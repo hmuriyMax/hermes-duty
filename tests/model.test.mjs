@@ -19,6 +19,7 @@ import {
   fmtAge,
   fmtTitle,
   groupDeals,
+  outcomeTone,
   shapeAttempts,
   shapeDeal,
   shapeNow,
@@ -47,8 +48,10 @@ test('порядок групп — приоритет ответа бэкенд
   )
   assert.deepEqual(Object.keys(model.byState).sort(), [...PRIORITY].sort())
   assert.equal(model.count, 7)
-  // чипы фильтра перечисляют те же состояния в том же порядке — только подписи, без правил
-  assert.deepEqual(Object.keys(STATE_META), PRIORITY)
+  // чипы фильтра идут в порядке `by_state` бэкенда — второго списка приоритета нет
+  assert.deepEqual(model.stateOrder, PRIORITY)
+  // таблица подписей покрывает ровно те состояния, что присылает бэкенд
+  assert.deepEqual([...Object.keys(STATE_META)].sort(), [...PRIORITY].sort())
 })
 
 test('у каждой группы порядок строк не пересортировывается', () => {
@@ -74,6 +77,55 @@ test('страница не навязывает свой порядок: гру
     groups.map((group) => group.state),
     ['wait_gate', 'wait_human'],
   )
+})
+
+test('чипы фильтра идут в порядке by_state из ответа, а не таблицы подписей', () => {
+  const reversed = [...PRIORITY].reverse()
+  const byState = {}
+  for (const state of reversed) byState[state] = 0
+  const built = shapeNow({ ...nowPayload, by_state: byState })
+
+  assert.deepEqual(built.stateOrder, reversed)
+  // подписи при этом остаются на месте: порядок пришёл из данных, не из таблицы
+  assert.equal(built.stateOrder.length, Object.keys(STATE_META).length)
+  // без by_state порядок берётся из первого появления состояний в делах
+  const noBackend = shapeNow({ deals: nowPayload.deals })
+  assert.deepEqual(noBackend.stateOrder, PRIORITY)
+})
+
+test('набор «падений» приходит с бэкенда: локальной копии красного нет', () => {
+  assert.equal(outcomeTone('crashed', 'failed', ['crashed', 'gave_up']), 'red')
+  // тот же исход без набора с бэкенда — серый, а не красный: UI не угадывает
+  assert.equal(outcomeTone('crashed', 'failed', []), 'gray')
+  assert.equal(outcomeTone('crashed', 'failed'), 'gray')
+  // успех и отложенное — презентация UI, набор падений её не касается
+  assert.equal(outcomeTone('done', 'completed', ['crashed']), 'green')
+  assert.equal(outcomeTone('reclaimed', 'released', ['crashed']), 'yellow')
+  // набор из ответа таймлайна попадает в тон попытки
+  const timeline = shapeAttempts(attemptsPayload)
+  assert.deepEqual(
+    timeline.attempts.map((attempt) => attempt.outcomeTone),
+    ['red', 'red', 'green'],
+  )
+})
+
+test('бейдж wait_human не обещает «человека»: вопрос может быть агенту', () => {
+  assert.equal(stateMeta('wait_human').label, 'ждёт ответа')
+  assert.ok(!STATE_META.wait_human.label.includes('человек'))
+  const deal = model.deals.find((item) => item.id === 't_a1b2c3d4')
+  assert.equal(deal.stateLabel, 'ждёт ответа')
+  // чей это вопрос — видно в evidence (origin в ответе бэкенда)
+  assert.match(deal.evidence, /origin='card'/)
+})
+
+test('pid: «не записан» и «состояние неизвестно» — разные факты', () => {
+  const unknown = shapeDeal({ attempt: { pid: 50123, pid_alive: null, age_sec: 5 }, waiting: { state: 'working' } })
+  assert.equal(unknown.attemptNote, 'состояние pid неизвестно')
+  const absent = shapeDeal({ attempt: { pid: null, pid_alive: null, age_sec: 5 }, waiting: { state: 'working' } })
+  assert.equal(absent.attemptNote, 'pid не записан')
+  assert.equal(shapeDeal({ attempt: { pid: 50123, pid_alive: true } }).attemptNote, 'pid жив')
+  assert.equal(shapeDeal({ attempt: { pid: 50123, pid_alive: false } }).attemptNote, 'pid мёртв')
+  assert.equal(shapeDeal({}).attemptNote, 'нет попытки')
 })
 
 test('незнакомое состояние — своей группой, без переклассификации', () => {

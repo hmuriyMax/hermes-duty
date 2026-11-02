@@ -3,6 +3,7 @@
   "task_id": "t_a1b2c3d4",
   "title": "IMPL: страница /duty — экран «сейчас» и таймлайн попыток",
   "count": 3,
+  "crash_outcomes": ["crashed", "gave_up", "spawn_failed", "timed_out"],
   "attempts": [
     {
       "run_id": 12,

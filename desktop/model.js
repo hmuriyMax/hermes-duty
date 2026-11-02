@@ -9,6 +9,10 @@
  * ниже — только подписи и цвета бейджей для известных состояний; незнакомое
  * состояние рисуется своим именем серым.
  *
+ * Два набора берутся из ответа, а не дублируются тут: порядок состояний — по
+ * ключам `by_state` (чипы фильтра), набор «падений» — по `crash_outcomes`
+ * (красный тон исхода). Так расширение набора на бэкенде не разъезжается с UI.
+ *
  * ВАЖНО: этот файл не импортируется из `desktop/plugin.js`. Загрузчик
  * десктопных плагинов исполняет `plugin.js` как blob-модуль и отказывает любому
  * спекулятору вне `@hermes/plugin-sdk` / `react*` (включая относительные пути),
@@ -17,10 +21,11 @@
  * `bin/duty-model-sync`, расхождение ловит `tests/model.test.mjs`.
  */
 
-// Подпись и тон бейджа по состоянию; порядок ключей — порядок чипов в фильтре.
-// Тон — ключ палитры TONE_COLOR, не css.
+// Подпись и тон бейджа по состоянию — только презентация, не правила. Подпись
+// `wait_human` намеренно не говорит «человека»: факт ставится по любому живому
+// вопросу пула, включая вопрос агенту (`origin='improver'` в evidence).
 const STATE_META = {
-  wait_human: { label: 'ждёт человека', tone: 'yellow' },
+  wait_human: { label: 'ждёт ответа', tone: 'yellow' },
   capability: { label: 'нужен доступ', tone: 'purple' },
   dead_lease: { label: 'лизинг истёк', tone: 'red' },
   crashed: { label: 'упало', tone: 'red' },
@@ -38,12 +43,10 @@ const TONE_COLOR = {
   blue: 'var(--ui-blue)',
 }
 
-// Тон исхода попытки: падение — красное, успех — зелёное, отложенное — жёлтое.
+// Тон исхода попытки: успех — зелёное, отложенное — жёлтое. Падений здесь нет:
+// их набор приходит с бэкенда (`crash_outcomes`), чтобы красный тон не разъехался
+// с правилами сервера.
 const OUTCOME_TONE = {
-  crashed: 'red',
-  gave_up: 'red',
-  spawn_failed: 'red',
-  timed_out: 'red',
   done: 'green',
   completed: 'green',
   succeeded: 'green',
@@ -106,6 +109,13 @@ function shapeDeal(deal) {
   const leaseState = String(lease.state || 'none')
   const attemptAge = attempt && attempt.age_sec !== undefined ? attempt.age_sec : null
   const lastAge = action.age_sec !== undefined ? action.age_sec : null
+  // «pid не записан» и «состояние pid неизвестно» (`os.kill` вернул OSError) — разные факты.
+  let attemptNote = 'нет попытки'
+  if (attempt) {
+    attemptNote = attempt.pid ? 'состояние pid неизвестно' : 'pid не записан'
+    if (pidAlive === true) attemptNote = 'pid жив'
+    if (pidAlive === false) attemptNote = 'pid мёртв'
+  }
   return {
     board: String(d.board || ''),
     id: String(d.id || ''),
@@ -119,13 +129,7 @@ function shapeDeal(deal) {
     evidence: String(waiting.evidence || ''),
     attemptAge,
     attemptAgeText: fmtAge(attemptAge),
-    attemptNote: attempt
-      ? pidAlive === false
-        ? 'pid мёртв'
-        : pidAlive === true
-          ? 'pid жив'
-          : 'pid не записан'
-      : 'нет попытки',
+    attemptNote,
     attemptRunId: attempt ? (attempt.run_id ?? null) : null,
     leaseState,
     leaseText: LEASE_LABEL[leaseState] || leaseState,
@@ -191,6 +195,13 @@ function shapeNow(payload) {
   const boardSlugs = new Set(boards.map((board) => board.slug))
   const byState = {}
   for (const deal of deals) byState[deal.state] = (byState[deal.state] || 0) + 1
+  // Порядок состояний — из ответа бэкенда (`by_state` идёт в порядке
+  // WAITING_PRIORITY), а не из порядка ключей таблицы подписей.
+  const backendStates =
+    data.by_state && typeof data.by_state === 'object' ? Object.keys(data.by_state) : []
+  const stateOrder = backendStates.length
+    ? backendStates.map(String)
+    : [...new Set(deals.map((deal) => deal.state))]
   return {
     now: Number.isFinite(Number(data.now)) ? Number(data.now) : null,
     deals,
@@ -203,6 +214,7 @@ function shapeNow(payload) {
     boardsRead: boards.filter((board) => board.read).length,
     count: deals.length,
     byState,
+    stateOrder,
   }
 }
 
@@ -223,9 +235,10 @@ function filterNow(model, filter) {
   return { ...model, deals, groups: groupDeals(deals), count: deals.length, byState }
 }
 
-/** Тон исхода попытки (падение/успех/отложено) с запасным правилом по статусу рана. */
-function outcomeTone(outcome, status) {
+/** Тон исхода попытки: «падение» — по набору бэкенда, дальше успех/отложено. */
+function outcomeTone(outcome, status, crashOutcomes) {
   const key = String(outcome || '')
+  if (key && Array.isArray(crashOutcomes) && crashOutcomes.includes(key)) return 'red'
   if (OUTCOME_TONE[key]) return OUTCOME_TONE[key]
   if (key) return 'gray'
   return String(status || '') === 'running' ? 'green' : 'gray'
@@ -241,6 +254,7 @@ function outcomeTone(outcome, status) {
 function shapeAttempts(payload) {
   const data = payload && typeof payload === 'object' ? payload : {}
   const list = Array.isArray(data.attempts) ? data.attempts : []
+  const crashes = Array.isArray(data.crash_outcomes) ? data.crash_outcomes.map(String) : []
   const longest = list.reduce((acc, attempt) => Math.max(acc, Number(attempt.duration_sec) || 0), 0) || 1
   const attempts = list.map((attempt) => {
     const duration = attempt.duration_sec === undefined ? null : attempt.duration_sec
@@ -260,7 +274,7 @@ function shapeAttempts(payload) {
       durationText: fmtAge(duration),
       barPct: Math.max(2, Math.round(((Number(duration) || 0) / longest) * 100)),
       outcome: String(attempt.outcome || ''),
-      outcomeTone: outcomeTone(attempt.outcome, attempt.status),
+      outcomeTone: outcomeTone(attempt.outcome, attempt.status, crashes),
       error: String(attempt.error || ''),
       summary: String(attempt.summary || ''),
       events,

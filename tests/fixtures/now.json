@@ -271,6 +271,7 @@
     "wait_slot": 1,
     "wait_gate": 1
   },
+  "crash_outcomes": ["crashed", "gave_up", "spawn_failed", "timed_out"],
   "boards": [
     {
       "slug": "hermes-tickets",

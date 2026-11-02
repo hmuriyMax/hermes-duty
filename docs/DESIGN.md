@@ -12,22 +12,24 @@
 
 ## Что P0 делает
 
-1. Находит все живые kanban-БД: корневую (доска `default`) и
-   `kanban/boards/<slug>/kanban.db`; файлы нулевого размера пропускаются
-   (`dashboard/plugin_api.py:124-136`).
+1. Находит все kanban-БД: корневую (доска `default`) и
+   `kanban/boards/<slug>/kanban.db`; файл нулевого размера не пропускается, а
+   помечается `note = "empty db"` и виден как непрочитанная доска
+   (`dashboard/plugin_api.py:124-147`) — иначе он молча исчезал бы и из
+   `boards[]`, и из `errors[]`, и срез выглядел бы полным.
 2. Открывает их строго на чтение — `?mode=ro`, одна транзакция-снимок `BEGIN` на
    доску (`dashboard/plugin_api.py:72-82`).
 3. Собирает по каждому активному делу (`status NOT IN ('done','archived')`,
    не больше `DEAL_LIMIT = 500` на доску): лизинг, текущую попытку, последнее
    действие, исход последнего рана, незавершённых родителей и живой вопрос пула
-   (`dashboard/plugin_api.py:548-711`).
+   (`dashboard/plugin_api.py:600-764`).
 4. Отдаёт срез «сейчас» — `GET /now`: дела всех досок в порядке приоритета
    таксономии, с доказательством состояния в `waiting.evidence`.
 5. Отдаёт таймлайн попыток дела — `GET /duty/{board}/{task_id}/attempts`: раны по
    возрастанию старта, длительность, исход, текст ошибки и события рана.
 6. Деградирует вместо падения: недоступная доска уходит в `errors[]` при HTTP 200,
    сбой вспомогательной таблицы — в `warnings[]` доски
-   (`dashboard/plugin_api.py:714-776`, `:705-711`).
+   (`dashboard/plugin_api.py:767-849`, `:634-691`).
 
 ## Что P0 не делает никогда
 
@@ -62,7 +64,7 @@
 | `GET /duty/{board}/{task_id}/attempts` | таймлайн попыток дела | 404 — нет доски или дела; 503 — доска/`task_runs` не читаются |
 
 `?state=` фильтрует только список `deals`: `by_state` и `boards[]` считаются по
-полному срезу до фильтра (`dashboard/plugin_api.py:761-765`).
+полному срезу до фильтра (`dashboard/plugin_api.py:834-838`).
 
 ## Форма ответа `/now`
 
@@ -76,7 +78,8 @@
     "consecutive_failures": 0, "created_at": 1793635898,
     "workspace_kind": "scratch",
     "attempt": {                  // null, если у дела не было ранов
-      "run_id": 12, "start": 1793646565, "age_sec": 41,
+      "run_id": 12, "source": "run",   // run|task: откуда взяты pid/start/heartbeat
+      "start": 1793646565, "age_sec": 41,
       "pid": 39899, "pid_alive": true,
       "heartbeat_age_sec": 12, "run_status": "running"
     },
@@ -89,7 +92,7 @@
     "waiting": { "state": "working", "evidence": "ран 12 running, pid 39899 жив, heartbeat 12с назад" }
   }],
   "by_state": { "wait_human": 0, "capability": 0, "dead_lease": 0, "crashed": 0,
-                "working": 1, "wait_slot": 3, "wait_gate": 8 },  // порядок = WAITING_PRIORITY
+                "working": 1, "no_signal": 0, "wait_slot": 3, "wait_gate": 8 },  // порядок = WAITING_PRIORITY
   "crash_outcomes": ["crashed", "gave_up", "spawn_failed", "timed_out"],
   "boards": [{ "slug": "hermes-duty", "path": "…/kanban.db", "read": true,
                "deals": 12, "truncated": false, "warnings": [] }],
@@ -99,20 +102,21 @@
 
 Сортировка детерминирована: `waiting.state` по `WAITING_PRIORITY`, затем возраст
 текущей попытки по убыванию, затем `id` — иначе UI дёргается между опросами
-(`dashboard/plugin_api.py:753-760`). `crash_outcomes` и `by_state` отдаются
+(`dashboard/plugin_api.py:826-833`). `crash_outcomes` и `by_state` отдаются
 клиенту, чтобы UI не держал копию этих наборов.
 
 ## Таксономия ожиданий (восемь взаимоисключающих состояний)
 
 Состояние — первое совпавшее по приоритету; все сработавшие факты уходят в
-`waiting.evidence` (`WAITING_PRIORITY`/`WAITING_FALLBACK` в `dashboard/plugin_api.py`). Порог свежести heartbeat — `HEARTBEAT_FRESH_SEC = 300` с.
+`waiting.evidence` (`WAITING_PRIORITY`/`WAITING_FALLBACK`, `dashboard/plugin_api.py:277-326`).
+Порог свежести heartbeat — `HEARTBEAT_FRESH_SEC = 300` с (`:289`).
 
 | # | состояние | как определяется |
 |---|---|---|
 | 1 | `wait_human` | живой вопрос пула (`status='sent'`), связанный с делом: `session_key` = id дела или id упомянут в `text`/`text_full` |
 | 2 | `capability` | `status=blocked` и (`block_kind='capability'` или причина блока содержит слово из `CAPABILITY_WORDS`: доступ, права, разрешение, `permission`, `access`, `credential`, `token`, `forbidden`, `403`) |
 | 3 | `dead_lease` | ран `running`, а его pid мёртв; **или** лизинг истёк, и последнего рана нет либо он `running` |
-| 4 | `crashed` | `consecutive_failures > 0`; **или** исход последнего рана ∈ `crashed`/`gave_up`/`spawn_failed`/`timed_out`; **или** ран `running` с живым pid, но heartbeat старше 300 с |
+| 4 | `crashed` | `consecutive_failures > 0`; **или** исход последнего рана ∈ `crashed`/`gave_up`/`spawn_failed`/`timed_out`; **или** ран `running`, pid не мёртв, но heartbeat старше 300 с ⚠ |
 | 5 | `working` | ран `running`, pid не мёртв, heartbeat не старше 300 с |
 | 6 | `no_signal` | `status=running`, но ни рана, ни pid, ни heartbeat нет: живого сигнала нет, дело не выдаётся за работающее |
 | 7 | `wait_slot` | `status=ready` и исполнитель уже держит другое дело (`running`) |
@@ -121,6 +125,35 @@
 Правило: состояние **не выводится из одной колонки**. Оно вычисляется по набору
 фактов (лизинг, pid, heartbeat, граф зависимостей, пул вопросов, исход последнего
 рана), и каждый сработавший факт показывается рядом как доказательство.
+
+### Формулировки `waiting.evidence` (дословно по коду)
+
+Факт — строка, собранная кодом; при нескольких сработавших фактах победитель идёт
+первым, остальные дописываются через `; ещё: …`, а при недоступном/обрезанном пуле
+к `wait_human` без вопроса — `; … — факт wait_human не проверен`
+(`dashboard/plugin_api.py:585-597`).
+
+- `working` — `ран 12 running, pid 39899 жив, heartbeat 12с назад`. Про pid
+  называется ровно то, что известно: `pid <pid> жив` (сигнал прошёл) или
+  `состояние pid <pid> неизвестно` (`os.kill` вернул прочий `OSError`,
+  `pid_alive=None`); «не записан» про существующий pid больше не печатается
+  (`dashboard/plugin_api.py:561-572`, `:349-362`).
+- `no_signal` — `status=running без живого сигнала: рана, pid и heartbeat нет`
+  (оглавление `WAITING_FALLBACK`, `dashboard/plugin_api.py:325`).
+- `dead_lease` — `ран <id> в статусе running, а pid <pid> мёртв (лизинг …)` либо
+  `лизинг истёк <N>с назад (<claim_lock>), ран <status>`
+  (`dashboard/plugin_api.py:528-542`).
+- `wait_slot` — `status=ready, профиль <assignee> занят делом <id> (running)`;
+  `wait_gate` — `незавершённые родители: <id> (<status>), …`
+  (`dashboard/plugin_api.py:574-583`).
+- `attempt.source` — `run` или `task`: если pid/start/heartbeat добраны из
+  карточки, а не из записи рана, подпись попытки на странице получает хвост
+  «, факты карточки» (`dashboard/plugin_api.py:447-479`, `desktop/model.js:116-123`).
+
+⚠ Помеченное расхождение кода (не правилось в FIX-2): evidence факта `crashed`
+печатает `pid <pid> жив` на условии «pid не мёртв», поэтому при `pid_alive=None`
+(прочий `OSError`) текст называет pid живым, хотя по коду состояние неизвестно
+(`dashboard/plugin_api.py:554-557`). Таблица выше описывает условие, не текст.
 
 Если ни один факт не сработал, статус доразбирается оглавлением
 `WAITING_FALLBACK`: `triage`/`blocked`/`review`/`awaiting_merge` → `wait_human`,
@@ -136,22 +169,27 @@
 |---|---|
 | `tasks` доски не читается (не открылась, нет таблицы) | `boards[].read = false`, `errors[]` с `{board, reason}`, дела этой доски отсутствуют |
 | `kanban.db` нулевого размера | `boards[].read = false` + `boards[].note = "empty db"` и `errors[]` с причиной `empty db (...)` — доска не исчезает из ответа |
-| доска упала на чужой схеме (`int()` по текстовой колонке и т.п.) | `boards[].read = false` + `errors[]` с причиной `<ТипИсключения>: <текст>`; ответ остаётся 200 |
-| `task_runs`, `task_links` или `task_events` не читаются | `boards[].warnings[]` строкой `<таблица>: <причина>`; факты деградируют, доска остаётся `read = true` |
+| доска упала на чужой схеме (`int()` по текстовой колонке и т.п.) | `boards[].read = false` + `errors[]` с причиной `<ТипИсключения>: <текст>`; `RuntimeError` (готовые причины: нет таблицы, 0-байтная БД) идёт без префикса; ответ остаётся 200 (`dashboard/plugin_api.py:796-813`) |
+| `task_runs`, `task_links`, `task_events` или `task_events(blocked)` не читаются | `boards[].warnings[]` строкой `<таблица>: <причина>` (для причин блока — ключ `task_events(blocked)`); факты деградируют, доска остаётся `read = true` (`dashboard/plugin_api.py:634-691`) |
 | `messaging/pool.db` нет или это не БД | `errors[]` с `board: "messaging/pool.db"` + в `waiting.evidence` пометка «факт `wait_human` не проверен» — иначе недоступный пул выглядел бы как «вопросов нет» |
-| живых вопросов в пуле больше `QUESTION_LIMIT = 200` | `errors[]` с причиной `questions truncated: ...` + та же пометка в `waiting.evidence` дел, которым вопрос не нашёлся |
-| дел больше `DEAL_LIMIT = 500` | `boards[].truncated = true`, на странице `/duty` — пометка «срез обрезан лимитом» |
+| живых вопросов в пуле больше `QUESTION_LIMIT = 200` (запрос берёт `LIMIT + 1`, поэтому пул ровно на 200 вопросов пометки не получает) | `errors[]` с `board: "messaging/pool.db"` и причиной `questions truncated: more than 200 live questions` + в `waiting.evidence` дел в состоянии `wait_human`, которым вопрос не нашёлся: `живых вопросов в пуле больше 200 (старые не вошли) — факт wait_human не проверен` (`dashboard/plugin_api.py:406-425`, `:784-791`, `:595-596`) |
+| дел на доске `>= DEAL_LIMIT = 500` (`truncated = len(tasks) >= DEAL_LIMIT`: лишней строки не берётся, поэтому ровно 500 дел тоже помечаются) | `boards[].truncated = true`; на странице `/duty` — строка `доска <slug>: срез обрезан лимитом, показано <N> дел` (`dashboard/plugin_api.py:623`, `:763`, `desktop/model.js:205-210`) |
 
-`truncated` и `warnings[]` не только отдаются, но и рисуются: страница `/duty`
-показывает их той же жёлтой полосой, что и недоступные доски (`desktop/model.js`,
-`desktop/plugin.js`).
+`truncated` и `warnings[]` не только отдаются, но и рисуются. Шейпер сводит их в
+два списка строк — `доска <slug>: срез обрезан лимитом, показано <N> дел` и
+`доска <slug>: <причина из warnings>` (`desktop/model.js:205-210`, копия в
+`desktop/plugin.js:233-238`). Страница добавляет их к недоступным доскам и упавшим
+источникам одной жёлтой полосой над списком (`desktop/plugin.js:673-680`,
+`:775-785`) и тем же списком в пустом состоянии (`:682-699`). Счётчик «досок
+19/19» при этом остаётся честным: доска прочитана, но срез неполон — и это видно
+текстом.
 
 Таймлайн попыток деградирует иначе: там 404/503 — это ответ про конкретное дело
 (нельзя показать пустой таймлайн вместо «не читается»), а сбой `task_events`
-просто оставляет `events: []` у ранов (`dashboard/plugin_api.py:805-868`).
+просто оставляет `events: []` у ранов (`dashboard/plugin_api.py:879-941`).
 
 Известные ограничения (не исправлены в `v0.0.1`, зафиксированы честно):
-причина сбоя `task_events` (события рана) в ответе таймлайна не отдаётся — там просто пустой `events`; если в `kanban/boards/` есть каталог `default`, его БД попадает в срез отдельной записью с тем же slug — и `?board=default` вернёт обе (корневую и каталог), потому что фильтр идёт по slug (`dashboard/plugin_api.py:724`).
+причина сбоя `task_events` (события рана) в ответе таймлайна не отдаётся — там просто пустой `events`; если в `kanban/boards/` есть каталог `default`, его БД попадает в срез отдельной записью с тем же slug — и `?board=default` вернёт обе (корневую и каталог), потому что фильтр идёт по slug (`dashboard/plugin_api.py:777`).
 
 ## Экраны
 
@@ -177,23 +215,26 @@
 пересчитываются: UI рисует `waiting.state` и `waiting.evidence` как есть, а группы
 строит в порядке первого появления состояния в ответе (`/now` уже отсортирован по
 `WAITING_PRIORITY`). Незнакомое состояние показывается последней группой серым,
-без попытки его «доразобрать» (`desktop/model.js:27-35`, `:152-165`).
+без попытки его «доразобрать» (`desktop/model.js:29-38`, `:158-171`).
 
 - строка таблицы: доска · `id` · title (многоточие) · assignee · возраст попытки ·
   состояние лизинга · возраст последнего действия · бейдж состояния с цветом
   (жёлтый `wait_human`, фиолетовый `capability`, красный `dead_lease`/`crashed`,
   зелёный `working`, серый `no_signal`/`wait_slot`/`wait_gate`);
 - фильтры локальные (доска, чипы состояний, поиск по `id`/title с debounce 240 мс):
-  `/now` на ввод не перезапрашивается (`desktop/plugin.js:22`, `desktop/model.js:222-236`);
+  `/now` на ввод не перезапрашивается (`desktop/plugin.js:22`, `desktop/model.js:239-253`);
 - правая панель — таймлайн попыток: полоса на попытку относительно самой долгой,
   длительность, исход цветом (набор «падений» — из `crash_outcomes` ответа),
   `error` текстом, события рана списком; пока грузится — скелетон;
 - ошибка запроса — красная плашка с текстом и кнопкой «повторить», данные на
   экране не затираются; недоступные доски и упавшие источники (`errors`) — жёлтой
   полосой, а в пустом состоянии — списком «доска X недоступна: причина» рядом со
-  счётчиком реально прочитанных досок (`desktop/plugin.js:653-678`, `:757-770`);
-- `boards[].truncated` и `boards[].warnings` шейпер разбирает, но страница их пока
-  не рисует — известный разрыв между данными и UI.
+  счётчиком реально прочитанных досок (`desktop/plugin.js:673-680`, `:682-699`, `:775-785`);
+- `boards[].truncated` и `boards[].warnings` шейпер разбирает в `truncatedNotices`
+  и `warningNotices` (`desktop/model.js:205-210`), а страница рисует их жёлтой
+  полосой над списком, когда дела есть, и тем же списком в пустом состоянии
+  (`desktop/plugin.js:673-680`, `:775-785`, `:682-699`); порядок строк в полосе:
+  недоступные доски, упавшие источники, обрезанный срез, деградировавшие таблицы.
 
 Шейпер ответов — `desktop/model.js` (чистые функции, без React/DOM). Загрузчик
 десктопных плагинов исполняет `plugin.js` как blob-модуль и отвергает любой
@@ -205,8 +246,9 @@
 
 План, ничего из этого в `v0.0.1` не сделано.
 
-- `0.0.2` — отрисовать `truncated`/`warnings` доски, экраны «Почему стоит» и
-  «Здоровье» поверх уже существующих `by_state`/`waiting.evidence`, CLI `bin/duty`.
+- `0.0.2` — экраны «Почему стоит» и «Здоровье» поверх уже существующих
+  `by_state`/`waiting.evidence`, CLI `bin/duty` (отрисовка `truncated`/`warnings`
+  доски вошла в `0.0.1`).
 - `0.0.3` — таксономия отказов и медиана ожидания как отдельный срез (второй
   роут `/health`-уровня, не расширение `/now`).
 - `0.1.0+` — P1: собственный журнал плагина и `ask()` как единственный канал

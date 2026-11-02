@@ -34,6 +34,11 @@ Hermes Desktop → пункт сайдбара **«Дела»** (или путь
 Страница обновляет `/now` раз в 10 секунд. Пустой список — это нормальный ответ:
 он означает «активных дел нет», а не «сломалось» (см. п. 6).
 
+Жёлтая полоса над списком (или такой же список в пустом состоянии) — это
+неполнота ответа, а не украшение: недоступная доска, упавший источник, обрезанный
+срез (`boards[].truncated`) или деградировавшая таблица (`boards[].warnings[]`).
+Разбор причин — таблица в п. 3.
+
 ## 3. Дёрнуть роуты через TestClient
 
 Без десктопа и без живого сервера: роутер монтируется в тестовое приложение.
@@ -92,8 +97,9 @@ if now["deals"]:
 |---|---|
 | `errors[]` не пуст | источник не прочитан; в `board` — `messaging/pool.db` или slug доски, в `reason` — текст сбоя |
 | `boards[].read = false` | доска не читается; её дел в ответе нет. `boards[].note = "empty db"` — файл `kanban.db` нулевого размера |
-| `boards[].warnings[]` | не читается вспомогательная таблица (`task_runs`/`task_links`/`task_events`) — факты деградировали |
-| `boards[].truncated = true` | дел на доске больше `DEAL_LIMIT = 500` — показан не весь срез |
+| `boards[].warnings[]` | не читается вспомогательная таблица (`task_runs`/`task_links`/`task_events`, для причин блока — `task_events(blocked)`) — факты деградировали; на странице это строка `доска <slug>: <причина>` в жёлтой полосе |
+| `boards[].truncated = true` | дел на доске `>= DEAL_LIMIT = 500` — показан не весь срез; на странице строка `доска <slug>: срез обрезан лимитом, показано <N> дел` |
+| `errors[]` с `board: "messaging/pool.db"` и `reason: "questions truncated: …"` | живых вопросов в пуле больше `QUESTION_LIMIT = 200`: вопрос этого дела мог не войти в срез, в `waiting.evidence` стоит «факт wait_human не проверен» |
 | `by_state` в ответе | счётчики по состояниям считаются до фильтра `?state=` |
 | 400 на `/now?state=…` | состояние не из таксономии (`wait_human`, `capability`, `dead_lease`, `crashed`, `working`, `no_signal`, `wait_slot`, `wait_gate`) |
 | 404 на `/now?board=…` | такой доски нет |
@@ -110,6 +116,15 @@ cd ~/.hermes/plugins/hermes-duty
 а не плагин: нужен venv, где `fastapi` и `pytest` стоят.
 
 Тесты поднимают свои БД в `tmp_path` по реальной схеме, живые источники не читают.
+
+Кейсы честности сигналов (ревью RV2) — `test_pid_state_unknown_is_not_reported_as_missing`,
+`test_running_without_any_live_signal_is_no_signal`,
+`test_foreign_schema_does_not_500_and_names_the_type`,
+`test_empty_kanban_db_is_visible_as_unread_board`,
+`test_question_pool_limit_is_not_silent`, `test_attempt_reports_where_its_facts_came_from`.
+Красная проба к ним: откатить правку (например, вернуть в `_waiting` строку
+`'не записан'` вместо `'состояние pid … неизвестно'`) — соответствующий тест
+обязан упасть; зелёный тест на откатанном коде означает, что он ничего не проверяет.
 
 ## 5. Проверить шейпер и версии
 

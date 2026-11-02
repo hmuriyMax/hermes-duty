@@ -50,7 +50,8 @@
 
 ## Порядок работ
 
-- `v0.0.1` — репозиторий, манифест, backend с `/health`, `/sources`, `/board/{slug}/tasks` (read-only).
+- `v0.0.1` — репозиторий, манифест, backend с `/health`, `/sources`, `/board/{slug}/tasks` (read-only),
+  плюс `GET /now` (лизинги + таксономия ожиданий) и `GET /duty/{board}/{task_id}/attempts`.
 - `v0.0.2` — сбор лизингов + экран «Сейчас» в dashboard (страница `/duty`).
 - `v0.0.3` — таксономия ожиданий + экран «Почему стоит».
 - `v0.0.4` — таймлайн попыток по `task_runs`/`task_events`.

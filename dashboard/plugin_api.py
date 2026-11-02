@@ -37,6 +37,15 @@ from fastapi import APIRouter, HTTPException
 
 router = APIRouter()
 
+# Busy-timeout соединения: сколько ждать чужую запись, а не дедлайн запроса.
+# Плагин читает живые БД, которые пишет ядро, поэтому ждать дольше смысла нет —
+# защита от медленного скана лежит на клиенте (`REQUEST_TIMEOUT_MS` в UI).
+SQL_BUSY_TIMEOUT_SEC = 2.0
+
+# id карточки kanban — один паттерн на файл (`t_` + hex, например `t_21f41d1c`).
+# Используется и для `session_key` вопроса пула, и для упоминания в его тексте.
+TASK_ID_RE = re.compile(r"t_[0-9a-f]{6,}")
+
 
 def _plugin_version() -> str:
     """Номер версии — один источник (plugin.yaml), а не четвёртая копия в коде."""
@@ -65,18 +74,40 @@ def _ro(path: Path) -> str:
     return path.resolve().as_uri() + "?mode=ro"
 
 
-def _query_checked(path: Path, sql: str, params: tuple = ()) -> tuple[list[dict[str, Any]], Optional[str]]:
+def _connect_ro(path: Path) -> sqlite3.Connection:
+    """Read-only соединение со снимком: `BEGIN` фиксирует одно состояние БД на срез."""
+    conn = sqlite3.connect(_ro(path), uri=True, timeout=SQL_BUSY_TIMEOUT_SEC)
+    conn.row_factory = sqlite3.Row
+    conn.execute("BEGIN")
+    return conn
+
+
+def _fetch(
+    conn: sqlite3.Connection, sql: str, params: tuple = ()
+) -> tuple[list[dict[str, Any]], Optional[str]]:
+    """Один запрос на уже открытом соединении: `(строки, причина сбоя)` без исключений.
+
+    Отдельно от `_query_checked`, потому что срез доски делает несколько запросов
+    по одному соединению, а не открывает новое на каждый.
+    """
+    try:
+        return [dict(row) for row in conn.execute(sql, params).fetchall()], None
+    except Exception as exc:  # noqa: BLE001 - битый файл/нет таблицы/нет прав
+        return [], f"{type(exc).__name__}: {exc}"
+
+
+def _query_checked(
+    path: Path, sql: str, params: tuple = ()
+) -> tuple[list[dict[str, Any]], Optional[str]]:
     """Один read-only запрос: `(строки, причина сбоя)`, без исключений наружу.
 
     Причина нужна экрану «сейчас»: доска, которая не читается, попадает в
     `errors` ответа, а не роняет роут.
     """
     try:
-        with closing(sqlite3.connect(_ro(path), uri=True, timeout=2.0)) as conn:
-            conn.row_factory = sqlite3.Row
-            conn.execute("BEGIN")
-            return [dict(row) for row in conn.execute(sql, params).fetchall()], None
-    except Exception as exc:  # noqa: BLE001 - битый файл/нет таблицы/нет прав
+        with closing(_connect_ro(path)) as conn:
+            return _fetch(conn, sql, params)
+    except Exception as exc:  # noqa: BLE001 - файл не открылся
         return [], f"{type(exc).__name__}: {exc}"
 
 
@@ -238,7 +269,8 @@ WAITING_PRIORITY = (
 # Ран считается живым, только если heartbeat не старше этого порога.
 HEARTBEAT_FRESH_SEC = 300
 
-# Outcome'ы рана, означающие падение попытки, а не работу.
+# Outcome'ы рана, означающие падение попытки, а не работу. Единственный источник
+# этого набора: он уходит клиенту в `crash_outcomes`, чтобы UI не держал копию.
 CRASH_OUTCOMES = ("crashed", "gave_up", "spawn_failed", "timed_out")
 
 # Статусы дела, в которых оно ждёт незавершённого родителя в графе зависимостей.
@@ -340,25 +372,28 @@ def _pool_questions(home: Path) -> tuple[dict[str, dict[str, Any]], Optional[str
     в `session_key` (проверено на живых данных — там ровно `t_xxxxxxxx`), а у
     остальных связь видна только по упоминанию `t_<id>` в тексте. Пути полей
     поэтому такие: `session_key` → затем `text`/`text_full`.
+
+    Второй элемент — причина сбоя: недоступный пул это не «вопросов нет», иначе
+    `wait_human` молча не срабатывает и ответ врёт про «никто не ждёт».
     """
     db = home / "messaging" / "pool.db"
     if not db.is_file():
-        return {}, None
+        return {}, f"pool.db not found: {db}"
     rows, err = _query_checked(
         db,
         "SELECT * FROM questions WHERE status = 'sent' ORDER BY id DESC LIMIT ?",
         (QUESTION_LIMIT,),
     )
     if err:
-        return {}, err
+        return {}, f"pool.db unreadable: {db} ({err})"
     index: dict[str, dict[str, Any]] = {}
     for row in rows:
         holders: set[str] = set()
         key = str(row.get("session_key") or "")
-        if re.fullmatch(r"t_[0-9a-z]{4,}", key):
+        if TASK_ID_RE.fullmatch(key):
             holders.add(key)
         blob = f"{row.get('text') or ''} {row.get('text_full') or ''}"
-        holders.update(re.findall(r"t_[0-9a-f]{6,}", blob))
+        holders.update(TASK_ID_RE.findall(blob))
         for task_id in holders:
             index.setdefault(task_id, row)
     return index, None
@@ -419,11 +454,17 @@ def _waiting(
     """
     status = str(task.get("status") or "")
     facts: dict[str, str] = {}
-    run_status = (last_run or {}).get("status")
-    run_id = (attempt or {}).get("run_id")
-    pid_alive = (attempt or {}).get("pid_alive")
-    heartbeat_age = (attempt or {}).get("heartbeat_age_sec")
-    pid = (attempt or {}).get("pid")
+    # Факты одного рана: статус, pid и heartbeat берутся из одной попытки
+    # (`attempt`), иначе старый `running` склеивается со стартовавшим новым раном
+    # и `dead_lease` не срабатывает. `last_run` нужен только для исхода последнего
+    # рана — и в тексте факта он назван явно.
+    attempt = attempt or {}
+    run_status = attempt.get("run_status")
+    run_id = attempt.get("run_id")
+    pid_alive = attempt.get("pid_alive")
+    heartbeat_age = attempt.get("heartbeat_age_sec")
+    pid = attempt.get("pid")
+    last_status = (last_run or {}).get("status")
 
     # 1. Живой вопрос человеку в пуле.
     if question is not None:
@@ -444,7 +485,7 @@ def _waiting(
     # 3. Протухший лизинг. Мёртвый pid при уже завершённом ране — не dead_lease:
     #    это либо crashed, либо нормальное завершение (проверяется ниже).
     hung_run = run_status == "running" and pid_alive is False
-    expired_claim = lease["state"] == "expired" and (last_run is None or run_status == "running")
+    expired_claim = lease["state"] == "expired" and (last_run is None or last_status == "running")
     if hung_run:
         facts["dead_lease"] = (
             f"ран {run_id} в статусе running, а pid {pid} мёртв "
@@ -453,7 +494,7 @@ def _waiting(
     elif expired_claim:
         facts["dead_lease"] = (
             f"лизинг истёк {-lease['expires_in_sec']}с назад ({lease['claim_lock'] or '—'}), "
-            f"ран {run_status or '—'}"
+            f"ран {last_status or '—'}"
         )
 
     # 4. Падение: счётчик отказов, кривой исход последнего рана или зависший ран
@@ -516,76 +557,85 @@ def _board_deals(
     slug = str(entry["slug"])
     path = Path(entry["path"])
     warnings: list[str] = []
-    tasks, err = _query_checked(
-        path,
-        "SELECT * FROM tasks WHERE status NOT IN (?, ?) ORDER BY created_at, id LIMIT ?",
-        (TERMINAL_STATUSES[0], TERMINAL_STATUSES[1], DEAL_LIMIT),
-    )
-    if err:
-        raise RuntimeError(err)
-    deal_ids = [str(row.get("id")) for row in tasks]
-    marks = ", ".join("?" * len(deal_ids))
-
-    runs_by_task: dict[str, list[dict[str, Any]]] = {}
-    parents_of: dict[str, list[tuple[str, str]]] = {}
-    suspenders: dict[str, dict[str, Any]] = {}
-    block_reasons: dict[str, str] = {}
-    if deal_ids:
-        rows, err = _query_checked(
-            path,
-            f"SELECT * FROM task_runs WHERE task_id IN ({marks}) ORDER BY started_at, id",
-            tuple(deal_ids),
+    try:
+        conn = _connect_ro(path)
+    except Exception as exc:  # noqa: BLE001 - файл не открылся: доска не читается
+        raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
+    # Одно соединение на доску: все запросы среза идут по одному снимку (`BEGIN`),
+    # а не открывают новое соединение на каждый запрос.
+    with closing(conn) as conn:
+        tasks, err = _fetch(
+            conn,
+            "SELECT * FROM tasks WHERE status NOT IN (?, ?) ORDER BY created_at, id LIMIT ?",
+            (TERMINAL_STATUSES[0], TERMINAL_STATUSES[1], DEAL_LIMIT),
         )
         if err:
-            warnings.append(f"task_runs: {err}")
-        for row in rows:
-            runs_by_task.setdefault(str(row.get("task_id")), []).append(row)
+            raise RuntimeError(err)
+        deal_ids = [str(row.get("id")) for row in tasks]
+        marks = ", ".join("?" * len(deal_ids))
 
-        # Незавершённый родитель — ровно то, чем гейтит ядро: родитель не в
-        # терминальном статусе (Edge-таблица `task_links`, колонки parent/child).
-        rows, err = _query_checked(
-            path,
-            "SELECT l.child_id, p.id AS parent_id, p.status AS parent_status "
-            "FROM task_links l JOIN tasks p ON p.id = l.parent_id "
-            "WHERE p.status NOT IN (?, ?) ORDER BY l.child_id, p.id",
-            (TERMINAL_STATUSES[0], TERMINAL_STATUSES[1]),
-        )
-        if err:
-            warnings.append(f"task_links: {err}")
-        for row in rows:
-            parents_of.setdefault(str(row.get("child_id")), []).append(
-                (str(row.get("parent_id")), str(row.get("parent_status")))
+        runs_by_task: dict[str, list[dict[str, Any]]] = {}
+        parents_of: dict[str, list[tuple[str, str]]] = {}
+        suspenders: dict[str, dict[str, Any]] = {}
+        block_reasons: dict[str, str] = {}
+        if deal_ids:
+            rows, err = _fetch(
+                conn,
+                f"SELECT * FROM task_runs WHERE task_id IN ({marks}) ORDER BY started_at, id",
+                tuple(deal_ids),
             )
-
-        # Последнее действие: самое свежее событие, а heartbeat — только если
-        # других событий у дела нет (иначе экран показывает шум).
-        latest_action_sql = (
-            f"SELECT * FROM task_events WHERE id IN (SELECT MAX(id) FROM task_events "
-            f"WHERE task_id IN ({marks}) AND kind != 'heartbeat' GROUP BY task_id)"
-        )
-        latest_any_sql = (
-            f"SELECT * FROM task_events WHERE id IN (SELECT MAX(id) FROM task_events "
-            f"WHERE task_id IN ({marks}) GROUP BY task_id)"
-        )
-        for sql in (latest_action_sql, latest_any_sql):
-            rows, err = _query_checked(path, sql, tuple(deal_ids))
             if err:
-                warnings.append(f"task_events: {err}")
-                break
+                warnings.append(f"task_runs: {err}")
             for row in rows:
-                suspenders.setdefault(str(row.get("task_id")), row)
+                runs_by_task.setdefault(str(row.get("task_id")), []).append(row)
 
-        rows, err = _query_checked(
-            path,
-            f"SELECT * FROM task_events WHERE id IN (SELECT MAX(id) FROM task_events "
-            f"WHERE task_id IN ({marks}) AND kind = 'blocked' GROUP BY task_id)",
-            tuple(deal_ids),
-        )
-        if err:
-            warnings.append(f"task_events(blocked): {err}")
-        for row in rows:
-            reason = _payload_summary(row.get("payload")) or ""
-            block_reasons[str(row.get("task_id"))] = reason
+            # Незавершённый родитель — ровно то, чем гейтит ядро: родитель не в
+            # терминальном статусе (Edge-таблица `task_links`, колонки parent/child).
+            # Связи ограничены делами среза: без `child_id IN (...)` join тянет всю доску.
+            rows, err = _fetch(
+                conn,
+                f"SELECT l.child_id, p.id AS parent_id, p.status AS parent_status "
+                f"FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+                f"WHERE l.child_id IN ({marks}) AND p.status NOT IN (?, ?) "
+                f"ORDER BY l.child_id, p.id",
+                tuple(deal_ids) + TERMINAL_STATUSES,
+            )
+            if err:
+                warnings.append(f"task_links: {err}")
+            for row in rows:
+                parents_of.setdefault(str(row.get("child_id")), []).append(
+                    (str(row.get("parent_id")), str(row.get("parent_status")))
+                )
+
+            # Последнее действие: самое свежее событие, а heartbeat — только если
+            # других событий у дела нет (иначе экран показывает шум).
+            latest_action_sql = (
+                f"SELECT * FROM task_events WHERE id IN (SELECT MAX(id) FROM task_events "
+                f"WHERE task_id IN ({marks}) AND kind != 'heartbeat' GROUP BY task_id)"
+            )
+            latest_any_sql = (
+                f"SELECT * FROM task_events WHERE id IN (SELECT MAX(id) FROM task_events "
+                f"WHERE task_id IN ({marks}) GROUP BY task_id)"
+            )
+            for sql in (latest_action_sql, latest_any_sql):
+                rows, err = _fetch(conn, sql, tuple(deal_ids))
+                if err:
+                    warnings.append(f"task_events: {err}")
+                    break
+                for row in rows:
+                    suspenders.setdefault(str(row.get("task_id")), row)
+
+            rows, err = _fetch(
+                conn,
+                f"SELECT * FROM task_events WHERE id IN (SELECT MAX(id) FROM task_events "
+                f"WHERE task_id IN ({marks}) AND kind = 'blocked' GROUP BY task_id)",
+                tuple(deal_ids),
+            )
+            if err:
+                warnings.append(f"task_events(blocked): {err}")
+            for row in rows:
+                reason = _payload_summary(row.get("payload")) or ""
+                block_reasons[str(row.get("task_id"))] = reason
 
     slots: dict[str, str] = {}
     for row in tasks:
@@ -652,7 +702,13 @@ def _board_deals(
             }
         )
 
-    return {"slug": slug, "path": str(path), "deals": deals, "warnings": warnings, "truncated": len(tasks) >= DEAL_LIMIT}
+    return {
+        "slug": slug,
+        "path": str(path),
+        "deals": deals,
+        "warnings": warnings,
+        "truncated": len(tasks) >= DEAL_LIMIT,
+    }
 
 
 def collect_now(
@@ -714,6 +770,7 @@ def collect_now(
         "count": len(deals),
         "deals": deals,
         "by_state": by_state,
+        "crash_outcomes": list(CRASH_OUTCOMES),
         "boards": boards,
         "errors": errors,
     }
@@ -801,4 +858,11 @@ def duty_attempts(board: str, task_id: str) -> dict[str, Any]:
                 "events": events_by_run.get(int(run.get("id") or 0), []),
             }
         )
-    return {"board": board, "task_id": task_id, "title": tasks[0].get("title"), "count": len(attempts), "attempts": attempts}
+    return {
+        "board": board,
+        "task_id": task_id,
+        "title": tasks[0].get("title"),
+        "count": len(attempts),
+        "crash_outcomes": list(CRASH_OUTCOMES),
+        "attempts": attempts,
+    }

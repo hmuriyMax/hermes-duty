@@ -140,10 +140,15 @@ def make_board(home: Path, slug: str, schema: str = KANBAN_SCHEMA) -> Path:
 
 
 def make_pool(home: Path) -> Path:
+    """Пул вопросов по реальной схеме; повторный вызов не пересоздаёт таблицу."""
     path = home / "messaging" / "pool.db"
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
-    conn.executescript(POOL_SCHEMA)
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='questions'"
+    ).fetchone()
+    if not exists:
+        conn.executescript(POOL_SCHEMA)
     conn.commit()
     conn.close()
     return path
@@ -270,10 +275,15 @@ def absent_pid() -> int:
 
 @pytest.fixture()
 def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Корень Hermes для фикстуры: агрегатор читает его через HERMES_HOME."""
+    """Корень Hermes для фикстуры: агрегатор читает его через HERMES_HOME.
+
+    Пул вопросов создаётся по умолчанию (как в живом Hermes): отсутствие
+    `messaging/pool.db` — отдельный сценарий, его проверяют свои тесты.
+    """
     root = tmp_path / "hermes"
     root.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(root))
+    make_pool(root)
     return root
 
 
@@ -521,23 +531,23 @@ def test_broken_board_lands_in_errors_and_route_stays_200(home: Path, client: Te
 def test_wait_human_from_pool_question(home: Path) -> None:
     """Живой вопрос пула по делу → wait_human (id карточки в session_key и в тексте)."""
     conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_askcard", status="blocked", block_kind="needs_input", created_at=NOW - 900)
-    add_task(conn, "t_asktext", status="blocked", block_kind="needs_input", created_at=NOW - 800)
+    add_task(conn, "t_a5ca0001", status="blocked", block_kind="needs_input", created_at=NOW - 900)
+    add_task(conn, "t_a5ce0002", status="blocked", block_kind="needs_input", created_at=NOW - 800)
     conn.commit()
     conn.close()
 
     pool = sqlite3.connect(make_pool(home))
-    question_id = add_question(pool, session_key="t_askcard", origin="card", project="stack")
-    add_question(pool, session_key="agent:main:local:dm", origin="session", text="уточни t_asktext, пожалуйста")
-    add_question(pool, session_key="t_askcard", origin="card", status="answered", text="старый вопрос")
+    question_id = add_question(pool, session_key="t_a5ca0001", origin="card", project="stack")
+    add_question(pool, session_key="agent:main:local:dm", origin="session", text="уточни t_a5ce0002, пожалуйста")
+    add_question(pool, session_key="t_a5ca0001", origin="card", status="answered", text="старый вопрос")
     pool.commit()
     pool.close()
 
     deals = deals_by_id(plugin_api.collect_now(home, NOW))
 
-    assert deals["t_askcard"]["waiting"]["state"] == "wait_human"
-    assert f"#{question_id}" in deals["t_askcard"]["waiting"]["evidence"]
-    assert deals["t_asktext"]["waiting"]["state"] == "wait_human"
+    assert deals["t_a5ca0001"]["waiting"]["state"] == "wait_human"
+    assert f"#{question_id}" in deals["t_a5ca0001"]["waiting"]["evidence"]
+    assert deals["t_a5ce0002"]["waiting"]["state"] == "wait_human"
 
 
 def test_capability_block_wins_over_human_fallback(home: Path) -> None:
@@ -654,3 +664,135 @@ def test_sources_untouched_by_now(home: Path) -> None:
 
     assert before == after
     assert not list(home.rglob("*-wal")) and not list(home.rglob("*-journal"))
+
+
+def test_missing_pool_db_lands_in_errors_and_is_not_silent(
+    home: Path, client: TestClient
+) -> None:
+    """Нет `messaging/pool.db` → 200 + `errors` про пул, а не молчаливое «вопросов нет».
+
+    Иначе `wait_human` тихо не срабатывает: «вопросов нет» и «канал вопросов не
+    читается» неотличимы ни в API, ни в UI.
+    """
+    conn = sqlite3.connect(make_board(home, "stack"))
+    add_task(conn, "t_90b10001", status="blocked", block_kind="needs_input", created_at=NOW - 900)
+    conn.commit()
+    conn.close()
+    (home / "messaging" / "pool.db").unlink()
+
+    response = client.get("/now")
+
+    assert response.status_code == 200
+    body = response.json()
+    errors = {error["board"]: error["reason"] for error in body["errors"]}
+    assert "messaging/pool.db" in errors
+    assert "pool.db not found" in errors["messaging/pool.db"]
+    # Доска и её дело не теряются: роут не валится, срез на месте.
+    assert [deal["id"] for deal in body["deals"]] == ["t_90b10001"]
+    assert {board["slug"]: board["read"] for board in body["boards"]} == {"stack": True}
+    # Состояние остаётся wait_human, но evidence честно говорит, что факт не проверен.
+    waiting = body["deals"][0]["waiting"]
+    assert waiting["state"] == "wait_human"
+    assert "факт wait_human не проверен" in waiting["evidence"]
+
+
+def test_pool_db_that_is_not_a_database_is_reported(home: Path, client: TestClient) -> None:
+    """Файл `messaging/pool.db` есть, но не БД → причина называет пул, а не «вопросов нет»."""
+    conn = sqlite3.connect(make_board(home, "stack"))
+    add_task(conn, "t_90b10002", status="todo", created_at=NOW - 700)
+    conn.commit()
+    conn.close()
+    (home / "messaging" / "pool.db").write_bytes(b"not a database at all")
+
+    questions, err = plugin_api._pool_questions(home)
+
+    assert questions == {}
+    assert err is not None and "pool.db unreadable" in err
+    body = client.get("/now").json()
+    errors = {error["board"]: error["reason"] for error in body["errors"]}
+    assert "messaging/pool.db" in errors
+    assert "not a database" in errors["messaging/pool.db"]
+    assert [deal["id"] for deal in body["deals"]] == ["t_90b10002"]
+
+
+def test_pool_absent_question_is_checked_on_clean_pool(home: Path) -> None:
+    """Пустой, но читаемый пул — это именно «вопросов нет»: ошибки нет."""
+    conn = sqlite3.connect(make_board(home, "stack"))
+    add_task(conn, "t_90b10003", status="todo", created_at=NOW - 600)
+    conn.commit()
+    conn.close()
+
+    questions, err = plugin_api._pool_questions(home)
+    result = plugin_api.collect_now(home, NOW)
+
+    assert questions == {} and err is None
+    assert result["errors"] == []
+    assert "не проверен" not in result["deals"][0]["waiting"]["evidence"]
+
+
+def test_stale_running_run_with_dead_pid_is_dead_lease(home: Path) -> None:
+    """Старый ран остался `running` с мёртвым pid, новый уже стартовал → dead_lease.
+
+    Факты одного рана: статус берётся из той же попытки, что дала pid, иначе
+    `running` последнего рана склеивается со старым pid и правило не срабатывает.
+    """
+    pid = absent_pid()
+    conn = sqlite3.connect(make_board(home, "stack"))
+    add_task(conn, "t_5a1e0001", status="running", created_at=NOW - 900)
+    stale = add_run(
+        conn,
+        "t_5a1e0001",
+        status="running",
+        worker_pid=pid,
+        started_at=NOW - 800,
+        last_heartbeat_at=NOW - 700,
+        claim_expires=NOW + 600,
+    )
+    newer = add_run(
+        conn,
+        "t_5a1e0001",
+        status="released",
+        started_at=NOW - 400,
+        ended_at=NOW - 300,
+        outcome="reclaimed",
+    )
+    conn.execute(
+        "UPDATE tasks SET worker_pid=?, current_run_id=?, claim_expires=? WHERE id='t_5a1e0001'",
+        (pid, stale, NOW + 600),
+    )
+    conn.commit()
+    conn.close()
+
+    deal = deals_by_id(plugin_api.collect_now(home, NOW))["t_5a1e0001"]
+
+    # Последний ран — новый, но попытка и её факты — про старый незакрытый ран.
+    assert deal["last_run"]["run_id"] == newer
+    assert deal["attempt"]["run_id"] == stale
+    assert deal["attempt"]["pid_alive"] is False
+    assert deal["waiting"]["state"] == "dead_lease"
+    assert f"ран {stale} в статусе running" in deal["waiting"]["evidence"]
+
+
+def test_crash_outcomes_come_from_the_backend_constant(
+    home: Path, client: TestClient
+) -> None:
+    """Набор «падений» — один источник: бэкенд отдаёт его клиенту в `crash_outcomes`."""
+    conn = sqlite3.connect(make_board(home, "stack"))
+    add_task(conn, "t_c0de0001", status="ready", created_at=NOW - 100)
+    add_run(
+        conn,
+        "t_c0de0001",
+        status="crashed",
+        started_at=NOW - 90,
+        ended_at=NOW - 60,
+        outcome="crashed",
+    )
+    conn.commit()
+    conn.close()
+
+    assert list(plugin_api.CRASH_OUTCOMES) == ["crashed", "gave_up", "spawn_failed", "timed_out"]
+    now_body = client.get("/now").json()
+    assert now_body["crash_outcomes"] == list(plugin_api.CRASH_OUTCOMES)
+    assert [deal["last_run"]["outcome"] for deal in now_body["deals"]] == ["crashed"]
+    attempts = client.get("/duty/stack/t_c0de0001/attempts").json()
+    assert attempts["crash_outcomes"] == list(plugin_api.CRASH_OUTCOMES)

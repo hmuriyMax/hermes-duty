@@ -1,0 +1,218 @@
+"""Контракт формы P0-роутов: `/health`, `/sources`, `/board/{slug}/tasks`.
+
+Baseline — `fd6d102` (каркас + read-only `/health`): у `/health` 11 ключей,
+у `/sources` 19, у `/board/{slug}/tasks` 15 (см. `evidence.json` карточки
+`t_ed22e46e`). Здесь форма зафиксирована тестом, а не ручной сверкой: удаление
+или добавление любого ключа в этих ответах роняет тест.
+
+Источники — свои маленькие БД в `tmp_path` по реальной схеме, живые не читаются.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import sqlite3
+import sys
+from pathlib import Path
+from typing import Any
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+MODULE_PATH = Path(__file__).resolve().parents[1] / "dashboard" / "plugin_api.py"
+_SPEC = importlib.util.spec_from_file_location("hermes_duty_plugin_api_contract", MODULE_PATH)
+assert _SPEC is not None and _SPEC.loader is not None
+plugin_api = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = plugin_api
+_SPEC.loader.exec_module(plugin_api)
+
+# Колонки скопированы с живой `kanban.db` — ровно те, что читает P0-роут.
+BOARD_SCHEMA = """
+CREATE TABLE tasks (
+    id                   TEXT PRIMARY KEY,
+    title                TEXT NOT NULL,
+    body                 TEXT,
+    assignee             TEXT,
+    status               TEXT NOT NULL,
+    priority             INTEGER DEFAULT 0,
+    created_by           TEXT,
+    created_at           INTEGER NOT NULL,
+    started_at           INTEGER,
+    completed_at         INTEGER,
+    workspace_kind       TEXT NOT NULL DEFAULT 'scratch',
+    workspace_path       TEXT,
+    branch_name          TEXT,
+    project_id           TEXT,
+    claim_lock           TEXT,
+    claim_expires        INTEGER,
+    tenant               TEXT,
+    result               TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    worker_pid           INTEGER,
+    last_failure_error   TEXT,
+    max_runtime_seconds  INTEGER,
+    last_heartbeat_at    INTEGER,
+    current_run_id       INTEGER,
+    block_kind           TEXT,
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    merged_into          TEXT
+);
+"""
+
+POOL_SCHEMA = """
+CREATE TABLE questions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_key TEXT NOT NULL,
+  project TEXT,
+  text TEXT NOT NULL,
+  text_full TEXT,
+  origin TEXT,
+  options_json TEXT,
+  status TEXT NOT NULL DEFAULT 'pending'
+      CHECK (status IN ('pending','sent','answered','expired','pickup_gateway')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  sent_at TEXT,
+  answered_at TEXT,
+  answer TEXT,
+  timeout REAL,
+  critical INTEGER NOT NULL DEFAULT 0,
+  kind TEXT NOT NULL DEFAULT 'question',
+  link TEXT
+);
+"""
+
+# Эталон формы: пути ключей ответа (массивы — по первому элементу).
+HEALTH_KEYS = {
+    "ok",
+    "version",
+    "hermes_home",
+    "kanban",
+    "kanban.databases",
+    "kanban.readable",
+    "kanban.task_rows",
+    "pool",
+    "pool.present",
+    "pool.total",
+    "mode",
+}
+
+SOURCES_KEYS = {
+    "version",
+    "hermes_home",
+    "boards",
+    "boards[].slug",
+    "boards[].path",
+    "boards[].size_bytes",
+    "boards[].mtime",
+    "boards[].readable",
+    "boards[].tasks",
+    "boards[].blocked",
+    "boards[].running",
+    "pool",
+    "pool.path",
+    "pool.by_origin_status",
+    "pool.by_origin_status[].origin",
+    "pool.by_origin_status[].status",
+    "pool.by_origin_status[].n",
+    "pool.total",
+    "profiles",
+}
+
+BOARD_KEYS = {
+    "slug",
+    "path",
+    "count",
+    "tasks",
+    "tasks[].id",
+    "tasks[].title",
+    "tasks[].assignee",
+    "tasks[].status",
+    "tasks[].block_kind",
+    "tasks[].consecutive_failures",
+    "tasks[].worker_pid",
+    "tasks[].current_run_id",
+    "tasks[].created_at",
+    "tasks[].started_at",
+    "tasks[].completed_at",
+}
+
+
+def shape(obj: Any, prefix: str = "") -> set[str]:
+    """Пути ключей ответа: значение не важно, важна форма контракта."""
+    paths: set[str] = set()
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            paths.add(path)
+            paths |= shape(value, path)
+    elif isinstance(obj, list) and obj:
+        paths |= shape(obj[0], f"{prefix}[]")
+    return paths
+
+
+@pytest.fixture()
+def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    """Один фикстурный корень Hermes: доска `stack` с одним делом и пул с вопросом."""
+    home = tmp_path / "hermes"
+    board = home / "kanban" / "boards" / "stack" / "kanban.db"
+    board.parent.mkdir(parents=True)
+    conn = sqlite3.connect(board)
+    conn.executescript(BOARD_SCHEMA)
+    conn.execute(
+        "INSERT INTO tasks (id, title, assignee, status, created_at, block_kind) "
+        "VALUES ('t_c0d7ac01', 'дело для контракта', 'implementer', 'blocked', 1793630000, "
+        "'needs_input')"
+    )
+    conn.commit()
+    conn.close()
+
+    pool = home / "messaging" / "pool.db"
+    pool.parent.mkdir()
+    conn = sqlite3.connect(pool)
+    conn.executescript(POOL_SCHEMA)
+    conn.execute(
+        "INSERT INTO questions (session_key, text, origin, status) "
+        "VALUES ('t_c0d7ac01', 'вопрос для контракта', 'card', 'sent')"
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    app = FastAPI()
+    app.include_router(plugin_api.router)
+    return TestClient(app)
+
+
+def test_health_shape_matches_baseline(client: TestClient) -> None:
+    """`/health` — 11 ключей, как в baseline `fd6d102`."""
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    keys = shape(response.json())
+    assert len(keys) == 11
+    assert keys == HEALTH_KEYS
+
+
+def test_sources_shape_matches_baseline(client: TestClient) -> None:
+    """`/sources` — 19 ключей, как в baseline `fd6d102`."""
+    response = client.get("/sources")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["pool"] is not None
+    keys = shape(body)
+    assert len(keys) == 19
+    assert keys == SOURCES_KEYS
+
+
+def test_board_tasks_shape_matches_baseline(client: TestClient) -> None:
+    """`/board/{slug}/tasks` — 15 ключей, как в baseline `fd6d102`."""
+    response = client.get("/board/stack/tasks")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["count"] == 1
+    keys = shape(body)
+    assert len(keys) == 15
+    assert keys == BOARD_KEYS

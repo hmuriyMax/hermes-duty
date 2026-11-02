@@ -29,8 +29,11 @@ Duty выводит состояние из журнала (`state = fold(events
     manifest.json        # манифест dashboard-половины (api: plugin_api.py)
     plugin_api.py        # backend-роутер (FastAPI), ТОЛЬКО чтение
     web/                 # статическая страница консоли (v0.1)
-  desktop/plugin.js      # страница /duty + пункт сайдбара (v0.1)
+  desktop/
+    plugin.js            # страница /duty + пункт сайдбара (v0.1)
+    model.js             # шейпер ответов /now и /attempts (чистые функции)
   bin/duty               # CLI канон (v0.2)
+  bin/duty-model-sync    # вшить model.js в plugin.js (загрузчик не резолвит ./)
   docs/DESIGN.md         # контракт P0: источники, схема чтения, экраны
   tests/                 # регрессия на фикстурах, не на живых БД
 ```
@@ -59,5 +62,8 @@ hermes plugins enable hermes-duty     # или Settings → Plugins в деск�
 
 ## Статус
 
-`v0.0.1` — P0 скелет: репозиторий, манифест, backend с `/health` и read-only
-источниками. Сбор событий и экран «сейчас» — следующие шаги в `docs/DESIGN.md`.
+`v0.0.1` — P0: репозиторий, манифест, backend с `/health` и read-only
+источниками, агрегатор `GET /now` с таксономией ожиданий, таймлайн попыток
+`GET /duty/{board}/{id}/attempts` и desktop-страница `/duty` поверх них.
+Живой рендер страницы смотрится в приложении после `Reload desktop plugins`;
+регрессия шейпера — `node --test tests/model.test.mjs`.

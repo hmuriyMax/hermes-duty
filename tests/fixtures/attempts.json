@@ -1,0 +1,54 @@
+{
+  "board": "hermes-tickets",
+  "task_id": "t_a1b2c3d4",
+  "title": "IMPL: страница /duty — экран «сейчас» и таймлайн попыток",
+  "count": 3,
+  "attempts": [
+    {
+      "run_id": 12,
+      "profile": "implementer",
+      "status": "failed",
+      "start": 1793630400,
+      "end": 1793630412,
+      "duration_sec": 12,
+      "outcome": "spawn_failed",
+      "error": "spawn: worker profile 'implementer' is already running a task (t_w0rk0001)",
+      "summary": null,
+      "events": [
+        { "kind": "claimed", "at": 1793630401, "summary": null },
+        { "kind": "failed", "at": 1793630412, "summary": "spawn: profile busy" }
+      ]
+    },
+    {
+      "run_id": 13,
+      "profile": "implementer",
+      "status": "failed",
+      "start": 1793630600,
+      "end": 1793631200,
+      "duration_sec": 600,
+      "outcome": "crashed",
+      "error": "panic: runtime error: invalid memory address or nil pointer dereference",
+      "summary": "упал на чтении истории",
+      "events": [
+        { "kind": "claimed", "at": 1793630601, "summary": null },
+        { "kind": "tool_call", "at": 1793630800, "summary": "go test ./..." },
+        { "kind": "crashed", "at": 1793631200, "summary": "panic: nil pointer dereference" }
+      ]
+    },
+    {
+      "run_id": 14,
+      "profile": "implementer",
+      "status": "running",
+      "start": 1793636880,
+      "end": null,
+      "duration_sec": 120,
+      "outcome": null,
+      "error": null,
+      "summary": null,
+      "events": [
+        { "kind": "claimed", "at": 1793636881, "summary": null },
+        { "kind": "blocked", "at": 1793636900, "summary": "нужен ответ: какой формат отчёта ждёт ревьюер" }
+      ]
+    }
+  ]
+}

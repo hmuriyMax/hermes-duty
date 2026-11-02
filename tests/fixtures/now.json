@@ -1,0 +1,324 @@
+{
+  "now": 1793637000,
+  "count": 7,
+  "deals": [
+    {
+      "board": "hermes-tickets",
+      "id": "t_a1b2c3d4",
+      "title": "IMPL: страница /duty — экран «сейчас» и таймлайн попыток с длинным заголовком, который обязан обрезаться многоточием в строке таблицы",
+      "assignee": "implementer",
+      "status": "blocked",
+      "priority": 3,
+      "consecutive_failures": 0,
+      "created_at": 1793630000,
+      "workspace_kind": "scratch",
+      "attempt": {
+        "run_id": 41,
+        "start": 1793635000,
+        "age_sec": 2000,
+        "pid": 50123,
+        "pid_alive": true,
+        "heartbeat_age_sec": 45,
+        "run_status": "running"
+      },
+      "lease": {
+        "claim_lock": "mbp-mshchemilkin:92226",
+        "expires_at": 1793638000,
+        "expires_in_sec": 1000,
+        "state": "live"
+      },
+      "last_action": {
+        "kind": "blocked",
+        "at": 1793636900,
+        "age_sec": 100,
+        "summary": "нужен ответ: какой формат отчёта ждёт ревьюер"
+      },
+      "last_run": {
+        "run_id": 41,
+        "status": "running",
+        "outcome": null,
+        "started_at": 1793635000,
+        "ended_at": null
+      },
+      "waiting": {
+        "state": "wait_human",
+        "evidence": "в пуле вопрос #421 status='sent' origin='card'; ещё: working: ран 41 running, pid 50123 жив, heartbeat 45с назад"
+      }
+    },
+    {
+      "board": "ozon",
+      "id": "t_ca900001",
+      "title": "DEPS: поднять realtime-config-go до v1.18 в qaravai",
+      "assignee": "implementer",
+      "status": "blocked",
+      "priority": 2,
+      "consecutive_failures": 0,
+      "created_at": 1793631100,
+      "workspace_kind": "worktree",
+      "attempt": null,
+      "lease": {
+        "claim_lock": null,
+        "expires_at": null,
+        "expires_in_sec": null,
+        "state": "none"
+      },
+      "last_action": {
+        "kind": "blocked",
+        "at": 1793634000,
+        "age_sec": 3000,
+        "summary": "нет доступа к staging-кластеру: просим токен"
+      },
+      "last_run": null,
+      "waiting": {
+        "state": "capability",
+        "evidence": "status=blocked, block_kind=capability: нет доступа к staging-кластеру"
+      }
+    },
+    {
+      "board": "hermes-duty",
+      "id": "t_dead0001",
+      "title": "PUBLISH: выкатить release/v0.0.1 в main",
+      "assignee": "publisher",
+      "status": "running",
+      "priority": 1,
+      "consecutive_failures": 0,
+      "created_at": 1793632000,
+      "workspace_kind": "dir",
+      "attempt": {
+        "run_id": 52,
+        "start": 1793633280,
+        "age_sec": 3720,
+        "pid": 777,
+        "pid_alive": false,
+        "heartbeat_age_sec": 5400,
+        "run_status": "running"
+      },
+      "lease": {
+        "claim_lock": "mbp-mshchemilkin:92226",
+        "expires_at": 1793636580,
+        "expires_in_sec": -420,
+        "state": "expired"
+      },
+      "last_action": {
+        "kind": "heartbeat",
+        "at": 1793631600,
+        "age_sec": 5400,
+        "summary": null
+      },
+      "last_run": {
+        "run_id": 52,
+        "status": "running",
+        "outcome": null,
+        "started_at": 1793633280,
+        "ended_at": null
+      },
+      "waiting": {
+        "state": "dead_lease",
+        "evidence": "ран 52 в статусе running, а pid 777 мёртв (лизинг expired)"
+      }
+    },
+    {
+      "board": "ozon",
+      "id": "t_cra5h001",
+      "title": "FIX: flaky-тест TestAggregateNow в pinned-review-service",
+      "assignee": "tester",
+      "status": "running",
+      "priority": 4,
+      "consecutive_failures": 3,
+      "created_at": 1793625000,
+      "workspace_kind": "worktree",
+      "attempt": {
+        "run_id": 60,
+        "start": 1793636100,
+        "age_sec": 900,
+        "pid": 8891,
+        "pid_alive": true,
+        "heartbeat_age_sec": 900,
+        "run_status": "running"
+      },
+      "lease": {
+        "claim_lock": "mbp-mshchemilkin:92226",
+        "expires_at": 1793637300,
+        "expires_in_sec": 300,
+        "state": "live"
+      },
+      "last_action": {
+        "kind": "failed",
+        "at": 1793636400,
+        "age_sec": 600,
+        "summary": "go test: 1 failing test"
+      },
+      "last_run": {
+        "run_id": 59,
+        "status": "failed",
+        "outcome": "crashed",
+        "started_at": 1793634000,
+        "ended_at": 1793635800
+      },
+      "waiting": {
+        "state": "crashed",
+        "evidence": "consecutive_failures=3; последний ран 59: outcome=crashed; ран 60 running, pid 8891 жив, heartbeat 900с назад"
+      }
+    },
+    {
+      "board": "hermes-tickets",
+      "id": "t_w0rk0001",
+      "title": "IMPL: правая панель тикета — контекст Jira",
+      "assignee": "implementer",
+      "status": "running",
+      "priority": 2,
+      "consecutive_failures": 0,
+      "created_at": 1793636500,
+      "workspace_kind": "worktree",
+      "attempt": {
+        "run_id": 70,
+        "start": 1793636820,
+        "age_sec": 180,
+        "pid": 4111,
+        "pid_alive": true,
+        "heartbeat_age_sec": 12,
+        "run_status": "running"
+      },
+      "lease": {
+        "claim_lock": "mbp-mshchemilkin:92226",
+        "expires_at": 1793637120,
+        "expires_in_sec": 120,
+        "state": "live"
+      },
+      "last_action": {
+        "kind": "tool_call",
+        "at": 1793636990,
+        "age_sec": 10,
+        "summary": "go_test: ok"
+      },
+      "last_run": {
+        "run_id": 70,
+        "status": "running",
+        "outcome": null,
+        "started_at": 1793636820,
+        "ended_at": null
+      },
+      "waiting": {
+        "state": "working",
+        "evidence": "ран 70 running, pid 4111 жив, heartbeat 12с назад"
+      }
+    },
+    {
+      "board": "default",
+      "id": "t_51070001",
+      "title": "RESEARCH: сравнить два подхода к хранению журнала дел",
+      "assignee": "researcher",
+      "status": "ready",
+      "priority": 5,
+      "consecutive_failures": 0,
+      "created_at": 1793639000,
+      "workspace_kind": "scratch",
+      "attempt": null,
+      "lease": {
+        "claim_lock": null,
+        "expires_at": null,
+        "expires_in_sec": null,
+        "state": "none"
+      },
+      "last_action": {
+        "kind": "created",
+        "at": 1793639000,
+        "age_sec": -2000,
+        "summary": null
+      },
+      "last_run": null,
+      "waiting": {
+        "state": "wait_slot",
+        "evidence": "status=ready, профиль researcher занят делом t_w0rk0001 (running)"
+      }
+    },
+    {
+      "board": "hermes-duty",
+      "id": "t_6a7e0001",
+      "title": "IMPL: экран «почему стоит» — группировка по состояниям",
+      "assignee": "implementer",
+      "status": "todo",
+      "priority": 6,
+      "consecutive_failures": 0,
+      "created_at": 1793638000,
+      "workspace_kind": "scratch",
+      "attempt": null,
+      "lease": {
+        "claim_lock": null,
+        "expires_at": null,
+        "expires_in_sec": null,
+        "state": "none"
+      },
+      "last_action": {
+        "kind": null,
+        "at": null,
+        "age_sec": null,
+        "summary": null
+      },
+      "last_run": null,
+      "waiting": {
+        "state": "wait_gate",
+        "evidence": "незавершённые родители: t_d0d7e8bc (running)"
+      }
+    }
+  ],
+  "by_state": {
+    "wait_human": 1,
+    "capability": 1,
+    "dead_lease": 1,
+    "crashed": 1,
+    "working": 1,
+    "wait_slot": 1,
+    "wait_gate": 1
+  },
+  "boards": [
+    {
+      "slug": "hermes-tickets",
+      "path": "/Users/example/.hermes/kanban/boards/hermes-tickets/kanban.db",
+      "read": true,
+      "deals": 2,
+      "truncated": false,
+      "warnings": []
+    },
+    {
+      "slug": "ozon",
+      "path": "/Users/example/.hermes/kanban/boards/ozon/kanban.db",
+      "read": true,
+      "deals": 2,
+      "truncated": false,
+      "warnings": ["task_events: no such column: run_id"]
+    },
+    {
+      "slug": "hermes-duty",
+      "path": "/Users/example/.hermes/kanban/boards/hermes-duty/kanban.db",
+      "read": true,
+      "deals": 2,
+      "truncated": false,
+      "warnings": []
+    },
+    {
+      "slug": "default",
+      "path": "/Users/example/.hermes/kanban.db",
+      "read": true,
+      "deals": 1,
+      "truncated": false,
+      "warnings": []
+    },
+    {
+      "slug": "ozon-legacy",
+      "path": "/Users/example/.hermes/kanban/boards/ozon-legacy/kanban.db",
+      "read": false,
+      "deals": 0
+    }
+  ],
+  "errors": [
+    {
+      "board": "ozon-legacy",
+      "reason": "unable to open database file"
+    },
+    {
+      "board": "messaging/pool.db",
+      "reason": "no such table: questions"
+    }
+  ]
+}

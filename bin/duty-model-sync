@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Вшить шейпер `desktop/model.js` в `desktop/plugin.js` между маркерами.
+
+    bin/duty-model-sync          # переписать вшитый блок
+    bin/duty-model-sync --check  # только проверить, что блок совпадает (0/1)
+
+Загрузчик десктопных плагинов исполняет `plugin.js` как blob-модуль и отказывает
+любому импорту вне `@hermes/plugin-sdk` / `react*` — относительный `./model.js`
+там не резолвится, плагин целиком не загрузился бы. Поэтому единственным
+источником остаётся `model.js`, а его тело (всё до строки `export {`) дословно
+живёт в `plugin.js` между `// duty:model-start` и `// duty:model-end`.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+MODEL = ROOT / "desktop" / "model.js"
+PLUGIN = ROOT / "desktop" / "plugin.js"
+
+START = "// duty:model-start"
+END = "// duty:model-end"
+
+
+def body() -> list[str]:
+    """Тело model.js без блока экспортов — то, что вшивается в plugin.js."""
+    text = MODEL.read_text(encoding="utf-8")
+    cut = text.rfind("\nexport {")
+    if cut < 0:
+        raise SystemExit(f"{MODEL}: no `export {{` block found")
+    return text[:cut].rstrip("\n").split("\n")
+
+
+def splice(current: str, lines: list[str]) -> str:
+    rows = current.split("\n")
+    try:
+        head = next(i for i, row in enumerate(rows) if row.startswith(START))
+        tail = next(i for i, row in enumerate(rows) if row.startswith(END))
+    except StopIteration:
+        raise SystemExit(f"{PLUGIN}: markers {START!r}/{END!r} not found") from None
+    if tail <= head:
+        raise SystemExit(f"{PLUGIN}: {END!r} before {START!r}")
+    return "\n".join(rows[: head + 1] + lines + rows[tail:])
+
+
+def main(argv: list[str]) -> int:
+    current = PLUGIN.read_text(encoding="utf-8")
+    want = splice(current, body())
+    if "--check" in argv[1:]:
+        if current != want:
+            print(f"DRIFT: {PLUGIN} inlined model is stale, run bin/duty-model-sync", file=sys.stderr)
+            return 1
+        print("OK: inlined model matches desktop/model.js")
+        return 0
+    if current == want:
+        print("OK: nothing to do")
+        return 0
+    PLUGIN.write_text(want, encoding="utf-8")
+    print(f"synced: {PLUGIN} <- {MODEL}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

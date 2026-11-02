@@ -1,0 +1,15 @@
+name: hermes-duty
+version: "0.1.0"
+manifest_version: 2
+description: >-
+  Hermes Duty — «дело» вместо карточки: этапы, попытки, доказательства и вопросы.
+  P0 — read-only наблюдаемость: лизинги и события из живых источников, экран
+  «кто держит задачу и что делает прямо сейчас». Не трогает ядро kanban и не
+  пишет в существующие БД.
+author: "mshchemilkin"
+kind: standalone
+license: MIT
+tags: [orchestration, observability, desktop, duty]
+provides_tools: []
+provides_hooks: []
+requires_env: []

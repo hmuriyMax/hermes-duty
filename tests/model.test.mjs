@@ -14,7 +14,7 @@ import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 
 import {
-  WAITING_ORDER,
+  STATE_META,
   filterNow,
   fmtAge,
   fmtTitle,
@@ -25,6 +25,10 @@ import {
   stateMeta,
 } from '../desktop/model.js'
 
+// Ожидаемый порядок приоритета — это ожидание теста к ответу бэкенда
+// (WAITING_PRIORITY в dashboard/plugin_api.py), а не константа страницы.
+const PRIORITY = ['wait_human', 'capability', 'dead_lease', 'crashed', 'working', 'wait_slot', 'wait_gate']
+
 const nowPayload = JSON.parse(readFileSync(new URL('./fixtures/now.json', import.meta.url), 'utf8'))
 const attemptsPayload = JSON.parse(readFileSync(new URL('./fixtures/attempts.json', import.meta.url), 'utf8'))
 const modelSource = readFileSync(new URL('../desktop/model.js', import.meta.url), 'utf8')
@@ -32,17 +36,19 @@ const pluginSource = readFileSync(new URL('../desktop/plugin.js', import.meta.ur
 
 const model = shapeNow(nowPayload)
 
-test('порядок групп — приоритет бэкенда, по одной группе на состояние', () => {
+test('порядок групп — приоритет ответа бэкенда, по одной группе на состояние', () => {
   assert.deepEqual(
     model.groups.map((group) => group.state),
-    WAITING_ORDER,
+    PRIORITY,
   )
   assert.deepEqual(
     model.groups.map((group) => group.count),
     [1, 1, 1, 1, 1, 1, 1],
   )
-  assert.deepEqual(Object.keys(model.byState).sort(), [...WAITING_ORDER].sort())
+  assert.deepEqual(Object.keys(model.byState).sort(), [...PRIORITY].sort())
   assert.equal(model.count, 7)
+  // чипы фильтра перечисляют те же состояния в том же порядке — только подписи, без правил
+  assert.deepEqual(Object.keys(STATE_META), PRIORITY)
 })
 
 test('у каждой группы порядок строк не пересортировывается', () => {
@@ -58,7 +64,19 @@ test('у каждой группы порядок строк не пересор
   )
 })
 
-test('незнакомое состояние — последней группой, без переклассификации', () => {
+test('страница не навязывает свой порядок: группы идут за ответом', () => {
+  // обратный порядок состояний — единственный источник приоритета это бэкенд
+  const groups = groupDeals([
+    shapeDeal({ board: 'b', id: 't_1', waiting: { state: 'wait_gate' } }),
+    shapeDeal({ board: 'b', id: 't_2', waiting: { state: 'wait_human' } }),
+  ])
+  assert.deepEqual(
+    groups.map((group) => group.state),
+    ['wait_gate', 'wait_human'],
+  )
+})
+
+test('незнакомое состояние — своей группой, без переклассификации', () => {
   const groups = groupDeals([
     shapeDeal({ board: 'b', id: 't_1', waiting: { state: 'working' } }),
     shapeDeal({ board: 'b', id: 't_2', waiting: { state: 'quantum' } }),

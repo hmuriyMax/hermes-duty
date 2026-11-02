@@ -1,12 +1,13 @@
 /**
  * Hermes Duty — шейпер данных страницы /duty (чистые функции, без React и DOM).
  *
- * Здесь НЕТ классификации состояний: единственный источник таксономии — бэкенд
- * (`WAITING_PRIORITY` и `waiting.state` в `dashboard/plugin_api.py`). Модуль
- * только раскладывает готовый ответ `/now` по группам в порядке приоритета и
- * форматирует числа для показа. `WAITING_ORDER` ниже — порядок отрисовки, а не
- * правило вывода состояния: неизвестное состояние не «доразбирается», а
- * показывается последней группой со своим именем.
+ * Здесь НЕТ классификации состояний и нет копии приоритета бэкенда: единственный
+ * источник таксономии — `dashboard/plugin_api.py` (`WAITING_PRIORITY`,
+ * `waiting.state`). `/now` уже отдаёт дела отсортированными по приоритету, поэтому
+ * группы строятся в порядке первого появления состояния в ответе — страница
+ * ничего не пересортировывает и не выводит состояние из фактов. `STATE_META`
+ * ниже — только подписи и цвета бейджей для известных состояний; незнакомое
+ * состояние рисуется своим именем серым.
  *
  * ВАЖНО: этот файл не импортируется из `desktop/plugin.js`. Загрузчик
  * десктопных плагинов исполняет `plugin.js` как blob-модуль и отказывает любому
@@ -16,18 +17,8 @@
  * `bin/duty-model-sync`, расхождение ловит `tests/model.test.mjs`.
  */
 
-// Порядок приоритета ожиданий — копия WAITING_PRIORITY бэкенда, только для отрисовки.
-const WAITING_ORDER = [
-  'wait_human',
-  'capability',
-  'dead_lease',
-  'crashed',
-  'working',
-  'wait_slot',
-  'wait_gate',
-]
-
-// Подпись и тон бейджа по состоянию. Тон — ключ палитры TONE_COLOR, не css.
+// Подпись и тон бейджа по состоянию; порядок ключей — порядок чипов в фильтре.
+// Тон — ключ палитры TONE_COLOR, не css.
 const STATE_META = {
   wait_human: { label: 'ждёт человека', tone: 'yellow' },
   capability: { label: 'нужен доступ', tone: 'purple' },
@@ -147,32 +138,24 @@ function shapeDeal(deal) {
   }
 }
 
-/** Группы строк по `waiting.state`: сначала WAITING_ORDER, затем незнакомые состояния. */
+/**
+ * Группы строк по `waiting.state` — в порядке первого появления в ответе.
+ *
+ * `/now` сортирует дела по `WAITING_PRIORITY` бэкенда, поэтому порядок групп
+ * получается приоритетным без второго списка приоритетов в UI; строки внутри
+ * группы сохраняют порядок ответа.
+ */
 function groupDeals(deals) {
-  const buckets = new Map(WAITING_ORDER.map((state) => [state, []]))
-  const unknown = []
+  const buckets = new Map()
   for (const deal of deals) {
-    if (buckets.has(deal.state)) {
-      buckets.get(deal.state).push(deal)
-      continue
-    }
-    let bucket = unknown.find((group) => group.state === deal.state)
-    if (!bucket) {
-      bucket = { state: deal.state || '—', deals: [] }
-      unknown.push(bucket)
-    }
-    bucket.deals.push(deal)
+    const state = deal.state || '—'
+    if (!buckets.has(state)) buckets.set(state, [])
+    buckets.get(state).push(deal)
   }
   const groups = []
-  for (const state of WAITING_ORDER) {
-    const rows = buckets.get(state)
-    if (!rows.length) continue
+  for (const [state, rows] of buckets) {
     const meta = stateMeta(state)
     groups.push({ state, label: meta.label, tone: meta.tone, count: rows.length, deals: rows })
-  }
-  for (const bucket of unknown) {
-    const meta = stateMeta(bucket.state)
-    groups.push({ state: bucket.state, label: meta.label, tone: meta.tone, count: bucket.deals.length, deals: bucket.deals })
   }
   return groups
 }
@@ -293,7 +276,6 @@ function shapeAttempts(payload) {
 }
 
 export {
-  WAITING_ORDER,
   STATE_META,
   TONE_COLOR,
   stateMeta,

@@ -393,6 +393,73 @@ def test_running_with_live_pid_and_stale_heartbeat_is_crashed(home: Path) -> Non
     assert "heartbeat 900с назад" in deal["waiting"]["evidence"]
 
 
+def test_crashed_with_unknown_pid_state_does_not_call_pid_alive(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`crashed` при `pid_alive=None`: pid записан, но жив ли он — неизвестно.
+
+    Раньше ветка `crashed` печатала «pid 50124 жив» безусловно, хотя `os.kill`
+    вернул прочий `OSError` (например `EPERM`) и ответа о живости не было.
+    """
+    conn = sqlite3.connect(make_board(home, "stack"))
+    add_task(conn, "t_0c0a0001", status="running", created_at=NOW - 2000)
+    run_id = add_run(
+        conn,
+        "t_0c0a0001",
+        status="running",
+        worker_pid=50124,
+        started_at=NOW - 1800,
+        last_heartbeat_at=NOW - 900,
+        claim_expires=NOW + 600,
+    )
+    conn.execute(
+        "UPDATE tasks SET worker_pid=50124, current_run_id=?, claim_expires=?, "
+        "last_heartbeat_at=? WHERE id='t_0c0a0001'",
+        (run_id, NOW + 600, NOW - 900),
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(plugin_api, "_pid_alive", lambda pid: None)
+
+    deal = deals_by_id(plugin_api.collect_now(home, NOW))["t_0c0a0001"]
+
+    assert deal["attempt"]["pid_alive"] is None
+    assert deal["waiting"]["state"] == "crashed"
+    assert "состояние pid 50124 неизвестно" in deal["waiting"]["evidence"]
+    assert "жив" not in deal["waiting"]["evidence"]
+
+
+def test_crashed_without_recorded_pid_says_not_recorded(home: Path) -> None:
+    """`crashed` при пустом `worker_pid`: «pid не записан», а не «pid None жив»."""
+    conn = sqlite3.connect(make_board(home, "stack"))
+    add_task(conn, "t_0c0a0002", status="running", created_at=NOW - 2000)
+    run_id = add_run(
+        conn,
+        "t_0c0a0002",
+        status="running",
+        started_at=NOW - 1800,
+        last_heartbeat_at=NOW - 900,
+        claim_expires=NOW + 600,
+    )
+    conn.execute(
+        "UPDATE tasks SET current_run_id=?, claim_expires=?, last_heartbeat_at=? "
+        "WHERE id='t_0c0a0002'",
+        (run_id, NOW + 600, NOW - 900),
+    )
+    conn.commit()
+    conn.close()
+
+    deal = deals_by_id(plugin_api.collect_now(home, NOW))["t_0c0a0002"]
+
+    assert deal["attempt"]["pid"] is None
+    assert deal["attempt"]["pid_alive"] is None
+    assert deal["waiting"]["state"] == "crashed"
+    assert "pid не записан" in deal["waiting"]["evidence"]
+    assert "жив" not in deal["waiting"]["evidence"]
+    assert "None" not in deal["waiting"]["evidence"]
+
+
 def test_consecutive_failures_is_crashed_with_evidence(home: Path) -> None:
     """Счётчик отказов 2 — падение, даже если карточка уже вернулась в очередь."""
     conn = sqlite3.connect(make_board(home, "stack"))
@@ -834,6 +901,38 @@ def test_pid_state_unknown_is_not_reported_as_missing(
     assert deal["waiting"]["state"] == "working"
     assert "состояние pid 50123 неизвестно" in deal["waiting"]["evidence"]
     assert "не записан" not in deal["waiting"]["evidence"]
+
+
+def test_working_without_recorded_pid_does_not_leak_none(home: Path) -> None:
+    """`working` при пустом `worker_pid`: «pid не записан», без «pid None неизвестно».
+
+    Раньше ветка `working` печатала `состояние pid None неизвестно`: и `None` в
+    тексте, и неверная формулировка — pid не «неизвестен», его не записали.
+    """
+    conn = sqlite3.connect(make_board(home, "stack"))
+    add_task(conn, "t_0c0a0003", status="running", created_at=NOW - 700)
+    run_id = add_run(
+        conn,
+        "t_0c0a0003",
+        status="running",
+        started_at=NOW - 600,
+        last_heartbeat_at=NOW - 20,
+        claim_expires=NOW + 600,
+    )
+    conn.execute(
+        "UPDATE tasks SET current_run_id=?, claim_expires=?, last_heartbeat_at=? "
+        "WHERE id='t_0c0a0003'",
+        (run_id, NOW + 600, NOW - 20),
+    )
+    conn.commit()
+    conn.close()
+
+    deal = deals_by_id(plugin_api.collect_now(home, NOW))["t_0c0a0003"]
+
+    assert deal["attempt"]["pid"] is None
+    assert deal["waiting"]["state"] == "working"
+    assert "pid не записан" in deal["waiting"]["evidence"]
+    assert "None" not in deal["waiting"]["evidence"]
 
 
 def test_running_without_any_live_signal_is_no_signal(home: Path, client: TestClient) -> None:

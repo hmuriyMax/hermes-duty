@@ -42,7 +42,7 @@ Hermes Desktop → пункт сайдбара **«Дела»** (или путь
 ## 3. Дёрнуть роуты через TestClient
 
 Без десктопа и без живого сервера: роутер монтируется в тестовое приложение.
-Сниппет проверялся на `release/v0.0.1` (`8618ce7`).
+Сниппет проверялся на `release/v0.0.1` (`d76e30a`) интерпретатором `~/.hermes/bvenv/bin/python`.
 
 ```python
 import importlib.util
@@ -109,7 +109,7 @@ if now["deals"]:
 
 ```bash
 cd ~/.hermes/plugins/hermes-duty
-~/.hermes/bvenv/bin/python -m pytest -q      # 27 passed
+~/.hermes/bvenv/bin/python -m pytest -q      # 30 passed
 ```
 
 `python3 -m pytest` из системы падает с `No module named pytest` — это окружение,

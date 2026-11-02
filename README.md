@@ -95,7 +95,7 @@ hermes plugins enable hermes-duty     # или Capabilities → Plugins в де�
 Из каталога плагина (`cd ~/.hermes/plugins/hermes-duty`):
 
 ```bash
-~/.hermes/bvenv/bin/python -m pytest -q     # 27 passed
+~/.hermes/bvenv/bin/python -m pytest -q     # 30 passed
 node --test tests/model.test.mjs            # 23 pass
 bin/duty-version check                      # OK
 ```
@@ -109,7 +109,7 @@ bin/duty-version check                      # OK
 `/health`, `/sources`, `/board/{slug}/tasks` на read-only источниках, агрегатор
 `GET /now` с таксономией ожиданий и фильтрами, таймлайн попыток
 `GET /duty/{board}/{id}/attempts`, desktop-страница `/duty` поверх них, регрессия
-(27 pytest + 23 node) и документация.
+(30 pytest + 23 node) и документация.
 
 Дальше (не сделано): экраны «Почему стоит» и «Здоровье», CLI `bin/duty`, затем
 P1 — собственный журнал плагина вместо чтения kanban. План по версиям —

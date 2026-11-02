@@ -362,6 +362,20 @@ def _pid_alive(pid: Optional[int]) -> Optional[bool]:
     return True
 
 
+def _pid_text(pid: Optional[int], pid_alive: Optional[bool]) -> str:
+    """Текст про pid ровно по тому, что известно: жив / состояние неизвестно / не записан.
+
+    Одна формулировка на все ветки: иначе копии в `crashed` и `working` разъезжаются
+    и одна из них называет «живым» то, чего не проверяла. `pid_alive=False` сюда не
+    доходит: обе ветки отсекают мёртвый pid раньше — это отдельный факт `dead_lease`.
+    """
+    if not pid:
+        return "pid не записан"
+    if pid_alive is True:
+        return f"pid {pid} жив"
+    return f"состояние pid {pid} неизвестно"
+
+
 def _payload_summary(payload: Optional[str]) -> Optional[str]:
     """Короткая выжимка payload'а события: сначала известные ключи, потом JSON целиком."""
     if not payload:
@@ -553,22 +567,18 @@ def _waiting(
     stale_heartbeat = (heartbeat_age or 0) > HEARTBEAT_FRESH_SEC
     if run_status == "running" and pid_alive is not False and stale_heartbeat:
         crash_bits.append(
-            f"ран {run_id} running, pid {pid} жив, heartbeat {heartbeat_age}с назад"
+            f"ран {run_id} running, {_pid_text(pid, pid_alive)}, heartbeat {heartbeat_age}с назад"
         )
     if crash_bits:
         facts["crashed"] = "; ".join(crash_bits)
 
     # 5. Живая работа: ран идёт, pid не мёртв, heartbeat свежий. Факт про pid
-    #    называет ровно то, что известно: жив / мёртв / состояние неизвестно
-    #    (`os.kill` вернул прочий OSError) — «не записан» тут было бы неправдой.
+    #    называет ровно то, что известно: жив / состояние неизвестно (`os.kill`
+    #    вернул прочий OSError) / не записан — формулировка одна на обе ветки.
     fresh_heartbeat = heartbeat_age is not None and heartbeat_age <= HEARTBEAT_FRESH_SEC
     if run_status == "running" and pid_alive is not False and fresh_heartbeat:
-        if pid_alive is True:
-            pid_text = f"pid {pid} жив"
-        else:
-            pid_text = f"состояние pid {pid} неизвестно"
         facts["working"] = (
-            f"ран {run_id} running, {pid_text}, heartbeat {heartbeat_age}с назад"
+            f"ран {run_id} running, {_pid_text(pid, pid_alive)}, heartbeat {heartbeat_age}с назад"
         )
 
     # 6. Очередь на занятый профиль.

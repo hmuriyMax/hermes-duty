@@ -29,7 +29,20 @@ from fastapi import APIRouter, HTTPException
 
 router = APIRouter()
 
-VERSION = "0.1.0"
+
+def _plugin_version() -> str:
+    """Номер версии — один источник (plugin.yaml), а не четвёртая копия в коде."""
+    meta = Path(__file__).resolve().parent.parent / "plugin.yaml"
+    try:
+        for line in meta.read_text().splitlines():
+            if line.startswith("version:"):
+                return line.split(":", 1)[1].strip().strip('"\'')
+    except OSError:
+        pass
+    return "0.0.0"
+
+
+VERSION = _plugin_version()
 
 
 def _hermes_home() -> Path:

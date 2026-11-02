@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""Версии hermes-duty: проверка, бамп и финализация по контракту docs/VERSIONING.md.
+
+    bin/duty-version check                 # три файла совпадают, ветка соответствует номеру
+    bin/duty-version bump 0.0.2            # проставить номер во всех трёх файлах (+ CHANGELOG)
+    bin/duty-version finalize [--push]     # ff main → tip рабочей ветки, тег vX.Y.Z, push
+
+Без `--push` finalize только печатает план и ничего не меняет.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+PLUGIN_YAML = ROOT / "plugin.yaml"
+MANIFEST = ROOT / "dashboard" / "manifest.json"
+INIT = ROOT / "__init__.py"
+CHANGELOG = ROOT / "CHANGELOG.md"
+
+SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+# ---------------------------------------------------------------- helpers
+
+
+def sh(*args: str) -> str:
+    res = subprocess.run(args, cwd=ROOT, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise SystemExit(f"git {' '.join(args)} failed: {res.stderr.strip()}")
+    return res.stdout.strip()
+
+
+def read_version() -> str:
+    m = re.search(r'^version:\s*"([^"]+)"', PLUGIN_YAML.read_text(), re.M)
+    if not m:
+        raise SystemExit("plugin.yaml: no version field")
+    return m.group(1)
+
+
+def versions() -> dict[str, str]:
+    manifest = json.loads(MANIFEST.read_text()).get("version", "")
+    init = re.search(r'__version__\s*=\s*"([^"]+)"', INIT.read_text())
+    return {
+        "plugin.yaml": read_version(),
+        "manifest.json": manifest,
+        "__init__.py": init.group(1) if init else "",
+    }
+
+
+def write_version(version: str) -> None:
+    PLUGIN_YAML.write_text(
+        re.sub(r'^version:\s*"[^"]+"', f'version: "{version}"', PLUGIN_YAML.read_text(), count=1, flags=re.M)
+    )
+    data = json.loads(MANIFEST.read_text())
+    data["version"] = version
+    MANIFEST.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    INIT.write_text(
+        re.sub(r'__version__\s*=\s*"[^"]+"', f'__version__ = "{version}"', INIT.read_text(), count=1)
+    )
+
+
+def add_changelog(version: str) -> None:
+    if not CHANGELOG.is_file():
+        return
+    text = CHANGELOG.read_text()
+    if f"## [{version}]" in text:
+        return
+    entry = f"## [{version}] — в разработке\n\n- _заполняется по ходу работы_\n\n"
+    marker = re.search(r"^## \[", text, re.M)
+    at = marker.start() if marker else len(text)
+    CHANGELOG.write_text(text[:at] + entry + text[at:])
+
+
+def branch() -> str:
+    return sh("git", "rev-parse", "--abbrev-ref", "HEAD")
+
+
+def dirty() -> bool:
+    return bool(sh("git", "status", "--porcelain", "--untracked-files=no"))
+
+
+def tag_exists(tag: str) -> bool:
+    res = subprocess.run(["git", "rev-parse", "--verify", "--quiet", f"refs/tags/{tag}"], cwd=ROOT, capture_output=True)
+    return res.returncode == 0
+
+
+def fail(msg: str) -> None:
+    raise SystemExit(f"✗ {msg}")
+
+
+# ---------------------------------------------------------------- commands
+
+
+def cmd_check() -> int:
+    found = versions()
+    uniq = set(found.values())
+    ok = True
+    print(f"version: {read_version()}")
+    for name, value in found.items():
+        mark = "ok  " if value == read_version() else "DIFF"
+        print(f"  {mark} {name:<16} {value or '<none>'}")
+        ok = ok and value == read_version()
+    if len(uniq) != 1:
+        print("✗ версии в файлах расходятся")
+        ok = False
+
+    br = branch()
+    print(f"branch:  {br}")
+    if br.startswith("release/v"):
+        expected = br[len("release/v"):]
+        if expected != read_version():
+            print(f"✗ ветка требует версию {expected}, а в файлах {read_version()}")
+            ok = False
+        else:
+            print(f"  ok  ветка соответствует номеру")
+    elif br == "main":
+        print("  · main: версия — последняя финализированная, сверяйте с тегом")
+    else:
+        print(f"  · ветка не release/*: работа должна идти в release/v{read_version()}")
+
+    tags = sh("tag", "--list", "v*").split()
+    if f"v{read_version()}" in tags:
+        print(f"  · тег v{read_version()} уже стоит: версия финализирована")
+    print()
+    print("OK" if ok else "ЕСТЬ РАСХОЖДЕНИЯ")
+    return 0 if ok else 1
+
+
+def cmd_bump(version: str) -> int:
+    if not SEMVER.match(version):
+        fail(f"'{version}' не похоже на X.Y.Z")
+    current = read_version()
+    if version == current:
+        print(f"· версия уже {version}, ничего не меняю")
+        return 0
+    if tag_exists(f"v{version}"):
+        fail(f"тег v{version} уже существует — эта версия опубликована, номер не переиспользуется")
+    write_version(version)
+    add_changelog(version)
+    print(f"✓ {current} → {version} (plugin.yaml, manifest.json, __init__.py, CHANGELOG)")
+    return 0
+
+
+def cmd_finalize(push: bool) -> int:
+    version = read_version()
+    br = branch()
+    problems = []
+    if dirty():
+        problems.append("рабочее дерево грязное — закоммитьте или уберите изменения")
+    if br != f"release/v{version}":
+        problems.append(f"финализация только из release/v{version}, сейчас {br}")
+    found = versions()
+    if set(found.values()) != {version}:
+        problems.append(f"версии в файлах расходятся: {found}")
+    if tag_exists(f"v{version}"):
+        problems.append(f"тег v{version} уже существует")
+    if not CHANGELOG.is_file() or f"## [{version}]" not in CHANGELOG.read_text():
+        problems.append(f"в CHANGELOG нет секции ## [{version}]")
+    if problems:
+        for p in problems:
+            print(f"✗ {p}")
+        return 1
+
+    tip = sh("rev-parse", "HEAD")
+    main_is_ancestor = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", "origin/main", tip], cwd=ROOT
+    ).returncode == 0
+    if not main_is_ancestor:
+        print("✗ origin/main не предок рабочей ветки — сначала подтяните main")
+
+    plan = [
+        f"git switch main && git merge --ff-only release/v{version}   # {tip[:10]}",
+        f"git tag -a v{version} -m 'hermes-duty {version}'",
+        f"git push origin main && git push origin v{version}",
+    ]
+    print(f"finalize v{version}:")
+    for line in plan:
+        print("  " + line)
+    if not main_is_ancestor:
+        return 1
+    if not push:
+        print("\nплан напечатан, ничего не сделано (добавьте --push)")
+        return 0
+
+    sh("switch", "main")
+    sh("merge", "--ff-only", f"release/v{version}")
+    sh("tag", "-a", f"v{version}", "-m", f"hermes-duty {version}")
+    sh("push", "origin", "main")
+    sh("push", "origin", f"v{version}")
+    print(f"\n✓ v{version} опубликована; следующая версия:")
+    print(f"  git switch -c release/vNEXT && bin/duty-version bump NEXT && git push -u origin release/vNEXT")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "check":
+        return cmd_check()
+    if cmd == "bump":
+        if not rest:
+            fail("нужен номер: bump X.Y.Z")
+        return cmd_bump(rest[0])
+    if cmd == "finalize":
+        return cmd_finalize("--push" in rest)
+    fail(f"неизвестная команда '{cmd}'")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

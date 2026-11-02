@@ -59,5 +59,5 @@ hermes plugins enable hermes-duty     # или Settings → Plugins в деск�
 
 ## Статус
 
-`v0.1.0` — P0 скелет: репозиторий, манифест, backend с `/health` и read-only
+`v0.0.1` — P0 скелет: репозиторий, манифест, backend с `/health` и read-only
 источниками. Сбор событий и экран «сейчас» — следующие шаги в `docs/DESIGN.md`.

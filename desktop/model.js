@@ -24,12 +24,15 @@
 // Подпись и тон бейджа по состоянию — только презентация, не правила. Подпись
 // `wait_human` намеренно не говорит «человека»: факт ставится по любому живому
 // вопросу пула, включая вопрос агенту (`origin='improver'` в evidence).
+// `no_signal` — серый, а не зелёный: дело со `status=running` без рана, pid и
+// heartbeat не работает, у него просто нет живого сигнала.
 const STATE_META = {
   wait_human: { label: 'ждёт ответа', tone: 'yellow' },
   capability: { label: 'нужен доступ', tone: 'purple' },
   dead_lease: { label: 'лизинг истёк', tone: 'red' },
   crashed: { label: 'упало', tone: 'red' },
   working: { label: 'работает', tone: 'green' },
+  no_signal: { label: 'нет сигнала', tone: 'gray' },
   wait_slot: { label: 'ждёт слот', tone: 'gray' },
   wait_gate: { label: 'ждёт гейт', tone: 'gray' },
 }
@@ -115,6 +118,9 @@ function shapeDeal(deal) {
     attemptNote = attempt.pid ? 'состояние pid неизвестно' : 'pid не записан'
     if (pidAlive === true) attemptNote = 'pid жив'
     if (pidAlive === false) attemptNote = 'pid мёртв'
+    // Часть фактов попытки бэкенд добрал из карточки, а не из записи рана
+    // (`attempt.source`): подпись не должна звучать как факт рана.
+    if (attempt.source === 'task') attemptNote = `${attemptNote}, факты карточки`
   }
   return {
     board: String(d.board || ''),
@@ -193,6 +199,15 @@ function shapeNow(payload) {
       reason: (errors.find((error) => error.board === board.slug) || {}).reason || 'причина не записана',
     }))
   const boardSlugs = new Set(boards.map((board) => board.slug))
+  // Прочитанная доска тоже бывает неполной: срез упёрся в лимит дел
+  // (`truncated`) или вспомогательная таблица не прочиталась (`warnings`).
+  // Молчать про это нельзя — доска тогда выглядит полной.
+  const truncatedNotices = boards
+    .filter((board) => board.truncated)
+    .map((board) => `доска ${board.slug}: срез обрезан лимитом, показано ${board.deals} дел`)
+  const warningNotices = boards.flatMap((board) =>
+    board.warnings.map((warning) => `доска ${board.slug}: ${warning}`),
+  )
   const byState = {}
   for (const deal of deals) byState[deal.state] = (byState[deal.state] || 0) + 1
   // Порядок состояний — из ответа бэкенда (`by_state` идёт в порядке
@@ -210,6 +225,8 @@ function shapeNow(payload) {
     errors,
     otherErrors: errors.filter((error) => !boardSlugs.has(error.board)),
     unreachable,
+    truncatedNotices,
+    warningNotices,
     boardsTotal: boards.length,
     boardsRead: boards.filter((board) => board.read).length,
     count: deals.length,

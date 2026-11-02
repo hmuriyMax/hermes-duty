@@ -102,10 +102,10 @@
 (`dashboard/plugin_api.py:753-760`). `crash_outcomes` и `by_state` отдаются
 клиенту, чтобы UI не держал копию этих наборов.
 
-## Таксономия ожиданий (семь взаимоисключающих состояний)
+## Таксономия ожиданий (восемь взаимоисключающих состояний)
 
 Состояние — первое совпавшее по приоритету; все сработавшие факты уходят в
-`waiting.evidence` (`dashboard/plugin_api.py:259-267`, `:439-545`). Порог свежести heartbeat — `HEARTBEAT_FRESH_SEC = 300` с (`:270`).
+`waiting.evidence` (`WAITING_PRIORITY`/`WAITING_FALLBACK` в `dashboard/plugin_api.py`). Порог свежести heartbeat — `HEARTBEAT_FRESH_SEC = 300` с.
 
 | # | состояние | как определяется |
 |---|---|---|
@@ -114,18 +114,19 @@
 | 3 | `dead_lease` | ран `running`, а его pid мёртв; **или** лизинг истёк, и последнего рана нет либо он `running` |
 | 4 | `crashed` | `consecutive_failures > 0`; **или** исход последнего рана ∈ `crashed`/`gave_up`/`spawn_failed`/`timed_out`; **или** ран `running` с живым pid, но heartbeat старше 300 с |
 | 5 | `working` | ран `running`, pid не мёртв, heartbeat не старше 300 с |
-| 6 | `wait_slot` | `status=ready` и исполнитель уже держит другое дело (`running`) |
-| 7 | `wait_gate` | `status` ∈ `todo`/`ready` и есть незавершённый родитель в `task_links` |
+| 6 | `no_signal` | `status=running`, но ни рана, ни pid, ни heartbeat нет: живого сигнала нет, дело не выдаётся за работающее |
+| 7 | `wait_slot` | `status=ready` и исполнитель уже держит другое дело (`running`) |
+| 8 | `wait_gate` | `status` ∈ `todo`/`ready` и есть незавершённый родитель в `task_links` |
 
 Правило: состояние **не выводится из одной колонки**. Оно вычисляется по набору
 фактов (лизинг, pid, heartbeat, граф зависимостей, пул вопросов, исход последнего
 рана), и каждый сработавший факт показывается рядом как доказательство.
 
 Если ни один факт не сработал, статус доразбирается оглавлением
-`WAITING_FALLBACK` (`dashboard/plugin_api.py:298-307`): `triage`/`blocked`/
-`review`/`awaiting_merge` → `wait_human`, `scheduled` → `wait_gate`,
-`todo`/`ready` → `wait_slot`, `running` → `working` («без живого сигнала»),
-незнакомый статус → `wait_slot` с пометкой «нет живых фактов».
+`WAITING_FALLBACK`: `triage`/`blocked`/`review`/`awaiting_merge` → `wait_human`,
+`scheduled` → `wait_gate`, `todo`/`ready` → `wait_slot`, `running` → `no_signal`
+(«без живого сигнала»), незнакомый статус → `wait_slot` с пометкой «нет живых
+фактов».
 
 ## Деградация источников
 
@@ -134,17 +135,22 @@
 | что сломалось | как видно в ответе |
 |---|---|
 | `tasks` доски не читается (не открылась, нет таблицы) | `boards[].read = false`, `errors[]` с `{board, reason}`, дела этой доски отсутствуют |
+| `kanban.db` нулевого размера | `boards[].read = false` + `boards[].note = "empty db"` и `errors[]` с причиной `empty db (...)` — доска не исчезает из ответа |
+| доска упала на чужой схеме (`int()` по текстовой колонке и т.п.) | `boards[].read = false` + `errors[]` с причиной `<ТипИсключения>: <текст>`; ответ остаётся 200 |
 | `task_runs`, `task_links` или `task_events` не читаются | `boards[].warnings[]` строкой `<таблица>: <причина>`; факты деградируют, доска остаётся `read = true` |
 | `messaging/pool.db` нет или это не БД | `errors[]` с `board: "messaging/pool.db"` + в `waiting.evidence` пометка «факт `wait_human` не проверен» — иначе недоступный пул выглядел бы как «вопросов нет» |
-| дел больше `DEAL_LIMIT = 500` | `boards[].truncated = true` |
+| живых вопросов в пуле больше `QUESTION_LIMIT = 200` | `errors[]` с причиной `questions truncated: ...` + та же пометка в `waiting.evidence` дел, которым вопрос не нашёлся |
+| дел больше `DEAL_LIMIT = 500` | `boards[].truncated = true`, на странице `/duty` — пометка «срез обрезан лимитом» |
+
+`truncated` и `warnings[]` не только отдаются, но и рисуются: страница `/duty`
+показывает их той же жёлтой полосой, что и недоступные доски (`desktop/model.js`,
+`desktop/plugin.js`).
 
 Таймлайн попыток деградирует иначе: там 404/503 — это ответ про конкретное дело
 (нельзя показать пустой таймлайн вместо «не читается»), а сбой `task_events`
 просто оставляет `events: []` у ранов (`dashboard/plugin_api.py:805-868`).
 
 Известные ограничения (не исправлены в `v0.0.1`, зафиксированы честно):
-файл `kanban.db` нулевого размера не попадает ни в `boards[]`, ни в `errors[]`;
-живые вопросы пула ограничены `QUESTION_LIMIT = 200` без пометки об усечении;
 причина сбоя `task_events` (события рана) в ответе таймлайна не отдаётся — там просто пустой `events`; если в `kanban/boards/` есть каталог `default`, его БД попадает в срез отдельной записью с тем же slug — и `?board=default` вернёт обе (корневую и каталог), потому что фильтр идёт по slug (`dashboard/plugin_api.py:724`).
 
 ## Экраны
@@ -176,7 +182,7 @@
 - строка таблицы: доска · `id` · title (многоточие) · assignee · возраст попытки ·
   состояние лизинга · возраст последнего действия · бейдж состояния с цветом
   (жёлтый `wait_human`, фиолетовый `capability`, красный `dead_lease`/`crashed`,
-  зелёный `working`, серый `wait_slot`/`wait_gate`);
+  зелёный `working`, серый `no_signal`/`wait_slot`/`wait_gate`);
 - фильтры локальные (доска, чипы состояний, поиск по `id`/title с debounce 240 мс):
   `/now` на ввод не перезапрашивается (`desktop/plugin.js:22`, `desktop/model.js:222-236`);
 - правая панель — таймлайн попыток: полоса на попытку относительно самой долгой,

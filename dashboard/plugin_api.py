@@ -122,17 +122,28 @@ def _table_exists(path: Path, table: str) -> bool:
 
 
 def _discover_boards(home: Path) -> list[dict[str, Any]]:
-    """Все живые kanban-БД: корневая (доска default) + boards/<slug>/kanban.db."""
-    found: list[dict[str, Any]] = []
+    """Все живые kanban-БД: корневая (доска default) + boards/<slug>/kanban.db.
+
+    0-байтная БД не выпадает из перечня: она помечается `note = "empty db"` и
+    видна как доска, которую не прочитали. Иначе такой файл молча исчезает и из
+    `boards[]`, и из `errors[]`, и срез выглядит полным, хотя доска потеряна.
+    """
+    candidates: list[tuple[str, Path]] = []
     root = home / "kanban.db"
-    if root.is_file() and root.stat().st_size > 0:
-        found.append({"slug": "default", "path": str(root)})
+    if root.is_file():
+        candidates.append(("default", root))
     boards_dir = home / "kanban" / "boards"
     if boards_dir.is_dir():
         for child in sorted(boards_dir.iterdir()):
             db = child / "kanban.db"
-            if child.is_dir() and db.is_file() and db.stat().st_size > 0:
-                found.append({"slug": child.name, "path": str(db)})
+            if child.is_dir() and db.is_file():
+                candidates.append((child.name, db))
+    found: list[dict[str, Any]] = []
+    for slug, path in candidates:
+        entry: dict[str, Any] = {"slug": slug, "path": str(path)}
+        if path.stat().st_size == 0:
+            entry["note"] = "empty db"
+        found.append(entry)
     return found
 
 
@@ -148,6 +159,9 @@ def _board_summary(entry: dict[str, Any]) -> dict[str, Any]:
         "blocked": 0,
         "running": 0,
     }
+    if entry.get("note"):
+        out["note"] = entry["note"]
+        return out
     if not _table_exists(path, "tasks"):
         # Пустая/служебная БД — не ошибка, честно помечаем.
         out["note"] = "no tasks table"
@@ -238,16 +252,20 @@ def board_tasks(slug: str) -> dict[str, Any]:
 
 # ------------------------------------------------------------- «сейчас» (P0b)
 #
-# Таксономия ожиданий: шесть взаимоисключающих состояний ожидания плюс
-# `working`. Состояние вычисляется по набору фактов (лизинг, pid, heartbeat,
-# граф зависимостей, пул вопросов, исход последнего рана), и каждый сработавший
-# факт попадает в `waiting.evidence` текстом — из одной колонки ничего не
-# выводится.
+# Таксономия ожиданий: семь взаимоисключающих состояний ожидания плюс
+# `working` и `no_signal`. Состояние вычисляется по набору фактов (лизинг, pid,
+# heartbeat, граф зависимостей, пул вопросов, исход последнего рана), и каждый
+# сработавший факт попадает в `waiting.evidence` текстом — из одной колонки
+# ничего не выводится.
 #
 # Порядок приоритета при совпадении фактов — ровно этот кортеж, первое
 # совпадение побеждает:
 #
-#     wait_human > capability > dead_lease > crashed > working > wait_slot > wait_gate
+#     wait_human > capability > dead_lease > crashed > working > no_signal
+#       > wait_slot > wait_gate
+#
+# `no_signal` — дело со `status=running`, у которого нет ни рана, ни pid, ни
+# heartbeat: живого сигнала нет, поэтому оно не выдаётся за работающее.
 #
 # Он же задаёт порядок сортировки ответа `/now`. Статус, для которого не
 # сработал ни один факт, доразбирается оглавлением `WAITING_FALLBACK` (кто
@@ -262,6 +280,7 @@ WAITING_PRIORITY = (
     "dead_lease",
     "crashed",
     "working",
+    "no_signal",
     "wait_slot",
     "wait_gate",
 )
@@ -293,8 +312,8 @@ CAPABILITY_WORDS = (
 
 # Остаточная ветка: статус, для которого ни один факт не сработал. Ключ — что
 # записано в `tasks.status`, значение — состояние и объяснение, кто должен
-# действовать. `running` в оглавлении нет: живой ран всегда даёт либо
-# `working`, либо `crashed`/`dead_lease`.
+# действовать. `running` в оглавлении есть, но ведёт в `no_signal`: живого
+# сигнала у такого дела нет, и «работает» про него сказать нельзя.
 WAITING_FALLBACK = {
     "triage": ("wait_human", "status=triage: ждёт разбора (спецификатор или человек)"),
     "scheduled": ("wait_gate", "status=scheduled: ждёт времени пробуждения"),
@@ -303,10 +322,11 @@ WAITING_FALLBACK = {
     "blocked": ("wait_human", "status=blocked: нужен человек"),
     "review": ("wait_human", "status=review: ждёт вердикта ревьюера"),
     "awaiting_merge": ("wait_human", "status=awaiting_merge: ждёт мерджа координатором"),
-    "running": ("working", "status=running без живого сигнала: pid/heartbeat не записаны"),
+    "running": ("no_signal", "status=running без живого сигнала: рана, pid и heartbeat нет"),
 }
 
 # Сколько активных дел берём с доски за один срез и сколько живых вопросов пула.
+# Оба лимита не молчат: сработавший лимит попадает в `truncated`/`errors`.
 DEAL_LIMIT = 500
 QUESTION_LIMIT = 200
 
@@ -365,7 +385,7 @@ def _payload_summary(payload: Optional[str]) -> Optional[str]:
     return text[:SUMMARY_LIMIT] + ("…" if len(text) > SUMMARY_LIMIT else "")
 
 
-def _pool_questions(home: Path) -> tuple[dict[str, dict[str, Any]], Optional[str]]:
+def _pool_questions(home: Path) -> tuple[dict[str, dict[str, Any]], Optional[str], bool]:
     """Живые вопросы пула (`status='sent'`), разложенные по id дела.
 
     Схема пула `card_id` не знает: у вопроса с `origin='card'` id карточки лежит
@@ -374,18 +394,24 @@ def _pool_questions(home: Path) -> tuple[dict[str, dict[str, Any]], Optional[str
     поэтому такие: `session_key` → затем `text`/`text_full`.
 
     Второй элемент — причина сбоя: недоступный пул это не «вопросов нет», иначе
-    `wait_human` молча не срабатывает и ответ врёт про «никто не ждёт».
+    `wait_human` молча не срабатывает и ответ врёт про «никто не ждёт». Третий —
+    признак того, что живых вопросов больше лимита: обрезанный пул тоже нельзя
+    выдавать за полный. Проверяется лишней строкой (`LIMIT + 1`), а не
+    равенством длины лимиту, — иначе полный пул ровно на `QUESTION_LIMIT`
+    вопросов ложной пометки не избежит.
     """
     db = home / "messaging" / "pool.db"
     if not db.is_file():
-        return {}, f"pool.db not found: {db}"
+        return {}, f"pool.db not found: {db}", False
     rows, err = _query_checked(
         db,
         "SELECT * FROM questions WHERE status = 'sent' ORDER BY id DESC LIMIT ?",
-        (QUESTION_LIMIT,),
+        (QUESTION_LIMIT + 1,),
     )
     if err:
-        return {}, f"pool.db unreadable: {db} ({err})"
+        return {}, f"pool.db unreadable: {db} ({err})", False
+    truncated = len(rows) > QUESTION_LIMIT
+    rows = rows[:QUESTION_LIMIT]
     index: dict[str, dict[str, Any]] = {}
     for row in rows:
         holders: set[str] = set()
@@ -396,7 +422,7 @@ def _pool_questions(home: Path) -> tuple[dict[str, dict[str, Any]], Optional[str
         holders.update(TASK_ID_RE.findall(blob))
         for task_id in holders:
             index.setdefault(task_id, row)
-    return index, None
+    return index, None, truncated
 
 
 def _lease(task: dict[str, Any], run: Optional[dict[str, Any]], now: int) -> dict[str, Any]:
@@ -419,14 +445,31 @@ def _lease(task: dict[str, Any], run: Optional[dict[str, Any]], now: int) -> dic
 
 
 def _attempt(task: dict[str, Any], run: Optional[dict[str, Any]], now: int) -> Optional[dict[str, Any]]:
-    """Текущая попытка дела: живой ран (или ран, на который указывает `current_run_id`)."""
+    """Текущая попытка дела: живой ран (или ран, на который указывает `current_run_id`).
+
+    Пид, старт и heartbeat берутся из записи рана, а карточка — только запасной
+    источник для старых БД, где `task_runs` скудный. Добор из карточки виден в
+    поле `source`: `run`, если все три факта из рана, иначе `task` — тогда часть
+    фактов попытки на самом деле карточные, и это не скрыто.
+    """
     if run is None:
         return None
-    pid = run.get("worker_pid") or task.get("worker_pid")
-    start = run.get("started_at") or task.get("started_at")
-    heartbeat = run.get("last_heartbeat_at") or task.get("last_heartbeat_at")
+    pid = run.get("worker_pid")
+    start = run.get("started_at")
+    heartbeat = run.get("last_heartbeat_at")
+    source = "run"
+    if pid is None:
+        pid = task.get("worker_pid")
+        source = "task"
+    if start is None:
+        start = task.get("started_at")
+        source = "task"
+    if heartbeat is None:
+        heartbeat = task.get("last_heartbeat_at")
+        source = "task"
     return {
         "run_id": run.get("id"),
+        "source": source,
         "start": None if start is None else int(start),
         "age_sec": _age_sec(start, now),
         "pid": None if not pid else int(pid),
@@ -485,7 +528,8 @@ def _waiting(
     # 3. Протухший лизинг. Мёртвый pid при уже завершённом ране — не dead_lease:
     #    это либо crashed, либо нормальное завершение (проверяется ниже).
     hung_run = run_status == "running" and pid_alive is False
-    expired_claim = lease["state"] == "expired" and (last_run is None or last_status == "running")
+    last_running = last_run is None or last_status == "running"
+    expired_claim = lease["state"] == "expired" and last_running
     if hung_run:
         facts["dead_lease"] = (
             f"ран {run_id} в статусе running, а pid {pid} мёртв "
@@ -506,18 +550,25 @@ def _waiting(
     last_outcome = (last_run or {}).get("outcome")
     if last_outcome in CRASH_OUTCOMES:
         crash_bits.append(f"последний ран {(last_run or {}).get('id')}: outcome={last_outcome}")
-    if run_status == "running" and pid_alive is not False and (heartbeat_age or 0) > HEARTBEAT_FRESH_SEC:
+    stale_heartbeat = (heartbeat_age or 0) > HEARTBEAT_FRESH_SEC
+    if run_status == "running" and pid_alive is not False and stale_heartbeat:
         crash_bits.append(
             f"ран {run_id} running, pid {pid} жив, heartbeat {heartbeat_age}с назад"
         )
     if crash_bits:
         facts["crashed"] = "; ".join(crash_bits)
 
-    # 5. Живая работа: ран идёт, pid жив, heartbeat свежий.
-    if run_status == "running" and pid_alive is not False and heartbeat_age is not None and heartbeat_age <= HEARTBEAT_FRESH_SEC:
+    # 5. Живая работа: ран идёт, pid не мёртв, heartbeat свежий. Факт про pid
+    #    называет ровно то, что известно: жив / мёртв / состояние неизвестно
+    #    (`os.kill` вернул прочий OSError) — «не записан» тут было бы неправдой.
+    fresh_heartbeat = heartbeat_age is not None and heartbeat_age <= HEARTBEAT_FRESH_SEC
+    if run_status == "running" and pid_alive is not False and fresh_heartbeat:
+        if pid_alive is True:
+            pid_text = f"pid {pid} жив"
+        else:
+            pid_text = f"состояние pid {pid} неизвестно"
         facts["working"] = (
-            f"ран {run_id} running, pid {pid} "
-            f"{'жив' if pid_alive else 'не записан'}, heartbeat {heartbeat_age}с назад"
+            f"ран {run_id} running, {pid_text}, heartbeat {heartbeat_age}с назад"
         )
 
     # 6. Очередь на занятый профиль.
@@ -528,7 +579,8 @@ def _waiting(
 
     # 7. Гейт по незавершённому родителю.
     if status in GATE_STATUSES and parents:
-        facts["wait_gate"] = "незавершённые родители: " + ", ".join(f"{pid_} ({st})" for pid_, st in parents)
+        gate_list = ", ".join(f"{pid_} ({st})" for pid_, st in parents)
+        facts["wait_gate"] = f"незавершённые родители: {gate_list}"
 
     state = next((name for name in WAITING_PRIORITY if name in facts), None)
     if state is None:
@@ -550,20 +602,21 @@ def _board_deals(
 ) -> dict[str, Any]:
     """Активные дела одной доски с лизингом, попыткой, последним действием и ожиданием.
 
-    Бросает RuntimeError, если не читается сама `tasks`: доска тогда попадает в
-    `errors` ответа. Провал вспомогательных таблиц (`task_runs`, `task_events`,
+    Провал чтения самой `tasks` роняет этот вызов: доска тогда попадает в
+    `errors` ответа (исключение не перехватывается здесь — его тип и текст важны
+    для причины). Провал вспомогательных таблиц (`task_runs`, `task_events`,
     `task_links`) деградирует факты и уходит в `warnings` доски, а не в ошибку.
     """
     slug = str(entry["slug"])
     path = Path(entry["path"])
+    if entry.get("note") == "empty db":
+        # 0-байтный файл sqlite откроет как пустую БД и скажет «no such table»;
+        # настоящую причину называем сами, чтобы она была видна в `errors`.
+        raise RuntimeError(f"empty db ({path}): 0 bytes")
     warnings: list[str] = []
-    try:
-        conn = _connect_ro(path)
-    except Exception as exc:  # noqa: BLE001 - файл не открылся: доска не читается
-        raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
     # Одно соединение на доску: все запросы среза идут по одному снимку (`BEGIN`),
     # а не открывают новое соединение на каждый запрос.
-    with closing(conn) as conn:
+    with closing(_connect_ro(path)) as conn:
         tasks, err = _fetch(
             conn,
             "SELECT * FROM tasks WHERE status NOT IN (?, ?) ORDER BY created_at, id LIMIT ?",
@@ -722,21 +775,41 @@ def collect_now(
     `errors`; ответ при этом остаётся 200.
     """
     scope = [b for b in _discover_boards(home) if board is None or b["slug"] == board]
-    questions, pool_err = _pool_questions(home)
+    questions, pool_err, pool_truncated = _pool_questions(home)
     errors: list[dict[str, str]] = []
-    pool_note: Optional[str] = None
+    # Заметки о неполноте пула: недоступен или обрезан лимитом. Обе дописываются
+    # в evidence дел, которым вопрос не нашёлся, — иначе `wait_human` выглядит
+    # проверенным, хотя пул мог не отдать нужный вопрос.
+    notes: list[str] = []
     if pool_err:
-        pool_note = f"пул вопросов недоступен ({pool_err}) — факт wait_human не проверен"
+        notes.append(f"пул вопросов недоступен ({pool_err})")
         errors.append({"board": "messaging/pool.db", "reason": pool_err})
+    if pool_truncated:
+        reason = f"questions truncated: more than {QUESTION_LIMIT} live questions"
+        notes.append(f"живых вопросов в пуле больше {QUESTION_LIMIT} (старые не вошли)")
+        errors.append({"board": "messaging/pool.db", "reason": reason})
+    pool_note = f"{'; '.join(notes)} — факт wait_human не проверен" if notes else None
 
     boards: list[dict[str, Any]] = []
     deals: list[dict[str, Any]] = []
     for entry in scope:
         try:
             collected = _board_deals(entry, now, questions, pool_note)
-        except RuntimeError as exc:
-            errors.append({"board": str(entry["slug"]), "reason": str(exc)})
-            boards.append({"slug": entry["slug"], "path": str(entry["path"]), "read": False, "deals": 0})
+        except Exception as exc:  # noqa: BLE001 - любая ошибка доски не валит срез
+            # Тип исключения важен: `ValueError` из чужой схемы (`int('soon')` по
+            # `claim_expires`) иначе не отличить от сбоя БД. RuntimeError несёт
+            # готовую причину, у остальных префиксуем тип.
+            reason = str(exc) if isinstance(exc, RuntimeError) else f"{type(exc).__name__}: {exc}"
+            errors.append({"board": str(entry["slug"]), "reason": reason})
+            unread: dict[str, Any] = {
+                "slug": entry["slug"],
+                "path": str(entry["path"]),
+                "read": False,
+                "deals": 0,
+            }
+            if entry.get("note"):
+                unread["note"] = entry["note"]
+            boards.append(unread)
             continue
         boards.append(
             {

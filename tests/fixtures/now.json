@@ -1,6 +1,6 @@
 {
   "now": 1793637000,
-  "count": 7,
+  "count": 8,
   "deals": [
     {
       "board": "hermes-tickets",
@@ -14,6 +14,7 @@
       "workspace_kind": "scratch",
       "attempt": {
         "run_id": 41,
+        "source": "run",
         "start": 1793635000,
         "age_sec": 2000,
         "pid": 50123,
@@ -86,6 +87,7 @@
       "workspace_kind": "dir",
       "attempt": {
         "run_id": 52,
+        "source": "run",
         "start": 1793633280,
         "age_sec": 3720,
         "pid": 777,
@@ -129,6 +131,7 @@
       "workspace_kind": "worktree",
       "attempt": {
         "run_id": 60,
+        "source": "run",
         "start": 1793636100,
         "age_sec": 900,
         "pid": 8891,
@@ -172,6 +175,7 @@
       "workspace_kind": "worktree",
       "attempt": {
         "run_id": 70,
+        "source": "run",
         "start": 1793636820,
         "age_sec": 180,
         "pid": 4111,
@@ -204,6 +208,35 @@
       }
     },
     {
+      "board": "ozon",
+      "id": "t_0519a001",
+      "title": "FIX: разобрать дело, оставленное в running после падения воркера",
+      "assignee": "implementer",
+      "status": "running",
+      "priority": 7,
+      "consecutive_failures": 0,
+      "created_at": 1793636000,
+      "workspace_kind": "scratch",
+      "attempt": null,
+      "lease": {
+        "claim_lock": null,
+        "expires_at": null,
+        "expires_in_sec": null,
+        "state": "none"
+      },
+      "last_action": {
+        "kind": "claimed",
+        "at": 1793635800,
+        "age_sec": 1200,
+        "summary": null
+      },
+      "last_run": null,
+      "waiting": {
+        "state": "no_signal",
+        "evidence": "status=running без живого сигнала: рана, pid и heartbeat нет"
+      }
+    },
+    {
       "board": "default",
       "id": "t_51070001",
       "title": "RESEARCH: сравнить два подхода к хранению журнала дел",
@@ -211,7 +244,7 @@
       "status": "ready",
       "priority": 5,
       "consecutive_failures": 0,
-      "created_at": 1793639000,
+      "created_at": 1793635000,
       "workspace_kind": "scratch",
       "attempt": null,
       "lease": {
@@ -222,8 +255,8 @@
       },
       "last_action": {
         "kind": "created",
-        "at": 1793639000,
-        "age_sec": -2000,
+        "at": 1793635000,
+        "age_sec": 2000,
         "summary": null
       },
       "last_run": null,
@@ -268,6 +301,7 @@
     "dead_lease": 1,
     "crashed": 1,
     "working": 1,
+    "no_signal": 1,
     "wait_slot": 1,
     "wait_gate": 1
   },
@@ -285,7 +319,7 @@
       "slug": "ozon",
       "path": "/Users/example/.hermes/kanban/boards/ozon/kanban.db",
       "read": true,
-      "deals": 2,
+      "deals": 3,
       "truncated": false,
       "warnings": ["task_events: no such column: run_id"]
     },
@@ -319,7 +353,7 @@
     },
     {
       "board": "messaging/pool.db",
-      "reason": "no such table: questions"
+      "reason": "questions truncated: more than 200 live questions"
     }
   ]
 }

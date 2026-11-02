@@ -704,10 +704,11 @@ def test_pool_db_that_is_not_a_database_is_reported(home: Path, client: TestClie
     conn.close()
     (home / "messaging" / "pool.db").write_bytes(b"not a database at all")
 
-    questions, err = plugin_api._pool_questions(home)
+    questions, err, truncated = plugin_api._pool_questions(home)
 
     assert questions == {}
     assert err is not None and "pool.db unreadable" in err
+    assert truncated is False
     body = client.get("/now").json()
     errors = {error["board"]: error["reason"] for error in body["errors"]}
     assert "messaging/pool.db" in errors
@@ -722,10 +723,11 @@ def test_pool_absent_question_is_checked_on_clean_pool(home: Path) -> None:
     conn.commit()
     conn.close()
 
-    questions, err = plugin_api._pool_questions(home)
+    questions, err, truncated = plugin_api._pool_questions(home)
     result = plugin_api.collect_now(home, NOW)
 
     assert questions == {} and err is None
+    assert truncated is False
     assert result["errors"] == []
     assert "не проверен" not in result["deals"][0]["waiting"]["evidence"]
 
@@ -796,3 +798,159 @@ def test_crash_outcomes_come_from_the_backend_constant(
     assert [deal["last_run"]["outcome"] for deal in now_body["deals"]] == ["crashed"]
     attempts = client.get("/duty/stack/t_c0de0001/attempts").json()
     assert attempts["crash_outcomes"] == list(plugin_api.CRASH_OUTCOMES)
+
+
+def test_pid_state_unknown_is_not_reported_as_missing(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`os.kill` ответил прочим `OSError` (`pid_alive=None`) → «состояние pid неизвестно».
+
+    Раньше evidence печатал «pid 50123 не записан», хотя pid в источнике есть:
+    сигнал сообщал об отсутствии данных, которых не было.
+    """
+    conn = sqlite3.connect(make_board(home, "stack"))
+    add_task(conn, "t_0dd00001", status="running", created_at=NOW - 700)
+    run_id = add_run(
+        conn,
+        "t_0dd00001",
+        status="running",
+        worker_pid=50123,
+        started_at=NOW - 600,
+        last_heartbeat_at=NOW - 20,
+    )
+    conn.execute(
+        "UPDATE tasks SET worker_pid=50123, current_run_id=? WHERE id='t_0dd00001'", (run_id,)
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(plugin_api, "_pid_alive", lambda pid: None)
+
+    deal = deals_by_id(plugin_api.collect_now(home, NOW))["t_0dd00001"]
+
+    assert deal["attempt"]["pid_alive"] is None
+    # Все факты попытки — из записи рана, а не из карточки.
+    assert deal["attempt"]["source"] == "run"
+    assert deal["waiting"]["state"] == "working"
+    assert "состояние pid 50123 неизвестно" in deal["waiting"]["evidence"]
+    assert "не записан" not in deal["waiting"]["evidence"]
+
+
+def test_running_without_any_live_signal_is_no_signal(home: Path, client: TestClient) -> None:
+    """`status=running` без рана/pid/heartbeat — не «работает», а «нет сигнала»."""
+    conn = sqlite3.connect(make_board(home, "stack"))
+    add_task(conn, "t_05a10001", status="running", created_at=NOW - 400)
+    conn.commit()
+    conn.close()
+
+    body = client.get("/now").json()
+    deal = deals_by_id(body)["t_05a10001"]
+
+    assert deal["attempt"] is None
+    assert deal["waiting"]["state"] == "no_signal"
+    assert "без живого сигнала" in deal["waiting"]["evidence"]
+    # Таксономия остаётся взаимоисключающей: дело попало ровно в одну корзину.
+    assert body["by_state"]["no_signal"] == 1
+    assert sum(body["by_state"].values()) == 1
+
+
+def test_foreign_schema_does_not_500_and_names_the_type(
+    home: Path, client: TestClient
+) -> None:
+    """Чужая схема доски (`claim_expires` текстом) → 200, причина в `errors` с типом."""
+    legacy = make_board(home, "legacy")
+    conn = sqlite3.connect(legacy)
+    add_task(conn, "t_1e9ac001", status="running", created_at=NOW - 300)
+    conn.execute("UPDATE tasks SET claim_expires='soon' WHERE id='t_1e9ac001'")
+    conn.commit()
+    conn.close()
+    conn = sqlite3.connect(make_board(home, "stack"))
+    add_task(conn, "t_0k000001", status="todo", created_at=NOW - 200)
+    conn.commit()
+    conn.close()
+
+    response = client.get("/now")
+
+    assert response.status_code == 200
+    body = response.json()
+    errors = {error["board"]: error["reason"] for error in body["errors"]}
+    assert "ValueError" in errors["legacy"]
+    assert {board["slug"]: board["read"] for board in body["boards"]}["legacy"] is False
+    # Здоровая доска в срезе осталась: один сбой источника не отменяет остальные.
+    assert [deal["id"] for deal in body["deals"]] == ["t_0k000001"]
+
+
+def test_empty_kanban_db_is_visible_as_unread_board(home: Path, client: TestClient) -> None:
+    """0-байтная `kanban.db` не исчезает: `read:false`, note `empty db` и причина в `errors`."""
+    conn = sqlite3.connect(make_board(home, "stack"))
+    add_task(conn, "t_3e0b0001", status="todo", created_at=NOW - 100)
+    conn.commit()
+    conn.close()
+    empty = home / "kanban" / "boards" / "empty-board" / "kanban.db"
+    empty.parent.mkdir(parents=True)
+    empty.write_bytes(b"")
+
+    body = client.get("/now").json()
+
+    boards = {board["slug"]: board for board in body["boards"]}
+    assert boards["empty-board"]["read"] is False
+    assert boards["empty-board"]["note"] == "empty db"
+    errors = {error["board"]: error["reason"] for error in body["errors"]}
+    assert "empty db" in errors["empty-board"]
+    assert [deal["id"] for deal in body["deals"]] == ["t_3e0b0001"]
+
+
+def test_question_pool_limit_is_not_silent(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Пул обрезан лимитом → причина в `errors` и в evidence дел без вопроса."""
+    monkeypatch.setattr(plugin_api, "QUESTION_LIMIT", 2)
+    conn = sqlite3.connect(make_board(home, "stack"))
+    add_task(conn, "t_9e570001", status="review", created_at=NOW - 500)
+    conn.commit()
+    conn.close()
+    pool = sqlite3.connect(make_pool(home))
+    add_question(pool, session_key="t_9e570001")
+    add_question(pool, session_key="agent:a")
+    add_question(pool, session_key="agent:b")
+    pool.commit()
+    pool.close()
+
+    body = plugin_api.collect_now(home, NOW)
+
+    errors = {error["board"]: error["reason"] for error in body["errors"]}
+    assert "questions truncated" in errors["messaging/pool.db"]
+    deal = deals_by_id(body)["t_9e570001"]
+    # Вопрос этого дела не вошёл в срез — состояние не выдаёт проверку за факт.
+    assert deal["waiting"]["state"] == "wait_human"
+    assert "живых вопросов в пуле больше 2" in deal["waiting"]["evidence"]
+    assert "факт wait_human не проверен" in deal["waiting"]["evidence"]
+
+    # Ровно лимит живых вопросов — это ещё не обрез: помечать нечего.
+    monkeypatch.setattr(plugin_api, "QUESTION_LIMIT", 3)
+    clean = plugin_api.collect_now(home, NOW)
+    assert "messaging/pool.db" not in {error["board"] for error in clean["errors"]}
+
+
+def test_attempt_reports_where_its_facts_came_from(home: Path) -> None:
+    """`attempt.source=task`, когда pid/heartbeat добраны из карточки, а не из рана."""
+    conn = sqlite3.connect(make_board(home, "stack"))
+    add_task(
+        conn,
+        "t_50d4c001",
+        status="running",
+        created_at=NOW - 700,
+        started_at=NOW - 600,
+        worker_pid=os.getpid(),
+        last_heartbeat_at=NOW - 30,
+    )
+    run_id = add_run(conn, "t_50d4c001", status="running", started_at=NOW - 600)
+    conn.execute("UPDATE tasks SET current_run_id=? WHERE id='t_50d4c001'", (run_id,))
+    conn.commit()
+    conn.close()
+
+    deal = deals_by_id(plugin_api.collect_now(home, NOW))["t_50d4c001"]
+
+    assert deal["attempt"]["run_id"] == run_id
+    assert deal["attempt"]["source"] == "task"
+    assert deal["attempt"]["pid"] == os.getpid()

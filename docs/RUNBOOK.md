@@ -91,10 +91,11 @@ if now["deals"]:
 | признак | что значит |
 |---|---|
 | `errors[]` не пуст | источник не прочитан; в `board` — `messaging/pool.db` или slug доски, в `reason` — текст сбоя |
-| `boards[].read = false` | доска не читается; её дел в ответе нет |
+| `boards[].read = false` | доска не читается; её дел в ответе нет. `boards[].note = "empty db"` — файл `kanban.db` нулевого размера |
 | `boards[].warnings[]` | не читается вспомогательная таблица (`task_runs`/`task_links`/`task_events`) — факты деградировали |
+| `boards[].truncated = true` | дел на доске больше `DEAL_LIMIT = 500` — показан не весь срез |
 | `by_state` в ответе | счётчики по состояниям считаются до фильтра `?state=` |
-| 400 на `/now?state=…` | состояние не из таксономии (`wait_human`, `capability`, `dead_lease`, `crashed`, `working`, `wait_slot`, `wait_gate`) |
+| 400 на `/now?state=…` | состояние не из таксономии (`wait_human`, `capability`, `dead_lease`, `crashed`, `working`, `no_signal`, `wait_slot`, `wait_gate`) |
 | 404 на `/now?board=…` | такой доски нет |
 | два `boards[]` со slug `default` | в `kanban/boards/` есть каталог `default` — он идёт отдельной записью рядом с корневой БД |
 
@@ -102,7 +103,7 @@ if now["deals"]:
 
 ```bash
 cd ~/.hermes/plugins/hermes-duty
-~/.hermes/bvenv/bin/python -m pytest -q      # 21 passed
+~/.hermes/bvenv/bin/python -m pytest -q      # 27 passed
 ```
 
 `python3 -m pytest` из системы падает с `No module named pytest` — это окружение,
@@ -113,7 +114,7 @@ cd ~/.hermes/plugins/hermes-duty
 ## 5. Проверить шейпер и версии
 
 ```bash
-node --test tests/model.test.mjs    # 20 pass
+node --test tests/model.test.mjs    # 23 pass
 bin/duty-model-sync --check         # OK: inlined model matches desktop/model.js
 bin/duty-version check              # OK (последняя строка), код 0
 ```

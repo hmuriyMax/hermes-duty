@@ -28,7 +28,16 @@ import {
 
 // Ожидаемый порядок приоритета — это ожидание теста к ответу бэкенда
 // (WAITING_PRIORITY в dashboard/plugin_api.py), а не константа страницы.
-const PRIORITY = ['wait_human', 'capability', 'dead_lease', 'crashed', 'working', 'wait_slot', 'wait_gate']
+const PRIORITY = [
+  'wait_human',
+  'capability',
+  'dead_lease',
+  'crashed',
+  'working',
+  'no_signal',
+  'wait_slot',
+  'wait_gate',
+]
 
 const nowPayload = JSON.parse(readFileSync(new URL('./fixtures/now.json', import.meta.url), 'utf8'))
 const attemptsPayload = JSON.parse(readFileSync(new URL('./fixtures/attempts.json', import.meta.url), 'utf8'))
@@ -44,10 +53,10 @@ test('порядок групп — приоритет ответа бэкенд
   )
   assert.deepEqual(
     model.groups.map((group) => group.count),
-    [1, 1, 1, 1, 1, 1, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
   )
   assert.deepEqual(Object.keys(model.byState).sort(), [...PRIORITY].sort())
-  assert.equal(model.count, 7)
+  assert.equal(model.count, 8)
   // чипы фильтра идут в порядке `by_state` бэкенда — второго списка приоритета нет
   assert.deepEqual(model.stateOrder, PRIORITY)
   // таблица подписей покрывает ровно те состояния, что присылает бэкенд
@@ -212,9 +221,51 @@ test('тон бейджа по состоянию: жёлтый/фиолетов
   assert.equal(stateMeta('dead_lease').tone, 'red')
   assert.equal(stateMeta('crashed').tone, 'red')
   assert.equal(stateMeta('working').tone, 'green')
+  assert.equal(stateMeta('no_signal').tone, 'gray')
+  assert.equal(stateMeta('no_signal').label, 'нет сигнала')
   assert.equal(stateMeta('wait_slot').tone, 'gray')
   assert.equal(stateMeta('wait_gate').tone, 'gray')
   assert.equal(stateMeta('').tone, 'gray')
+})
+
+test('дело без живого сигнала не выдаётся за работающее', () => {
+  const deal = model.deals.find((item) => item.id === 't_0519a001')
+  assert.equal(deal.state, 'no_signal')
+  assert.equal(deal.tone, 'gray')
+  assert.equal(deal.stateLabel, 'нет сигнала')
+  assert.equal(deal.attemptNote, 'нет попытки')
+  assert.match(deal.evidence, /без живого сигнала/)
+})
+
+test('факты попытки из карточки помечены, а не выдаются за факт рана', () => {
+  const fromTask = shapeDeal({
+    attempt: { pid: 4111, pid_alive: true, source: 'task', age_sec: 180 },
+    waiting: { state: 'working' },
+  })
+  assert.equal(fromTask.attemptNote, 'pid жив, факты карточки')
+  // факты из записи рана идут без оговорки
+  const fromRun = model.deals.find((item) => item.id === 't_dead0001')
+  assert.equal(fromRun.attemptNote, 'pid мёртв')
+  assert.equal(model.deals.find((item) => item.id === 't_w0rk0001').attemptNote, 'pid жив')
+})
+
+test('обрезанный срез и warnings доски не молчат: пометки рядом с недоступными', () => {
+  const withNotices = shapeNow({
+    ...nowPayload,
+    boards: [
+      ...nowPayload.boards,
+      { slug: 'big', read: true, deals: 500, truncated: true, warnings: ['task_runs: no such table'] },
+    ],
+  })
+  // доска прочиталась, но показано не всё — это видно текстом, а не только счётом
+  assert.deepEqual(withNotices.truncatedNotices, [
+    'доска big: срез обрезан лимитом, показано 500 дел',
+  ])
+  assert.ok(withNotices.warningNotices.includes('доска big: task_runs: no such table'))
+  assert.ok(withNotices.warningNotices.includes('доска ozon: task_events: no such column: run_id'))
+  // в фикстуре нет обрезанных досок, но warnings у ozon есть всегда
+  assert.deepEqual(model.truncatedNotices, [])
+  assert.deepEqual(model.warningNotices, ['доска ozon: task_events: no such column: run_id'])
 })
 
 test('доски: счётчик прочитанных и причины недоступных — из ответа, без догадок', () => {
@@ -231,10 +282,10 @@ test('доски: счётчик прочитанных и причины нед
 
 test('фильтры локальные: доска, набор состояний, поиск по id и заголовку', () => {
   const byBoard = filterNow(model, { board: 'ozon' })
-  assert.equal(byBoard.count, 2)
+  assert.equal(byBoard.count, 3)
   assert.deepEqual(
     byBoard.groups.map((group) => group.state),
-    ['capability', 'crashed'],
+    ['capability', 'crashed', 'no_signal'],
   )
   // счётчики досок и ошибок фильтр не трогает — пустое состояние остаётся честным
   assert.equal(byBoard.boardsRead, model.boardsRead)
@@ -254,7 +305,7 @@ test('фильтры локальные: доска, набор состояни
   assert.equal(filterNow(model, { query: '  QARAVAI ' }).count, 1)
   assert.equal(filterNow(model, { query: 't_dead0001' }).count, 1)
   assert.equal(filterNow(model, { query: 'такого-нет' }).count, 0)
-  assert.equal(filterNow(model, {}).count, 7)
+  assert.equal(filterNow(model, {}).count, 8)
 })
 
 test('пустой ответ /now не роняет модель', () => {

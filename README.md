@@ -72,8 +72,9 @@ Duty выводит состояние из журнала (`state = fold(events
    и не пытается «угадать» состояние — она показывает лизинг, процесс и последнее
    действие, как они записаны в источниках.
 3. **Честная таксономия.** `wait_human`, `capability`, `dead_lease`, `crashed`,
-   `working`, `wait_slot`, `wait_gate` — семь взаимоисключающих состояний по
-   приоритету, а не «blocked»; каждый факт показывается доказательством.
+   `working`, `no_signal`, `wait_slot`, `wait_gate` — восемь взаимоисключающих
+   состояний по приоритету, а не «blocked»; каждый факт показывается
+   доказательством, а дело без живого сигнала не выдаётся за работающее.
 4. **Деградация вместо 500.** Недоступная доска или пул вопросов попадают в
    `errors[]` при HTTP 200, а не превращаются в падение роута.
 5. **Ничего не автозапускается.** Все процессы — внутри существующего жизненного
@@ -94,8 +95,8 @@ hermes plugins enable hermes-duty     # или Capabilities → Plugins в де�
 Из каталога плагина (`cd ~/.hermes/plugins/hermes-duty`):
 
 ```bash
-~/.hermes/bvenv/bin/python -m pytest -q     # 21 passed
-node --test tests/model.test.mjs            # 20 pass
+~/.hermes/bvenv/bin/python -m pytest -q     # 27 passed
+node --test tests/model.test.mjs            # 23 pass
 bin/duty-version check                      # OK
 ```
 
@@ -108,8 +109,8 @@ bin/duty-version check                      # OK
 `/health`, `/sources`, `/board/{slug}/tasks` на read-only источниках, агрегатор
 `GET /now` с таксономией ожиданий и фильтрами, таймлайн попыток
 `GET /duty/{board}/{id}/attempts`, desktop-страница `/duty` поверх них, регрессия
-(21 pytest + 20 node) и документация.
+(27 pytest + 23 node) и документация.
 
-Дальше (не сделано): отрисовка `truncated`/`warnings` доски, экраны «Почему стоит»
-и «Здоровье», CLI `bin/duty`, затем P1 — собственный журнал плагина вместо чтения
-kanban. План по версиям — `docs/DESIGN.md`, раздел «Дальше».
+Дальше (не сделано): экраны «Почему стоит» и «Здоровье», CLI `bin/duty`, затем
+P1 — собственный журнал плагина вместо чтения kanban. План по версиям —
+`docs/DESIGN.md`, раздел «Дальше».

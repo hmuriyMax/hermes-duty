@@ -29,6 +29,8 @@ SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
 
 
 def sh(*args: str) -> str:
+    if args[:1] != ("git",):
+        raise SystemExit(f"internal: sh() needs a git subcommand, got {args!r}")
     res = subprocess.run(args, cwd=ROOT, capture_output=True, text=True)
     if res.returncode != 0:
         raise SystemExit(f"git {' '.join(args)} failed: {res.stderr.strip()}")
@@ -123,7 +125,7 @@ def cmd_check() -> int:
     else:
         print(f"  · ветка не release/*: работа должна идти в release/v{read_version()}")
 
-    tags = sh("tag", "--list", "v*").split()
+    tags = sh("git", "tag", "--list", "v*").split()
     if f"v{read_version()}" in tags:
         print(f"  · тег v{read_version()} уже стоит: версия финализирована")
     print()
@@ -166,7 +168,7 @@ def cmd_finalize(push: bool) -> int:
             print(f"✗ {p}")
         return 1
 
-    tip = sh("rev-parse", "HEAD")
+    tip = sh("git", "rev-parse", "HEAD")
     main_is_ancestor = subprocess.run(
         ["git", "merge-base", "--is-ancestor", "origin/main", tip], cwd=ROOT
     ).returncode == 0
@@ -187,11 +189,11 @@ def cmd_finalize(push: bool) -> int:
         print("\nплан напечатан, ничего не сделано (добавьте --push)")
         return 0
 
-    sh("switch", "main")
-    sh("merge", "--ff-only", f"release/v{version}")
-    sh("tag", "-a", f"v{version}", "-m", f"hermes-duty {version}")
-    sh("push", "origin", "main")
-    sh("push", "origin", f"v{version}")
+    sh("git", "switch", "main")
+    sh("git", "merge", "--ff-only", f"release/v{version}")
+    sh("git", "tag", "-a", f"v{version}", "-m", f"hermes-duty {version}")
+    sh("git", "push", "origin", "main")
+    sh("git", "push", "origin", f"v{version}")
     print(f"\n✓ v{version} опубликована; следующая версия:")
     print(f"  git switch -c release/vNEXT && bin/duty-version bump NEXT && git push -u origin release/vNEXT")
     return 0

@@ -4,6 +4,5 @@
   "description": "P0-наблюдаемость: лизинги, процессы и последнее действие по каждому делу. Только чтение.",
   "icon": "GitPullRequest",
   "version": "0.1.0",
-  "tab": { "path": "/duty", "hidden": false },
   "api": "plugin_api.py"
 }

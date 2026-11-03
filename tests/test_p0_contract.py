@@ -88,6 +88,9 @@ CREATE TABLE questions (
 """
 
 # Эталон формы: пути ключей ответа (массивы — по первому элементу).
+# 0.0.3: `/health` дополнен блоком `journal: {events, deals, drift: {empty_journal}}`
+# — расхождение журнала и kanban видно числом, а не на глаз (docs/JOURNAL.md,
+# инвариант 5). Это осознанное расширение формы: 11 ключей → 16.
 HEALTH_KEYS = {
     "ok",
     "version",
@@ -99,6 +102,11 @@ HEALTH_KEYS = {
     "pool",
     "pool.present",
     "pool.total",
+    "journal",
+    "journal.events",
+    "journal.deals",
+    "journal.drift",
+    "journal.drift.empty_journal",
     "mode",
 }
 
@@ -203,13 +211,32 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
 
 
 def test_health_shape_matches_baseline(client: TestClient) -> None:
-    """`/health` — 11 ключей, как в baseline `fd6d102`."""
+    """`/health` — 16 ключей: baseline 11 плюс `journal.*` (0.0.3)."""
     response = client.get("/health")
 
     assert response.status_code == 200
     keys = shape(response.json())
-    assert len(keys) == 11
+    assert len(keys) == 16
     assert keys == HEALTH_KEYS
+
+
+def test_health_journal_drift_counts_deals_without_events(client: TestClient, tmp_path: Path) -> None:
+    """Журнала ещё нет → 0 событий и все активные дела в расхождении (не «всё хорошо»)."""
+    journal = client.get("/health").json()["journal"]
+
+    assert journal == {"events": 0, "deals": 0, "drift": {"empty_journal": 1}}
+    # `/health` не создаёт файл журнала как побочный эффект чтения.
+    assert not (tmp_path / "hermes" / "duty" / "duty.db").exists()
+
+
+def test_now_does_not_create_or_write_the_journal(client: TestClient, tmp_path: Path) -> None:
+    """Срез без `?ingest=1` ничего не пишет: журнал не появляется даже файлом."""
+    body = client.get("/now").json()
+
+    assert body["count"] == 1
+    assert body["errors"] == []
+    assert body["deals"][0]["waiting"]["evidence"].startswith("journal: empty — состояние из kanban")
+    assert not (tmp_path / "hermes" / "duty" / "duty.db").exists()
 
 
 def test_sources_shape_matches_baseline(client: TestClient) -> None:

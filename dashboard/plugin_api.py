@@ -1,8 +1,15 @@
 """Hermes Duty — backend desktop-плагина «Дела».
 
-P0: только чтение. Плагин открывает живые источники в режиме `?mode=ro` и
-показывает, что в них есть, — он ничего не пишет ни в kanban, ни в pool, ни в
-state.db, и не пересчитывает статусы карточек.
+С 0.0.3 состояние дела считается не по колонкам kanban, а по **своему журналу
+событий** (`dashboard/journal.py`, контракт `docs/JOURNAL.md`):
+`waiting = fold(events)`. Журнал живёт в `$HERMES_HOME/duty/duty.db` и принадлежит
+плагину; чужие БД (`kanban.db`, `state.db`, `pool.db`) по-прежнему открываются
+только `?mode=ro`, и срез в них ничего не пишет.
+
+Единственное место, где плагин пишет, — свой журнал, и только по явному
+требованию: `POST /ingest` или `GET /now?ingest=1`. Проход ingest читает kanban
+на чтение, сравнивает с журналом и дописывает недостающие события; повторный
+проход — no-op. Без этого флага ни один роут не создаёт и не меняет файлов.
 
 Маршруты монтируются как `/api/plugins/hermes-duty/<...>`.
 
@@ -11,23 +18,27 @@ state.db, и не пересчитывает статусы карточек.
 - `kanban.db` в корне — живая БД доски `default` (остальные доски лежат в
   `kanban/boards/<slug>/kanban.db`);
 - `messaging/pool.db` — пул вопросов (для таксономии ожиданий, тоже только чтение);
-- `profiles/<role>/state.db` — сессии, из которых берётся «последнее действие».
+- `profiles/<role>/state.db` — сессии, из которых берётся «последнее действие»;
+- `duty/duty.db` — свой журнал (читается всеми, пишется только ingest).
 
 Ядро kanban и его диспетчер не импортируются: P0 не должен зависеть от кода,
 который мы собираемся заменить.
 
 Экран «сейчас» (`/now`) и таймлайн попыток (`/duty/{board}/{task_id}/attempts`)
-считаются здесь же, по тем же read-only источникам: состояние ожидания дела
-выводится из набора фактов (лизинг, pid, heartbeat, граф зависимостей, пул
-вопросов, исход последнего рана), а не из одной колонки `status`.
+считаются здесь же: состояние ожидания дела выводится fold'ом по событиям
+журнала, а дело, которого в журнале ещё нет, — по набору фактов kanban (лизинг,
+pid, heartbeat, граф зависимостей, пул вопросов, исход последнего рана) с честной
+пометкой в `waiting.evidence`, откуда состояние взято.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
 import sqlite3
+import sys
 import time
 from contextlib import closing
 from pathlib import Path
@@ -35,6 +46,30 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.routing import APIRoute
+
+# `dashboard/journal.py` рядом с этим файлом. Плагин грузит `plugin_api.py` как
+# отдельный модуль (`spec_from_file_location`), пакета у него нет, поэтому
+# относительный импорт невозможен: соседний файл берём по пути и кладём в
+# `sys.modules` под стабильным именем — второй загрузки в процессе не будет.
+JOURNAL_MODULE_NAME = "hermes_duty_journal"
+
+
+def _load_journal() -> Any:
+    """Загрузить `dashboard/journal.py` (журнал событий и fold по контракту)."""
+    loaded = sys.modules.get(JOURNAL_MODULE_NAME)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / "journal.py"
+    spec = importlib.util.spec_from_file_location(JOURNAL_MODULE_NAME, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise ImportError(f"journal module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[JOURNAL_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+journal = _load_journal()
 
 
 # Один набор заголовков на все ответы: и 200, и ошибки. Кэш промежуточного
@@ -286,7 +321,15 @@ def _pool_summary(home: Path) -> Optional[dict[str, Any]]:
 
 @router.get("/health")
 def health() -> dict[str, Any]:
-    """Живая проверка: плагин смонтирован и источники читаются на чтение."""
+    """Живая проверка: плагин смонтирован и источники читаются на чтение.
+
+    `journal` — состояние своего журнала: `events` (строк), `deals` (дел с
+    событиями) и `drift.empty_journal` — сколько активных дел kanban журнал ещё
+    не подобрал. Это число, а не «всё хорошо»: пока оно больше нуля, состояние
+    этих дел считается по kanban, и расхождение видно счётчиком. `/health`
+    журнал не создаёт и не пишет: нет файла — значит событий 0, а в расхождении
+    все активные дела, и это правда.
+    """
     home = _hermes_home()
     boards = _discover_boards(home)
     readable = [b for b in boards if _table_exists(Path(b["path"]), "tasks")]
@@ -304,8 +347,51 @@ def health() -> dict[str, Any]:
             ),
         },
         "pool": {"present": pool is not None, "total": (pool or {}).get("total", 0)},
+        "journal": _journal_health(home, readable),
         "mode": "read-only",
     }
+
+
+def _journal_health(home: Path, boards: list[dict[str, Any]]) -> dict[str, Any]:
+    """`{events, deals, drift: {empty_journal}}` — сколько журнал знает и чего не догнал.
+
+    `drift.empty_journal` — активные дела kanban без единого события в журнале:
+    именно им состояние считается по kanban (правило 7 контракта), и пока ingest
+    их не подобрал, число больше нуля. Нечитаемый журнал тоже виден (поле `note`),
+    а не выдаётся за пустой: «ноль событий» и «журнал не открылся» — разные вещи.
+    """
+    active: set[str] = set()
+    for entry in boards:
+        rows, _ = _query_checked(
+            Path(entry["path"]),
+            "SELECT id FROM tasks WHERE status NOT IN (?, ?)",
+            TERMINAL_STATUSES,
+        )
+        active.update(str(row.get("id")) for row in rows)
+    try:
+        conn = journal.open_journal(home, create=False)
+    except Exception as exc:  # noqa: BLE001 - свой журнал не открылся
+        return {
+            "events": 0,
+            "deals": 0,
+            "drift": {"empty_journal": len(active)},
+            "note": f"journal unreadable: {type(exc).__name__}: {exc}",
+        }
+    if conn is None:
+        return {"events": 0, "deals": 0, "drift": {"empty_journal": len(active)}}
+    try:
+        totals = journal.counts(conn)
+        known = journal.deal_ids(conn)
+    except Exception as exc:  # noqa: BLE001 - битый журнал
+        return {
+            "events": 0,
+            "deals": 0,
+            "drift": {"empty_journal": len(active)},
+            "note": f"journal unreadable: {type(exc).__name__}: {exc}",
+        }
+    finally:
+        conn.close()
+    return {"events": totals["events"], "deals": totals["deals"], "drift": {"empty_journal": len(active - known)}}
 
 
 @router.get("/sources")
@@ -365,18 +451,13 @@ def board_tasks(slug: str) -> dict[str, Any]:
 # должен действовать), чтобы у активного дела состояние было всегда.
 
 # Терминальные статусы: такие карточки в `/now` не попадают — это не «дела сейчас».
-TERMINAL_STATUSES = ("done", "archived")
+# Набор один на весь бэкенд: fold читает его из журнала, а не держит второй копии —
+# разъехавшийся набор закрывал бы дела не там, где их закрывает состояние.
+TERMINAL_STATUSES = journal.TERMINAL_STATUSES
 
-WAITING_PRIORITY = (
-    "wait_human",
-    "capability",
-    "dead_lease",
-    "crashed",
-    "working",
-    "no_signal",
-    "wait_slot",
-    "wait_gate",
-)
+# Порядок таксономии — тоже один: fold выбирает победителя по нему, поверхность
+# по нему же сортирует и группирует. Вторая копия здесь разошлась бы с журналом.
+WAITING_PRIORITY = journal.WAITING_PRIORITY
 
 # Ран считается живым, только если heartbeat не старше этого порога.
 HEARTBEAT_FRESH_SEC = 300
@@ -390,18 +471,7 @@ GATE_STATUSES = ("todo", "ready")
 
 # Слова, по которым причина блока читается как «нужен доступ или права» —
 # нужны только если причина блока пришла без typed-колонки `block_kind`.
-CAPABILITY_WORDS = (
-    "доступ",
-    "права",
-    "прав.",
-    "разрешени",
-    "permission",
-    "access",
-    "credential",
-    "token",
-    "forbidden",
-    "403",
-)
+CAPABILITY_WORDS = journal.CAPABILITY_WORDS
 
 # Остаточная ветка: статус, для которого ни один факт не сработал. Ключ — что
 # записано в `tasks.status`, значение — состояние и объяснение, кто должен
@@ -454,19 +524,13 @@ def _age_sec(at: Optional[int], now: int) -> Optional[int]:
 
 
 def _pid_alive(pid: Optional[int]) -> Optional[bool]:
-    """Честная проверка живости pid: None — pid неизвестен, иначе ответ ядра."""
-    if not pid:
-        return None
-    try:
-        os.kill(int(pid), 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # Процесс есть, но он не наш: значит живой.
-        return True
-    except OSError:
-        return None
-    return True
+    """Честная проверка живости pid: None — pid неизвестен, иначе ответ ядра.
+
+    Реализация одна на бэкенд — в журнале (`journal.pid_alive`): fold проверяет
+    тот же pid по тем же правилам, и вторая копия `os.kill` разошлась бы с ним в
+    трактовке `EPERM`.
+    """
+    return journal.pid_alive(pid)
 
 
 def _pid_text(pid: Optional[int], pid_alive: Optional[bool]) -> str:
@@ -476,11 +540,7 @@ def _pid_text(pid: Optional[int], pid_alive: Optional[bool]) -> str:
     и одна из них называет «живым» то, чего не проверяла. `pid_alive=False` сюда не
     доходит: обе ветки отсекают мёртвый pid раньше — это отдельный факт `dead_lease`.
     """
-    if not pid:
-        return "pid не записан"
-    if pid_alive is True:
-        return f"pid {pid} жив"
-    return f"состояние pid {pid} неизвестно"
+    return journal.pid_text(pid, pid_alive)
 
 
 def _payload_summary(payload: Optional[str]) -> Optional[str]:
@@ -737,8 +797,119 @@ def _waiting(
     return {"state": state, "evidence": evidence}
 
 
+# --------------------------------------------------- журнал событий (0.0.3)
+#
+# Состояние дела считается fold'ом по событиям своего журнала (контракт
+# `docs/JOURNAL.md`). Kanban-факты (`_waiting` выше) остаются нужны в двух
+# случаях: журнал по делу пуст (правило 7 контракта) и журнал есть, но живого
+# факта в нём нет — например, у дела было только `created`. В обоих случаях
+# состояние считается по kanban, а `waiting.evidence` начинается с того, откуда
+# оно взято: «нет данных в журнале» нельзя показывать как «всё спокойно».
+
+# Имя источника в `errors[]`/`evidence`, когда свой журнал не читается.
+JOURNAL_SOURCE = "duty/duty.db"
+
+
+def _journal_context(
+    home: Path, boards: list[dict[str, Any]], *, ingest: bool = False
+) -> tuple[dict[str, list[dict[str, Any]]], Optional[str], list[dict[str, str]]]:
+    """События журнала по делам; при `ingest` — сначала проход ingest.
+
+    Читающие роуты журнал не пишут и файла не создают (`create=False`): иначе
+    «открыл экран» и «включил журнал» стали бы одним действием, а срез отвечал бы
+    за запись. Недоступный журнал не валит ответ: причина уходит в `errors`, а
+    состояние дел считается по kanban с пометкой в `evidence`.
+    """
+    try:
+        conn = journal.open_journal(home, create=ingest)
+    except Exception as exc:  # noqa: BLE001 - свой журнал не открылся
+        reason = f"{type(exc).__name__}: {exc}"
+        return {}, f"journal: недоступен ({reason}) — состояние из kanban", [
+            {"board": JOURNAL_SOURCE, "reason": reason}
+        ]
+    if conn is None:  # журнала ещё нет — это пустой журнал, а не ошибка
+        return {}, None, []
+    errors: list[dict[str, str]] = []
+    try:
+        if ingest:
+            report = journal.ingest(conn, home, boards)
+            errors.extend(report.get("errors") or [])
+        by_deal: dict[str, list[dict[str, Any]]] = {}
+        for event in journal.read_events(conn):
+            by_deal.setdefault(str(event["deal_id"]), []).append(event)
+        return by_deal, None, errors
+    except Exception as exc:  # noqa: BLE001 - битый/занятый журнал
+        reason = f"{type(exc).__name__}: {exc}"
+        return {}, f"journal: недоступен ({reason}) — состояние из kanban", [
+            {"board": JOURNAL_SOURCE, "reason": reason}
+        ]
+    finally:
+        conn.close()
+
+
+def _deal_waiting(
+    folded: dict[str, Any],
+    kanban_waiting: dict[str, str],
+    question: Optional[dict[str, Any]],
+    journal_note: Optional[str],
+) -> dict[str, Any]:
+    """`waiting` дела: журнал первым, kanban — только с честной пометкой, откуда факт.
+
+    `human_kind` отделяет два разных «нужен человек»: `question` — ждёт ответа на
+    вопрос, `status` — ждёт решения по статусу (блок, разбор, ревью, мердж). Это
+    закрывает п.5 заметки 0.0.2, где оба случая назывались «ждёт ответа».
+    """
+    if folded["state"] is not None:
+        return _journal_waiting(folded, question)
+    if journal_note:
+        head = journal_note
+    elif folded["reason"] == "empty":
+        head = "journal: empty — состояние из kanban"
+    else:
+        head = (
+            f"journal: нет живых фактов (последнее событие: {folded['last_kind'] or '—'}) "
+            f"— состояние из kanban"
+        )
+    state = kanban_waiting["state"]
+    return {
+        "state": state,
+        "evidence": f"{head}; {kanban_waiting['evidence']}",
+        "human_kind": "question" if question is not None else ("status" if state == "wait_human" else None),
+    }
+
+
+def _journal_waiting(folded: dict[str, Any], question: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Состояние из журнала плюс живой вопрос пула, которого журнал ещё не знает.
+
+    `ask()` станет единственным каналом вопросов и будет писать `question_asked`
+    в журнал (W2). Пока журнал вопросов не знает, живой вопрос пула — факт, а не
+    догадка, и он важнее прочих состояний (приоритет 1 таксономии); в `evidence`
+    при этом сказано, что факт из пула, а не из журнала.
+    """
+    state = folded["state"]
+    human_kind = folded["human_kind"]
+    if question is None or human_kind == "question":
+        return {"state": state, "evidence": folded["evidence"], "human_kind": human_kind}
+    pool_fact = (
+        f"пул: вопрос #{question.get('id')} status='{question.get('status')}' "
+        f"origin='{question.get('origin')}' — в журнале вопроса нет"
+    )
+    if state != "wait_human":
+        return {
+            "state": "wait_human",
+            "evidence": f"{pool_fact}; ещё: {state}: {folded['evidence']}",
+            "human_kind": "question",
+        }
+    return {"state": state, "evidence": f"{folded['evidence']}; ещё: {pool_fact}", "human_kind": "question"}
+
+
 def _board_deals(
-    entry: dict[str, Any], now: int, questions: dict[str, dict[str, Any]], pool_note: Optional[str]
+    entry: dict[str, Any],
+    now: int,
+    questions: dict[str, dict[str, Any]],
+    pool_note: Optional[str],
+    journal_events: dict[str, list[dict[str, Any]]],
+    journal_note: Optional[str] = None,
 ) -> dict[str, Any]:
     """Активные дела одной доски с лизингом, попыткой, последним действием и ожиданием.
 
@@ -746,6 +917,10 @@ def _board_deals(
     `errors` ответа (исключение не перехватывается здесь — его тип и текст важны
     для причины). Провал вспомогательных таблиц (`task_runs`, `task_events`,
     `task_links`) деградирует факты и уходит в `warnings` доски, а не в ошибку.
+
+    Дело, у которого последнее событие журнала — `completed` (правило 2
+    контракта), в срез не попадает: журнал говорит, что дело закрыто. Расхождение
+    с kanban при этом не молчит — дело называется в `warnings` доски.
     """
     slug = str(entry["slug"])
     path = Path(entry["path"])
@@ -836,6 +1011,7 @@ def _board_deals(
             slots.setdefault(str(row.get("assignee") or ""), str(row.get("id")))
 
     deals: list[dict[str, Any]] = []
+    closed: list[str] = []
     for task in tasks:
         task_id = str(task.get("id"))
         runs = runs_by_task.get(task_id, [])
@@ -849,16 +1025,31 @@ def _board_deals(
         event = suspenders.get(task_id)
         assignee = task.get("assignee")
         slot_holder = slots.get(str(assignee or ""))
-        waiting = _waiting(
-            task,
-            attempt,
-            lease,
-            last_run,
-            parents_of.get(task_id, []),
-            None if slot_holder == task_id else slot_holder,
-            questions.get(task_id),
-            block_reasons.get(task_id, ""),
-            pool_note,
+        question = questions.get(task_id)
+        folded = journal.fold(journal_events.get(task_id, []), now=now)
+        if not folded["active"]:
+            # Правило 2: журнал говорит, что дело закрыто. В срез оно не идёт, но и
+            # не исчезает молча — расхождение с kanban названо в warnings доски.
+            closed.append(
+                f"дело {task_id}: в журнале completed, а kanban status={task.get('status')} — "
+                f"в срез не попало (правило 2 fold)"
+            )
+            continue
+        waiting = _deal_waiting(
+            folded,
+            _waiting(
+                task,
+                attempt,
+                lease,
+                last_run,
+                parents_of.get(task_id, []),
+                None if slot_holder == task_id else slot_holder,
+                question,
+                block_reasons.get(task_id, ""),
+                pool_note,
+            ),
+            question,
+            journal_note,
         )
         deals.append(
             {
@@ -899,13 +1090,17 @@ def _board_deals(
         "slug": slug,
         "path": str(path),
         "deals": deals,
-        "warnings": warnings,
+        "warnings": warnings + closed,
         "truncated": len(tasks) >= DEAL_LIMIT,
     }
 
 
 def collect_now(
-    home: Path, now: int, board: Optional[str] = None, state: Optional[str] = None
+    home: Path,
+    now: int,
+    board: Optional[str] = None,
+    state: Optional[str] = None,
+    ingest: bool = False,
 ) -> dict[str, Any]:
     """Срез «сейчас» по всем доскам: активные дела, отсортированные по таксономии.
 
@@ -913,16 +1108,23 @@ def collect_now(
     возраст текущей попытки по убыванию, затем `id` — иначе UI дёргается между
     опросами. Доска, у которой не читается `tasks`, пропускается и попадает в
     `errors`; ответ при этом остаётся 200.
+
+    `waiting` считается fold'ом по журналу (правило 7 контракта — исключение:
+    дело без событий считается по kanban, и это сказано в `evidence`). `ingest`
+    запускает проход в свой журнал до сбора среза; без него срез ничего не пишет.
     """
-    scope = [b for b in _discover_boards(home) if board is None or b["slug"] == board]
+    boards = _discover_boards(home)
+    scope = [entry for entry in boards if board is None or entry["slug"] == board]
     questions, pool_note, pool_errors = _pool_context(home)
     errors: list[dict[str, str]] = list(pool_errors)
+    journal_events, journal_note, journal_errors = _journal_context(home, boards, ingest=ingest)
+    errors.extend(journal_errors)
 
-    boards: list[dict[str, Any]] = []
+    boards_out: list[dict[str, Any]] = []
     deals: list[dict[str, Any]] = []
     for entry in scope:
         try:
-            collected = _board_deals(entry, now, questions, pool_note)
+            collected = _board_deals(entry, now, questions, pool_note, journal_events, journal_note)
         except Exception as exc:  # noqa: BLE001 - любая ошибка доски не валит срез
             # Тип исключения важен: `ValueError` из чужой схемы (`int('soon')` по
             # `claim_expires`) иначе не отличить от сбоя БД. RuntimeError несёт
@@ -937,9 +1139,9 @@ def collect_now(
             }
             if entry.get("note"):
                 unread["note"] = entry["note"]
-            boards.append(unread)
+            boards_out.append(unread)
             continue
-        boards.append(
+        boards_out.append(
             {
                 "slug": collected["slug"],
                 "path": collected["path"],
@@ -972,7 +1174,7 @@ def collect_now(
         "deals": deals,
         "by_state": by_state,
         "crash_outcomes": list(CRASH_OUTCOMES),
-        "boards": boards,
+        "boards": boards_out,
         "errors": errors,
     }
 
@@ -1209,7 +1411,8 @@ def deal(board: str, task_id: str) -> dict[str, Any]:
     shaped: Optional[dict[str, Any]] = None
     if not terminal:
         questions, pool_note, _ = _pool_context(home)
-        collected = _board_deals(entry, now, questions, pool_note)
+        journal_events, journal_note, _ = _journal_context(home, [])
+        collected = _board_deals(entry, now, questions, pool_note, journal_events, journal_note)
         shaped = next((item for item in collected["deals"] if item["id"] == task_id), None)
     body = task.get("body") or ""
     return {
@@ -1236,11 +1439,14 @@ def _board_entry(home: Path, slug: str) -> dict[str, Any]:
 
 
 @router.get("/now")
-def now(board: Optional[str] = None, state: Optional[str] = None) -> dict[str, Any]:
+def now(board: Optional[str] = None, state: Optional[str] = None, ingest: bool = False) -> dict[str, Any]:
     """Активные дела всех досок: лизинг, попытка, последнее действие, ожидание.
 
     `?board=<slug>` — только одна доска (404, если её нет);
-    `?state=<waiting.state>` — только дела в этом состоянии ожидания.
+    `?state=<waiting.state>` — только дела в этом состоянии ожидания;
+    `?ingest=1` — сначала прогнать ingest в свой журнал (тот же проход, что
+    `POST /ingest`, только без отчёта). Без флага срез ничего не пишет: журнал
+    открывается на чтение и файла не создаёт.
     """
     if state is not None and state not in WAITING_PRIORITY:
         raise HTTPException(
@@ -1251,7 +1457,35 @@ def now(board: Optional[str] = None, state: Optional[str] = None) -> dict[str, A
     home = _hermes_home()
     if board is not None:
         _board_entry(home, board)
-    return collect_now(home, _now_sec(), board=board, state=state)
+    return collect_now(home, _now_sec(), board=board, state=state, ingest=ingest)
+
+
+@router.post("/ingest")
+def ingest_now() -> dict[str, Any]:
+    """Проход ingest по требованию: дописать в свой журнал недостающие события.
+
+    Единственный роут, который пишет, и пишет он только в `duty/duty.db`.
+    Источники (`kanban.db`, `state.db`, `pool.db`) открываются `mode=ro` —
+    инвариант «в kanban не пишем» проверяется тестом по `mtime`.
+
+    Повторный вызов — no-op: `appended: 0` (`INSERT OR IGNORE` по
+    `idempotency_key`). Ответ — отчёт прохода: сколько строк добавлено, по каким
+    доскам, что не прочиталось (`errors[]`). Тот же проход доступен как
+    `GET /now?ingest=1`.
+    """
+    home = _hermes_home()
+    try:
+        conn = journal.open_journal(home)
+    except Exception as exc:  # noqa: BLE001 - свой журнал не открылся
+        raise HTTPException(
+            status_code=503,
+            headers=NO_STORE_HEADERS,
+            detail=f"journal unreadable: {type(exc).__name__}: {exc}",
+        ) from exc
+    try:
+        return journal.ingest(conn, home, _discover_boards(home))
+    finally:
+        conn.close()
 
 
 @router.get("/duty/{board}/{task_id}/attempts")

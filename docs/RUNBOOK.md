@@ -85,9 +85,14 @@ app.include_router(mod.router, prefix="/api/plugins/hermes-duty")
 client = TestClient(app)
 
 print(client.get("/api/plugins/hermes-duty/health").json())
-# {'ok': True, 'version': '0.0.1', 'hermes_home': '/Users/…/.hermes',
+# {'ok': True, 'version': '0.0.3', 'hermes_home': '/Users/…/.hermes',
 #  'kanban': {'databases': 19, 'readable': 19, 'task_rows': N},
-#  'pool': {'present': True, 'total': N}, 'mode': 'read-only'}
+#  'pool': {'present': True, 'total': N},
+#  'journal': {'events': 16, 'deals': 12, 'drift': {'empty_journal': 0}},
+#  'mode': 'read-only'}
+
+# Проход ingest в свой журнал: единственное, что плагин пишет (только duty/duty.db).
+print(client.post("/api/plugins/hermes-duty/ingest").json()["appended"])   # 16, потом 0
 
 now = client.get("/api/plugins/hermes-duty/now").json()
 print(now["count"], now["by_state"], now["errors"], len(now["boards"]))
@@ -119,6 +124,11 @@ if now["deals"]:
 | `warnings[]` в `/stats` не пуст | срез доски обрезан `STATS_TASK_LIMIT = 5000` задач: `totals.waiting_sec` и доля первой попытки посчитаны по неполной выборке; на странице «Здоровье» это строка `доска <slug>: срез обрезан лимитом …` над KPI |
 | `errors[]` с `board: "messaging/pool.db"` и `reason: "questions truncated: …"` | живых вопросов в пуле больше `QUESTION_LIMIT = 200`: вопрос этого дела мог не войти в срез, в `waiting.evidence` стоит «факт wait_human не проверен» |
 | `by_state` в ответе | счётчики по состояниям считаются до фильтра `?state=` |
+| `journal: empty — состояние из kanban` в начале `waiting.evidence` | дела нет в журнале (или в журнале нет живого факта): состояние посчитано по kanban, и это сказано словами; `POST /ingest` подберёт дело, и пометка уйдёт |
+| `journal.drift.empty_journal` больше нуля в `/health` | столько активных дел журнал ещё не видел; после `POST /ingest` число падает до нуля. Пока оно больше нуля, состояние этих дел — из kanban |
+| `journal.note` в `/health` | свой журнал не открылся — это не «ноль событий», причина названа |
+| `waiting.human_kind` | `question` — ждёт ответа на вопрос пула; `status` — ждёт решения по статусу (блок, разбор, ревью, мердж) |
+| `boards[].warnings[]` строкой `дело t_…: в журнале completed, а kanban status=…` | журнал говорит, что дело закрыто (правило 2 fold), и оно не попало в срез — расхождение названо, а не скрыто |
 | 400 на `/now?state=…` | состояние не из таксономии (`wait_human`, `capability`, `dead_lease`, `crashed`, `working`, `no_signal`, `wait_slot`, `wait_gate`) |
 | 404 на `/now?board=…` | такой доски нет |
 | два `boards[]` со slug `default` | в `kanban/boards/` есть каталог `default` — он идёт отдельной записью рядом с корневой БД |
@@ -127,7 +137,7 @@ if now["deals"]:
 
 ```bash
 cd ~/.hermes/plugins/hermes-duty
-~/.hermes/hermes-agent/venv/bin/python -m pytest -q      # 46 passed
+~/.hermes/hermes-agent/venv/bin/python -m pytest -q      # 88 passed
 ```
 
 Новые кейсы 0.0.2 — `tests/test_screens.py`: `/deal` (активное дело, завершённое
@@ -135,6 +145,13 @@ cd ~/.hermes/plugins/hermes-duty
 недоступная доска, выборка без ранов). Кейсы 0.0.3 там же: распределение ожидания
 (p50/p90/p99 на 1..10 и на объединённой выборке, один элемент, пустая выборка,
 обрезанная доска в `warnings[]`).
+
+Кейсы журнала 0.0.3 — `tests/test_journal.py`: схема по контракту (`events`,
+`UNIQUE(idempotency_key)`, индекс `(deal_id, id)`, WAL, `busy_timeout=2000`),
+`fold` без единой БД (инвариант 4), правила 1–7 (включая `human_kind` и tri-state
+pid), повторный ingest → `0` новых строк и тот же `fold` (инвариант 3), `mtime`
+`kanban.db`/`state.db` не меняется (инвариант 1), `drift.empty_journal` падает
+после ingest, а `GET /now` без `?ingest=1` журнал не создаёт.
 
 `python3 -m pytest` из системы падает с `No module named pytest` — это окружение,
 а не плагин: нужен venv, где `fastapi` и `pytest` стоят.

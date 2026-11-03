@@ -359,6 +359,12 @@ def health() -> dict[str, Any]:
     home = _hermes_home()
     boards = _discover_boards(home)
     readable = [b for b in boards if _table_exists(Path(b["path"]), "tasks")]
+    # Доски, которые не попали в `readable`, не считают свой drift ни в одну
+    # сторону: без имени это выглядело бы как «расхождений нет». Причина (включая
+    # `note` источника) идёт в `journal.note`, а не в тишину.
+    skipped = [
+        f"{b['slug']}: {b.get('note') or 'no tasks table'}" for b in boards if b not in readable
+    ]
     pool = _pool_summary(home)
     return {
         "ok": True,
@@ -373,51 +379,64 @@ def health() -> dict[str, Any]:
             ),
         },
         "pool": {"present": pool is not None, "total": (pool or {}).get("total", 0)},
-        "journal": _journal_health(home, readable),
+        "journal": _journal_health(home, readable, skipped),
         "mode": "read-only",
     }
 
 
-def _journal_health(home: Path, boards: list[dict[str, Any]]) -> dict[str, Any]:
+def _journal_health(
+    home: Path, boards: list[dict[str, Any]], skipped: Optional[list[str]] = None
+) -> dict[str, Any]:
     """`{events, deals, drift: {empty_journal}}` — сколько журнал знает и чего не догнал.
 
     `drift.empty_journal` — активные дела kanban без единого события в журнале:
     именно им состояние считается по kanban (правило 7 контракта), и пока ingest
-    их не подобрал, число больше нуля. Нечитаемый журнал тоже виден (поле `note`),
-    а не выдаётся за пустой: «ноль событий» и «журнал не открылся» — разные вещи.
+    их не подобрал, число больше нуля.
+
+    Непрочитанное не выдаётся за «расхождений нет»: доска, которую не удалось
+    прочитать (или у которой нет `tasks`), в `active` не попадает, поэтому её
+    дела не считаются ни в одну сторону — и это названо в `note`. Поле `note`
+    появляется только тогда, когда сказать есть что; при полностью читаемых
+    источниках ответ — ровно три ключа контракта.
     """
     active: set[str] = set()
+    unread: list[str] = list(skipped or [])
     for entry in boards:
-        rows, _ = _query_checked(
+        rows, err = _query_checked(
             Path(entry["path"]),
             "SELECT id FROM tasks WHERE status NOT IN (?, ?)",
             TERMINAL_STATUSES,
         )
+        if err:
+            unread.append(f"{entry.get('slug')}: {err}")
+            continue
         active.update(str(row.get("id")) for row in rows)
+
+    notes = [f"boards unreadable: {'; '.join(unread)}"] if unread else []
+    totals = {"events": 0, "deals": 0}
+    known: set[str] = set()
     try:
         conn = journal.open_journal(home, create=False)
     except Exception as exc:  # noqa: BLE001 - свой журнал не открылся
-        return {
-            "events": 0,
-            "deals": 0,
-            "drift": {"empty_journal": len(active)},
-            "note": f"journal unreadable: {type(exc).__name__}: {exc}",
-        }
-    if conn is None:
-        return {"events": 0, "deals": 0, "drift": {"empty_journal": len(active)}}
-    try:
-        totals = journal.counts(conn)
-        known = journal.deal_ids(conn)
-    except Exception as exc:  # noqa: BLE001 - битый журнал
-        return {
-            "events": 0,
-            "deals": 0,
-            "drift": {"empty_journal": len(active)},
-            "note": f"journal unreadable: {type(exc).__name__}: {exc}",
-        }
-    finally:
-        conn.close()
-    return {"events": totals["events"], "deals": totals["deals"], "drift": {"empty_journal": len(active - known)}}
+        conn = None
+        notes.append(f"journal unreadable: {type(exc).__name__}: {exc}")
+    if conn is not None:
+        try:
+            totals = journal.counts(conn)
+            known = journal.deal_ids(conn)
+        except Exception as exc:  # noqa: BLE001 - битый журнал
+            notes.append(f"journal unreadable: {type(exc).__name__}: {exc}")
+        finally:
+            conn.close()
+
+    answer: dict[str, Any] = {
+        "events": totals["events"],
+        "deals": totals["deals"],
+        "drift": {"empty_journal": len(active - known)},
+    }
+    if notes:
+        answer["note"] = "; ".join(notes)
+    return answer
 
 
 @router.get("/sources")
@@ -832,8 +851,9 @@ def _waiting(
 # состояние считается по kanban, а `waiting.evidence` начинается с того, откуда
 # оно взято: «нет данных в журнале» нельзя показывать как «всё спокойно».
 
-# Имя источника в `errors[]`/`evidence`, когда свой журнал не читается.
-JOURNAL_SOURCE = "duty/duty.db"
+# Имя источника в `errors[]`/`evidence`, когда свой журнал не читается. Одна копия
+# в `journal.py`: иначе путь к журналу разошёлся бы между модулями.
+JOURNAL_SOURCE = journal.JOURNAL_SOURCE
 
 
 def _journal_context(

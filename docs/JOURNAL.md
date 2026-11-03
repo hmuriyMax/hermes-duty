@@ -55,11 +55,13 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 | `attempt_ended` | ран закрыт | `run_id`, `outcome`, `error` |
 | `blocked` | `status=blocked` | `block_kind`, `reason` |
 | `unblocked` | был `blocked`, стал иной статус | `previous_kind` |
-| `completed` | `status=done` (или `archived` как отдельный факт) | `status` |
+| `completed` | `status=done` (или `archived` как отдельный факт: переносится тем же `completed` со `status="archived"`) | `status` |
 | `question_asked` | `ask()` создал вопрос в пуле | `question_id`, `session_key`, `critical`, `timeout` |
 | `question_answered` | ответ найден в пуле | `question_id`, `answer_len`, `answered_via` |
 
 Набор закрыт: новый `kind` добавляется вместе с правилом fold и тестом, а не «по пути».
+Закрытость держится кодом, а не дисциплиной: `append()` отвергает `kind` вне набора
+(`ValueError`) до записи, поэтому «почти записанной» пачки в журнале не остаётся.
 
 ## Идемпотентность
 
@@ -84,6 +86,9 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 1. События применяются в порядке `id`.
 2. Если последнее событие `completed`/`archived` — дело не активно, в `/now` не попадает.
 3. `blocked` без последующего `unblocked` → `wait_human` с `evidence` из payload.
+   Исключение — доступ и права: `block_kind='capability'` (или причина блока со словом
+   из `CAPABILITY_WORDS`) даёт состояние `capability`, а не `wait_human`: человек тут
+   не решает, а даёт доступ. Таксономия — `docs/DESIGN.md`.
 4. `claimed` без `attempt_started` старше `CLAIM_STALE_SEC` (сейчас 900) → `dead_lease`.
 5. `attempt_started` без `attempt_ended`, pid мёртв → `crashed`; pid не читается →
    `no_signal` (tri-state, как в 0.0.2).
@@ -93,6 +98,10 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 7. Пустой журнал (дела нет в событиях) → состояние считается по kanban как раньше, а
    `evidence` честно говорит `journal: empty — состояние из kanban`. Такие дела
    считаются в `/health.drift.empty_journal`, пока ingest их не подберёт.
+8. От дела остался только снимок `created`, и в нём есть родители → `wait_gate`.
+   Закрытие родителей видно в их собственных событиях, а не в этих, поэтому факт
+   назван снимком («родители на момент created»), а не сегодняшним состоянием графа.
+   Правило 8 — расширение таксономии `docs/DESIGN.md`, не отмена правил 1–7.
 
 ## Ingest
 
@@ -141,6 +150,13 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 Так закрывается п.5 заметки 0.0.2: дело без вопроса больше не выдаёт себя за «ждёт
 ответа» — у него `waiting.human_kind="status"`, а после `ask()` — `"question"`.
 
+Живой вопрос пула, о котором журнал ещё не знает (вопрос задал другой продюсер пула,
+`sync_answers`/`ingest` до него ещё не дошли), тоже считается фактом: поверхность
+поднимает дело до `wait_human` с `human_kind="question"` и пишет в `evidence`, что
+факт из пула, а не из журнала («в журнале вопроса нет»). Это не вторая правда о
+состоянии, а честно подписанный источник факта — иначе вопрос без ответа выглядел бы
+как «человеку ничего не нужно».
+
 ## Инварианты (проверяются тестами)
 
 1. Ни одной записи в `kanban.db`/`state.db`: mtime до и после сценария совпадает.
@@ -148,7 +164,9 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 3. Повторный ingest не плодит событий (идемпотентность).
 4. `fold` не читает БД: на вход только список событий.
 5. В `/health` есть `journal: {events, deals, drift: {empty_journal}}` — расхождение
-   журнала и kanban видно числом, а не на глаз.
+   журнала и kanban видно числом, а не на глаз. Нечитаемая доска или нечитаемый
+   журнал добавляет поле `note` с причиной: `drift.empty_journal = 0` при
+   непрочитанном источнике — это «не проверено», а не «всё хорошо».
 6. Второй `ask()` по тому же делу не создаёт второй строки в пуле: возвращается
    `question_id` живого вопроса и одно событие `question_asked`.
 7. Сбой пула (нет файла / только на чтение) не пишет события и уходит в `errors[]`;

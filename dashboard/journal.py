@@ -8,8 +8,9 @@
 Границы модуля по контракту:
 
 - журнал — собственность плагина: `$HERMES_HOME/duty/duty.db`, режим WAL;
-- чужие БД (`kanban.db`, `state.db`, `pool.db`) открываются только на чтение
-  (`connect_ro` — единственное место, где этот модуль их касается), а пишем мы
+- чужие БД (`kanban.db`, `state.db`) открываются только на чтение
+  (`connect_ro` — единственное место, где этот модуль их касается); пул вопросов
+  (`pool.db`) пишет только `ask()`, этот модуль его не открывает вовсе — пишем мы
   исключительно в свой журнал;
 - `fold` — чистая функция: на вход список событий, на выход состояние ожидания.
   Ни БД, ни файлов она не открывает. Внешние факты, без которых правила 4–5
@@ -26,11 +27,16 @@ import sqlite3
 import time
 from contextlib import closing
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 # Каталог и файл журнала рядом с остальными БД Hermes: `duty/` — наш namespace.
 JOURNAL_SUBDIR = "duty"
 JOURNAL_FILE = "duty.db"
+
+# Имя источника в `errors[]`, когда не читается свой журнал: путь, как у остальных
+# источников (`messaging/pool.db`), а не слаг доски — иначе «доска duty» читалась
+# бы как ещё одна доска kanban.
+JOURNAL_SOURCE = f"{JOURNAL_SUBDIR}/{JOURNAL_FILE}"
 
 # Сколько ждать чужую запись, а не сколько живёт запрос (как в `plugin_api`).
 BUSY_TIMEOUT_MS = 2000
@@ -182,10 +188,17 @@ def append(conn: sqlite3.Connection, events: Iterable[dict[str, Any]]) -> int:
     же фактами даёт 0, и это видно числом, а не на глаз. Пачка пишется одной
     транзакцией и в порядке `(ts, KIND_ORDER)` — потому что порядок применения в
     fold это порядок `id`, и он обязан совпадать с порядком фактов.
+
+    `kind` проверяется по закрытому набору `EVENT_KINDS`: набор, который держится
+    одной дисциплиной, — не набор. Неизвестный вид отвергается целиком до записи,
+    поэтому «почти записанная» пачка в журнале не остаётся.
     """
     ordered = sorted(events, key=lambda ev: (int(ev["ts"]), _kind_rank(str(ev["kind"]))))
     if not ordered:
         return 0
+    for ev in ordered:
+        if str(ev["kind"]) not in EVENT_KINDS:
+            raise ValueError(f"unknown event kind {ev['kind']!r}: allowed {', '.join(EVENT_KINDS)}")
     rows = [
         (
             int(ev["ts"]),
@@ -249,7 +262,12 @@ def deal_ids(conn: sqlite3.Connection) -> set[str]:
 # ------------------------------------------------------------------ fold
 
 
-def fold(events: Iterable[dict[str, Any]], *, now: Optional[int] = None) -> dict[str, Any]:
+def fold(
+    events: Iterable[dict[str, Any]],
+    *,
+    now: Optional[int] = None,
+    pid_probe: Optional[Callable[[Any], Optional[bool]]] = None,
+) -> dict[str, Any]:
     """Состояние ожидания дела по его событиям — правила 1–7 контракта.
 
     Чистая функция: ни БД, ни файлов. События применяются в порядке `id`
@@ -266,7 +284,9 @@ def fold(events: Iterable[dict[str, Any]], *, now: Optional[int] = None) -> dict
       поверхность по kanban и говорит это в `evidence`: «нет данных» нельзя
       выдавать за «всё спокойно».
 
-    `now` подставляется тестами; по умолчанию берутся часы.
+    `now` подставляется тестами; по умолчанию берутся часы. `pid_probe` — тот же
+    шов для живости pid: по умолчанию `pid_alive` (то есть `os.kill`), тесты
+    подставляют свой ответ, чтобы результат не зависел от живых процессов.
     """
     ordered = sorted(events, key=lambda ev: int(ev.get("id") or 0))
     if not ordered:
@@ -323,7 +343,7 @@ def fold(events: Iterable[dict[str, Any]], *, now: Optional[int] = None) -> dict
     if attempt is not None:
         payload = _payload(attempt[1])
         pid = payload.get("pid")
-        alive = pid_alive(pid)
+        alive = (pid_probe or pid_alive)(pid)
         start = f"ран {payload.get('run_id') or '—'} начат {_ago(attempt[1].get('ts'), now_sec)}"
         if alive is False:
             facts.setdefault("crashed", []).append(f"{start}, attempt_ended нет, {pid_text(pid, alive)}")
@@ -523,7 +543,10 @@ def ingest(conn: sqlite3.Connection, home: Path, boards: Iterable[dict[str, Any]
     Один факт — одна строка источника:
 
     - `task_events` → `created`/`claimed`/`blocked`/`unblocked`/`completed`;
-    - `task_runs` → `attempt_started`/`attempt_ended` (ран открылся/закрылся);
+      `archived` переносится тем же `completed` со `status="archived"`;
+    - `task_runs` → `attempt_started`/`attempt_ended` (ран открылся/закрылся;
+      `attempt_ended` возможен только при непустом `ended_at`);
+    - строка `tasks` → `created`, если kanban-события `created` у дела не было;
     - `lease_lost` события в kanban не имеет и выводится сравнением журнала с
       текущим лизингом: лизинг был, попытки за ним не было, а лизинга больше нет.
 
@@ -565,13 +588,21 @@ def ingest(conn: sqlite3.Connection, home: Path, boards: Iterable[dict[str, Any]
 
     lost, error = _lease_lost_events(conn, leases, now)
     if error:
-        report["errors"].append({"board": JOURNAL_SUBDIR, "reason": error})
-    written = append(conn, lost)
-    report["appended"] += written
+        report["errors"].append({"board": JOURNAL_SOURCE, "reason": error})
+    # `lease_lost` пишется по доске отдельной пачкой: счётчик `appended` доски
+    # обязан считать строки, которые легли в журнал, а не кандидатов. На повторном
+    # проходе кандидат тот же (условие в `_lease_lost_events` от записи не
+    # меняется), `INSERT OR IGNORE` его отбрасывает — и доска не должна врать
+    # единицей.
+    lost_by_board: dict[str, list[dict[str, Any]]] = {}
     for lost_event in lost:
+        lost_by_board.setdefault(str(lost_event["board"]), []).append(lost_event)
+    for slug, board_lost in lost_by_board.items():
+        written = append(conn, board_lost)
+        report["appended"] += written
         for board in report["boards"]:
-            if board["slug"] == lost_event["board"]:
-                board["appended"] += 1
+            if board["slug"] == slug:
+                board["appended"] += written
     report.update(counts(conn))
     return report
 
@@ -684,12 +715,14 @@ def _board_pass(
             out.append(_event(slug, deal_id, "unblocked", ts, {"previous_kind": block_kind_by_deal.get(deal_id)}, row["id"], now))
         elif kind == "archived":
             out.append(_event(slug, deal_id, "completed", ts, {"status": "archived"}, row["id"], now))
-        elif _completed_status(payload, task) is not None:
+        elif (completed_status := _completed_status(payload, task)) is not None:
             # `completed` в kanban — это «этап сдан»: карточка могла уйти в
             # `review`/`awaiting_merge`. Завершением дела событие считается
             # только по терминальному статусу, иначе fold закрыл бы живое дело.
+            # Статус берётся из payload события, а если его там нет — из карточки:
+            # выбор ветки делает `_completed_status`, здесь только запись факта.
             out.append(
-                _event(slug, deal_id, "completed", ts, {"status": _completed_status(payload, task)}, row["id"], now)
+                _event(slug, deal_id, "completed", ts, {"status": completed_status}, row["id"], now)
             )
 
     for row in runs:

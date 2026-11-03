@@ -3,9 +3,9 @@
 Проверяется то, что нельзя увидеть глазами при ревью: схема совпадает с
 контрактом, повторный ingest ничего не дописывает, fold не открывает ни одной БД,
 состояние дела считается по событиям, а дело без событий честно помечается
-«journal: empty». `question_asked`/`question_answered` пишет `ask()` (канал
-вопросов — следующий шаг, W2), поэтому здесь они проверяются через fold и
-`append`: набор `kind` на них не расширяется.
+«journal: empty». `question_asked`/`question_answered` пишет `ask()`
+(`dashboard/ask.py`, свои тесты — у него), поэтому здесь они проверяются через
+fold и `append`: набор `kind` на них не расширяется.
 
 Фикстуры — свои маленькие `kanban.db`/`pool.db` в `tmp_path` по реальной схеме;
 живые источники не читаются.
@@ -342,6 +342,24 @@ def test_append_ignores_duplicates_by_key(home: Path) -> None:
     conn.close()
 
 
+def test_append_rejects_kind_outside_the_closed_set(home: Path) -> None:
+    """Набор `kind` закрыт кодом: `append` отвергает вид вне `EVENT_KINDS` целиком.
+
+    Без этой проверки «набор закрыт» держался дисциплиной: посторонний `kind` лёг
+    бы в журнал, и fold встретил бы факт, для которого нет правила.
+    """
+    conn = journal.open_journal(home)
+    batch = events(("created", None), ("heartbeat", {"pid": 1}))
+
+    with pytest.raises(ValueError) as excinfo:
+        journal.append(conn, batch)
+
+    assert "heartbeat" in str(excinfo.value)
+    # Пачка отвергается до записи: «почти записанной» половины в журнале не остаётся.
+    assert journal.counts(conn) == {"events": 0, "deals": 0}
+    conn.close()
+
+
 def test_read_events_is_ordered_and_filtered(home: Path) -> None:
     """События идут по возрастанию `id`; `deal_id` и `since_id` — необязательный отбор."""
     conn = journal.open_journal(home)
@@ -535,7 +553,23 @@ def test_fold_closed_attempt_is_not_a_live_fact() -> None:
     assert folded["reason"] == "no_live_fact"
 
 
-def test_fold_created_with_parents_is_wait_gate() -> None:
+def test_fold_pid_liveness_is_injectable() -> None:
+    """Живость pid — шов, а не скрытая зависимость: тест задаёт ответ сам.
+
+    Пункт 7 ревью: `fold` звал `os.kill`, то есть результат зависел от живого
+    состояния процессов машины. Теперь ответ подставляется (`pid_probe`), и один и
+    тот же набор событий даёт `working`/`crashed`, не спрашивая ядро.
+    """
+    batch = events(("attempt_started", {"run_id": 7, "pid": 999_999}), ts=NOW - 60)
+
+    assert journal.fold(batch, now=NOW, pid_probe=lambda pid: True)["state"] == "working"
+    assert journal.fold(batch, now=NOW, pid_probe=lambda pid: False)["state"] == "crashed"
+    assert journal.fold(batch, now=NOW, pid_probe=lambda pid: None)["state"] == "no_signal"
+    # Без шва поведение прежнее: мёртвый pid — `crashed`.
+    assert journal.fold(batch, now=NOW)["state"] == "crashed"
+
+
+def test_created_with_parents_is_wait_gate() -> None:
     """Правило 8 таксономии: от дела остался снимок `created` с родителями — гейт."""
     folded = journal.fold(events(("created", {"status": "todo", "parents": ["t_parent"]})), now=NOW)
 
@@ -752,6 +786,108 @@ def test_ingest_completed_without_status_uses_task_status(home: Path) -> None:
     assert "completed" not in journal_kinds(home)
 
 
+def test_ingest_completed_of_done_card_closes_deal(home: Path, client: TestClient) -> None:
+    """B1, ветка «статус из карточки»: дело сдали → в журнале `completed`.
+
+    Дело закрывается ровно в одном месте — ingest через `_completed_status()`.
+    До этого теста про `completed` были только отрицательные проверки («событие
+    НЕ появилось»), поэтому `_completed_status()`, всегда возвращающий `None`,
+    оставлял весь набор зелёным, а журнал перестал бы закрывать дела вовсе.
+
+    Дело сначала живёт на доске (иначе это история, которую ingest намеренно не
+    мигрирует), потом карточка уходит в `done`, а kanban-событие `completed`
+    приходит без `status` — статус берётся из карточки.
+    """
+    board = make_board(home)
+    conn = sqlite3.connect(board)
+    add_task(conn, "t_done", status="running")
+    add_kanban_event(conn, "created", task_id="t_done", payload={"status": "running"}, created_at=NOW - 900)
+    conn.commit()
+    ingest(board, home)
+    assert "completed" not in journal_kinds(home)
+
+    conn.execute("UPDATE tasks SET status = 'done' WHERE id = 't_done'")
+    add_kanban_event(conn, "completed", task_id="t_done", payload={}, created_at=NOW - 800)
+    conn.commit()
+    conn.close()
+
+    client.post("/ingest")
+
+    kinds = journal_kinds(home)
+    assert "completed" in kinds
+    conn = journal.open_journal(home, create=False)
+    assert conn is not None
+    rows = journal.read_events(conn, deal_id="t_done")
+    conn.close()
+    completed = [event for event in rows if event["kind"] == "completed"]
+    assert len(completed) == 1
+    assert completed[0]["payload"] == {"status": "done"}
+    assert journal.fold(rows, now=NOW)["active"] is False
+    assert client.get("/now").json()["count"] == 0
+
+
+def test_ingest_completed_by_payload_status_takes_deal_out_of_now(home: Path, client: TestClient) -> None:
+    """B1, ветка «статус из payload»: `completed` события закрывает дело и уводит его из `/now`.
+
+    Карточка при этом ещё активна (`awaiting_merge`), поэтому срез обязан не
+    просто выкинуть дело, а назвать расхождение в `boards[].warnings`: «дело
+    ушло» и «дело пропало» — разные вещи.
+    """
+    board = make_board(home)
+    conn = sqlite3.connect(board)
+    add_task(conn, "t_stage", status="awaiting_merge")
+    add_kanban_event(conn, "created", task_id="t_stage", payload={"status": "ready"}, created_at=NOW - 900)
+    add_kanban_event(conn, "completed", task_id="t_stage", payload={"status": "done"}, created_at=NOW - 800)
+    conn.commit()
+    conn.close()
+
+    before = client.get("/now").json()
+    client.post("/ingest")
+    after = client.get("/now").json()
+
+    assert [deal["id"] for deal in before["deals"]] == ["t_stage"]
+    assert before["boards"][0]["warnings"] == []
+    assert after["count"] == 0
+    assert any(
+        "t_stage" in warning and "правило 2" in warning for warning in after["boards"][0]["warnings"]
+    )
+
+
+def test_ingest_writes_attempt_ended_for_closed_run(home: Path) -> None:
+    """B2: у закрытого рана (`ended_at`) появляется `attempt_ended`, и попытка не живёт.
+
+    До этого теста ни один `add_run(...)` не задавал `ended_at`, поэтому потеря
+    записи `attempt_ended` в ingest не роняла ничего: дело с закрытым раном
+    навсегда осталось бы в `working`/`no_signal` — тихая ложь в `/now`.
+    """
+    board = make_board(home)
+    pid = os.getpid()
+    conn = sqlite3.connect(board)
+    add_task(conn, "t_ran", status="running", worker_pid=pid)
+    run_id = add_run(conn, "t_ran", started_at=NOW - 600, ended_at=NOW - 100, outcome="completed", worker_pid=pid)
+    add_kanban_event(conn, "created", task_id="t_ran", payload={"status": "running"}, created_at=NOW - 900)
+    conn.commit()
+    conn.close()
+
+    ingest(board, home)
+
+    conn = journal.open_journal(home, create=False)
+    assert conn is not None
+    rows = journal.read_events(conn, deal_id="t_ran")
+    conn.close()
+    ended = [event for event in rows if event["kind"] == "attempt_ended"]
+    assert len(ended) == 1
+    assert ended[0]["payload"] == {"run_id": run_id, "outcome": "completed", "error": None}
+    assert ended[0]["ts"] == NOW - 100
+    # Тот же набор без `attempt_ended` даёт живой факт — на этом различии тест и стоит.
+    still_open = journal.fold([event for event in rows if event["kind"] != "attempt_ended"], now=NOW)
+    assert still_open["state"] == "working"
+    folded = journal.fold(rows, now=NOW)
+    assert folded["state"] is None
+    assert folded["reason"] == "no_live_fact"
+    assert folded["last_kind"] == "attempt_ended"
+
+
 def test_ingest_reports_unreadable_board(home: Path) -> None:
     """Ошибка источника — факт отчёта, а не падение прохода."""
     broken = board_db(home, "broken")
@@ -900,6 +1036,146 @@ def test_question_in_journal_reports_answer_expected(home: Path, client: TestCli
     assert waiting["state"] == "wait_human"
     assert waiting["human_kind"] == "question"
     assert "#7" in waiting["evidence"]
+
+
+def test_repeat_pass_counts_no_rows_for_lease_lost(home: Path) -> None:
+    """Счётчик доски считает вставленные строки, а не кандидатов `lease_lost`.
+
+    Кандидат на `lease_lost` на повторном проходе тот же (условие вывода от записи
+    не меняется), `INSERT OR IGNORE` его отбрасывает. До правки `appended` доски
+    прибавлял единицу за кандидата, а итог оставался нулём: сумма по доскам
+    расходилась с `appended` ответа — число врало тихо.
+    """
+    board = make_board(home)
+    conn = sqlite3.connect(board)
+    add_task(conn, "t_lost2", status="ready")
+    add_kanban_event(conn, "created", task_id="t_lost2", payload={"status": "ready"}, created_at=NOW - 900)
+    add_kanban_event(conn, "claimed", task_id="t_lost2", payload={"lock": "L2", "expires": NOW - 500}, run_id=1, created_at=NOW - 800)
+    conn.commit()
+    conn.close()
+
+    first = ingest(board, home)
+    second = ingest(board, home)
+
+    assert "lease_lost" in journal_kinds(home)
+    # created + claimed + lease_lost — и ровно столько же насчитала доска
+    assert first["appended"] == 3
+    assert first["appended"] == sum(item["appended"] for item in first["boards"])
+    assert second["appended"] == 0
+    assert [item["appended"] for item in second["boards"]] == [0]
+
+
+def test_now_deal_shape_is_pinned(home: Path, client: TestClient) -> None:
+    """Форма `/now` и `/now.deals[]` запинена тестом: правка поля роняет тест.
+
+    Пункт 6 ревью: пин был только на `waiting`, а сама форма дела проверялась
+    чтением кода — при следующей правке поле уехало бы молча. `_age_sec` здесь
+    намеренно отсутствует: это служебный ключ сортировки, наружу он не идёт.
+    """
+    board = make_board(home)
+    pid = os.getpid()
+    conn = sqlite3.connect(board)
+    add_task(conn, "t_shape", status="running", worker_pid=pid, claim_lock="L", claim_expires=NOW + 600)
+    add_run(conn, "t_shape", worker_pid=pid, claim_lock="L")
+    add_kanban_event(conn, "created", task_id="t_shape", payload={"status": "running"}, created_at=NOW - 900)
+    conn.commit()
+    conn.close()
+
+    body = client.get("/now").json()
+
+    assert list(body) == ["now", "count", "deals", "by_state", "crash_outcomes", "boards", "errors"]
+    assert list(body["by_state"]) == list(journal.WAITING_PRIORITY)
+    assert body["crash_outcomes"] == list(plugin_api.CRASH_OUTCOMES)
+    assert list(body["boards"][0]) == ["slug", "path", "read", "deals", "truncated", "warnings"]
+    deal = body["deals"][0]
+    assert list(deal) == [
+        "board",
+        "id",
+        "title",
+        "assignee",
+        "status",
+        "priority",
+        "consecutive_failures",
+        "created_at",
+        "workspace_kind",
+        "attempt",
+        "lease",
+        "last_action",
+        "last_run",
+        "waiting",
+    ]
+    assert list(deal["attempt"]) == [
+        "run_id",
+        "source",
+        "start",
+        "age_sec",
+        "pid",
+        "pid_alive",
+        "heartbeat_age_sec",
+        "run_status",
+    ]
+    assert list(deal["lease"]) == ["claim_lock", "expires_at", "expires_in_sec", "state"]
+    assert list(deal["last_action"]) == ["kind", "at", "age_sec", "summary"]
+    assert list(deal["last_run"]) == ["run_id", "status", "outcome", "started_at", "ended_at"]
+    assert list(deal["waiting"]) == ["state", "evidence", "human_kind"]
+
+
+def test_health_names_boards_it_could_not_read(home: Path, client: TestClient) -> None:
+    """Нечитаемая доска не «выпадает из drift молча»: она названа в `journal.note`.
+
+    Пункт 9 ревью: причина сбоя `_query_checked` выбрасывалась, доска не попадала в
+    `active`, и `drift.empty_journal` показывал 0 — «тихое всё хорошо». Теперь у
+    ответа появляется `note` с именем доски и причиной, а не только число.
+    """
+    board = make_board(home)
+    conn = sqlite3.connect(board)
+    add_task(conn, "t_ok", status="ready")
+    conn.commit()
+    conn.close()
+    empty = board_db(home, "broken")
+    empty.parent.mkdir(parents=True)
+    empty.write_bytes(b"")
+
+    journal_health = client.get("/health").json()["journal"]
+
+    assert journal_health["drift"]["empty_journal"] == 1
+    assert "broken" in journal_health["note"]
+
+
+def test_health_has_no_note_when_every_board_reads(home: Path, client: TestClient) -> None:
+    """Читаемые источники — ровно три ключа контракта: `note` не появляется зря."""
+    board = make_board(home)
+    conn = sqlite3.connect(board)
+    add_task(conn, "t_ok", status="ready")
+    conn.commit()
+    conn.close()
+
+    journal_health = client.get("/health").json()["journal"]
+
+    assert list(journal_health) == ["events", "deals", "drift"]
+    assert journal_health["drift"]["empty_journal"] == 1
+
+
+def test_unreadable_journal_names_itself_as_a_path(home: Path, client: TestClient) -> None:
+    """Недоступный журнал назван путём `duty/duty.db`, как остальные источники.
+
+    Не слагом доски: «доска duty» читалась бы как ещё одна доска kanban, а дело
+    тут — свой файл. Имя берётся из одной константы `journal.JOURNAL_SOURCE`.
+    """
+    journal_path = home / "duty" / "duty.db"
+    journal_path.parent.mkdir(parents=True)
+    journal_path.write_bytes(b"not a database")  # журнал есть, но не читается
+    board = make_board(home)
+    conn = sqlite3.connect(board)
+    add_task(conn, "t_ok", status="ready")
+    conn.commit()
+    conn.close()
+
+    body = client.get("/now").json()
+
+    sources = [error["board"] for error in body["errors"]]
+    assert journal.JOURNAL_SOURCE in sources
+    assert "duty" not in sources
 
 
 def journal_count(home: Path) -> int:

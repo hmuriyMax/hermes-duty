@@ -15,26 +15,26 @@
 1. Находит все kanban-БД: корневую (доска `default`) и
    `kanban/boards/<slug>/kanban.db`; файл нулевого размера не пропускается, а
    помечается `note = "empty db"` и виден как непрочитанная доска
-   (`dashboard/plugin_api.py:124-147`) — иначе он молча исчезал бы и из
-   `boards[]`, и из `errors[]`, и срез выглядел бы полным.
+   (`_discover_boards()` в `dashboard/plugin_api.py`) — иначе он молча исчезал бы
+   и из `boards[]`, и из `errors[]`, и срез выглядел бы полным.
 2. Открывает их строго на чтение — `?mode=ro`, одна транзакция-снимок `BEGIN` на
-   доску (`dashboard/plugin_api.py:72-82`).
+   доску (`_ro()`/`_connect_ro()`).
 3. Собирает по каждому активному делу (`status NOT IN ('done','archived')`,
    не больше `DEAL_LIMIT = 500` на доску): лизинг, текущую попытку, последнее
    действие, исход последнего рана, незавершённых родителей и живой вопрос пула
-   (`dashboard/plugin_api.py:610-774`).
+   (`_board_deals()`).
 4. Отдаёт срез «сейчас» — `GET /now`: дела всех досок в порядке приоритета
    таксономии, с доказательством состояния в `waiting.evidence`.
 5. Отдаёт таймлайн попыток дела — `GET /duty/{board}/{task_id}/attempts`: раны по
    возрастанию старта, длительность, исход, текст ошибки и события рана.
 6. Деградирует вместо падения: недоступная доска уходит в `errors[]` при HTTP 200,
    сбой вспомогательной таблицы — в `warnings[]` доски
-   (`dashboard/plugin_api.py:777-859`, `:644-698`).
+   (`collect_now()` плюс `_board_deals()`: оба в `dashboard/plugin_api.py`).
 
 ## Что P0 не делает никогда
 
 - не пишет в `kanban.db`, `pool.db`, `state.db` (`_ro()` — единственный способ
-  открыть источник, `dashboard/plugin_api.py:72-82`);
+  открыть источник, `dashboard/plugin_api.py`);
 - не импортирует диспетчер и не вызывает `hermes kanban`;
 - не пересчитывает статусы карточек — только то, что записано (состояние ожидания
   выводится из набора фактов, но сами факты не переписываются);
@@ -49,7 +49,7 @@
 | `<home>/profiles/<role>/state.db` | только перечисление профилей в `/sources`; содержимое не читается |
 
 Пути не хардкодятся: корень вычисляется из `HERMES_HOME` или `~/.hermes`
-(`dashboard/plugin_api.py:65-69`).
+(`_hermes_home()`).
 
 **Выбывшие доски в срез не входят.** Ядро kanban убирает закрытые доски в
 `kanban/boards/_archived/` и ставит рядом камень `board.json` с
@@ -86,7 +86,7 @@
 | `POST /ask/{board}/{task_id}` | вопрос по делу в пул: `{question_id, deduped, errors[]}` | 404 — нет доски или дела; 400 — пустой `text`/кривые `options`; 503 — пул или журнал недоступны |
 
 `?state=` фильтрует только список `deals`: `by_state` и `boards[]` считаются по
-полному срезу до фильтра (`dashboard/plugin_api.py:844-848`).
+полному срезу до фильтра (`collect_now()`).
 
 ## Форма ответа `/now`
 
@@ -124,14 +124,15 @@
 
 Сортировка детерминирована: `waiting.state` по `WAITING_PRIORITY`, затем возраст
 текущей попытки по убыванию, затем `id` — иначе UI дёргается между опросами
-(`dashboard/plugin_api.py:836-843`). `crash_outcomes` и `by_state` отдаются
+(`collect_now()` в `dashboard/plugin_api.py`). `crash_outcomes` и `by_state` отдаются
 клиенту, чтобы UI не держал копию этих наборов.
 
 ## Таксономия ожиданий (восемь взаимоисключающих состояний)
 
 Состояние — первое совпавшее по приоритету; все сработавшие факты уходят в
-`waiting.evidence` (`WAITING_PRIORITY`/`WAITING_FALLBACK`, `dashboard/plugin_api.py:277-326`).
-Порог свежести heartbeat — `HEARTBEAT_FRESH_SEC = 300` с (`:289`).
+`waiting.evidence` (`WAITING_PRIORITY`/`WAITING_FALLBACK` в `dashboard/journal.py`
+и `dashboard/plugin_api.py`).
+Порог свежести heartbeat — `HEARTBEAT_FRESH_SEC = 300` с.
 
 | # | состояние | как определяется |
 |---|---|---|
@@ -150,32 +151,32 @@
 
 ### Формулировки `waiting.evidence` (дословно по коду)
 
+Ссылки ниже — файл и имя функции, без номеров строк: номера на 0.0.3 уже разошлись
+с кодом, а имя символа — нет.
+
 Факт — строка, собранная кодом; при нескольких сработавших фактах победитель идёт
 первым, остальные дописываются через `; ещё: …`, а при недоступном/обрезанном пуле
 к `wait_human` без вопроса — `; … — факт wait_human не проверен`
-(`dashboard/plugin_api.py:595-607`).
+(`_waiting()` в `dashboard/plugin_api.py`).
 
 - `working` — `ран 12 running, pid 39899 жив, heartbeat 12с назад`. Про pid
   называется ровно то, что известно: `pid <pid> жив` (сигнал прошёл),
   `состояние pid <pid> неизвестно` (`os.kill` вернул прочий `OSError`,
   `pid_alive=None`) или `pid не записан` (пустой `worker_pid`); «не записан» про
   существующий pid не печатается. Формулировка одна на обе ветки — `_pid_text`
-  (`dashboard/plugin_api.py:575-582`, `:365-376`, `:349-362`).
+  (и `_waiting()` для тех же строк).
 - `crashed` — `consecutive_failures=N` / `последний ран <id>: outcome=…` /
   `ран <id> running, <pid-факт>, heartbeat <N>с назад`; pid-факт тот же самый
-  (та же `_pid_text`: «жив» только если живость подтверждена) —
-  `dashboard/plugin_api.py:568-571`.
+  (та же `_pid_text`: «жив» только если живость подтверждена) — `_waiting()`.
 - `no_signal` — `status=running без живого сигнала: рана, pid и heartbeat нет`
-  (оглавление `WAITING_FALLBACK`, `dashboard/plugin_api.py:325`).
+  (оглавление `WAITING_FALLBACK`).
 - `dead_lease` — `ран <id> в статусе running, а pid <pid> мёртв (лизинг …)` либо
-  `лизинг истёк <N>с назад (<claim_lock>), ран <status>`
-  (`dashboard/plugin_api.py:542-556`).
+  `лизинг истёк <N>с назад (<claim_lock>), ран <status>` (`_waiting()`).
 - `wait_slot` — `status=ready, профиль <assignee> занят делом <id> (running)`;
-  `wait_gate` — `незавершённые родители: <id> (<status>), …`
-  (`dashboard/plugin_api.py:584-593`).
+  `wait_gate` — `незавершённые родители: <id> (<status>), …` (`_waiting()`).
 - `attempt.source` — `run` или `task`: если pid/start/heartbeat добраны из
   карточки, а не из записи рана, подпись попытки на странице получает хвост
-  «, факты карточки» (`dashboard/plugin_api.py:461-493`, `desktop/model.js:116-123`).
+  «, факты карточки» (`_attempt()` в `dashboard/plugin_api.py`, `desktop/model.js`).
 
 Если ни один факт не сработал, статус доразбирается оглавлением
 `WAITING_FALLBACK`: `triage`/`blocked`/`review`/`awaiting_merge` → `wait_human`,
@@ -191,11 +192,11 @@
 |---|---|
 | `tasks` доски не читается (не открылась, нет таблицы) | `boards[].read = false`, `errors[]` с `{board, reason}`, дела этой доски отсутствуют |
 | `kanban.db` нулевого размера | `boards[].read = false` + `boards[].note = "empty db"` и `errors[]` с причиной `empty db (...)` — доска не исчезает из ответа |
-| доска упала на чужой схеме (`int()` по текстовой колонке и т.п.) | `boards[].read = false` + `errors[]` с причиной `<ТипИсключения>: <текст>`; `RuntimeError` (готовые причины: нет таблицы, 0-байтная БД) идёт без префикса; ответ остаётся 200 (`dashboard/plugin_api.py:806-823`) |
-| `task_runs`, `task_links`, `task_events` или `task_events(blocked)` не читаются | `boards[].warnings[]` строкой `<таблица>: <причина>` (для причин блока — ключ `task_events(blocked)`); факты деградируют, доска остаётся `read = true` (`dashboard/plugin_api.py:644-698`) |
+| доска упала на чужой схеме (`int()` по текстовой колонке и т.п.) | `boards[].read = false` + `errors[]` с причиной `<ТипИсключения>: <текст>`; `RuntimeError` (готовые причины: нет таблицы, 0-байтная БД) идёт без префикса; ответ остаётся 200 (`collect_now()`) |
+| `task_runs`, `task_links`, `task_events` или `task_events(blocked)` не читаются | `boards[].warnings[]` строкой `<таблица>: <причина>` (для причин блока — ключ `task_events(blocked)`); факты деградируют, доска остаётся `read = true` (`_board_deals()`) |
 | `messaging/pool.db` нет или это не БД | `errors[]` с `board: "messaging/pool.db"` + в `waiting.evidence` пометка «факт `wait_human` не проверен» — иначе недоступный пул выглядел бы как «вопросов нет» |
-| живых вопросов в пуле больше `QUESTION_LIMIT = 200` (запрос берёт `LIMIT + 1`, поэтому пул ровно на 200 вопросов пометки не получает) | `errors[]` с `board: "messaging/pool.db"` и причиной `questions truncated: more than 200 live questions` + в `waiting.evidence` дел в состоянии `wait_human`, которым вопрос не нашёлся: `живых вопросов в пуле больше 200 (старые не вошли) — факт wait_human не проверен` (`dashboard/plugin_api.py:420-439`, `:794-801`, `:605-606`) |
-| дел на доске `>= DEAL_LIMIT = 500` (`truncated = len(tasks) >= DEAL_LIMIT`: лишней строки не берётся, поэтому ровно 500 дел тоже помечаются) | `boards[].truncated = true`; на странице `/duty` — строка `доска <slug>: срез обрезан лимитом, показано <N> дел` (`dashboard/plugin_api.py:633`, `:773`, `desktop/model.js:205-210`) |
+| живых вопросов в пуле больше `QUESTION_LIMIT = 200` (запрос берёт `LIMIT + 1`, поэтому пул ровно на 200 вопросов пометки не получает) | `errors[]` с `board: "messaging/pool.db"` и причиной `questions truncated: more than 200 live questions` + в `waiting.evidence` дел в состоянии `wait_human`, которым вопрос не нашёлся: `живых вопросов в пуле больше 200 (старые не вошли) — факт wait_human не проверен` (`_pool_context()`, `_waiting()`) |
+| дел на доске `>= DEAL_LIMIT = 500` (`truncated = len(tasks) >= DEAL_LIMIT`: лишней строки не берётся, поэтому ровно 500 дел тоже помечаются) | `boards[].truncated = true`; на странице `/duty` — строка `доска <slug>: срез обрезан лимитом, показано <N> дел` (`_board_deals()`, `desktop/model.js`) |
 
 `truncated` и `warnings[]` не только отдаются, но и рисуются. Шейпер сводит их в
 два списка строк — `доска <slug>: срез обрезан лимитом, показано <N> дел` и
@@ -208,10 +209,10 @@
 
 Таймлайн попыток деградирует иначе: там 404/503 — это ответ про конкретное дело
 (нельзя показать пустой таймлайн вместо «не читается»), а сбой `task_events`
-просто оставляет `events: []` у ранов (`dashboard/plugin_api.py:889-951`).
+просто оставляет `events: []` у ранов (`duty_attempts()`).
 
 Известные ограничения (не исправлены в `v0.0.1`, зафиксированы честно):
-причина сбоя `task_events` (события рана) в ответе таймлайна не отдаётся — там просто пустой `events`; если в `kanban/boards/` есть каталог `default`, его БД попадает в срез отдельной записью с тем же slug — и `?board=default` вернёт обе (корневую и каталог), потому что фильтр идёт по slug (`dashboard/plugin_api.py:787`).
+причина сбоя `task_events` (события рана) в ответе таймлайна не отдаётся — там просто пустой `events`; если в `kanban/boards/` есть каталог `default`, его БД попадает в срез отдельной записью с тем же slug — и `?board=default` вернёт обе (корневую и каталог), потому что фильтр идёт по slug (`collect_now()`).
 
 ## Экраны
 

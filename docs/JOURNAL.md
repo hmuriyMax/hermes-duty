@@ -1,0 +1,135 @@
+# Журнал дел: контракт 0.0.3
+
+Спека W1. Пока этот документ не сойдётся с кодом, `docs/DESIGN.md` остаётся контрактом
+поверхности (роуты, таксономия, форма ответов), а журнал живёт здесь.
+
+## Зачем
+
+До 0.0.2 состояние дела **выводилось из изменяемых колонок** kanban (`status`,
+`claim_lock`, `claim_expires`, `task_runs`). Это тот же дефект, из-за которого мы
+затевали проект: колонка отвечает и за факт, и за политику, поэтому врёт ровно тогда,
+когда сломана, а «почему дело стоит» приходится восстанавливать догадкой.
+
+В 0.0.3 состояние считается из **своего журнала**: `state(deal) = fold(events)`. Журнал
+принадлежит плагину, живёт отдельно от kanban и не переписывается задним числом.
+
+## Хранилище
+
+```
+$HERMES_HOME/duty/duty.db          # свой журнал, plugin-owned
+```
+
+- `journal_mode=WAL`, `busy_timeout=2000`, `synchronous=NORMAL`.
+- Файл создаётся при первом запуске; отсутствие файла — не ошибка, а «журнала ещё нет».
+- Чужие БД (`kanban.db`, `state.db`, `pool.db`) открываются **только** `mode=ro`,
+  кроме пула вопросов: в `pool.db` плагин пишет через `ask()` (разрешено Max 03.11).
+
+```sql
+CREATE TABLE IF NOT EXISTS events (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts              INTEGER NOT NULL,          -- unix seconds, момент факта
+  recorded_at     INTEGER NOT NULL,          -- unix seconds, момент записи
+  deal_id         TEXT    NOT NULL,          -- t_<hex>
+  board           TEXT    NOT NULL,          -- слаг доски на момент факта
+  kind            TEXT    NOT NULL,          -- см. набор ниже
+  payload         TEXT    NOT NULL DEFAULT '{}',  -- JSON, только факты источника
+  source          TEXT    NOT NULL,          -- ingest | ask | cli
+  idempotency_key TEXT    NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS events_idem ON events(idempotency_key);
+CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
+```
+
+`payload` — сырые факты, а не выводы: `{"run_id": 41, "pid": 991, "status": "blocked",
+"kind": "needs_input", "reason": "…"}`. Никаких вычисленных состояний в журнале: состояние
+всегда пересчитывается fold'ом, иначе в журнале появится вторая правда.
+
+## Набор событий
+
+| `kind` | когда пишется | ключевые поля payload |
+|---|---|---|
+| `created` | дело впервые увидено на доске | `title`, `assignee`, `status`, `parents` |
+| `claimed` | появился лизинг (`claim_lock`/`claim_expires`) | `claim_lock`, `claim_expires` |
+| `lease_lost` | лизинг исчез без завершения | `previous_expires` |
+| `attempt_started` | открылся ран в `task_runs` | `run_id`, `pid` |
+| `attempt_ended` | ран закрыт | `run_id`, `outcome`, `error` |
+| `blocked` | `status=blocked` | `block_kind`, `reason` |
+| `unblocked` | был `blocked`, стал иной статус | `previous_kind` |
+| `completed` | `status=done` (или `archived` как отдельный факт) | `status` |
+| `question_asked` | `ask()` создал вопрос в пуле | `question_id`, `session_key`, `critical`, `timeout` |
+| `question_answered` | ответ найден в пуле | `question_id`, `answer_len`, `answered_via` |
+
+Набор закрыт: новый `kind` добавляется вместе с правилом fold и тестом, а не «по пути».
+
+## Идемпотентность
+
+`idempotency_key` — строка, уникальная для факта источника:
+
+- ingest: `ingest:<board>:<deal_id>:<kind>:<stable>` где `stable` — идентификатор строки
+  источника (`task_events.id`, `task_runs.id`, либо хеш кортежа для колонок:
+  `sha1(claim_lock|claim_expires)`), а не время;
+- ask: `ask:<question_id>:<kind>`;
+- cli: `cli:<deal_id>:<kind>:<sha1(аргументы)>`.
+
+Повторный проход ingest обязан быть no-op: `INSERT OR IGNORE` по уникальному индексу.
+Тест: два прогона подряд → число строк не меняется, `fold` даёт тот же результат.
+
+## Fold
+
+`fold(events) -> waiting` — чистая функция без I/O, живёт в `desktop/model.js`-подобном
+модуле на стороне бэкенда (`dashboard/journal.py`), чтобы UI ничего не пересчитывал.
+
+Правила:
+
+1. События применяются в порядке `id`.
+2. Если последнее событие `completed`/`archived` — дело не активно, в `/now` не попадает.
+3. `blocked` без последующего `unblocked` → `wait_human` с `evidence` из payload.
+4. `claimed` без `attempt_started` старше `CLAIM_STALE_SEC` (сейчас 900) → `dead_lease`.
+5. `attempt_started` без `attempt_ended`, pid мёртв → `crashed`; pid не читается →
+   `no_signal` (tri-state, как в 0.0.2).
+6. `question_asked` без `question_answered` → `wait_human` с `human_kind="question"`;
+   это и закрывает п.5 заметки 0.0.2: «ждёт ответа» считается по вопросам, а блокировка
+   без вопроса имеет `human_kind="status"`.
+7. Пустой журнал (дела нет в событиях) → состояние считается по kanban как раньше, а
+   `evidence` честно говорит `journal: empty — состояние из kanban`. Такие дела
+   считаются в `/health.drift.empty_journal`, пока ingest их не подберёт.
+
+## Ingest
+
+Отдельный проход (внутри запроса `/now` при `?ingest=1`, либо фоновым вызовом CLI):
+читает kanban-источники **read-only**, сравнивает с журналом и дописывает недостающие
+события. Инварианты:
+
+- ingest не меняет kanban ни в каком виде (проверяется тестом по mtime);
+- ingest не «додумывает»: нет строки в источнике — нет события;
+- ошибка источника не валит ответ: дело попадает в `errors[]` как в 0.0.2.
+
+## `ask()`
+
+Единственный канал вопросов. Пишет в `messaging/pool.db` (схема imessage-gateway):
+`session_key=t_<deal_id>`, `origin='duty'`, `kind='decision'`, `text` — краткая строка,
+`text_full` — развёрнутая с фактами дела, `options_json` — варианты, если заданы.
+
+- Перед созданием ищет живой вопрос по делу (`status='sent'`, `session_key=t_<id>`):
+  есть — возвращает его, дубль не создаёт.
+- `critical=1` ставится, когда дело в `wait_human` дольше `ASK_CRITICAL_SEC` (дефолт 7200),
+  иначе вопрос смертен по обычному TTL пула.
+- Ответ читается по `question_id`; при появлении ответа пишется `question_answered`,
+  вопрос закрывается штатным путём пула (не руками в SQL).
+- Создание вопроса фиксируется в журнале **после** успешной вставки в пул; при сбое
+  пула событие не пишется, ошибка уходит в `errors[]`.
+
+## Инварианты (проверяются тестами)
+
+1. Ни одной записи в `kanban.db`/`state.db`: mtime до и после сценария совпадает.
+2. `pool.db` пишется только по пути `ask()`; в остальных сценариях — `mode=ro`.
+3. Повторный ingest не плодит событий (идемпотентность).
+4. `fold` не читает БД: на вход только список событий.
+5. В `/health` есть `journal: {events, deals, drift: {empty_journal}}` — расхождение
+   журнала и kanban видно числом, а не на глаз.
+
+## Что НЕ входит в 0.0.3
+
+- Свой планировщик и spawn воркеров (это уже замена kanban целиком, следующий шаг).
+- Запись в kanban-колонки: duty по-прежнему ничего там не меняет.
+- Миграция исторических событий задним числом: журнал начинается с момента включения.

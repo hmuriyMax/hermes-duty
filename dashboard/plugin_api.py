@@ -46,6 +46,13 @@ SQL_BUSY_TIMEOUT_SEC = 2.0
 # Используется и для `session_key` вопроса пула, и для упоминания в его тексте.
 TASK_ID_RE = re.compile(r"t_[0-9a-f]{6,}")
 
+# Корневая БД: доска `default` лежит не в `kanban/boards/`, а прямо в корне Hermes.
+DEFAULT_BOARD = "default"
+
+# Каталог выбывших досок: ядро убирает туда закрытые доски (`_archived/<slug>/`)
+# и ставит рядом камень `board.json` с `"archived": true`. Это не источник среза.
+ARCHIVED_DIR = "_archived"
+
 
 def _plugin_version() -> str:
     """Номер версии — один источник (plugin.yaml), а не четвёртая копия в коде."""
@@ -121,25 +128,83 @@ def _table_exists(path: Path, table: str) -> bool:
     return any(str(r.get("name")) == table for r in rows)
 
 
-def _discover_boards(home: Path) -> list[dict[str, Any]]:
-    """Все живые kanban-БД: корневая (доска default) + boards/<slug>/kanban.db.
+def _archived_reason(board_dir: Path) -> Optional[str]:
+    """Почему доска выбыла, или None, если она живая.
 
-    0-байтная БД не выпадает из перечня: она помечается `note = "empty db"` и
-    видна как доска, которую не прочитали. Иначе такой файл молча исчезает и из
-    `boards[]`, и из `errors[]`, и срез выглядит полным, хотя доска потеряна.
+    Ядро kanban убирает закрытые доски в `kanban/boards/_archived/` и ставит в
+    каталог доски могильный камень `board.json` с `"archived": true`; открывать
+    такую доску ядро отказывается (`_refuse_dead_board_resurrection`). Для среза
+    это не источник, а история: читать её значит показывать архив как живое дело,
+    а не читать — значит держать вечный `errors[]` на каждом ответе.
     """
+    if board_dir.name == ARCHIVED_DIR or board_dir.parent.name == ARCHIVED_DIR:
+        return f"{ARCHIVED_DIR}: выбывшие доски, не живой источник"
+    tombstone = board_dir / "board.json"
+    if not tombstone.is_file():
+        return None
+    try:
+        raw = json.loads(tombstone.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    if isinstance(raw, dict) and raw.get("archived"):
+        return "board.json: archived"
+    return None
+
+
+def _board_paths(home: Path) -> list[tuple[str, Path]]:
+    """Все каталоги-кандидаты в доски: корень Hermes + `kanban/boards/<slug>`."""
     candidates: list[tuple[str, Path]] = []
     root = home / "kanban.db"
     if root.is_file():
-        candidates.append(("default", root))
+        candidates.append((DEFAULT_BOARD, root))
     boards_dir = home / "kanban" / "boards"
     if boards_dir.is_dir():
         for child in sorted(boards_dir.iterdir()):
             db = child / "kanban.db"
             if child.is_dir() and db.is_file():
                 candidates.append((child.name, db))
+            # Сам каталог `_archived/` — это namespace, а не доска: настоящие
+            # выбывшие доски лежат на уровень глубже (`_archived/<slug>/`).
+            # Без этого спуска архив был бы невидим целиком.
+            if child.is_dir() and child.name == ARCHIVED_DIR:
+                for retired in sorted(child.iterdir()):
+                    retired_db = retired / "kanban.db"
+                    if retired.is_dir() and retired_db.is_file():
+                        candidates.append((retired.name, retired_db))
+    return candidates
+
+
+def _discover_archived(home: Path) -> list[dict[str, Any]]:
+    """Выбывшие доски: видны в `/sources`, но не читаются в срез.
+
+    Молча выкинуть архив нельзя — тогда «доски не видно» станет неотличимо от
+    «доски нет». Поэтому он перечислен отдельным списком с причиной.
+    """
     found: list[dict[str, Any]] = []
-    for slug, path in candidates:
+    for slug, path in _board_paths(home):
+        if slug == DEFAULT_BOARD:
+            continue
+        reason = _archived_reason(path.parent)
+        if reason is None:
+            continue
+        found.append({"slug": slug, "path": str(path), "reason": reason})
+    return found
+
+
+def _discover_boards(home: Path) -> list[dict[str, Any]]:
+    """Все живые kanban-БД: корневая (доска default) + boards/<slug>/kanban.db.
+
+    0-байтная БД не выпадает из перечня: она помечается `note = "empty db"` и
+    видна как доска, которую не прочитали. Иначе такой файл молча исчезает и из
+    `boards[]`, и из `errors[]`, и срез выглядит полным, хотя доска потеряна.
+
+    Выбывшие доски (`_archived/`, камень `board.json: archived`) сюда не входят:
+    они не источник среза, их место — `/sources.archived`.
+    """
+    found: list[dict[str, Any]] = []
+    for slug, path in _board_paths(home):
+        if slug != DEFAULT_BOARD and _archived_reason(path.parent) is not None:
+            continue
         entry: dict[str, Any] = {"slug": slug, "path": str(path)}
         if path.stat().st_size == 0:
             entry["note"] = "empty db"
@@ -228,6 +293,7 @@ def sources() -> dict[str, Any]:
         "version": VERSION,
         "hermes_home": str(home),
         "boards": [_board_summary(b) for b in _discover_boards(home)],
+        "archived": _discover_archived(home),
         "pool": _pool_summary(home),
         "profiles": profiles,
     }

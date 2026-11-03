@@ -999,6 +999,67 @@ def test_empty_kanban_db_is_visible_as_unread_board(home: Path, client: TestClie
     assert [deal["id"] for deal in body["deals"]] == ["t_3e0b0001"]
 
 
+def test_archived_namespace_is_not_a_live_source(home: Path, client: TestClient) -> None:
+    """`boards/_archived/` — не доска: в срез не читается, в `errors[]` не шумит.
+
+    Раньше `_archived/kanban.db` попадал в обнаружение как ещё одна доска и висел
+    в `errors[]` на каждом ответе («empty db»), хотя это каталог выбывших досок.
+    """
+    conn = sqlite3.connect(make_board(home, "stack"))
+    add_task(conn, "t_3e0c0001", status="todo", created_at=NOW - 100)
+    conn.commit()
+    conn.close()
+    retired = make_board(home, "_archived/old-board")
+    conn = sqlite3.connect(retired)
+    add_task(conn, "t_3e0c0002", status="running", created_at=NOW - 100)
+    conn.commit()
+    conn.close()
+    empty_ns = home / "kanban" / "boards" / "_archived" / "kanban.db"
+    empty_ns.write_bytes(b"")
+
+    body = client.get("/now").json()
+
+    assert [deal["id"] for deal in body["deals"]] == ["t_3e0c0001"]
+    assert body["errors"] == []
+    assert {board["slug"] for board in body["boards"]} == {"stack"}
+    archived = {entry["slug"]: entry for entry in client.get("/sources").json()["archived"]}
+    assert archived["old-board"]["reason"] == "_archived: выбывшие доски, не живой источник"
+    assert archived["old-board"]["path"].endswith("_archived/old-board/kanban.db")
+    assert "_archived" in archived
+
+
+def test_archived_tombstone_board_is_skipped(home: Path, client: TestClient) -> None:
+    """Доска с камнем `board.json: archived` не читается в срез и видна в `/sources`."""
+    conn = sqlite3.connect(make_board(home, "stack"))
+    add_task(conn, "t_3e0d0001", status="todo", created_at=NOW - 100)
+    conn.commit()
+    conn.close()
+    legacy = make_board(home, "legacy")
+    conn = sqlite3.connect(legacy)
+    add_task(conn, "t_3e0d0002", status="blocked", created_at=NOW - 100)
+    conn.commit()
+    conn.close()
+    (legacy.parent / "board.json").write_text('{"slug": "legacy", "archived": true}')
+
+    body = client.get("/now").json()
+
+    assert [deal["id"] for deal in body["deals"]] == ["t_3e0d0001"]
+    assert body["errors"] == []
+    archived = {entry["slug"]: entry for entry in client.get("/sources").json()["archived"]}
+    assert archived["legacy"]["reason"] == "board.json: archived"
+
+
+def test_archived_board_is_not_routable(home: Path, client: TestClient) -> None:
+    """`/board/<выбывшая>/tasks` — 404: архив не источник, его нельзя читать как доску."""
+    make_board(home, "_archived/old-board")
+    legacy = make_board(home, "legacy")
+    (legacy.parent / "board.json").write_text('{"slug": "legacy", "archived": true}')
+
+    assert client.get("/board/_archived/tasks").status_code == 404
+    assert client.get("/board/old-board/tasks").status_code == 404
+    assert client.get("/board/legacy/tasks").status_code == 404
+
+
 def test_question_pool_limit_is_not_silent(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

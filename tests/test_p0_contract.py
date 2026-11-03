@@ -1,9 +1,14 @@
 """Контракт формы P0-роутов: `/health`, `/sources`, `/board/{slug}/tasks`.
 
 Baseline — `fd6d102` (каркас + read-only `/health`): у `/health` 11 ключей,
-у `/sources` 19, у `/board/{slug}/tasks` 15 (см. `evidence.json` карточки
+у `/sources` было 19, у `/board/{slug}/tasks` 15 (см. `evidence.json` карточки
 `t_ed22e46e`). Здесь форма зафиксирована тестом, а не ручной сверкой: удаление
 или добавление любого ключа в этих ответах роняет тест.
+
+`/sources` 19 → 23 в 0.0.2: добавлен список выбывших досок (`archived[]` с
+`slug`/`path`/`reason`) — осознанное расширение, а не дрейф: архив перестал быть
+источником среза, но обязан быть видимым, иначе «доски нет» и «доска в архиве»
+неотличимы.
 
 Источники — свои маленькие БД в `tmp_path` по реальной схеме, живые не читаются.
 """
@@ -109,6 +114,10 @@ SOURCES_KEYS = {
     "boards[].tasks",
     "boards[].blocked",
     "boards[].running",
+    "archived",
+    "archived[].slug",
+    "archived[].path",
+    "archived[].reason",
     "pool",
     "pool.path",
     "pool.by_origin_status",
@@ -178,6 +187,15 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     conn.commit()
     conn.close()
 
+    # Выбывшая доска под `_archived/`: её форма в `/sources.archived` тоже часть
+    # контракта, поэтому в фикстуре она есть (иначе `shape()` не увидит список).
+    retired = home / "kanban" / "boards" / "_archived" / "retired" / "kanban.db"
+    retired.parent.mkdir(parents=True)
+    conn = sqlite3.connect(retired)
+    conn.executescript(BOARD_SCHEMA)
+    conn.commit()
+    conn.close()
+
     monkeypatch.setenv("HERMES_HOME", str(home))
     app = FastAPI()
     app.include_router(plugin_api.router)
@@ -195,14 +213,14 @@ def test_health_shape_matches_baseline(client: TestClient) -> None:
 
 
 def test_sources_shape_matches_baseline(client: TestClient) -> None:
-    """`/sources` — 19 ключей, как в baseline `fd6d102`."""
+    """`/sources` — 23 ключа: baseline 19 плюс `archived[]` (0.0.2)."""
     response = client.get("/sources")
 
     assert response.status_code == 200
     body = response.json()
     assert body["pool"] is not None
     keys = shape(body)
-    assert len(keys) == 19
+    assert len(keys) == 23
     assert keys == SOURCES_KEYS
 
 

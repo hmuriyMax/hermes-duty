@@ -78,20 +78,38 @@ CREATE TABLE IF NOT EXISTS attachments (
 ## События
 
 Каждая мутация пишет строку дела и событие **в одной транзакции** (иначе журнал и store
-разъедутся). Используются уже определённые `kind`:
+разъедутся). Виды событий и их правила fold определены в `docs/JOURNAL.md` («Набор
+событий») — здесь только то, какая команда какой вид пишет. Виды `review_requested`,
+`changes_requested`, `collected`, `gate_opened`, `gate_closed`, `patched`, `commented`
+и `attached` заведены вместе с W5 и живут в контракте журнала; до W5 их не было ни в
+одном документе.
 
 | команда | событие |
 |---|---|
 | создать дело | `created` (`source='cli'/'api'`) |
+| правка спецификации (`PATCH` без `status`) | `patched` (`fields`) |
+| архив (`PATCH {status: archived}`) | `completed` со `status='archived'` |
 | блокировка | `blocked` (`block_kind`, `reason`) |
 | разблокировка | `unblocked` |
 | взять в работу | `claimed` (`owner`) |
 | завершить | `completed` |
-| на ревью / вернуть | `review_requested`, `changes_requested` (новые kind — добавить в контракт журнала вместе с тестом) |
+| на ревью / вернуть | `review_requested`, `changes_requested` (`reviewer`, `summary` / `reason`) |
+| вердикт ревью и закрытие | `collected`, `completed` (одной транзакцией) |
 | комментарий | `commented` (`author`, `len`) |
+| вложение (метаданные) | `attached` (`filename`, `size_bytes`, `content_type`) |
+| переход гейта ребёнка (пишет мутация родителя) | `gate_opened` / `gate_closed` (`from`, `to`, `parent`) |
+
+Закрытость дела считается по последнему **state-changing** событию журнала
+(`completed`), а `commented`/`attached`/`patched` её не снимают: правило fold —
+`docs/JOURNAL.md`, правила 2 и 12. Поэтому комментарий или вложение по закрытому делу
+остаются фактом таймлайна, а не возвратом в работу.
 
 `idempotency_key` для мутаций: `cli:<deal_id>:<kind>:<sha1(аргументы)>`, для API —
 `api:<deal_id>:<kind>:<sha1(тело запроса)>`; повторный тот же вызов не плодит событий.
+У `gate_opened`/`gate_closed` ключ считается от причины перехода, а не от аргументов:
+`<source>:<child_id>:<kind>:sha1(<idempotency_key события родителя>|<child_id>|<kind>)`,
+поэтому повтор той же причины перехода не плодит событий, а новый переход родителя даёт
+новый ключ.
 
 ## API
 

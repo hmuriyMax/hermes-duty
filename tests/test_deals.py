@@ -357,6 +357,31 @@ def test_event_write_failure_rolls_back_comment(home: Path, client: TestClient, 
     assert bodies == ["до сбоя"]
 
 
+def test_store_write_failure_rolls_back_event(
+    home: Path, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Обратная половина инварианта 2: событие легло, запись store упала — откат обоих.
+
+    Первые два теста проверяют «событие не легло → нет строки». Здесь наоборот:
+    подменяется `deals._set_status` — единственная запись строки дела из `_apply`,
+    — и после падения события `blocked` в журнале быть не должно, а `status`
+    обязан остаться прежним. Иначе транзакция «наполовину»: журнал говорит
+    «заблокировано», а дело стоит в очереди.
+    """
+    deal = create(client)
+    assert deal["status"] == "ready"
+
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("store недоступен")
+
+    monkeypatch.setattr(deals, "_set_status", boom)
+    with pytest.raises(RuntimeError, match="store недоступен"):
+        mutate(client, "POST", f"/deals/{deal['id']}/block", json={"kind": "needs_input", "reason": "нет ТЗ"})
+
+    assert kinds(home, deal["id"]) == ["created"]
+    assert deal_rows(home)[0]["status"] == "ready"
+
+
 # ------------------------------------------------------- идемпотентность (3)
 
 
@@ -589,6 +614,67 @@ def test_own_deal_visible_in_now_and_leaves_after_complete(home: Path, client: T
     assert card["terminal"] is True
     assert card["deal"] is None
     assert [event["kind"] for event in card["timeline"]] == ["created", "completed"]
+
+
+def test_closed_deal_stays_closed_after_comment_attach_and_patch(
+    home: Path, client: TestClient
+) -> None:
+    """Закрытое дело не «воскресает» комментарием, вложением и правкой (правила 2, 12).
+
+    `commented`/`attached`/`patched` состояния не меняют, поэтому закрытость
+    считается по последнему state-changing событию. Без этого fold уходил в
+    `no_live_fact` с `active: True`, и карточка в одном ответе говорила
+    `terminal: true` и показывала состояние ожидания «status=done: нет живых
+    фактов» — ложь на экране.
+    """
+    deal = create(client)
+    mutate(client, "POST", f"/deals/{deal['id']}/complete", json={"summary": "готово"})
+    mutate(client, "POST", f"/deals/{deal['id']}/comment", json={"author": "max", "body": "спасибо"})
+    mutate(
+        client, "POST", f"/deals/{deal['id']}/attach", files={"file": ("note.txt", b"hello", "text/plain")}
+    )
+    patched = mutate(client, "PATCH", f"/deals/{deal['id']}", json={"title": "переименовано после закрытия"})
+
+    assert kinds(home, deal["id"]) == ["created", "completed", "commented", "attached", "patched"]
+    assert patched["status"] == "done"
+    assert patched["mutation"] == {"events": 1, "idempotent": False}
+    # `patched` — правка спецификации, и её payload называет поля, а не состояние
+    assert events(home, deal["id"])[-1]["payload"] == {"fields": ["title"]}
+    assert journal.fold(events(home, deal["id"]))["active"] is False
+
+    assert deal["id"] not in now_deals(client)
+
+    card = client.get(f"/deal/{BOARD}/{deal['id']}").json()
+    # Закрытость и отсутствие состояния согласованы в одном ответе: дело не
+    # активно (у него нет `deal.waiting`), и терминальность это подтверждает.
+    assert card["terminal"] is True
+    assert card["deal"] is None
+    assert "wait_slot" not in json.dumps(card, ensure_ascii=False)
+
+
+def test_archived_patch_keeps_closed_deal_closed(home: Path, client: TestClient) -> None:
+    """Обратный случай: `patch(status=archived)` закрывает честно, а не «воскрешает».
+
+    Архив — state-changing факт (тот же `completed` со `status="archived"`),
+    поэтому закрытость не снимается, а переносится: карточка говорит
+    `terminal: true`, `status` отражает архив, состояния ожидания нет.
+    """
+    deal = create(client)
+    mutate(client, "POST", f"/deals/{deal['id']}/complete", json={"summary": "готово"})
+    archived = mutate(client, "PATCH", f"/deals/{deal['id']}", json={"status": "archived"})
+
+    assert archived["status"] == "archived"
+    assert kinds(home, deal["id"]) == ["created", "completed", "completed"]
+    assert events(home, deal["id"])[-1]["payload"] == {"status": "archived"}
+    folded = journal.fold(events(home, deal["id"]))
+    assert folded["active"] is False
+    assert "status=archived" in folded["evidence"]
+
+    assert deal["id"] not in now_deals(client)
+    card = client.get(f"/deal/{BOARD}/{deal['id']}").json()
+    assert card["status"] == "archived"
+    assert card["terminal"] is True
+    assert card["deal"] is None
 
 
 def test_deal_card_carries_comments_and_attachments(home: Path, client: TestClient) -> None:

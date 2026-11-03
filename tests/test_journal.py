@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -313,6 +314,24 @@ def test_schema_matches_contract(home: Path) -> None:
     assert (home / "duty" / "duty.db").is_file()
 
 
+def test_every_kind_has_a_row_in_the_contract() -> None:
+    """Ни один `kind` не живёт в коде без строки в контракте (п.5 ревью W5).
+
+    Таблица «Набор событий» — единственное место, где вид назван словами вместе с
+    правилом fold. Тест держит соответствие в обе стороны: вид без строки —
+    расхождение кода и контракта, строка без вида — обещание, которого нет.
+    """
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "JOURNAL.md").read_text(encoding="utf-8")
+    start = doc.index("## Набор событий")
+    section = doc[start : doc.index("## ", start + len("## Набор событий"))]
+    documented = {
+        match.group(1) for match in re.finditer(r"^\|\s*`([a-z_]+)`\s*\|", section, flags=re.MULTILINE)
+    }
+    documented.discard("kind")  # заголовок таблицы
+
+    assert documented == set(journal.EVENT_KINDS)
+
+
 def test_missing_journal_is_empty_not_an_error(home: Path) -> None:
     """Отсутствие файла — «журнала ещё нет»: пустой журнал, без исключения."""
     assert not (home / "duty" / "duty.db").exists()
@@ -428,6 +447,68 @@ def test_fold_last_completed_makes_deal_inactive() -> None:
     assert folded["active"] is False
     assert folded["state"] is None
     assert "status=done" in folded["evidence"]
+
+
+def test_fold_closed_deal_is_not_reopened_by_non_state_kinds() -> None:
+    """Правила 2 и 12: комментарий, вложение и правка закрытость не снимают.
+
+    Закрытость считается по последнему state-changing событию, а не по последней
+    строке журнала. Иначе `commented` поверх `completed` возвращал дело в срез с
+    `active: True` и состоянием ожидания — «воскресшее» дело на экране.
+    """
+    folded = journal.fold(
+        events(
+            ("created", {"status": "ready"}),
+            ("completed", {"status": "done"}),
+            ("commented", {"author": "max", "len": 6}),
+            ("attached", {"filename": "note.txt"}),
+            ("patched", {"fields": ["title"]}),
+        ),
+        now=NOW,
+    )
+
+    assert folded["active"] is False
+    assert folded["state"] is None
+    assert folded["reason"] == "closed"
+    assert "status=done" in folded["evidence"]
+    # `last_kind` остаётся честной последней строкой журнала: разница между ней и
+    # решением о закрытости и есть правило 2.
+    assert folded["last_kind"] == "patched"
+    # Набор «не меняющих состояние» видов назван в одном месте и ровно этими тремя.
+    assert journal.NON_STATE_KINDS == ("commented", "attached", "patched")
+
+
+def test_state_changing_kind_after_completed_reopens_honestly() -> None:
+    """Обратная сторона правила 2: настоящий переход после `completed` снова активен.
+
+    Блокировка закрытого дела — state-changing факт, и fold обязан его показать,
+    иначе правило превратилось бы в «после `completed` журнал больше не читают».
+    """
+    folded = journal.fold(
+        events(
+            ("created", {"status": "ready"}),
+            ("completed", {"status": "done"}),
+            ("blocked", {"block_kind": "needs_input", "reason": "вернулось"}),
+        ),
+        now=NOW,
+    )
+
+    assert folded["active"] is True
+    assert folded["state"] == "wait_human"
+
+
+def test_created_snapshot_gate_survives_a_comment() -> None:
+    """Правило 8 считается по state-changing событию: комментарий гейт не отменяет."""
+    folded = journal.fold(
+        events(
+            ("created", {"status": "todo", "parents": ["d_aabbccdd"]}),
+            ("commented", {"author": "max", "len": 6}),
+        ),
+        now=NOW,
+    )
+
+    assert folded["state"] == "wait_gate"
+    assert "d_aabbccdd" in folded["evidence"]
 
 
 def test_fold_blocked_without_unblocked_is_wait_human_status() -> None:

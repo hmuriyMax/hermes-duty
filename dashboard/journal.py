@@ -108,6 +108,13 @@ EVENT_KINDS = (
     "question_answered",
 )
 
+# Виды, которые состояния не меняют (правило 12 `docs/JOURNAL.md`): комментарий,
+# вложение и правка спецификации — факты таймлайна, а не перехода. Закрытость и
+# гейт считаются по последнему state-changing событию, поэтому любое из них поверх
+# `completed` закрытое дело не воскрешает. Набор один на весь модуль: расползаться
+# по `if` в вызывающих это правило не должно.
+NON_STATE_KINDS = ("commented", "attached", "patched")
+
 # Виды kanban-событий, которые переносятся в журнал один-к-одному.
 INGEST_EVENT_KINDS = ("created", "claimed", "blocked", "unblocked", "completed", "archived")
 
@@ -325,20 +332,44 @@ def deal_ids(conn: sqlite3.Connection) -> set[str]:
 # ------------------------------------------------------------------ fold
 
 
+def _last_state_event(ordered: list[dict[str, Any]]) -> dict[str, Any]:
+    """Последнее state-changing событие: `NON_STATE_KINDS` не в счёт.
+
+    Проверено ли дело закрытым и остался ли от него снимок гейта — решает не
+    последняя строка журнала, а последний факт, менявший состояние. Fallback на
+    последнее событие нужен только на вырожденном наборе, где state-changing нет
+    вовсе: пустой список сюда не приходит (fold проверил его раньше).
+    """
+    for event in reversed(ordered):
+        if str(event.get("kind") or "") not in NON_STATE_KINDS:
+            return event
+    return ordered[-1]
+
+
+def _closed_kind(kind: str) -> bool:
+    """Закрывает ли событие дело: `completed` — единственный такой факт.
+
+    Отдельного `kind` для архива нет (`docs/JOURNAL.md`): `archived` приходит тем
+    же `completed` со `status="archived"` в payload, и потому закрытость по нему
+    считается так же честно, как по `done`.
+    """
+    return kind == "completed"
+
+
 def fold(
     events: Iterable[dict[str, Any]],
     *,
     now: Optional[int] = None,
     pid_probe: Optional[Callable[[Any], Optional[bool]]] = None,
 ) -> dict[str, Any]:
-    """Состояние ожидания дела по его событиям — правила 1–7 контракта.
+    """Состояние ожидания дела по его событиям — правила 1–13 контракта.
 
     Чистая функция: ни БД, ни файлов. События применяются в порядке `id`
     (правило 1). Ответ:
 
-    - `active: False` — последнее событие `completed` (правило 2): дело не
-      активно, в `/now` не попадает; `state` тогда `None`.
-    - `state` из восьми состояний — сработал живой факт (правила 3–6, 8):
+    - `active: False` — последнее state-changing событие `completed` (правило 2):
+      дело не активно, в `/now` не попадает; `state` тогда `None`;
+    - `state` из восьми состояний — сработал живой факт (правила 3–6, 8, 9, 11):
       блок, вопрос человеку, лизинг без попытки, попытка без завершения,
       снимок `created` с незакрытыми родителями;
     - `state: None` с `reason: "empty"` — событий нет вовсе (правило 7), а с
@@ -357,9 +388,17 @@ def fold(
     last_kind = str(ordered[-1].get("kind") or "")
     now_sec = _now_sec() if now is None else int(now)
 
-    if last_kind == "completed":
-        status = _payload(ordered[-1]).get("status") or "done"
-        return _verdict(False, None, f"журнал: последнее событие completed (status={status})", "closed", last_kind)
+    # 2. Закрытость — по последнему state-changing событию, а не по последней
+    #    строке журнала: `commented`/`attached`/`patched` состояния не меняют
+    #    (правило 12), и закрытое дело после них остаётся закрытым. Иначе дело
+    #    «воскресало» бы карточкой: fold уходил в `no_live_fact` с `active: True`,
+    #    и дело снова попадало в состояние ожидания.
+    changed = _last_state_event(ordered)
+    if _closed_kind(str(changed.get("kind") or "")):
+        status = _payload(changed).get("status") or "done"
+        return _verdict(
+            False, None, f"журнал: закрыто событием completed (status={status})", "closed", last_kind
+        )
 
     facts: dict[str, list[str]] = {}
     question = _open_question(ordered)
@@ -420,10 +459,12 @@ def fold(
             )
 
     # 8. Гейт: от дела остался только снимок `created`, и в нём есть родители.
-    #    Закрытие родителей видно в их собственных событиях, а не в этих, поэтому
-    #    факт назван снимком, а не сегодняшним состоянием графа.
-    if last_kind == "created":
-        parents = _payload(ordered[-1]).get("parents") or []
+    #    Считается по последнему state-changing событию — комментарий или правка
+    #    спецификации снимок гейта не отменяют (правило 12). Закрытие родителей
+    #    видно в их собственных событиях, а не в этих, поэтому факт назван
+    #    снимком («родители на момент created»), а не сегодняшним состоянием графа.
+    if str(changed.get("kind") or "") == "created":
+        parents = _payload(changed).get("parents") or []
         if parents:
             facts.setdefault("wait_gate", []).append(
                 "родители на момент created: "
@@ -477,9 +518,12 @@ def fold(
 
     # 12. `commented`, `attached` и `patched` состояния не создают намеренно:
     #     «человек оставил комментарий» или «поправил title» — не ожидание и не
-    #     повод показывать дело ждущим. Эти факты живут в таймлайне дела
-    #     (`/deal/{board}/{id}`), а не в таксономии; вторая правда о состоянии из
-    #     них не выводится.
+    #     повод показывать дело ждущим. Набор назван в одном месте
+    #     (`NON_STATE_KINDS`), и им же считается закрытость (правило 2): эти три
+    #     вида закрытое дело не воскрешают.
+    # 13. `collected` состояние не поднимает: вердикт снял ожидание ревью, и дело
+    #     возвращается к тому, что говорит его `status`. Ветки здесь нет намеренно —
+    #     `collected` участвует только в выборе вердикта (правила 9–10).
 
     state = next((name for name in WAITING_PRIORITY if name in facts), None)
     if state is None:

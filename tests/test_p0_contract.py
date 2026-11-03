@@ -234,3 +234,14 @@ def test_board_tasks_shape_matches_baseline(client: TestClient) -> None:
     keys = shape(body)
     assert len(keys) == 15
     assert keys == BOARD_KEYS
+
+
+def test_all_responses_are_not_cacheable(client: TestClient) -> None:
+    """Ни один ответ плагина не кэшируется: иначе протухший снимок выглядит живым.
+
+    Проверяем и успешный ответ, и 404 — кэш промежуточного слоя одинаково охотно
+    держит оба, а «доска недоступна» из вчерашнего тела потом висит на экране.
+    """
+    for path in ("/health", "/sources", "/now", "/board/stack/tasks", "/board/nope/tasks"):
+        response = client.get(path)
+        assert response.headers.get("cache-control") == "no-store, no-cache, must-revalidate", path

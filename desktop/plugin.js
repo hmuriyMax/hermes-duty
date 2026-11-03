@@ -333,6 +333,24 @@ function shapeAttempts(payload) {
     attempts,
   }
 }
+
+/**
+ * Строки неполноты ответа `/now`: недоступная доска, упавший источник,
+ * обрезанная или деградировавшая доска.
+ *
+ * `stale` — последний запрос не прошёл, на экране прошлый снимок: его замечания
+ * уже не факт о настоящем, поэтому отдаём пусто. Иначе «доска X недоступна»
+ * переживает починку кода и висит, пока страницу не перезагрузят.
+ */
+function noticeLines(model, stale = false) {
+  if (stale || !model) return []
+  return [
+    ...model.unreachable.map((bad) => `доска ${bad.board} недоступна: ${bad.reason}`),
+    ...model.otherErrors.map((bad) => `источник ${bad.board} недоступен: ${bad.reason}`),
+    ...model.truncatedNotices,
+    ...model.warningNotices,
+  ]
+}
 // duty:model-end
 
 /* ---------------- стили страницы ---------------- */
@@ -667,21 +685,14 @@ function AttemptsPanel({ sel, onClose }) {
   )
 }
 
-// Неполнота ответа /now одной строкой: недоступная доска, упавший источник и
-// прочитанная, но обрезанная/деградировавшая доска. Общая для жёлтой полосы над
-// списком и для пустого состояния — иначе «досок 19/19» врёт про полноту среза.
-function noticeLinesOf(model) {
-  return [
-    ...model.unreachable.map((bad) => `доска ${bad.board} недоступна: ${bad.reason}`),
-    ...model.otherErrors.map((bad) => `источник ${bad.board} недоступен: ${bad.reason}`),
-    ...model.truncatedNotices,
-    ...model.warningNotices,
-  ]
-}
+// Неполнота ответа /now одной строкой — общая для жёлтой полосы над списком и
+// для пустого состояния, иначе «досок 19/19» врёт про полноту среза. Собирает её
+// модель (`noticeLines`), потому что правило «устаревший снимок замечаний не
+// имеет» проверяется тестом, а не глазами при ревью рендера.
 
-function EmptyState({ view, model, onReset }) {
+function EmptyState({ view, model, onReset, stale }) {
   const filtered = model.count > 0 && view.count === 0
-  const lines = noticeLinesOf(model)
+  const lines = noticeLines(model, stale)
   return h(
     'div',
     { className: 'duty-empty' },
@@ -767,7 +778,13 @@ function DutyPage() {
     ? h(
         'div',
         { className: 'duty-banner' },
-        h('span', null, `ошибка запроса /now: ${snap.error}`),
+        h(
+          'span',
+          null,
+          model
+            ? `снимок от ${fmtClock(model.now)} — обновление не удалось: ${snap.error}`
+            : `ошибка запроса /now: ${snap.error}`,
+        ),
         h(Button, { size: 'xs', variant: 'secondary', onClick: () => void snap.refresh() }, 'повторить'),
       )
     : null
@@ -775,12 +792,16 @@ function DutyPage() {
   // Недоступные доски, упавшие источники и обрезанные/деградировавшие доски —
   // жёлтой полосой над списком, чтобы неполнота ответа была видна и тогда, когда
   // дела есть (в пустом состоянии те же строки перечисляет EmptyState).
-  const noticeLines = model ? noticeLinesOf(model) : []
-  const notices = noticeLines.length && view && view.count > 0
+  // Показываем их только по свежему ответу: при `snap.error` экран держит прошлый
+  // снимок, и его замечания — не факт о настоящем (иначе «доска _archived
+  // недоступна» висит вечно, хотя последний ответ её уже не содержит).
+  const stale = Boolean(snap.error)
+  const noticeRows = noticeLines(model, stale)
+  const notices = noticeRows.length && view && view.count > 0
     ? h(
         'div',
         { className: 'duty-note' },
-        ...noticeLines.map((line, i) => h('div', { key: `notice-${i}` }, line)),
+        ...noticeRows.map((line, i) => h('div', { key: `notice-${i}` }, line)),
       )
     : null
 
@@ -853,7 +874,7 @@ function DutyPage() {
       ),
     )
   } else if (!view.count) {
-    list = h('div', { className: 'duty-list' }, h(EmptyState, { view, model, onReset: resetFilters }))
+    list = h('div', { className: 'duty-list' }, h(EmptyState, { view, model, onReset: resetFilters, stale }))
   } else {
     list = h(
       'div',

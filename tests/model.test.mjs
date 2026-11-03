@@ -19,6 +19,7 @@ import {
   fmtAge,
   fmtTitle,
   groupDeals,
+  noticeLines,
   outcomeTone,
   shapeAttempts,
   shapeDeal,
@@ -266,6 +267,19 @@ test('обрезанный срез и warnings доски не молчат: п
   // в фикстуре нет обрезанных досок, но warnings у ozon есть всегда
   assert.deepEqual(model.truncatedNotices, [])
   assert.deepEqual(model.warningNotices, ['доска ozon: task_events: no such column: run_id'])
+})
+
+test('устаревший снимок не показывает замечаний прошлого ответа', () => {
+  // в фикстуре есть недоступная доска и ошибка источника — по свежему ответу это факт
+  assert.ok(noticeLines(model).some((line) => line.startsWith('доска ozon-legacy недоступна')))
+  assert.ok(noticeLines(model).some((line) => line.startsWith('источник messaging/pool.db')))
+
+  // тот же снимок, но последний запрос не прошёл: на экране картина прошлого
+  // ответа, и её замечания больше ничего не утверждают о настоящем
+  assert.deepEqual(noticeLines(model, true), [])
+
+  // «забыли передать снимок» не должно бросать исключение на пустом состоянии
+  assert.deepEqual(noticeLines(null), [])
 })
 
 test('доски: счётчик прочитанных и причины недоступных — из ответа, без догадок', () => {

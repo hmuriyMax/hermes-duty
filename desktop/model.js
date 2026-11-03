@@ -306,6 +306,24 @@ function shapeAttempts(payload) {
   }
 }
 
+/**
+ * Строки неполноты ответа `/now`: недоступная доска, упавший источник,
+ * обрезанная или деградировавшая доска.
+ *
+ * `stale` — последний запрос не прошёл, на экране прошлый снимок: его замечания
+ * уже не факт о настоящем, поэтому отдаём пусто. Иначе «доска X недоступна»
+ * переживает починку кода и висит, пока страницу не перезагрузят.
+ */
+function noticeLines(model, stale = false) {
+  if (stale || !model) return []
+  return [
+    ...model.unreachable.map((bad) => `доска ${bad.board} недоступна: ${bad.reason}`),
+    ...model.otherErrors.map((bad) => `источник ${bad.board} недоступен: ${bad.reason}`),
+    ...model.truncatedNotices,
+    ...model.warningNotices,
+  ]
+}
+
 export {
   STATE_META,
   TONE_COLOR,
@@ -319,4 +337,5 @@ export {
   filterNow,
   outcomeTone,
   shapeAttempts,
+  noticeLines,
 }

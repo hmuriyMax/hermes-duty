@@ -34,8 +34,35 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException
+from fastapi.routing import APIRoute
 
-router = APIRouter()
+
+# Один набор заголовков на все ответы: и 200, и ошибки. Кэш промежуточного
+# слоя держит и `404`, поэтому «доска недоступна» из прошлого тела иначе
+# переживает починку кода.
+NO_STORE_HEADERS = {"Cache-Control": "no-store, no-cache, must-revalidate"}
+
+
+class _NoStoreRoute(APIRoute):
+    """Ответы плагина не кэшируются нигде.
+
+    Снимок «сейчас» живёт секунды, а `4xx/5xx` и тела без заголовков кэширования
+    промежуточные слои (LAN-прокси, кэш клиента) вправе переиспользовать — тогда
+    на экране висит картина, снятая до починки, и выглядит свежей.
+    """
+
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def wrapper(request):
+            response = await handler(request)
+            response.headers.update(NO_STORE_HEADERS)
+            return response
+
+        return wrapper
+
+
+router = APIRouter(route_class=_NoStoreRoute)
 
 # Busy-timeout соединения: сколько ждать чужую запись, а не дедлайн запроса.
 # Плагин читает живые БД, которые пишет ядро, поэтому ждать дольше смысла нет —
@@ -305,7 +332,7 @@ def board_tasks(slug: str) -> dict[str, Any]:
     home = _hermes_home()
     match = [b for b in _discover_boards(home) if b["slug"] == slug]
     if not match:
-        raise HTTPException(status_code=404, detail=f"board '{slug}' not found")
+        raise HTTPException(status_code=404, headers=NO_STORE_HEADERS, detail=f"board '{slug}' not found")
     path = Path(match[0]["path"])
     rows = _query(
         path,
@@ -929,7 +956,7 @@ def _board_entry(home: Path, slug: str) -> dict[str, Any]:
     """Запись доски по слагу или HTTP 404."""
     match = [b for b in _discover_boards(home) if b["slug"] == slug]
     if not match:
-        raise HTTPException(status_code=404, detail=f"board '{slug}' not found")
+        raise HTTPException(status_code=404, headers=NO_STORE_HEADERS, detail=f"board '{slug}' not found")
     return match[0]
 
 
@@ -943,6 +970,7 @@ def now(board: Optional[str] = None, state: Optional[str] = None) -> dict[str, A
     if state is not None and state not in WAITING_PRIORITY:
         raise HTTPException(
             status_code=400,
+            headers=NO_STORE_HEADERS,
             detail=f"unknown state '{state}', expected one of {list(WAITING_PRIORITY)}",
         )
     home = _hermes_home()
@@ -958,16 +986,16 @@ def duty_attempts(board: str, task_id: str) -> dict[str, Any]:
     path = Path(_board_entry(home, board)["path"])
     tasks, err = _query_checked(path, "SELECT id, title FROM tasks WHERE id = ?", (task_id,))
     if err:
-        raise HTTPException(status_code=503, detail=f"board '{board}' unreadable: {err}")
+        raise HTTPException(status_code=503, headers=NO_STORE_HEADERS, detail=f"board '{board}' unreadable: {err}")
     if not tasks:
-        raise HTTPException(status_code=404, detail=f"task '{task_id}' not found on board '{board}'")
+        raise HTTPException(status_code=404, headers=NO_STORE_HEADERS, detail=f"task '{task_id}' not found on board '{board}'")
 
     now = _now_sec()
     runs, err = _query_checked(
         path, "SELECT * FROM task_runs WHERE task_id = ? ORDER BY started_at, id", (task_id,)
     )
     if err:
-        raise HTTPException(status_code=503, detail=f"task_runs unreadable: {err}")
+        raise HTTPException(status_code=503, headers=NO_STORE_HEADERS, detail=f"task_runs unreadable: {err}")
     events_by_run: dict[int, list[dict[str, Any]]] = {}
     rows, err = _query_checked(
         path,

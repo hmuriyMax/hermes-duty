@@ -37,6 +37,15 @@ const STATE_META = {
   wait_gate: { label: 'ждёт гейт', tone: 'gray' },
 }
 
+// Подпись `wait_human` по `human_kind` бэкенда: `question` — есть живой вопрос,
+// на который можно ответить, `status` — вопроса нет, решение принимается по
+// статусу. Одна подпись на оба случая возвращала бы «ждёт ответа» блокировке без
+// вопроса, пока шапка в том же кадре пишет «0 вопросов + 1 блокировка».
+const WAIT_HUMAN_LABEL = {
+  question: 'ждёт ответа',
+  status: 'ждёт решения',
+}
+
 const TONE_COLOR = {
   yellow: 'var(--ui-yellow)',
   purple: 'var(--ui-purple)',
@@ -64,10 +73,19 @@ const LEASE_LABEL = {
   unknown: 'неизвестен',
 }
 
-/** Мета состояния; неизвестное состояние показываем как есть серым. */
-function stateMeta(state) {
+/**
+ * Мета состояния; неизвестное состояние показываем как есть серым.
+ *
+ * `humanKind` уточняет только `wait_human`: «ждёт ответа» — есть живой вопрос,
+ * «ждёт решения» — вопроса нет. Остальные состояния от `human_kind` не зависят.
+ */
+function stateMeta(state, humanKind) {
   const key = String(state || '')
-  return STATE_META[key] || { label: key || '—', tone: 'gray' }
+  const meta = STATE_META[key] || { label: key || '—', tone: 'gray' }
+  if (key === 'wait_human' && WAIT_HUMAN_LABEL[String(humanKind || '')]) {
+    return { label: WAIT_HUMAN_LABEL[String(humanKind)], tone: meta.tone }
+  }
+  return meta
 }
 
 /** Русская форма числа: `1 вопрос`, `2 вопроса`, `5 вопросов`. */
@@ -146,7 +164,8 @@ function shapeDeal(deal) {
   const lease = d.lease && typeof d.lease === 'object' ? d.lease : {}
   const action = d.last_action && typeof d.last_action === 'object' ? d.last_action : {}
   const waiting = d.waiting && typeof d.waiting === 'object' ? d.waiting : {}
-  const meta = stateMeta(waiting.state)
+  const humanKind = String(waiting.human_kind || '')
+  const meta = stateMeta(waiting.state, humanKind)
   const pidAlive = attempt ? attempt.pid_alive : null
   const leaseState = String(lease.state || 'none')
   const attemptAge = attempt && attempt.age_sec !== undefined ? attempt.age_sec : null
@@ -174,8 +193,10 @@ function shapeDeal(deal) {
     evidence: String(waiting.evidence || ''),
     // `human_kind` бэкенда: `question` — есть живой вопрос, `status` — человек
     // нужен, но вопроса нет (`waiting.human_kind`, контракт docs/JOURNAL.md).
-    // Пустое значение — состояние не про ожидание человека.
-    humanKind: String(waiting.human_kind || ''),
+    // Пустое значение — состояние не про ожидание человека. Подпись бейджа тоже
+    // считается по нему (см. `stateMeta`), иначе «ждёт ответа» звучит у блокировки
+    // без вопроса.
+    humanKind,
     attemptAge,
     attemptAgeText: fmtAge(attemptAge),
     attemptNote,
@@ -208,7 +229,12 @@ function groupDeals(deals) {
   const groups = []
   for (const [state, rows] of buckets) {
     const meta = stateMeta(state)
-    groups.push({ state, label: meta.label, tone: meta.tone, count: rows.length, deals: rows })
+    // Внутри группы `wait_human` встречаются оба вида: подпись группы говорит
+    // «ждёт ответа», только если вопрос есть у каждого дела в ней; иначе остаётся
+    // базовая — группа с блокировками без вопросов не обещает ответа.
+    const kinds = new Set(rows.map((deal) => deal.humanKind || ''))
+    const label = kinds.size === 1 ? stateMeta(state, [...kinds][0]).label : meta.label
+    groups.push({ state, label, tone: meta.tone, count: rows.length, deals: rows })
   }
   return groups
 }
@@ -370,6 +396,7 @@ function noticeLines(model, stale = false) {
 
 export {
   STATE_META,
+  WAIT_HUMAN_LABEL,
   TONE_COLOR,
   stateMeta,
   humanCounts,

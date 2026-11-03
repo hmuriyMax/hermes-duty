@@ -103,9 +103,12 @@ asked = client.post(
     "/api/plugins/hermes-duty/ask/stack/t_0001",
     json={"text": "Даёшь ок на выкатку?", "text_full": "### Контекст\n\n…", "options": ["ок", "нет"]},
 ).json()
-print(asked)                     # {'question_id': 501, 'deduped': False, 'errors': []}
+print(asked)                     # {'question_id': 501, 'created': True, 'deduped': False, 'adopted': False, 'errors': []}
 print(client.post("/api/plugins/hermes-duty/ask/stack/t_0001", json={"text": "?"}).json())
-# {'question_id': 501, 'deduped': True, 'errors': []}
+# {'question_id': 501, 'created': False, 'deduped': True, 'adopted': False, 'errors': []}
+# Подхвачен чужой живой вопрос (origin != 'duty', например сканер карточек):
+# id тот же, но факта в журнале нет — роут говорит это полем adopted:
+# {'question_id': 512, 'created': False, 'deduped': True, 'adopted': True, 'errors': []}
 
 now = client.get("/api/plugins/hermes-duty/now").json()
 print(now["count"], now["by_state"], now["errors"], len(now["boards"]))
@@ -140,9 +143,10 @@ if now["deals"]:
 | `journal: empty — состояние из kanban` в начале `waiting.evidence` | дела нет в журнале (или в журнале нет живого факта): состояние посчитано по kanban, и это сказано словами; `POST /ingest` подберёт дело, и пометка уйдёт |
 | `journal.drift.empty_journal` больше нуля в `/health` | столько активных дел журнал ещё не видел; после `POST /ingest` число падает до нуля. Пока оно больше нуля, состояние этих дел — из kanban |
 | `journal.note` в `/health` | свой журнал не открылся — это не «ноль событий», причина названа |
-| `waiting.human_kind` | `question` — ждёт ответа на вопрос пула; `status` — ждёт решения по статусу (блок, разбор, ревью, мердж), вопроса нет. В шапке «Сейчас» это двумя числами: `N вопросов + M блокировок` |
+| `waiting.human_kind` | `question` — ждёт ответа на вопрос пула; `status` — ждёт решения по статусу (блок, разбор, ревью, мердж), вопроса нет. В шапке «Сейчас» это двумя числами: `N вопросов + M блокировок`; в счётчик входят только эти два вида — `capability`, `no_signal` и `crashed` считаются отдельно, потому что там нужен не ответ и не решение, а доступ/разбор |
 | `503` на `POST /ask/{board}/{task_id}` с `errors[].board = "messaging/pool.db"` | вопрос не создан: пул отсутствует, не читается или только на чтение. Событие `question_asked` при этом не пишется — в журнале нет следа вопроса, которого нет в пуле |
 | `deduped: true` в ответе `/ask` | живой вопрос по делу уже был — вернули его `question_id`, второй строки в пуле нет |
+| `adopted: true` в ответе `/ask` | подхвачен живой вопрос **чужого** продюсера (`origin != 'duty'`): id возвращён, `question_asked` по нему не пишется — ответ на чужой вопрос журналу не виден, и снять факт было бы нечем. Живой вопрос при этом виден в пуле, и `/now` поднимает дело до `wait_human` с пометкой «в журнале вопроса нет» |
 | `boards[].warnings[]` строкой `дело t_…: в журнале completed, а kanban status=…` | журнал говорит, что дело закрыто (правило 2 fold), и оно не попало в срез — расхождение названо, а не скрыто |
 | 400 на `/now?state=…` | состояние не из таксономии (`wait_human`, `capability`, `dead_lease`, `crashed`, `working`, `no_signal`, `wait_slot`, `wait_gate`) |
 | 404 на `/now?board=…` | такой доски нет |

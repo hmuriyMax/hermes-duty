@@ -15,6 +15,7 @@ import { test } from 'node:test'
 
 import {
   STATE_META,
+  WAIT_HUMAN_LABEL,
   filterNow,
   fmtAge,
   fmtTitle,
@@ -122,12 +123,49 @@ test('набор «падений» приходит с бэкенда: лока
 })
 
 test('бейдж wait_human не обещает «человека»: вопрос может быть агенту', () => {
-  assert.equal(stateMeta('wait_human').label, 'ждёт ответа')
+  assert.equal(stateMeta('wait_human', 'question').label, 'ждёт ответа')
   assert.ok(!STATE_META.wait_human.label.includes('человек'))
   const deal = model.deals.find((item) => item.id === 't_a1b2c3d4')
   assert.equal(deal.stateLabel, 'ждёт ответа')
   // чей это вопрос — видно в evidence (origin в ответе бэкенда)
   assert.match(deal.evidence, /origin='card'/)
+})
+
+test('подпись wait_human — по human_kind: «ждёт ответа» / «ждёт решения»', () => {
+  // Блокировка без вопроса больше не выдаётся за ожидание ответа: шапка в том же
+  // кадре пишет «0 вопросов + 1 блокировка», и бейдж обязан говорить то же.
+  const asQuestion = shapeDeal({ waiting: { state: 'wait_human', human_kind: 'question' } })
+  const asStatus = shapeDeal({ waiting: { state: 'wait_human', human_kind: 'status' } })
+  assert.equal(asQuestion.stateLabel, 'ждёт ответа')
+  assert.equal(asStatus.stateLabel, 'ждёт решения')
+  // тон бейджа от human_kind не зависит: это всё ещё ожидание человека
+  assert.equal(asStatus.tone, 'yellow')
+  assert.equal(asQuestion.tone, 'yellow')
+
+  // Без human_kind подпись базовая (не «ждёт решения» и не пустая).
+  assert.equal(stateMeta('wait_human').label, STATE_META.wait_human.label)
+  // Состояния, не связанные с ожиданием человека, от human_kind не зависят.
+  assert.equal(stateMeta('working', 'status').label, 'работает')
+  assert.equal(stateMeta('capability', 'question').label, 'нужен доступ')
+  // Оба вида «нужен человек» названы: незаполненная подпись = дырка в бейдже.
+  assert.deepEqual(Object.keys(WAIT_HUMAN_LABEL).sort(), ['question', 'status'])
+})
+
+test('подпись группы wait_human не обещает ответа, если вопросов в ней нет', () => {
+  const onlyStatus = groupDeals([
+    shapeDeal({ waiting: { state: 'wait_human', human_kind: 'status' } }),
+    shapeDeal({ waiting: { state: 'wait_human', human_kind: 'status' } }),
+  ])
+  assert.equal(onlyStatus[0].label, 'ждёт решения')
+  assert.equal(onlyStatus[0].count, 2)
+
+  // Смешанная группа идёт под базовой подписью: «ждёт ответа» было бы неправдой
+  // про половину строк, а «ждёт решения» — про другую.
+  const mixed = groupDeals([
+    shapeDeal({ waiting: { state: 'wait_human', human_kind: 'question' } }),
+    shapeDeal({ waiting: { state: 'wait_human', human_kind: 'status' } }),
+  ])
+  assert.equal(mixed[0].label, STATE_META.wait_human.label)
 })
 
 test('human_kind: «вопрос» и «блокировка» считаются раздельно и одной строкой', () => {

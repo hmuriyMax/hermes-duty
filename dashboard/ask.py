@@ -6,12 +6,17 @@
   `origin='duty'`, `kind='decision'`, `text` — краткая строка, `text_full` — развёрнутая,
   `options_json` — варианты ответа, если заданы;
 - перед созданием ищется живой вопрос по делу; найденный возвращается как есть, дубль
-  не создаётся;
+  не создаётся. Живой вопрос **своего** продюсера (`origin='duty'`) при этом получает
+  факт `question_asked` идемпотентно, живой вопрос **чужого** — только id, без факта:
+  снять `question_asked` по чужому вопросу нечем (чужой продюсер в наш журнал не
+  пишет), и дело залипло бы в «ждёт ответа» навсегда;
 - событие `question_asked` пишется в журнал **после** успешной вставки в пул: сбой пула
   не оставляет в журнале ни вопроса, ни его тени — ошибка уходит вызывающему
   (`AskError`) и превращается в `errors[]` ответа;
-- `sync_answers` — обратный ход: ответ, найденный в пуле, становится фактом журнала
-  (`question_answered`), ровно один раз на вопрос.
+- `sync_answers` — обратный ход: ответ (`answered`) или истёкший срок (`expired`),
+  найденные в пуле, становятся фактом журнала (`question_answered`), ровно один раз
+  на вопрос. Отвеченный вопрос и вопрос с истёкшим TTL одинаково перестают быть
+  живым фактом ожидания — иначе дело вечно «ждёт ответа» у вопроса, которого нет.
 
 Границы модуля:
 
@@ -40,6 +45,7 @@ import json
 import sqlite3
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -57,8 +63,19 @@ ASK_KIND = "decision"
 
 # Живой вопрос по делу: `sent` — по контракту, `pending` — тот же вопрос до первого
 # тика демона моста (он ещё не ушёл в iMessage, но уже существует; без него второй
-# `ask()` за эти секунды создал бы дубль).
+# `ask()` за эти секунды создал бы дубль). Набор — единственный источник правды для
+# живых статусов: его же читает срез пула (`plugin_api._pool_questions`).
 LIVE_STATUSES = ("pending", "sent")
+
+# Вопрос закрыт пулом: `answered` — человек ответил, `expired` — вышел срок. Срок
+# (`timeout`) duty задаёт некритичному вопросу, и пул переводит такую строку в
+# `expired` своим чистящим циклом. Оба статуса закрывают факт в журнале: без
+# второго неотвеченный вопрос с истёкшим TTL остался бы открытым навсегда.
+CLOSED_STATUSES = ("answered", "expired")
+
+# Признак в `answered_via` для закрытия по сроку: пул меняет статус, но
+# `answered_via` не заполняет, и без пометки истечение выглядело бы ответом.
+EXPIRED_VIA = "expired"
 
 # Дело, которое ждёт человека дольше этого порога, получает `critical=1`
 # (вопрос поднимается в панели и не истекает).
@@ -101,8 +118,26 @@ class AskError(RuntimeError):
     """Пул вопросов не принял вопрос или не читается.
 
     Причина в тексте — её видно в `errors[]` ответа как есть: «вопроса нет» и
-    «пул недоступен» — разные факты, и второй нельзя выдавать за первый.
+    «пул недоступен» — разные факты, и второй нельзя выдавать за первый. Сюда же
+    уходит сбой журнала после успешной вставки в пул: вопрос уже создан, и это
+    должно быть сказано, а не выдано за 500 без подробностей.
     """
+
+
+@dataclass(frozen=True)
+class AskResult:
+    """Итог `ask()`: id вопроса и что именно произошло.
+
+    `created` — строка пула создана этим вызовом; `adopted` — подхвачен живой
+    вопрос чужого продюсера, по которому факта в журнале нет и не будет. Оба
+    признака нужны роуту: «вернул существующий вопрос» и «вернул существующий
+    чужой вопрос, факт не записан» — разные факты, и второй нельзя показывать
+    так же молча, как первый.
+    """
+
+    question_id: int
+    created: bool
+    adopted: bool
 
 
 def pool_path(home: Path) -> Path:
@@ -124,6 +159,12 @@ def find_live(home: Path, deal_id: str) -> Optional[dict[str, Any]]:
     Читает пул `mode=ro`: сам поиск ничего не меняет, и это же правило действует
     для любого чтения пула в плагине. Отсутствие файла — не «вопросов нет», а
     `AskError`: иначе второй вопрос молча создался бы поверх недоступного пула.
+
+    `origin` намеренно не фильтруется: живой вопрос по делу — факт пула, чей бы он
+    ни был, и второй вопрос поверх него был бы дублем. Что с ним делать, решает
+    `ask()`: чужой возвращается без записи в журнал, свой — с идемпотентным фактом.
+    `created_at` нужен, чтобы факт в журнале получил настоящий `ts` вопроса, а не
+    время вызова.
     """
     db = pool_path(home)
     if not db.is_file():
@@ -137,7 +178,7 @@ def find_live(home: Path, deal_id: str) -> Optional[dict[str, Any]]:
         try:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
-                f"SELECT id, status, critical, timeout, origin FROM questions "
+                f"SELECT id, status, critical, timeout, origin, created_at FROM questions "
                 f"WHERE session_key = ? AND status IN ({marks}) ORDER BY id DESC LIMIT 1",
                 (key, *LIVE_STATUSES),
             ).fetchone()
@@ -155,20 +196,29 @@ def ask(
     text_full: Optional[str],
     options: Optional[Iterable[str]] = None,
     critical: Optional[bool] = None,
-) -> int:
-    """Задать вопрос по делу; вернуть `question_id` (существующий или новый).
+) -> AskResult:
+    """Задать вопрос по делу; вернуть id вопроса и что именно произошло.
 
     `conn` — соединение с журналом (`journal.open_journal`), `deal` — факты дела:
     обязательны `id`, `board` и `home` (корень Hermes, где лежит пул).
 
     `critical=None` означает «решить по фактам журнала»: дело ждёт человека дольше
     `ASK_CRITICAL_SEC` — вопрос критичный, иначе у него есть срок
-    (`ASK_TIMEOUT_HOURS`). Явное значение вызывающего важнее расчёта.
+    (`ASK_TIMEOUT_HOURS`). Явное значение вызывающего важнее расчёта, но только при
+    создании вопроса: у подхваченного живого вопроса аргументы (`text`, `text_full`,
+    `options`, `critical`) не применяются — вопрос уже задан, и его факты берутся из
+    строки пула (контракт `docs/JOURNAL.md`, «`ask()`»).
 
-    Живой вопрос по делу (второй `ask()` по тому же делу) возвращается как есть:
-    строка в пуле не создаётся, а факт `question_asked` дописывается идемпотентно
-    (ключ `ask:<question_id>:question_asked`) — так журнал узнаёт и о вопросе,
-    созданном другим продюсером пула.
+    Три исхода, все в `AskResult`:
+
+    - `created=True` — строка пула создана этим вызовом, `question_asked` записан;
+    - `created=False, adopted=False` — живой **свой** вопрос: тот же id, факт
+      `question_asked` дописан идемпотентно (так журнал узнаёт о вопросе, созданном
+      до включения журнала);
+    - `created=False, adopted=True` — живой вопрос **чужого** продюсера
+      (`origin != 'duty'`): id возвращается, в журнал не пишется ничего. Ответ на
+      такой вопрос журналу принципиально не виден, `question_asked` снять было бы
+      нечем — дело залипло бы в «ждёт ответа» навсегда.
     """
     deal_id = str(deal.get("id") or "")
     board = str(deal.get("board") or "")
@@ -184,16 +234,20 @@ def ask(
 
     live = find_live(Path(home), deal_id)
     if live is not None:
+        question_id = int(live["id"])
+        if str(live.get("origin") or "") != ASK_ORIGIN:
+            return AskResult(question_id=question_id, created=False, adopted=True)
         _record_asked(
             conn,
             deal_id=deal_id,
             board=board,
-            question_id=int(live["id"]),
+            question_id=question_id,
             key=key,
             critical=int(live.get("critical") or 0),
             timeout=live.get("timeout"),
+            ts=_iso_sec(live.get("created_at")) or int(time.time()),
         )
-        return int(live["id"])
+        return AskResult(question_id=question_id, created=False, adopted=False)
 
     flag = _critical(conn, deal_id, critical)
     timeout = None if flag else ASK_TIMEOUT_HOURS
@@ -207,6 +261,10 @@ def ask(
         critical=flag,
         timeout=timeout,
     )
+    if question_id <= 0:
+        # `ask:0:*` в журнале заглушил бы ключом все будущие `question_asked`
+        # (UNIQUE по `idempotency_key`), поэтому нулевой id — отказ, а не id.
+        raise AskError(f"pool.db returned no question id: {pool_path(Path(home))}")
     _record_asked(
         conn,
         deal_id=deal_id,
@@ -215,21 +273,32 @@ def ask(
         key=key,
         critical=flag,
         timeout=timeout,
+        ts=int(time.time()),
     )
-    return question_id
+    return AskResult(question_id=question_id, created=True, adopted=False)
 
 
 def sync_answers(conn: sqlite3.Connection, home: Path) -> dict[str, Any]:
-    """Ответы пула → журнал: `question_answered` по каждому отвеченному вопросу.
+    """Закрытые вопросы пула → журнал: `question_answered` по каждому.
 
-    Читаются только свои вопросы (`origin='duty'`) в статусе `answered`: чужие
-    продюсеры пула пишут свои факты сами. Событие идемпотентно по ключу
-    `ask:<question_id>:question_answered`, поэтому повторный проход (в том числе
-    после падения между проходами) даёт `appended: 0`, а не второй факт ответа.
+    Читаются только свои вопросы (`origin='duty'`) в статусе `answered` или
+    `expired`: чужой вопрос в журнал не попадает вовсе (`ask()` его не
+    записывает), поэтому и снимать по нему нечего — свои факты чужой продюсер
+    пишет сам, а в наш журнал ему писать некуда.
 
-    Ответ в самом пуле этот модуль не закрывает и не переписывает: вопрос
-    закрывается штатным путём пула (`msgq resolve`, реплай в iMessage, панель
-    `/imsg`), а duty только замечает факт.
+    `expired` закрывает вопрос так же, как ответ: некритичный вопрос получает срок
+    (`ASK_TIMEOUT_HOURS`), пул переводит протухшую строку в `expired`, и без этого
+    факта дело ждало бы ответа на вопрос, которого уже нет. Признак истечения
+    пишется в `answered_via='expired'`, чтобы ответ человека и выход срока не
+    читались как одно и то же.
+
+    Событие идемпотентно по ключу `ask:<question_id>:question_answered`, поэтому
+    повторный проход (в том числе после падения между проходами) даёт `appended: 0`,
+    а не второй факт.
+
+    Ответ и истечение в самом пуле этот модуль не закрывает и не переписывает:
+    вопрос закрывается штатным путём пула (`msgq resolve`, реплай в iMessage,
+    панель `/imsg`, чистящий цикл демона), а duty только замечает факт.
     """
     db = pool_path(Path(home))
     report: dict[str, Any] = {"appended": 0, "errors": []}
@@ -237,7 +306,7 @@ def sync_answers(conn: sqlite3.Connection, home: Path) -> dict[str, Any]:
         report["errors"].append({"board": QUESTION_SOURCE, "reason": f"pool.db not found: {db}"})
         return report
     try:
-        rows = _answered_rows(db)
+        rows = _closed_rows(db)
     except sqlite3.Error as exc:
         report["errors"].append({"board": QUESTION_SOURCE, "reason": f"pool.db unreadable: {db} ({exc})"})
         return report
@@ -250,8 +319,12 @@ def sync_answers(conn: sqlite3.Connection, home: Path) -> dict[str, Any]:
             deal_id = _deal_of(str(row.get("session_key") or ""))
         except ValueError:
             continue
+        expired = str(row.get("status") or "") == "expired"
         events.append(
             {
+                # У истёкшего вопроса пул `answered_at` не заполняет: момент
+                # истечения в пуле не записан, поэтому `ts` — когда закрытие
+                # увидела duty, и это сказано признаком `answered_via`.
                 "ts": _iso_sec(row.get("answered_at")) or now,
                 "recorded_at": now,
                 "deal_id": deal_id,
@@ -259,8 +332,11 @@ def sync_answers(conn: sqlite3.Connection, home: Path) -> dict[str, Any]:
                 "kind": "question_answered",
                 "payload": {
                     "question_id": int(row["id"]),
-                    "answer_len": len(str(row.get("answer") or "")),
-                    "answered_via": row.get("answered_via") or None,
+                    "answer_len": 0 if expired else len(str(row.get("answer") or "")),
+                    # Причину закрытия называет пул, если назвал: истёкший по сроку
+                    # вопрос приходит без `answered_via` (его ставит только наша
+                    # пометка), а закрытый чужой причиной — со своим значением.
+                    "answered_via": row.get("answered_via") or (EXPIRED_VIA if expired else None),
                 },
                 "source": ASK_SOURCE,
                 "idempotency_key": f"ask:{int(row['id'])}:question_answered",
@@ -270,15 +346,23 @@ def sync_answers(conn: sqlite3.Connection, home: Path) -> dict[str, Any]:
     return report
 
 
-def _answered_rows(db: Path) -> list[dict[str, Any]]:
-    """Свои отвеченные вопросы пула (только чтение)."""
+def _closed_rows(db: Path) -> list[dict[str, Any]]:
+    """Свои закрытые вопросы пула (`answered`/`expired`) — только чтение.
+
+    Полный список, а не «старше курсора»: вопрос закрывается не в порядке `id`
+    (у каждого дела свой вопрос, и ответы приходят как придётся), поэтому
+    водяной знак `id > last_seen` пропустил бы поздно закрытый вопрос с меньшим
+    id — ровно тот случай, когда факт остался бы висеть навсегда. Цена — один
+    проход по своим вопросам пула, которых не больше, чем было вызовов `ask()`.
+    """
+    marks = ", ".join("?" * len(CLOSED_STATUSES))
     conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=BUSY_TIMEOUT_MS / 1000)
     try:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT id, session_key, answer, answered_at, answered_via FROM questions "
-            "WHERE origin = ? AND status = 'answered' ORDER BY id",
-            (ASK_ORIGIN,),
+            "SELECT id, session_key, status, answer, answered_at, answered_via FROM questions "
+            f"WHERE origin = ? AND status IN ({marks}) ORDER BY id",
+            (ASK_ORIGIN, *CLOSED_STATUSES),
         ).fetchall()
     finally:
         conn.close()
@@ -337,29 +421,41 @@ def _record_asked(
     key: str,
     critical: int,
     timeout: Any,
+    ts: int,
 ) -> None:
-    """Факт «вопрос создан» в журнал — после успешной вставки в пул, идемпотентно."""
+    """Факт «вопрос создан» в журнал — после успешной вставки в пул, идемпотентно.
+
+    Сбой журнала здесь — не 500: строка пула уже создана, и вызывающий обязан
+    узнать, что вопрос есть, а факта нет. `AskError` говорит это словами, а
+    повторное действие лечит расхождение идемпотентным ключом.
+    """
     now = int(time.time())
-    _journal().append(
-        conn,
-        [
-            {
-                "ts": now,
-                "recorded_at": now,
-                "deal_id": deal_id,
-                "board": board,
-                "kind": "question_asked",
-                "payload": {
-                    "question_id": question_id,
-                    "session_key": key,
-                    "critical": critical,
-                    "timeout": timeout,
-                },
-                "source": ASK_SOURCE,
-                "idempotency_key": f"ask:{question_id}:question_asked",
-            }
-        ],
-    )
+    try:
+        _journal().append(
+            conn,
+            [
+                {
+                    "ts": ts,
+                    "recorded_at": now,
+                    "deal_id": deal_id,
+                    "board": board,
+                    "kind": "question_asked",
+                    "payload": {
+                        "question_id": question_id,
+                        "session_key": key,
+                        "critical": critical,
+                        "timeout": timeout,
+                    },
+                    "source": ASK_SOURCE,
+                    "idempotency_key": f"ask:{question_id}:question_asked",
+                }
+            ],
+        )
+    except sqlite3.Error as exc:
+        raise AskError(
+            f"вопрос #{question_id} создан в пуле, факт журнала не записан "
+            f"(идемпотентный повтор лечит): {exc}"
+        ) from exc
 
 
 def _critical(conn: sqlite3.Connection, deal_id: str, explicit: Optional[bool]) -> int:

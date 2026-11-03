@@ -45,7 +45,7 @@
 | источник | что берём |
 |---|---|
 | `<home>/kanban.db`, `<home>/kanban/boards/*/kanban.db` | `tasks` (лизинг, pid, статус, `current_run_id`), `task_runs` (попытки), `task_events` (журнал: последнее действие, причина блока), `task_links` (граф зависимостей) |
-| `<home>/messaging/pool.db` | `questions` со `status='sent'` — таксономия «ждёт ответа» |
+| `<home>/messaging/pool.db` | `questions` с живым статусом (`pending`/`sent`, `ask.LIVE_STATUSES`) — таксономия «ждёт ответа» |
 | `<home>/profiles/<role>/state.db` | только перечисление профилей в `/sources`; содержимое не читается |
 
 Пути не хардкодятся: корень вычисляется из `HERMES_HOME` или `~/.hermes`
@@ -83,7 +83,7 @@
 | `GET /deal/{board}/{task_id}` | одно дело: спецификация + факты `/now` | 404 — нет доски или дела; 503 — доска не читается |
 | `GET /stats` | здоровье по доскам и итогом | — (деградация в `errors[]`) |
 | `POST /ingest` | проход в свой журнал + `answers` (ответы пула) | — (деградация в `errors[]`) |
-| `POST /ask/{board}/{task_id}` | вопрос по делу в пул: `{question_id, deduped, errors[]}` | 404 — нет доски или дела; 400 — пустой `text`/кривые `options`; 503 — пул или журнал недоступны |
+| `POST /ask/{board}/{task_id}` | вопрос по делу в пул: `{question_id, created, deduped, adopted, errors[]}` | 404 — нет доски или дела; 400 — пустой `text`/кривые `options`; 503 — пул или журнал недоступны |
 
 `?state=` фильтрует только список `deals`: `by_state` и `boards[]` считаются по
 полному срезу до фильтра (`collect_now()`).
@@ -136,7 +136,7 @@
 
 | # | состояние | как определяется |
 |---|---|---|
-| 1 | `wait_human` | живой вопрос пула (`status='sent'`), связанный с делом: `session_key` = id дела или id упомянут в `text`/`text_full` |
+| 1 | `wait_human` | живой вопрос пула (`pending`/`sent`, `ask.LIVE_STATUSES`), связанный с делом: `session_key` = id дела или id упомянут в `text`/`text_full` |
 | 2 | `capability` | `status=blocked` и (`block_kind='capability'` или причина блока содержит слово из `CAPABILITY_WORDS`: доступ, права, разрешение, `permission`, `access`, `credential`, `token`, `forbidden`, `403`) |
 | 3 | `dead_lease` | ран `running`, а его pid мёртв; **или** лизинг истёк, и последнего рана нет либо он `running` |
 | 4 | `crashed` | `consecutive_failures > 0`; **или** исход последнего рана ∈ `crashed`/`gave_up`/`spawn_failed`/`timed_out`; **или** ран `running`, pid не мёртв, но heartbeat старше 300 с |

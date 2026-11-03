@@ -38,6 +38,17 @@ test('шейпер один на две поверхности: веб импо�
   assert.ok(!app.includes('wait_human:'), 'в app.js появилась своя таблица состояний')
 })
 
+test('бейдж дела в вебе подписывается по human_kind, а не по одному состоянию', () => {
+  // «ждёт ответа» и «ждёт решения» — два разных ожидания человека, и подпись
+  // обязана различать их на обеих поверхностях (шейпер общий).
+  assert.match(app, /function Badge\(state, humanKind, label\)/)
+  assert.match(app, /stateMeta\(state, humanKind\)/)
+  assert.ok(
+    !/Badge\(deal\.state\)/.test(app),
+    'бейдж дела без human_kind: блокировка без вопроса снова скажет «ждёт ответа»',
+  )
+})
+
 test('четыре экрана маршрутизируются', () => {
   assert.match(app, /parts\[0\] === 'deal'/)
   assert.match(app, /parts\[0\] === 'why'/)

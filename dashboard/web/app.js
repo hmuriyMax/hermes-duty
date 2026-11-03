@@ -89,9 +89,9 @@ async function api(path) {
 
 /* ------------------------------------------------------------------ бейдж */
 
-function Badge(state) {
-  const meta = stateMeta(state)
-  return h('span', { class: `badge t-${meta.tone}`, title: state || '' }, h('i'), meta.label)
+function Badge(state, humanKind, label) {
+  const meta = stateMeta(state, humanKind)
+  return h('span', { class: `badge t-${meta.tone}`, title: state || '' }, h('i'), label || meta.label)
 }
 
 /* ------------------------------------------------------------- состояние */
@@ -166,7 +166,7 @@ function dealRow(deal) {
     h('td', { class: 'n', title: attemptTitle }, deal.attemptAgeText),
     h('td', { title: leaseTitle }, deal.leaseText),
     h('td', { class: 'n', title: `${deal.lastActionKind}: ${deal.lastActionSummary || '—'}` }, deal.lastActionAgeText),
-    h('td', null, Badge(deal.state)),
+    h('td', null, Badge(deal.state, deal.humanKind)),
   )
 }
 
@@ -174,7 +174,7 @@ function groupBlock(group) {
   return h(
     'section',
     { class: 'grp' },
-    h('div', { class: 'grp-h' }, Badge(group.state), h('span', { class: 'n' }, `${group.count}`)),
+    h('div', { class: 'grp-h' }, Badge(group.state, null, group.label), h('span', { class: 'n' }, `${group.count}`)),
     h(
       'table',
       null,
@@ -239,6 +239,9 @@ function filtersBlock(model) {
       ),
       ...model.stateOrder.map((state) => {
         const meta = stateMeta(state)
+        // Подпись чипа — та же, что у группы: «ждёт ответа» стоит только там,
+        // где в этом состоянии действительно есть вопрос.
+        const group = model.groups.find((item) => item.state === state)
         return h(
           'button',
           {
@@ -246,7 +249,7 @@ function filtersBlock(model) {
             title: state,
             onclick: () => toggle(state),
           },
-          meta.label,
+          group ? group.label : meta.label,
           h('span', { class: 'n' }, `${model.byState[state] || 0}`),
         )
       }),
@@ -337,7 +340,7 @@ function whyCard(deal) {
     h(
       'div',
       { class: 'why-meta' },
-      Badge(deal.state),
+      Badge(deal.state, deal.humanKind),
       h('span', { class: 'mono' }, `${deal.board} · ${deal.id}`),
       h('span', { class: 'muted' }, deal.assignee),
     ),
@@ -691,7 +694,7 @@ function viewDeal(board, taskId) {
     h(
       'div',
       { class: 'why-meta' },
-      deal ? Badge(deal.state) : h('span', { class: 'badge t-gray' }, h('i'), `завершено: ${data.status}`),
+      deal ? Badge(deal.state, deal.humanKind) : h('span', { class: 'badge t-gray' }, h('i'), `завершено: ${data.status}`),
     ),
     h(
       'div',

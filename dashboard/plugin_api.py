@@ -612,7 +612,11 @@ def _payload_summary(payload: Optional[str]) -> Optional[str]:
 
 
 def _pool_questions(home: Path) -> tuple[dict[str, dict[str, Any]], Optional[str], bool]:
-    """Живые вопросы пула (`status='sent'`), разложенные по id дела.
+    """Живые вопросы пула (`ask.LIVE_STATUSES`), разложенные по id дела.
+
+    Набор живых статусов берётся у `ask.py`, а не пишется здесь второй раз: `sent`
+    и `pending` — один и тот же живой вопрос (второй ещё не ушёл в iMessage), и
+    разъехавшийся набор показывал бы `status='pending'` там, где вопрос уже есть.
 
     Схема пула `card_id` не знает: у вопроса с `origin='card'` id карточки лежит
     в `session_key` (проверено на живых данных — там ровно `t_xxxxxxxx`), а у
@@ -629,10 +633,11 @@ def _pool_questions(home: Path) -> tuple[dict[str, dict[str, Any]], Optional[str
     db = home / "messaging" / "pool.db"
     if not db.is_file():
         return {}, f"pool.db not found: {db}", False
+    marks = ", ".join("?" * len(ask.LIVE_STATUSES))
     rows, err = _query_checked(
         db,
-        "SELECT * FROM questions WHERE status = 'sent' ORDER BY id DESC LIMIT ?",
-        (QUESTION_LIMIT + 1,),
+        f"SELECT * FROM questions WHERE status IN ({marks}) ORDER BY id DESC LIMIT ?",
+        (*ask.LIVE_STATUSES, QUESTION_LIMIT + 1),
     )
     if err:
         return {}, f"pool.db unreadable: {db} ({err})", False
@@ -1559,8 +1564,11 @@ def ask_deal(board: str, task_id: str, payload: dict[str, Any] = Body(...)) -> A
     (`text_full`, `options` и `critical` необязательны; `critical` по умолчанию
     решается по журналу — дело ждёт человека дольше `ASK_CRITICAL_SEC`).
 
-    Ответ: `{"question_id": N, "deduped": bool, "errors": []}`. Живой вопрос по
-    делу возвращается как есть (`deduped: true`), второй строки в пуле нет.
+    Ответ: `{"question_id": N, "created": bool, "deduped": bool, "adopted": bool, "errors": []}`.
+    Живой вопрос по делу возвращается как есть (`deduped: true`), второй строки в
+    пуле нет. `adopted: true` — подхвачен живой вопрос **чужого** продюсера
+    (`origin != 'duty'`): id возвращён, но `question_asked` по нему не пишется,
+    потому что снять этот факт нечем (ответ на чужой вопрос журналу не виден).
     Сбой пула — 503 с `errors[]`, где назван пул и дело: событие в журнал при
     этом не пишется (`question_asked` только после успешной вставки).
     """
@@ -1606,8 +1614,7 @@ def ask_deal(board: str, task_id: str, payload: dict[str, Any] = Body(...)) -> A
             detail=f"journal unreadable: {type(exc).__name__}: {exc}",
         ) from exc
     try:
-        before = ask.find_live(home, task_id)
-        question_id = ask.ask(
+        result = ask.ask(
             conn,
             deal,
             text,
@@ -1621,14 +1628,21 @@ def ask_deal(board: str, task_id: str, payload: dict[str, Any] = Body(...)) -> A
             headers=NO_STORE_HEADERS,
             content={
                 "question_id": None,
+                "created": False,
                 "deduped": False,
+                "adopted": False,
                 "errors": [{"board": ask.QUESTION_SOURCE, "reason": f"ask {task_id}: {exc}"}],
             },
         )
     finally:
         conn.close()
-    deduped = before is not None and int(before["id"]) == question_id
-    return {"question_id": question_id, "deduped": deduped, "errors": []}
+    return {
+        "question_id": result.question_id,
+        "created": result.created,
+        "deduped": not result.created,
+        "adopted": result.adopted,
+        "errors": [],
+    }
 
 
 @router.get("/duty/{board}/{task_id}/attempts")

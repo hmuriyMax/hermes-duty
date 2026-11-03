@@ -100,9 +100,10 @@ CREATE TABLE IF NOT EXISTS attachments (
 | переход гейта ребёнка (пишет мутация родителя) | `gate_opened` / `gate_closed` (`from`, `to`, `parent`) |
 
 Закрытость дела считается по последнему **state-changing** событию журнала
-(`completed`), а `commented`/`attached`/`patched` её не снимают: правило fold —
-`docs/JOURNAL.md`, правила 2 и 12. Поэтому комментарий или вложение по закрытому делу
-остаются фактом таймлайна, а не возвратом в работу.
+(`completed`), а виды из набора `journal.NON_STATE_KINDS` — `commented`, `attached`,
+`patched`, `question_answered` — её не снимают: правило fold —
+`docs/JOURNAL.md`, правила 2 и 12. Поэтому комментарий, вложение или поздний ответ на
+вопрос по закрытому делу остаются фактом таймлайна, а не возвратом в работу.
 
 `idempotency_key` для мутаций: `cli:<deal_id>:<kind>:<sha1(аргументы)>`, для API —
 `api:<deal_id>:<kind>:<sha1(тело запроса)>`; повторный тот же вызов не плодит событий.

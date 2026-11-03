@@ -872,6 +872,37 @@ def test_own_deal_question_repeat_returns_same_question(home: Path, client: Test
     assert kinds(home, deal_id).count("question_asked") == 1
 
 
+def test_late_answer_does_not_revive_closed_own_deal(home: Path, client: TestClient) -> None:
+    """Норма блокера FIX-W5c: поздний ответ на вопрос не воскрешает закрытое дело.
+
+    Штатный хвост собственного цикла вопросов: `create → ask → complete` и только
+    потом `sync_answers` (ответ пришёл, когда дело уже завершили). `question_answered`
+    не входит в state-changing виды, поэтому закрытость читается по `completed`:
+    `fold` не активен, `GET /deal` отдаёт `terminal: true` и `deal: None`, слова
+    `wait_slot` в ответе нет, а в `/now` дело не появляется.
+    """
+    deal_id, question_id = own_deal_with_question(client)
+    mutate(client, "POST", f"/deals/{deal_id}/complete", json={"summary": "готово"})
+
+    close_pool_question(home, question_id, answer="делай так")
+    assert sync_answers(home)["appended"] == 1
+
+    # Ответ лёг последней строкой журнала — именно этот порядок и ломал закрытость.
+    assert kinds(home, deal_id)[-1] == "question_answered"
+    folded = journal.fold(events(home, deal_id), now=NOW)
+    assert folded["active"] is False
+    assert folded["state"] is None
+    assert folded["reason"] == "closed"
+
+    response = client.get(f"/deal/{BOARD}/{deal_id}")
+    assert response.status_code == 200, response.text
+    card = response.json()
+    assert card["terminal"] is True
+    assert card["deal"] is None, card["deal"]
+    assert "wait_slot" not in json.dumps(card, ensure_ascii=False)
+    assert deal_id not in now_deals(client)
+
+
 def test_kanban_deal_question_cycle_still_works(home: Path, client: TestClient) -> None:
     """`t_…`-путь не сломан: тот же цикл вопроса для наблюдаемого дела."""
     response = client.post(f"/ask/{BOARD}/{KANBAN_DEAL}", json={"text": "Вопрос по kanban-делу"})

@@ -474,8 +474,9 @@ def test_fold_closed_deal_is_not_reopened_by_non_state_kinds() -> None:
     # `last_kind` остаётся честной последней строкой журнала: разница между ней и
     # решением о закрытости и есть правило 2.
     assert folded["last_kind"] == "patched"
-    # Набор «не меняющих состояние» видов назван в одном месте и ровно этими тремя.
-    assert journal.NON_STATE_KINDS == ("commented", "attached", "patched")
+    # Набор «не открывающих живое ожидание» видов назван в одном месте и ровно этими
+    # четырьмя: ответ на вопрос — закрывающий факт, а не переход.
+    assert journal.NON_STATE_KINDS == ("commented", "attached", "patched", "question_answered")
 
 
 def test_state_changing_kind_after_completed_reopens_honestly() -> None:
@@ -495,6 +496,33 @@ def test_state_changing_kind_after_completed_reopens_honestly() -> None:
 
     assert folded["active"] is True
     assert folded["state"] == "wait_human"
+
+
+def test_late_question_answered_does_not_reopen_closed_deal() -> None:
+    """Правила 2 и 12: поздний ответ на вопрос закрытое дело не воскрешает.
+
+    Штатный хвост: вопрос задан, дело завершили, ответ пришёл позже
+    (`sync_answers` пишет `question_answered` по закрытому делу). Ответ —
+    закрывающий факт, и живое ожидание он открывать не может: иначе fold уходил в
+    `no_live_fact` с `active: True`, и дело снова попадало в срез с состоянием
+    ожидания, хотя `terminal: true`.
+    """
+    folded = journal.fold(
+        events(
+            ("created", {"status": "ready"}),
+            ("question_asked", {"question_id": 42, "session_key": "t_0001"}),
+            ("completed", {"status": "done"}),
+            ("question_answered", {"question_id": 42, "answer_len": 3, "answered_via": "pool"}),
+        ),
+        now=NOW,
+    )
+
+    assert folded["active"] is False
+    assert folded["state"] is None
+    assert folded["reason"] == "closed"
+    assert "status=done" in folded["evidence"]
+    # `last_kind` по-прежнему честная последняя строка журнала.
+    assert folded["last_kind"] == "question_answered"
 
 
 def test_created_snapshot_gate_survives_a_comment() -> None:
@@ -834,6 +862,60 @@ def test_ingest_writes_lease_lost_for_claim_without_attempt(home: Path) -> None:
     conn.close()
     assert len(rows) == 1
     assert rows[0]["payload"] == {"previous_expires": NOW - 500}
+
+
+def test_ingest_does_not_write_lease_lost_for_closed_deal_with_tail(home: Path) -> None:
+    """Хвост после `completed` не делает закрытое дело кандидатом на `lease_lost`.
+
+    `lease_lost` в kanban события не имеет: он выводится сравнением журнала с
+    источником (лизинг был, попытки за ним не было, лизинга больше нет). Признак
+    «дело закрыто» читался по последней строке журнала (`events[-1]`), и у дела с
+    хвостом (`commented`, `question_answered`) он был ложен — в закрытое дело
+    дописывался `lease_lost`, а он state-changing, то есть снова воскрешал дело.
+    Теперь закрытость считается общим предикатом fold (правило 2).
+    """
+    board = make_board(home)
+    conn = sqlite3.connect(board)
+    add_task(conn, "t_tail", status="running", claim_lock="L-tail", claim_expires=NOW + 600)
+    add_kanban_event(conn, "created", task_id="t_tail", payload={"status": "running"}, created_at=NOW - 900)
+    add_kanban_event(
+        conn,
+        "claimed",
+        task_id="t_tail",
+        payload={"lock": "L-tail", "expires": NOW + 600, "run_id": 1},
+        run_id=1,
+        created_at=NOW - 800,
+    )
+    conn.commit()
+    conn.close()
+
+    ingest(board, home)  # журнал знает дело, пока оно ещё активно
+
+    conn = sqlite3.connect(board)
+    conn.execute("UPDATE tasks SET status='done', claim_lock=NULL, claim_expires=NULL WHERE id='t_tail'")
+    add_kanban_event(conn, "completed", task_id="t_tail", payload={"status": "done"}, created_at=NOW - 100)
+    conn.commit()
+    conn.close()
+
+    ingest(board, home)  # закрытие легло в журнал; хвоста ещё нет
+    jconn = journal.open_journal(home)
+    journal.append(
+        jconn, events(("commented", {"author": "max", "len": 6}), deal_id="t_tail", ts=NOW - 50)
+    )
+    jconn.close()
+
+    first = ingest(board, home)
+    second = ingest(board, home)
+
+    kinds = journal_kinds(home)
+    assert "completed" in kinds
+    # Хвост — последняя строка журнала, и решение о закрытости от него не зависит.
+    assert kinds[-1] == "commented"
+    assert "lease_lost" not in kinds
+    # Идемпотентность сохранена: дописывать нечего ни на первом проходе с хвостом,
+    # ни на повторном.
+    assert first["appended"] == 0
+    assert second["appended"] == 0
 
 
 def test_ingest_keeps_live_lease_untouched(home: Path) -> None:

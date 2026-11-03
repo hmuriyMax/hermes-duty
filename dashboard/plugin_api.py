@@ -426,6 +426,19 @@ QUESTION_LIMIT = 200
 # Длина текстовой выжимки payload'а события в ответе.
 SUMMARY_LIMIT = 240
 
+# Сколько задач берёт экран «Здоровье» с доски. Это не срез «сейчас»: тут важна
+# доля, а не мгновенная картина, поэтому лимит больше. Сработавший лимит виден
+# как `truncated` доски — молча урезать выборку нельзя, иначе медиана врёт.
+STATS_TASK_LIMIT = 5000
+
+# Исходы рана, которые считаются успехом попытки. Отдельно от статуса: у рана
+# бывает `status='awaiting_merge'` с `outcome='completed'` — этап пройден.
+SUCCESS_OUTCOMES = ("completed", "done", "succeeded")
+
+# Сколько тела дела отдаём на экран «Дело» (тело карточки — спецификация, в
+# ответе она нужна целиком, но не бесконечно).
+DEAL_BODY_LIMIT = 20000
+
 
 def _now_sec() -> int:
     """Текущее время в unix-секундах — как все `*_at` в источниках."""
@@ -530,6 +543,29 @@ def _pool_questions(home: Path) -> tuple[dict[str, dict[str, Any]], Optional[str
         for task_id in holders:
             index.setdefault(task_id, row)
     return index, None, truncated
+
+
+def _pool_context(
+    home: Path,
+) -> tuple[dict[str, dict[str, Any]], Optional[str], list[dict[str, str]]]:
+    """Пул вопросов: индекс по делу, готовая заметка о неполноте и ошибки ответа.
+
+    Пул нужен двум роутам (`/now` и `/deal/...`), и заметка о неполноте обязана
+    звучать одинаково: иначе один экран говорит «вопросов нет», а другой честно
+    предупреждает, что факт `wait_human` не проверен.
+    """
+    questions, pool_err, pool_truncated = _pool_questions(home)
+    notes: list[str] = []
+    errors: list[dict[str, str]] = []
+    if pool_err:
+        notes.append(f"пул вопросов недоступен ({pool_err})")
+        errors.append({"board": "messaging/pool.db", "reason": pool_err})
+    if pool_truncated:
+        reason = f"questions truncated: more than {QUESTION_LIMIT} live questions"
+        notes.append(f"живых вопросов в пуле больше {QUESTION_LIMIT} (старые не вошли)")
+        errors.append({"board": "messaging/pool.db", "reason": reason})
+    pool_note = f"{'; '.join(notes)} — факт wait_human не проверен" if notes else None
+    return questions, pool_note, errors
 
 
 def _lease(task: dict[str, Any], run: Optional[dict[str, Any]], now: int) -> dict[str, Any]:
@@ -878,20 +914,8 @@ def collect_now(
     `errors`; ответ при этом остаётся 200.
     """
     scope = [b for b in _discover_boards(home) if board is None or b["slug"] == board]
-    questions, pool_err, pool_truncated = _pool_questions(home)
-    errors: list[dict[str, str]] = []
-    # Заметки о неполноте пула: недоступен или обрезан лимитом. Обе дописываются
-    # в evidence дел, которым вопрос не нашёлся, — иначе `wait_human` выглядит
-    # проверенным, хотя пул мог не отдать нужный вопрос.
-    notes: list[str] = []
-    if pool_err:
-        notes.append(f"пул вопросов недоступен ({pool_err})")
-        errors.append({"board": "messaging/pool.db", "reason": pool_err})
-    if pool_truncated:
-        reason = f"questions truncated: more than {QUESTION_LIMIT} live questions"
-        notes.append(f"живых вопросов в пуле больше {QUESTION_LIMIT} (старые не вошли)")
-        errors.append({"board": "messaging/pool.db", "reason": reason})
-    pool_note = f"{'; '.join(notes)} — факт wait_human не проверен" if notes else None
+    questions, pool_note, pool_errors = _pool_context(home)
+    errors: list[dict[str, str]] = list(pool_errors)
 
     boards: list[dict[str, Any]] = []
     deals: list[dict[str, Any]] = []
@@ -949,6 +973,226 @@ def collect_now(
         "crash_outcomes": list(CRASH_OUTCOMES),
         "boards": boards,
         "errors": errors,
+    }
+
+
+# --------------------------------------------------- «дело» и «здоровье» (0.0.2)
+#
+# Экран «Дело» — одна карточка: чем дело занято сейчас (тот же факт-набор, что в
+# `/now`) плюс её собственная спецификация. Экран «Здоровье» — агрегат по ранам:
+# доля этапов, пройденных с первой попытки, медиана ожидания до первой попытки и
+# таксономия исходов. Ни один из них ничего не пишет и не пересчитывает статусы.
+
+
+def _median(values: list[int]) -> Optional[int]:
+    """Медиана целых значений; None — если выборки нет (не 0 и не выдумка)."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return int(ordered[mid])
+    return int(round((ordered[mid - 1] + ordered[mid]) / 2))
+
+
+def _stats_board(entry: dict[str, Any]) -> dict[str, Any]:
+    """Метрики одной доски: первая попытка, ожидание до неё, исходы ранов.
+
+    Провал чтения `tasks` роняет вызов (доска уходит в `errors`), провал
+    `task_runs` — только в `warnings`: доля попыток тогда не считается, и это
+    видно как `first_try.with_runs = 0`, а не как «всё с первой попытки».
+    """
+    slug = str(entry["slug"])
+    path = Path(entry["path"])
+    if entry.get("note") == "empty db":
+        raise RuntimeError(f"empty db ({path}): 0 bytes")
+    warnings: list[str] = []
+    with closing(_connect_ro(path)) as conn:
+        # Лимит проверяется лишней строкой: ровно `STATS_TASK_LIMIT` задач не
+        # должны помечаться обрезанными.
+        tasks, err = _fetch(
+            conn,
+            "SELECT id, status, created_at FROM tasks ORDER BY created_at, id LIMIT ?",
+            (STATS_TASK_LIMIT + 1,),
+        )
+        if err:
+            raise RuntimeError(err)
+        truncated = len(tasks) > STATS_TASK_LIMIT
+        tasks = tasks[:STATS_TASK_LIMIT]
+        task_ids = [str(task.get("id")) for task in tasks]
+        runs_by_task: dict[str, list[dict[str, Any]]] = {}
+        if task_ids:
+            marks = ", ".join("?" * len(task_ids))
+            rows, err = _fetch(
+                conn,
+                f"SELECT task_id, status, outcome, started_at FROM task_runs "
+                f"WHERE task_id IN ({marks}) ORDER BY started_at, id",
+                tuple(task_ids),
+            )
+            if err:
+                warnings.append(f"task_runs: {err}")
+            for row in rows:
+                runs_by_task.setdefault(str(row.get("task_id")), []).append(row)
+
+    by_status: dict[str, int] = {}
+    by_outcome: dict[str, int] = {}
+    waits: list[int] = []
+    first_try_ok = 0
+    with_runs = 0
+    runs_total = 0
+    for task in tasks:
+        status = str(task.get("status") or "—")
+        by_status[status] = by_status.get(status, 0) + 1
+        runs = runs_by_task.get(str(task.get("id")), [])
+        if not runs:
+            continue
+        with_runs += 1
+        runs_total += len(runs)
+        for run in runs:
+            outcome = run.get("outcome")
+            key = str(outcome) if outcome else f"без исхода ({run.get('status') or '—'})"
+            by_outcome[key] = by_outcome.get(key, 0) + 1
+        first = runs[0]
+        if str(first.get("outcome") or "") in SUCCESS_OUTCOMES:
+            first_try_ok += 1
+        created = task.get("created_at")
+        started = first.get("started_at")
+        if created is not None and started is not None:
+            waits.append(max(0, int(started) - int(created)))
+
+    return {
+        "slug": slug,
+        "path": str(path),
+        "read": True,
+        "truncated": truncated,
+        "warnings": warnings,
+        "tasks_total": len(tasks),
+        "tasks_by_status": by_status,
+        "runs_total": runs_total,
+        "runs_by_outcome": by_outcome,
+        "first_try": {
+            "ok": first_try_ok,
+            "with_runs": with_runs,
+            "share": (first_try_ok / with_runs) if with_runs else None,
+        },
+        "wait": {"median_sec": _median(waits), "samples": len(waits)},
+        "_waits": waits,
+    }
+
+
+def collect_stats(home: Path, now: int) -> dict[str, Any]:
+    """Здоровье всех живых досок: агрегат по ранам плюс итог по прочитанным.
+
+    Медиана считается по объединённой выборке, а не как среднее медиан: медиана
+    медиан не равна медиане. Доска, у которой не читается `tasks`, попадает в
+    `errors` и в итог не входит — ответ остаётся 200.
+    """
+    boards: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    waits: list[int] = []
+    by_status: dict[str, int] = {}
+    by_outcome: dict[str, int] = {}
+    tasks_total = 0
+    runs_total = 0
+    first_try_ok = 0
+    with_runs = 0
+    for entry in _discover_boards(home):
+        try:
+            collected = _stats_board(entry)
+        except Exception as exc:  # noqa: BLE001 - ошибка доски не валит ответ
+            reason = str(exc) if isinstance(exc, RuntimeError) else f"{type(exc).__name__}: {exc}"
+            errors.append({"board": str(entry["slug"]), "reason": reason})
+            unread: dict[str, Any] = {
+                "slug": entry["slug"],
+                "path": str(entry["path"]),
+                "read": False,
+                "tasks_total": 0,
+            }
+            if entry.get("note"):
+                unread["note"] = entry["note"]
+            boards.append(unread)
+            continue
+        waits.extend(collected.pop("_waits"))
+        tasks_total += collected["tasks_total"]
+        runs_total += collected["runs_total"]
+        first_try_ok += collected["first_try"]["ok"]
+        with_runs += collected["first_try"]["with_runs"]
+        for key, count in collected["tasks_by_status"].items():
+            by_status[key] = by_status.get(key, 0) + count
+        for key, count in collected["runs_by_outcome"].items():
+            by_outcome[key] = by_outcome.get(key, 0) + count
+        boards.append(collected)
+
+    return {
+        "now": now,
+        "boards": boards,
+        "errors": errors,
+        "totals": {
+            "tasks_total": tasks_total,
+            "tasks_by_status": by_status,
+            "runs_total": runs_total,
+            "runs_by_outcome": by_outcome,
+            "first_try": {
+                "ok": first_try_ok,
+                "with_runs": with_runs,
+                "share": (first_try_ok / with_runs) if with_runs else None,
+            },
+            "wait": {"median_sec": _median(waits), "samples": len(waits)},
+        },
+        "success_outcomes": list(SUCCESS_OUTCOMES),
+        "crash_outcomes": list(CRASH_OUTCOMES),
+    }
+
+
+@router.get("/stats")
+def stats() -> dict[str, Any]:
+    """Здоровье: доля с первой попытки, медиана ожидания, таксономия исходов."""
+    return collect_stats(_hermes_home(), _now_sec())
+
+
+@router.get("/deal/{board}/{task_id}")
+def deal(board: str, task_id: str) -> dict[str, Any]:
+    """Одно дело: спецификация плюс тот же факт-набор, что в `/now`.
+
+    `deal` — `null` для завершённого дела (`done`/`archived`): состояний ожидания
+    у него нет, и придумывать их нельзя. Таймлайн попыток живёт отдельно —
+    `GET /duty/{board}/{task_id}/attempts` — и работает для любого дела.
+    """
+    home = _hermes_home()
+    entry = _board_entry(home, board)
+    rows, err = _query_checked(Path(entry["path"]), "SELECT * FROM tasks WHERE id = ?", (task_id,))
+    if err:
+        raise HTTPException(
+            status_code=503, headers=NO_STORE_HEADERS, detail=f"board '{board}' unreadable: {err}"
+        )
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            headers=NO_STORE_HEADERS,
+            detail=f"task '{task_id}' not found on board '{board}'",
+        )
+    task = rows[0]
+    status = str(task.get("status") or "")
+    terminal = status in TERMINAL_STATUSES
+    now = _now_sec()
+    shaped: Optional[dict[str, Any]] = None
+    if not terminal:
+        questions, pool_note, _ = _pool_context(home)
+        collected = _board_deals(entry, now, questions, pool_note)
+        shaped = next((item for item in collected["deals"] if item["id"] == task_id), None)
+    body = task.get("body") or ""
+    return {
+        "now": now,
+        "board": board,
+        "id": task_id,
+        "title": task.get("title"),
+        "status": status,
+        "assignee": task.get("assignee"),
+        "terminal": terminal,
+        "created_at": task.get("created_at"),
+        "body": body[:DEAL_BODY_LIMIT],
+        "body_truncated": len(body) > DEAL_BODY_LIMIT,
+        "deal": shaped,
     }
 
 
@@ -1043,3 +1287,92 @@ def duty_attempts(board: str, task_id: str) -> dict[str, Any]:
         "crash_outcomes": list(CRASH_OUTCOMES),
         "attempts": attempts,
     }
+
+
+# ------------------------------------------------------ веб-версия (0.0.2)
+#
+# Страница, открываемая в любом браузере: `http://127.0.0.1:<port>/web/hermes-duty/`.
+# Живёт НЕ под `/api` (там гейт токена), токен вшивается в HTML, а данные
+# страница берёт с `/api/plugins/hermes-duty/*` заголовком `X-Hermes-Session-Token`
+# — ровно как веб-версия `hermes-tickets`.
+#
+# Шейпер данных общий с десктопом: страница импортирует `desktop/model.js`,
+# который отдаётся этим же роутом. Второй копии таксономии и форматирования в
+# вебе нет — иначе бейджи и доказательства разъезжались бы между поверхностями.
+
+_WEB_MIME = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json",
+    ".svg": "image/svg+xml",
+}
+
+# Страница обновляется правкой файлов в репозитории: без запрета кэша браузер
+# держит старый app.js и правки «не доезжают» до вкладки.
+_WEB_NO_CACHE = {"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache"}
+
+_WEB_404 = (
+    '<!doctype html><html lang="ru"><body style="font-family:system-ui;padding:40px">'
+    "Hermes Duty: страница не найдена в сборке плагина (dashboard/web/ отсутствует)."
+    "</body></html>"
+)
+
+
+def _register_web_version() -> None:
+    """Смонтировать `/web/hermes-duty/*` и общий шейпер `/web/hermes-duty/model.js`.
+
+    Плагин монтируется in-process (`isolation` не задан), поэтому
+    `hermes_cli.web_server.app` доступен отсюда. В host-изоляции роут не
+    смонтируется — веб-версии не будет, API-роуты продолжат работать.
+    """
+    try:
+        from fastapi.responses import FileResponse, HTMLResponse
+        from hermes_cli.web_server import _SESSION_TOKEN, app as _app
+    except Exception:  # noqa: BLE001 - не in-process: веб-версия просто не монтируется
+        return
+
+    web_dir = Path(__file__).resolve().parent / "web"
+    if not (web_dir / "index.html").is_file():
+        return  # веб-фронта нет в сборке — не мешаем API
+    model_file = Path(__file__).resolve().parent.parent / "desktop" / "model.js"
+    gated = bool(getattr(_app.state, "auth_required", False))
+    token_js = "" if gated else f"window.__HERMES_SESSION_TOKEN__={json.dumps(_SESSION_TOKEN)};"
+
+    async def _web_index():  # noqa: ANN202 - сигнатура FastAPI-обработчика
+        try:
+            html = (web_dir / "index.html").read_text(encoding="utf-8")
+        except OSError:
+            return HTMLResponse(_WEB_404, status_code=404, headers=_WEB_NO_CACHE)
+        html = html.replace(
+            "<!--__HERMES_TOKEN__-->", f"<script>{token_js}</script>" if token_js else ""
+        )
+        return HTMLResponse(html, headers=_WEB_NO_CACHE)
+
+    async def _web_model():  # noqa: ANN202 - шейпер общий с десктопом
+        if not model_file.is_file():
+            return HTMLResponse(_WEB_404, status_code=404, headers=_WEB_NO_CACHE)
+        return FileResponse(
+            str(model_file), media_type="text/javascript; charset=utf-8", headers=_WEB_NO_CACHE
+        )
+
+    async def _web_static(path: str):  # noqa: ANN202 - статика рядом с index.html
+        if not path or ".." in path:
+            path = "index.html"
+        resolved = os.path.realpath(os.path.join(web_dir, path))
+        if not resolved.startswith(os.path.realpath(web_dir) + os.sep) or not os.path.isfile(resolved):
+            return HTMLResponse(_WEB_404, status_code=404, headers=_WEB_NO_CACHE)
+        return FileResponse(
+            resolved,
+            media_type=_WEB_MIME.get(os.path.splitext(resolved)[1].lower(), "application/octet-stream"),
+            headers=_WEB_NO_CACHE,
+        )
+
+    _app.add_api_route("/web/hermes-duty", _web_index, methods=["GET"], include_in_schema=False)
+    _app.add_api_route("/web/hermes-duty/", _web_index, methods=["GET"], include_in_schema=False)
+    _app.add_api_route("/web/hermes-duty/model.js", _web_model, methods=["GET"], include_in_schema=False)
+    _app.add_api_route("/web/hermes-duty/{path:path}", _web_static, methods=["GET"], include_in_schema=False)
+
+
+_register_web_version()

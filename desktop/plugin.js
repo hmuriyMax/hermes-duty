@@ -19,8 +19,19 @@ import { createElement as h, useCallback, useEffect, useMemo, useRef, useState }
 const ID = 'hermes-duty'
 const PATH = '/duty'
 const REFRESH_MS = 10_000
+// «Здоровье» — агрегат по всей истории ранов: он не меняется за секунды, а скан
+// всех досок дороже среза «сейчас», поэтому обновляется реже.
+const STATS_REFRESH_MS = 30_000
 const SEARCH_DEBOUNCE_MS = 240
 const REQUEST_TIMEOUT_MS = 20_000
+
+// Экраны страницы: «Сейчас» — срез, «Почему стоит» — тот же срез с объяснением,
+// «Здоровье» — агрегат по ранам. «Дело» — не таб: он открывается из дела.
+const TABS = [
+  ['now', 'Сейчас'],
+  ['why', 'Почему стоит'],
+  ['health', 'Здоровье'],
+]
 
 // ctx.rest, забинденный в register().
 let rest = null
@@ -407,6 +418,36 @@ const CSS = `
 .duty-events li{margin:1px 0}
 .duty-error{color:var(--ui-red);font-size:11px;white-space:pre-wrap;word-break:break-word;margin-top:4px}
 .duty-summary{font-size:11px;color:var(--ui-text-tertiary);margin-top:4px;word-break:break-word}
+.duty-tabs{display:flex;gap:2px;margin-left:6px}
+.duty-tab{height:22px;padding:0 9px;border-radius:999px;border:1px solid transparent;background:transparent;color:var(--ui-text-tertiary);font:inherit;font-size:11px;cursor:pointer;white-space:nowrap}
+.duty-tab:hover{background:color-mix(in srgb, var(--ui-text-primary) 8%, transparent);color:var(--ui-text-primary)}
+.duty-tab.on{color:var(--ui-accent);background:color-mix(in srgb, var(--ui-accent) 14%, transparent);border-color:color-mix(in srgb, var(--ui-accent) 40%, transparent)}
+.duty-scroll{flex:1 1 auto;min-height:0;overflow:auto;padding:10px 16px 24px}
+.duty-why-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:10px}
+.duty-why-card{border:1px solid var(--ui-stroke-tertiary);border-radius:8px;padding:10px 12px;min-width:0}
+.duty-why-title{font-size:12px;font-weight:600;line-height:1.35;word-break:break-word}
+.duty-why-meta{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:5px 0 0}
+.duty-why-foot{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:8px;font-size:11px;color:var(--ui-text-tertiary)}
+.duty-kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin-bottom:14px}
+.duty-kpi{border:1px solid var(--ui-stroke-tertiary);border-radius:8px;padding:10px 12px}
+.duty-kpi-k{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--ui-text-tertiary)}
+.duty-kpi-v{font-size:24px;font-weight:600;font-variant-numeric:tabular-nums;margin:4px 0 2px}
+.duty-kpi-track{height:6px;border-radius:3px;background:var(--ui-bg-quaternary);overflow:hidden;margin-top:8px}
+.duty-kpi-fill{height:6px;border-radius:3px;background:var(--ui-green)}
+.duty-tax{display:flex;flex-direction:column;gap:5px}
+.duty-tax-row{display:grid;grid-template-columns:170px 1fr 56px;align-items:center;gap:8px;font-size:11px}
+.duty-tax-name{font-family:var(--ui-font-mono, ui-monospace, monospace);color:var(--ui-text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.duty-tax-track{height:7px;border-radius:4px;background:var(--ui-bg-quaternary);overflow:hidden}
+.duty-tax-fill{height:7px;border-radius:4px}
+.duty-health-table td{white-space:nowrap;text-overflow:ellipsis}
+.duty-deal-head{display:flex;flex-direction:column;gap:6px;border:1px solid var(--ui-stroke-tertiary);border-radius:8px;padding:10px 12px;margin-bottom:12px}
+.duty-deal-title{font-size:13px;font-weight:600;word-break:break-word}
+.duty-deal-facts{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--ui-text-secondary)}
+.duty-deal-facts b{color:var(--ui-text-primary);font-weight:600}
+.duty-deal-body{display:grid;grid-template-columns:minmax(280px,1fr) minmax(320px,1fr);gap:12px;align-items:start}
+@media (max-width:1080px){.duty-deal-body{grid-template-columns:1fr}}
+.duty-deal-spec,.duty-deal-attempts{min-width:0}
+.duty-spec{margin:0;white-space:pre-wrap;word-break:break-word;font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:11px;line-height:1.5;color:var(--ui-text-secondary);max-height:60vh;overflow:auto;border:1px solid var(--ui-stroke-tertiary);border-radius:6px;padding:8px}
 `
 
 /* ---------------- данные ---------------- */
@@ -476,6 +517,65 @@ function useAttempts(board, taskId) {
 
   useEffect(() => {
     void load()
+  }, [load])
+
+  return { ...state, reload: load }
+}
+
+/* ---------------- данные: «дело» и «здоровье» ---------------- */
+
+/** Экран «Здоровье»: агрегат по ранам. Запрашивается только когда экран открыт. */
+function useStats(enabled) {
+  const [snap, setSnap] = useState({ data: null, error: null, loading: false })
+  const alive = useRef(true)
+
+  const load = useCallback(async () => {
+    setSnap((prev) => ({ ...prev, loading: true }))
+    try {
+      const data = await rest('/stats', { timeoutMs: REQUEST_TIMEOUT_MS })
+      if (alive.current) setSnap({ data, error: null, loading: false })
+    } catch (error) {
+      // Прошлый снимок не затираем: экран не мигает пустотой при обрыве.
+      if (alive.current) setSnap((prev) => ({ data: prev.data, error: errText(error), loading: false }))
+    }
+  }, [])
+
+  useEffect(() => {
+    alive.current = true
+    if (!enabled) return () => { alive.current = false }
+    void load()
+    const timer = setInterval(() => void load(), STATS_REFRESH_MS)
+    return () => {
+      alive.current = false
+      clearInterval(timer)
+    }
+  }, [enabled, load])
+
+  return { ...snap, reload: load }
+}
+
+/** Экран «Дело»: спецификация + тот же факт-набор, что в `/now`. */
+function useDeal(board, taskId) {
+  const [state, setState] = useState({ key: '', data: null, error: null, loading: false })
+  const key = board && taskId ? `${board}/${taskId}` : ''
+
+  const load = useCallback(async () => {
+    if (!key) return
+    setState((prev) => ({ key, data: prev.key === key ? prev.data : null, error: null, loading: true }))
+    try {
+      const data = await rest(`/deal/${encodeURIComponent(board)}/${encodeURIComponent(taskId)}`, {
+        timeoutMs: REQUEST_TIMEOUT_MS,
+      })
+      setState((prev) => (prev.key === key ? { key, data, error: null, loading: false } : prev))
+    } catch (error) {
+      setState((prev) => (prev.key === key ? { ...prev, error: errText(error), loading: false } : prev))
+    }
+  }, [board, taskId, key])
+
+  useEffect(() => {
+    void load()
+    const timer = setInterval(() => void load(), REFRESH_MS)
+    return () => clearInterval(timer)
   }, [load])
 
   return { ...state, reload: load }
@@ -631,34 +731,227 @@ function AttemptCard({ attempt }) {
   )
 }
 
-/** Правая панель: таймлайн попыток выбранного дела. */
-function AttemptsPanel({ sel, onClose }) {
-  const query = useAttempts(sel?.board, sel?.id)
-  const timeline = useMemo(() => (query.data ? shapeAttempts(query.data) : null), [query.data])
+// Неполнота ответа /now одной строкой — общая для жёлтой полосы над списком и
+// для пустого состояния, иначе «досок 19/19» врёт про полноту среза. Собирает её
+// модель (`noticeLines`), потому что правило «устаревший снимок замечаний не
+// имеет» проверяется тестом, а не глазами при ревью рендера.
 
-  let body
-  if (query.error) {
-    body = h(
+/* ---------------- экран «почему стоит» ---------------- */
+
+/**
+ * Карточка одного дела: состояние и доказательство словами бэкенда.
+ *
+ * Ничего не досчитывается: `waiting.evidence` — это факты, которые сработали в
+ * бэкенде (лизинг, pid, heartbeat, граф зависимостей, пул вопросов). Экран
+ * показывает их целиком, чтобы «почему стоит» можно было проверить, а не
+ * поверить.
+ */
+function WhyCard({ deal, onOpen }) {
+  return h(
+    'article',
+    { className: 'duty-why-card' },
+    h('div', { className: 'duty-why-title' }, deal.titleFull || deal.title),
+    h(
       'div',
+      { className: 'duty-why-meta' },
+      h(StateBadge, { label: deal.stateLabel, tone: deal.tone, title: deal.state }),
+      h('span', { className: 'duty-mono' }, `${deal.board} · ${deal.id}`),
+      h('span', { className: 'duty-muted' }, deal.assignee),
+    ),
+    h('div', { className: 'duty-evidence', style: { margin: '6px 0 0' } }, deal.evidence || 'доказательство не записано'),
+    h(
+      'div',
+      { className: 'duty-why-foot' },
+      h('span', null, `попытка: ${deal.attemptAgeText} (${deal.attemptNote})`),
+      h('span', null, `действие: ${deal.lastActionAgeText} назад`),
+      h(Button, { size: 'xs', variant: 'secondary', onClick: () => onOpen(deal) }, 'открыть дело'),
+    ),
+  )
+}
+
+function WhyScreen({ model, stale, onOpen }) {
+  const lines = noticeLines(model, stale)
+  return h(
+    'div',
+    { className: 'duty-scroll' },
+    lines.length
+      ? h('div', { className: 'duty-note', style: { margin: '0 0 10px' } }, ...lines.map((line, i) => h('div', { key: `n-${i}` }, line)))
+      : null,
+    h(
+      'div',
+      { className: 'duty-muted', style: { margin: '0 2px 10px' } },
+      'группа — состояние ожидания, текст в рамке — доказательство из бэкенда; страница ничего не досчитывает',
+    ),
+    !model.count
+      ? h('div', { className: 'duty-empty' }, h('b', null, 'нечего объяснять: активных дел нет'))
+      : h(
+          'div',
+          null,
+          ...model.groups.map((group) =>
+            h(
+              'section',
+              { key: `why-${group.state}`, style: { marginBottom: '16px' } },
+              h(
+                'div',
+                { className: 'duty-group-h' },
+                h(StateBadge, { label: group.label, tone: group.tone, title: group.state }),
+                h('span', { className: 'duty-num' }, `${group.count}`),
+                h('span', { className: 'duty-mono' }, group.state),
+              ),
+              h(
+                'div',
+                { className: 'duty-why-grid' },
+                ...group.deals.map((deal) => h(WhyCard, { key: `${deal.board}/${deal.id}`, deal, onOpen })),
+              ),
+            ),
+          ),
+        ),
+  )
+}
+
+/* ---------------- экран «здоровье» ---------------- */
+
+function Kpi({ title, value, sub, barPct }) {
+  return h(
+    'div',
+    { className: 'duty-kpi' },
+    h('div', { className: 'duty-kpi-k' }, title),
+    h('div', { className: 'duty-kpi-v' }, value),
+    h('div', { className: 'duty-muted' }, sub),
+    barPct === null || barPct === undefined
+      ? null
+      : h('div', { className: 'duty-kpi-track' }, h('div', { className: 'duty-kpi-fill', style: { width: `${barPct}%` } })),
+  )
+}
+
+/**
+ * Таксономия исходов: доля каждого исхода среди всех ранов.
+ *
+ * Наборы успеха и падения приходят в ответе (`success_outcomes`/
+ * `crash_outcomes`) — страница не решает сама, что считать падением.
+ */
+function Taxonomy({ stats }) {
+  const entries = Object.entries(stats.totals.runs_by_outcome || {}).sort((a, b) => b[1] - a[1])
+  const crashes = new Set(stats.crash_outcomes || [])
+  const success = new Set(stats.success_outcomes || [])
+  if (!entries.length) return h('div', { className: 'duty-muted' }, 'ранов нет: таксономия считается по task_runs')
+  const max = entries[0][1] || 1
+  return h(
+    'div',
+    { className: 'duty-tax' },
+    ...entries.map(([key, count]) => {
+      const tone = crashes.has(key) ? TONE_COLOR.red : success.has(key) ? TONE_COLOR.green : TONE_COLOR.gray
+      return h(
+        'div',
+        { className: 'duty-tax-row', key: `tax-${key}` },
+        h('span', { className: 'duty-tax-name', title: key }, key),
+        h('div', { className: 'duty-tax-track' }, h('div', { className: 'duty-tax-fill', style: { width: `${Math.max(1, Math.round((count / max) * 100))}%`, background: tone } })),
+        h('span', { className: 'duty-num', style: { textAlign: 'right' } }, `${count}`),
+      )
+    }),
+  )
+}
+
+function BoardHealthTable({ stats }) {
+  return h(
+    'table',
+    { className: 'duty-table duty-health-table' },
+    h(
+      'thead',
       null,
       h(
-        'div',
-        { className: 'duty-banner', style: { margin: '0 0 8px' } },
-        h('span', null, query.error),
-        h(Button, { size: 'xs', variant: 'secondary', onClick: () => void query.reload() }, 'повторить'),
+        'tr',
+        null,
+        h('th', null, 'доска'),
+        h('th', null, 'задач'),
+        h('th', null, 'ранов'),
+        h('th', null, 'с первой попытки'),
+        h('th', null, 'медиана ожидания'),
+        h('th', null, 'неполнота'),
       ),
-    )
-  } else if (query.loading && !timeline) {
-    body = h(TimelineSkeleton, null)
-  } else if (!timeline || !timeline.count) {
-    body = h('div', { className: 'duty-muted' }, 'попыток нет: у дела ещё не было ранов')
-  } else {
-    body = h('div', null, ...timeline.attempts.map((attempt, i) => h(AttemptCard, { key: `att-${attempt.runId ?? i}`, attempt })))
-  }
+    ),
+    h(
+      'tbody',
+      null,
+      ...stats.boards.map((board) => {
+        if (!board.read) {
+          return h(
+            'tr',
+            { key: `bh-${board.slug}` },
+            h('td', { className: 'duty-mono' }, board.slug),
+            h('td', { colSpan: 5, className: 'duty-muted' }, board.note || 'доска недоступна'),
+          )
+        }
+        const share = board.first_try.share
+        const incompleteness = [board.truncated ? 'срез обрезан лимитом' : '', ...(board.warnings || [])]
+          .filter(Boolean)
+          .join('; ')
+        return h(
+          'tr',
+          { key: `bh-${board.slug}` },
+          h('td', { className: 'duty-mono' }, board.slug),
+          h('td', { className: 'duty-num' }, `${board.tasks_total}`),
+          h('td', { className: 'duty-num' }, `${board.runs_total}`),
+          h('td', { className: 'duty-num' }, `${board.first_try.ok}/${board.first_try.with_runs} · ${share === null ? '—' : `${Math.round(share * 100)}%`}`),
+          h('td', { className: 'duty-num' }, board.wait.median_sec === null ? '—' : fmtAge(board.wait.median_sec)),
+          h('td', { className: 'duty-muted' }, incompleteness || '—'),
+        )
+      }),
+    ),
+  )
+}
 
+function HealthScreen({ stats }) {
+  if (stats.error && !stats.data) {
+    return h('div', { className: 'duty-scroll' }, h('div', { className: 'duty-banner', style: { margin: 0 } }, h('span', null, stats.error), h(Button, { size: 'xs', variant: 'secondary', onClick: () => void stats.reload() }, 'повторить')))
+  }
+  if (!stats.data) {
+    return h('div', { className: 'duty-scroll' }, h('div', { className: 'duty-skel-row' }, ...Array.from({ length: 5 }, (_, i) => h('div', { className: 'duty-skel', key: `hs-${i}`, style: { width: `${92 - i * 10}%` } }))))
+  }
+  const data = stats.data
+  const totals = data.totals
+  const crashes = new Set(data.crash_outcomes || [])
+  const crashRuns = Object.entries(totals.runs_by_outcome || {}).reduce((acc, [key, count]) => (crashes.has(key) ? acc + count : acc), 0)
+  const share = totals.first_try.share
+  const readBoards = data.boards.filter((board) => board.read).length
   return h(
-    'aside',
-    { className: 'duty-detail' },
+    'div',
+    { className: 'duty-scroll' },
+    stats.error ? h('div', { className: 'duty-banner', style: { margin: '0 0 10px' } }, h('span', null, `снимок не обновлён: ${stats.error}`), h(Button, { size: 'xs', variant: 'secondary', onClick: () => void stats.reload() }, 'повторить')) : null,
+    data.errors.length
+      ? h('div', { className: 'duty-note', style: { margin: '0 0 10px' } }, ...data.errors.map((err, i) => h('div', { key: `he-${i}` }, `источник ${err.board} недоступен: ${err.reason}`)))
+      : null,
+    h(
+      'div',
+      { className: 'duty-kpis' },
+      h(Kpi, { title: 'дела с первой попытки', value: share === null ? '—' : `${Math.round(share * 100)}%`, sub: `${totals.first_try.ok} из ${totals.first_try.with_runs} дел, у которых были раны`, barPct: share === null ? null : Math.round(share * 100) }),
+      h(Kpi, { title: 'медиана ожидания до первой попытки', value: totals.wait.median_sec === null ? '—' : fmtAge(totals.wait.median_sec), sub: `выборка: ${totals.wait.samples} дел (created_at → started_at)` }),
+      h(Kpi, { title: 'ранов всего', value: `${totals.runs_total}`, sub: `падений: ${crashRuns}${totals.runs_total ? ` · ${Math.round((crashRuns / totals.runs_total) * 100)}%` : ''}` }),
+      h(Kpi, { title: 'прочитано досок', value: `${readBoards} / ${data.boards.length}`, sub: `задач в срезе: ${totals.tasks_total}` }),
+    ),
+    h('div', { className: 'duty-group-h' }, h('span', null, 'таксономия исходов'), h('span', { className: 'duty-mono' }, 'по всем ранам')),
+    h(Taxonomy, { stats: data }),
+    h('div', { className: 'duty-group-h', style: { marginTop: '14px' } }, h('span', null, 'доски')),
+    h(BoardHealthTable, { stats: data }),
+    h(
+      'div',
+      { className: 'duty-muted', style: { marginTop: '10px' } },
+      'успех и падение — наборы исходов из ответа бэкенда; «с первой попытки» — первый по времени ран дела уже успешен; медиана считается по объединённой выборке дел',
+    ),
+  )
+}
+
+/* ---------------- экран «дело» ---------------- */
+
+function DealScreen({ sel, onBack }) {
+  const detail = useDeal(sel.board, sel.id)
+  const query = useAttempts(sel.board, sel.id)
+  const deal = useMemo(() => (detail.data && detail.data.deal ? shapeDeal(detail.data.deal) : null), [detail.data])
+  const timeline = useMemo(() => (query.data ? shapeAttempts(query.data) : null), [query.data])
+
+  const head = h(
+    'div',
+    { className: 'duty-deal-head' },
     h(
       'div',
       { className: 'duty-panel-h' },
@@ -666,29 +959,63 @@ function AttemptsPanel({ sel, onClose }) {
         'div',
         { style: { flex: '1 1 auto', minWidth: 0 } },
         h('div', { className: 'duty-mono' }, `${sel.board} · ${sel.id}`),
-        h('div', { className: 'duty-panel-title' }, sel.titleFull || '—'),
-        h(
+        h('div', { className: 'duty-deal-title' }, (detail.data && detail.data.title) || sel.titleFull || '—'),
+      ),
+      h(Button, { size: 'xs', variant: 'secondary', onClick: onBack }, '← к списку'),
+    ),
+    deal
+      ? h(StateBadge, { label: deal.stateLabel, tone: deal.tone, title: deal.state })
+      : detail.data
+        ? h(StateBadge, { label: `завершено: ${detail.data.status}`, tone: 'gray', title: detail.data.status })
+        : null,
+    deal ? h('div', { className: 'duty-evidence' }, deal.evidence || 'доказательство не записано') : null,
+    detail.data
+      ? h(
           'div',
-          { style: { marginTop: '4px' } },
-          h(StateBadge, { label: sel.stateLabel, tone: sel.tone, title: sel.state }),
-        ),
+          { className: 'duty-deal-facts' },
+          h('span', null, 'статус: ', h('b', null, detail.data.status || '—')),
+          h('span', null, 'исполнитель: ', h('b', null, detail.data.assignee || '—')),
+          deal ? h('span', null, 'попытка: ', h('b', null, `${deal.attemptAgeText} (${deal.attemptNote})`)) : null,
+          deal ? h('span', null, 'лизинг: ', h('b', null, deal.leaseText)) : null,
+          deal ? h('span', null, 'действие: ', h('b', null, `${deal.lastActionAgeText} назад`)) : null,
+        )
+      : null,
+  )
+
+  let body
+  if (detail.error && !detail.data) {
+    body = h('div', { className: 'duty-banner', style: { margin: 0 } }, h('span', null, detail.error), h(Button, { size: 'xs', variant: 'secondary', onClick: () => void detail.reload() }, 'повторить'))
+  } else if (!detail.data) {
+    body = h('div', { className: 'duty-skel-row' }, ...Array.from({ length: 4 }, (_, i) => h('div', { className: 'duty-skel', key: `ds-${i}`, style: { width: `${90 - i * 12}%` } })))
+  } else {
+    body = h(
+      'div',
+      { className: 'duty-deal-body' },
+      h(
+        'div',
+        { className: 'duty-deal-spec' },
+        h('div', { className: 'duty-group-h' }, h('span', null, 'спецификация'), detail.data.body_truncated ? h('span', { className: 'duty-mono' }, 'обрезана лимитом') : null),
+        detail.data.body
+          ? h('pre', { className: 'duty-spec' }, detail.data.body)
+          : h('div', { className: 'duty-muted' }, 'тело дела пустое'),
       ),
       h(
-        'button',
-        { type: 'button', className: 'duty-icon-btn', title: 'Закрыть панель', onClick: onClose },
-        h(Codicon, { name: 'close', size: '0.8rem' }),
+        'div',
+        { className: 'duty-deal-attempts' },
+        h('div', { className: 'duty-group-h' }, h('span', null, 'попытки'), h('span', { className: 'duty-num' }, `${timeline ? timeline.count : '…'}`)),
+        query.error
+          ? h('div', { className: 'duty-banner', style: { margin: 0 } }, h('span', null, query.error), h(Button, { size: 'xs', variant: 'secondary', onClick: () => void query.reload() }, 'повторить'))
+          : !timeline
+            ? h(TimelineSkeleton, null)
+            : !timeline.count
+              ? h('div', { className: 'duty-muted' }, 'попыток нет: у дела ещё не было ранов')
+              : h('div', null, ...timeline.attempts.map((attempt, i) => h(AttemptCard, { key: `att-${attempt.runId ?? i}`, attempt }))),
       ),
-    ),
-    sel.evidence ? h('div', { className: 'duty-evidence' }, sel.evidence) : null,
-    h('div', { className: 'duty-group-h' }, h('span', null, 'попытки')),
-    body,
-  )
-}
+    )
+  }
 
-// Неполнота ответа /now одной строкой — общая для жёлтой полосы над списком и
-// для пустого состояния, иначе «досок 19/19» врёт про полноту среза. Собирает её
-// модель (`noticeLines`), потому что правило «устаревший снимок замечаний не
-// имеет» проверяется тестом, а не глазами при ревью рендера.
+  return h('div', { className: 'duty-scroll' }, head, body)
+}
 
 function EmptyState({ view, model, onReset, stale }) {
   const filtered = model.count > 0 && view.count === 0
@@ -711,12 +1038,15 @@ function EmptyState({ view, model, onReset, stale }) {
 
 function DutyPage() {
   const snap = useNow()
+  const [screen, setScreen] = useState('now')
   const [board, setBoard] = useState('')
   const [states, setStates] = useState(() => new Set())
   const [query, setQuery] = useState('')
   const [effQuery, setEffQuery] = useState('')
   const [sel, setSel] = useState(null)
   const [tick, setTick] = useState(() => Date.now())
+  // «Здоровье» запрашивается только когда экран открыт: это скан всех досок.
+  const stats = useStats(screen === 'health')
 
   // Поиск — локальный и с задержкой: данные не перезапрашиваются на каждый символ.
   useEffect(() => {
@@ -742,7 +1072,12 @@ function DutyPage() {
 
   const updatedAgo = snap.updatedAt ? Math.max(0, Math.floor((tick - snap.updatedAt) / 1000)) : null
   const selectedKey = sel ? `${sel.board}/${sel.id}` : ''
-  const pick = (deal) => setSel(sel && selectedKey === `${deal.board}/${deal.id}` ? null : deal)
+  // Клик по делу открывает его собственным экраном: у дела есть спецификация и
+  // таймлайн попыток, и в узкую панель они не помещаются.
+  const pick = (deal) => {
+    setSel(deal)
+    setScreen('deal')
+  }
   const toggleState = (state) =>
     setStates((prev) => {
       const next = new Set(prev)
@@ -761,6 +1096,25 @@ function DutyPage() {
     'header',
     { className: 'duty-head' },
     h('h1', null, 'Дела'),
+    h(
+      'div',
+      { className: 'duty-tabs' },
+      ...TABS.map(([key, label]) =>
+        h(
+          'button',
+          {
+            key,
+            type: 'button',
+            className: screen === key ? 'duty-tab on' : 'duty-tab',
+            onClick: () => {
+              setScreen(key)
+              setSel(null)
+            },
+          },
+          label,
+        ),
+      ),
+    ),
     model ? h('span', { className: 'duty-muted duty-num' }, `сейчас: ${view.count}`) : null,
     model ? h('span', { className: 'duty-muted' }, `· досок ${model.boardsRead}/${model.boardsTotal}`) : null,
     h('span', { className: 'duty-spacer' }),
@@ -883,14 +1237,36 @@ function DutyPage() {
     )
   }
 
+  // Экраны переключаются табами; данные для каждого — свои, из одного и того же
+  // бэкенда. «Дело» открывается из списка или из «Почему стоит».
+  let content
+  if (screen === 'deal' && sel) {
+    content = h(DealScreen, {
+      key: `${sel.board}/${sel.id}`,
+      sel,
+      onBack: () => {
+        setSel(null)
+        setScreen('now')
+      },
+    })
+  } else if (screen === 'why') {
+    content = model
+      ? h(WhyScreen, { model, stale, onOpen: pick })
+      : h('div', { className: 'duty-scroll' }, h('div', { className: 'duty-skel-row' }, ...Array.from({ length: 6 }, (_, i) => h('div', { className: 'duty-skel', key: `ws-${i}`, style: { width: `${95 - i * 8}%` } }))))
+  } else if (screen === 'health') {
+    content = h(HealthScreen, { stats })
+  } else {
+    content = h('div', { className: 'duty-body' }, list)
+  }
+
   return h(
     'div',
     { className: 'duty-page' },
     header,
-    banner,
-    notices,
-    filters,
-    h('div', { className: 'duty-body' }, list, sel ? h(AttemptsPanel, { sel, onClose: () => setSel(null) }) : null),
+    screen === 'now' || screen === 'why' ? banner : null,
+    screen === 'now' ? notices : null,
+    screen === 'now' ? filters : null,
+    content,
   )
 }
 

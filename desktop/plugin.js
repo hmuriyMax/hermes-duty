@@ -866,7 +866,7 @@ function BoardHealthTable({ stats }) {
         h('th', null, 'задач'),
         h('th', null, 'ранов'),
         h('th', null, 'с первой попытки'),
-        h('th', null, 'медиана ожидания'),
+        h('th', null, 'ожидание p50 / p90'),
         h('th', null, 'неполнота'),
       ),
     ),
@@ -893,7 +893,7 @@ function BoardHealthTable({ stats }) {
           h('td', { className: 'duty-num' }, `${board.tasks_total}`),
           h('td', { className: 'duty-num' }, `${board.runs_total}`),
           h('td', { className: 'duty-num' }, `${board.first_try.ok}/${board.first_try.with_runs} · ${share === null ? '—' : `${Math.round(share * 100)}%`}`),
-          h('td', { className: 'duty-num' }, board.wait.median_sec === null ? '—' : fmtAge(board.wait.median_sec)),
+          h('td', { className: 'duty-num' }, board.waiting_sec.p50 === null ? '—' : `${fmtAge(board.waiting_sec.p50)} / ${fmtAge(board.waiting_sec.p90)}`),
           h('td', { className: 'duty-muted' }, incompleteness || '—'),
         )
       }),
@@ -921,11 +921,14 @@ function HealthScreen({ stats }) {
     data.errors.length
       ? h('div', { className: 'duty-note', style: { margin: '0 0 10px' } }, ...data.errors.map((err, i) => h('div', { key: `he-${i}` }, `источник ${err.board} недоступен: ${err.reason}`)))
       : null,
+    data.warnings.length
+      ? h('div', { className: 'duty-note', style: { margin: '0 0 10px' } }, ...data.warnings.map((text, i) => h('div', { key: `hw-${i}` }, text)))
+      : null,
     h(
       'div',
       { className: 'duty-kpis' },
       h(Kpi, { title: 'дела с первой попытки', value: share === null ? '—' : `${Math.round(share * 100)}%`, sub: `${totals.first_try.ok} из ${totals.first_try.with_runs} дел, у которых были раны`, barPct: share === null ? null : Math.round(share * 100) }),
-      h(Kpi, { title: 'медиана ожидания до первой попытки', value: totals.wait.median_sec === null ? '—' : fmtAge(totals.wait.median_sec), sub: `выборка: ${totals.wait.samples} дел (created_at → started_at)` }),
+      h(Kpi, { title: 'ожидание до первой попытки: p50 / p90', value: totals.waiting_sec.p50 === null ? '—' : `${fmtAge(totals.waiting_sec.p50)} / ${fmtAge(totals.waiting_sec.p90)}`, sub: totals.waiting_sec.count ? `p99: ${fmtAge(totals.waiting_sec.p99)} · максимум: ${fmtAge(totals.waiting_sec.max)} · выборка: ${totals.waiting_sec.count} дел (created_at → started_at)` : 'выборки нет: у дел среза нет ни одного рана (created_at → started_at)' }),
       h(Kpi, { title: 'ранов всего', value: `${totals.runs_total}`, sub: `падений: ${crashRuns}${totals.runs_total ? ` · ${Math.round((crashRuns / totals.runs_total) * 100)}%` : ''}` }),
       h(Kpi, { title: 'прочитано досок', value: `${readBoards} / ${data.boards.length}`, sub: `задач в срезе: ${totals.tasks_total}` }),
     ),
@@ -936,7 +939,7 @@ function HealthScreen({ stats }) {
     h(
       'div',
       { className: 'duty-muted', style: { marginTop: '10px' } },
-      'успех и падение — наборы исходов из ответа бэкенда; «с первой попытки» — первый по времени ран дела уже успешен; медиана считается по объединённой выборке дел',
+      'успех и падение — наборы исходов из ответа бэкенда; «с первой попытки» — первый по времени ран дела уже успешен; p50/p90/p99 — метод ближайшего ранга по объединённой выборке дел (сортировка одна, интерполяции нет)',
     ),
   )
 }

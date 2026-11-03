@@ -428,7 +428,8 @@ SUMMARY_LIMIT = 240
 
 # Сколько задач берёт экран «Здоровье» с доски. Это не срез «сейчас»: тут важна
 # доля, а не мгновенная картина, поэтому лимит больше. Сработавший лимит виден
-# как `truncated` доски — молча урезать выборку нельзя, иначе медиана врёт.
+# как `truncated` доски и назван в `warnings[]` итога — молча урезать выборку
+# нельзя, иначе и доля, и распределение ожидания врут.
 STATS_TASK_LIMIT = 5000
 
 # Исходы рана, которые считаются успехом попытки. Отдельно от статуса: у рана
@@ -980,19 +981,37 @@ def collect_now(
 #
 # Экран «Дело» — одна карточка: чем дело занято сейчас (тот же факт-набор, что в
 # `/now`) плюс её собственная спецификация. Экран «Здоровье» — агрегат по ранам:
-# доля этапов, пройденных с первой попытки, медиана ожидания до первой попытки и
-# таксономия исходов. Ни один из них ничего не пишет и не пересчитывает статусы.
+# доля этапов, пройденных с первой попытки, распределение ожидания до первой
+# попытки (p50/p90/p99, а не одно число) и таксономия исходов. Ни один из них
+# ничего не пишет и не пересчитывает статусы.
+
+PERCENTILES = (50, 90, 99)
 
 
-def _median(values: list[int]) -> Optional[int]:
-    """Медиана целых значений; None — если выборки нет (не 0 и не выдумка)."""
-    if not values:
-        return None
+def _waiting_distribution(values: list[int]) -> dict[str, Any]:
+    """Распределение ожидания до первой попытки: p50, p90, p99, `count`, `max`.
+
+    Метод — ближайший ранг (nearest rank), без интерполяции: перцентиль `p` —
+    это значение на позиции `ceil(p / 100 * n)` в возрастающем ряду (нумерация
+    с 1). На наборе 1..10 это даёт p50 = 5 и p90 = 9 (у интерполяции было бы
+    5.5 и 9.1). Ряд сортируется один раз, все три перцентиля берутся из него по
+    индексу — второго прохода по данным нет, поэтому p99 отдаётся всегда.
+
+    Пустая выборка — `null` во всех перцентилях и `count: 0`: «нет данных» и
+    «ждали 0 секунд» — разные вещи, нули здесь были бы выдумкой.
+    """
     ordered = sorted(values)
-    mid = len(ordered) // 2
-    if len(ordered) % 2:
-        return int(ordered[mid])
-    return int(round((ordered[mid - 1] + ordered[mid]) / 2))
+    count = len(ordered)
+    if not count:
+        return {"p50": None, "p90": None, "p99": None, "count": 0, "max": None}
+    shaped: dict[str, Any] = {}
+    for pct in PERCENTILES:
+        # ceil(pct * count / 100) целочисленно, без float на границах
+        rank = -(-pct * count // 100)
+        shaped[f"p{pct}"] = int(ordered[min(rank, count) - 1])
+    shaped["count"] = count
+    shaped["max"] = int(ordered[-1])
+    return shaped
 
 
 def _stats_board(entry: dict[str, Any]) -> dict[str, Any]:
@@ -1075,7 +1094,7 @@ def _stats_board(entry: dict[str, Any]) -> dict[str, Any]:
             "with_runs": with_runs,
             "share": (first_try_ok / with_runs) if with_runs else None,
         },
-        "wait": {"median_sec": _median(waits), "samples": len(waits)},
+        "waiting_sec": _waiting_distribution(waits),
         "_waits": waits,
     }
 
@@ -1083,12 +1102,18 @@ def _stats_board(entry: dict[str, Any]) -> dict[str, Any]:
 def collect_stats(home: Path, now: int) -> dict[str, Any]:
     """Здоровье всех живых досок: агрегат по ранам плюс итог по прочитанным.
 
-    Медиана считается по объединённой выборке, а не как среднее медиан: медиана
-    медиан не равна медиане. Доска, у которой не читается `tasks`, попадает в
-    `errors` и в итог не входит — ответ остаётся 200.
+    Распределение ожидания считается по объединённой выборке, а не как среднее
+    перцентилей досок: перцентиль перцентилей не равен перцентилю объединённой
+    выборки. Доска, у которой не читается `tasks`, попадает в `errors` и в итог
+    не входит — ответ остаётся 200.
+
+    Обрезанный срез доски (`truncated`) остаётся флагом этой доски, но дополнительно
+    называется в `warnings[]` верхнего уровня: распределение по неполной выборке
+    нельзя выдавать за полное, а `totals.waiting_sec` читают в отрыве от `boards[]`.
     """
     boards: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
+    warnings: list[str] = []
     waits: list[int] = []
     by_status: dict[str, int] = {}
     by_outcome: dict[str, int] = {}
@@ -1121,12 +1146,18 @@ def collect_stats(home: Path, now: int) -> dict[str, Any]:
             by_status[key] = by_status.get(key, 0) + count
         for key, count in collected["runs_by_outcome"].items():
             by_outcome[key] = by_outcome.get(key, 0) + count
+        if collected["truncated"]:
+            warnings.append(
+                f"доска {collected['slug']}: срез обрезан лимитом {STATS_TASK_LIMIT} задач — "
+                f"распределение ожидания и доля первой попытки считаются по неполной выборке"
+            )
         boards.append(collected)
 
     return {
         "now": now,
         "boards": boards,
         "errors": errors,
+        "warnings": warnings,
         "totals": {
             "tasks_total": tasks_total,
             "tasks_by_status": by_status,
@@ -1137,7 +1168,7 @@ def collect_stats(home: Path, now: int) -> dict[str, Any]:
                 "with_runs": with_runs,
                 "share": (first_try_ok / with_runs) if with_runs else None,
             },
-            "wait": {"median_sec": _median(waits), "samples": len(waits)},
+            "waiting_sec": _waiting_distribution(waits),
         },
         "success_outcomes": list(SUCCESS_OUTCOMES),
         "crash_outcomes": list(CRASH_OUTCOMES),
@@ -1146,7 +1177,7 @@ def collect_stats(home: Path, now: int) -> dict[str, Any]:
 
 @router.get("/stats")
 def stats() -> dict[str, Any]:
-    """Здоровье: доля с первой попытки, медиана ожидания, таксономия исходов."""
+    """Здоровье: доля с первой попытки, распределение ожидания (p50/p90/p99), исходы."""
     return collect_stats(_hermes_home(), _now_sec())
 
 

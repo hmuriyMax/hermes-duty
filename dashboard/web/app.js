@@ -446,7 +446,7 @@ function boardTable(stats) {
       h('td', { class: 'n' }, `${board.tasks_total}`),
       h('td', { class: 'n' }, `${board.runs_total}`),
       h('td', { class: 'n' }, `${board.first_try.ok}/${board.first_try.with_runs} · ${pct(share)}`),
-      h('td', { class: 'n' }, board.wait.median_sec === null ? '—' : fmtAge(board.wait.median_sec)),
+      h('td', { class: 'n' }, board.waiting_sec.p50 === null ? '—' : `${fmtAge(board.waiting_sec.p50)} / ${fmtAge(board.waiting_sec.p90)}`),
       h(
         'td',
         { class: 'muted' },
@@ -471,7 +471,7 @@ function boardTable(stats) {
           h('th', null, 'задач'),
           h('th', null, 'ранов'),
           h('th', null, 'с первой попытки'),
-          h('th', null, 'медиана ожидания'),
+          h('th', null, 'ожидание p50 / p90'),
           h('th', null, 'неполнота'),
         ),
       ),
@@ -498,6 +498,7 @@ function viewHealth() {
   if (stats.errors.length) {
     parts.push(noticesBlock(stats.errors.map((err) => `источник ${err.board} недоступен: ${err.reason}`)))
   }
+  if (stats.warnings && stats.warnings.length) parts.push(noticesBlock(stats.warnings))
 
   parts.push(
     h(
@@ -510,9 +511,11 @@ function viewHealth() {
         totals.first_try.share === null ? null : Math.round(totals.first_try.share * 100),
       ),
       kpi(
-        'медиана ожидания до первой попытки',
-        totals.wait.median_sec === null ? '—' : fmtAge(totals.wait.median_sec),
-        `выборка: ${totals.wait.samples} дел (created_at → started_at)`,
+        'ожидание до первой попытки: p50 / p90',
+        totals.waiting_sec.p50 === null ? '—' : `${fmtAge(totals.waiting_sec.p50)} / ${fmtAge(totals.waiting_sec.p90)}`,
+        totals.waiting_sec.count
+          ? `p99: ${fmtAge(totals.waiting_sec.p99)} · максимум: ${fmtAge(totals.waiting_sec.max)} · выборка: ${totals.waiting_sec.count} дел (created_at → started_at)`
+          : 'выборки нет: у дел среза нет ни одного рана (created_at → started_at)',
       ),
       kpi('ранов всего', `${totals.runs_total}`, `падений: ${crashRuns} · ${pct(crashShare)}`),
       kpi('прочитано досок', `${readBoards} / ${stats.boards.length}`, `задач в срезе: ${totals.tasks_total}`),
@@ -532,7 +535,7 @@ function viewHealth() {
       h(
         'div',
         null,
-        'Как это считается: успех попытки — исход рана из набора успеха (передаётся бэкендом), падение — из набора crash. «С первой попытки» — у дела первый по времени ран уже успешен. Медиана — по объединённой выборке; обрезанный срез доски помечен в колонке «неполнота», чтобы доля и медиана не выглядели полными.',
+        'Как это считается: успех попытки — исход рана из набора успеха (передаётся бэкендом), падение — из набора crash. «С первой попытки» — у дела первый по времени ран уже успешен. p50/p90/p99 ожидания — метод ближайшего ранга (позиция ceil(p/100 · n) в возрастающем ряду, без интерполяции) по объединённой выборке; обрезанный срез доски помечен в колонке «неполнота» и в предупреждениях выше, чтобы доля и распределение не выглядели полными.',
       ),
     ),
   )

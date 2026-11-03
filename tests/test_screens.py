@@ -5,9 +5,10 @@
 живые БД не читаются.
 
 Проверяется не рендер, а то, что нельзя проверить глазами при ревью:
-медиана считается по объединённой выборке (а не средним медиан), «с первой
-попытки» — по первому по времени рану, обрезанный срез помечен, недоступная
-доска не роняет ответ и не попадает в итог, а завершённое дело не получает
+распределение ожидания считается методом ближайшего ранга по объединённой
+выборке (а не средним перцентилей досок), «с первой попытки» — по первому по
+времени рану, обрезанный срез помечен и назван в `warnings[]`, недоступная доска
+не роняет ответ и не попадает в итог, а завершённое дело не получает
 придуманного состояния ожидания.
 """
 
@@ -194,9 +195,10 @@ def test_deal_body_is_capped(client, tmp_path, monkeypatch):
     assert body["body_truncated"] is True
 
 
-def test_stats_first_try_and_median_wait(client, tmp_path):
+def test_stats_first_try_and_wait_distribution(client, tmp_path):
     # Три дела: первая попытка успешна у двух, у третьего — падение; ожидание
-    # до первой попытки 100/300/800 с → медиана 300.
+    # до первой попытки 100/300/800 с. Метод ближайшего ранга: p50 — 2-й из 3
+    # (300), p90 и p99 — 3-й (800), максимум 800.
     make_board(
         tmp_path / "kanban.db",
         tasks=[
@@ -217,17 +219,50 @@ def test_stats_first_try_and_median_wait(client, tmp_path):
     assert totals["tasks_total"] == 3
     assert totals["runs_total"] == 4
     assert totals["first_try"] == {"ok": 2, "with_runs": 3, "share": pytest.approx(2 / 3)}
-    assert totals["wait"]["median_sec"] == 300
-    assert totals["wait"]["samples"] == 3
+    assert totals["waiting_sec"] == {"p50": 300, "p90": 800, "p99": 800, "count": 3, "max": 800}
     assert totals["runs_by_outcome"] == {"completed": 3, "crashed": 1}
     assert "completed" in stats["success_outcomes"]
     assert "crashed" in stats["crash_outcomes"]
+    # срез не обрезан — распределение полное, предупреждать не о чем
+    assert stats["warnings"] == []
 
 
-def test_stats_median_is_over_pooled_sample(client, tmp_path):
-    # Доска A: ожидания 0 и 0 (медиана 0). Доска B: 1000 с. Медиана медиан дала
-    # бы 0 или 1000 в зависимости от способа, медиана объединённой выборки — 0,
-    # а вот доля считается по сумме дел. Проверяем именно объединение: 0,0,1000.
+def test_stats_wait_percentiles_nearest_rank(client, tmp_path):
+    # Ожидания 1..10 с: ближайший ранг даёт p50 = 5 (позиция 5 из 10) и p90 = 9
+    # (позиция 9), p99 — позиция 10, то есть максимум; интерполяция дала бы 5.5 и
+    # 9.1, а медиана чётного ряда — 5.5. Тест фиксирует именно метод.
+    make_board(
+        tmp_path / "kanban.db",
+        tasks=[
+            {"id": f"t_p{i:02d}", "status": "done", "created_at": NOW - 1000 + i}
+            for i in range(1, 11)
+        ],
+        runs=[
+            {"task_id": f"t_p{i:02d}", "outcome": "completed", "started_at": NOW - 1000 + i + i}
+            for i in range(1, 11)
+        ],
+    )
+    totals = client.get("/stats").json()["totals"]
+
+    # ожидание дела i — ровно i секунд (created_at = NOW - 1000 + i, started_at = +i)
+    assert totals["waiting_sec"] == {"p50": 5, "p90": 9, "p99": 10, "count": 10, "max": 10}
+
+
+def test_stats_wait_single_sample_has_all_percentiles(client, tmp_path):
+    # Один элемент: любой перцентиль — это он сам, а не None и не 0.
+    make_board(
+        tmp_path / "kanban.db",
+        tasks=[{"id": "t_one", "status": "done", "created_at": NOW - 107}],
+        runs=[{"task_id": "t_one", "outcome": "completed", "started_at": NOW - 100}],
+    )
+    totals = client.get("/stats").json()["totals"]
+
+    assert totals["waiting_sec"] == {"p50": 7, "p90": 7, "p99": 7, "count": 1, "max": 7}
+
+
+def test_stats_wait_is_over_pooled_sample(client, tmp_path):
+    # Доска A: ожидания 0 и 0. Доска B: 1000 с. Перцентиль по каждой доске отдельно
+    # дал бы 0 и 1000; объединённая выборка 0,0,1000 — p50 = 0, p90 = 1000.
     make_board(
         tmp_path / "kanban" / "boards" / "a" / "kanban.db",
         tasks=[{"id": "t_a1", "status": "done", "created_at": NOW - 100}, {"id": "t_a2", "status": "done", "created_at": NOW - 100}],
@@ -243,8 +278,7 @@ def test_stats_median_is_over_pooled_sample(client, tmp_path):
     )
     totals = client.get("/stats").json()["totals"]
 
-    assert totals["wait"]["samples"] == 3
-    assert totals["wait"]["median_sec"] == 0
+    assert totals["waiting_sec"] == {"p50": 0, "p90": 1000, "p99": 1000, "count": 3, "max": 1000}
     assert totals["first_try"]["with_runs"] == 3
 
 
@@ -263,9 +297,59 @@ def test_stats_reports_unreadable_board_without_failing(client, tmp_path):
     assert stats["totals"]["tasks_total"] == 1
 
 
-def test_stats_without_runs_reports_null_share_and_median(client, tmp_path):
+def test_stats_without_runs_reports_null_share_and_empty_distribution(client, tmp_path):
     make_board(tmp_path / "kanban.db", tasks=[{"id": "t_noruns", "status": "todo"}])
     totals = client.get("/stats").json()["totals"]
 
     assert totals["first_try"] == {"ok": 0, "with_runs": 0, "share": None}
-    assert totals["wait"] == {"median_sec": None, "samples": 0}
+    # «нет данных» — не «ждали 0 секунд»: перцентили null, count 0
+    assert totals["waiting_sec"] == {"p50": None, "p90": None, "p99": None, "count": 0, "max": None}
+
+
+def test_stats_truncated_board_marks_distribution_incomplete(client, tmp_path, monkeypatch):
+    # Срез доски обрезан лимитом: распределение посчитано, но по неполной выборке,
+    # и это названо предупреждением верхнего уровня — иначе `totals.waiting_sec`
+    # читался бы как полный.
+    monkeypatch.setattr(plugin_api, "STATS_TASK_LIMIT", 2)
+    make_board(
+        tmp_path / "kanban.db",
+        tasks=[
+            {"id": "t_tr1", "status": "done", "created_at": NOW - 1000},
+            {"id": "t_tr2", "status": "done", "created_at": NOW - 900},
+            {"id": "t_tr3", "status": "done", "created_at": NOW - 800},
+        ],
+        runs=[
+            {"task_id": "t_tr1", "outcome": "completed", "started_at": NOW - 900},
+            {"task_id": "t_tr2", "outcome": "completed", "started_at": NOW - 800},
+            {"task_id": "t_tr3", "outcome": "completed", "started_at": NOW - 700},
+        ],
+    )
+    stats = client.get("/stats").json()
+    totals = stats["totals"]
+
+    assert stats["boards"][0]["truncated"] is True
+    assert totals["tasks_total"] == 2  # в срез вошли первые два дела по created_at
+    assert totals["waiting_sec"] == {"p50": 100, "p90": 100, "p99": 100, "count": 2, "max": 100}
+    assert len(stats["warnings"]) == 1
+    assert "срез обрезан лимитом" in stats["warnings"][0]
+    assert stats["warnings"][0].startswith("доска default")
+
+
+def test_stats_board_distribution_is_not_averaged_across_boards(client, tmp_path):
+    # Перцентили доски считаются по её собственной выборке — не подмешивая итог.
+    make_board(
+        tmp_path / "kanban" / "boards" / "a" / "kanban.db",
+        tasks=[{"id": "t_x1", "status": "done", "created_at": NOW - 100}],
+        runs=[{"task_id": "t_x1", "started_at": NOW - 40}],
+    )
+    make_board(
+        tmp_path / "kanban" / "boards" / "b" / "kanban.db",
+        tasks=[{"id": "t_y1", "status": "done", "created_at": NOW - 100}],
+        runs=[{"task_id": "t_y1", "started_at": NOW - 100}],
+    )
+    stats = client.get("/stats").json()
+    per_board = {board["slug"]: board["waiting_sec"] for board in stats["boards"]}
+
+    assert per_board["a"] == {"p50": 60, "p90": 60, "p99": 60, "count": 1, "max": 60}
+    assert per_board["b"] == {"p50": 0, "p90": 0, "p99": 0, "count": 1, "max": 0}
+    assert stats["totals"]["waiting_sec"] == {"p50": 0, "p90": 60, "p99": 60, "count": 2, "max": 60}

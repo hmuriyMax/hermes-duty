@@ -18,6 +18,7 @@ import {
   filterNow,
   fmtAge,
   fmtClock,
+  humanLine,
   noticeLines,
   shapeAttempts,
   shapeDeal,
@@ -38,6 +39,7 @@ const SEARCH_DEBOUNCE_MS = 240
 const app = document.getElementById('app')
 const stampEl = document.getElementById('stamp')
 const verEl = document.getElementById('ver')
+const humanEl = document.getElementById('human')
 
 function h(tag, props, ...children) {
   const el = document.createElement(tag)
@@ -285,6 +287,15 @@ function viewNow() {
   const parts = []
 
   if (verEl && !verEl.textContent && snap.data.by_state) verEl.textContent = ''
+
+  // «N вопросов + M блокировок» по тому, что сейчас на экране (с фильтрами):
+  // вопрос — на него можно ответить, блокировка — нужен человек без вопроса.
+  if (humanEl) {
+    humanEl.textContent = view.count ? humanLine(view.humanCounts) : ''
+    humanEl.title = view.count
+      ? `ждёт человека: ${humanLine(view.humanCounts)}`
+      : 'никто не ждёт человека'
+  }
 
   if (snap.error) {
     parts.push(
@@ -544,17 +555,6 @@ function viewHealth() {
 
 /* ------------------------------------------------------------- экран «дело» */
 
-async function loadDeal(board, taskId) {
-  const key = `${board}/${taskId}`
-  if (dealSnap.key !== key) {
-    dealSnap.key = key
-    dealSnap.data = null
-    dealSnap.attempts = null
-    dealSnap.error = null
-  }
-  dealSnap.loading = true
-  try {
-    const [detail, attempts] = await Promise.all([
 // «Дело» — полноценный экран: таб открывает последнее открытое дело, а если
 // такого нет — список активных дел, из которого видно, куда идти. Запоминаем в
 // localStorage: переключение табов не должно терять контекст.
@@ -579,8 +579,19 @@ function lastDeal() {
   return board && id ? { board, id } : null
 }
 
-      api(`/deal/${encodeURIComponent(board)}/${encodeURIComponent(taskId)}`),
+async function loadDeal(board, taskId) {
   rememberDeal(board, taskId)
+  const key = `${board}/${taskId}`
+  if (dealSnap.key !== key) {
+    dealSnap.key = key
+    dealSnap.data = null
+    dealSnap.attempts = null
+    dealSnap.error = null
+  }
+  dealSnap.loading = true
+  try {
+    const [detail, attempts] = await Promise.all([
+      api(`/deal/${encodeURIComponent(board)}/${encodeURIComponent(taskId)}`),
       api(`/duty/${encodeURIComponent(board)}/${encodeURIComponent(taskId)}/attempts`),
     ])
     if (dealSnap.key === key) {
@@ -597,17 +608,6 @@ function lastDeal() {
   }
 }
 
-function attemptCard(attempt) {
-  return h(
-    'div',
-    { class: 'att' },
-    h(
-      'div',
-      { class: 'att-h' },
-      h('span', { class: 'mono' }, `#${attempt.runId ?? '—'}`),
-      h('span', { class: 'muted' }, attempt.profile),
-      h('span', { class: 'tnum' }, attempt.durationText),
-      h('span', { class: 'sp' }),
 /**
  * «Дело» без выбранного дела: последнее открытое плюс активные дела списком.
  * Экран обязан быть достижим сам по себе — иначе он существует только как
@@ -635,6 +635,17 @@ function viewDealPicker() {
   return h('div', null, ...parts)
 }
 
+function attemptCard(attempt) {
+  return h(
+    'div',
+    { class: 'att' },
+    h(
+      'div',
+      { class: 'att-h' },
+      h('span', { class: 'mono' }, `#${attempt.runId ?? '—'}`),
+      h('span', { class: 'muted' }, attempt.profile),
+      h('span', { class: 'tnum' }, attempt.durationText),
+      h('span', { class: 'sp' }),
       h('span', { class: `badge t-${attempt.outcomeTone}`, title: `status=${attempt.status}${attempt.outcome ? `, outcome=${attempt.outcome}` : ''}` }, attempt.outcome || attempt.status),
     ),
     h('div', { class: `track t-${attempt.outcomeTone}` }, h('div', { class: 'bar', style: `width:${attempt.barPct}%` })),
@@ -743,6 +754,9 @@ function render() {
   for (const link of document.querySelectorAll('#tabs a')) {
     link.classList.toggle('on', link.dataset.tab === route.name)
   }
+  // Счётчик «вопросов + блокировок» — про срез «сейчас»: на других экранах он
+  // показывал бы число от прошлого снимка.
+  if (humanEl && route.name !== 'now') humanEl.textContent = ''
 }
 
 function schedule() {

@@ -19,6 +19,8 @@ import {
   fmtAge,
   fmtTitle,
   groupDeals,
+  humanCounts,
+  humanLine,
   noticeLines,
   outcomeTone,
   shapeAttempts,
@@ -126,6 +128,48 @@ test('бейдж wait_human не обещает «человека»: вопро
   assert.equal(deal.stateLabel, 'ждёт ответа')
   // чей это вопрос — видно в evidence (origin в ответе бэкенда)
   assert.match(deal.evidence, /origin='card'/)
+})
+
+test('human_kind: «вопрос» и «блокировка» считаются раздельно и одной строкой', () => {
+  // Форма из ответа бэкенда: `waiting.human_kind` доезжает до строки таблицы.
+  const asQuestion = shapeDeal({ waiting: { state: 'wait_human', human_kind: 'question' } })
+  const asStatus = shapeDeal({ waiting: { state: 'wait_human', human_kind: 'status' } })
+  const noHuman = shapeDeal({ waiting: { state: 'working' } })
+  assert.equal(asQuestion.humanKind, 'question')
+  assert.equal(asStatus.humanKind, 'status')
+  assert.equal(noHuman.humanKind, '')
+
+  // Счётчики — по делам, а не по состояниям: два разных «нужен человек».
+  assert.deepEqual(
+    humanCounts([asQuestion, asStatus, asStatus, noHuman]),
+    { question: 1, status: 2 },
+  )
+  assert.deepEqual(humanCounts([]), { question: 0, status: 0 })
+
+  // Строка шапки: русские формы числа, а не «1 вопросов».
+  assert.equal(humanLine({ question: 1, status: 2 }), '1 вопрос + 2 блокировки')
+  assert.equal(humanLine({ question: 21, status: 5 }), '21 вопрос + 5 блокировок')
+  assert.equal(humanLine({ question: 3, status: 11 }), '3 вопроса + 11 блокировок')
+  assert.equal(humanLine({ question: 0, status: 0 }), '0 вопросов + 0 блокировок')
+
+  // Фикстура ответа: у дела в wait_human вопрос есть — модель это видит.
+  assert.deepEqual(model.humanCounts, { question: 1, status: 0 })
+})
+
+test('фильтр пересчитывает счётчики человека по видимым делам', () => {
+  const payload = {
+    deals: [
+      { board: 'one', id: 't_1', waiting: { state: 'wait_human', human_kind: 'question' } },
+      { board: 'two', id: 't_2', waiting: { state: 'wait_human', human_kind: 'status' } },
+    ],
+    by_state: { wait_human: 2 },
+  }
+  const shaped = shapeNow(payload)
+  assert.deepEqual(shaped.humanCounts, { question: 1, status: 1 })
+
+  const onlyTwo = filterNow(shaped, { board: 'two' })
+  assert.deepEqual(onlyTwo.humanCounts, { question: 0, status: 1 })
+  assert.equal(humanLine(onlyTwo.humanCounts), '0 вопросов + 1 блокировка')
 })
 
 test('pid: «не записан» и «состояние неизвестно» — разные факты', () => {

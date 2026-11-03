@@ -19,6 +19,7 @@ const read = (path) => readFileSync(new URL(path, root), 'utf8')
 const html = read('dashboard/web/index.html')
 const app = read('dashboard/web/app.js')
 const api = read('dashboard/plugin_api.py')
+const pluginSource = read('desktop/plugin.js')
 
 test('веб-сборка на месте: html, модуль и стили', () => {
   for (const file of ['dashboard/web/index.html', 'dashboard/web/app.js', 'dashboard/web/styles.css']) {
@@ -49,16 +50,29 @@ test('четыре экрана маршрутизируются', () => {
   }
 })
 
-test('бэкенд монтирует страницу и отдаёт общий шейпер', () => {
 test('«Дело» без выбранного дела показывает выбор, а не пустоту', () => {
   assert.match(app, /route\.board \? viewDeal\(route\.board, route\.id\) : viewDealPicker\(\)/)
   assert.match(app, /function viewDealPicker\(\)/)
   assert.match(app, /localStorage\.setItem\(LAST_DEAL/)
 })
 
+test('бэкенд монтирует страницу и отдаёт общий шейпер', () => {
   assert.ok(api.includes('"/web/hermes-duty"'), 'нет роута /web/hermes-duty')
   assert.ok(api.includes('"/web/hermes-duty/model.js"'), 'нет роута шейпера')
   assert.ok(api.includes('"/web/hermes-duty/{path:path}"'), 'нет статики')
+})
+
+test('«N вопросов + M блокировок»: счётчик шапки берётся из шейпера, а не из своей копии', () => {
+  const modelSource = read('desktop/model.js')
+  // веб-шапка: пустой span, который заполняет app.js той же функцией шейпера
+  assert.match(html, /id="human"/)
+  assert.match(app, /humanLine\(view\.humanCounts\)/)
+  // десктоп: та же строка в шапке плагина (шейпер вшит в plugin.js дословно)
+  assert.match(pluginSource, /humanLine\(view\.humanCounts\)/)
+  // таблица форм числа и сама строка живут в одном месте — в шейпере
+  assert.match(modelSource, /function plural\(/)
+  assert.match(modelSource, /function humanLine\(/)
+  assert.ok(!/function plural\(/.test(app), 'в app.js появилась своя таблица форм числа')
 })
 
 test('порт и хост backend не захардкожены в веб-сборке', () => {

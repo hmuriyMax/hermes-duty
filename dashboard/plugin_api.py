@@ -6,10 +6,15 @@
 плагину; чужие БД (`kanban.db`, `state.db`, `pool.db`) по-прежнему открываются
 только `?mode=ro`, и срез в них ничего не пишет.
 
-Единственное место, где плагин пишет, — свой журнал, и только по явному
-требованию: `POST /ingest` или `GET /now?ingest=1`. Проход ingest читает kanban
-на чтение, сравнивает с журналом и дописывает недостающие события; повторный
-проход — no-op. Без этого флага ни один роут не создаёт и не меняет файлов.
+Единственное место, где плагин пишет в свой журнал, — проход ingest, и только по
+явному требованию: `POST /ingest` или `GET /now?ingest=1`. Проход ingest читает
+kanban на чтение, сравнивает с журналом и дописывает недостающие события;
+повторный проход — no-op. Без этого флага ни один читающий роут не создаёт и не
+меняет файлов.
+
+Вопросы человеку идут одним каналом — `dashboard/ask.py`: `POST /ask/{board}/{task_id}`
+пишет вопрос в пул `messaging/pool.db` (`origin='duty'`, `kind='decision'`) и факт
+`question_asked` в журнал. Остальной код пул только читает (`mode=ro`).
 
 Маршруты монтируются как `/api/plugins/hermes-duty/<...>`.
 
@@ -44,7 +49,8 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Body, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 
 # `dashboard/journal.py` рядом с этим файлом. Плагин грузит `plugin_api.py` как
@@ -52,6 +58,8 @@ from fastapi.routing import APIRoute
 # относительный импорт невозможен: соседний файл берём по пути и кладём в
 # `sys.modules` под стабильным именем — второй загрузки в процессе не будет.
 JOURNAL_MODULE_NAME = "hermes_duty_journal"
+# `dashboard/ask.py` — единственный канал вопросов: пишет в пул и в журнал.
+ASK_MODULE_NAME = "hermes_duty_ask"
 
 
 def _load_journal() -> Any:
@@ -70,6 +78,24 @@ def _load_journal() -> Any:
 
 
 journal = _load_journal()
+
+
+def _load_ask() -> Any:
+    """Загрузить `dashboard/ask.py` — единственный канал вопросов (`ask()`)."""
+    loaded = sys.modules.get(ASK_MODULE_NAME)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / "ask.py"
+    spec = importlib.util.spec_from_file_location(ASK_MODULE_NAME, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise ImportError(f"ask module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[ASK_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+ask = _load_ask()
 
 
 # Один набор заголовков на все ответы: и 200, и ошибки. Кэш промежуточного
@@ -834,6 +860,12 @@ def _journal_context(
         if ingest:
             report = journal.ingest(conn, home, boards)
             errors.extend(report.get("errors") or [])
+            # В том же проходе журнал узнаёт ответы пула: вопрос, на который уже
+            # ответили, обязан перестать быть живым фактом ожидания.
+            answers = ask.sync_answers(conn, home)
+            for error in answers.get("errors") or []:
+                if error not in errors:
+                    errors.append(error)
         by_deal: dict[str, list[dict[str, Any]]] = {}
         for event in journal.read_events(conn):
             by_deal.setdefault(str(event["deal_id"]), []).append(event)
@@ -1464,14 +1496,17 @@ def now(board: Optional[str] = None, state: Optional[str] = None, ingest: bool =
 def ingest_now() -> dict[str, Any]:
     """Проход ingest по требованию: дописать в свой журнал недостающие события.
 
-    Единственный роут, который пишет, и пишет он только в `duty/duty.db`.
-    Источники (`kanban.db`, `state.db`, `pool.db`) открываются `mode=ro` —
-    инвариант «в kanban не пишем» проверяется тестом по `mtime`.
+    Единственный роут (вместе с `POST /ask`), который пишет, и пишет он только в
+    `duty/duty.db`. Источники (`kanban.db`, `state.db`, `pool.db`) открываются
+    `mode=ro` — инвариант «в kanban не пишем» проверяется тестом по `mtime`.
 
     Повторный вызов — no-op: `appended: 0` (`INSERT OR IGNORE` по
     `idempotency_key`). Ответ — отчёт прохода: сколько строк добавлено, по каким
     доскам, что не прочиталось (`errors[]`). Тот же проход доступен как
     `GET /now?ingest=1`.
+
+    Там же дочитываются ответы пула (`ask.sync_answers`, блок `answers`):
+    вопрос, на который уже ответили, перестаёт быть живым фактом ожидания.
     """
     home = _hermes_home()
     try:
@@ -1483,9 +1518,97 @@ def ingest_now() -> dict[str, Any]:
             detail=f"journal unreadable: {type(exc).__name__}: {exc}",
         ) from exc
     try:
-        return journal.ingest(conn, home, _discover_boards(home))
+        report = journal.ingest(conn, home, _discover_boards(home))
+        report["answers"] = ask.sync_answers(conn, home)
+        return report
     finally:
         conn.close()
+
+
+@router.post("/ask/{board}/{task_id}")
+def ask_deal(board: str, task_id: str, payload: dict[str, Any] = Body(...)) -> Any:
+    """Явный канал вопроса по делу: пул `messaging/pool.db` плюс событие журнала.
+
+    Кто и когда зовёт: человек или координатор (из UI/CLI), когда дело стоит в
+    `blocked`/`needs_input` **без** живого вопроса — тогда `/now` честно говорит
+    `waiting.human_kind="status"`, а этот роут превращает «нужен человек» в
+    конкретный вопрос со вариантами ответа. Автоматически ingest вопросов не
+    создаёт: пул решений не должен наполняться проходами по доске.
+
+    Тело: `{"text": "...", "text_full": "...", "options": ["..."], "critical": true}`
+    (`text_full`, `options` и `critical` необязательны; `critical` по умолчанию
+    решается по журналу — дело ждёт человека дольше `ASK_CRITICAL_SEC`).
+
+    Ответ: `{"question_id": N, "deduped": bool, "errors": []}`. Живой вопрос по
+    делу возвращается как есть (`deduped: true`), второй строки в пуле нет.
+    Сбой пула — 503 с `errors[]`, где назван пул и дело: событие в журнал при
+    этом не пишется (`question_asked` только после успешной вставки).
+    """
+    home = _hermes_home()
+    entry = _board_entry(home, board)
+    rows, err = _query_checked(Path(entry["path"]), "SELECT id FROM tasks WHERE id = ?", (task_id,))
+    if err:
+        raise HTTPException(
+            status_code=503, headers=NO_STORE_HEADERS, detail=f"board '{board}' unreadable: {err}"
+        )
+    if not rows:
+        raise HTTPException(
+            status_code=404, headers=NO_STORE_HEADERS, detail=f"task '{task_id}' not found on board '{board}'"
+        )
+
+    text = " ".join(str(payload.get("text") or "").split())
+    if not text:
+        raise HTTPException(
+            status_code=400, headers=NO_STORE_HEADERS, detail="ask: поле 'text' обязательно"
+        )
+    options = payload.get("options")
+    if options is not None and (
+        not isinstance(options, list) or not all(isinstance(option, str) for option in options)
+    ):
+        raise HTTPException(
+            status_code=400,
+            headers=NO_STORE_HEADERS,
+            detail="ask: 'options' — список простых строк (не объектов)",
+        )
+    critical = payload.get("critical")
+    if critical is not None and not isinstance(critical, bool):
+        raise HTTPException(
+            status_code=400, headers=NO_STORE_HEADERS, detail="ask: 'critical' — true/false"
+        )
+
+    deal = {"id": task_id, "board": board, "home": home}
+    try:
+        conn = journal.open_journal(home)
+    except Exception as exc:  # noqa: BLE001 - свой журнал не открылся
+        raise HTTPException(
+            status_code=503,
+            headers=NO_STORE_HEADERS,
+            detail=f"journal unreadable: {type(exc).__name__}: {exc}",
+        ) from exc
+    try:
+        before = ask.find_live(home, task_id)
+        question_id = ask.ask(
+            conn,
+            deal,
+            text,
+            payload.get("text_full"),
+            options=options,
+            critical=critical,
+        )
+    except ask.AskError as exc:
+        return JSONResponse(
+            status_code=503,
+            headers=NO_STORE_HEADERS,
+            content={
+                "question_id": None,
+                "deduped": False,
+                "errors": [{"board": ask.QUESTION_SOURCE, "reason": f"ask {task_id}: {exc}"}],
+            },
+        )
+    finally:
+        conn.close()
+    deduped = before is not None and int(before["id"]) == question_id
+    return {"question_id": question_id, "deduped": deduped, "errors": []}
 
 
 @router.get("/duty/{board}/{task_id}/attempts")

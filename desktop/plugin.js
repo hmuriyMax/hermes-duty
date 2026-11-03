@@ -115,6 +115,45 @@ function stateMeta(state) {
   return STATE_META[key] || { label: key || '—', tone: 'gray' }
 }
 
+/** Русская форма числа: `1 вопрос`, `2 вопроса`, `5 вопросов`. */
+function plural(n, one, few, many) {
+  const tail = Math.abs(Number(n) || 0) % 100
+  const last = tail % 10
+  if (tail > 10 && tail < 20) return many
+  if (last === 1) return one
+  if (last >= 2 && last <= 4) return few
+  return many
+}
+
+/**
+ * Сколько дел ждёт человека и в каком виде — по `waiting.human_kind` дел.
+ *
+ * Это два разных «нужен человек»: `question` — есть живой вопрос, на который
+ * можно ответить, `status` — вопроса нет, решение принимается по статусу
+ * (блок, разбор, ревью, мердж). Считать их одним числом значит обещать вопрос,
+ * которого нет, поэтому UI показывает «N вопросов + M блокировок».
+ */
+function humanCounts(deals) {
+  const counts = { question: 0, status: 0 }
+  for (const deal of deals || []) {
+    const kind = deal && deal.humanKind
+    if (kind === 'question' || kind === 'status') counts[kind] += 1
+  }
+  return counts
+}
+
+/** Строка «N вопросов + M блокировок» для шапки экрана «Сейчас». */
+function humanLine(counts) {
+  const questions = Number(counts && counts.question) || 0
+  const statuses = Number(counts && counts.status) || 0
+  return `${questions} ${plural(questions, 'вопрос', 'вопроса', 'вопросов')} + ${statuses} ${plural(
+    statuses,
+    'блокировка',
+    'блокировки',
+    'блокировок',
+  )}`
+}
+
 /** Возраст/длительность в человекочитаемом виде: `45 с`, `12 мин`, `3 ч`, `2 д`. */
 function fmtAge(sec) {
   if (sec === null || sec === undefined || sec === '') return '—'
@@ -178,6 +217,10 @@ function shapeDeal(deal) {
     stateLabel: meta.label,
     tone: meta.tone,
     evidence: String(waiting.evidence || ''),
+    // `human_kind` бэкенда: `question` — есть живой вопрос, `status` — человек
+    // нужен, но вопроса нет (`waiting.human_kind`, контракт docs/JOURNAL.md).
+    // Пустое значение — состояние не про ожидание человека.
+    humanKind: String(waiting.human_kind || ''),
     attemptAge,
     attemptAgeText: fmtAge(attemptAge),
     attemptNote,
@@ -276,6 +319,7 @@ function shapeNow(payload) {
     boardsRead: boards.filter((board) => board.read).length,
     count: deals.length,
     byState,
+    humanCounts: humanCounts(deals),
     stateOrder,
   }
 }
@@ -294,7 +338,7 @@ function filterNow(model, filter) {
   )
   const byState = {}
   for (const deal of deals) byState[deal.state] = (byState[deal.state] || 0) + 1
-  return { ...model, deals, groups: groupDeals(deals), count: deals.length, byState }
+  return { ...model, deals, groups: groupDeals(deals), count: deals.length, byState, humanCounts: humanCounts(deals) }
 }
 
 /** Тон исхода попытки: «падение» — по набору бэкенда, дальше успех/отложено. */
@@ -1084,6 +1128,7 @@ function DutyPage() {
   // Клик по делу открывает его собственным экраном: у дела есть спецификация и
   // таймлайн попыток, и в узкую панель они не помещаются.
   const pick = (deal) => {
+    lastDeal = deal
     setSel(deal)
     setScreen('deal')
   }
@@ -1126,10 +1171,19 @@ function DutyPage() {
       ),
     ),
     model ? h('span', { className: 'duty-muted duty-num' }, `сейчас: ${view.count}`) : null,
+    model && view
+      ? h(
+          'span',
+          {
+            className: 'duty-muted duty-num',
+            title: 'ждёт человека: N вопросов (есть живой вопрос) + M блокировок (вопроса нет)',
+          },
+          humanLine(view.humanCounts),
+        )
+      : null,
     model ? h('span', { className: 'duty-muted' }, `· досок ${model.boardsRead}/${model.boardsTotal}`) : null,
     h('span', { className: 'duty-spacer' }),
     snap.loading && !model
-    lastDeal = deal
       ? h('span', { className: 'duty-muted' }, 'загрузка…')
       : h('span', { className: 'duty-muted duty-num' }, updatedAgo === null ? 'ещё не обновлялось' : `обновлено ${updatedAgo} с назад`),
     h(
@@ -1260,6 +1314,17 @@ function DutyPage() {
         setScreen('now')
       },
     })
+  } else if (screen === 'deal') {
+    // Дело ещё не выбрано: показываем активные дела — экран обязан быть
+    // самостоятельным, а не только следствием клика по строке.
+    content = model
+      ? h(
+          'div',
+          { className: 'duty-scroll' },
+          h('div', { className: 'duty-why-meta' }, 'выбери дело из активных'),
+          ...view.groups.map((group) => h(DealGroup, { key: `pick-${group.state}`, group, selectedKey, onPick: pick })),
+        )
+      : h('div', { className: 'duty-scroll' }, h('div', { className: 'duty-skel-row' }, ...Array.from({ length: 4 }, (_, i) => h('div', { className: 'duty-skel', key: `ds-${i}`, style: { width: `${92 - i * 9}%` } })))),
   } else if (screen === 'why') {
     content = model
       ? h(WhyScreen, { model, stale, onOpen: pick })
@@ -1314,16 +1379,5 @@ export default {
       order: 61,
       data: { label: 'Дела', path: '/duty', codicon: 'pulse' },
     })
-  } else if (screen === 'deal') {
-    // Дело ещё не выбрано: показываем активные дела — экран обязан быть
-    // самостоятельным, а не только следствием клика по строке.
-    content = model
-      ? h(
-          'div',
-          { className: 'duty-scroll' },
-          h('div', { className: 'duty-why-meta' }, 'выбери дело из активных'),
-          ...view.groups.map((group) => h(DealGroup, { key: `pick-${group.state}`, group, selectedKey, onPick: pick })),
-        )
-      : h('div', { className: 'duty-scroll' }, h('div', { className: 'duty-skel-row' }, ...Array.from({ length: 4 }, (_, i) => h('div', { className: 'duty-skel', key: `ds-${i}`, style: { width: `${92 - i * 9}%` } })))),
   },
 }

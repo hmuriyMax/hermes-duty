@@ -93,6 +93,19 @@ print(client.get("/api/plugins/hermes-duty/health").json())
 
 # Проход ingest в свой журнал: единственное, что плагин пишет (только duty/duty.db).
 print(client.post("/api/plugins/hermes-duty/ingest").json()["appended"])   # 16, потом 0
+# в том же ответе — сколько ответов пула доехало до журнала:
+print(client.post("/api/plugins/hermes-duty/ingest").json()["answers"])    # {'appended': 0, 'errors': []}
+
+# Вопрос по делу — единственный канал вопросов (пул messaging/pool.db, origin='duty').
+# Пишется по явному запросу: дело в blocked/needs_input без вопроса, а человек/координатор
+# решает, что спросить. Повторный вызов вернёт тот же question_id (deduped).
+asked = client.post(
+    "/api/plugins/hermes-duty/ask/stack/t_0001",
+    json={"text": "Даёшь ок на выкатку?", "text_full": "### Контекст\n\n…", "options": ["ок", "нет"]},
+).json()
+print(asked)                     # {'question_id': 501, 'deduped': False, 'errors': []}
+print(client.post("/api/plugins/hermes-duty/ask/stack/t_0001", json={"text": "?"}).json())
+# {'question_id': 501, 'deduped': True, 'errors': []}
 
 now = client.get("/api/plugins/hermes-duty/now").json()
 print(now["count"], now["by_state"], now["errors"], len(now["boards"]))
@@ -127,7 +140,9 @@ if now["deals"]:
 | `journal: empty — состояние из kanban` в начале `waiting.evidence` | дела нет в журнале (или в журнале нет живого факта): состояние посчитано по kanban, и это сказано словами; `POST /ingest` подберёт дело, и пометка уйдёт |
 | `journal.drift.empty_journal` больше нуля в `/health` | столько активных дел журнал ещё не видел; после `POST /ingest` число падает до нуля. Пока оно больше нуля, состояние этих дел — из kanban |
 | `journal.note` в `/health` | свой журнал не открылся — это не «ноль событий», причина названа |
-| `waiting.human_kind` | `question` — ждёт ответа на вопрос пула; `status` — ждёт решения по статусу (блок, разбор, ревью, мердж) |
+| `waiting.human_kind` | `question` — ждёт ответа на вопрос пула; `status` — ждёт решения по статусу (блок, разбор, ревью, мердж), вопроса нет. В шапке «Сейчас» это двумя числами: `N вопросов + M блокировок` |
+| `503` на `POST /ask/{board}/{task_id}` с `errors[].board = "messaging/pool.db"` | вопрос не создан: пул отсутствует, не читается или только на чтение. Событие `question_asked` при этом не пишется — в журнале нет следа вопроса, которого нет в пуле |
+| `deduped: true` в ответе `/ask` | живой вопрос по делу уже был — вернули его `question_id`, второй строки в пуле нет |
 | `boards[].warnings[]` строкой `дело t_…: в журнале completed, а kanban status=…` | журнал говорит, что дело закрыто (правило 2 fold), и оно не попало в срез — расхождение названо, а не скрыто |
 | 400 на `/now?state=…` | состояние не из таксономии (`wait_human`, `capability`, `dead_lease`, `crashed`, `working`, `no_signal`, `wait_slot`, `wait_gate`) |
 | 404 на `/now?board=…` | такой доски нет |

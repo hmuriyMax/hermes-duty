@@ -43,7 +43,8 @@
       },
       "waiting": {
         "state": "wait_human",
-        "evidence": "в пуле вопрос #421 status='sent' origin='card'; ещё: working: ран 41 running, pid 50123 жив, heartbeat 45с назад"
+        "evidence": "в пуле вопрос #421 status='sent' origin='card'; ещё: working: ран 41 running, pid 50123 жив, heartbeat 45с назад",
+        "human_kind": "question"
       }
     },
     {

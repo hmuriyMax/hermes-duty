@@ -82,6 +82,8 @@
 | `GET /duty/{board}/{task_id}/attempts` | таймлайн попыток дела | 404 — нет доски или дела; 503 — доска/`task_runs` не читаются |
 | `GET /deal/{board}/{task_id}` | одно дело: спецификация + факты `/now` | 404 — нет доски или дела; 503 — доска не читается |
 | `GET /stats` | здоровье по доскам и итогом | — (деградация в `errors[]`) |
+| `POST /ingest` | проход в свой журнал + `answers` (ответы пула) | — (деградация в `errors[]`) |
+| `POST /ask/{board}/{task_id}` | вопрос по делу в пул: `{question_id, deduped, errors[]}` | 404 — нет доски или дела; 400 — пустой `text`/кривые `options`; 503 — пул или журнал недоступны |
 
 `?state=` фильтрует только список `deals`: `by_state` и `boards[]` считаются по
 полному срезу до фильтра (`dashboard/plugin_api.py:844-848`).
@@ -109,7 +111,7 @@
                      "age_sec": 41, "summary": "pid 39899 …" },
     "last_run": { "run_id": 12, "status": "running", "outcome": null,
                   "started_at": 1793646565, "ended_at": null },   // null, если ранов нет
-    "waiting": { "state": "working", "evidence": "ран 12 running, pid 39899 жив, heartbeat 12с назад" }
+    "waiting": { "state": "working", "evidence": "ран 12 running, pid 39899 жив, heartbeat 12с назад", "human_kind": null }
   }],
   "by_state": { "wait_human": 0, "capability": 0, "dead_lease": 0, "crashed": 0,
                 "working": 1, "no_signal": 0, "wait_slot": 3, "wait_gate": 8 },  // порядок = WAITING_PRIORITY

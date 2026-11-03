@@ -56,8 +56,18 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 | `blocked` | `status=blocked` | `block_kind`, `reason` |
 | `unblocked` | был `blocked`, стал иной статус | `previous_kind` |
 | `completed` | `status=done` (или `archived` как отдельный факт: переносится тем же `completed` со `status="archived"`) | `status` |
+| `review_requested` | своё дело сдано в ревью (`duty complete d_… --review`) | `reviewer`, `summary` |
+| `changes_requested` | ревьюер вернул дело на доработку | `reason`, `reviewer` |
+| `collected` | ревью пройдено: вердикт снял ожидание | `summary` |
+| `commented` | человек оставил комментарий в деле | `author`, `len` |
+| `attached` | в деле появились метаданные вложения | `filename`, `size_bytes`, `content_type` |
 | `question_asked` | `ask()` создал вопрос в пуле | `question_id`, `session_key`, `critical`, `timeout` |
 | `question_answered` | ответ найден в пуле — или у вопроса вышел срок (`answered_via='expired'`): закрытие по TTL снимает факт так же, как ответ | `question_id`, `answer_len`, `answered_via` |
+
+Пять видов (`review_requested`, `changes_requested`, `collected`, `commented`,
+`attached`) заведены вместе с W5 — владением своим делом (`docs/OWNERSHIP.md`).
+Их пишут только мутации своих дел; ingest их не создаёт: у kanban-карточки нет
+вердикта ревьюера, который duty считал бы своим фактом.
 
 Набор закрыт: новый `kind` добавляется вместе с правилом fold и тестом, а не «по пути».
 Закрытость держится кодом, а не дисциплиной: `append()` отвергает `kind` вне набора
@@ -71,7 +81,10 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
   источника (`task_events.id`, `task_runs.id`, либо хеш кортежа для колонок:
   `sha1(claim_lock|claim_expires)`), а не время;
 - ask: `ask:<question_id>:<kind>`;
-- cli: `cli:<deal_id>:<kind>:<sha1(аргументы)>`.
+- cli: `cli:<deal_id>:<kind>:<sha1(аргументы)>`;
+- api: `api:<deal_id>:<kind>:<sha1(тело запроса)>` — мутации своих дел по HTTP
+  (`docs/OWNERSHIP.md`). Один и тот же вызов второй раз даёт 0 новых строк, чем бы
+  он ни пришёл; что CLI, что API пишут в один модуль (`dashboard/deals.py`).
 
 Повторный проход ingest обязан быть no-op: `INSERT OR IGNORE` по уникальному индексу.
 Тест: два прогона подряд → число строк не меняется, `fold` даёт тот же результат.
@@ -102,6 +115,27 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
    Закрытие родителей видно в их собственных событиях, а не в этих, поэтому факт
    назван снимком («родители на момент created»), а не сегодняшним состоянием графа.
    Правило 8 — расширение таксономии `docs/DESIGN.md`, не отмена правил 1–7.
+9. `review_requested` без последующего `collected`/`changes_requested` →
+   `wait_human` с `human_kind="status"`: сдано в ревью, вердикта нет. Это тот же
+   смысл, которым статус `review` уже назван в `WAITING_FALLBACK` («ждёт вердикта
+   ревьюера»), — человеку нужно решение, а не ответ на вопрос. `reviewer` из
+   payload попадает в `evidence`.
+10. `changes_requested` без последующей сдачи → `wait_slot`: дело возвращено на
+    доработку, и ждёт оно исполнителя, а не решения — решение человек уже принял.
+    Причина берётся из payload и попадает в `evidence`. Состояние `wait_human`
+    здесь было бы ложью в другую сторону: оно перебивает `claim` и попытку по
+    приоритету и висело бы на деле, которое уже в работе. Взятое после возврата
+    дело (`claimed` позже `changes_requested`) этот факт снимает: причина возврата
+    остаётся в таймлайне, но «ждёт исполнителя» про такое дело уже неправда.
+    Ожидание снимается новой сдачей (`review_requested`), `collected`, `completed`
+    или `claimed`, а не временем: необработанный возврат обязан быть виден.
+11. `commented` и `attached` **не создают состояния** и в `WAITING_PRIORITY` не
+    участвуют: «оставил комментарий» — не ожидание. Эти факты живут в таймлайне
+    дела, и вторая правда о состоянии из них не выводится. Правило названо явно,
+    чтобы отсутствие этих видов в fold не читалось как забытая ветка.
+12. `collected` состояние не поднимает: вердикт снял ожидание ревью, и дело
+    возвращается к тому, что говорит его `status` (своё дело — `deals.status`).
+
 
 ## Ingest
 
@@ -160,7 +194,10 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
   старше `timeout`) в этот статус, не заполняя ни `answered_at`, ни `answered_via`.
   Факт закрытия пишется как `question_answered` с `answered_via="expired"` и
   `answer_len=0`, а `ts` = момент, когда закрытие увидела duty (момент истечения в
-  пуле не записан). Если пул причину назвал сам (например `answered_via="card"` —
+  пуле не записан). `answer_len=0` для `expired` — намеренно: `answer` у протухшей
+  строки пул не заполняет, а если что-то в этой колонке и осталось, это не ответ по
+  вопросу, и выдавать длину этого текста за длину ответа значило бы соврать. Если пул
+  причину назвал сам (например `answered_via="card"` —
   условие алерта исчезло), в факте остаётся его причина: подменять её на «истёк
   срок» значило бы соврать. Без этого факта неотвеченный вопрос с истёкшим TTL
   оставался бы в журнале открытым навсегда — второй триггер того же «вечно ждёт

@@ -104,12 +104,16 @@ POST   /deals/{id}/comment       {author, body}
 POST   /deals/{id}/block         {kind, reason}
 POST   /deals/{id}/unblock       {}
 POST   /deals/{id}/claim         {owner}
-POST   /deals/{id}/complete      {summary}
+POST   /deals/{id}/complete      {summary, review?, reviewer?}
+POST   /deals/{id}/review        {reviewer?, summary?}
+POST   /deals/{id}/changes       {reason, reviewer?}
 POST   /deals/{id}/attach        multipart: file  → {attachment}
 ```
 
 Ответы — та же форма, что у `/deal/{board}/{id}` (дело + факты + таймлайн), чтобы
-экран не знал, откуда дело: своё или наблюдаемое.
+экран не знал, откуда дело: своё или наблюдаемое. К ней добавлен блок
+`mutation: {events, idempotent}`: «сделано» и «уже было» — разные факты, и клиенту
+не нужно угадывать их по коду возврата.
 
 Правила:
 
@@ -117,6 +121,14 @@ POST   /deals/{id}/attach        multipart: file  → {attachment}
   (это то же правило гейта, что в kanban, но считаем сами);
 - `PATCH` не даёт менять `origin` и переписывать `id`; смена `status` — только через
   команды, кроме `PATCH {status: archived}`;
+- `complete` без `review` закрывает дело; `complete {review: true}` и `/review` —
+  сдача в ревью; `/changes` возвращает на доработку с обязательной причиной;
+- `archived` — конечное состояние: команды жизни (`claim`/`block`/`complete`/
+  `review`/`changes`/`unblock`) по архивному делу отвечают ошибкой входа, а не
+  воскрешают его молча;
+- повтор того же вызова не плодит событий (`mutation.events: 0`,
+  `mutation.idempotent: true`), но повтор отличается от «делать нечего»: последнее —
+  ошибка входа с причиной;
 - ошибки — как в 0.0.2: `errors[]` с причиной, никаких 500 на битом входе.
 
 ## CLI
@@ -126,8 +138,14 @@ duty create --board B --title "…" [--body-file F] [--assignee ROLE] [--parent 
 duty comment d_… "текст"
 duty block d_… --kind needs_input "причина"
 duty unblock d_… | duty complete d_… --summary "…" | duty claim d_…
-duty attach d_… FILE
+duty review d_… [--reviewer ROLE] | duty changes d_… "причина"
+duty attach d_… FILE | duty archive d_…
 ```
+
+`archive` — это тот же `PATCH {status: archived}`, названный командой: закрытое
+дело, которое убирают с доски, не должно требовать ручного `PATCH`.
+`--json` печатает ответ роута дословно (включая `mutation`), человеческий вывод
+называет дело, статус, ожидание и число записанных событий.
 
 CLI и API ходят в один модуль (как W3): второго набора правил быть не должно.
 

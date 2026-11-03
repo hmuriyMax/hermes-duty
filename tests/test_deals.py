@@ -1,0 +1,864 @@
+"""Владение своим делом: store, мутации, гейт и цикл вопроса (W5).
+
+Проверяется то, чего не видно при чтении кода: каждая мутация пишет строку дела и
+событие журнала **одной** транзакцией, повтор с теми же аргументами не плодит
+событий, `ready` появляется только по закрытым родителям и переход гейта назван
+событием, а не молчанием, и ни одна мутация не трогает `kanban.db`/`state.db`.
+
+Отдельная группа — цикл вопроса своего дела (`d_…`): `session_key` пула
+(`t_d_…`) и id дела должны сходиться в одну сторону и обратно, иначе
+`question_asked` и `question_answered` живут под разными id и дело навсегда
+остаётся «ждёт ответа» (находка координатора 03.11). Рядом — тот же цикл для
+`t_…`: второй путь не должен сломаться от появления своего пространства id.
+
+Фикстуры — свои маленькие `kanban.db`/`pool.db` в `tmp_path` по реальной схеме;
+живые источники не читаются и не пишутся.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import sqlite3
+import sys
+from pathlib import Path
+from typing import Any
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+MODULE_PATH = Path(__file__).resolve().parents[1] / "dashboard" / "plugin_api.py"
+_SPEC = importlib.util.spec_from_file_location("hermes_duty_plugin_api_deals", MODULE_PATH)
+assert _SPEC is not None and _SPEC.loader is not None
+plugin_api = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = plugin_api
+_SPEC.loader.exec_module(plugin_api)
+
+journal = plugin_api.journal
+ask = plugin_api.ask
+deals = plugin_api.deals
+
+NOW = 1_800_000_000
+BOARD = "stack"
+KANBAN_DEAL = "t_0000aa"
+
+KANBAN_SCHEMA = """
+CREATE TABLE tasks (
+    id                   TEXT PRIMARY KEY,
+    title                TEXT NOT NULL,
+    body                 TEXT,
+    assignee             TEXT,
+    status               TEXT NOT NULL,
+    priority             INTEGER DEFAULT 0,
+    created_by           TEXT,
+    created_at           INTEGER NOT NULL,
+    started_at           INTEGER,
+    completed_at         INTEGER,
+    workspace_kind       TEXT NOT NULL DEFAULT 'scratch',
+    workspace_path       TEXT,
+    branch_name          TEXT,
+    project_id           TEXT,
+    claim_lock           TEXT,
+    claim_expires        INTEGER,
+    tenant               TEXT,
+    result               TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    worker_pid           INTEGER,
+    last_failure_error   TEXT,
+    max_runtime_seconds  INTEGER,
+    last_heartbeat_at    INTEGER,
+    current_run_id       INTEGER,
+    block_kind           TEXT,
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    merged_into          TEXT
+);
+CREATE TABLE task_runs (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id             TEXT NOT NULL,
+    profile             TEXT,
+    step_key            TEXT,
+    status              TEXT NOT NULL,
+    claim_lock          TEXT,
+    claim_expires       INTEGER,
+    worker_pid          INTEGER,
+    worker_started_at   INTEGER,
+    max_runtime_seconds INTEGER,
+    last_heartbeat_at   INTEGER,
+    started_at          INTEGER NOT NULL,
+    ended_at            INTEGER,
+    outcome             TEXT,
+    summary             TEXT,
+    metadata            TEXT,
+    error               TEXT
+);
+CREATE TABLE task_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id    TEXT NOT NULL,
+    run_id     INTEGER,
+    kind       TEXT NOT NULL,
+    payload    TEXT,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE task_links (
+    parent_id  TEXT NOT NULL,
+    child_id   TEXT NOT NULL,
+    PRIMARY KEY (parent_id, child_id)
+);
+"""
+
+# Схема пула скопирована с живого `messaging/pool.db` — колонки, которые читает и
+# пишет imessage-gateway (`answered_via` нужен `sync_answers`).
+POOL_SCHEMA = """
+CREATE TABLE questions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_key TEXT NOT NULL,
+  project TEXT,
+  text TEXT NOT NULL,
+  text_full TEXT,
+  origin TEXT,
+  options_json TEXT,
+  status TEXT NOT NULL DEFAULT 'pending'
+      CHECK (status IN ('pending','sent','answered','expired','pickup_gateway')),
+  sender_rowid INTEGER,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  sent_at TEXT,
+  answered_at TEXT,
+  answer TEXT,
+  timeout REAL,
+  critical INTEGER NOT NULL DEFAULT 0,
+  notified_at TEXT,
+  reminder_every REAL NOT NULL DEFAULT 4.0,
+  kind TEXT NOT NULL DEFAULT 'question',
+  link TEXT,
+  answered_via TEXT,
+  external_notified_at TEXT,
+  external_ref TEXT
+);
+"""
+
+
+# ------------------------------------------------------------------ фикстуры
+
+
+@pytest.fixture()
+def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Корень Hermes: доска с одним kanban-делом, пустой пул, пустой `state.db`."""
+    root = tmp_path / "hermes"
+    root.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    board = root / "kanban" / "boards" / BOARD / "kanban.db"
+    board.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(board)
+    conn.executescript(KANBAN_SCHEMA)
+    conn.execute(
+        "INSERT INTO tasks (id, title, body, assignee, status, created_at, block_kind) "
+        "VALUES (?, 'kanban-дело', 'тело', 'implementer', 'blocked', ?, 'needs_input')",
+        (KANBAN_DEAL, NOW - 3600),
+    )
+    conn.commit()
+    conn.close()
+    pool = root / "messaging" / "pool.db"
+    pool.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(pool)
+    conn.executescript(POOL_SCHEMA)
+    conn.commit()
+    conn.close()
+    state_db = root / "profiles" / "implementer" / "state.db"
+    state_db.parent.mkdir(parents=True)
+    sqlite3.connect(state_db).close()
+    return root
+
+
+@pytest.fixture()
+def client(home: Path) -> TestClient:
+    app = FastAPI()
+    app.include_router(plugin_api.router)
+    return TestClient(app)
+
+
+def store(home: Path) -> sqlite3.Connection:
+    """Соединение своего store — открывается мутациями, а не тестом."""
+    conn = deals.open_store(home)
+    assert conn is not None
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def deal_rows(home: Path) -> list[dict[str, Any]]:
+    conn = store(home)
+    try:
+        return [dict(row) for row in conn.execute("SELECT * FROM deals ORDER BY created_at, id")]
+    finally:
+        conn.close()
+
+
+def events(home: Path, deal_id: str | None = None) -> list[dict[str, Any]]:
+    """События журнала в порядке `id` (payload разобран, как его отдаёт модуль)."""
+    conn = store(home)
+    try:
+        return journal.read_events(conn, deal_id)
+    finally:
+        conn.close()
+
+
+def kinds(home: Path, deal_id: str) -> list[str]:
+    return [str(event["kind"]) for event in events(home, deal_id)]
+
+
+def create(client: TestClient, **payload: Any) -> dict[str, Any]:
+    """`POST /deals` со значениями по умолчанию: доска, заголовок, тело."""
+    request = {"board": BOARD, "title": "своё дело", "body": "спецификация"}
+    request.update(payload)
+    response = client.post("/deals", json=request)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def mutate(client: TestClient, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+    """Мутация с проверкой кода 200: отказ должен быть виден отдельным тестом."""
+    response = client.request(method, path, **kwargs)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def now_deals(client: TestClient) -> dict[str, dict[str, Any]]:
+    """`/now` по id дела: один ответ на «что сейчас» для обоих пространств."""
+    return {item["id"]: item for item in client.get("/now").json()["deals"]}
+
+
+def source_stats(home: Path) -> dict[Path, tuple[int, int]]:
+    """mtime и размер источников, которые мутации не имеют права трогать."""
+    paths = [
+        home / "kanban" / "boards" / BOARD / "kanban.db",
+        home / "profiles" / "implementer" / "state.db",
+        home / "messaging" / "pool.db",
+    ]
+    return {path: (path.stat().st_mtime_ns, path.stat().st_size) for path in paths}
+
+
+# --------------------------------------------------------- создание и store
+
+
+def test_create_writes_deal_row_and_created_event(home: Path, client: TestClient) -> None:
+    """`POST /deals`: строка store и `created` в журнале, id своего пространства."""
+    body = create(client)
+
+    assert body["id"].startswith("d_")
+    assert body["status"] == "ready"
+    assert body["title"] == "своё дело"
+    assert body["mutation"] == {"events": 1, "idempotent": False}
+    assert body["errors"] == []
+
+    rows = deal_rows(home)
+    assert len(rows) == 1
+    assert rows[0]["id"] == body["id"]
+    assert rows[0]["origin"] == "duty"
+    assert rows[0]["body"] == "спецификация"
+
+    assert kinds(home, body["id"]) == ["created"]
+    created = events(home, body["id"])[0]
+    assert created["board"] == BOARD
+    assert created["source"] == "api"
+    assert created["payload"]["parents"] == []
+    assert created["payload"]["title"] == "своё дело"
+
+
+def test_create_with_unknown_parent_is_error_not_500(home: Path, client: TestClient) -> None:
+    """Несуществующий родитель — `errors[]` и 400, а не падение роута."""
+    response = client.post("/deals", json={"board": BOARD, "title": "ребёнок", "parents": ["d_deadbeef"]})
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["deal"] is None
+    assert body["errors"], body
+    assert "d_deadbeef" in body["errors"][0]["reason"]
+    assert deal_rows(home) == []
+
+
+def test_create_on_unknown_board_is_error(home: Path, client: TestClient) -> None:
+    """Доска, которой нет ни в kanban, ни в store, не заводится молча."""
+    response = client.post("/deals", json={"board": "no-such-board", "title": "дело"})
+
+    assert response.status_code == 400
+    assert "no-such-board" in response.json()["errors"][0]["reason"]
+    assert deal_rows(home) == []
+
+
+def test_create_requires_title_and_board(client: TestClient) -> None:
+    """Пустой title или board — ошибка входа, а не дело без имени."""
+    for payload in ({"board": BOARD, "title": "  "}, {"board": "", "title": "дело"}):
+        response = client.post("/deals", json=payload)
+        assert response.status_code == 400
+        assert response.json()["errors"], payload
+
+
+def test_no_kanban_origin_rows_ever(home: Path, client: TestClient) -> None:
+    """`origin='kanban'` в `deals` не появляется ни в одном сценарии (инвариант 4)."""
+    parent = create(client, title="родитель")
+    child = create(client, title="ребёнок", parents=[parent["id"]])
+    mutate(client, "POST", f"/deals/{child['id']}/block", json={"kind": "needs_input", "reason": "нет ТЗ"})
+    mutate(client, "POST", f"/deals/{child['id']}/unblock", json={})
+    mutate(client, "POST", f"/deals/{child['id']}/claim", json={"owner": "implementer"})
+    mutate(client, "POST", f"/deals/{child['id']}/complete", json={"summary": "ok"})
+    client.get("/now")
+    client.get(f"/deal/{BOARD}/{child['id']}")
+
+    conn = store(home)
+    try:
+        origins = {str(row[0]) for row in conn.execute("SELECT DISTINCT origin FROM deals")}
+    finally:
+        conn.close()
+    assert origins == {"duty"}
+    assert deal_rows(home), "строки должны быть — проверяется их origin"
+
+
+# ------------------------------------------------ одна транзакция на мутацию
+
+
+def test_event_write_failure_rolls_back_deal_row(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Сбой записи события откатывает всё дело, а не половину (инвариант 2).
+
+    Подменяется `journal.append_in_tx` — единственная точка, через которую
+    мутация пишет журнал: если событие не легло, строки дела быть не должно.
+    """
+    app = FastAPI()
+    app.include_router(plugin_api.router)
+
+    def boom(*args: Any, **kwargs: Any) -> int:
+        raise RuntimeError("журнал недоступен")
+
+    monkeypatch.setattr(journal, "append_in_tx", boom)
+    with pytest.raises(RuntimeError, match="журнал недоступен"):
+        TestClient(app).post("/deals", json={"board": BOARD, "title": "не должно остаться"})
+    # store мог быть создан (файл и схема), но строки дела в нём нет
+    assert deal_rows(home) == []
+
+
+def test_event_write_failure_rolls_back_comment(home: Path, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Тот же сбой на комментарии: строка `comments` не остаётся без события."""
+    deal = create(client)
+    mutate(client, "POST", f"/deals/{deal['id']}/comment", json={"author": "max", "body": "до сбоя"})
+
+    def boom(*args: Any, **kwargs: Any) -> int:
+        raise RuntimeError("журнал недоступен")
+
+    monkeypatch.setattr(journal, "append_in_tx", boom)
+    with pytest.raises(RuntimeError, match="журнал недоступен"):
+        mutate(client, "POST", f"/deals/{deal['id']}/comment", json={"author": "max", "body": "после"})
+
+    conn = store(home)
+    try:
+        bodies = [str(row[0]) for row in conn.execute("SELECT body FROM comments ORDER BY id")]
+    finally:
+        conn.close()
+    assert bodies == ["до сбоя"]
+
+
+# ------------------------------------------------------- идемпотентность (3)
+
+
+def test_repeat_comment_adds_no_events(home: Path, client: TestClient) -> None:
+    """Повтор того же комментария: 0 событий, вторая строка не пишется."""
+    deal = create(client)
+    first = mutate(client, "POST", f"/deals/{deal['id']}/comment", json={"author": "max", "body": "проверка"})
+    second = mutate(client, "POST", f"/deals/{deal['id']}/comment", json={"author": "max", "body": "проверка"})
+
+    assert first["mutation"] == {"events": 1, "idempotent": False}
+    assert second["mutation"] == {"events": 0, "idempotent": True}
+    assert kinds(home, deal["id"]) == ["created", "commented"]
+    assert len(second["comments"]) == 1
+
+
+def test_repeat_complete_and_block_add_no_events(home: Path, client: TestClient) -> None:
+    """Повтор `complete`/`block` с теми же аргументами — тот же ответ без событий."""
+    deal = create(client)
+    mutate(client, "POST", f"/deals/{deal['id']}/complete", json={"summary": "ok"})
+    again = mutate(client, "POST", f"/deals/{deal['id']}/complete", json={"summary": "ok"})
+    assert again["mutation"] == {"events": 0, "idempotent": True}
+    assert kinds(home, deal["id"]) == ["created", "completed"]
+
+    other = create(client, title="второе")
+    mutate(client, "POST", f"/deals/{other['id']}/block", json={"kind": "needs_input", "reason": "нет ТЗ"})
+    repeat = mutate(client, "POST", f"/deals/{other['id']}/block", json={"kind": "needs_input", "reason": "нет ТЗ"})
+    assert repeat["mutation"] == {"events": 0, "idempotent": True}
+    assert kinds(home, other["id"]) == ["created", "blocked"]
+
+
+def test_same_arguments_from_different_sources_are_different_facts(home: Path, client: TestClient) -> None:
+    """`cli` и `api` — разные источники: один текст от них это два события."""
+    deal = create(client)
+    conn = store(home)
+    try:
+        deals.add_comment(conn, deal["id"], author="max", body="проверка", source="cli")
+    finally:
+        conn.close()
+
+    assert kinds(home, deal["id"]) == ["created", "commented"]
+    keys = [event["idempotency_key"] for event in events(home, deal["id"])]
+    assert len(set(keys)) == len(keys)
+    assert any(key.startswith("cli:") for key in keys)
+    assert any(key.startswith("api:") for key in keys)
+
+
+def test_repeat_unblock_is_idempotent_and_foreign_unblock_is_error(
+    home: Path, client: TestClient
+) -> None:
+    """Повтор снятия блока — 0 событий; снятие без блока другим автором — ошибка.
+
+    Два случая различаются ответом: «уже снято этим же вызовом» и «снимать нечего»
+    нельзя отдавать одним кодом, иначе скрипт не поймёт, повтор это или ошибка.
+    """
+    deal = create(client)
+    mutate(client, "POST", f"/deals/{deal['id']}/block", json={"kind": "needs_input", "reason": "нет ТЗ"})
+    mutate(client, "POST", f"/deals/{deal['id']}/unblock", json={})
+    again = mutate(client, "POST", f"/deals/{deal['id']}/unblock", json={})
+    assert again["mutation"] == {"events": 0, "idempotent": True}
+    assert kinds(home, deal["id"]) == ["created", "blocked", "unblocked"]
+
+    response = client.post(f"/deals/{deal['id']}/unblock", json={"author": "кто-то"})
+    assert response.status_code == 400
+    assert "не в blocked" in response.json()["errors"][0]["reason"]
+
+
+def test_archived_deal_is_not_reopened_by_commands(home: Path, client: TestClient) -> None:
+    """`archived` — конечное состояние: команды жизни его не воскрешают."""
+    deal = create(client)
+    mutate(client, "PATCH", f"/deals/{deal['id']}", json={"status": "archived"})
+
+    for path, payload in (
+        ("complete", {"summary": "ok"}),
+        ("claim", {"owner": "implementer"}),
+        ("block", {"kind": "needs_input", "reason": "нет ТЗ"}),
+        ("review", {"reviewer": "reviewer"}),
+        ("changes", {"reason": "верни"}),
+    ):
+        response = client.post(f"/deals/{deal['id']}/{path}", json=payload)
+        assert response.status_code == 400, (path, response.text)
+        assert "archived" in response.json()["errors"][0]["reason"]
+
+    assert kinds(home, deal["id"]) == ["created", "completed"]
+    assert deal_rows(home)[0]["status"] == "archived"
+
+
+# ----------------------------------------------------------------- ревью (4)
+
+
+def test_review_then_collect_writes_verdict_and_close(home: Path, client: TestClient) -> None:
+    """Ревью пройдено: `collected` и `completed` — два факта одной транзакции.
+
+    Вердикт и закрытие — разные события: склеив их, потеряли бы, что ревью было.
+    Повтор той же команды не дописывает ни одного из двух.
+    """
+    deal = create(client)
+    review = mutate(
+        client, "POST", f"/deals/{deal['id']}/complete", json={"summary": "на ревью", "review": True}
+    )
+    assert review["status"] == "review"
+    assert review["deal"]["waiting"]["state"] == "wait_human"
+    assert review["deal"]["waiting"]["human_kind"] == "status"
+
+    collected = mutate(client, "POST", f"/deals/{deal['id']}/complete", json={"summary": "принято"})
+    assert collected["status"] == "done"
+    assert collected["mutation"] == {"events": 2, "idempotent": False}
+    assert kinds(home, deal["id"]) == ["created", "review_requested", "collected", "completed"]
+
+    again = mutate(client, "POST", f"/deals/{deal['id']}/complete", json={"summary": "принято"})
+    assert again["mutation"] == {"events": 0, "idempotent": True}
+    assert kinds(home, deal["id"]) == ["created", "review_requested", "collected", "completed"]
+
+
+def test_changes_requested_waits_for_executor_not_human(home: Path, client: TestClient) -> None:
+    """Возврат на доработку — `wait_slot` с причиной, а не «ждёт человека».
+
+    Решение человек уже принял; ждёт дело исполнителя. Проверяется и приоритет:
+    `claim` перебивает этот факт, чего `wait_human` не позволил бы.
+    """
+    deal = create(client)
+    mutate(client, "POST", f"/deals/{deal['id']}/review", json={"reviewer": "reviewer"})
+    mutate(client, "POST", f"/deals/{deal['id']}/changes", json={"reason": "нет тестов"})
+
+    waiting = waiting_of(client, deal["id"])
+    assert waiting["state"] == "wait_slot"
+    assert waiting["human_kind"] is None
+    assert "нет тестов" in waiting["evidence"]
+
+    mutate(client, "POST", f"/deals/{deal['id']}/claim", json={"owner": "implementer"})
+    assert waiting_of(client, deal["id"])["state"] != "wait_slot"
+
+
+# --------------------------------------------------------------- гейт (5)
+def test_child_ready_only_when_parent_done(home: Path, client: TestClient) -> None:
+    """Ребёнок `todo`, пока родитель не закрыт; закрытие — событие `gate_opened`."""
+    parent = create(client, title="родитель")
+    child = create(client, title="ребёнок", parents=[parent["id"]])
+    assert child["status"] == "todo"
+    assert now_deals(client)[child["id"]]["waiting"]["state"] == "wait_gate"
+
+    mutate(client, "POST", f"/deals/{parent['id']}/complete", json={"summary": "ok"})
+
+    assert kinds(home, child["id"]) == ["created", "gate_opened"]
+    opened = events(home, child["id"])[-1]
+    assert opened["payload"] == {"from": "todo", "to": "ready", "parent": parent["id"]}
+    assert now_deals(client)[child["id"]]["status"] == "ready"
+
+
+def test_parent_leaving_done_closes_gate_with_event(home: Path, client: TestClient) -> None:
+    """Возврат родителя на доработку: ребёнок снова ждёт гейт, переход назван событием.
+
+    Родитель уходит из `done` штатным путём (`changes` — вердикт ревьюера), и
+    ребёнок не остаётся молча в `ready`: строка меняется вместе с событием
+    `gate_closed`, а fold говорит `wait_gate` с именем родителя.
+    """
+    parent = create(client, title="родитель")
+    child = create(client, title="ребёнок", parents=[parent["id"]])
+    mutate(client, "POST", f"/deals/{parent['id']}/complete", json={"summary": "ok"})
+    assert now_deals(client)[child["id"]]["status"] == "ready"
+
+    mutate(client, "POST", f"/deals/{parent['id']}/changes", json={"reason": "не принято"})
+
+    assert kinds(home, child["id"]) == ["created", "gate_opened", "gate_closed"]
+    closed = events(home, child["id"])[-1]
+    assert closed["payload"] == {"from": "ready", "to": "todo", "parent": parent["id"]}
+    child_now = now_deals(client)[child["id"]]
+    assert child_now["status"] == "todo"
+    assert child_now["waiting"]["state"] == "wait_gate"
+    assert parent["id"] in child_now["waiting"]["evidence"]
+
+
+def test_gate_reopens_on_second_close_without_duplicate_events(home: Path, client: TestClient) -> None:
+    """Закрытие родителя второй раз открывает гейт новым фактом, а не повтором."""
+    parent = create(client, title="родитель")
+    child = create(client, title="ребёнок", parents=[parent["id"]])
+    mutate(client, "POST", f"/deals/{parent['id']}/complete", json={"summary": "первый раз"})
+    mutate(client, "POST", f"/deals/{parent['id']}/changes", json={"reason": "вернули"})
+    mutate(client, "POST", f"/deals/{parent['id']}/complete", json={"summary": "второй раз"})
+
+    assert kinds(home, child["id"]) == ["created", "gate_opened", "gate_closed", "gate_opened"]
+    assert now_deals(client)[child["id"]]["status"] == "ready"
+
+
+# ---------------------------------------------------- источники read-only (1)
+
+
+def test_mutations_never_touch_kanban_or_pool(home: Path, client: TestClient) -> None:
+    """mtime и размер `kanban.db`/`state.db`/`pool.db` не меняются (инвариант 1)."""
+    before = source_stats(home)
+
+    parent = create(client, title="родитель")
+    child = create(client, title="ребёнок", parents=[parent["id"]])
+    mutate(client, "PATCH", f"/deals/{child['id']}", json={"title": "переименовано"})
+    mutate(client, "POST", f"/deals/{child['id']}/comment", json={"author": "max", "body": "текст"})
+    mutate(client, "POST", f"/deals/{child['id']}/block", json={"kind": "needs_input", "reason": "нет ТЗ"})
+    mutate(client, "POST", f"/deals/{child['id']}/unblock", json={})
+    mutate(client, "POST", f"/deals/{child['id']}/claim", json={"owner": "implementer"})
+    mutate(client, "POST", f"/deals/{child['id']}/attach", files={"file": ("note.txt", b"hello", "text/plain")})
+    mutate(client, "POST", f"/deals/{child['id']}/review", json={"reviewer": "reviewer"})
+    mutate(client, "POST", f"/deals/{child['id']}/changes", json={"reason": "поправь"})
+    mutate(client, "POST", f"/deals/{child['id']}/complete", json={"summary": "ok"})
+    mutate(client, "POST", f"/deals/{parent['id']}/complete", json={"summary": "ok"})
+    client.get("/now")
+    client.get(f"/deal/{BOARD}/{child['id']}")
+    client.get(f"/deal/{BOARD}/{KANBAN_DEAL}")
+
+    assert source_stats(home) == before
+
+
+# ----------------------------------------------------- срез и карточка дела
+
+
+def test_own_deal_visible_in_now_and_leaves_after_complete(home: Path, client: TestClient) -> None:
+    """Своё дело в `/now` рядом с kanban, отличается префиксом и уходит после `done`."""
+    deal = create(client)
+
+    listed = now_deals(client)
+    assert set(listed) == {deal["id"], KANBAN_DEAL}
+    assert listed[deal["id"]]["status"] == "ready"
+    assert listed[KANBAN_DEAL]["waiting"]["state"] == "wait_human"
+    boards = {entry["slug"]: entry for entry in client.get("/now").json()["boards"]}
+    assert boards[BOARD]["own_deals"] == 1
+    assert boards[BOARD]["deals"] == 2
+
+    mutate(client, "POST", f"/deals/{deal['id']}/complete", json={"summary": "ok"})
+
+    assert deal["id"] not in now_deals(client)
+    card = client.get(f"/deal/{BOARD}/{deal['id']}").json()
+    assert card["status"] == "done"
+    assert card["terminal"] is True
+    assert card["deal"] is None
+    assert [event["kind"] for event in card["timeline"]] == ["created", "completed"]
+
+
+def test_deal_card_carries_comments_and_attachments(home: Path, client: TestClient) -> None:
+    """`GET /deal`: комментарии и вложения своего дела — часть карточки."""
+    deal = create(client)
+    mutate(client, "POST", f"/deals/{deal['id']}/comment", json={"author": "max", "body": "первый"})
+    attached = mutate(
+        client, "POST", f"/deals/{deal['id']}/attach", files={"file": ("note.txt", b"hello", "text/plain")}
+    )
+
+    card = client.get(f"/deal/{BOARD}/{deal['id']}").json()
+    assert [item["body"] for item in card["comments"]] == ["первый"]
+    assert [item["filename"] for item in card["attachments"]] == ["note.txt"]
+    attachment = card["attachments"][0]
+    assert Path(attachment["path"]).read_bytes() == b"hello"
+    assert attachment["size_bytes"] == 5
+    assert attached["attachment"]["path"] == attachment["path"]
+    # хеш содержимого — в имени файла и в payload события: одинаковый файл ложится
+    # один раз, а строка `attachments` ссылается на тот же путь
+    digest = events(home, deal["id"])[-1]["payload"]["sha256"]
+    assert Path(attachment["path"]).name.startswith(digest)
+
+
+def test_attach_repeat_keeps_one_file_and_one_event(home: Path, client: TestClient) -> None:
+    """Тот же файл второй раз: 0 событий, одна строка, один файл на диске."""
+    deal = create(client)
+    mutate(client, "POST", f"/deals/{deal['id']}/attach", files={"file": ("note.txt", b"hello", "text/plain")})
+    again = mutate(
+        client, "POST", f"/deals/{deal['id']}/attach", files={"file": ("note.txt", b"hello", "text/plain")}
+    )
+
+    assert again["mutation"] == {"events": 0, "idempotent": True}
+    assert kinds(home, deal["id"]) == ["created", "attached"]
+    files = list((home / "duty" / "attachments" / deal["id"]).iterdir())
+    assert len(files) == 1
+
+
+def test_patch_cannot_set_lifecycle_status(home: Path, client: TestClient) -> None:
+    """Через `PATCH` статус жизни не ставится: `done`/`review` — команды, не поле."""
+    deal = create(client)
+    response = client.patch(f"/deals/{deal['id']}", json={"status": "done"})
+
+    assert response.status_code == 400
+    assert "done" in response.json()["errors"][0]["reason"]
+    assert deal_rows(home)[0]["status"] == "ready"
+
+    archived = mutate(client, "PATCH", f"/deals/{deal['id']}", json={"status": "archived"})
+    assert archived["status"] == "archived"
+    assert archived["terminal"] is True
+
+
+def test_unknown_deal_is_404_not_500(client: TestClient) -> None:
+    """Мутация по несуществующему делу — 404 с причиной в `errors[]`."""
+    for method, path, kwargs in (
+        ("POST", "/deals/d_00000000/comment", {"json": {"body": "текст"}}),
+        ("POST", "/deals/d_00000000/unblock", {"json": {}}),
+        ("PATCH", "/deals/d_00000000", {"json": {"title": "имя"}}),
+    ):
+        response = client.request(method, path, **kwargs)
+        assert response.status_code == 404, (path, response.text)
+        assert response.json()["errors"]
+
+
+def test_kanban_deal_is_not_mutable_through_store_routes(client: TestClient) -> None:
+    """`t_…` не мутируется роутами своего store: префикс — граница владения."""
+    response = client.post(f"/deals/{KANBAN_DEAL}/comment", json={"author": "max", "body": "текст"})
+
+    assert response.status_code in (400, 404)
+    assert response.json()["errors"]
+
+
+# ---------------------------------------- цикл вопроса своего дела (находка)
+
+
+def own_deal_with_question(client: TestClient, text: str = "Вопрос по делу") -> tuple[str, int]:
+    """Своё дело плюс живой вопрос по нему через роут `/ask`."""
+    deal = create(client)
+    response = client.post(f"/ask/{BOARD}/{deal['id']}", json={"text": text})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["errors"] == []
+    return deal["id"], int(body["question_id"])
+
+
+def pool_rows(home: Path) -> list[dict[str, Any]]:
+    conn = sqlite3.connect(home / "messaging" / "pool.db")
+    conn.row_factory = sqlite3.Row
+    try:
+        return [dict(row) for row in conn.execute("SELECT * FROM questions ORDER BY id")]
+    finally:
+        conn.close()
+
+
+def close_pool_question(home: Path, question_id: int, *, answer: str | None) -> None:
+    """Закрыть вопрос штатным путём пула: `answered` с ответом или `expired`."""
+    conn = sqlite3.connect(home / "messaging" / "pool.db")
+    try:
+        if answer is None:
+            conn.execute("UPDATE questions SET status='expired' WHERE id = ?", (question_id,))
+        else:
+            conn.execute(
+                "UPDATE questions SET status='answered', answer=?, answered_via='manual', "
+                "answered_at='2026-11-03T10:00:00.000Z' WHERE id = ?",
+                (answer, question_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def sync_answers(home: Path) -> dict[str, Any]:
+    """Проход `sync_answers` с тем же соединением, что у ингеста."""
+    conn = journal.open_journal(home)
+    assert conn is not None
+    try:
+        return ask.sync_answers(conn, home)
+    finally:
+        conn.close()
+
+
+def waiting_of(client: TestClient, deal_id: str) -> dict[str, Any]:
+    card = client.get(f"/deal/{BOARD}/{deal_id}").json()
+    assert card["deal"] is not None, card
+    return card["deal"]["waiting"]
+
+
+def test_own_deal_question_uses_t_prefixed_session_key(home: Path, client: TestClient) -> None:
+    """Вопрос своего дела: пул видит ключ `t_d_…`, журнал — id дела `d_…`.
+
+    Это и есть однозначный маппинг: `ask()` пишет факт под тем же id, который
+    выведет `sync_answers`, иначе ответ уехал бы под `t_d_…`.
+    """
+    deal_id, question_id = own_deal_with_question(client)
+
+    row = pool_rows(home)[0]
+    assert row["id"] == question_id
+    assert row["session_key"] == f"t_{deal_id}"
+    assert ask.deal_id_of(row["session_key"]) == deal_id
+    assert ask.session_key(deal_id) == f"t_{deal_id}"
+
+    asked = [event for event in events(home, deal_id) if event["kind"] == "question_asked"]
+    assert len(asked) == 1
+    assert asked[0]["payload"]["session_key"] == f"t_{deal_id}"
+    assert asked[0]["payload"]["question_id"] == question_id
+
+
+def test_own_deal_question_clears_after_answer(home: Path, client: TestClient) -> None:
+    """Цикл `d_…`: вопрос → ответ в пуле → `sync_answers` → ожидание снято."""
+    deal_id, question_id = own_deal_with_question(client)
+    waiting = waiting_of(client, deal_id)
+    assert waiting["state"] == "wait_human"
+    assert waiting["human_kind"] == "question"
+
+    close_pool_question(home, question_id, answer="делай так")
+    report = sync_answers(home)
+    assert report["appended"] == 1
+
+    answered = [event for event in events(home, deal_id) if event["kind"] == "question_answered"]
+    assert len(answered) == 1
+    assert answered[0]["payload"]["question_id"] == question_id
+    waiting = waiting_of(client, deal_id)
+    assert waiting["human_kind"] != "question", waiting
+    assert waiting["state"] == "wait_slot"
+
+
+def test_own_deal_question_clears_after_expiry(home: Path, client: TestClient) -> None:
+    """Истечение TTL закрывает вопрос так же: дело не ждёт ответа, которого нет."""
+    deal_id, question_id = own_deal_with_question(client)
+    close_pool_question(home, question_id, answer=None)
+    assert sync_answers(home)["appended"] == 1
+
+    answered = [event for event in events(home, deal_id) if event["kind"] == "question_answered"]
+    assert answered[0]["payload"]["answered_via"] == "expired"
+    assert waiting_of(client, deal_id)["human_kind"] != "question"
+
+
+def test_own_deal_live_question_visible_in_now(home: Path, client: TestClient) -> None:
+    """`/now` для своего дела с живым вопросом говорит «ждёт ответа», а не «вопросов нет»."""
+    deal_id, _ = own_deal_with_question(client)
+
+    listed = now_deals(client)[deal_id]
+    assert listed["waiting"]["state"] == "wait_human"
+    assert listed["waiting"]["human_kind"] == "question"
+    assert "вопрос" in listed["waiting"]["evidence"].lower()
+
+
+def test_own_deal_question_repeat_returns_same_question(home: Path, client: TestClient) -> None:
+    """Повторный `ask` по тому же делу не заводит второй вопрос и второе событие."""
+    deal_id, question_id = own_deal_with_question(client)
+    again = client.post(f"/ask/{BOARD}/{deal_id}", json={"text": "другой текст"}).json()
+
+    assert int(again["question_id"]) == question_id
+    assert again["deduped"] is True
+    assert len(pool_rows(home)) == 1
+    assert kinds(home, deal_id).count("question_asked") == 1
+
+
+def test_kanban_deal_question_cycle_still_works(home: Path, client: TestClient) -> None:
+    """`t_…`-путь не сломан: тот же цикл вопроса для наблюдаемого дела."""
+    response = client.post(f"/ask/{BOARD}/{KANBAN_DEAL}", json={"text": "Вопрос по kanban-делу"})
+    assert response.status_code == 200, response.text
+    question_id = int(response.json()["question_id"])
+
+    row = pool_rows(home)[0]
+    assert row["session_key"] == KANBAN_DEAL
+    assert ask.deal_id_of(row["session_key"]) == KANBAN_DEAL
+
+    waiting = waiting_of(client, KANBAN_DEAL)
+    assert waiting["human_kind"] == "question"
+
+    close_pool_question(home, question_id, answer="ответ")
+    assert sync_answers(home)["appended"] == 1
+    assert [event["kind"] for event in events(home, KANBAN_DEAL)].count("question_answered") == 1
+    assert waiting_of(client, KANBAN_DEAL)["human_kind"] != "question"
+
+
+def test_unparsed_session_key_is_reported_not_skipped(home: Path, client: TestClient) -> None:
+    """Неразобранный `session_key` — строка в `errors[]`, а не тихий `continue`."""
+    conn = sqlite3.connect(home / "messaging" / "pool.db")
+    try:
+        conn.execute(
+            "INSERT INTO questions (session_key, text, origin, status, critical, answer, answered_via) "
+            "VALUES ('чужой-ключ', 'вопрос', 'duty', 'answered', 0, 'ок', 'manual')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    report = sync_answers(home)
+    assert report["appended"] == 0
+    assert report["errors"], report
+    assert "чужой-ключ" in json.dumps(report["errors"], ensure_ascii=False)
+
+
+# ------------------------------------------------------------------ attempts
+
+
+def test_attempts_of_own_deal_are_empty_with_reason(client: TestClient) -> None:
+    """Своё дело существует, попыток у него нет: пустой таймлайн с пометкой, не 404."""
+    deal = create(client)
+    body = client.get(f"/duty/{BOARD}/{deal['id']}/attempts").json()
+
+    assert body["count"] == 0
+    assert body["attempts"] == []
+    assert "попыток нет" in body["note"]
+    assert body["task_id"] == deal["id"]
+
+
+# ------------------------------------------------------------------ CLI (5)
+
+
+def test_cli_create_comment_complete(home: Path, client: TestClient, capsys: pytest.CaptureFixture[str]) -> None:
+    """CLI и роуты ходят в один модуль: `duty create/comment/complete` видны в store."""
+    from importlib import util as importlib_util
+
+    cli_path = Path(__file__).resolve().parents[1] / "dashboard" / "cli.py"
+    spec = importlib_util.spec_from_file_location("hermes_duty_cli_deals", cli_path)
+    assert spec is not None and spec.loader is not None
+    cli = importlib_util.module_from_spec(spec)
+    sys.modules[spec.name] = cli
+    spec.loader.exec_module(cli)
+
+    assert cli.main(["create", "--board", BOARD, "--title", "из терминала", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    deal_id = payload["id"]
+    assert deal_id.startswith("d_")
+    assert cli.main(["comment", deal_id, "проверка"]) == 0
+    assert cli.main(["complete", deal_id, "--summary", "ok"]) == 0
+    capsys.readouterr()
+
+    assert kinds(home, deal_id) == ["created", "commented", "completed"]
+    assert deal_rows(home)[0]["status"] == "done"
+    assert cli.main(["comment", "d_00000000", "нет такого"]) == 1

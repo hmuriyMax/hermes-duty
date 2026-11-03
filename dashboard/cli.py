@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import getpass
 import importlib.util
 import json
 import os
@@ -94,15 +95,20 @@ def _route(fn: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
 
     Коды берутся из того, что уже решил роут: 404 — «не найдено» (1), остальное
     (503 «источник не прочитался», 400 «неизвестное состояние») — ошибка
-    источников или разбора (2). Второго набора правил у CLI нет.
+    источников или разбора (2). Мутации отвечают тем же: `DealNotFound` —
+    «дела нет» (1), `DealError` — «вход не тот» (2). Второго набора правил у CLI
+    нет.
     """
     try:
         return fn(*args, **kwargs)
     except (NotFound, SourceFailure):
         raise
     except Exception as exc:  # отказ роута и есть ответ CLI
-        detail = getattr(exc, "detail", None) or f"{type(exc).__name__}: {exc}"
-        if getattr(exc, "status_code", None) == 404:
+        detail = getattr(exc, "detail", None) or str(exc) or f"{type(exc).__name__}: {exc}"
+        missing = getattr(exc, "status_code", None) == 404 or isinstance(
+            exc, api().deals.DealNotFound
+        )
+        if missing:
             raise NotFound(str(detail)) from exc
         raise SourceFailure(str(detail)) from exc
 
@@ -235,7 +241,93 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--interval", type=float, default=10.0, help="секунд между тиками (по умолчанию 10)")
     watch.add_argument("--board", help="только одна доска (slug)")
     watch.add_argument("--state", help="только дела в этом waiting.state")
+
+    # Мутации своего дела (`docs/OWNERSHIP.md`): те же функции, что у роутов
+    # `/deals…`, — CLI не заводит второго набора правил.
+    create = command("create", "завести своё дело (id d_<hex>)")
+    create.add_argument("--board", required=True, help="слаг доски (kanban-доска или своя в store)")
+    create.add_argument("--title", required=True, help="заголовок дела")
+    create.add_argument("--body-file", help="файл с телом дела (спецификацией)")
+    create.add_argument("--assignee", help="профиль-роль исполнителя")
+    create.add_argument("--parent", action="append", default=[], help="id своего родителя (d_…); можно несколько")
+
+    comment = command("comment", "комментарий в своё дело")
+    comment.add_argument("deal_id")
+    comment.add_argument("body", help="текст комментария")
+    comment.add_argument("--author", default="max", help="автор (по умолчанию max)")
+
+    block = command("block", "заблокировать своё дело")
+    block.add_argument("deal_id")
+    block.add_argument("reason", nargs="?", default="", help="причина блокировки")
+    block.add_argument("--kind", default="needs_input", help="block_kind (по умолчанию needs_input)")
+
+    unblock = command("unblock", "снять блокировку своего дела")
+    unblock.add_argument("deal_id")
+
+    claim = command("claim", "взять своё дело в работу")
+    claim.add_argument("deal_id")
+    claim.add_argument("--owner", help="профиль-владелец (по умолчанию HERMES_PROFILE или пользователь)")
+
+    complete = command("complete", "закрыть своё дело или сдать в ревью")
+    complete.add_argument("deal_id")
+    complete.add_argument("--summary", default="", help="итог дела")
+    complete.add_argument("--review", action="store_true", help="сдать в ревью вместо закрытия")
+    complete.add_argument("--reviewer", help="профиль ревьюера")
+
+    review = command("review", "сдать своё дело в ревью")
+    review.add_argument("deal_id")
+    review.add_argument("--reviewer", help="профиль ревьюера")
+    review.add_argument("--summary", default="", help="что сдаётся")
+
+    changes = command("changes", "вернуть своё дело на доработку")
+    changes.add_argument("deal_id")
+    changes.add_argument("reason", help="причина возврата")
+    changes.add_argument("--reviewer", help="кто вернул")
+
+    attach = command("attach", "приложить файл к своему делу")
+    attach.add_argument("deal_id")
+    attach.add_argument("file", help="путь к файлу")
+
+    archive = command("archive", "пометить своё дело archived (PATCH {status: archived})")
+    archive.add_argument("deal_id")
     return parser
+
+
+# Опции команд мутаций, у которых значение идёт отдельным словом. Нужны
+# `_positionals_first`: без них нормализация спутала бы значение опции с
+# позиционным аргументом. Список относится ровно к тем командам, которые она
+# нормализует (`block`, `changes`).
+VALUE_OPTIONS = ("--kind", "--reviewer")
+
+
+def _positionals_first(argv: list[str], commands: tuple[str, ...]) -> list[str]:
+    """Поставить позиционные аргументы перед опциями для указанных команд.
+
+    `argparse` заполняет позиционные одним куском в начале команды, поэтому
+    причина, написанная после опции (`duty block d_… --kind needs_input
+    "причина"` — форма из `docs/OWNERSHIP.md`), попадала бы в «unrecognized
+    arguments». Здесь argv приводится к тому, что разбор умеет, а не наоборот:
+    правило одно и живёт в одном месте.
+    """
+    words = list(argv)
+    index = next((i for i, item in enumerate(words) if not item.startswith("-")), None)
+    if index is None or words[index] not in commands:
+        return words
+    positionals: list[str] = []
+    options: list[str] = []
+    cursor = index + 1
+    while cursor < len(words):
+        item = words[cursor]
+        if item.startswith("-"):
+            options.append(item)
+            if item in VALUE_OPTIONS and cursor + 1 < len(words):
+                options.append(words[cursor + 1])
+                cursor += 2
+                continue
+        else:
+            positionals.append(item)
+        cursor += 1
+    return words[: index + 1] + positionals + options
 
 
 # ------------------------------------------------------------------ оформление
@@ -622,8 +714,77 @@ def render_why(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-# ----------------------------------------------------------------------- watch
+# ------------------------------------------------------------------- мутации
 
+
+def render_mutation(payload: dict[str, Any], action: str) -> str:
+    """Итог мутации словами: дело, его статус, ожидание и что именно записалось.
+
+    Ни одного нового правила здесь нет: статус, ожидание и доказательство — поля
+    ответа роута. `событий записано: 0 · повтор` — это ответ «уже было», а не
+    «ничего не получилось», и он назван словами, чтобы пилот не гадал.
+    """
+    mutation = payload.get("mutation") or {}
+    lines = [
+        f"{action} {payload.get('board')}/{payload.get('id')} · {payload.get('status') or '—'}",
+        f"заголовок: {payload.get('title') or '—'}",
+    ]
+    if payload.get("assignee"):
+        lines.append(f"исполнитель: {payload.get('assignee')}")
+    shaped = payload.get("deal")
+    if shaped is None:
+        lines.append(
+            "ожидание: не считается — дело закрыто"
+            if payload.get("terminal")
+            else "ожидание: не посчитано (ответ роута без фактов)"
+        )
+    else:
+        waiting = shaped.get("waiting") or {}
+        state = str(waiting.get("state") or "—")
+        if waiting.get("human_kind"):
+            state = f"{state}/{waiting['human_kind']}"
+        lines.append(f"ожидание: {state}")
+        lines.append(f"доказательство: {waiting.get('evidence') or 'не записано'}")
+    events = mutation.get("events")
+    tail = "" if not mutation.get("idempotent") else " · повтор: store не тронут"
+    lines.append(f"событий записано: {events if events is not None else '—'}{tail}")
+    if payload.get("comments"):
+        lines.append(f"комментариев в деле: {len(payload['comments'])}")
+    if payload.get("attachments"):
+        last = payload["attachments"][-1]
+        lines.append(
+            f"вложений в деле: {len(payload['attachments'])} "
+            f"(последнее: {last.get('filename')} → {last.get('path')})"
+        )
+    return "\n".join(lines)
+
+
+def _mutate(fn: Any, action: str, *args: Any, as_json: bool = False, **kwargs: Any) -> int:
+    """Выполнить мутацию и напечатать ответ; код возврата — как у остальных команд.
+
+    `--json` печатает ответ дословно (ровно форма роута + блок `mutation`): скрипт
+    берёт id своего дела оттуда, а не парсит человеческую строку.
+    """
+    payload = _route(fn, *args, **kwargs)
+    if as_json:
+        _emit_json(payload, sys.stdout)
+    else:
+        print(render_mutation(payload, action), file=sys.stdout)
+    return _payload_code(payload)
+
+
+def _claim_owner(explicit: Optional[str]) -> str:
+    """Владелец для `claim`: явный, иначе профиль агента, иначе пользователь ОС.
+
+    Владелец — факт, а не догадка: у агента есть `HERMES_PROFILE`, у человека —
+    учётка; подставлять «duty» значило бы назвать владельцем плагин.
+    """
+    if explicit:
+        return explicit
+    return os.environ.get("HERMES_PROFILE") or getpass.getuser()
+
+
+# ----------------------------------------------------------------------- watch
 
 def run_watch(
     interval: float,
@@ -691,7 +852,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     """Точка входа CLI: вернуть код 0/1/2, ничего не печатая в stderr без причины."""
     _ensure_interpreter(argv)
     parser = build_parser()
-    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    words = _positionals_first(list(sys.argv[1:] if argv is None else argv), ("block", "changes"))
+    args = parser.parse_args(words)
     if not args.command:
         parser.print_help()
         return EXIT_OK
@@ -732,6 +894,81 @@ def main(argv: Optional[list[str]] = None) -> int:
                 timeline_error = str(exc)
             print(render_deal(payload, timeline, timeline_error), file=out)
             return EXIT_SOURCE if timeline_error else _payload_code(payload)
+        if args.command == "create":
+            body = ""
+            if args.body_file:
+                try:
+                    body = Path(args.body_file).expanduser().read_text(encoding="utf-8")
+                except OSError as exc:
+                    print(f"! не читается {args.body_file}: {exc}", file=sys.stderr)
+                    return EXIT_SOURCE
+            request: dict[str, Any] = {
+                "board": args.board,
+                "title": args.title,
+                "body": body,
+                "parents": list(args.parent),
+            }
+            if args.assignee:
+                request["assignee"] = args.assignee
+            return _mutate(
+                api().deals_create, "СОЗДАНО", api().hermes_home(), request, source="cli", as_json=args.json
+            )
+        if args.command == "comment":
+            request = {"author": args.author, "body": args.body}
+            return _mutate(
+                api().deals_comment, "КОММЕНТАРИЙ", api().hermes_home(), args.deal_id, request,
+                source="cli", as_json=args.json,
+            )
+        if args.command == "block":
+            request = {"kind": args.kind, "reason": args.reason}
+            return _mutate(
+                api().deals_block, "ЗАБЛОКИРОВАНО", api().hermes_home(), args.deal_id, request,
+                source="cli", as_json=args.json,
+            )
+        if args.command == "unblock":
+            return _mutate(
+                api().deals_unblock, "РАЗБЛОКИРОВАНО", api().hermes_home(), args.deal_id, {},
+                source="cli", as_json=args.json,
+            )
+        if args.command == "claim":
+            request = {"owner": _claim_owner(args.owner)}
+            return _mutate(
+                api().deals_claim, "ВЗЯТО В РАБОТУ", api().hermes_home(), args.deal_id, request,
+                source="cli", as_json=args.json,
+            )
+        if args.command == "complete":
+            request = {"summary": args.summary, "review": bool(args.review), "reviewer": args.reviewer}
+            return _mutate(
+                api().deals_complete, "ЗАВЕРШЕНО", api().hermes_home(), args.deal_id, request,
+                source="cli", as_json=args.json,
+            )
+        if args.command == "review":
+            request = {"reviewer": args.reviewer, "summary": args.summary}
+            return _mutate(
+                api().deals_review, "СДАНО В РЕВЬЮ", api().hermes_home(), args.deal_id, request,
+                source="cli", as_json=args.json,
+            )
+        if args.command == "changes":
+            request = {"reason": args.reason, "reviewer": args.reviewer}
+            return _mutate(
+                api().deals_changes, "ВОЗВРАЩЕНО НА ДОРАБОТКУ", api().hermes_home(), args.deal_id, request,
+                source="cli", as_json=args.json,
+            )
+        if args.command == "attach":
+            try:
+                content = Path(args.file).expanduser().read_bytes()
+            except OSError as exc:
+                print(f"! не читается {args.file}: {exc}", file=sys.stderr)
+                return EXIT_SOURCE
+            return _mutate(
+                api().deals_attach, "ВЛОЖЕНИЕ", api().hermes_home(), args.deal_id,
+                filename=Path(args.file).name, content=content, source="cli", as_json=args.json,
+            )
+        if args.command == "archive":
+            return _mutate(
+                api().deals_patch, "АРХИВИРОВАНО", api().hermes_home(), args.deal_id,
+                {"status": "archived"}, source="cli", as_json=args.json,
+            )
     except NotFound as exc:
         print(f"! {exc}", file=sys.stderr)
         return EXIT_NOT_FOUND

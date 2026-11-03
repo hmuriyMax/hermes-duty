@@ -78,6 +78,15 @@ CAPABILITY_WORDS = (
 
 # Закрытый набор `kind` (контракт): новый вид события заводится вместе с
 # правилом fold и тестом, а не «по пути».
+#
+# `review_requested`/`changes_requested`/`collected` — переходы своих дел
+# (`docs/OWNERSHIP.md`): сдано в ревью, возвращено на доработку, ревью пройдено.
+# `gate_opened`/`gate_closed` — переход гейта по родителям (своё дело стало
+# `ready` или снова `todo`): `ready` не ставится руками, и переход обязан быть
+# виден фактом, а не только колонкой.
+# `patched` — правка спецификации своего дела (title/body/assignee).
+# `commented`/`attached` — сами по себе факты ожидания не создают, но нужны
+# таймлайну: без них «почему дело стоит» теряет последнее действие человека.
 EVENT_KINDS = (
     "created",
     "claimed",
@@ -87,6 +96,14 @@ EVENT_KINDS = (
     "blocked",
     "unblocked",
     "completed",
+    "review_requested",
+    "changes_requested",
+    "collected",
+    "gate_opened",
+    "gate_closed",
+    "patched",
+    "commented",
+    "attached",
     "question_asked",
     "question_answered",
 )
@@ -98,14 +115,27 @@ INGEST_EVENT_KINDS = ("created", "claimed", "blocked", "unblocked", "completed",
 # «дело появилось», потом лизинг, попытка, блок, её снятие, конец попытки и
 # завершение дела. Без этого при равном `ts` порядок `id` решался бы порядком
 # таблиц-источников, и fold мог прочитать завершение раньше его начала.
+#
+# Ревью и гейт идут после вопросов и до `completed`: `changes_requested` обязан
+# примениться раньше `collected` того же дела, иначе возврат на доработку
+# прочитался бы как «ревью пройдено»; `gate_opened`/`gate_closed` — раньше
+# `completed`, чтобы гейт не перечитал закрытие как открытие.
 KIND_ORDER = (
     "created",
+    "patched",
     "claimed",
     "attempt_started",
     "blocked",
     "unblocked",
     "question_asked",
     "question_answered",
+    "commented",
+    "attached",
+    "review_requested",
+    "changes_requested",
+    "collected",
+    "gate_opened",
+    "gate_closed",
     "attempt_ended",
     "lease_lost",
     "completed",
@@ -193,13 +223,55 @@ def append(conn: sqlite3.Connection, events: Iterable[dict[str, Any]]) -> int:
     одной дисциплиной, — не набор. Неизвестный вид отвергается целиком до записи,
     поэтому «почти записанная» пачка в журнале не остаётся.
     """
+    rows = _event_rows(events)
+    if not rows:
+        return 0
+    before = conn.total_changes
+    with conn:  # одна транзакция на пачку
+        conn.executemany(_INSERT_SQL, rows)
+    return conn.total_changes - before
+
+
+def append_in_tx(conn: sqlite3.Connection, events: Iterable[dict[str, Any]]) -> int:
+    """Дописать события **внутрь уже открытой транзакции вызывающего**.
+
+    Мутация своего дела пишет строку store и событие одной транзакцией
+    (`docs/OWNERSHIP.md`): журнал и store не должны разъехаться. `append` здесь
+    не годится — он делает `commit`, и откат строки дела после него уже ничего бы
+    не отменил. Транзакцией владеет вызывающий: `commit`/`rollback` — его.
+
+    Проверка набора `kind` та же, что у `append`: неизвестный вид отвергается до
+    записи, поэтому «почти записанной» пачки не остаётся и внутри чужой
+    транзакции.
+    """
+    rows = _event_rows(events)
+    if not rows:
+        return 0
+    before = conn.total_changes
+    conn.executemany(_INSERT_SQL, rows)
+    return conn.total_changes - before
+
+
+_INSERT_SQL = (
+    "INSERT OR IGNORE INTO events "
+    "(ts, recorded_at, deal_id, board, kind, payload, source, idempotency_key) "
+    "VALUES (?,?,?,?,?,?,?,?)"
+)
+
+
+def _event_rows(events: Iterable[dict[str, Any]]) -> list[tuple[Any, ...]]:
+    """События → строки для `INSERT` в порядке `(ts, KIND_ORDER)`; пустой вход — пусто.
+
+    Порядок и проверка набора одни на оба пути записи (`append` и
+    `append_in_tx`): второй копии этих правил быть не должно.
+    """
     ordered = sorted(events, key=lambda ev: (int(ev["ts"]), _kind_rank(str(ev["kind"]))))
     if not ordered:
-        return 0
+        return []
     for ev in ordered:
         if str(ev["kind"]) not in EVENT_KINDS:
             raise ValueError(f"unknown event kind {ev['kind']!r}: allowed {', '.join(EVENT_KINDS)}")
-    rows = [
+    return [
         (
             int(ev["ts"]),
             int(ev["recorded_at"]),
@@ -212,15 +284,6 @@ def append(conn: sqlite3.Connection, events: Iterable[dict[str, Any]]) -> int:
         )
         for ev in ordered
     ]
-    before = conn.total_changes
-    with conn:  # одна транзакция на пачку
-        conn.executemany(
-            "INSERT OR IGNORE INTO events "
-            "(ts, recorded_at, deal_id, board, kind, payload, source, idempotency_key) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            rows,
-        )
-    return conn.total_changes - before
 
 
 def read_events(
@@ -368,6 +431,56 @@ def fold(
                 + " (закрытие в журнале по делу не видно)"
             )
 
+    # 9. Сдано в ревью и вердикта ещё нет: `review_requested` без последующего
+    #    `collected`/`changes_requested`. Это `wait_human` с `human_kind="status"`
+    #    — ровно то, чем статус `review` уже назван в `WAITING_FALLBACK` («ждёт
+    #    вердикта ревьюера»): человеку нужно решение, а не ответ на вопрос.
+    #    Своим делам этот факт отвечает на «почему стоит» без чтения колонки.
+    verdict = _last_of_kinds(ordered, ("review_requested", "collected", "changes_requested"))
+    if verdict is not None and str(verdict[1].get("kind")) == "review_requested":
+        payload = _payload(verdict[1])
+        reviewer = payload.get("reviewer")
+        facts.setdefault("wait_human", []).append(
+            f"сдано в ревью {_ago(verdict[1].get('ts'), now_sec)}"
+            + (f", ревьюер {reviewer}" if reviewer else ", ревьюер не назначен")
+            + " — вердикта в журнале нет"
+        )
+
+    # 10. Возврат на доработку: `changes_requested` без последующей сдачи. Это
+    #     `wait_slot`, а не `wait_human`: решение «не принято» человек уже принял,
+    #     и ждёт дело исполнителя, который переделает. Приоритет состояний это
+    #     подтверждает — `claim`/попытка перебивают `wait_slot`, а `wait_human`
+    #     перебил бы их сам и висел бы на деле, которое уже в работе. Взятое
+    #     после возврата дело (`claimed`) этот факт снимает: причина возврата
+    #     осталась в таймлайне, но «ждёт исполнителя» про него уже неправда.
+    #     Причину называет payload — она в evidence, а не подразумевается.
+    if verdict is not None and str(verdict[1].get("kind")) == "changes_requested":
+        taken = any(str(ev.get("kind")) == "claimed" for ev in ordered[verdict[0] + 1 :])
+        if not taken:
+            payload = _payload(verdict[1])
+            facts.setdefault("wait_slot", []).append(
+                f"возвращено на доработку {_ago(verdict[1].get('ts'), now_sec)}: "
+                f"{_short(str(payload.get('reason') or '')) or 'причина не записана'}"
+            )
+
+    # 11. Гейт по родителям: `gate_closed` без последующего `gate_opened` — дело
+    #     снова ждёт родителя. Это тот же `wait_gate`, что и у снимка `created`, но
+    #     по последнему известному факту: родителя вернули из `done`, и переход
+    #     назван событием, а не выведен из колонки.
+    gate = _last_of_kinds(ordered, ("gate_opened", "gate_closed"))
+    if gate is not None and str(gate[1].get("kind")) == "gate_closed":
+        payload = _payload(gate[1])
+        facts.setdefault("wait_gate", []).append(
+            f"гейт закрыт {_ago(gate[1].get('ts'), now_sec)}: родитель {payload.get('parent') or '—'} "
+            f"больше не закрыт (status={payload.get('to') or '—'})"
+        )
+
+    # 12. `commented`, `attached` и `patched` состояния не создают намеренно:
+    #     «человек оставил комментарий» или «поправил title» — не ожидание и не
+    #     повод показывать дело ждущим. Эти факты живут в таймлайне дела
+    #     (`/deal/{board}/{id}`), а не в таксономии; вторая правда о состоянии из
+    #     них не выводится.
+
     state = next((name for name in WAITING_PRIORITY if name in facts), None)
     if state is None:
         return _verdict(None, None, None, "no_live_fact", last_kind)
@@ -460,6 +573,20 @@ def _last_of_kind(ordered: list[dict[str, Any]], kind: str) -> Optional[tuple[in
     return None
 
 
+def _last_of_kinds(
+    ordered: list[dict[str, Any]], kinds: tuple[str, ...]
+) -> Optional[tuple[int, dict[str, Any]]]:
+    """Индекс и событие последнего факта из набора видов — по одному проходу.
+
+    Нужен там, где важен порядок между видами одного смысла (сдано в ревью,
+    возвращено, ревью пройдено): «последний из набора» и есть текущий вердикт.
+    """
+    for index in range(len(ordered) - 1, -1, -1):
+        if str(ordered[index].get("kind") or "") in kinds:
+            return index, ordered[index]
+    return None
+
+
 def _kind_rank(kind: str) -> int:
     """Место вида события в каноническом порядке применения (`KIND_ORDER`)."""
     return KIND_ORDER.index(kind) if kind in KIND_ORDER else len(KIND_ORDER)
@@ -493,6 +620,15 @@ def pid_text(pid: Any, alive: Optional[bool]) -> str:
     if alive is False:
         return f"pid {pid} мёртв"
     return f"состояние pid {pid} неизвестно"
+
+
+def payload_of(event: dict[str, Any]) -> dict[str, Any]:
+    """`payload` события объектом — публичная форма `_payload` для соседних модулей.
+
+    Своё дело (`dashboard/deals.py`) читает `block_kind` из журнала, и второй
+    разбор JSON с другой трактовкой мусора разошёлся бы с fold.
+    """
+    return _payload(event)
 
 
 def _payload(event: dict[str, Any]) -> dict[str, Any]:

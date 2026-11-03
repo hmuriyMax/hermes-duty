@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sqlite3
 import sys
 import time
@@ -146,11 +147,34 @@ def pool_path(home: Path) -> Path:
 
 
 def session_key(deal_id: str) -> str:
-    """Ключ сессии пула для дела: `t_<deal_id>` (id карточки уже с префиксом `t_`)."""
+    """Ключ сессии пула для дела: `t_` + id дела.
+
+    У kanban-дела id уже `t_<hex>`, поэтому ключ — он сам; у своего дела id
+    `d_<hex>`, и ключ получается `t_d_<hex>` (схема пула ждёт префикс `t_`).
+    Обратный ход — `deal_id_of`, и он же единственное место, где это правило
+    разворачивается: разъехавшиеся «туда» и «обратно» дали бы вечное «ждёт
+    ответа» (находка координатора 03.11).
+    """
     key = str(deal_id or "").strip()
     if not key:
         raise ValueError("ask: у дела нет id")
     return key if key.startswith("t_") else f"t_{key}"
+
+
+def deal_id_of(key: str) -> Optional[str]:
+    """id дела из `session_key` пула — один маппинг на оба пространства id.
+
+    `t_<hex>` — kanban-дело, `t_d_<hex>` — своё: снимается ровно один префикс
+    `t_`, остальное отдаётся как есть. Чужой `session_key` (другой продюсер,
+    другая форма) — `None`: «не наше» и «наше, но не разобрали» это разные факты,
+    и второй обязан попасть в `errors[]`, а не в тишину.
+    """
+    value = str(key or "").strip()
+    if re.fullmatch(r"[td]_[0-9a-f]{6,}", value):
+        return value
+    if value.startswith("t_") and re.fullmatch(r"d_[0-9a-f]{6,}", value[2:]):
+        return value[2:]
+    return None
 
 
 def find_live(home: Path, deal_id: str) -> Optional[dict[str, Any]]:
@@ -315,9 +339,19 @@ def sync_answers(conn: sqlite3.Connection, home: Path) -> dict[str, Any]:
     now = int(time.time())
     events: list[dict[str, Any]] = []
     for row in rows:
-        try:
-            deal_id = _deal_of(str(row.get("session_key") or ""))
-        except ValueError:
+        deal_id = deal_id_of(str(row.get("session_key") or ""))
+        if deal_id is None:
+            # Неразобранный ключ — не «нет факта», а «факт потерян»: вопрос пул
+            # закрыл, и без строки в `errors[]` это исчезло бы молча.
+            report["errors"].append(
+                {
+                    "board": QUESTION_SOURCE,
+                    "reason": (
+                        f"вопрос #{row.get('id')} закрыт, но session_key "
+                        f"{row.get('session_key')!r} не разобран в id дела — question_answered не записан"
+                    ),
+                }
+            )
             continue
         expired = str(row.get("status") or "") == "expired"
         events.append(
@@ -484,14 +518,6 @@ def _waiting_since(conn: sqlite3.Connection, deal_id: str) -> Optional[int]:
         elif kind in ("unblocked", "completed"):
             since = None
     return since
-
-
-def _deal_of(key: str) -> str:
-    """id дела из `session_key` пула (`t_<hex>`); иное — не наше дело."""
-    value = str(key or "").strip()
-    if not value.startswith("t_") or len(value) < 3:
-        raise ValueError(f"ask: session_key is not a deal id: {value}")
-    return value
 
 
 def _board_of(conn: sqlite3.Connection, deal_id: str) -> str:

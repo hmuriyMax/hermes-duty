@@ -49,7 +49,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 
@@ -60,6 +60,8 @@ from fastapi.routing import APIRoute
 JOURNAL_MODULE_NAME = "hermes_duty_journal"
 # `dashboard/ask.py` — единственный канал вопросов: пишет в пул и в журнал.
 ASK_MODULE_NAME = "hermes_duty_ask"
+# `dashboard/deals.py` — свой store дел и мутации (`docs/OWNERSHIP.md`).
+DEALS_MODULE_NAME = "hermes_duty_deals"
 
 
 def _load_journal() -> Any:
@@ -98,6 +100,24 @@ def _load_ask() -> Any:
 ask = _load_ask()
 
 
+def _load_deals() -> Any:
+    """Загрузить `dashboard/deals.py` — свой store дел и мутации по контракту."""
+    loaded = sys.modules.get(DEALS_MODULE_NAME)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / "deals.py"
+    spec = importlib.util.spec_from_file_location(DEALS_MODULE_NAME, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise ImportError(f"deals module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[DEALS_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+deals = _load_deals()
+
+
 # Один набор заголовков на все ответы: и 200, и ошибки. Кэш промежуточного
 # слоя держит и `404`, поэтому «доска недоступна» из прошлого тела иначе
 # переживает починку кода.
@@ -130,9 +150,11 @@ router = APIRouter(route_class=_NoStoreRoute)
 # защита от медленного скана лежит на клиенте (`REQUEST_TIMEOUT_MS` в UI).
 SQL_BUSY_TIMEOUT_SEC = 2.0
 
-# id карточки kanban — один паттерн на файл (`t_` + hex, например `t_21f41d1c`).
-# Используется и для `session_key` вопроса пула, и для упоминания в его тексте.
-TASK_ID_RE = re.compile(r"t_[0-9a-f]{6,}")
+# id дела в обоих пространствах: kanban-карточка — `t_<hex>`, своё дело —
+# `d_<hex>` (`docs/OWNERSHIP.md`). Один паттерн на файл: по нему и `session_key`
+# вопроса пула, и упоминание в его тексте, и поиск дела в индексе `/now`.
+# Префикс — не украшение: он и отличает владение от наблюдения.
+DEAL_ID_RE = re.compile(r"[td]_[0-9a-f]{6,}")
 
 # Корневая БД: доска `default` лежит не в `kanban/boards/`, а прямо в корне Hermes.
 DEFAULT_BOARD = "default"
@@ -140,6 +162,15 @@ DEFAULT_BOARD = "default"
 # Каталог выбывших досок: ядро убирает туда закрытые доски (`_archived/<slug>/`)
 # и ставит рядом камень `board.json` с `"archived": true`. Это не источник среза.
 ARCHIVED_DIR = "_archived"
+
+
+def hermes_home() -> Path:
+    """Корень Hermes — та же точка, что у роутов.
+
+    CLI зовёт её отсюда, а не ищет `HERMES_HOME` сам: иначе «где живёт store» и
+    «где живут источники» разъехались бы между терминалом и экраном.
+    """
+    return _hermes_home()
 
 
 def _plugin_version() -> str:
@@ -623,12 +654,15 @@ def _pool_questions(home: Path) -> tuple[dict[str, dict[str, Any]], Optional[str
     остальных связь видна только по упоминанию `t_<id>` в тексте. Пути полей
     поэтому такие: `session_key` → затем `text`/`text_full`.
 
-    Второй элемент — причина сбоя: недоступный пул это не «вопросов нет», иначе
-    `wait_human` молча не срабатывает и ответ врёт про «никто не ждёт». Третий —
-    признак того, что живых вопросов больше лимита: обрезанный пул тоже нельзя
-    выдавать за полный. Проверяется лишней строкой (`LIMIT + 1`), а не
-    равенством длины лимиту, — иначе полный пул ровно на `QUESTION_LIMIT`
-    вопросов ложной пометки не избежит.
+    `session_key` разворачивается в id дела **одной функцией** (`ask.deal_id_of`),
+    а не как есть: у своего дела ключ пула — `t_d_<hex>`, и подставить его сырым
+    значило бы не найти вопрос своего дела ни в `/now`, ни в `_pool_questions`
+    (находка координатора 03.11). Второй элемент — причина сбоя: недоступный
+    пул это не «вопросов нет», иначе `wait_human` молча не срабатывает и ответ
+    врёт про «никто не ждёт». Третий — признак того, что живых вопросов больше
+    лимита: обрезанный пул тоже нельзя выдавать за полный. Проверяется лишней
+    строкой (`LIMIT + 1`), а не равенством длины лимиту, — иначе полный пул
+    ровно на `QUESTION_LIMIT` вопросов ложной пометки не избежит.
     """
     db = home / "messaging" / "pool.db"
     if not db.is_file():
@@ -646,11 +680,11 @@ def _pool_questions(home: Path) -> tuple[dict[str, dict[str, Any]], Optional[str
     index: dict[str, dict[str, Any]] = {}
     for row in rows:
         holders: set[str] = set()
-        key = str(row.get("session_key") or "")
-        if TASK_ID_RE.fullmatch(key):
-            holders.add(key)
+        deal_id = ask.deal_id_of(str(row.get("session_key") or ""))
+        if deal_id:
+            holders.add(deal_id)
         blob = f"{row.get('text') or ''} {row.get('text_full') or ''}"
-        holders.update(TASK_ID_RE.findall(blob))
+        holders.update(DEAL_ID_RE.findall(blob))
         for task_id in holders:
             index.setdefault(task_id, row)
     return index, None, truncated
@@ -1152,6 +1186,250 @@ def _board_deals(
     }
 
 
+# ------------------------------------------------------- свои дела (0.0.3, W5)
+#
+# Владение делом (`docs/OWNERSHIP.md`): свой store (`dashboard/deals.py`) живёт
+# рядом с журналом, в той же `duty/duty.db`. Срез «сейчас» показывает свои дела
+# наравне с kanban-делами — те же поля и та же сортировка, отличается только
+# префиксом `d_`; `/deal` отдаёт одну форму для обоих, чтобы экран не знал,
+# откуда дело. Читающие пути store не создают (`create=False`): смотр экрана не
+# должен заводить таблицы как побочный эффект.
+
+# Имя источника в `errors[]` для своих дел — путь журнала: store живёт в том же
+# файле, и вторая строка «duty.db (дела)» только путала бы.
+DEALS_SOURCE = journal.JOURNAL_SOURCE
+
+# Остаточная ветка для своего дела: живого факта в журнале нет, а kanban тут ни
+# при чём — своего дела в kanban нет, и «состояние из kanban» было бы выдумкой.
+# Поэтому состояние называет `deals.status`, а текст говорит вслух, что спавна в
+# 0.0.3 нет: дело берут руками (`duty claim`).
+OWN_WAITING_FALLBACK = {
+    "todo": (
+        "wait_slot",
+        "status=todo без живых фактов: ждёт исполнителя (спавна в 0.0.3 нет — берут вручную: duty claim)",
+    ),
+    "ready": (
+        "wait_slot",
+        "status=ready без живых фактов: ждёт исполнителя (спавна в 0.0.3 нет — берут вручную: duty claim)",
+    ),
+    "running": (
+        "no_signal",
+        "status=running без попытки: в 0.0.3 попыток нет (аренда и спавн — следующая версия)",
+    ),
+    "blocked": ("wait_human", "status=blocked: нужен человек"),
+    "review": ("wait_human", "status=review: ждёт вердикта ревьюера"),
+}
+
+
+def _timeline(events: list[dict[str, Any]], now: int) -> list[dict[str, Any]]:
+    """Таймлайн дела по событиям журнала: что произошло, когда и с чем.
+
+    Одна форма для своих и наблюдаемых дел: экран рисует её одинаково. Выжимка
+    payload'а берётся тем же `_payload_summary`, что у последнего действия, —
+    второго форматтера в ответе быть не должно.
+    """
+    return [
+        {
+            "kind": event.get("kind"),
+            "at": event.get("ts"),
+            "recorded_at": event.get("recorded_at"),
+            "age_sec": _age_sec(event.get("ts"), now),
+            "source": event.get("source"),
+            "summary": _payload_summary(json.dumps(event.get("payload") or {}, ensure_ascii=False)),
+        }
+        for event in events
+    ]
+
+
+def _own_waiting(
+    folded: dict[str, Any],
+    question: Optional[dict[str, Any]],
+    status: str,
+    journal_note: Optional[str],
+    pool_note: Optional[str],
+) -> dict[str, Any]:
+    """`waiting` своего дела: журнал первым, остальное — по `deals.status`.
+
+    Kanban-ветки здесь нет и быть не может: своего дела в kanban не существует, и
+    подставить туда «состояние из kanban» значило бы выдумать факт. Пометка в
+    `evidence` говорит, откуда взято состояние, — как и у наблюдаемых дел.
+    """
+    if folded["state"] is not None:
+        return _journal_waiting(folded, question)
+    if journal_note:
+        head = journal_note
+    else:
+        head = (
+            f"journal: нет живых фактов (последнее событие: {folded['last_kind'] or '—'}) "
+            "— состояние из status своего дела"
+        )
+    state, evidence = OWN_WAITING_FALLBACK.get(
+        status, ("wait_slot", f"status={status or '—'}: нет живых фактов")
+    )
+    human_kind = "question" if question is not None else ("status" if state == "wait_human" else None)
+    if pool_note and state == "wait_human" and question is None:
+        evidence = f"{evidence}; {pool_note}"
+    return {"state": state, "evidence": f"{head}; {evidence}", "human_kind": human_kind}
+
+
+def _own_shaped(
+    row: dict[str, Any],
+    events: list[dict[str, Any]],
+    now: int,
+    question: Optional[dict[str, Any]],
+    journal_note: Optional[str],
+    pool_note: Optional[str],
+) -> dict[str, Any]:
+    """Дело своего store в той же форме, что дело kanban в `/now`.
+
+    Пустые факты названы пустыми, а не выброшены: у своего дела нет рана и
+    лизинга (в 0.0.3 их нет вовсе), и это видно полем, а не отсутствием ключа —
+    иначе экран не отличил бы «нечего показывать» от «не посчитали».
+    """
+    last = events[-1] if events else None
+    folded = journal.fold(events, now=now)
+    return {
+        "board": str(row["board"]),
+        "id": str(row["id"]),
+        "title": row.get("title"),
+        "assignee": row.get("assignee"),
+        "status": str(row["status"]),
+        "priority": None,
+        "consecutive_failures": 0,
+        "created_at": row.get("created_at"),
+        "workspace_kind": None,
+        "attempt": None,
+        "lease": {"claim_lock": None, "expires_at": None, "expires_in_sec": None, "state": "none"},
+        "last_action": {
+            "kind": None if last is None else last.get("kind"),
+            "at": None if last is None else last.get("ts"),
+            "age_sec": None if last is None else _age_sec(last.get("ts"), now),
+            "summary": None
+            if last is None
+            else _payload_summary(json.dumps(last.get("payload") or {}, ensure_ascii=False)),
+        },
+        "last_run": None,
+        "waiting": _own_waiting(folded, question, str(row["status"]), journal_note, pool_note),
+        "_age_sec": _age_sec(row.get("created_at"), now),
+    }
+
+
+def _own_deals(
+    home: Path,
+    now: int,
+    questions: dict[str, dict[str, Any]],
+    pool_note: Optional[str],
+    journal_events: dict[str, list[dict[str, Any]]],
+    journal_note: Optional[str],
+    board: Optional[str] = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Активные свои дела для среза «сейчас»: `(дела, ошибки)`.
+
+    Отсутствие store — не ошибка, а «своих дел ещё нет» (`create=False` файла не
+    создаёт). Нечитаемый store или журнал — строка в `errors[]`: пустой список без
+    причины выглядел бы как «своих дел нет», а это разные факты.
+    """
+    try:
+        conn = deals.open_store(home, create=False)
+    except Exception as exc:  # noqa: BLE001 - свой store не открылся
+        return [], [{"board": DEALS_SOURCE, "reason": f"{type(exc).__name__}: {exc}"}]
+    if conn is None:
+        return [], []
+    try:
+        if not deals.has_store(conn):
+            return [], []
+        out: list[dict[str, Any]] = []
+        for row in deals.deal_rows(conn, board=board, open_only=True):
+            events = journal_events.get(str(row["id"]), [])
+            folded = journal.fold(events, now=now)
+            if not folded["active"]:
+                continue  # закрытое дело в срез не идёт (правило 2 fold)
+            out.append(
+                _own_shaped(
+                    row,
+                    events,
+                    now,
+                    questions.get(str(row["id"])),
+                    journal_note,
+                    pool_note,
+                )
+            )
+        return out, []
+    except Exception as exc:  # noqa: BLE001 - битый store/журнал
+        return [], [{"board": DEALS_SOURCE, "reason": f"store: {type(exc).__name__}: {exc}"}]
+    finally:
+        conn.close()
+
+
+def _deal_response(
+    *,
+    now: int,
+    board: str,
+    deal_id: str,
+    row: dict[str, Any],
+    shaped: Optional[dict[str, Any]],
+    comments: list[dict[str, Any]],
+    attachments: list[dict[str, Any]],
+    timeline: list[dict[str, Any]],
+    errors: Optional[list[dict[str, str]]] = None,
+) -> dict[str, Any]:
+    """Ответ «одно дело» — одна форма и для kanban-дела, и для своего.
+
+    Экран не должен знать, откуда дело: ключи одинаковые, различаются только
+    значения. У наблюдаемого дела нет наших комментариев и вложений — там пустые
+    списки, а не отсутствие полей, иначе клиент держал бы две ветки разбора.
+    """
+    body_text = str(row.get("body") or "")
+    status = str(row.get("status") or "")
+    return {
+        "now": now,
+        "board": board,
+        "id": deal_id,
+        "title": row.get("title"),
+        "status": status,
+        "assignee": row.get("assignee"),
+        "terminal": status in TERMINAL_STATUSES,
+        "created_at": row.get("created_at"),
+        "body": body_text[:DEAL_BODY_LIMIT],
+        "body_truncated": len(body_text) > DEAL_BODY_LIMIT,
+        "deal": shaped,
+        "comments": comments,
+        "attachments": attachments,
+        "timeline": timeline,
+        "errors": list(errors or []),
+    }
+
+
+def _own_response(
+    conn: sqlite3.Connection,
+    row: dict[str, Any],
+    now: int,
+    *,
+    questions: Optional[dict[str, dict[str, Any]]] = None,
+    pool_note: Optional[str] = None,
+    journal_note: Optional[str] = None,
+) -> dict[str, Any]:
+    """Полный ответ по делу своего store (та же форма, что `/deal`)."""
+    deal_id = str(row["id"])
+    events = journal.read_events(conn, deal_id)
+    folded = journal.fold(events, now=now)
+    shaped = (
+        _own_shaped(row, events, now, (questions or {}).get(deal_id), journal_note, pool_note)
+        if folded["active"]
+        else None
+    )
+    return _deal_response(
+        now=now,
+        board=str(row["board"]),
+        deal_id=deal_id,
+        row=row,
+        shaped=shaped,
+        comments=deals.comments_of(conn, deal_id),
+        attachments=deals.attachments_of(conn, deal_id),
+        timeline=_timeline(events, now),
+    )
+
+
 def collect_now(
     home: Path,
     now: int,
@@ -1176,9 +1454,19 @@ def collect_now(
     errors: list[dict[str, str]] = list(pool_errors)
     journal_events, journal_note, journal_errors = _journal_context(home, boards, ingest=ingest)
     errors.extend(journal_errors)
+    # Свои дела (`docs/OWNERSHIP.md`) идут в тот же срез: экран отличает их только
+    # префиксом `d_`. Ошибка своего store не валит ответ — она в `errors[]`, как и
+    # ошибка доски: «своих дел нет» и «store не прочитался» — разные факты.
+    own_deals, own_errors = _own_deals(
+        home, now, questions, pool_note, journal_events, journal_note, board
+    )
+    errors.extend(own_errors)
 
     boards_out: list[dict[str, Any]] = []
-    deals: list[dict[str, Any]] = []
+    # Имя `deals` занято модулем своего store (`deals.store_path`), поэтому список
+    # дел среза называется `items`: иначе внутри функции модуль был бы затенён и
+    # `deals.store_path(...)` означал бы «метод списка».
+    items: list[dict[str, Any]] = []
     for entry in scope:
         try:
             collected = _board_deals(entry, now, questions, pool_note, journal_events, journal_note)
@@ -1208,10 +1496,36 @@ def collect_now(
                 "warnings": collected["warnings"],
             }
         )
-        deals.extend(collected["deals"])
+        items.extend(collected["deals"])
+
+    # Свои дела вливаются в тот же список и в те же счётчики досок: иначе `/now`
+    # показывал бы два разных «сколько дел» — по срезу и по доскам.
+    items.extend(own_deals)
+    own_by_board: dict[str, int] = {}
+    for own in own_deals:
+        own_by_board[str(own["board"])] = own_by_board.get(str(own["board"]), 0) + 1
+    for slug, count in sorted(own_by_board.items()):
+        for entry in boards_out:
+            if entry["slug"] == slug:
+                entry["deals"] = int(entry.get("deals") or 0) + count
+                entry["own_deals"] = count
+                break
+        else:
+            # Доска есть только в своём store: kanban-доски с таким слагом нет.
+            # Это не «непрочитанная доска», поэтому `read: true` и путь store.
+            boards_out.append(
+                {
+                    "slug": slug,
+                    "path": str(deals.store_path(home)),
+                    "read": True,
+                    "deals": count,
+                    "own_deals": count,
+                    "note": "только свои дела: kanban-доски с таким слагом нет",
+                }
+            )
 
     order = {name: i for i, name in enumerate(WAITING_PRIORITY)}
-    deals.sort(
+    items.sort(
         key=lambda deal: (
             order.get(deal["waiting"]["state"], len(order)),
             -(deal["_age_sec"] or 0),
@@ -1219,16 +1533,16 @@ def collect_now(
         )
     )
     by_state = {name: 0 for name in WAITING_PRIORITY}
-    for deal in deals:
+    for deal in items:
         by_state[deal["waiting"]["state"]] = by_state.get(deal["waiting"]["state"], 0) + 1
     if state is not None:
-        deals = [deal for deal in deals if deal["waiting"]["state"] == state]
-    for deal in deals:
+        items = [deal for deal in items if deal["waiting"]["state"] == state]
+    for deal in items:
         deal.pop("_age_sec", None)
     return {
         "now": now,
-        "count": len(deals),
-        "deals": deals,
+        "count": len(items),
+        "deals": items,
         "by_state": by_state,
         "crash_outcomes": list(CRASH_OUTCOMES),
         "boards": boards_out,
@@ -1480,11 +1794,17 @@ def stats(board: Optional[str] = None, since: Optional[int] = None) -> dict[str,
 def deal(board: str, task_id: str) -> dict[str, Any]:
     """Одно дело: спецификация плюс тот же факт-набор, что в `/now`.
 
-    `deal` — `null` для завершённого дела (`done`/`archived`): состояний ожидания
-    у него нет, и придумывать их нельзя. Таймлайн попыток живёт отдельно —
-    `GET /duty/{board}/{task_id}/attempts` — и работает для любого дела.
+    Дело ищется по префиксу id: `d_<hex>` — своё (store), `t_<hex>` — наблюдаемое
+    (kanban). Форма ответа одна на оба: экран не должен знать, откуда дело, иначе
+    пришлось бы держать две ветки разбора одного и того же экрана.
+
+    `deal` — `null` для закрытого дела (`done`/`archived`): состояний ожидания у
+    него нет, и придумывать их нельзя. Таймлайн попыток живёт отдельно —
+    `GET /duty/{board}/{task_id}/attempts`.
     """
     home = _hermes_home()
+    if deals.is_own(task_id):
+        return _own_deal(home, board, task_id)
     entry = _board_entry(home, board)
     rows, err = _query_checked(Path(entry["path"]), "SELECT * FROM tasks WHERE id = ?", (task_id,))
     if err:
@@ -1498,29 +1818,550 @@ def deal(board: str, task_id: str) -> dict[str, Any]:
             detail=f"task '{task_id}' not found on board '{board}'",
         )
     task = rows[0]
-    status = str(task.get("status") or "")
-    terminal = status in TERMINAL_STATUSES
     now = _now_sec()
+    journal_events, journal_note, _ = _journal_context(home, [])
     shaped: Optional[dict[str, Any]] = None
-    if not terminal:
+    if str(task.get("status") or "") not in TERMINAL_STATUSES:
         questions, pool_note, _ = _pool_context(home)
-        journal_events, journal_note, _ = _journal_context(home, [])
         collected = _board_deals(entry, now, questions, pool_note, journal_events, journal_note)
         shaped = next((item for item in collected["deals"] if item["id"] == task_id), None)
-    body = task.get("body") or ""
+    return _deal_response(
+        now=now,
+        board=board,
+        deal_id=task_id,
+        row=task,
+        shaped=shaped,
+        # Комментарии и вложения у наблюдаемого дела — не наши: store их не ведёт,
+        # и пустой список здесь означает «duty их не держит», а не «их нет».
+        comments=[],
+        attachments=[],
+        timeline=_timeline(journal_events.get(task_id, []), now),
+    )
+
+
+def _resolve_deal(home: Path, board: str, deal_id: str) -> dict[str, Any]:
+    """Дело по id для роутов: своё (store) или kanban — по префиксу.
+
+    Одно место, где решается «где искать дело»: `d_` живёт в store, `t_` — на
+    доске kanban, и один id не ищется в двух правдах. Возвращает ровно те факты,
+    которых хватает вопросу и таймлайну (`id`, `board`, `status`, `title`, `own`);
+    404/503 бросаются здесь же, чтобы у всех роутов была одна формулировка отказа.
+    """
+    if deals.is_own(deal_id):
+        try:
+            conn = deals.open_store(home, create=False)
+        except Exception as exc:  # noqa: BLE001 - свой store не открылся
+            raise HTTPException(
+                status_code=503,
+                headers=NO_STORE_HEADERS,
+                detail=f"store unreadable: {type(exc).__name__}: {exc}",
+            ) from exc
+        if conn is None:
+            raise HTTPException(
+                status_code=404,
+                headers=NO_STORE_HEADERS,
+                detail=f"deal '{deal_id}' not found: своего store ещё нет",
+            )
+        try:
+            row = deals.deal_row(conn, deal_id) if deals.has_store(conn) else None
+        finally:
+            conn.close()
+        if row is None or str(row["board"]) != board:
+            raise HTTPException(
+                status_code=404,
+                headers=NO_STORE_HEADERS,
+                detail=f"deal '{deal_id}' not found on board '{board}'",
+            )
+        return {
+            "id": deal_id,
+            "board": board,
+            "status": str(row["status"]),
+            "title": row.get("title"),
+            "own": True,
+        }
+    entry = _board_entry(home, board)
+    rows, err = _query_checked(
+        Path(entry["path"]), "SELECT id, title, status FROM tasks WHERE id = ?", (deal_id,)
+    )
+    if err:
+        raise HTTPException(
+            status_code=503, headers=NO_STORE_HEADERS, detail=f"board '{board}' unreadable: {err}"
+        )
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            headers=NO_STORE_HEADERS,
+            detail=f"task '{deal_id}' not found on board '{board}'",
+        )
     return {
-        "now": now,
+        "id": deal_id,
         "board": board,
-        "id": task_id,
-        "title": task.get("title"),
-        "status": status,
-        "assignee": task.get("assignee"),
-        "terminal": terminal,
-        "created_at": task.get("created_at"),
-        "body": body[:DEAL_BODY_LIMIT],
-        "body_truncated": len(body) > DEAL_BODY_LIMIT,
-        "deal": shaped,
+        "status": str(rows[0].get("status") or ""),
+        "title": rows[0].get("title"),
+        "own": False,
     }
+
+
+def _own_deal(home: Path, board: str, deal_id: str) -> dict[str, Any]:
+    """Своё дело по id: строка store плюс журнал; 404, если его нет или не та доска."""
+    try:
+        conn = deals.open_store(home, create=False)
+    except Exception as exc:  # noqa: BLE001 - свой store не открылся
+        raise HTTPException(
+            status_code=503,
+            headers=NO_STORE_HEADERS,
+            detail=f"store unreadable: {type(exc).__name__}: {exc}",
+        ) from exc
+    if conn is None:
+        raise HTTPException(
+            status_code=404,
+            headers=NO_STORE_HEADERS,
+            detail=f"deal '{deal_id}' not found: своего store ещё нет",
+        )
+    try:
+        row = deals.deal_row(conn, deal_id) if deals.has_store(conn) else None
+        if row is None or str(row["board"]) != board:
+            raise HTTPException(
+                status_code=404,
+                headers=NO_STORE_HEADERS,
+                detail=f"deal '{deal_id}' not found on board '{board}'",
+            )
+        questions, pool_note, _ = _pool_context(home)
+        _, journal_note, _ = _journal_context(home, [])
+        return _own_response(
+            conn, row, _now_sec(), questions=questions, pool_note=pool_note, journal_note=journal_note
+        )
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------- мутации своих дел (W5)
+#
+# Роуты и CLI ходят в **одни** функции (`deals_*` ниже), а те — в
+# `dashboard/deals.py`: второго набора правил быть не должно (`docs/OWNERSHIP.md`,
+# «CLI и API ходят в один модуль (как W3)»). Ошибка входа — `errors[]` с причиной
+# и 400/404, а не 500: битый вход это ответ, а не падение.
+
+
+def _known_boards(home: Path) -> list[str]:
+    """Слаги kanban-досок: своя доска должна быть здесь или уже в store.
+
+    Так опечатка в слаге не заводит тихую доску-призрак: `POST /deals` с чужим
+    слагом отвечает ошибкой, а не создаёт новое пространство имён.
+    """
+    return [str(entry["slug"]) for entry in _discover_boards(home)]
+
+
+def _store_for_write(home: Path) -> sqlite3.Connection:
+    """Соединение store для мутации: 503, если файл не открывается."""
+    try:
+        conn = deals.open_store(home)
+    except Exception as exc:  # noqa: BLE001 - свой store не открылся
+        raise HTTPException(
+            status_code=503,
+            headers=NO_STORE_HEADERS,
+            detail=f"store unreadable: {type(exc).__name__}: {exc}",
+        ) from exc
+    if conn is None:  # pragma: no cover - create=True всегда даёт соединение
+        raise HTTPException(
+            status_code=503, headers=NO_STORE_HEADERS, detail="store unreadable: no connection"
+        )
+    return conn
+
+
+def _error_body(board: Optional[str], deal_id: Optional[str], reason: str) -> dict[str, Any]:
+    """Тело ошибки мутации — та же форма, что у успеха, но `deal: null`.
+
+    Клиент не должен разбирать второй тип тела ради отказа: ключи те же, причина
+    в `errors[]` (как у остальных ошибок 0.0.2), дело не притворяется живым.
+    """
+    return {
+        "now": _now_sec(),
+        "board": board,
+        "id": deal_id,
+        "title": None,
+        "status": None,
+        "assignee": None,
+        "terminal": False,
+        "created_at": None,
+        "body": "",
+        "body_truncated": False,
+        "deal": None,
+        "comments": [],
+        "attachments": [],
+        "timeline": [],
+        "errors": [{"board": board or DEALS_SOURCE, "reason": reason}],
+    }
+
+
+def _deal_error(exc: RuntimeError, board: Optional[str], deal_id: Optional[str]) -> JSONResponse:
+    """Отвергнутая мутация: 404 для «дела нет», 400 для «вход не тот», не 500.
+
+    Тип в подписи — `RuntimeError` (`deals.DealError` — его наследник): модуль
+    своего store загружается по пути, и как аннотация он не тип для проверяльщика,
+    а поведение от этого не меняется.
+    """
+    status = 404 if isinstance(exc, deals.DealNotFound) else 400
+    return JSONResponse(
+        status_code=status,
+        headers=NO_STORE_HEADERS,
+        content=_error_body(board, deal_id, str(exc)),
+    )
+
+
+def _mutation(conn: sqlite3.Connection, home: Path, result: dict[str, Any]) -> dict[str, Any]:
+    """Ответ мутации: та же форма, что `/deal`, плюс блок `mutation`.
+
+    `mutation.events` — сколько строк журнала легло этим вызовом, `idempotent` —
+    что вызов повторил уже сделанное (0 новых событий, store не тронут). Оба
+    факта в ответе, потому что «сделано» и «уже было» — разные ответы, и CLI не
+    должен угадывать их по коду возврата.
+    """
+    questions, pool_note, _ = _pool_context(home)
+    _, journal_note, _ = _journal_context(home, [])
+    body = _own_response(
+        conn,
+        result["deal"],
+        _now_sec(),
+        questions=questions,
+        pool_note=pool_note,
+        journal_note=journal_note,
+    )
+    body["mutation"] = {"events": result["events"], "idempotent": result["idempotent"]}
+    if "attachment" in result:
+        body["attachment"] = result["attachment"]
+    return body
+
+
+def deals_create(home: Path, payload: dict[str, Any], *, source: str = "api") -> dict[str, Any]:
+    """`POST /deals` и `duty create`: одно правило на оба входа."""
+    parents = payload.get("parents") or []
+    if not isinstance(parents, list) or not all(isinstance(item, str) for item in parents):
+        raise deals.DealError("create: 'parents' — список id своих дел (d_<hex>)")
+    assignee = payload.get("assignee")
+    if assignee is not None and not isinstance(assignee, str):
+        raise deals.DealError("create: 'assignee' — строка (профиль-роль) или null")
+    body = payload.get("body")
+    if body is not None and not isinstance(body, str):
+        raise deals.DealError("create: 'body' — строка")
+    conn = _store_for_write(home)
+    try:
+        return _mutation(
+            conn,
+            home,
+            deals.create_deal(
+                conn,
+                board=str(payload.get("board") or ""),
+                title=str(payload.get("title") or ""),
+                body=str(body or ""),
+                assignee=assignee,
+                parents=parents,
+                known_boards=_known_boards(home),
+                source=source,
+            ),
+        )
+    finally:
+        conn.close()
+
+
+def deals_patch(
+    home: Path, deal_id: str, payload: dict[str, Any], *, source: str = "api"
+) -> dict[str, Any]:
+    """`PATCH /deals/{id}`: title/body/assignee и `status='archived'`."""
+    conn = _store_for_write(home)
+    try:
+        return _mutation(
+            conn,
+            home,
+            deals.patch_deal(
+                conn,
+                deal_id,
+                title=payload.get("title"),
+                body=payload.get("body"),
+                assignee=payload.get("assignee"),
+                status=payload.get("status"),
+                source=source,
+            ),
+        )
+    finally:
+        conn.close()
+
+
+def deals_comment(
+    home: Path, deal_id: str, payload: dict[str, Any], *, source: str = "api"
+) -> dict[str, Any]:
+    """`POST /deals/{id}/comment`: комментарий человека (автор по умолчанию `max`)."""
+    conn = _store_for_write(home)
+    try:
+        return _mutation(
+            conn,
+            home,
+            deals.add_comment(
+                conn,
+                deal_id,
+                author=str(payload.get("author") or "max"),
+                body=str(payload.get("body") or ""),
+                source=source,
+            ),
+        )
+    finally:
+        conn.close()
+
+
+def deals_block(
+    home: Path, deal_id: str, payload: dict[str, Any], *, source: str = "api"
+) -> dict[str, Any]:
+    """`POST /deals/{id}/block`: блокировка с типизированной причиной."""
+    conn = _store_for_write(home)
+    try:
+        return _mutation(
+            conn,
+            home,
+            deals.set_blocked(
+                conn,
+                deal_id,
+                kind=str(payload.get("kind") or "needs_input"),
+                reason=str(payload.get("reason") or ""),
+                author=str(payload.get("author") or "max"),
+                source=source,
+            ),
+        )
+    finally:
+        conn.close()
+
+
+def deals_unblock(
+    home: Path, deal_id: str, payload: dict[str, Any], *, source: str = "api"
+) -> dict[str, Any]:
+    """`POST /deals/{id}/unblock`: снять блок и вернуть дело в очередь."""
+    conn = _store_for_write(home)
+    try:
+        return _mutation(
+            conn,
+            home,
+            deals.set_unblocked(
+                conn, deal_id, author=str(payload.get("author") or "max"), source=source
+            ),
+        )
+    finally:
+        conn.close()
+
+
+def deals_claim(
+    home: Path, deal_id: str, payload: dict[str, Any], *, source: str = "api"
+) -> dict[str, Any]:
+    """`POST /deals/{id}/claim`: взять дело в работу (аренды в 0.0.3 нет)."""
+    conn = _store_for_write(home)
+    try:
+        return _mutation(
+            conn,
+            home,
+            deals.claim_deal(conn, deal_id, owner=str(payload.get("owner") or ""), source=source),
+        )
+    finally:
+        conn.close()
+
+
+def deals_complete(
+    home: Path, deal_id: str, payload: dict[str, Any], *, source: str = "api"
+) -> dict[str, Any]:
+    """`POST /deals/{id}/complete`: закрыть дело или сдать в ревью (`review: true`)."""
+    review = payload.get("review")
+    if review is not None and not isinstance(review, bool):
+        raise deals.DealError("complete: 'review' — true/false")
+    conn = _store_for_write(home)
+    try:
+        return _mutation(
+            conn,
+            home,
+            deals.complete_deal(
+                conn,
+                deal_id,
+                summary=str(payload.get("summary") or ""),
+                review=bool(review),
+                reviewer=payload.get("reviewer"),
+                source=source,
+            ),
+        )
+    finally:
+        conn.close()
+
+
+def deals_review(
+    home: Path, deal_id: str, payload: dict[str, Any], *, source: str = "api"
+) -> dict[str, Any]:
+    """`POST /deals/{id}/review`: сдать дело в ревью."""
+    conn = _store_for_write(home)
+    try:
+        return _mutation(
+            conn,
+            home,
+            deals.request_review(
+                conn,
+                deal_id,
+                reviewer=payload.get("reviewer"),
+                summary=str(payload.get("summary") or ""),
+                source=source,
+            ),
+        )
+    finally:
+        conn.close()
+
+
+def deals_changes(
+    home: Path, deal_id: str, payload: dict[str, Any], *, source: str = "api"
+) -> dict[str, Any]:
+    """`POST /deals/{id}/changes`: вернуть дело на доработку с причиной."""
+    conn = _store_for_write(home)
+    try:
+        return _mutation(
+            conn,
+            home,
+            deals.request_changes(
+                conn,
+                deal_id,
+                reason=str(payload.get("reason") or ""),
+                reviewer=payload.get("reviewer"),
+                source=source,
+            ),
+        )
+    finally:
+        conn.close()
+
+
+def deals_attach(
+    home: Path,
+    deal_id: str,
+    *,
+    filename: str,
+    content: bytes,
+    content_type: Optional[str] = None,
+    source: str = "api",
+) -> dict[str, Any]:
+    """`POST /deals/{id}/attach`: метаданные вложения плюс факт `attached`."""
+    conn = _store_for_write(home)
+    try:
+        return _mutation(
+            conn,
+            home,
+            deals.attach_file(
+                conn,
+                home,
+                deal_id,
+                filename=filename,
+                content=content,
+                content_type=content_type,
+                source=source,
+            ),
+        )
+    finally:
+        conn.close()
+
+
+@router.post("/deals")
+def create_deal_route(payload: dict[str, Any] = Body(...)) -> Any:
+    """`POST /deals {board, title, body?, assignee?, parents?[]}` → дело.
+
+    Отвечает той же формой, что `/deal/{board}/{id}`, плюс блок `mutation`. Ошибка
+    входа (нет доски, нет родителя, пустой title) — 400 с `errors[]`: контракт
+    прямо запрещает 500 на битом входе.
+    """
+    try:
+        return deals_create(_hermes_home(), payload)
+    except deals.DealError as exc:
+        return _deal_error(exc, payload.get("board"), None)
+
+
+@router.patch("/deals/{deal_id}")
+def patch_deal_route(deal_id: str, payload: dict[str, Any] = Body(...)) -> Any:
+    """`PATCH /deals/{id} {title?, body?, assignee?, status?}` → дело."""
+    try:
+        return deals_patch(_hermes_home(), deal_id, payload)
+    except deals.DealError as exc:
+        return _deal_error(exc, None, deal_id)
+
+
+@router.post("/deals/{deal_id}/comment")
+def comment_deal_route(deal_id: str, payload: dict[str, Any] = Body(...)) -> Any:
+    """`POST /deals/{id}/comment {author, body}` → дело с комментарием в таймлайне."""
+    try:
+        return deals_comment(_hermes_home(), deal_id, payload)
+    except deals.DealError as exc:
+        return _deal_error(exc, None, deal_id)
+
+
+@router.post("/deals/{deal_id}/block")
+def block_deal_route(deal_id: str, payload: dict[str, Any] = Body(...)) -> Any:
+    """`POST /deals/{id}/block {kind, reason}` → дело в `blocked`."""
+    try:
+        return deals_block(_hermes_home(), deal_id, payload)
+    except deals.DealError as exc:
+        return _deal_error(exc, None, deal_id)
+
+
+@router.post("/deals/{deal_id}/unblock")
+def unblock_deal_route(deal_id: str, payload: dict[str, Any] = Body(default={})) -> Any:
+    """`POST /deals/{id}/unblock {}` → дело снова в очереди."""
+    try:
+        return deals_unblock(_hermes_home(), deal_id, payload or {})
+    except deals.DealError as exc:
+        return _deal_error(exc, None, deal_id)
+
+
+@router.post("/deals/{deal_id}/claim")
+def claim_deal_route(deal_id: str, payload: dict[str, Any] = Body(...)) -> Any:
+    """`POST /deals/{id}/claim {owner}` → дело `running` с названным владельцем."""
+    try:
+        return deals_claim(_hermes_home(), deal_id, payload)
+    except deals.DealError as exc:
+        return _deal_error(exc, None, deal_id)
+
+
+@router.post("/deals/{deal_id}/complete")
+def complete_deal_route(deal_id: str, payload: dict[str, Any] = Body(...)) -> Any:
+    """`POST /deals/{id}/complete {summary, review?}` → дело закрыто или в ревью."""
+    try:
+        return deals_complete(_hermes_home(), deal_id, payload)
+    except deals.DealError as exc:
+        return _deal_error(exc, None, deal_id)
+
+
+@router.post("/deals/{deal_id}/review")
+def review_deal_route(deal_id: str, payload: dict[str, Any] = Body(...)) -> Any:
+    """`POST /deals/{id}/review {reviewer?, summary?}` → `status='review'`."""
+    try:
+        return deals_review(_hermes_home(), deal_id, payload)
+    except deals.DealError as exc:
+        return _deal_error(exc, None, deal_id)
+
+
+@router.post("/deals/{deal_id}/changes")
+def changes_deal_route(deal_id: str, payload: dict[str, Any] = Body(...)) -> Any:
+    """`POST /deals/{id}/changes {reason, reviewer?}` → возврат на доработку."""
+    try:
+        return deals_changes(_hermes_home(), deal_id, payload)
+    except deals.DealError as exc:
+        return _deal_error(exc, None, deal_id)
+
+
+@router.post("/deals/{deal_id}/attach")
+def attach_deal_route(deal_id: str, file: UploadFile = File(...)) -> Any:
+    """`POST /deals/{id}/attach` (multipart `file`) → дело плюс `attachment`.
+
+    Файл читается целиком: предел вложения (`deals.ATTACH_LIMIT_BYTES`) назван
+    числом, и превышение — 400 с причиной, а не тихо урезанный файл.
+    """
+    try:
+        content = file.file.read()
+        return deals_attach(
+            _hermes_home(),
+            deal_id,
+            filename=file.filename or "",
+            content=content,
+            content_type=file.content_type,
+        )
+    except deals.DealError as exc:
+        return _deal_error(exc, None, deal_id)
 
 
 def _board_entry(home: Path, slug: str) -> dict[str, Any]:
@@ -1609,16 +2450,7 @@ def ask_deal(board: str, task_id: str, payload: dict[str, Any] = Body(...)) -> A
     этом не пишется (`question_asked` только после успешной вставки).
     """
     home = _hermes_home()
-    entry = _board_entry(home, board)
-    rows, err = _query_checked(Path(entry["path"]), "SELECT id FROM tasks WHERE id = ?", (task_id,))
-    if err:
-        raise HTTPException(
-            status_code=503, headers=NO_STORE_HEADERS, detail=f"board '{board}' unreadable: {err}"
-        )
-    if not rows:
-        raise HTTPException(
-            status_code=404, headers=NO_STORE_HEADERS, detail=f"task '{task_id}' not found on board '{board}'"
-        )
+    _resolve_deal(home, board, task_id)
 
     text = " ".join(str(payload.get("text") or "").split())
     if not text:
@@ -1683,8 +2515,24 @@ def ask_deal(board: str, task_id: str, payload: dict[str, Any] = Body(...)) -> A
 
 @router.get("/duty/{board}/{task_id}/attempts")
 def duty_attempts(board: str, task_id: str) -> dict[str, Any]:
-    """Таймлайн попыток дела: все раны по возрастанию старта плюс их события."""
+    """Таймлайн попыток дела: все раны по возрастанию старта плюс их события.
+
+    У своего дела попыток нет и быть не может: спавна в 0.0.3 нет (`docs/OWNERSHIP.md`,
+    «что НЕ входит»). Роут отвечает пустым таймлайном с пометкой, а не 404: дело
+    существует, и «попыток не было» — это факт о нём, а не отсутствие дела.
+    """
     home = _hermes_home()
+    if deals.is_own(task_id):
+        resolved = _resolve_deal(home, board, task_id)
+        return {
+            "board": board,
+            "task_id": task_id,
+            "title": resolved.get("title"),
+            "count": 0,
+            "crash_outcomes": list(CRASH_OUTCOMES),
+            "attempts": [],
+            "note": "своё дело: попыток нет (аренда и спавн — следующая версия)",
+        }
     path = Path(_board_entry(home, board)["path"])
     tasks, err = _query_checked(path, "SELECT id, title FROM tasks WHERE id = ?", (task_id,))
     if err:

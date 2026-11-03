@@ -1,0 +1,745 @@
+"""CLI hermes-duty: тот же бэкенд, что у роутов, но из терминала.
+
+    duty now [--board B] [--state S]      таблица дел: доска, id, ожидание, возраст, доказательство
+    duty deal <board> <id>                карточка дела: факты плюс таймлайн попыток
+    duty attempts <board> <id>            только таймлайн попыток
+    duty stats [--board B] [--since D]    p50/p90/p99, исходы, «с первой попытки»
+    duty why <board> <id>                 доказательство словами бэкенда
+    duty watch [--interval 10]            тот же `now`, перерисовка в терминале
+    --json (глобальный флаг)              машиночитаемый вывод: ровно форма роута
+
+Ни одного собственного правила здесь нет: команды вызывают те же функции, что и
+маршруты (`dashboard/plugin_api.py`: `now`, `deal`, `duty_attempts`, `stats`), а не
+ходят в HTTP и не пересчитывают состояния. `--json` печатает ответ роута дословно
+— второй формы у CLI нет, поэтому расхождение «терминал сказал одно, экран другое»
+невозможно по построению.
+
+Коды возврата (контракт карточки W3):
+
+- `0` — успех: ответ получен целиком, `errors[]` пуст;
+- `1` — доска или дело не найдены (роут ответил 404);
+- `2` — ошибка источников: роут ответил ошибкой (503 «не прочиталось», 400
+  «неизвестное состояние») либо в ответе есть `errors[]` — часть источников не
+  прочитана, и выдавать такой ответ за полный нельзя.
+
+`duty watch` деградацию источников не превращает в падение: печатает `errors[]`
+строками и продолжает. Отсутствующая доска — исключение: она не появится сама,
+поэтому выход сразу с кодом 1.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import importlib.util
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any, Optional
+
+EXIT_OK = 0
+EXIT_NOT_FOUND = 1
+EXIT_SOURCE = 2
+
+# Метка «я уже перезапускался»: без неё неудачный поиск интерпретатора дал бы
+# бесконечную цепочку `execv`.
+REEXEC_MARK = "DUTY_CLI_REEXEC"
+
+# `dashboard/plugin_api.py` — тот же модуль, что грузит плагин: пакета у него нет,
+# поэтому берём его по пути и кладём в `sys.modules` под стабильным именем.
+PLUGIN_API_MODULE_NAME = "hermes_duty_plugin_api"
+
+
+class NotFound(RuntimeError):
+    """Дело или доска не найдены (роут ответил 404) — код возврата 1."""
+
+
+class SourceFailure(RuntimeError):
+    """Источники не прочитались (503/400 роута или `errors[]` ответа) — код 2."""
+
+
+# --------------------------------------------------------------- бэкенд роутов
+
+
+def _load_plugin_api() -> Any:
+    """Загрузить `dashboard/plugin_api.py` — тот же модуль, что у маршрутов."""
+    loaded = sys.modules.get(PLUGIN_API_MODULE_NAME)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / "plugin_api.py"
+    spec = importlib.util.spec_from_file_location(PLUGIN_API_MODULE_NAME, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise SourceFailure(f"plugin_api module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[PLUGIN_API_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_API: Any = None
+
+
+def api() -> Any:
+    """Модуль бэкенда (грузится один раз на процесс)."""
+    global _API
+    if _API is None:
+        _API = _load_plugin_api()
+    return _API
+
+
+def _route(fn: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    """Вызвать функцию роута и перевести её отказ в код возврата CLI.
+
+    Коды берутся из того, что уже решил роут: 404 — «не найдено» (1), остальное
+    (503 «источник не прочитался», 400 «неизвестное состояние») — ошибка
+    источников или разбора (2). Второго набора правил у CLI нет.
+    """
+    try:
+        return fn(*args, **kwargs)
+    except (NotFound, SourceFailure):
+        raise
+    except Exception as exc:  # отказ роута и есть ответ CLI
+        detail = getattr(exc, "detail", None) or f"{type(exc).__name__}: {exc}"
+        if getattr(exc, "status_code", None) == 404:
+            raise NotFound(str(detail)) from exc
+        raise SourceFailure(str(detail)) from exc
+
+
+def _payload_code(payload: dict[str, Any]) -> int:
+    """Код возврата по ответу: `errors[]` значит «часть источников не прочитана»."""
+    return EXIT_SOURCE if payload.get("errors") else EXIT_OK
+
+
+def _agent_pythons() -> list[str]:
+    """Кандидаты в интерпретатор агента: в них есть fastapi, нужный бэкенду.
+
+    Смотрим и в `HERMES_HOME`, и в домашний `~/.hermes`: `HERMES_HOME` бывает
+    профилем (`~/.hermes/profiles/<role>`), а интерпретатор с зависимостями живёт
+    в корне агента — привязывать поиск к одному пути значит ломать CLI в
+    профильной оболочке.
+    """
+    explicit = os.environ.get("DUTY_PYTHON")
+    roots = [Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")).expanduser()]
+    roots.append(Path.home() / ".hermes")
+    found: list[str] = [explicit] if explicit else []
+    for root in roots:
+        for base in (root / "hermes-agent" / "venv" / "bin", root / "bvenv" / "bin"):
+            for name in ("python3", "python"):
+                candidate = base / name
+                if candidate.is_file() and os.access(candidate, os.X_OK) and str(candidate) not in found:
+                    found.append(str(candidate))
+    return found
+
+
+def _ensure_interpreter(argv: Optional[list[str]]) -> None:
+    """Перезапустить CLI интерпретатором агента, если в текущем нет fastapi.
+
+    `dashboard/plugin_api.py` импортирует fastapi на уровне модуля, а в системном
+    `python3` (Xcode) его нет. Перезапуск `os.execv` оставляет один и тот же код и
+    одну форму ответа — это не второй путь вычислений, а тот же самый под другим
+    интерпретатором.
+    """
+    if importlib.util.find_spec("fastapi") is not None:
+        return
+    args = list(sys.argv[1:] if argv is None else argv)
+    if os.environ.get(REEXEC_MARK):
+        print(
+            "duty: в текущем интерпретаторе нет fastapi, а интерпретатор агента не найден "
+            f"({sys.executable}). Укажите его через DUTY_PYTHON.",
+            file=sys.stderr,
+        )
+        raise SystemExit(EXIT_SOURCE)
+    for candidate in _agent_pythons():
+        if Path(candidate).resolve() == Path(sys.executable).resolve():
+            continue
+        os.environ[REEXEC_MARK] = "1"
+        try:
+            os.execv(candidate, [candidate, str(Path(__file__).resolve()), *args])
+        except OSError:
+            continue
+    print(
+        "duty: не найден интерпретатор с fastapi — ни текущий, ни интерпретатор агента. "
+        "Укажите его через DUTY_PYTHON.",
+        file=sys.stderr,
+    )
+    raise SystemExit(EXIT_SOURCE)
+
+
+# ------------------------------------------------------------------ разбор argv
+
+
+def since_arg(value: str) -> int:
+    """`--since D` → unix-секунды: unix-время, `YYYY-MM-DD` или `YYYY-MM-DDTHH:MM[:SS]`.
+
+    Дата без времени читается как полночь по местным часам: «с этого дня» значит
+    «с начала дня», а не «с текущей секунды». Ничего не додумываем: непонятная
+    дата — ошибка разбора (`argparse` отвечает кодом 2).
+    """
+    text = value.strip()
+    if text.isdigit():
+        return int(text)
+    try:
+        moment = datetime.datetime.fromisoformat(text.replace(" ", "T"))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--since: ожидалось unix-время, YYYY-MM-DD или YYYY-MM-DDTHH:MM, получено {value!r}"
+        ) from exc
+    return int(moment.timestamp())
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Разбор команд. `--json` объявлен и глобально, и внутри команд: флаг должен
+    работать и до команды, и после неё — это одна и та же опция."""
+    parser = argparse.ArgumentParser(
+        prog="duty",
+        description="Дела hermes-duty из терминала: те же функции, что у роутов, без HTTP.",
+    )
+    parser.add_argument("--json", action="store_true", help="машиночитаемый вывод: ровно форма роута")
+    commands = parser.add_subparsers(dest="command", metavar="команда")
+
+    def command(name: str, help_text: str) -> argparse.ArgumentParser:
+        sub = commands.add_parser(name, help=help_text, description=help_text)
+        # `default=SUPPRESS`: иначе подпарсер перезапишет `--json`, уже прочитанный
+        # до команды (`duty --json now`), своим значением по умолчанию.
+        sub.add_argument(
+            "--json",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="машиночитаемый вывод: ровно форма роута",
+        )
+        return sub
+
+    now = command("now", "таблица дел: доска, id, ожидание, возраст, доказательство")
+    now.add_argument("--board", help="только одна доска (slug)")
+    now.add_argument("--state", help="только дела в этом waiting.state")
+
+    deal = command("deal", "карточка дела: факты плюс таймлайн попыток")
+    deal.add_argument("board")
+    deal.add_argument("task_id")
+
+    attempts = command("attempts", "только таймлайн попыток")
+    attempts.add_argument("board")
+    attempts.add_argument("task_id")
+
+    stats = command("stats", "p50/p90/p99, исходы, доля с первой попытки")
+    stats.add_argument("--board", help="только одна доска (slug)")
+    stats.add_argument("--since", type=since_arg, help="окно по created_at: unix, YYYY-MM-DD или YYYY-MM-DDTHH:MM")
+
+    why = command("why", "доказательство словами бэкенда")
+    why.add_argument("board")
+    why.add_argument("task_id")
+
+    watch = command("watch", "тот же now, перерисовка в терминале")
+    watch.add_argument("--interval", type=float, default=10.0, help="секунд между тиками (по умолчанию 10)")
+    watch.add_argument("--board", help="только одна доска (slug)")
+    watch.add_argument("--state", help="только дела в этом waiting.state")
+    return parser
+
+
+# ------------------------------------------------------------------ оформление
+
+
+def _fmt_age(sec: Any) -> str:
+    """Возраст/длительность словами: `45 с`, `12 мин`, `3 ч`, `2 д`."""
+    if sec is None or sec == "":
+        return "—"
+    value = max(0, int(sec))
+    if value < 60:
+        return f"{value} с"
+    if value < 3600:
+        return f"{value // 60} мин"
+    if value < 86400:
+        return f"{value // 3600} ч"
+    return f"{value // 86400} д"
+
+
+def _fmt_clock(at: Any) -> str:
+    """Время события: ЧЧ:ММ:СС (попытки идут минутами, секунды нужны для порядка)."""
+    if not at:
+        return "—"
+    return time.strftime("%H:%M:%S", time.localtime(int(at)))
+
+
+def _fmt_stamp(at: Any) -> str:
+    """Метка среза: дата и время, чтобы «сейчас» не путалось со «вчера»."""
+    if not at:
+        return "—"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(at)))
+
+
+def _age(at: Any, now: Any) -> Optional[int]:
+    """Сколько секунд назад была метка — вычитание двух полей ответа, не правило."""
+    if at is None or not now:
+        return None
+    return max(0, int(now) - int(at))
+
+
+def _clip(text: Any, width: int) -> str:
+    """Одна строка не длиннее `width`: переводы строк ломают таблицу."""
+    value = " ".join(str("" if text is None else text).split())
+    if len(value) <= width:
+        return value
+    return value[: width - 1].rstrip() + "…"
+
+
+def _table(columns: tuple[tuple[str, int], ...], rows: list[list[Any]]) -> str:
+    """Простая таблица: ширина колонки — максимум из заголовка и обрезанных ячеек."""
+    cells = [[_clip(cell, width) for cell, (_, width) in zip(row, columns)] for row in rows]
+    widths: list[int] = []
+    for index, (header, _) in enumerate(columns):
+        width = len(header)
+        for row in cells:
+            width = max(width, len(row[index]))
+        widths.append(width)
+    lines = ["  ".join(header.ljust(widths[i]) for i, (header, _) in enumerate(columns)).rstrip()]
+    for row in cells:
+        lines.append("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip())
+    return "\n".join(lines)
+
+
+def _counts(mapping: Any) -> str:
+    """Счётчики строкой в порядке убывания: `completed 200 · crashed 12`."""
+    items = [(str(key), int(value)) for key, value in (mapping or {}).items()]
+    if not items:
+        return "—"
+    items.sort(key=lambda item: (-item[1], item[0]))
+    return " · ".join(f"{key} {value}" for key, value in items)
+
+
+def _distribution(dist: Any) -> str:
+    """Распределение ожидания: перцентили бэкенда как есть, без пересчёта."""
+    data = dist or {}
+    if not data.get("count"):
+        return "нет данных (ни у одного дела не было первой попытки)"
+    parts = [
+        f"p{pct} {_fmt_age(data.get(f'p{pct}'))}" for pct in (50, 90, 99) if data.get(f"p{pct}") is not None
+    ]
+    return f"{' · '.join(parts)} (n={data.get('count')}, максимум {_fmt_age(data.get('max'))})"
+
+
+def _share(first: Any) -> str:
+    """«С первой попытки»: доля и её основание, а не одно число без знаменателя."""
+    data = first or {}
+    with_runs = int(data.get("with_runs") or 0)
+    if not with_runs:
+        return "нет ранов — доля не считается"
+    ok = int(data.get("ok") or 0)
+    share = data.get("share")
+    percent = "—" if share is None else f"{round(float(share) * 100)}%"
+    return f"{ok}/{with_runs} ({percent})"
+
+
+def _share_cell(first: Any) -> str:
+    """Та же доля компактно для таблицы: у доски без ранов — прочерк, «нет ранов» один раз в итоге."""
+    data = first or {}
+    if not int(data.get("with_runs") or 0):
+        return "—"
+    share = data.get("share")
+    percent = "—" if share is None else f"{round(float(share) * 100)}%"
+    return f"{int(data.get('ok') or 0)}/{int(data['with_runs'])} ({percent})"
+
+
+def _notice_lines(payload: dict[str, Any]) -> list[str]:
+    """Строки деградации: что не прочиталось и что прочитано неполно.
+
+    Роут отвечает 200 и называет это в `errors[]`/`warnings[]`; CLI не выдаёт
+    частичный ответ за полный, но и не падает из-за него.
+    """
+    lines: list[str] = []
+    for error in payload.get("errors") or []:
+        lines.append(f"! источник {error.get('board')}: {error.get('reason')}")
+    for warning in payload.get("warnings") or []:
+        lines.append(f"! {warning}")
+    for board in payload.get("boards") or []:
+        for warning in board.get("warnings") or []:
+            lines.append(f"! доска {board.get('slug')}: {warning}")
+        if board.get("truncated"):
+            lines.append(f"! доска {board.get('slug')}: срез обрезан лимитом — картина неполная")
+    return lines
+
+
+# -------------------------------------------------------------------- команды
+
+
+NOW_COLUMNS = (
+    ("ДОСКА", 16),
+    ("ID", 14),
+    ("СОСТОЯНИЕ", 20),
+    ("ОЖИДАНИЕ", 9),
+    ("ВОЗРАСТ", 8),
+    ("ДЕЛО", 28),
+    ("ДОКАЗАТЕЛЬСТВО", 72),
+)
+
+STATS_COLUMNS = (
+    ("ДОСКА", 16),
+    ("ЗАДАЧ", 7),
+    ("РАНОВ", 7),
+    ("С ПЕРВОЙ", 15),
+    ("P50", 8),
+    ("P90", 8),
+    ("P99", 8),
+    ("ОЖИДАНИЙ", 9),
+)
+
+
+def _now_row(deal: dict[str, Any], now: Any) -> list[Any]:
+    """Строка таблицы «сейчас» из дела ответа `/now`.
+
+    `ОЖИДАНИЕ` — возраст текущей попытки, а если попытки нет — возраст дела: ровно
+    то число, по которому `/now` сортирует дела. `ВОЗРАСТ` — возраст самого дела.
+    Обе колонки — вычитание полей ответа, не новые правила.
+    """
+    waiting = deal.get("waiting") or {}
+    attempt = deal.get("attempt") or {}
+    state = str(waiting.get("state") or "—")
+    human_kind = waiting.get("human_kind")
+    if human_kind:
+        state = f"{state}/{human_kind}"
+    deal_age = _age(deal.get("created_at"), now)
+    wait_age = attempt.get("age_sec")
+    if wait_age is None:
+        wait_age = deal_age
+    return [
+        deal.get("board"),
+        deal.get("id"),
+        state,
+        _fmt_age(wait_age),
+        _fmt_age(deal_age),
+        deal.get("title"),
+        waiting.get("evidence"),
+    ]
+
+
+def render_now(payload: dict[str, Any]) -> str:
+    """Таблица дел: та же сортировка и те же состояния, что у `/now`."""
+    lines = [f"ДЕЛА СЕЙЧАС · {_fmt_stamp(payload.get('now'))} · дел: {payload.get('count', 0)}"]
+    counted = ", ".join(
+        f"{name} {count}" for name, count in (payload.get("by_state") or {}).items() if count
+    )
+    if counted:
+        lines.append(f"по состояниям: {counted}")
+    lines.extend(_notice_lines(payload))
+    deals = payload.get("deals") or []
+    if not deals:
+        lines.append("")
+        lines.append("активных дел нет")
+        return "\n".join(lines)
+    lines.append("")
+    lines.append(_table(NOW_COLUMNS, [_now_row(deal, payload.get("now")) for deal in deals]))
+    lines.append("")
+    lines.append("доказательство целиком: duty why <доска> <id> · таймлайн: duty attempts <доска> <id>")
+    return "\n".join(lines)
+
+
+def _board_row(board: dict[str, Any]) -> list[Any]:
+    """Строка таблицы «по доскам»: непрочитанная доска — прочерки, а не нули."""
+    if not board.get("read"):
+        return [board.get("slug"), "—", "—", "не прочитана", "—", "—", "—", "—"]
+    first = board.get("first_try") or {}
+    dist = board.get("waiting_sec") or {}
+    return [
+        board.get("slug"),
+        board.get("tasks_total"),
+        board.get("runs_total"),
+        _share_cell(first),
+        _fmt_age(dist.get("p50")),
+        _fmt_age(dist.get("p90")),
+        _fmt_age(dist.get("p99")),
+        dist.get("count", 0),
+    ]
+
+
+def render_stats(payload: dict[str, Any]) -> str:
+    """Здоровье: перцентили ожидания, исходы и доля с первой попытки."""
+    totals = payload.get("totals") or {}
+    boards = payload.get("boards") or []
+    lines = [
+        "ЗДОРОВЬЕ · {} · досок: {} · задач: {} · ранов: {}".format(
+            _fmt_stamp(payload.get("now")),
+            len(boards),
+            totals.get("tasks_total", 0),
+            totals.get("runs_total", 0),
+        )
+    ]
+    lines.extend(_notice_lines(payload))
+    lines.append("")
+    lines.append(f"с первой попытки: {_share(totals.get('first_try'))}")
+    lines.append(f"ожидание до первой попытки: {_distribution(totals.get('waiting_sec'))}")
+    lines.append(f"исходы ранов: {_counts(totals.get('runs_by_outcome'))}")
+    lines.append(f"статусы дел: {_counts(totals.get('tasks_by_status'))}")
+    if boards:
+        lines.append("")
+        lines.append(_table(STATS_COLUMNS, [_board_row(board) for board in boards]))
+    return "\n".join(lines)
+
+
+def _attempt_head(attempt: dict[str, Any]) -> str:
+    """Первая строка попытки: кто, чем закончилось, сколько шло."""
+    bits = [f"#{attempt.get('run_id')}", str(attempt.get("profile") or "—"), str(attempt.get("status") or "—")]
+    if attempt.get("outcome"):
+        bits.append(f"outcome={attempt.get('outcome')}")
+    bits.append(f"старт {_fmt_clock(attempt.get('start'))}")
+    bits.append(f"длительность {_fmt_age(attempt.get('duration_sec'))}")
+    return " · ".join(bits)
+
+
+def render_attempts(payload: dict[str, Any]) -> str:
+    """Таймлайн попыток: раны по возрастанию старта плюс их события."""
+    lines = [
+        "ПОПЫТКИ · {}/{} · {} · {}".format(
+            payload.get("board"),
+            payload.get("task_id"),
+            _clip(payload.get("title"), 80),
+            payload.get("count", 0),
+        )
+    ]
+    attempts = payload.get("attempts") or []
+    if not attempts:
+        lines.append("")
+        lines.append("попыток нет")
+        return "\n".join(lines)
+    for attempt in attempts:
+        lines.append("")
+        lines.append(_attempt_head(attempt))
+        if attempt.get("summary"):
+            lines.append(f"  итог: {attempt.get('summary')}")
+        if attempt.get("error"):
+            lines.append(f"  ошибка: {attempt.get('error')}")
+        for event in attempt.get("events") or []:
+            summary = event.get("summary") or ""
+            lines.append(f"  {_fmt_clock(event.get('at'))}  {event.get('kind')}  {summary}".rstrip())
+    return "\n".join(lines)
+
+
+def _waiting_head(payload: dict[str, Any]) -> str:
+    """Строка состояния ожидания: состояние, вид «нужен человек» и приговор журнала."""
+    shaped = payload.get("deal")
+    if shaped is None:
+        if payload.get("terminal"):
+            return f"не считается: дело закрыто (status={payload.get('status')}), ждать нечего"
+        return (
+            "не посчитано: дела нет в срезе «сейчас» — журнал говорит completed "
+            "либо срез обрезан лимитом (решение роута /deal)"
+        )
+    waiting = shaped.get("waiting") or {}
+    state = str(waiting.get("state") or "—")
+    if waiting.get("human_kind"):
+        state = f"{state}/{waiting['human_kind']}"
+    return state
+
+
+def render_deal(payload: dict[str, Any], timeline: Optional[dict[str, Any]], timeline_error: Optional[str]) -> str:
+    """Карточка дела: спецификация, факты ожидания и таймлайн попыток."""
+    lines = [
+        "ДЕЛО {}/{} · {} · {} · создано {}".format(
+            payload.get("board"),
+            payload.get("id"),
+            payload.get("status") or "—",
+            payload.get("assignee") or "—",
+            _fmt_stamp(payload.get("created_at")),
+        )
+    ]
+    lines.append(f"заголовок: {payload.get('title') or '—'}")
+    lines.append(f"состояние ожидания: {_waiting_head(payload)}")
+    shaped = payload.get("deal")
+    if shaped is not None:
+        lines.append(f"доказательство: {(shaped.get('waiting') or {}).get('evidence') or 'не записано'}")
+        lines.append("")
+        lines.extend(_fact_lines(shaped, payload.get("now")))
+    # Тело карточки — спецификация дела (как на экране «Дело»); в CLI оно не
+    # печатается, чтобы карточка оставалась фактами и таймлайном. Целиком оно
+    # есть в `--json` того же роута — дословно.
+    lines.append("")
+    if timeline is None:
+        lines.append(f"! таймлайн попыток не прочитан: {timeline_error}")
+    else:
+        lines.append(render_attempts(timeline))
+    return "\n".join(lines)
+
+
+def _fact_lines(shaped: dict[str, Any], now: Any) -> list[str]:
+    """Факты дела словами: попытка, лизинг, последнее действие — поля ответа как есть."""
+    lines: list[str] = []
+    attempt = shaped.get("attempt")
+    if attempt is None:
+        lines.append("  попытка: нет")
+    else:
+        alive = {True: "pid жив", False: "pid мёртв", None: "pid не записан или неизвестен"}[
+            attempt.get("pid_alive")
+        ]
+        lines.append(
+            f"  попытка: ран {attempt.get('run_id')} {attempt.get('run_status') or '—'}, "
+            f"{alive} ({attempt.get('pid') or '—'}), heartbeat {_fmt_age(attempt.get('heartbeat_age_sec'))} назад, "
+            f"факты из {attempt.get('source')}"
+        )
+    lease = shaped.get("lease") or {}
+    lease_state = str(lease.get("state") or "—")
+    if lease_state == "none":
+        lines.append("  лизинг: нет")
+    else:
+        lines.append(
+            f"  лизинг: {lease_state}, истекает через {_fmt_age(lease.get('expires_in_sec'))} "
+            f"({lease.get('claim_lock') or '—'})"
+        )
+    action = shaped.get("last_action") or {}
+    lines.append(
+        f"  последнее действие: {action.get('kind') or '—'} {_fmt_age(action.get('age_sec'))} назад"
+        + (f" — {action.get('summary')}" if action.get("summary") else "")
+    )
+    last_run = shaped.get("last_run")
+    if last_run:
+        lines.append(
+            f"  последний ран: {last_run.get('run_id')} {last_run.get('status') or '—'} "
+            f"outcome={last_run.get('outcome') or '—'}"
+        )
+    lines.append(f"  возраст дела: {_fmt_age(_age(shaped.get('created_at'), now))}")
+    return lines
+
+
+def render_why(payload: dict[str, Any]) -> str:
+    """Доказательство словами бэкенда: тот же `waiting.evidence`, что на экране «Почему стоит»."""
+    lines = [
+        "ПОЧЕМУ СТОИТ {}/{} · {} · {}".format(
+            payload.get("board"),
+            payload.get("id"),
+            payload.get("status") or "—",
+            payload.get("assignee") or "—",
+        )
+    ]
+    lines.append(f"заголовок: {payload.get('title') or '—'}")
+    lines.append(f"состояние ожидания: {_waiting_head(payload)}")
+    shaped = payload.get("deal")
+    if shaped is None:
+        lines.append("доказательство: не записано — роут /deal не вернул фактов ожидания")
+        return "\n".join(lines)
+    lines.append("доказательство (словами бэкенда):")
+    lines.append(f"  {(shaped.get('waiting') or {}).get('evidence') or 'не записано'}")
+    lines.append("факты, из которых оно собрано:")
+    lines.extend(_fact_lines(shaped, payload.get("now")))
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------- watch
+
+
+def run_watch(
+    interval: float,
+    *,
+    board: Optional[str] = None,
+    state: Optional[str] = None,
+    as_json: bool = False,
+    ticks: Optional[int] = None,
+    stream: Any = None,
+) -> int:
+    """Перерисовывать `now` в терминале, не падая на деградации источников.
+
+    `ticks` ограничивает число тиков (тесты и разовые прогоны), `None` — вечно,
+    до сигнала. Экран чистится только когда вывод — терминал: в файле и в пайпе
+    остаются блоки текста, а не escape-последовательности.
+    """
+    out = stream or sys.stdout
+    tick = 0
+    while ticks is None or tick < ticks:
+        tick += 1
+        first_tick = tick == 1
+        try:
+            payload = _route(api().now, board=board, state=state)
+        except NotFound as exc:
+            # Доска не появится сама: это не деградация, а неверный аргумент.
+            print(f"! {exc}", file=sys.stderr)
+            return EXIT_NOT_FOUND
+        except SourceFailure as exc:
+            # Источник может ожить через тик — печатаем строку и продолжаем. Но не
+            # на первом тике: там отказ значит «аргументы неверны или источников
+            # нет вовсе», и молча крутиться в ошибке — не ответ.
+            _write(out, f"! источники: {exc}")
+            if first_tick:
+                return EXIT_SOURCE
+        else:
+            body = json.dumps(payload, ensure_ascii=False) if as_json else render_now(payload)
+            if out.isatty() and not as_json:
+                _write(out, "\x1b[2J\x1b[H" + body)
+            else:
+                _write(out, body if tick == 1 else "\n" + body)
+        if ticks is not None and tick >= ticks:
+            break
+        try:
+            time.sleep(interval)
+        except KeyboardInterrupt:  # pragma: no cover - ручное прерывание
+            break
+    return EXIT_OK
+
+
+def _write(stream: Any, text: str) -> None:
+    """Один блок вывода плюс сброс буфера: watch должен обновляться сразу."""
+    stream.write(text + "\n")
+    stream.flush()
+
+
+# ------------------------------------------------------------------------ main
+
+
+def _emit_json(payload: dict[str, Any], stream: Any) -> None:
+    """`--json` — ответ роута дословно, без добавленных ключей."""
+    print(json.dumps(payload, ensure_ascii=False, indent=2), file=stream)
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    """Точка входа CLI: вернуть код 0/1/2, ничего не печатая в stderr без причины."""
+    _ensure_interpreter(argv)
+    parser = build_parser()
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    if not args.command:
+        parser.print_help()
+        return EXIT_OK
+    out = sys.stdout
+    try:
+        if args.command == "watch":
+            return run_watch(
+                args.interval, board=args.board, state=args.state, as_json=args.json, stream=out
+            )
+        if args.command == "now":
+            payload = _route(api().now, board=args.board, state=args.state)
+            _emit_json(payload, out) if args.json else print(render_now(payload), file=out)
+            return _payload_code(payload)
+        if args.command == "stats":
+            payload = _route(api().stats, board=args.board, since=args.since)
+            _emit_json(payload, out) if args.json else print(render_stats(payload), file=out)
+            return _payload_code(payload)
+        if args.command == "attempts":
+            payload = _route(api().duty_attempts, args.board, args.task_id)
+            _emit_json(payload, out) if args.json else print(render_attempts(payload), file=out)
+            return _payload_code(payload)
+        if args.command == "why":
+            payload = _route(api().deal, args.board, args.task_id)
+            _emit_json(payload, out) if args.json else print(render_why(payload), file=out)
+            return _payload_code(payload)
+        if args.command == "deal":
+            payload = _route(api().deal, args.board, args.task_id)
+            if args.json:
+                # Форма роута `/deal` дословно: таймлайн — отдельный роут
+                # `/duty/.../attempts` и своя форма (`duty attempts --json`).
+                _emit_json(payload, out)
+                return _payload_code(payload)
+            timeline: Optional[dict[str, Any]] = None
+            timeline_error: Optional[str] = None
+            try:
+                timeline = _route(api().duty_attempts, args.board, args.task_id)
+            except SourceFailure as exc:
+                timeline_error = str(exc)
+            print(render_deal(payload, timeline, timeline_error), file=out)
+            return EXIT_SOURCE if timeline_error else _payload_code(payload)
+    except NotFound as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+    except SourceFailure as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return EXIT_SOURCE
+    return EXIT_SOURCE  # pragma: no cover - неизвестная команда сюда не доходит
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

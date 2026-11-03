@@ -1273,12 +1273,18 @@ def _waiting_distribution(values: list[int]) -> dict[str, Any]:
     return shaped
 
 
-def _stats_board(entry: dict[str, Any]) -> dict[str, Any]:
+def _stats_board(entry: dict[str, Any], *, since: Optional[int] = None) -> dict[str, Any]:
     """Метрики одной доски: первая попытка, ожидание до неё, исходы ранов.
 
     Провал чтения `tasks` роняет вызов (доска уходит в `errors`), провал
     `task_runs` — только в `warnings`: доля попыток тогда не считается, и это
     видно как `first_try.with_runs = 0`, а не как «всё с первой попытки».
+
+    `since` — нижняя граница окна по `tasks.created_at` (unix-секунды). Фильтр
+    живёт здесь, а не в CLI: распределение и доля считаются по тому же проходу,
+    иначе терминал показывал бы числа, которых не считает ни один роут. Задачи
+    без `created_at` в окно не попадают — их нечем датировать, — и это названо
+    в `warnings`, а не спрятано.
     """
     slug = str(entry["slug"])
     path = Path(entry["path"])
@@ -1290,11 +1296,21 @@ def _stats_board(entry: dict[str, Any]) -> dict[str, Any]:
         # должны помечаться обрезанными.
         tasks, err = _fetch(
             conn,
-            "SELECT id, status, created_at FROM tasks ORDER BY created_at, id LIMIT ?",
-            (STATS_TASK_LIMIT + 1,),
+            "SELECT id, status, created_at FROM tasks "
+            "WHERE (? IS NULL OR (created_at IS NOT NULL AND created_at >= ?)) "
+            "ORDER BY created_at, id LIMIT ?",
+            (since, since, STATS_TASK_LIMIT + 1),
         )
         if err:
             raise RuntimeError(err)
+        if since is not None:
+            rows, err = _fetch(conn, "SELECT COUNT(*) AS n FROM tasks WHERE created_at IS NULL")
+            if err:
+                warnings.append(f"tasks(created_at): {err}")
+            elif rows and int(rows[0].get("n") or 0):
+                warnings.append(
+                    f"задач без created_at: {int(rows[0]['n'])} — в окно since не вошли, датировать нечем"
+                )
         truncated = len(tasks) > STATS_TASK_LIMIT
         tasks = tasks[:STATS_TASK_LIMIT]
         task_ids = [str(task.get("id")) for task in tasks]
@@ -1358,13 +1374,23 @@ def _stats_board(entry: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def collect_stats(home: Path, now: int) -> dict[str, Any]:
-    """Здоровье всех живых досок: агрегат по ранам плюс итог по прочитанным.
+def collect_stats(
+    home: Path,
+    now: int,
+    board: Optional[str] = None,
+    since: Optional[int] = None,
+) -> dict[str, Any]:
+    """Здоровье живых досок: агрегат по ранам плюс итог по прочитанным.
 
     Распределение ожидания считается по объединённой выборке, а не как среднее
     перцентилей досок: перцентиль перцентилей не равен перцентилю объединённой
     выборки. Доска, у которой не читается `tasks`, попадает в `errors` и в итог
     не входит — ответ остаётся 200.
+
+    `board` и `since` — те же фильтры, что у `collect_now`: CLI не фильтрует
+    готовый агрегат (перцентиль подмножества не считается из перцентилей целого),
+    а просит ту же функцию посчитать по нужному окну. `boards[]` и `totals`
+    поэтому всегда согласованы между собой.
 
     Обрезанный срез доски (`truncated`) остаётся флагом этой доски, но дополнительно
     называется в `warnings[]` верхнего уровня: распределение по неполной выборке
@@ -1380,9 +1406,10 @@ def collect_stats(home: Path, now: int) -> dict[str, Any]:
     runs_total = 0
     first_try_ok = 0
     with_runs = 0
-    for entry in _discover_boards(home):
+    scope = [entry for entry in _discover_boards(home) if board is None or entry["slug"] == board]
+    for entry in scope:
         try:
-            collected = _stats_board(entry)
+            collected = _stats_board(entry, since=since)
         except Exception as exc:  # noqa: BLE001 - ошибка доски не валит ответ
             reason = str(exc) if isinstance(exc, RuntimeError) else f"{type(exc).__name__}: {exc}"
             errors.append({"board": str(entry["slug"]), "reason": reason})
@@ -1435,9 +1462,18 @@ def collect_stats(home: Path, now: int) -> dict[str, Any]:
 
 
 @router.get("/stats")
-def stats() -> dict[str, Any]:
-    """Здоровье: доля с первой попытки, распределение ожидания (p50/p90/p99), исходы."""
-    return collect_stats(_hermes_home(), _now_sec())
+def stats(board: Optional[str] = None, since: Optional[int] = None) -> dict[str, Any]:
+    """Здоровье: доля с первой попытки, распределение ожидания (p50/p90/p99), исходы.
+
+    `?board=<slug>` — только одна доска (404, если её нет);
+    `?since=<unix>` — только дела, созданные не раньше этой секунды. Оба фильтра
+    считает `collect_stats`, поэтому CLI и роут отдают одну и ту же форму и одни
+    и те же числа; без параметров ответ прежний.
+    """
+    home = _hermes_home()
+    if board is not None:
+        _board_entry(home, board)
+    return collect_stats(home, _now_sec(), board=board, since=since)
 
 
 @router.get("/deal/{board}/{task_id}")

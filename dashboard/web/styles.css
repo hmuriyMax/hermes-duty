@@ -119,6 +119,10 @@ a:hover { text-decoration: underline; }
 
 .stamp { color: var(--text-3); font-size: 12px; font-variant-numeric: tabular-nums; }
 
+/* «N вопросов + M блокировок»: два разных «нужен человек», одной строкой. */
+.human { color: var(--text-2); font-size: 12px; font-variant-numeric: tabular-nums; }
+.human:empty { display: none; }
+
 .hub {
   font-size: 12px;
   font-weight: 600;

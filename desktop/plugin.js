@@ -25,13 +25,19 @@ const STATS_REFRESH_MS = 30_000
 const SEARCH_DEBOUNCE_MS = 240
 const REQUEST_TIMEOUT_MS = 20_000
 
-// Экраны страницы: «Сейчас» — срез, «Почему стоит» — тот же срез с объяснением,
-// «Здоровье» — агрегат по ранам. «Дело» — не таб: он открывается из дела.
+// Экраны страницы, в порядке спеки: «Сейчас» — срез, «Дело» — спецификация и
+// таймлайн попыток, «Почему стоит» — тот же срез с объяснением, «Здоровье» —
+// агрегат по ранам. «Дело» открывается из любой строки, но и сам по себе таб:
+// экран, достижимый только кликом по строке, на своём месте не читается.
 const TABS = [
   ['now', 'Сейчас'],
+  ['deal', 'Дело'],
   ['why', 'Почему стоит'],
   ['health', 'Здоровье'],
 ]
+
+// Последнее открытое дело: таб «Дело» возвращает к нему, а не к пустоте.
+let lastDeal = null
 
 // ctx.rest, забинденный в register().
 let rest = null
@@ -1111,7 +1117,8 @@ function DutyPage() {
             className: screen === key ? 'duty-tab on' : 'duty-tab',
             onClick: () => {
               setScreen(key)
-              setSel(null)
+              // «Дело» возвращает к последнему открытому; остальные табы — без выбора.
+              setSel(key === 'deal' ? lastDeal : null)
             },
           },
           label,
@@ -1122,6 +1129,7 @@ function DutyPage() {
     model ? h('span', { className: 'duty-muted' }, `· досок ${model.boardsRead}/${model.boardsTotal}`) : null,
     h('span', { className: 'duty-spacer' }),
     snap.loading && !model
+    lastDeal = deal
       ? h('span', { className: 'duty-muted' }, 'загрузка…')
       : h('span', { className: 'duty-muted duty-num' }, updatedAgo === null ? 'ещё не обновлялось' : `обновлено ${updatedAgo} с назад`),
     h(
@@ -1306,5 +1314,16 @@ export default {
       order: 61,
       data: { label: 'Дела', path: '/duty', codicon: 'pulse' },
     })
+  } else if (screen === 'deal') {
+    // Дело ещё не выбрано: показываем активные дела — экран обязан быть
+    // самостоятельным, а не только следствием клика по строке.
+    content = model
+      ? h(
+          'div',
+          { className: 'duty-scroll' },
+          h('div', { className: 'duty-why-meta' }, 'выбери дело из активных'),
+          ...view.groups.map((group) => h(DealGroup, { key: `pick-${group.state}`, group, selectedKey, onPick: pick })),
+        )
+      : h('div', { className: 'duty-scroll' }, h('div', { className: 'duty-skel-row' }, ...Array.from({ length: 4 }, (_, i) => h('div', { className: 'duty-skel', key: `ds-${i}`, style: { width: `${92 - i * 9}%` } })))),
   },
 }

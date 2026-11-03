@@ -555,7 +555,32 @@ async function loadDeal(board, taskId) {
   dealSnap.loading = true
   try {
     const [detail, attempts] = await Promise.all([
+// «Дело» — полноценный экран: таб открывает последнее открытое дело, а если
+// такого нет — список активных дел, из которого видно, куда идти. Запоминаем в
+// localStorage: переключение табов не должно терять контекст.
+const LAST_DEAL = 'duty:last-deal'
+
+function rememberDeal(board, id) {
+  try {
+    localStorage.setItem(LAST_DEAL, `${board}/${id}`)
+  } catch {
+    /* приватный режим / выключенное хранилище — не повод ломать экран */
+  }
+}
+
+function lastDeal() {
+  let raw = ''
+  try {
+    raw = localStorage.getItem(LAST_DEAL) || ''
+  } catch {
+    return null
+  }
+  const [board, id] = raw.split('/')
+  return board && id ? { board, id } : null
+}
+
       api(`/deal/${encodeURIComponent(board)}/${encodeURIComponent(taskId)}`),
+  rememberDeal(board, taskId)
       api(`/duty/${encodeURIComponent(board)}/${encodeURIComponent(taskId)}/attempts`),
     ])
     if (dealSnap.key === key) {
@@ -583,6 +608,33 @@ function attemptCard(attempt) {
       h('span', { class: 'muted' }, attempt.profile),
       h('span', { class: 'tnum' }, attempt.durationText),
       h('span', { class: 'sp' }),
+/**
+ * «Дело» без выбранного дела: последнее открытое плюс активные дела списком.
+ * Экран обязан быть достижим сам по себе — иначе он существует только как
+ * побочный эффект клика по строке, и его «нет» на самом деле «не видно».
+ */
+function viewDealPicker() {
+  const model = snap.data ? shapeNow(snap.data) : null
+  const last = lastDeal()
+  const parts = [h('div', { class: 'sec-h' }, h('h2', null, 'дело'), h('span', { class: 'num' }, 'открыть дело'))]
+  if (last) {
+    parts.push(
+      h(
+        'div',
+        { class: 'note' },
+        h('div', null, 'последнее открытое: '),
+        h('a', { href: `#/deal/${encodeURIComponent(last.board)}/${encodeURIComponent(last.id)}` }, `${last.board}/${last.id}`),
+      ),
+    )
+  }
+  if (!model) {
+    parts.push(h('div', { class: 'panel' }, h('div', { class: 'panel-b' }, h('div', { class: 'skel', style: 'width:60%' }))))
+    return h('div', null, ...parts)
+  }
+  parts.push(...(model.groups.length ? model.groups.map(groupBlock) : [h('div', { class: 'empty' }, 'активных дел нет')]))
+  return h('div', null, ...parts)
+}
+
       h('span', { class: `badge t-${attempt.outcomeTone}`, title: `status=${attempt.status}${attempt.outcome ? `, outcome=${attempt.outcome}` : ''}` }, attempt.outcome || attempt.status),
     ),
     h('div', { class: `track t-${attempt.outcomeTone}` }, h('div', { class: 'bar', style: `width:${attempt.barPct}%` })),
@@ -606,7 +658,7 @@ function viewDeal(board, taskId) {
       'div',
       null,
       errorBanner(dealSnap.error, () => loadDeal(board, taskId)),
-      h('a', { href: '#/now' }, '← к списку дел'),
+      h('a', { href: '#/deal' }, '← к списку дел'),
     )
   }
   if (!dealSnap.data) {
@@ -660,7 +712,7 @@ function viewDeal(board, taskId) {
   return h(
     'div',
     null,
-    h('div', { style: 'margin-bottom:10px' }, h('a', { href: '#/now' }, '← к списку дел')),
+    h('div', { style: 'margin-bottom:10px' }, h('a', { href: '#/deal' }, '← к списку дел')),
     head,
     h('div', { class: 'two-col' }, left, right),
   )
@@ -671,8 +723,10 @@ function viewDeal(board, taskId) {
 function parseRoute() {
   const raw = (location.hash || '#/now').replace(/^#/, '')
   const parts = raw.split('/').filter(Boolean)
-  if (parts[0] === 'deal' && parts[1] && parts[2]) {
-    return { name: 'deal', board: decodeURIComponent(parts[1]), id: decodeURIComponent(parts[2]) }
+  if (parts[0] === 'deal') {
+    return parts[1] && parts[2]
+      ? { name: 'deal', board: decodeURIComponent(parts[1]), id: decodeURIComponent(parts[2]) }
+      : { name: 'deal' }
   }
   if (parts[0] === 'why') return { name: 'why' }
   if (parts[0] === 'health') return { name: 'health' }
@@ -684,7 +738,7 @@ function render() {
   if (route.name === 'now') body.append(viewNow())
   else if (route.name === 'why') body.append(viewWhy())
   else if (route.name === 'health') body.append(viewHealth())
-  else body.append(viewDeal(route.board, route.id))
+  else body.append(route.board ? viewDeal(route.board, route.id) : viewDealPicker())
 
   for (const link of document.querySelectorAll('#tabs a')) {
     link.classList.toggle('on', link.dataset.tab === route.name)
@@ -701,7 +755,8 @@ function run() {
   if (route.name === 'now') void loadNow()
   else if (route.name === 'why') void loadNow()
   else if (route.name === 'health') void loadHealth()
-  else void loadDeal(route.board, route.id)
+  else if (route.board) void loadDeal(route.board, route.id)
+  else void loadNow()
 }
 
 function onRoute() {

@@ -42,12 +42,20 @@ test('четыре экрана маршрутизируются', () => {
   assert.match(app, /parts\[0\] === 'why'/)
   assert.match(app, /parts\[0\] === 'health'/)
   assert.match(app, /return \{ name: 'now' \}/)
-  for (const tab of ['now', 'why', 'health']) {
+  // «Дело» — таб, а не только следствие клика по строке: экран, до которого
+  // нельзя дойти из навигации, на своём месте не читается.
+  for (const tab of ['now', 'deal', 'why', 'health']) {
     assert.match(html, new RegExp(`data-tab="${tab}"`), `нет вкладки ${tab}`)
   }
 })
 
 test('бэкенд монтирует страницу и отдаёт общий шейпер', () => {
+test('«Дело» без выбранного дела показывает выбор, а не пустоту', () => {
+  assert.match(app, /route\.board \? viewDeal\(route\.board, route\.id\) : viewDealPicker\(\)/)
+  assert.match(app, /function viewDealPicker\(\)/)
+  assert.match(app, /localStorage\.setItem\(LAST_DEAL/)
+})
+
   assert.ok(api.includes('"/web/hermes-duty"'), 'нет роута /web/hermes-duty')
   assert.ok(api.includes('"/web/hermes-duty/model.js"'), 'нет роута шейпера')
   assert.ok(api.includes('"/web/hermes-duty/{path:path}"'), 'нет статики')

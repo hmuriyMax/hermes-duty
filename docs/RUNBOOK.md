@@ -1161,7 +1161,60 @@ bin/duty decide d_f8389a4b stop           # или закрыть: completed cau
 3. **Таймаута у парковки нет.** «Никто не ответил» ≠ «решено остановить»: запаркованное
    дело висит в `/now` с `block_kind='parked'`, пока человек не решит.
 
-## 13. Что делать не нужно
+## 13. Проверки: красные пробы 0.0.4
+
+Раздел отвечает на один вопрос: **какой тест докажет, что решение 0.0.4 не откатилось**.
+Каждая строка проверена прогоном, а не обещанием: откат кода → названный тест краснеет →
+код возвращён как было → тест снова зелёный. Прогон шёл на `8a329d5` (2026-11-04),
+`git status --porcelain` после каждой пробы чист, `pytest tests/ -q` до и после —
+`626 passed, 1 skipped`.
+
+Проба берётся одной командой (имя теста — из правого столбца):
+
+```bash
+~/.hermes/hermes-agent/venv/bin/python -m pytest "tests/test_driver.py::test_pool_answer_closes_orphan_and_order_is_sweep_sync_decision" -q
+```
+
+| Проба | Что ломаем (откат) | Какой тест падает — имя и строка |
+|---|---|---|
+| **W15 «ответ пула»** (обязательная) | убрать вызов `ask.sync_answers(conn, home)` из `dashboard/driver.py:490`: закрытый вопрос пула перестаёт доезжать до журнала до решения | `tests/test_driver.py::test_pool_answer_closes_orphan_and_order_is_sweep_sync_decision` — падает на `tests/test_driver.py:1172`: `AssertionError: ['sweep', 'decision']` (в порядке шага пропал `sync`) |
+| **W12 «сирота»** | `dashboard/reaper.py:243`: `sweep` считает запись, но не пишет факт (`written = 0`), и попытка без отчёта с истёкшим лизингом остаётся «идущей» | `tests/test_reaper.py::test_orphan_with_expired_lease_is_closed_as_infra` — `tests/test_reaper.py:294`: `assert row["written"] == 1` → `0 == 1` |
+| **W14 «база этапа»** | `dashboard/runner.py:521`: `base_of_stage` отдаёт `spec.base` и не смотрит на предшественника — второй этап получает чистое дерево | `tests/test_runner.py::test_base_of_stage_takes_the_predecessor_commit` — `tests/test_runner.py:1392`: ждали коммит предшественника `43cd985`, получили `HEAD` |
+| **W17 «умолчание workspace»** | `dashboard/spec.py:572`: молчание снова значит `none` (`workspace = "none"`), этап с `needs` теряет дерево | `tests/test_spec.py::test_stage_with_needs_defaults_to_worktree` — `tests/test_spec.py:874`: `- worktree` / `+ none` |
+| **W21 «закрытие фактом журнала»** | `dashboard/deals.py:1203`: `close_stages_done` двигает строку дела, но не пишет `completed` — итог печатается «по записи», которой нет | `tests/test_driver.py::test_all_stages_done_writes_one_completed_and_closes_the_deal` — `tests/test_driver.py:1401`: «закрытие — один факт, а не абзац», `assert 0 == 1` |
+
+### Что проба ловит сверх одного теста
+
+Каждый откат дополнительно прогонялся целиком — столько тестов держат решение:
+
+| Проба | Полный `pytest tests/ -q` под откатом |
+|---|---|
+| W15 | `6 failed, 620 passed, 1 skipped` |
+| W12 | `8 failed, 618 passed, 1 skipped` |
+| W14 | `10 failed, 616 passed, 1 skipped` |
+| W17 | `4 failed, 622 passed, 1 skipped` |
+| W21 | `6 failed, 620 passed, 1 skipped` |
+
+Один тест в таблице назван не потому, что остальные неважны, а потому что он падает
+**первым и по делу**: его падение уже называет откат. Числа полного прогона — из того же
+транскрипта; сам транскрипт (команда → вывод: зелёный → откат → красный → возврат →
+зелёный) приложен к карточке 0.0.4 файлом `evidence-0.0.4.md`.
+
+### Чего в таблице нет
+
+- проб под W16/W18/W19/W20 — у них проверка живым прогоном (`§12`), а не откатом кода;
+- второй пробы W21 («повторный `run` не пишет второй `completed`») — её держит соседний
+  тест `tests/test_driver.py::test_repeated_run_on_closed_deal_writes_no_second_completed`,
+  отдельного отката под неё не делали и строку не выдумываем.
+
+### Как добавить свою строку
+
+1. сломать ровно одно правило (одна строка кода, один смысл) и убедиться, что тест краснеет;
+2. записать имя теста и **строку падения** — не «тест про ответы», а `file:line`;
+3. вернуть код (`git checkout -- <файл>`), прогнать тест и полный `pytest`: числа в столбце
+   «полный прогон» должны вернуться к `626 passed, 1 skipped`.
+
+## 14. Что делать не нужно
 
 - не перезапускать gateway ради страницы;
 - не править номер версии руками — только `bin/duty-version`;

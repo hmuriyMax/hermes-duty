@@ -118,6 +118,7 @@ HERMES_HOME=~/.hermes ~/.hermes/plugins/hermes-duty/bin/duty now
 | `duty attempts <board> <id>` | только таймлайн попыток |
 | `duty stats [--board B] [--since D]` | p50/p90/p99 ожидания, исходы ранов, доля с первой попытки, таблица по доскам; `--since` — unix, `YYYY-MM-DD` или `YYYY-MM-DDTHH:MM` |
 | `duty why <board> <id>` | доказательство `waiting.evidence` словами бэкенда плюс факты, из которых оно собрано |
+| `duty demo [--home DIR] [--keep]` | прогон одного дела по спеке на **песочном корне** (временный каталог): create → claim → ask → answer → gate → comment/attach → ingest → complete → late answer. Сам проверяет 7 инвариантов (вопрос уводит в `wait_human`, ответ возвращает в работу, гейт открывается завершением родителя, закрытое дело уходит из `/now`, поздний ответ не воскрешает, повторный ingest не плодит, `kanban.db` не изменился) и печатает границу «чего ещё нет до движка 0.1.0». Живые БД только читаются; `--keep` оставляет песочницу для разбора |
 | `duty watch [--interval 10] [--board B] [--state S]` | тот же `now`, перерисовка в терминале (в пайпе — блоками, без escape-последовательностей) |
 | `duty create --board B --title "…" [--body-file F] [--assignee ROLE] [--parent d_…]…` | завести своё дело; `--json` отдаёт `id` для следующих команд |
 | `duty comment d_… "текст" [--author …]` | комментарий в своё дело (`--author`, по умолчанию `max`) |
@@ -129,6 +130,14 @@ HERMES_HOME=~/.hermes ~/.hermes/plugins/hermes-duty/bin/duty now
 | `duty changes d_… "причина" [--reviewer …]` | вернуть на доработку |
 | `duty attach d_… FILE` | приложить файл (копия в `duty/attachments/<deal_id>/`) |
 | `duty archive d_…` | `PATCH {status: archived}` — архив назван командой |
+
+`duty demo` — не роут, а прогон модели труда: одна команда проходит дело от создания
+до закрытия на песочном корне (временный каталог; из `~/.hermes` берётся только DDL схем,
+данные не читаются), проверяет семь инвариантов учёта и печатает отчёт — шаги, журнал
+дела, пул вопросов, проверки и блок «чего ещё нет». Спека-образец — `examples/demo.yaml`
+(тот же текст печатается в отчёте): этапы и evidence-команды в нём есть, но движка,
+который их исполняет, в 0.0.3 нет — это 0.1.0. Тесты прогона — `tests/test_demo.py`
+(9 кейсов).
 
 Коды возврата: `0` — ответ получен целиком и `errors[]` пуст; `1` — доски или дела нет
 (404 роута); `2` — источники не прочитались (503/400 роута или непустой `errors[]`)
@@ -151,6 +160,7 @@ HERMES_HOME=~/.hermes ~/.hermes/plugins/hermes-duty/bin/duty now
     journal.py           # свой журнал событий, fold и ingest (docs/JOURNAL.md)
     deals.py             # свой store дел: мутации, гейт, комментарии, вложения (docs/OWNERSHIP.md)
     cli.py               # CLI: разбор команд и оформление вывода поверх тех же роутов
+    demo.py              # прогон дела по спеке на песочном корне (bin/duty demo)
     ask.py               # единственный канал вопросов: пул + question_asked/answered
   desktop/
     plugin.js            # четыре экрана (/duty) + пункт сайдбара «Дела»
@@ -159,7 +169,7 @@ HERMES_HOME=~/.hermes ~/.hermes/plugins/hermes-duty/bin/duty now
     index.html           # веб-версия тех же экранов (не-/api путь /web/hermes-duty/)
     app.js               # SPA: #/now, #/why, #/health, #/deal/<board>/<id>
     styles.css           # авто-тема (prefers-color-scheme), как у hermes-tickets
-  bin/duty               # CLI: now/deal/attempts/stats/why/watch + мутации своих дел
+  bin/duty               # CLI: now/deal/attempts/stats/why/watch/demo + мутации своих дел
   bin/duty-version       # версия: check / bump / finalize
   bin/duty-model-sync    # вшить model.js в plugin.js (загрузчик не резолвит ./)
   docs/DESIGN.md         # контракт P0: источники, роуты, таксономия, деградация
@@ -167,6 +177,7 @@ HERMES_HOME=~/.hermes ~/.hermes/plugins/hermes-duty/bin/duty now
   docs/OWNERSHIP.md      # контракт владения: store дел, мутации, id, инварианты
   docs/VERSIONING.md     # контракт версий и ритуал bin/duty-version
   docs/RUNBOOK.md        # как проверить плагин руками
+  examples/demo.yaml     # спека-образец для прогона (не читается кодом: движка 0.1.0 нет)
   tests/                 # pytest (агрегатор, контракт роутов) + node --test (шейпер)
 ```
 
@@ -205,11 +216,12 @@ hermes plugins enable hermes-duty     # или Capabilities → Plugins в де�
 Из каталога плагина (`cd ~/.hermes/plugins/hermes-duty`):
 
 ```bash
-~/.hermes/hermes-agent/venv/bin/python -m pytest -q        # 204 passed
+~/.hermes/hermes-agent/venv/bin/python -m pytest -q        # 213 passed
 node --test tests/model.test.mjs tests/web.test.mjs        # 37 pass (28 + 9)
 bin/duty-model-sync --check                                # OK
 bin/duty-version check                                     # OK
 HERMES_HOME=~/.hermes bin/duty now                         # таблица дел, код 0
+HERMES_HOME=~/.hermes bin/duty demo                        # 7 проверок OK, код 0
 ```
 
 Живой рендер смотрится в приложении (после включения плагина) и в браузере —

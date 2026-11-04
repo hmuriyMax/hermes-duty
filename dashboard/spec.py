@@ -3,10 +3,11 @@
 Почему это отдельный слой. Спека — единственное место, где сказано, из каких
 этапов состоит работа, какие доказательства принимаются и куда идёт вопрос.
 Ошибка в ней сегодня проявляется поздно: «публикация обогнала ревью» — это
-неправильный `verdict.changes`, который видно только в момент публикации, а
-«этап недостижим» — только когда движок до него никогда не дойдёт. Поэтому
-контракт читается **до** запуска: `load_spec()` разбирает файл, `validate_spec()`
-возвращает список отказов, и ни один из них не требует запускать что-либо.
+публикующий этап без ревью в предках или неправильный `verdict.changes`, которые
+видно только в момент публикации, а «этап недостижим» — только когда движок до
+него никогда не дойдёт. Поэтому контракт читается **до** запуска: `load_spec()`
+разбирает файл, `validate_spec()` возвращает список отказов, и ни один из них не
+требует запускать что-либо.
 
 Границы слоя:
 
@@ -61,6 +62,16 @@ VERDICT_KEYS = ("approve", "changes", "max_rounds")
 
 WORKSPACES = ("worktree", "dir", "none")
 TO_HUMAN = ("decisions_only", "never")
+
+# Роли, которые действуют вовне: публикуют, мержат, деплоят. Набор — имена
+# профилей Hermes, которые заводят под эти права (`publisher`; `deployer`, если
+# такой профиль появится). Держится одной константой, чтобы «кто публикует» не
+# разъезжалось по коду: по ней решается, требовать ли ревью в предках.
+PUBLISHING_ROLES = ("publisher", "deployer")
+
+# Роль, которая выносит приговор. Ревью в предках публикующего этапа — то, что
+# делает «гейти PUB на RV, а не на IMP» проверкой, а не договорённостью в скилле.
+REVIEWING_ROLE = "reviewer"
 
 # Команды, которые сами меняют мир: это действие, а не доказательство. Спека
 # принимает только то, что можно проверить повторным запуском, — поэтому такие
@@ -639,26 +650,42 @@ _profiles_cache: Optional[frozenset[str]] = None
 FAILURES_MODULE_NAME = "hermes_duty_failures"
 
 
+def _failures_module() -> Optional[Any]:
+    """Модуль `dashboard/failures.py` — один экземпляр на процесс."""
+    import importlib.util
+    import sys
+
+    loaded = sys.modules.get(FAILURES_MODULE_NAME)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / "failures.py"
+    module_spec = importlib.util.spec_from_file_location(FAILURES_MODULE_NAME, path)
+    if module_spec is None or module_spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        return None
+    module = importlib.util.module_from_spec(module_spec)
+    sys.modules[FAILURES_MODULE_NAME] = module
+    module_spec.loader.exec_module(module)
+    return module
+
+
 def failure_classes() -> tuple[str, ...]:
     """Классы отказа из `dashboard/failures.py` — словарь живёт там, а не здесь.
 
     Спека сверяет `retry.on` с этим кортежем: опечатка в классе иначе молча
     выключила бы повтор, а спека при этом считалась бы объявленной.
     """
-    import importlib.util
-    import sys
+    module = _failures_module()
+    return tuple(module.CLASSES) if module is not None else ()
 
-    loaded = sys.modules.get(FAILURES_MODULE_NAME)
-    if loaded is not None:
-        return tuple(loaded.CLASSES)
-    path = Path(__file__).resolve().parent / "failures.py"
-    module_spec = importlib.util.spec_from_file_location(FAILURES_MODULE_NAME, path)
-    if module_spec is None or module_spec.loader is None:  # pragma: no cover - файл выпал из сборки
-        return ()
-    module = importlib.util.module_from_spec(module_spec)
-    sys.modules[FAILURES_MODULE_NAME] = module
-    module_spec.loader.exec_module(module)
-    return tuple(module.CLASSES)
+
+def failure_class(name: str) -> str:
+    """Значение константы класса (`CAPABILITY`, …) из `dashboard/failures.py`.
+
+    Нужно правилу про `retry.on`: спека предупреждает про `capability` по имени,
+    а имя берёт из того же словаря, чтобы «стена» не завелась вторым написанием.
+    """
+    module = _failures_module()
+    return str(getattr(module, name, "")) if module is not None else ""
 
 
 def known_profiles(root: Optional[Path] = None) -> frozenset[str]:
@@ -963,6 +990,40 @@ def _check_verdicts(spec: Spec) -> list[Issue]:
     return issues
 
 
+def _check_review_gate(spec: Spec) -> list[Issue]:
+    """Публикующий или рискованный этап обязан иметь ревью в предках.
+
+    Это второе имя того же правила, ради которого слой существует. `verdict.changes`
+    бережёт возврат на доработку, но ничего не говорит о том, что между
+    реализацией и публикацией стоит приговор. Поэтому этап, который действует
+    вовне (`role` из `PUBLISHING_ROLES` — профиль `publisher`, деплой) или сам
+    объявлен рискованным (`ask.risky: true`), проверяется отдельно: в его
+    транзитивных `needs` должен быть хотя бы один этап с `role: reviewer`.
+    Публикация прямо от реализации — ровно «PUB обогнал RV», и такая спека не
+    запускается.
+    """
+    if not _references_intact(spec):
+        return []  # ссылки битые — уже отказ `needs`/`parallel_with`, граф не проверить
+    by_id = {stage.id: stage for stage in spec.stages}
+    ancestors = _ancestors(spec)
+    issues: list[Issue] = []
+    for stage in spec.stages:
+        risky = stage.ask.risky if stage.ask is not None else False
+        if stage.role not in PUBLISHING_ROLES and not risky:
+            continue
+        if any(by_id[need].role == REVIEWING_ROLE for need in ancestors.get(stage.id, set())):
+            continue
+        issues.append(
+            Issue(
+                spec.path,
+                stage.line,
+                "review-gate",
+                f"этап {stage.id!r} публикует, но в его предках нет ревью (role: {REVIEWING_ROLE})",
+            )
+        )
+    return issues
+
+
 def _check_workspace(spec: Spec) -> list[Issue]:
     """`worktree` без `repo`/`base` — не дерево, а догадка: от чего отводить неизвестно."""
     issues: list[Issue] = []
@@ -1084,6 +1145,20 @@ def _check_retry(spec: Spec) -> list[Issue]:
                     "retry.on пуст: ретрай без классов отказов не сработает",
                 )
             )
+        # `capability` — стена (бюджет, доступ, роль), а не сбой: повтор её обычно
+        # не рассасывает. Это предупреждение, а не отказ: выбор автора спеки
+        # осознанный, а решение всё равно за политикой движка.
+        capability = failure_class("CAPABILITY")
+        if capability and capability in retry.on:
+            issues.append(
+                Issue(
+                    spec.path,
+                    stage.lines.get("retry.on", line),
+                    "retry.on",
+                    f"{capability} обычно не рассасывается повтором; если это осознанно — оставь как есть",
+                    WARNING,
+                )
+            )
         # Класс сравнивается со словарём `dashboard/failures.py`: опечатка в
         # `retry.on` иначе молча выключила бы повтор, и спека выглядела бы
         # объявленной, а политика — без классов.
@@ -1117,6 +1192,7 @@ def validate_spec(spec: Spec, *, profiles: Optional[frozenset[str]] = None) -> l
     issues += _check_reachable(spec)
     issues += _check_evidence(spec)
     issues += _check_verdicts(spec)
+    issues += _check_review_gate(spec)
     issues += _check_workspace(spec)
     issues += _check_ask(spec)
     issues += _check_budget(spec)

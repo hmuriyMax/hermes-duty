@@ -171,6 +171,18 @@ verdict: {approve: next, changes: impl, max_rounds: 2}
   возврат на доработку перескочил бы проверку, и такая спека не запускается;
 - `max_rounds` ≥ 1.
 
+Гейт «публикация не обгоняет ревью» — правило `review-gate`: этап, чья `role`
+входит в набор публикующих (`publisher`, `deployer`) или у которого
+`ask.risky: true`, обязан иметь в транзитивных `needs` этап с `role: reviewer`.
+`verdict.changes` бережёт возврат на доработку, `review-gate` — сам приговор
+между реализацией и публикацией: «PUB после RV, а не после IMP» проверяется до
+запуска, а не выводится из кода. Список публикующих ролей — одна константа
+(`PUBLISHING_ROLES` в `dashboard/spec.py`).
+
+`retry.on: [capability]` — **предупреждение**, а не отказ: `capability` обычно не
+рассасывается повтором; если это осознанно — оставь как есть (движок решает по
+политике, валидатор осознанный выбор не запрещает).
+
 ## Правила отказа
 
 Каждое правило — отдельный тест в `tests/test_spec.py`. Отказ печатается как
@@ -192,6 +204,7 @@ verdict: {approve: next, changes: impl, max_rounds: 2}
 | `verdict.approve` | не `next` и не существующий `id` |
 | `verdict.changes` | не предшественник; несуществующий `id`; `changes` нет вовсе |
 | `verdict.max_rounds` | меньше 1 |
+| `review-gate` | публикующий (`publisher`/`deployer`) или рискованный (`ask.risky: true`) этап без `role: reviewer` в транзитивных `needs` |
 | `evidence` | `evidence` не список; элемент не словарь |
 | `evidence.cmd` | `cmd` пустой или не строка |
 | `evidence.must` | `must` не целое (в том числе `true`/`false`) |
@@ -207,6 +220,10 @@ verdict: {approve: next, changes: impl, max_rounds: 2}
 | `budget` | `tokens`/`minutes` не положительное целое |
 | `retry.max` | не целое или меньше нуля |
 | `retry.on` | пустой список классов отказов или класс не из `CLASSES` (`infra`, `contract`, `capability`) — опечатка молча выключила бы повтор |
+
+Предупреждение (`severity: warning`) годную спеку отказом не делает и печатается
+при `OK`: так проходят `base` на машине без репозитория дела и `retry.on` с
+`capability`.
 
 ### Профили роли
 

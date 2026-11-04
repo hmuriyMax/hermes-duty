@@ -437,6 +437,174 @@ def test_verdict_max_rounds_zero(tmp_path: Path):
     assert "verdict.max_rounds" in rules(found)
 
 
+# ------------------------------------------------------------ гейт публикации
+
+
+def test_publish_without_review_is_error(tmp_path: Path):
+    """Публикация прямо от реализации — ровно «PUB обогнал RV»: спека не запускается."""
+    path = write(
+        tmp_path,
+        """duty: probe
+stages:
+  - id: impl
+    role: implementer
+  - id: publish
+    role: publisher
+    needs: [impl]
+""",
+    )
+    found = spec_module.validate_spec(spec_module.load_spec(path), profiles=PROFILES)
+    assert [(issue.rule, issue.line, issue.severity) for issue in found] == [("review-gate", 5, "error")]
+    assert "этап 'publish' публикует, но в его предках нет ревью (role: reviewer)" in found[0].message
+    assert str(found[0]).startswith(f"{path}:5: review-gate:")
+
+
+def test_publish_after_review_is_ok(tmp_path: Path):
+    """Ревью в предках — гейт закрыт: публикация после приговора законна."""
+    found = issues(
+        tmp_path,
+        """
+        duty: probe
+        stages:
+          - id: impl
+            role: implementer
+          - id: review
+            role: reviewer
+            needs: [impl]
+            verdict: {approve: next, changes: impl, max_rounds: 1}
+          - id: publish
+            role: publisher
+            needs: [review]
+        """,
+    )
+    assert found == []
+
+
+def test_publish_after_stage_that_itself_after_review_is_ok(tmp_path: Path):
+    """Ревью — транзитивно: `publish` после `verify`, а `verify` после `review`, законен."""
+    found = issues(
+        tmp_path,
+        """
+        duty: probe
+        stages:
+          - id: impl
+            role: implementer
+          - id: review
+            role: reviewer
+            needs: [impl]
+            verdict: {approve: next, changes: impl, max_rounds: 1}
+          - id: verify
+            role: tester
+            needs: [review]
+          - id: publish
+            role: publisher
+            needs: [verify]
+        """,
+    )
+    assert found == []
+
+
+def test_review_downstream_of_publish_does_not_count(tmp_path: Path):
+    """Ревью после публикации предком не считается: обгон остаётся обгоном."""
+    found = issues(
+        tmp_path,
+        """
+        duty: probe
+        stages:
+          - id: impl
+            role: implementer
+          - id: publish
+            role: publisher
+            needs: [impl]
+          - id: review
+            role: reviewer
+            needs: [publish]
+            verdict: {approve: next, changes: impl, max_rounds: 1}
+        """,
+    )
+    assert [issue.rule for issue in found] == ["review-gate"]
+    assert "publish" in found[0].message
+
+
+@pytest.mark.parametrize("role", spec_module.PUBLISHING_ROLES)
+def test_every_publishing_role_needs_review(tmp_path: Path, role: str):
+    """Список публикующих ролей — одна константа: деплой не обходит гейт мимо `publisher`."""
+    loaded = spec_module.load_spec(
+        write(
+            tmp_path,
+            f"""
+            duty: probe
+            stages:
+              - id: impl
+                role: implementer
+              - id: publish
+                role: {role}
+                needs: [impl]
+            """,
+        )
+    )
+    found = spec_module.validate_spec(loaded, profiles=PROFILES | {role})
+    assert [issue.rule for issue in found] == ["review-gate"]
+
+
+def test_risky_stage_without_review_is_error(tmp_path: Path):
+    """`ask.risky: true` на этапе без ревью в предках — тоже публикация без приговора."""
+    found = issues(
+        tmp_path,
+        """
+        duty: probe
+        stages:
+          - id: impl
+            role: implementer
+          - id: ask
+            role: documenter
+            needs: [impl]
+            ask: {q: "Публикуем diff?", options: ["пушить", "стоп"], risky: true}
+        """,
+    )
+    assert [issue.rule for issue in found] == ["review-gate"]
+    assert "этап 'ask'" in found[0].message
+
+
+def test_risky_stage_after_review_is_ok(tmp_path: Path):
+    """Рискованный этап после ревью — законен: человек спрошен уже после приговора."""
+    found = issues(
+        tmp_path,
+        """
+        duty: probe
+        stages:
+          - id: impl
+            role: implementer
+          - id: review
+            role: reviewer
+            needs: [impl]
+            verdict: {approve: next, changes: impl, max_rounds: 1}
+          - id: ask
+            role: documenter
+            needs: [review]
+            ask: {q: "Публикуем diff?", options: ["пушить", "стоп"], risky: true}
+        """,
+    )
+    assert found == []
+
+
+def test_plain_stage_needs_no_review(tmp_path: Path):
+    """Гейт не расширяется на всех: этап, который ничего не публикует, ревью не требует."""
+    found = issues(
+        tmp_path,
+        """
+        duty: probe
+        stages:
+          - id: impl
+            role: implementer
+          - id: docs
+            role: documenter
+            needs: [impl]
+        """,
+    )
+    assert found == []
+
+
 # ------------------------------------------------------------------ доказательства
 
 FORBIDDEN = ["git push origin HEAD", "git commit -m x", "rm -rf build", "sudo make install"]
@@ -766,6 +934,27 @@ def test_retry_on_empty(tmp_path: Path):
     assert "retry.on" in rules(found)
 
 
+def test_retry_on_capability_is_warning_not_error(tmp_path: Path):
+    """`capability` повтором обычно не рассасывается — предупреждение, а не отказ.
+
+    Осознанный выбор автора спеки законен: движок всё равно решает по политике,
+    а валидатор не запрещает то, что объявлено нарочно.
+    """
+    path = write(
+        tmp_path,
+        """duty: probe
+stages:
+  - id: impl
+    role: implementer
+    retry: {max: 2, on: [infra, capability]}
+""",
+    )
+    found = spec_module.validate_spec(spec_module.load_spec(path), profiles=PROFILES)
+    assert [(issue.rule, issue.line, issue.severity) for issue in found] == [("retry.on", 5, "warning")]
+    assert "capability обычно не рассасывается повтором; если это осознанно — оставь как есть" in found[0].message
+    assert spec_module.errors(found) == []
+
+
 # --------------------------------------------------------------- строка отказа
 
 
@@ -844,6 +1033,25 @@ def test_cli_check_json_shape(capsys, tmp_path: Path):
     assert payload["duty"] == "probe"
     assert payload["issues"][0]["rule"] == "role"
     assert payload["issues"][0]["severity"] == "error"
+
+
+def test_cli_check_publish_before_review_names_line(capsys, tmp_path: Path):
+    """Приёмка: спека «publish после impl» — отказ `review-gate` с `file:line`."""
+    path = write(
+        tmp_path,
+        """duty: probe
+stages:
+  - id: impl
+    role: implementer
+  - id: publish
+    role: publisher
+    needs: [impl]
+""",
+    )
+    code, out = run_cli(["spec", "check", str(path)], capsys)
+    assert code == 1
+    assert f"{path}:5: review-gate:" in out
+    assert "в его предках нет ревью" in out
 
 
 def test_cli_check_unreadable_spec_exit_2(capsys, tmp_path: Path):

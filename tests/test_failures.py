@@ -548,7 +548,9 @@ def test_spec_rejects_unknown_failure_class(tmp_path: Path) -> None:
 
     for kind in failures.CLASSES:
         good = retry_spec(tmp_path, f"{{max: 1, on: [{kind}]}}")
-        assert spec_module.validate_spec(good, profiles=frozenset({"implementer"})) == []
+        # `capability` — не отказ, а предупреждение: стена повтором не рассасывается,
+        # но объявленный нарочно класс законен. Поэтому проверяются отказы.
+        assert spec_module.errors(spec_module.validate_spec(good, profiles=frozenset({"implementer"}))) == []
 
     unclassified = retry_spec(tmp_path, "{max: 1, on: [unknown]}")
     assert [issue.rule for issue in spec_module.validate_spec(unclassified, profiles=frozenset({"implementer"}))] == [

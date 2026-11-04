@@ -651,6 +651,8 @@ def test_json_report_schema(tmp_path: Path) -> None:
         "kind",
         "reason",
         "question_id",
+        "base",
+        "commit",
         "duration_sec",
     }
     assert set(restored["decision"]) == {

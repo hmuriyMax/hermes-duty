@@ -138,12 +138,14 @@ duty.yaml
 журнал событий (duty/duty.db)
    │  transit.next_stage(spec, events, now) → run(stage#n) | wait | done | failed | park
    ▼
-runner.step(decision) — лизинг этапа, дерево попытки, контракт файлом,
+runner.step(decision) — лизинг этапа, дерево попытки от базы **этапа**
+   │                    (base_of_stage: spec.base у первого этапа, коммит
+   │                     предшественника у следующего), контракт файлом,
    │                    hermes chat -p <role> … , чтение потока
    │  attempt_started / attempt_progress → в журнал (что делается прямо сейчас)
    ▼
 evidence.verify(отчёт, дерево, начало попытки)
-   ├─ ok  → attempt_ended(outcome=done)
+   ├─ ok  → commit_tree() → attempt_ended(outcome=done, commit=<sha>)
    └─ нет → attempt_ended(outcome=failed, kind=contract|capability)
    ▼
 failures.classify → policy → decide_park

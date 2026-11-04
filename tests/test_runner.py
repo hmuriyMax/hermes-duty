@@ -182,6 +182,7 @@ class Fake:
         pid: int = 4242,
         broken_result: bool = False,
         pack: bool = False,
+        files: Optional[dict[str, str]] = None,
     ) -> None:
         self.lines = [json.dumps(line, ensure_ascii=False) + "\n" for line in (lines or [])]
         self.result = result
@@ -190,6 +191,9 @@ class Fake:
         self.pid = pid
         self.broken_result = broken_result
         self.pack = pack
+        # Файлы, которые «исполнитель» создаёт в дереве попытки: тест проверяет,
+        # что работу этапа видит следующий этап (регрессия W14).
+        self.files = dict(files or {})
         self.calls: list[dict[str, Any]] = []
         self.stopped = 0
         self.exit = None if hang else exit_code
@@ -198,6 +202,10 @@ class Fake:
     # --- то, что нужно `runner.follow`
     def __call__(self, cmd: list[str], cwd: Path, env: Any = None) -> "Fake":
         self.calls.append({"cmd": list(cmd), "cwd": Path(cwd)})
+        for name, text in self.files.items():
+            target = Path(cwd) / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
         self._report(Path(cmd[list(cmd).index("--query-file") + 1]), Path(cwd))
         return self
 
@@ -223,13 +231,26 @@ class Fake:
         """Отчёт вместе с пакетом: артефакт в дереве и записи объявленных команд.
 
         Хеш считается по настоящему файлу — тест проверяет гейт на тех же
-        правилах, что и живая попытка, а не на подставленном «совпало».
+        правилах, что и живая попытка, а не на подставленном «совпало». Заданные
+        `files` становятся артефактами отчёта; без них кладётся `notes.txt`.
         """
         report = dict(self.result or {})
-        notes = cwd / "notes.txt"
-        notes.write_text("приговор: changes\n", encoding="utf-8")
-        digest = hashlib.sha256(notes.read_bytes()).hexdigest()
-        report.setdefault("artifacts", [{"path": notes.name, "sha256": digest}])
+        if self.files:
+            report.setdefault(
+                "artifacts",
+                [
+                    {
+                        "path": name,
+                        "sha256": hashlib.sha256((Path(cwd) / name).read_bytes()).hexdigest(),
+                    }
+                    for name in self.files
+                ],
+            )
+        else:
+            notes = cwd / "notes.txt"
+            notes.write_text("приговор: changes\n", encoding="utf-8")
+            digest = hashlib.sha256(notes.read_bytes()).hexdigest()
+            report.setdefault("artifacts", [{"path": notes.name, "sha256": digest}])
         declared = contract.get("evidence_to_produce") if isinstance(contract, dict) else None
         report.setdefault(
             "evidence",
@@ -477,8 +498,20 @@ def test_contract_carries_previous_artifacts(tmp_path: Path) -> None:
 
     previous = runner.previous_reports(conn, deal, spec, "review")
     assert previous == [
-        {"stage": "impl", "artifacts": ["/tmp/diff.patch"], "summary": "поправил шапку", "verdict": None},
-        {"stage": "verify", "artifacts": [], "summary": "тесты зелёные", "verdict": "changes"},
+        {
+            "stage": "impl",
+            "commit": "",
+            "artifacts": ["/tmp/diff.patch"],
+            "summary": "поправил шапку",
+            "verdict": None,
+        },
+        {
+            "stage": "verify",
+            "commit": "",
+            "artifacts": [],
+            "summary": "тесты зелёные",
+            "verdict": "changes",
+        },
     ]
 
 
@@ -1198,6 +1231,434 @@ def _decision(kind: str, **fields: Any) -> Any:
             "what": fields.get("what", ""),
         },
     )()
+
+
+# ------------------------------------------------------------- база этапа (W14)
+
+
+def fact(kind: str, payload: dict[str, Any], *, ts: int = NOW, key: str = "test:fact") -> dict[str, Any]:
+    """Событие журнала в памяти: проверка базы этапа не требует БД."""
+    return {
+        "ts": ts,
+        "recorded_at": ts,
+        "deal_id": "d_probe",
+        "board": "duty",
+        "kind": kind,
+        "payload": payload,
+        "source": "test",
+        "idempotency_key": key,
+    }
+
+
+def ended_of(conn: sqlite3.Connection, deal: dict[str, Any], stage_id: str) -> dict[str, Any]:
+    """`attempt_ended` конкретного этапа: в журнале их несколько, этап — разный."""
+    found = [
+        event
+        for event in events(conn, deal)
+        if str(event["kind"]) == "attempt_ended"
+        and journal.payload_of(event).get("stage") == stage_id
+    ]
+    assert len(found) == 1, f"attempt_ended этапа {stage_id}: {len(found)}"
+    return found[0]
+
+
+def started_of(conn: sqlite3.Connection, deal: dict[str, Any], stage_id: str, attempt: int) -> dict[str, Any]:
+    """`attempt_started` конкретной попытки: номер попытки — часть факта."""
+    found = [
+        event
+        for event in events(conn, deal)
+        if str(event["kind"]) == "attempt_started"
+        and journal.payload_of(event).get("stage") == stage_id
+        and int(journal.payload_of(event).get("attempt") or 0) == int(attempt)
+    ]
+    assert len(found) == 1, f"attempt_started {stage_id}#{attempt}: {len(found)}"
+    return found[0]
+
+
+def git_head(path: Path) -> str:
+    """`git rev-parse HEAD` в дереве или репозитории — фактическая ревизия."""
+    return subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+def git_out(path: Path, *args: str) -> str:
+    """Вывод git-команды в дереве: так проверяется содержимое и чистота дерева."""
+    return subprocess.run(
+        ["git", "-C", str(path), *args], capture_output=True, text=True, check=True
+    ).stdout
+
+
+def git_commit_object(repo: Path, *, parent: str, message: str) -> str:
+    """Коммит-объект поверх `parent` без движения ветки и рабочего дерева.
+
+    `commit-tree` даёт ровно то, что нужно проверке родства: два коммита можно
+    сделать и линейными, и расходящимися, не трогая ни `main`, ни checkout.
+    """
+    tree = git_out(repo, "rev-parse", f"{parent}^{{tree}}").strip()
+    made = subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+            "commit-tree", tree, "-p", parent, "-m", message,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return made.stdout.strip()
+
+
+def chain_repo_spec(tmp_path: Path, repo: Path) -> Any:
+    """impl → verify, оба с деревом: цепочка, на которой E2E и упал."""
+    return write_spec(
+        tmp_path,
+        f"""
+        duty: probe
+        repo: {repo}
+        base: HEAD
+        stages:
+          - id: impl
+            role: implementer
+            workspace: worktree
+          - id: verify
+            role: tester
+            workspace: worktree
+            needs: [impl]
+        """,
+    )
+
+
+def split_repo_spec(tmp_path: Path, repo: Path, *, needs: str) -> Any:
+    """Два предшественника и этап, которому нужны оба: проверка родства коммитов."""
+    return write_spec(
+        tmp_path,
+        f"""
+        duty: probe
+        repo: {repo}
+        base: HEAD
+        stages:
+          - id: a
+            role: implementer
+            workspace: worktree
+          - id: b
+            role: implementer
+            workspace: worktree
+          - id: both
+            role: tester
+            workspace: worktree
+            needs: {needs}
+        """,
+    )
+
+
+def test_base_of_stage_without_needs_is_the_deal_base(tmp_path: Path) -> None:
+    """Первый этап отводится от `spec.base`: база дела и база этапа — одно."""
+    repo = git_repo(tmp_path)
+    spec = chain_repo_spec(tmp_path, repo)
+    assert runner.base_of_stage(spec, spec.stage("impl"), []) == "HEAD"
+
+
+def test_base_of_stage_without_predecessor_result_is_the_deal_base(tmp_path: Path) -> None:
+    """Предшественник без коммита и без дерева: отводить не от чего — `spec.base`."""
+    repo = git_repo(tmp_path)
+    spec = chain_repo_spec(tmp_path, repo)
+    head = git_head(repo)
+    seeded = [
+        fact(
+            "attempt_ended",
+            {"stage": "impl", "attempt": 1, "outcome": "done", "result": {"summary": "ок"}},
+        )
+    ]
+    assert runner.base_of_stage(spec, spec.stage("verify"), seeded) == head
+
+
+def test_base_of_stage_takes_the_predecessor_commit(tmp_path: Path) -> None:
+    """Этап с `needs` отводится от коммита предшественника, а не от базы дела."""
+    repo = git_repo(tmp_path)
+    spec = chain_repo_spec(tmp_path, repo)
+    made = git_commit_object(repo, parent=git_head(repo), message="работа impl")
+    seeded = [
+        fact(
+            "attempt_ended",
+            {
+                "stage": "impl",
+                "attempt": 1,
+                "outcome": "done",
+                "commit": made,
+                "result": {"summary": "готово", "artifacts": [{"path": "a.txt", "sha256": "…"}]},
+            },
+        )
+    ]
+    assert runner.base_of_stage(spec, spec.stage("verify"), seeded) == made
+
+
+def test_base_of_stage_ignores_a_failed_predecessor_attempt(tmp_path: Path) -> None:
+    """Провал предшественника базой не бывает: годится только успешная попытка."""
+    repo = git_repo(tmp_path)
+    spec = chain_repo_spec(tmp_path, repo)
+    head = git_head(repo)
+    made = git_commit_object(repo, parent=head, message="чужая работа")
+    seeded = [
+        fact(
+            "attempt_ended",
+            {"stage": "impl", "attempt": 1, "outcome": "failed", "kind": "contract", "commit": made},
+            ts=NOW,
+        )
+    ]
+    assert runner.base_of_stage(spec, spec.stage("verify"), seeded) == head
+
+
+def test_second_stage_tree_is_detached_from_the_predecessor_commit(tmp_path: Path) -> None:
+    """Дерево второго этапа стоит на коммите первого; ветку движок не двигает."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    repo = git_repo(tmp_path)
+    spec = chain_repo_spec(tmp_path, repo)
+    head = git_head(repo)
+
+    run(conn, spec, deal, home, Fake(result={"status": "done", "summary": "готово"}, pack=True))
+    impl_commit = ended_of(conn, deal, "impl")["payload"]["commit"]
+    assert impl_commit, "движок обязан записать коммит принятой попытки"
+
+    second = runner.run_stage(
+        conn,
+        spec,
+        deal,
+        "verify",
+        1,
+        home=home,
+        spawn=Fake(result={"status": "done", "summary": "проверил"}, pack=True),
+        clock=lambda: NOW,
+    )
+    assert (second["outcome"], second["base"]) == ("done", impl_commit)
+
+    tree = runner.attempt_dir(home, deal, "verify", 1) / "tree"
+    assert git_head(tree) == impl_commit, "второй этап отведён от коммита первого"
+    assert git_head(repo) == head, "ветку движок не двигает: её двигает публикация"
+    assert git_out(tree, "rev-parse", "--abbrev-ref", "HEAD").strip() == "HEAD"
+
+
+def test_engine_commits_the_work_the_executor_did_not(tmp_path: Path) -> None:
+    """Исполнитель отчитался артефактами без коммита — движок фиксирует работу сам."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    repo = git_repo(tmp_path)
+    spec = chain_repo_spec(tmp_path, repo)
+
+    run(conn, spec, deal, home, Fake(result={"status": "done", "summary": "готово"}, pack=True))
+    payload = ended_of(conn, deal, "impl")["payload"]
+
+    assert "commit" not in (payload["result"] or {}), "исполнитель коммита не делал"
+    assert len(str(payload["commit"])) == 40, payload["commit"]
+    tree = runner.attempt_dir(home, deal, "impl", 1) / "tree"
+    assert git_head(tree) == payload["commit"]
+    assert git_out(tree, "status", "--porcelain").strip() == "", "дерево попытки чистое"
+    tracked = git_out(tree, "show", "--name-only", "--format=", payload["commit"])
+    assert "notes.txt" in tracked, "работа попытки попала в коммит"
+
+
+def test_predecessor_artifacts_are_visible_in_the_next_stage_tree(tmp_path: Path) -> None:
+    """Регрессия E2E `d_a2a26b55`: файл, созданный на `impl`, есть в дереве `verify`.
+
+    Ровно этот случай и уронил живой прогон: `verify` получил чистое дерево от
+    базы дела и не нашёл `dashboard/failures.py`, который сделал `impl`.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    repo = git_repo(tmp_path)
+    spec = chain_repo_spec(tmp_path, repo)
+    made = "def failures():\n    return []\n"
+
+    run(
+        conn,
+        spec,
+        deal,
+        home,
+        Fake(result={"status": "done", "summary": "добавил"}, files={"dashboard/failures.py": made}, pack=True),
+    )
+    runner.run_stage(
+        conn,
+        spec,
+        deal,
+        "verify",
+        1,
+        home=home,
+        spawn=Fake(result={"status": "done", "summary": "проверил"}, pack=True),
+        clock=lambda: NOW,
+    )
+
+    tree = runner.attempt_dir(home, deal, "verify", 1) / "tree"
+    assert (tree / "dashboard" / "failures.py").read_text(encoding="utf-8") == made
+    assert ended_of(conn, deal, "verify")["payload"]["outcome"] == "done"
+
+
+def test_contract_previous_carries_the_predecessor_commit(tmp_path: Path) -> None:
+    """`previous` несёт коммит и артефакты предшественника, а не только артефакты."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    repo = git_repo(tmp_path)
+    spec = chain_repo_spec(tmp_path, repo)
+
+    run(conn, spec, deal, home, Fake(result={"status": "done", "summary": "готово"}, pack=True))
+    impl_commit = ended_of(conn, deal, "impl")["payload"]["commit"]
+    runner.run_stage(
+        conn,
+        spec,
+        deal,
+        "verify",
+        1,
+        home=home,
+        spawn=Fake(result={"status": "done", "summary": "проверил"}, pack=True),
+        clock=lambda: NOW,
+    )
+
+    workdir = runner.attempt_dir(home, deal, "verify", 1)
+    contract = json.loads(runner.contract_path(workdir, "verify", 1).read_text(encoding="utf-8"))
+    previous = contract["previous"]
+    assert len(previous) == 1
+    assert previous[0]["stage"] == "impl"
+    assert previous[0]["commit"] == impl_commit
+    assert previous[0]["artifacts"] and previous[0]["artifacts"][0]["path"] == "notes.txt"
+    assert previous[0]["summary"] == "готово"
+
+
+def test_attempt_started_records_the_real_base(tmp_path: Path) -> None:
+    """`attempt_started.payload.base` называет ревизию, от которой этап работал."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    repo = git_repo(tmp_path)
+    spec = chain_repo_spec(tmp_path, repo)
+    head = git_head(repo)
+
+    run(conn, spec, deal, home, Fake(result={"status": "done", "summary": "готово"}, pack=True))
+    impl_commit = ended_of(conn, deal, "impl")["payload"]["commit"]
+    runner.run_stage(
+        conn,
+        spec,
+        deal,
+        "verify",
+        1,
+        home=home,
+        spawn=Fake(result={"status": "done", "summary": "проверил"}, pack=True),
+        clock=lambda: NOW,
+    )
+
+    assert started_of(conn, deal, "impl", 1)["payload"]["base"] == head
+    assert started_of(conn, deal, "verify", 1)["payload"]["base"] == impl_commit
+
+
+def test_repeat_attempt_of_the_stage_uses_the_same_base(tmp_path: Path) -> None:
+    """Повтор попытки отводится от той же базы: «что видел этап» воспроизводимо."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    repo = git_repo(tmp_path)
+    spec = chain_repo_spec(tmp_path, repo)
+
+    run(conn, spec, deal, home, Fake(result={"status": "done", "summary": "готово"}, pack=True))
+    impl_commit = ended_of(conn, deal, "impl")["payload"]["commit"]
+    runner.run_stage(
+        conn, spec, deal, "verify", 1, home=home, spawn=Fake(exit_code=2), clock=lambda: NOW
+    )
+    runner.run_stage(
+        conn,
+        spec,
+        deal,
+        "verify",
+        2,
+        home=home,
+        spawn=Fake(result={"status": "done", "summary": "проверил"}, pack=True),
+        clock=lambda: NOW,
+    )
+
+    assert started_of(conn, deal, "verify", 1)["payload"]["base"] == impl_commit
+    assert started_of(conn, deal, "verify", 2)["payload"]["base"] == impl_commit
+
+
+def test_two_needs_with_linear_commits_take_the_later(tmp_path: Path) -> None:
+    """Два предшественника с линейными коммитами: база — тот, что содержит обоих.
+
+    Проверяется в обе стороны: порядок в журнале не решает, решает родство.
+    """
+    repo = git_repo(tmp_path)
+    spec = split_repo_spec(tmp_path, repo, needs="[a, b]")
+    head = git_head(repo)
+    first = git_commit_object(repo, parent=head, message="a")
+    second = git_commit_object(repo, parent=first, message="b")
+    stage = spec.stage("both")
+
+    a_first = [
+        fact("attempt_ended", {"stage": "a", "attempt": 1, "outcome": "done", "commit": first}, ts=NOW),
+        fact("attempt_ended", {"stage": "b", "attempt": 1, "outcome": "done", "commit": second}, ts=NOW + 10),
+    ]
+    assert runner.base_of_stage(spec, stage, a_first) == second
+
+    # Предок записан позже потомка: база всё равно потомок — работа предка уже в нём.
+    b_first = [
+        fact("attempt_ended", {"stage": "a", "attempt": 1, "outcome": "done", "commit": second}, ts=NOW + 10),
+        fact("attempt_ended", {"stage": "b", "attempt": 1, "outcome": "done", "commit": first}, ts=NOW),
+    ]
+    assert runner.base_of_stage(spec, stage, b_first) == second
+
+
+def test_divergent_predecessors_stop_the_stage_with_contract(tmp_path: Path) -> None:
+    """Два расходящихся коммита без общего потомка — `failed(contract)`, а не выбор."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    repo = git_repo(tmp_path)
+    spec = split_repo_spec(tmp_path, repo, needs="[a, b]")
+    head = git_head(repo)
+    left = git_commit_object(repo, parent=head, message="a")
+    right = git_commit_object(repo, parent=head, message="b")
+    seed(
+        conn,
+        deal,
+        "attempt_ended",
+        {"stage": "a", "attempt": 1, "outcome": "done", "commit": left},
+        key="test:a:ended",
+        ts=NOW,
+    )
+    seed(
+        conn,
+        deal,
+        "attempt_ended",
+        {"stage": "b", "attempt": 1, "outcome": "done", "commit": right},
+        key="test:b:ended",
+        ts=NOW + 10,
+    )
+    fake = Fake(result={"status": "done", "summary": "готово"}, pack=True)
+
+    report = runner.run_stage(
+        conn, spec, deal, "both", 1, home=home, spawn=fake, clock=lambda: NOW
+    )
+
+    assert (report["outcome"], report["kind"]) == ("failed", "contract"), report
+    assert "разошлись" in report["reason"] and left[:12] in report["reason"]
+    assert fake.calls == [], "попытка не поднимается, пока база не выведена"
+    assert not (runner.attempt_dir(home, deal, "both", 1) / "tree").exists()
+    ended = ended_of(conn, deal, "both")
+    assert (ended["payload"]["outcome"], ended["payload"]["kind"]) == ("failed", "contract")
+
+
+def test_base_of_stage_reports_an_unresolvable_predecessor_commit(tmp_path: Path) -> None:
+    """Коммит предшественника назван, но его нет в репозитории — отказ, а не тишина."""
+    repo = git_repo(tmp_path)
+    spec = chain_repo_spec(tmp_path, repo)
+    seeded = [
+        fact(
+            "attempt_ended",
+            {"stage": "impl", "attempt": 1, "outcome": "done", "commit": "0" * 40},
+        )
+    ]
+    with pytest.raises(runner.BaseError) as caught:
+        runner.base_of_stage(spec, spec.stage("verify"), seeded)
+    assert "не резолвится" in str(caught.value)
 
 
 # ---------------------------------------------------------------- живой прогон

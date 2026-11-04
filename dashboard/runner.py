@@ -13,9 +13,12 @@
    один этап — второй получит `False` и не сделает ничего. TTL — из
    `stage.budget.minutes` (по умолчанию 30 мин), продление — по heartbeat'у
    попытки не реже TTL/3.
-2. **Дерево попытки**. `worktree` — `git worktree add <каталог попытки>/tree
-   <base>` от `spec.base`; `dir` — каталог дела из `repo` спеки; `none` — дерева
-   нет (этапы-гейты). Каталог попытки лежит под
+2. **Дерево попытки**. `worktree` — `git worktree add --detach <каталог
+   попытки>/tree <база этапа>`; `dir` — каталог дела из `repo` спеки; `none` —
+   дерева нет (этапы-гейты). База этапа — не `spec.base`: у этапа без `needs`
+   это `spec.base`, у следующего — то, что произвёл предшественник
+   (`base_of_stage`). Иначе второй этап получал бы чистое дерево и не видел
+   работу первого. Каталог попытки лежит под
    `<home>/kanban/boards/<board>/workspaces/<deal>-<stage>-<attempt>` — это
    разрешённый корень `role-access` (`docs/PROBES.md`, проба 3): иначе read-only
    роль не прочитает ни дерево, ни отчёт. Успешная попытка дерево оставляет,
@@ -41,6 +44,10 @@
    деревом попытки — хеши файлов, резолв коммита, коды объявленных команд и их
    свежесть, бюджет. Только принятый пакет закрывает попытку `done`; иначе
    `failed(contract)` или `failed(capability)` с первыми отказами в `reason`.
+   Принятую работу движок **фиксирует коммитом в дереве попытки**
+   (`commit_tree`): исполнитель вправе отчитаться артефактами без коммита, но
+   тогда следующему этапу не от чего отвести дерево. Sha уходит в
+   `attempt_ended.payload.commit`.
 8. **Вопрос из попытки**: `question` в `result.json` → `ask()` (единственный
    канал) и дело в `wait_human`. Продолжение — резюмом сессии (`RESUME-OK`,
    `docs/PROBES.md`): id сессии из события `result` хранится в
@@ -164,6 +171,12 @@ DUTY_SUBDIR = ".duty"
 # мгновенный, но и не бесконечный.
 WORKTREE_TIMEOUT_SEC = 300
 
+# Автор коммита движка: попытку фиксирует движок, а не человек, и в истории это
+# должно быть видно. Настройки машины (`user.email`, подпись) на факт не влияют:
+# без этого коммит движка падал бы на чужом окружении.
+ENGINE_COMMIT_NAME = "duty"
+ENGINE_COMMIT_EMAIL = "duty@local"
+
 # Шаг опроса потока: короткий, чтобы heartbeat лизинга и таймаут срабатывали
 # вовремя, но без busy-loop.
 POLL_SEC = 0.2
@@ -177,6 +190,17 @@ class RunnerError(RuntimeError):
 
     Отдельный тип, потому что «этап не запускался» и «попытка упала» — разные
     факты: первый не пишет событий вовсе, второй обязан быть в журнале.
+    """
+
+
+class BaseError(RunnerError):
+    """База этапа не выводится из журнала: предшественники разошлись.
+
+    Это отказ **контракта**, а не инфраструктуры: два разных коммита
+    предшественников без общего потомка означают, что дерево, отведённое от
+    любого из них, молча теряло бы работу другого. Выбирать «первый попавшийся»
+    здесь нельзя — нужен человек (или merge), и `run_stage` пишет
+    `failed(contract)` с этой причиной.
     """
 
 
@@ -362,25 +386,28 @@ def _git(args: Iterable[str], cwd: Path) -> tuple[int, str]:
 # --------------------------------------------------------------------- дерево
 
 
-def prepare_tree(spec: Any, stage: Any, workdir: Path) -> tuple[Optional[Path], Path]:
+def prepare_tree(
+    spec: Any, stage: Any, workdir: Path, *, base: Optional[str] = None
+) -> tuple[Optional[Path], Path]:
     """Дерево попытки по `workspace` этапа: (дерево или None, cwd процесса).
 
-    `worktree` — своё дерево от `spec.base` (валидатор уже проверил, что rev
-    существует); `dir` — каталог дела из `repo` спеки, без worktree; `none` —
-    дерева нет, cwd — сам каталог попытки.
+    `worktree` — своё дерево от базы этапа (`base`, по умолчанию `spec.base`:
+    валидатор уже проверил, что rev существует); `dir` — каталог дела из `repo`
+    спеки, без worktree; `none` — дерева нет, cwd — сам каталог попытки.
     """
     workdir = Path(workdir)
     if stage.workspace == "worktree":
         repo = Path(str(spec.repo or "")).expanduser()
         tree = workdir / "tree"
+        rev = str(base if base is not None else spec.base or "")
         # `--detach`: база — это коммит, а не ветка. Ветка может быть уже занята
         # другим деревом (главный checkout, дерево прошлой попытки), и тогда
         # `git worktree add <путь> <ветка>` отказывает «is already used by
         # worktree». Попытка всегда отводится от коммита, поэтому detach —
         # не обход, а верная модель: ветку двигает не попытка, а публикация.
-        code, reason = _git(["worktree", "add", "--detach", str(tree), str(spec.base or "")], repo)
+        code, reason = _git(["worktree", "add", "--detach", str(tree), rev], repo)
         if code != 0:
-            raise RunnerError(f"git worktree add {tree} от {spec.base!r} в {repo}: {reason or code}")
+            raise RunnerError(f"git worktree add {tree} от {rev!r} в {repo}: {reason or code}")
         return tree, tree
     if stage.workspace == "dir":
         if spec.repo is None:
@@ -392,6 +419,194 @@ def prepare_tree(spec: Any, stage: Any, workdir: Path) -> tuple[Optional[Path], 
             raise RunnerError(f"каталог дела {repo} не найден (workspace: dir этапа {stage.id!r})")
         return None, repo
     return None, workdir
+
+
+# ---------------------------------------------------------------- база этапа
+
+
+def _successful_of(needs: Iterable[str], events: Iterable[Any]) -> dict[str, tuple[int, dict[str, Any]]]:
+    """Последняя успешная попытка каждого предшественника: этап → (ts, payload).
+
+    Успех — исход из `OK_STATUSES` без класса отказа: тот же набор, по которому
+    `transit` считает этап `done`, — иначе база этапа и «этап пройден»
+    разошлись бы. Берётся последняя по журналу (`ts`, `id`): возврат на
+    доработку оставляет несколько успешных попыток, и годится последняя.
+    """
+    wanted = set(needs)
+    found: dict[str, tuple[int, dict[str, Any]]] = {}
+    for event in events or ():
+        if not isinstance(event, dict) or str(event.get("kind") or "") != "attempt_ended":
+            continue
+        payload = journal.payload_of(event)
+        stage_id = str(payload.get("stage") or "")
+        if stage_id not in wanted:
+            continue
+        if str(payload.get("outcome") or "").strip().lower() not in OK_STATUSES:
+            continue
+        if str(payload.get("kind") or "").strip():
+            continue
+        found[stage_id] = (_int(event.get("ts")) or 0, payload)
+    return found
+
+
+def attempt_commit(payload: dict[str, Any]) -> str:
+    """Что произвела попытка: `payload.commit`, коммит из отчёта, HEAD её дерева.
+
+    Первый источник — движок (`commit_tree`): после успешной попытки работа
+    зафиксирована коммитом в дереве, и sha лежит в событии. Второй — отчёт
+    исполнителя: он вправе закоммитить сам, и гейт уже проверил, что коммит
+    резолвится и не был предком базы. Третий — сохранённое дерево попытки без
+    коммита (события до этой правки): его HEAD и есть то, что видел этап.
+    Пустая строка — попытка не произвела ничего, от чего можно отвести дерево.
+    """
+    commit = payload.get("commit")
+    if isinstance(commit, str) and commit.strip():
+        return commit.strip()
+    result = payload.get("result")
+    if isinstance(result, dict):
+        commit = result.get("commit")
+        if isinstance(commit, str) and commit.strip():
+            return commit.strip()
+    details = payload.get("details")
+    tree = details.get("tree") if isinstance(details, dict) else None
+    if not isinstance(tree, str) or not tree:
+        return ""
+    code, out = _git(["rev-parse", "--verify", "HEAD^{commit}"], Path(tree))
+    if code != 0 or not out:
+        return ""
+    return out.split()[0]
+
+
+def _sha(repo: Path, rev: str) -> str:
+    """Полный sha ревизии в репозитории; пустая строка — ревизия не резолвится."""
+    if not rev:
+        return ""
+    code, out = _git(["rev-parse", "--verify", f"{rev}^{{commit}}"], repo)
+    if code != 0 or not out:
+        return ""
+    return out.split()[0]
+
+
+def _ancestor(repo: Path, older: str, newer: str) -> Optional[bool]:
+    """`older` — предок или равен `newer`; `None` — git не ответил."""
+    code, _ = _git(["merge-base", "--is-ancestor", older, newer], repo)
+    if code == 0:
+        return True
+    if code == 1:
+        return False
+    return None
+
+
+def base_of_stage(spec: Any, stage: Any, events: Iterable[Any]) -> str:
+    """Коммит, от которого отводится дерево этапа — база **этапа**, не дела.
+
+    У этапа без `needs` база — `spec.base`. У следующего — то, что произвёл
+    предшественник: коммит его последней успешной попытки (`attempt_commit`),
+    а если произвести было нечего — `spec.base`. Иначе второй этап получал бы
+    чистое дерево и не видел работу первого: цепочка impl → verify → review
+    была бы неисполнима в принципе (дефект, найденный прогоном E2E `d_a2a26b55`).
+
+    Несколько предшественников: решает не время, а родство коммитов. Берётся
+    самый поздний по журналу, и каждый следующий годится, только если он уже
+    внутри выбранного (или наоборот — тогда он становится выбранным). Два
+    расходящихся коммита без общего потомка — `BaseError`, то есть
+    `failed(contract)` с названными коммитами: дерево от одного из них молча
+    теряло бы работу другого, и «взяли первый попавшийся» здесь недопустимо.
+
+    База этапа `dir`/`none` базой не становится: у первого каталог дела общий (и
+    коммит движка туда не пишется), у второго работы нет вовсе — делиться нечем,
+    и база остаётся `spec.base`.
+    """
+    needs = tuple(str(need) for need in (getattr(stage, "needs", None) or ()))
+    if not needs:
+        return str(getattr(spec, "base", "") or "")
+    fallback = str(getattr(spec, "base", "") or "")
+    found = _successful_of(needs, events)
+    rows = []
+    for need in needs:
+        hit = found.get(need)
+        commit = attempt_commit(hit[1]) if hit is not None else ""
+        rows.append((hit[0] if hit is not None else 0, need, commit or fallback))
+    # Поздний предшественник первый: при равном родстве выбранным остаётся он.
+    rows.sort(key=lambda row: row[0], reverse=True)
+    repo_text = str(getattr(spec, "repo", "") or "").strip()
+    repo = Path(repo_text).expanduser() if repo_text else None
+    resolved = []
+    for ts, need, rev in rows:
+        if not rev:
+            # Предшественник не произвёл ни коммита, ни базы (цепочка гейтов без
+            # репозитория): отводить дерево не от чего, и это не отказ.
+            continue
+        if repo is None or not repo.is_dir():
+            raise BaseError(
+                f"этап {stage.id!r}: база {rev!r} предшественника {need!r} названа, "
+                f"а репозитория {repo_text or '—'} нет — дерево этапа не от чего отвести"
+            )
+        sha = _sha(repo, rev)
+        if not sha:
+            raise BaseError(
+                f"этап {stage.id!r}: ревизия {rev!r} предшественника {need!r} "
+                f"не резолвится в {repo} — дерево этапа не от чего отвести"
+            )
+        resolved.append((ts, need, sha))
+    if not resolved or repo is None:
+        return fallback
+    chosen = resolved[0]
+    for ts, need, sha in resolved[1:]:
+        if sha == chosen[2]:
+            continue
+        if _ancestor(repo, sha, chosen[2]) is True:
+            continue  # работа этого предшественника уже внутри выбранного коммита
+        if _ancestor(repo, chosen[2], sha) is True:
+            chosen = (ts, need, sha)
+            continue
+        raise BaseError(
+            f"этап {stage.id!r}: предшественники разошлись — {chosen[1]!r} произвёл "
+            f"{chosen[2][:12]}…, {need!r} произвёл {sha[:12]}…, общего потомка нет: "
+            "дерево этапа, отведённое от одного из них, потеряло бы работу другого"
+        )
+    return chosen[2]
+
+
+def commit_tree(tree: Path, deal: Any, stage_id: str, attempt: int) -> tuple[str, str]:
+    """Зафиксировать работу попытки коммитом в её дереве: (sha, причина отказа).
+
+    Исполнитель по контракту вправе отчитаться артефактами без коммита (так и
+    сделал `impl` в E2E `d_a2a26b55`), но тогда следующему этапу не от чего
+    отвести дерево. Поэтому факт фиксирует движок — **внутри дерева попытки**:
+    дерево в detached HEAD, ветку это не двигает, чужие правки не трогаются, а
+    полученный sha уходит в `attempt_ended.payload.commit`.
+
+    Пустой коммит не ошибка: исполнитель мог закоммитить сам, и тогда `HEAD` —
+    его работа. Отказ коммита отличается не кодом возврата, а деревом: если
+    после неудачи `git status` чист, фиксировать больше нечего (исполнитель уже
+    сделал это), а если грязно — работа не зафиксирована и попытке нельзя
+    отдавать `done`: следующий этап повторил бы дефект W14.
+    """
+    tree = Path(tree)
+    code, reason = _git(["add", "-A"], tree)
+    if code != 0:
+        return "", f"git add -A отказал: {reason or code}"
+    code, reason = _git(
+        [
+            # `-c` перед подкомандой: коммит движка не зависит от `user.email`
+            # и от подписи, настроенных на машине.
+            "-c", f"user.name={ENGINE_COMMIT_NAME}",
+            "-c", f"user.email={ENGINE_COMMIT_EMAIL}",
+            "-c", "commit.gpgsign=false",
+            "commit", "--no-verify",
+            "-m", f"duty: {deal['id']} {stage_id} attempt {int(attempt)}",
+        ],
+        tree,
+    )
+    if code != 0:
+        dirty_code, dirty = _git(["status", "--porcelain"], tree)
+        if dirty_code != 0 or dirty.strip():
+            return "", f"git commit отказал: {reason or code}"
+    code, out = _git(["rev-parse", "--verify", "HEAD^{commit}"], tree)
+    if code != 0 or not out:
+        return "", f"git rev-parse HEAD отказал: {out or code}"
+    return out.split()[0], ""
 
 
 def remove_tree(spec: Any, stage: Any, workdir: Path) -> tuple[bool, str]:
@@ -417,37 +632,48 @@ def remove_tree(spec: Any, stage: Any, workdir: Path) -> tuple[bool, str]:
 
 
 def previous_reports(
-    conn: sqlite3.Connection, deal: Any, spec: Any, stage_id: str
+    conn: sqlite3.Connection,
+    deal: Any,
+    spec: Any,
+    stage_id: str,
+    *,
+    events: Optional[Iterable[Any]] = None,
 ) -> list[dict[str, Any]]:
-    """Отчёты предшественников из журнала: этап, артефакты, резюме, вердикт.
+    """Отчёты предшественников из журнала: этап, коммит, артефакты, резюме, вердикт.
 
-    Собирается только по фактам: `attempt_ended` с результатом даёт `summary` и
-    `artifacts`, `collected`/`changes_requested` — вердикт. Порядок — объявление
-    этапов в спеке, чтобы файл контракта не зависел от порядка событий.
+    Собирается только по фактам: `attempt_ended` с результатом даёт `commit`,
+    `summary` и `artifacts`, `collected`/`changes_requested` — вердикт. Порядок —
+    объявление этапов в спеке, чтобы файл контракта не зависел от порядка
+    событий. `commit` обязателен: без него следующий исполнитель не знает, от
+    чего отводиться, и «что видел этап» отвечалось бы только чтением кода
+    (`base_of_stage` берёт базу оттуда же). `events` — уже прочитанный журнал
+    того же дела: один проход на шаг, а не по проходу на каждый вопрос.
     """
-    results: dict[str, dict[str, Any]] = {}
+    found: dict[str, dict[str, Any]] = {}
     verdicts: dict[str, str] = {}
-    for event in journal.read_events(conn, str(deal["id"])):
+    for event in events if events is not None else journal.read_events(conn, str(deal["id"])):
         payload = journal.payload_of(event)
         stage = payload.get("stage")
         if not isinstance(stage, str) or not stage:
             continue
         kind = str(event.get("kind") or "")
         if kind == "attempt_ended":
-            result = payload.get("result")
-            if isinstance(result, dict):
-                results[stage] = result
+            if isinstance(payload.get("result"), dict):
+                found[stage] = payload
         elif kind in ("collected", "changes_requested"):
             verdicts[stage] = "approve" if kind == "collected" else "changes"
     out: list[dict[str, Any]] = []
     for stage in getattr(spec, "stages", ()):
-        if stage.id == stage_id or (stage.id not in results and stage.id not in verdicts):
+        if stage.id == stage_id or (stage.id not in found and stage.id not in verdicts):
             continue
-        result = results.get(stage.id) or {}
+        payload = found.get(stage.id) or {}
+        result = payload.get("result")
+        result = result if isinstance(result, dict) else {}
         artifacts = result.get("artifacts")
         out.append(
             {
                 "stage": stage.id,
+                "commit": attempt_commit(payload),
                 "artifacts": artifacts if isinstance(artifacts, list) else [],
                 "summary": str(result.get("summary") or ""),
                 "verdict": verdicts.get(stage.id),
@@ -1001,10 +1227,20 @@ def run_stage(
             "reason": f"этап уже за процессом pid={held.get('pid')}, срок до {held.get('expires_at')}",
         }
 
+    stage_base = str(spec.base or "")
     try:
         workdir.mkdir(parents=True, exist_ok=True)
-        tree, cwd = prepare_tree(spec, stage, workdir)
+        # Журнал читается один раз на шаг: из него же берётся база этапа и отчёты
+        # предшественников, и два прохода дали бы два ответа на один вопрос.
+        events = journal.read_events(conn, str(deal["id"]))
+        # База этапа, а не база дела: у первого этапа — `spec.base`, у следующего —
+        # коммит предшественника (`base_of_stage`). Разошедшиеся предшественники —
+        # отказ контракта, а не инфраструктуры: дерево от одного из них потеряло
+        # бы работу другого.
+        stage_base = base_of_stage(spec, stage, events)
+        tree, cwd = prepare_tree(spec, stage, workdir, base=stage_base)
     except (RunnerError, OSError) as exc:
+        kind = FAIL_CONTRACT if isinstance(exc, BaseError) else FAIL_INFRA
         release(conn, deal=deal, stage=stage_id, pid=engine_pid)
         now = _now_sec(int(clock()))
         event = _event(
@@ -1015,30 +1251,41 @@ def run_stage(
                 "stage": stage_id,
                 "attempt": attempt,
                 "outcome": OUTCOME_FAILED,
-                "kind": FAIL_INFRA,
+                "kind": kind,
                 "reason": str(exc),
-                "details": {"workdir": str(workdir), "tree": None},
+                "details": {"workdir": str(workdir), "tree": None, "base": stage_base},
             },
             {"stage": stage_id, "attempt": attempt, "outcome": OUTCOME_FAILED},
             now,
         )
         journal.append(conn, [event])
         park = park_exhausted(
-            conn, spec, deal, stage, attempt, FAIL_INFRA, str(exc), home=home, clock=clock
+            conn, spec, deal, stage, attempt, kind, str(exc), home=home, clock=clock
         )
         return {
             "started": True,
             "stage": stage_id,
             "attempt": attempt,
             "outcome": OUTCOME_FAILED,
-            "kind": FAIL_INFRA,
+            "kind": kind,
             "reason": str(exc),
             "workdir": str(workdir),
             "tree": None,
+            "base": stage_base,
             "park": park,
         }
 
-    previous = previous_reports(conn, deal, spec, stage_id)
+    # Фактическая база дерева: `git rev-parse HEAD` после отвода. База в спеке
+    # бывает ревизией (`main`, `HEAD`), а в журнале нужен коммит — иначе разбор
+    # «от чего работал этап» снова требовал бы чтения кода.
+    actual_base = stage_base
+    if tree is not None:
+        sha = _sha(Path(tree), "HEAD")
+        if sha:
+            actual_base = sha
+
+    previous = previous_reports(conn, deal, spec, stage_id, events=events)
+
     session_id = last_session(conn, deal, stage_id) if answer is not None else ""
     contract = build_contract(
         spec,
@@ -1090,6 +1337,9 @@ def run_stage(
             "cwd": str(cwd),
             "workdir": str(workdir),
             "tree": str(tree) if tree is not None else None,
+            # Фактическая база дерева (rev): от чего этап работал. Без неё разбор
+            # «второй этап не увидел работу первого» снова требовал бы чтения кода.
+            "base": actual_base,
             "lease_expires": now + ttl,
             "contract_path": str(contract_file),
             "contract": contract,
@@ -1169,6 +1419,19 @@ def run_stage(
             # `contract` для несходящегося пакета, `capability` для бюджета.
             outcome, kind, reason = OUTCOME_FAILED, failures.verdict_kind(verdict), verdict.reason()
 
+    # Работа принята — движок фиксирует её коммитом **в дереве попытки**: только
+    # так следующему этапу есть от чего отвести дерево (W14). `dir`/`none` не
+    # коммитятся: у первого дерево чужое (каталог дела), у второго его нет.
+    # Неудача фиксации — инфра: работа сделана, но «что видел этап» не станет
+    # воспроизводимым, и `done` отдавать нельзя.
+    committed = ""
+    if outcome == OUTCOME_DONE and tree is not None:
+        committed, commit_error = commit_tree(tree, deal, stage_id, attempt)
+        if not committed:
+            outcome = OUTCOME_FAILED
+            kind = FAIL_INFRA
+            reason = f"работа попытки не зафиксирована коммитом: {commit_error}"
+
     cleaned = False
     cleanup = ""
     if outcome != OUTCOME_DONE and stage.workspace == "worktree":
@@ -1181,6 +1444,10 @@ def run_stage(
         "outcome": outcome,
         "kind": kind or None,
         "reason": reason,
+        # База этапа и коммит, который произвела попытка: два факта, по которым
+        # следующий этап отводит дерево и по которым разбирается «что видел этап».
+        "base": actual_base,
+        "commit": committed or None,
         "details": {
             "exit_code": exit_code,
             "session_id": followed.session_id or session_id or None,
@@ -1236,6 +1503,8 @@ def run_stage(
         "run_id": run_id,
         "workdir": str(workdir),
         "tree": str(tree) if tree is not None else None,
+        "base": actual_base,
+        "commit": committed or None,
         "session_id": followed.session_id or session_id or "",
         "usage_tokens": followed.usage,
         "tools": followed.tools,

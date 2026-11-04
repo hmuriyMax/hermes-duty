@@ -116,9 +116,13 @@ duty.yaml ──▶ bin/duty spec check ──▶ годна (или «file:line
   `bin/duty demo` в блоке «чего ещё нет». Уборка осиротевшей попытки (`reap`) в 0.0.4
   уже есть — факт `attempt_ended`, лизинг умершей попытки отпускается; дерево попытки
   уборка не трогает (`workspace: worktree` убирает сам движок при отказе попытки).
-- **E2E на настоящем репозитории ещё не прогнан.** Гейт P2 («дело проходит
-  impl → verify → review на настоящем репозитории») закрывается живым прогоном, где
-  публикация требует «ок» Max; в 0.0.4 сданы механизм и его тесты без модели.
+- **E2E: цепочка impl → verify пройдена живым прогоном, публикация — нет.** Живой
+  прогон 04.11 (`d_a2a26b55`) прошёл `impl`, а `verify` упал дефектом: дерево этапа
+  отводилось от базы дела, и второй этап не видел работу первого. После правки
+  (`runner.base_of_stage` + коммит принятой работы движком) двухэтапная проба
+  `d_a71a59e0` на копии кейса прошла оба этапа: `verify` получил дерево от коммита
+  `impl` и нашёл его файл. Гейт P2 целиком («… → review → публикация») закрывается
+  живым прогоном, где публикация требует «ок» Max.
 
 ## Что уже работает (роуты и экраны)
 
@@ -339,7 +343,7 @@ hermes plugins enable hermes-duty     # или Capabilities → Plugins в де�
 Из каталога плагина (`cd ~/.hermes/plugins/hermes-duty`):
 
 ```bash
-~/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q  # 539 passed, 1 skipped
+~/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q  # 555 passed, 1 skipped
 node --test tests/model.test.mjs tests/web.test.mjs        # 49 pass (37 + 12)
 bin/duty-model-sync --check                                # OK
 bin/duty-version check                                     # OK
@@ -369,7 +373,7 @@ CommonJS — `node --check plugin.js` пропускает то, что вали
 (исчерпание паркует дело), лента этапов `stagefeed.py`, `external_ref` у дела,
 драйвер `dashboard/driver.py` (`bin/duty run`) и уборка осиротевших попыток
 `reaper.sweep` (`bin/duty reap`, `reaped: true`). Регрессия
-**539 pytest + 1 skipped**, **49 node** (37 + 12), `bin/duty demo` — 7/7.
+**555 pytest + 1 skipped**, **49 node** (37 + 12), `bin/duty demo` — 7/7.
 
 `v0.0.3` — свой журнал событий (`state = fold(events)`, `POST /ingest`, `journal` в
 `/health`), единственный канал вопросов `ask()`, CLI `bin/duty` (чтение и мутации),

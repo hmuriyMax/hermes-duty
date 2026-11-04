@@ -1171,6 +1171,9 @@ def stage_verdict(home: Path, deal_id: str, stage: str) -> dict[str, Any]:
         "reason": "",
         "details": [],
         "workdir": None,
+        # База дерева, от которой работал этап (`attempt_started.payload.base`):
+        # пусто — попытка шла без дерева или событие записано до 0.0.4.
+        "base": None,
         "note": "",
     }
     home = Path(home)
@@ -1231,6 +1234,9 @@ def stage_verdict(home: Path, deal_id: str, stage: str) -> dict[str, Any]:
             "reaped": bool(ended.get("reaped")),
             "details": issues,
             "workdir": (details.get("workdir") if isinstance(details, dict) else None),
+            # База дерева именно этой попытки: у этапа с `needs` это коммит
+            # предшественника, и по ней видно, «что видел этап» (W14).
+            "base": started.get("base"),
             "note": "" if ended else "попытка не закрыта: `attempt_ended` ещё нет",
         }
     )
@@ -1258,6 +1264,8 @@ def render_stage_verdict(payload: dict[str, Any]) -> str:
         lines.append(f"  {payload['note']}")
     if payload.get("reaped"):
         lines.append("  попытку закрыл движок (reaped): отчёта нет — это не падение исполнителя")
+    if payload.get("base"):
+        lines.append(f"  база дерева: {payload['base']}")
     if payload.get("workdir"):
         lines.append(f"  каталог попытки: {payload['workdir']}")
     if payload.get("reason"):

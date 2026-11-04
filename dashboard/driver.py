@@ -249,6 +249,11 @@ def _rows(number: int, step_result: dict[str, Any], duration: float) -> list[dic
                 "kind": str(run.get("kind") or "") or None,
                 "reason": str(run.get("reason") or ""),
                 "question_id": run.get("question_id"),
+                # База дерева и коммит попытки: по ним видно, от чего этап работал
+                # и что оставил следующему (W14). В человеческую строку они не
+                # идут — она про исход, — но в `--json` и отчёте прогона нужны.
+                "base": run.get("base"),
+                "commit": run.get("commit"),
                 "duration_sec": round(float(duration), 1),
             }
         )

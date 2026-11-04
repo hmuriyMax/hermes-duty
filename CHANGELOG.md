@@ -42,7 +42,8 @@
 
 - `dashboard/runner.py` — один шаг движка: взял лизинг этапа (атомарно, таблица
   `leases` в той же `duty/duty.db`; TTL из `budget.minutes`, продление по
-  heartbeat'у не реже TTL/3), подготовил дерево (`git worktree add` от `spec.base`
+  heartbeat'у не реже TTL/3), подготовил дерево (`git worktree add --detach` от базы
+  этапа — `spec.base` у первого, коммит предшественника у следующего
   либо каталог дела, либо ничего), записал контракт файлом, заспавнил
   `hermes chat -p <role> --query-file <контракт> --format stream-json --oneshot`
   с cwd дерева, прочитал поток и записал факты.
@@ -318,6 +319,35 @@
   `bin/duty run` на деле с осиротевшей попыткой трогается с места.
 - `dashboard/demo.py` — из блока «чего ещё нет» убран `reap` (осталась декомпозиция).
 
+**Этап отводится от коммита предшественника, а не от базы дела**
+
+- `dashboard/runner.py` — `base_of_stage(spec, stage, events) -> str` и
+  `commit_tree()`. Живой прогон E2E `d_a2a26b55` уронил `verify` отказом
+  `artifact.missing` на файле, который сделал `impl`: `prepare_tree` отводил
+  дерево **каждого** этапа от `spec.base`, и второй этап получал чистое дерево.
+  Теперь база — база **этапа**: у этапа без `needs` это `spec.base`, у следующего —
+  коммит последней успешной попытки предшественника. Принятую работу движок
+  фиксирует сам (`git add -A` + `commit` в дереве попытки, detached HEAD, ветку не
+  двигает) и пишет sha в `attempt_ended.payload.commit`, поэтому база следующего
+  этапа — всегда коммит, а не «дерево, которое кто-то оставил».
+- Несколько предшественников решает не время, а родство коммитов: годится тот,
+  что содержит работу остальных; два расходящихся коммита без общего потомка —
+  `failed(contract)` с названными sha (дерево от одного молча теряло бы работу
+  другого), и попытка не поднимается вообще.
+- `attempt_started.payload.base` и `attempt_ended.payload.base` — фактическая база
+  дерева (`git rev-parse HEAD` после отвода): в `bin/duty why … <этап>` она
+  печатается строкой «база дерева», в отчёте прогона едет полем `base`. `previous`
+  в контракте попытки несёт `commit` предшественника рядом с артефактами и
+  резюме — следующий исполнитель знает, от чего отводиться.
+- `tests/test_runner.py` — 13 новых кейсов: база первого этапа, база от коммита
+  предшественника, провал предшественника базой не бывает, `git rev-parse HEAD`
+  дерева второго этапа равен коммиту первого (ветка дела не тронута), автокоммит
+  движка и его sha в событии, регрессия ровно на `d_a2a26b55` (файл `impl` есть в
+  дереве `verify`), `previous.commit`, `attempt_started.base`, повтор попытки от
+  той же базы, линейные и расходящиеся предшественники.
+- `docs/SPEC.md`, `docs/JOURNAL.md` — что значит `base` при `needs` и новые поля
+  событий попытки.
+
 ### Изменено
 
 - `dashboard/journal.py` — набор `kind` расширен одним словом: `attempt_progress`
@@ -376,18 +406,19 @@
 
 | прогон | результат |
 |---|---|
-| `pytest tests/ -q` | `539 passed, 1 skipped` (skip — живой прогон под `@pytest.mark.live`, включается `pytest -m live`) |
+| `pytest tests/ -q` | `555 passed, 1 skipped` (skip — живой прогон под `@pytest.mark.live`, включается `pytest -m live`) |
 | `node --test tests/model.test.mjs` | `37 pass` |
 | `node --test tests/web.test.mjs` | `12 pass` |
 | `bin/duty demo` | 7 проверок OK, код 0 |
 | `bin/duty-version check` | OK |
 | `hermes plugins validate .` | Validation passed |
 
-По файлам (собрано 540 = 539 passed + 1 skipped): `test_spec` 72, `test_journal`
-61, `test_transit` 51, `test_deals` 50, `test_runner` 39, `test_cli` 37,
-`test_failures` 34, `test_evidence` 30, `test_aggregate` 30, `test_ask` 29,
+По файлам (собрано 556 = 555 passed + 1 skipped): `test_spec` 72, `test_journal`
+61, `test_runner` 52, `test_transit` 51, `test_deals` 50, `test_cli` 37,
+`test_failures` 34, `test_aggregate` 30, `test_evidence` 30, `test_ask` 29,
 `test_routing` 25, `test_driver` 22, `test_reaper` 16, `test_stagefeed` 15,
-`test_screens` 12, `test_demo` 9, `test_p0_contract` 6, `test_frontend_syntax` 2.
+`test_screens` 12, `test_demo` 9, `test_p0_contract` 6, `test_frontend_syntax` 2,
+`test_worktree_base` 3.
 
 ## [0.0.3] — в разработке
 

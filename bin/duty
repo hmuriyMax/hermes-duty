@@ -8,6 +8,8 @@
     bin/duty why <board> <id>
     bin/duty why <board> <id> <этап>   (плюс приговор последней попытки этапа)
     bin/duty watch [--interval 10]
+    bin/duty run <deal_id> [--spec <duty.yaml>] [--max-steps N] [--once]
+                                       (движок доводит дело: решение → шаг → журнал)
     bin/duty demo [--keep]
     bin/duty spec check <file>   (OK либо file:line: правило: текст; --json — та же форма)
     --json  (глобальный флаг: ровно форма роута)

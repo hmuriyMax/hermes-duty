@@ -7,6 +7,7 @@
     duty why <board> <id>                 доказательство словами бэкенда
     duty why <board> <id> <этап>          то же плюс приговор последней попытки этапа
     duty watch [--interval 10]            тот же `now`, перерисовка в терминале
+    duty run <deal_id> [--spec F]         довести своё дело по спеке: решение → шаг → журнал
     duty spec check <file>                спека дела до запуска: OK или file:line: правило: текст
     --json (глобальный флаг)              машиночитаемый вывод: ровно форма роута
 
@@ -27,6 +28,12 @@
 `duty watch` деградацию источников не превращает в падение: печатает `errors[]`
 строками и продолжает. Отсутствующая доска — исключение: она не появится сама,
 поэтому выход сразу с кодом 1.
+
+`duty run` (движок доводит дело до конца) добавляет к этому свои три кода —
+`3` ждёт (`wait`: ответа человека, приговора, паузы, чужого лизинга), `4` упёрлось
+в предел шагов, `130` прервано с клавиатуры (`dashboard/driver.py`). Решение «что
+дальше» по-прежнему считает `transit`, шаг делает `runner`: у CLI и здесь только
+оформление и код возврата.
 """
 
 from __future__ import annotations
@@ -95,6 +102,8 @@ SPEC_MODULE_NAME = "hermes_duty_spec"
 # Журнал: `why <доска> <id> <этап>` читает те же события, что и движок.
 JOURNAL_MODULE_NAME = "hermes_duty_journal"
 FAILURES_MODULE_NAME = "hermes_duty_failures"
+# Драйвер дела: `run` зовёт его, а не собирает цикл «решение → шаг» в терминале.
+DRIVER_MODULE_NAME = "hermes_duty_driver"
 
 
 def _load_demo() -> Any:
@@ -166,6 +175,26 @@ def _load_failures() -> Any:
         raise SourceFailure(f"failures module not found: {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[FAILURES_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_driver() -> Any:
+    """Загрузить `dashboard/driver.py` — движок, который доводит дело до конца.
+
+    `run` не собирает цикл у себя: решение считает `transit`, шаг делает
+    `runner`, а драйвер только связывает их. Вторая копия цикла в терминале
+    означала бы второй набор поведения.
+    """
+    loaded = sys.modules.get(DRIVER_MODULE_NAME)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / "driver.py"
+    spec = importlib.util.spec_from_file_location(DRIVER_MODULE_NAME, path)
+    if spec is None or spec.loader is None:
+        raise SourceFailure(f"driver module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[DRIVER_MODULE_NAME] = module
     spec.loader.exec_module(module)
     return module
 
@@ -337,6 +366,23 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--interval", type=float, default=10.0, help="секунд между тиками (по умолчанию 10)")
     watch.add_argument("--board", help="только одна доска (slug)")
     watch.add_argument("--state", help="только дела в этом waiting.state")
+
+    # Драйвер дела (`docs/RUNBOOK.md`): цикл «решение → шаг → перечитать журнал».
+    # Решение считает `transit`, шаг делает `runner`; CLI только разбирает argv и
+    # оформляет отчёт, поэтому правил перехода здесь нет.
+    run = command("run", "довести своё дело по спеке: решение → шаг → перечитать журнал")
+    run.add_argument("deal_id", help="id своего дела (d_…): у него есть store и журнал")
+    run.add_argument(
+        "--spec",
+        help="спека дела (duty.yaml): по умолчанию — путь из журнала дела (created.payload.spec)",
+    )
+    run.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="предел шагов прогона: превышение — код 4 (по умолчанию 20 — DEFAULT_MAX_STEPS драйвера)",
+    )
+    run.add_argument("--once", action="store_true", help="один шаг и выход (отладка и тесты)")
 
     # Мутации своего дела (`docs/OWNERSHIP.md`): те же функции, что у роутов
     # `/deals…`, — CLI не заводит второго набора правил.
@@ -1321,6 +1367,82 @@ def render_failure_log(payload: dict[str, Any]) -> str:
 # ------------------------------------------------------------------------ main
 
 
+def render_run_step(row: dict[str, Any]) -> str:
+    """Строка шага прогона: `impl · попытка 1 · ok (12.4s)` или `verify · попытка 1 · contract: …`.
+
+    Формат — ровно то, что человек видит в терминале по ходу прогона: этап,
+    номер попытки и исход. Отказ называется классом и причиной (`contract: нет
+    evidence по go build`), а не словом «ошибка»: разбирать его — не работа
+    терминала, он показывает факт из события.
+    """
+    stage = str(row.get("stage") or "—")
+    attempt = row.get("attempt") or 0
+    if not row.get("started"):
+        return f"{stage} · попытка {attempt} · не поднята: {row.get('reason') or 'причина не записана'}"
+    outcome = str(row.get("outcome") or "")
+    kind = row.get("kind")
+    if outcome == _load_failures().OUTCOME_DONE:
+        duration = row.get("duration_sec")
+        took = f" ({float(duration):.1f}s)" if isinstance(duration, (int, float)) else ""
+        return f"{stage} · попытка {attempt} · ok{took}"
+    detail = f"{kind}: {row.get('reason')}" if kind else str(row.get("reason") or outcome or "исход не записан")
+    return f"{stage} · попытка {attempt} · {detail}"
+
+
+def _decision_text(decision: dict[str, Any]) -> str:
+    """Решение `transit` словами CLI: `run(verify#1)`, `wait(question)`, `done`."""
+    kind = str(decision.get("kind") or "—")
+    if kind == "run":
+        pairs = ", ".join(
+            f"{stage}#{attempt}"
+            for stage, attempt in zip(decision.get("stages") or [], decision.get("attempts") or [])
+        )
+        return f"run({pairs})"
+    if kind == "wait":
+        text = f"wait({decision.get('what') or '—'})"
+        if decision.get("retry_at"):
+            text += f" до {decision['retry_at']}"
+        return text
+    if kind == "failed":
+        return f"failed({decision.get('fail_kind') or '—'})"
+    if kind == "park":
+        stages = decision.get("stages") or []
+        return f"park({stages[0] if stages else '—'})"
+    return kind
+
+
+def render_run_final(report: dict[str, Any]) -> str:
+    """Итог прогона одной строкой: что сделано и чего ждём.
+
+    Ожидание называется тем, чего не хватает (`wait(question)` плюс номер
+    вопроса в причине, `wait(retry)` плюс `retry_at`, `wait(gate)` плюс кто
+    держит): «вышел с кодом 3» без этих слов человеку ничего не говорит.
+    """
+    outcome = str(report.get("outcome") or "")
+    decision = report.get("decision") or {}
+    steps = report.get("steps") or []
+    made = len({row.get("n") for row in steps})
+    note = str(report.get("note") or decision.get("reason") or "")
+    if outcome == "done":
+        return f"итог: дело закрыто — {note or 'все этапы закрыты'} (шагов: {made})"
+    if outcome == "failed":
+        return f"итог: дело остановлено отказом {decision.get('fail_kind') or '—'} — {note} (шагов: {made})"
+    if outcome == "park":
+        return (
+            f"итог: дело припарковано, решает человек — вопрос #{decision.get('question_id') or '—'}, "
+            f"{note} (шагов: {made})"
+        )
+    if outcome == "wait":
+        return f"итог: ждём {_decision_text(decision)} — {note}"
+    if outcome == "limit":
+        return f"итог: предел шагов — {note}"
+    if outcome == "interrupted":
+        return f"итог: прервано — {note} (шагов: {made})"
+    if outcome == "step":
+        return f"итог: сделан один шаг (--once) — дальше {_decision_text(decision)}"
+    return f"итог: {outcome or '—'} — {note}"
+
+
 def _emit_json(payload: dict[str, Any], stream: Any) -> None:
     """`--json` — ответ роута дословно, без добавленных ключей."""
     print(json.dumps(payload, ensure_ascii=False, indent=2), file=stream)
@@ -1341,6 +1463,22 @@ def main(argv: Optional[list[str]] = None) -> int:
             return run_watch(
                 args.interval, board=args.board, state=args.state, as_json=args.json, stream=out
             )
+        if args.command == "run":
+            # Прогон дела: цикл живёт в `dashboard/driver.py`, здесь — argv,
+            # построчный вывод шагов и итог. Код возврата — из отчёта драйвера
+            # (`0/1/2/3/4/130`), а не выдуманный терминалом.
+            driver = _load_driver()
+            report = _route(
+                driver.drive,
+                api().hermes_home(),
+                args.deal_id,
+                spec_path=args.spec,
+                max_steps=driver.DEFAULT_MAX_STEPS if args.max_steps is None else args.max_steps,
+                once=args.once,
+                on_step=None if args.json else (lambda row: print(render_run_step(row), file=out)),
+            )
+            _emit_json(report, out) if args.json else print(render_run_final(report), file=out)
+            return int(report.get("exit_code") or EXIT_OK)
         if args.command == "demo":
             report = _load_demo().run_demo(
                 api(), home=Path(args.home) if args.home else None, keep=args.keep,

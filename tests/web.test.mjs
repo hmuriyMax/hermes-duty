@@ -91,3 +91,37 @@ test('порт и хост backend не захардкожены в веб-сб�
     assert.ok(!/18742|127\.0\.0\.1|localhost:\d+/.test(text), `${name}: захардкоженный адрес`)
   }
 })
+
+test('карточка дела рисует ленту этапов из ответа /deal, а не из своего расчёта', () => {
+  // один шейпер на обе поверхности: правила состояний этапа живут в model.js
+  assert.match(app, /shapeStages/)
+  assert.ok(!/STAGE_META\s*=\s*\{/.test(app), 'в app.js появилась своя таблица состояний этапа')
+  // лента встроена в карточку дела
+  assert.match(app, /function stageFeedPanel\(data\)/)
+  assert.match(app, /stageFeedPanel\(data\)/)
+  // причина пустоты приходит с бэкенда (`stages_note`), а не выдумывается экраном
+  assert.match(app, /feed\.note/)
+  // вопрос ведёт в панель пула: отвечают там, а лента — read-only
+  assert.match(app, /questionHref/)
+})
+
+test('лента этапов без прогресс-баров: «сколько прошло» никто не мерил', () => {
+  const start = app.indexOf('function stageFeedPanel(')
+  const end = app.indexOf('function attemptCard(')
+  assert.ok(start > 0 && end > start, 'не найден блок ленты этапов в app.js')
+  const feedSource = app.slice(start, end)
+  assert.ok(!feedSource.includes("class: 'track'"), 'в ленте этапов появился прогресс-бар')
+  assert.ok(!feedSource.includes('barPct'), 'в ленте этапов появился процент прогресса')
+  // и ни одной кнопки, двигающей дело: экран не решает
+  assert.ok(!/<button/i.test(feedSource), 'в ленте этапов появилась кнопка')
+  assert.ok(!/onclick|onClick/.test(feedSource), 'лента этапов обрабатывает клики')
+})
+
+test('десктопная лента берёт те же `stages` из ctx.rest(/deal/…)', () => {
+  // данные — только через ctx.rest, ни одного прямого fetch
+  assert.match(pluginSource, /shapeStages\(detail\.data\)/)
+  assert.match(pluginSource, /h\(StageFeed, \{ feed \}\)/)
+  assert.ok(!pluginSource.includes('fetch('), 'plugin.js: прямой fetch запрещён')
+  // ожидание вопроса — ссылкой на пул, как и в вебе
+  assert.match(pluginSource, /href: stage\.questionHref/)
+})

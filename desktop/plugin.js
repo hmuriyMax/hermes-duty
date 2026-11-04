@@ -209,6 +209,7 @@ function shapeDeal(deal) {
   const lease = d.lease && typeof d.lease === 'object' ? d.lease : {}
   const action = d.last_action && typeof d.last_action === 'object' ? d.last_action : {}
   const waiting = d.waiting && typeof d.waiting === 'object' ? d.waiting : {}
+  const stage = d.stage && typeof d.stage === 'object' ? d.stage : null
   const humanKind = String(waiting.human_kind || '')
   const meta = stateMeta(waiting.state, humanKind)
   const pidAlive = attempt ? attempt.pid_alive : null
@@ -253,6 +254,15 @@ function shapeDeal(deal) {
     lastActionAgeText: fmtAge(lastAge),
     lastActionKind: String(action.kind || '—'),
     lastActionSummary: String(action.summary || ''),
+    // Этап и номер попытки из журнала (`/now.stage`): «что сейчас» видно в
+    // строке, не открывая дело. Пусто — ни одной попытки у дела не было, и
+    // подставлять «этап 0» значило бы выдумать граф.
+    stageId: stage ? String(stage.id || '') : '',
+    stageAttempt: stage ? Number(stage.attempt) || 0 : 0,
+    stageLive: stage ? stage.live === true : false,
+    stageText: stage
+      ? `${String(stage.id || '—')} · попытка ${Number(stage.attempt) || 0}${stage.live === true ? ' · идёт' : ''}`
+      : '',
     search: `${d.board || ''} ${d.id || ''} ${d.title || ''} ${d.assignee || ''} ${waiting.state || ''}`.toLowerCase(),
   }
 }
@@ -437,6 +447,218 @@ function noticeLines(model, stale = false) {
     ...model.truncatedNotices,
     ...model.warningNotices,
   ]
+}
+
+/* ------------------------------------------- лента этапов и попыток (W6) */
+
+// Состояния этапа приходят из `transit.stage_states` (`done|running|pending|
+// failed|wait_human|wait_gate|parked`). Правила не дублируются: здесь только
+// подпись и тон. Цвет по заданию: `done` — спокойный зелёный, `running` —
+// акцент, `wait_*` — янтарный, `failed` — красный, `pending` — серый.
+const STAGE_META = {
+  done: { label: 'пройден', tone: 'green' },
+  running: { label: 'идёт', tone: 'blue' },
+  wait_human: { label: 'ждёт человека', tone: 'yellow' },
+  wait_gate: { label: 'ждёт гейт', tone: 'yellow' },
+  pending: { label: 'ждёт хода', tone: 'gray' },
+  failed: { label: 'отказ', tone: 'red' },
+  parked: { label: 'припаркован', tone: 'yellow' },
+}
+
+// Чем кончился процесс: `blocked`/`refused` янтарные — это не падение
+// исполнения, а отказ гейта или вопрос человеку. Незнакомый исход остаётся
+// серым: тон не выдумывается (тот же принцип, что у `outcomeTone`).
+const ATTEMPT_TONE = {
+  done: 'green',
+  ok: 'green',
+  success: 'green',
+  passed: 'green',
+  accepted: 'green',
+  blocked: 'yellow',
+  refused: 'yellow',
+  rate_limited: 'yellow',
+  reclaimed: 'yellow',
+  failed: 'red',
+}
+
+/** Подпись и тон состояния этапа; незнакомое состояние — как есть, серым. */
+function stageMeta(state) {
+  const key = String(state || '')
+  return STAGE_META[key] || { label: key || '—', tone: 'gray' }
+}
+
+/** Число с разделителем разрядов: `15 234` глазом читается, `15234` — нет. */
+function fmtCount(value) {
+  if (value === null || value === undefined || value === '') return '—'
+  const n = Number(value)
+  if (!Number.isFinite(n)) return '—'
+  return String(Math.trunc(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ' ')
+}
+
+/**
+ * Запись объявленной команды: спека против отчёта попытки.
+ *
+ * `ok: false` без записи — не «упало», а «не доказано»: подпись говорит именно
+ * это, иначе отсутствие evidence читалось бы как проваленный build.
+ */
+function shapeStageEvidence(entry) {
+  const e = entry && typeof entry === 'object' ? entry : {}
+  const must = e.must === null || e.must === undefined ? null : Number(e.must)
+  const got = e.got === null || e.got === undefined ? null : Number(e.got)
+  let label = 'не доказано: записи нет'
+  let tone = 'gray'
+  if (got !== null) {
+    const proved = e.ok === true
+    label = proved ? `exit ${got} — как объявлено` : `exit ${got}, объявлено ${must === null ? '—' : must}`
+    tone = proved ? 'green' : 'red'
+  } else if (e.ok === true) {
+    label = 'подтверждено'
+    tone = 'green'
+  }
+  return {
+    cmd: String(e.cmd || '—'),
+    must,
+    got,
+    mustText: must === null ? '—' : String(must),
+    gotText: got === null ? '—' : String(got),
+    label,
+    tone,
+    at: e.at ?? null,
+    clock: fmtClock(e.at),
+  }
+}
+
+/**
+ * Одна попытка этапа — процесс: время, длительность, код выхода, токены,
+ * инструменты, причина отказа.
+ *
+ * Длительность есть только у закрытой попытки. У идущей её нет, и подставлять
+ * «сколько уже идёт» значило бы мерить прогресс, которого никто не мерил.
+ * Живость — отдельный факт от журнала: `live` (лизинг действует), `dead`
+ * (лизинг истёк, завершения нет), `unknown` (срок лизинга не записан).
+ */
+function shapeStageAttempt(attempt) {
+  const a = attempt && typeof attempt === 'object' ? attempt : {}
+  const outcome = String(a.outcome || '')
+  const live = a.live === true
+  const dead = a.dead === true
+  const lease = String(a.lease || '')
+  const duration = a.duration_sec === undefined ? null : a.duration_sec
+  let liveText = 'закрыта без исхода'
+  if (live) liveText = 'идёт'
+  else if (dead) liveText = 'процесс мёртв: лизинг истёк, завершения нет'
+  else if (lease === 'unknown') liveText = 'живость неизвестна: лизинг не записан'
+  else if (outcome) liveText = `исход: ${outcome}`
+  const tone = live ? 'blue' : dead ? 'red' : ATTEMPT_TONE[outcome] || 'gray'
+  const records = (Array.isArray(a.evidence) ? a.evidence : []).map((record) => {
+    const r = record && typeof record === 'object' ? record : {}
+    const exit = r.exit === null || r.exit === undefined ? null : Number(r.exit)
+    return {
+      cmd: String(r.cmd || '—'),
+      exit,
+      exitText: exit === null ? '—' : String(exit),
+      clock: fmtClock(r.started_at),
+    }
+  })
+  return {
+    n: Number(a.n) || null,
+    number: `#${Number(a.n) || '—'}`,
+    runId: a.run_id ?? null,
+    stage: String(a.stage || ''),
+    role: String(a.role || ''),
+    pid: a.pid ?? null,
+    pidText: a.pid ? `pid ${a.pid}` : 'pid не записан',
+    start: a.started_at ?? null,
+    clock: fmtClock(a.started_at),
+    finishedAt: a.finished_at ?? null,
+    finishClock: fmtClock(a.finished_at),
+    duration,
+    durationText: live ? 'идёт' : fmtAge(duration),
+    exit: a.exit ?? null,
+    exitText: a.exit === null || a.exit === undefined ? '—' : String(a.exit),
+    outcome,
+    kind: String(a.kind || ''),
+    tokens: a.tokens ?? null,
+    tokensText: fmtCount(a.tokens),
+    tools: a.tools ?? null,
+    toolsText: fmtCount(a.tools),
+    reason: String(a.reason || ''),
+    live,
+    dead,
+    lease,
+    liveText,
+    tone,
+    evidence: records,
+    hasEvidence: records.length > 0,
+  }
+}
+
+/**
+ * Этап дела: имя, роль, состояние, номер попытки, ожидание, попытки, evidence.
+ *
+ * Ожидание вопроса вынесено отдельной строкой с `question_id` и ссылкой на
+ * панель пула (`/imsg`): вопрос живёт там, где на него отвечают, а лента — нет.
+ * Своей кнопки «ответить»/«перезапустить» экран не заводит: он ничего не решает.
+ */
+function shapeStage(stage) {
+  const s = stage && typeof stage === 'object' ? stage : {}
+  const meta = stageMeta(s.state)
+  const waits = s.waits && typeof s.waits === 'object' ? s.waits : null
+  const needs = (Array.isArray(s.needs) ? s.needs : []).map(String)
+  const attempts = (Array.isArray(s.attempts) ? s.attempts : []).map(shapeStageAttempt)
+  const evidence = (Array.isArray(s.evidence) ? s.evidence : []).map(shapeStageEvidence)
+  const kind = waits ? String(waits.kind || '') : ''
+  const questionId =
+    waits && waits.question_id !== null && waits.question_id !== undefined ? String(waits.question_id) : ''
+  let waitText = ''
+  if (kind === 'question') waitText = `вопрос ${questionId ? `#${questionId}` : 'без номера'} — ждёт ответа`
+  else if (kind === 'human') waitText = 'ждёт человека: вопроса в пуле нет'
+  else if (kind === 'gate') waitText = `ждёт гейт: ${String(waits.reason || 'граф не пускает')}`
+  const attempt = Number(s.attempt) || 0
+  return {
+    id: String(s.id || '—'),
+    role: String(s.role || '—'),
+    state: String(s.state || ''),
+    stateLabel: meta.label,
+    tone: meta.tone,
+    attempt,
+    attemptText: `попытка ${attempt}`,
+    rounds: Number(s.rounds) || 0,
+    needs,
+    needsText: needs.length ? `после: ${needs.join(', ')}` : '',
+    reason: String(s.reason || ''),
+    waits,
+    waitKind: kind,
+    questionId,
+    questionHref: questionId ? '/imsg' : '',
+    waitText,
+    attempts,
+    attemptsCount: attempts.length,
+    hasAttempts: attempts.length > 0,
+    evidence,
+    hasEvidence: evidence.length > 0,
+  }
+}
+
+/**
+ * Лента этапов из ответа `/deal` (`stages` + `stages_note`).
+ *
+ * Пустой список — не ошибка рендера: у дела может не быть спеки, а у этапов —
+ * попыток. Причину пустоты называет `note` бэкенда, поэтому экран не гадает.
+ * Своих правил «готово/не готово» здесь нет: состояние приходит посчитанным.
+ */
+function shapeStages(payload) {
+  const data = payload && typeof payload === 'object' ? payload : {}
+  const stages = (Array.isArray(data.stages) ? data.stages : []).map(shapeStage)
+  const attempts = stages.reduce((sum, stage) => sum + stage.attemptsCount, 0)
+  return {
+    spec: String(data.spec || ''),
+    note: String(data.stages_note || ''),
+    stages,
+    count: stages.length,
+    attempts,
+    empty: stages.length === 0,
+  }
 }
 // duty:model-end
 
@@ -686,6 +908,7 @@ function DealRow({ deal, selected, onPick }) {
     h('td', { className: 'duty-mono', title: deal.id }, deal.id),
     h('td', { title: deal.titleFull }, deal.title),
     h('td', { title: deal.assignee }, deal.assignee),
+    h('td', { className: 'duty-muted duty-mono', title: deal.stageText || 'этап не начат' }, deal.stageText || '—'),
     h('td', { className: 'duty-num', title: attemptTitle }, deal.attemptAgeText),
     h('td', { title: leaseTitle }, deal.leaseText),
     h('td', { className: 'duty-num', title: `${deal.lastActionKind}: ${deal.lastActionSummary || '—'}` }, deal.lastActionAgeText),
@@ -712,6 +935,7 @@ function DealGroup({ group, selectedKey, onPick }) {
         h('col', { style: { width: '96px' } }),
         h('col', { style: { width: '104px' } }),
         h('col', null),
+        h('col', { style: { width: '132px' } }),
         h('col', { style: { width: '104px' } }),
         h('col', { style: { width: '68px' } }),
         h('col', { style: { width: '64px' } }),
@@ -728,6 +952,7 @@ function DealGroup({ group, selectedKey, onPick }) {
           h('th', null, 'дело'),
           h('th', null, 'заголовок'),
           h('th', null, 'исполнитель'),
+          h('th', null, 'этап'),
           h('th', null, 'попытка'),
           h('th', null, 'лизинг'),
           h('th', null, 'действие'),
@@ -811,6 +1036,137 @@ function AttemptCard({ attempt }) {
 // для пустого состояния, иначе «досок 19/19» врёт про полноту среза. Собирает её
 // модель (`noticeLines`), потому что правило «устаревший снимок замечаний не
 // имеет» проверяется тестом, а не глазами при ревью рендера.
+
+/* ---------------- лента этапов и попыток дела (W6) ---------------- */
+
+/**
+ * Попытка этапа — процесс: время, длительность, код выхода, токены,
+ * инструменты, причина отказа и живость.
+ *
+ * Живость печатается словом модели (`liveText`): «идёт», «процесс мёртв: лизинг
+ * истёк», «закрыта без исхода». Экран не решает, жив ли процесс, — он это читает
+ * из журнала, поэтому здесь нет ни `pid`-проверок, ни часов.
+ */
+function StageAttempt({ attempt }) {
+  const facts = [
+    attempt.number,
+    attempt.pidText,
+    attempt.clock,
+    attempt.durationText,
+    `exit ${attempt.exitText}`,
+    `токенов ${attempt.tokensText}`,
+    `инструментов ${attempt.toolsText}`,
+    attempt.kind ? `класс ${attempt.kind}` : '',
+  ].filter((part) => part && part !== '')
+  return h(
+    'div',
+    { className: 'duty-att' },
+    h(
+      'div',
+      { className: 'duty-att-h' },
+      h('span', { className: 'duty-mono' }, facts.join(' · ')),
+      h('span', { className: 'duty-spacer' }),
+      h(StateBadge, { label: attempt.liveText, tone: attempt.tone, title: `state=${attempt.lease}` }),
+    ),
+    attempt.reason ? h('div', { className: 'duty-error' }, attempt.reason) : null,
+    attempt.hasEvidence
+      ? h(
+          'ul',
+          { className: 'duty-events' },
+          ...attempt.evidence.map((record, i) =>
+            h(
+              'li',
+              { key: `saev-${i}` },
+              h('span', { className: 'duty-mono' }, record.cmd),
+              ` · exit ${record.exitText}`,
+              record.clock !== '—' ? ` · ${record.clock}` : '',
+            ),
+          ),
+        )
+      : null,
+  )
+}
+
+/**
+ * Один этап ленты: имя, роль, номер попытки, состояние и — отдельной строкой —
+ * ожидание. Вопрос ведёт в панель пула (`/imsg`): отвечать на него здесь нельзя,
+ * экран ничего не решает.
+ */
+function StageRow({ stage }) {
+  return h(
+    'div',
+    { className: 'duty-stage' },
+    h(
+      'div',
+      { className: 'duty-att-h' },
+      h('span', { className: 'duty-mono' }, stage.id),
+      h('span', { className: 'duty-muted' }, stage.role),
+      h('span', { className: 'duty-num' }, stage.attemptText),
+      stage.rounds > 1 ? h('span', { className: 'duty-muted' }, `раунд ${stage.rounds}`) : null,
+      h('span', { className: 'duty-spacer' }),
+      h(StateBadge, { label: stage.stateLabel, tone: stage.tone, title: stage.state }),
+    ),
+    stage.needsText ? h('div', { className: 'duty-muted' }, stage.needsText) : null,
+    stage.waitText
+      ? h(
+          'div',
+          { className: 'duty-evidence' },
+          stage.questionHref
+            ? h('a', { href: stage.questionHref }, stage.waitText)
+            : stage.waitText,
+        )
+      : null,
+    stage.hasAttempts
+      ? h(
+          'div',
+          null,
+          ...stage.attempts.map((attempt, i) =>
+            h(StageAttempt, { key: `sa-${stage.id}-${attempt.runId ?? i}`, attempt }),
+          ),
+        )
+      : h('div', { className: 'duty-muted' }, 'попыток нет'),
+    stage.hasEvidence
+      ? h(
+          'ul',
+          { className: 'duty-events' },
+          ...stage.evidence.map((entry, i) =>
+            h(
+              'li',
+              { key: `sev-${i}` },
+              h('span', { className: 'duty-mono' }, entry.cmd),
+              ` · ${entry.label}`,
+            ),
+          ),
+        )
+      : null,
+  )
+}
+
+/**
+ * Лента этапов целиком: вертикальный список в порядке объявления графа.
+ *
+ * Пустой список печатает причину (`note` бэкенда: нет спеки, спека не читается),
+ * а не «этапов нет»: это разные факты, и разница видна только если её назвать.
+ * Прогресс-баров здесь нет — «сколько прошло» никто не мерил.
+ */
+function StageFeed({ feed }) {
+  const head = h(
+    'div',
+    { className: 'duty-group-h' },
+    h('span', null, 'этапы'),
+    h('span', { className: 'duty-num' }, feed.empty ? '—' : `${feed.count} · попыток ${feed.attempts}`),
+  )
+  if (feed.empty) {
+    return h('div', { className: 'duty-deal-stages' }, head, h('div', { className: 'duty-muted' }, feed.note || 'этапов нет'))
+  }
+  return h(
+    'div',
+    { className: 'duty-deal-stages' },
+    head,
+    feed.spec ? h('div', { className: 'duty-mono duty-muted' }, feed.spec) : null,
+    h('div', null, ...feed.stages.map((stage) => h(StageRow, { key: `st-${stage.id}`, stage }))),
+  )
+}
 
 /* ---------------- экран «почему стоит» ---------------- */
 
@@ -1027,6 +1383,9 @@ function DealScreen({ sel, onBack }) {
   const query = useAttempts(sel.board, sel.id)
   const deal = useMemo(() => (detail.data && detail.data.deal ? shapeDeal(detail.data.deal) : null), [detail.data])
   const timeline = useMemo(() => (query.data ? shapeAttempts(query.data) : null), [query.data])
+  // Лента этапов приходит тем же ответом `/deal` (`stages`), что и голова дела:
+  // одна ручка — один кадр, этапы не могут отставать от фактов дела.
+  const feed = useMemo(() => shapeStages(detail.data), [detail.data])
 
   const head = h(
     'div',
@@ -1078,6 +1437,7 @@ function DealScreen({ sel, onBack }) {
           ? h('pre', { className: 'duty-spec' }, detail.data.body)
           : h('div', { className: 'duty-muted' }, 'тело дела пустое'),
       ),
+      h(StageFeed, { feed }),
       h(
         'div',
         { className: 'duty-deal-attempts' },

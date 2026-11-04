@@ -23,6 +23,7 @@ import {
   shapeAttempts,
   shapeDeal,
   shapeNow,
+  shapeStages,
   stateMeta,
 } from './model.js'
 
@@ -163,6 +164,9 @@ function dealRow(deal) {
     h('td', { class: 'mono' }, deal.id),
     h('td', { class: 'ttl', title: deal.titleFull }, deal.title),
     h('td', null, deal.assignee),
+    // Этап и номер попытки из журнала (`/now.stage`): «что сейчас» видно в
+    // строке, без открытия дела. Прочерк — у дела ещё не было попытки.
+    h('td', { class: 'mono muted', title: deal.stageText || 'этап не начат' }, deal.stageText || '—'),
     h('td', { class: 'n', title: attemptTitle }, deal.attemptAgeText),
     h('td', { title: leaseTitle }, deal.leaseText),
     h('td', { class: 'n', title: `${deal.lastActionKind}: ${deal.lastActionSummary || '—'}` }, deal.lastActionAgeText),
@@ -188,6 +192,7 @@ function groupBlock(group) {
           h('th', null, 'дело'),
           h('th', null, 'заголовок'),
           h('th', null, 'исполнитель'),
+          h('th', null, 'этап'),
           h('th', null, 'попытка'),
           h('th', null, 'лизинг'),
           h('th', null, 'действие'),
@@ -638,6 +643,111 @@ function viewDealPicker() {
   return h('div', null, ...parts)
 }
 
+/* ------------------------------------------------- лента этапов и попыток */
+
+// Попытка этапа — процесс. Печатается одной строкой фактов: номер, pid, начало,
+// длительность, код выхода, токены, инструменты, класс отказа. Прогресс-баров
+// здесь нет: «сколько прошло» никто не мерил, а полоса обещала бы измерение.
+function stageAttemptRow(attempt) {
+  const facts = [
+    attempt.number,
+    attempt.pidText,
+    attempt.clock,
+    attempt.durationText,
+    `exit ${attempt.exitText}`,
+    `токенов ${attempt.tokensText}`,
+    `инструментов ${attempt.toolsText}`,
+    attempt.kind ? `класс ${attempt.kind}` : '',
+  ].filter((part) => part && part !== '')
+  return h(
+    'div',
+    { class: 'stage-att' },
+    h(
+      'div',
+      { class: 'stage-att-h' },
+      h('span', { class: 'mono' }, facts.join(' · ')),
+      h('span', { class: 'sp' }),
+      h('span', { class: `badge t-${attempt.tone}`, title: `state=${attempt.lease}` }, h('i'), attempt.liveText),
+    ),
+    attempt.reason ? h('div', { class: 'stage-reason' }, attempt.reason) : null,
+    attempt.hasEvidence
+      ? h(
+          'ul',
+          { class: 'stage-ev' },
+          ...attempt.evidence.map((record) =>
+            h(
+              'li',
+              null,
+              h('span', { class: 'mono' }, record.cmd),
+              ` · exit ${record.exitText}`,
+              record.clock !== '—' ? ` · ${record.clock}` : '',
+            ),
+          ),
+        )
+      : null,
+  )
+}
+
+// Этап ленты: имя, роль, номер попытки, состояние; ожидание — отдельной строкой.
+// Вопрос ведёт на панель пула (`/imsg`), потому что отвечают там; кнопок экран
+// не заводит — он read-only по спеке, а не «пока не сделали».
+function stageRow(stage) {
+  return h(
+    'div',
+    { class: 'stage' },
+    h(
+      'div',
+      { class: 'stage-h' },
+      h('span', { class: 'mono stage-id' }, stage.id),
+      h('span', { class: 'muted' }, stage.role),
+      h('span', { class: 'tnum' }, stage.attemptText),
+      stage.rounds > 1 ? h('span', { class: 'muted' }, `раунд ${stage.rounds}`) : null,
+      h('span', { class: 'sp' }),
+      h('span', { class: `badge t-${stage.tone}`, title: stage.state }, h('i'), stage.stateLabel),
+    ),
+    stage.needsText ? h('div', { class: 'muted' }, stage.needsText) : null,
+    stage.waitText
+      ? h(
+          'div',
+          { class: 'stage-wait' },
+          stage.questionHref ? h('a', { href: stage.questionHref }, stage.waitText) : stage.waitText,
+        )
+      : null,
+    stage.hasAttempts
+      ? h('div', { class: 'stage-atts' }, ...stage.attempts.map(stageAttemptRow))
+      : h('div', { class: 'stage-atts' }, h('div', { class: 'muted' }, 'попыток нет')),
+    stage.hasEvidence
+      ? h(
+          'ul',
+          { class: 'stage-ev' },
+          ...stage.evidence.map((entry) => h('li', null, h('span', { class: 'mono' }, entry.cmd), ` · ${entry.label}`)),
+        )
+      : null,
+  )
+}
+
+/**
+ * Панель ленты этапов в карточке дела.
+ *
+ * Пустой список печатает причину (`stages_note` бэкенда: нет спеки, спека не
+ * читается) — «этапов нет» и «спеки нет» разные факты, и разница видна, только
+ * если её назвать.
+ */
+function stageFeedPanel(data) {
+  const feed = shapeStages(data)
+  const title = feed.empty ? 'этапы' : `этапы · ${feed.count}, попыток ${feed.attempts}`
+  const body = feed.empty
+    ? h('div', { class: 'panel-b muted' }, feed.note || 'этапов нет')
+    : h('div', null, ...feed.stages.map(stageRow))
+  return h(
+    'div',
+    { class: 'panel', style: 'margin-bottom:14px' },
+    h('div', { class: 'panel-h' }, title),
+    feed.spec ? h('div', { class: 'panel-b mono muted', style: 'padding-bottom:0' }, feed.spec) : null,
+    body,
+  )
+}
+
 function attemptCard(attempt) {
   return h(
     'div',
@@ -728,6 +838,7 @@ function viewDeal(board, taskId) {
     null,
     h('div', { style: 'margin-bottom:10px' }, h('a', { href: '#/deal' }, '← к списку дел')),
     head,
+    stageFeedPanel(data),
     h('div', { class: 'two-col' }, left, right),
   )
 }

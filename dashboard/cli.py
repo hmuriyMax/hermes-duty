@@ -321,6 +321,10 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--title", required=True, help="заголовок дела")
     create.add_argument("--body-file", help="файл с телом дела (спецификацией)")
     create.add_argument("--assignee", help="профиль-роль исполнителя")
+    create.add_argument(
+        "--spec",
+        help="спека дела (duty.yaml): по ней экран «Дело» рисует этапы; путь разворачивается в абсолютный",
+    )
     create.add_argument("--parent", action="append", default=[], help="id своего родителя (d_…); можно несколько")
 
     comment = command("comment", "комментарий в своё дело")
@@ -1227,6 +1231,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             }
             if args.assignee:
                 request["assignee"] = args.assignee
+            if args.spec:
+                # Путь разворачивается здесь, как у `duty spec check`: store
+                # принимает только абсолютный, иначе «откуда взялась спека» не
+                # восстановить из журнала (`docs/SPEC.md`).
+                request["spec"] = str(Path(args.spec).expanduser().resolve())
             return _mutate(
                 api().deals_create, "СОЗДАНО", api().hermes_home(), request, source="cli", as_json=args.json
             )

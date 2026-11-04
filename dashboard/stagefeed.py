@@ -1,0 +1,429 @@
+"""Лента этапов дела: состояние графа и попытки — **только из журнала**.
+
+Экран «Дело» отвечает на вопрос «что было и что делает», а не «в каком статусе
+карточка» (спека-источник, «Наблюдаемость: четыре экрана»). Поэтому источник у
+этого модуля ровно один — `duty/duty.db`: срез этапов считает `transit.stage_states`
+по событиям, а попытки берутся из `attempt_started`/`attempt_ended`/`attempt_progress`.
+
+Чего здесь принципиально нет:
+
+- `ps`, `lsof`, чтения `/proc` и вообще любого взгляда на живые процессы. Живость
+  попытки определяется по журналу: нет `attempt_ended` и лизинг ещё не истёк —
+  `live: true`; нет `attempt_ended`, а срок лизинга прошёл — `live: false` и
+  `dead: true`. Это и есть «мёртвый процесс виден», без выдуманного статуса:
+  состояние этапа остаётся тем, что записано (`running`), а мёртвость процесса
+  называется отдельным полем.
+- второго набора правил «что значит готово»: состояния этапов считает
+  `transit.stage_states`, а не этот файл. Здесь только форма ответа.
+
+Что модуль отдаёт:
+
+- `snapshot(...)` — блок `stages` для `GET /deal`: этапы спеки в порядке
+  объявления, у каждого состояние, номер попытки, раунды, ожидание, что делала
+  каждая попытка и что доказано из объявленных команд;
+- `current(...)` — этап и номер попытки для среза `/now`: «что сейчас» видно без
+  открытия дела;
+- `spec_of(...)` — спека, записанная в журнале при создании дела
+  (`created.payload.spec`): путь к графу берётся из журнала, а не угадывается.
+
+Спека — файл, а не факт о процессе: граф читается `dashboard/spec.py` тем же
+`load_spec()`, что и у движка. Журнал говорит, **какая** спека у дела; файл —
+**из чего** она состоит. Если спеки нет или она не читается, `stages` пуст, а
+`note` называет причину: пустая лента без объяснения выглядела бы как «этапов
+нет», а это разные факты.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
+from typing import Any, Iterable, Optional
+
+# Модули плагина грузятся по пути и живут в `sys.modules` под общими именами:
+# вторая загрузка означала бы вторую копию констант и правил в одном процессе.
+JOURNAL_MODULE_NAME = "hermes_duty_journal"
+TRANSIT_MODULE_NAME = "hermes_duty_transit"
+SPEC_MODULE_NAME = "hermes_duty_spec"
+
+
+def _load(name: str, filename: str) -> Any:
+    """`dashboard/<filename>` — тот же модуль, что грузит остальной плагин."""
+    loaded = sys.modules.get(name)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / filename
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise ImportError(f"module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+journal = _load(JOURNAL_MODULE_NAME, "journal.py")
+transit = _load(TRANSIT_MODULE_NAME, "transit.py")
+spec_module = _load(SPEC_MODULE_NAME, "spec.py")
+
+ATTEMPT_STARTED = "attempt_started"
+ATTEMPT_ENDED = "attempt_ended"
+
+# Живость попытки: три ответа, а не два. `None` — журнал не записал срок лизинга
+# (старая запись или событие без `lease_expires`), и тогда «жив» было бы догадкой.
+LIVE = "live"
+DEAD = "dead"
+UNKNOWN = "unknown"
+
+# Причины, по которым ленты может не быть. Текст уходит в `note` как есть: экран
+# печатает его рядом с пустым списком, поэтому «нет спеки» и «спека не читается»
+# остаются различимыми.
+NO_SPEC = "у дела нет спеки: этапы строятся из графа `duty.yaml` — укажи её в `duty create --spec` или в `?spec=<путь>`"
+RELATIVE_SPEC = "путь к спеке должен быть абсолютным: относительный не восстановить в журнале"
+NO_STAGES = "в спеке нет этапов: показывать нечего"
+
+
+def _int(value: Any) -> int:
+    """Целое из payload: `True` числом не считается, мусор — нулём."""
+    if value is None or isinstance(value, bool):
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _maybe_int(value: Any) -> Optional[int]:
+    """Целое или `None`: код выхода и токены отсутствуют честно, а не нулём."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _number(value: Any) -> Any:
+    """`question_id` числом, если это число: пул отдаёт и `284`, и `"284"`."""
+    if value is None or value == "":
+        return None
+    text = str(value)
+    return int(text) if text.isdigit() else text
+
+
+def _normalise(value: Any) -> str:
+    """Команда без лишних пробелов: `go  build` и `go build` — одна команда."""
+    return " ".join(str(value or "").split())
+
+
+def _payload(event: dict[str, Any]) -> dict[str, Any]:
+    """`payload` события объектом: разбор тот же, что у журнала (мусор → `{}`)."""
+    return journal.payload_of(event)
+
+
+def spec_of(events: Iterable[Any]) -> Optional[str]:
+    """Спека дела по журналу: `created.payload.spec`, записанный при создании.
+
+    Путь берётся из события, а не из строки дела: журнал — единственная правда о
+    том, по какому графу дело создавалось. Событий без спеки — `None`.
+    """
+    for event in events or ():
+        if not isinstance(event, dict) or str(event.get("kind") or "") != "created":
+            continue
+        path = _payload(event).get("spec")
+        if isinstance(path, str) and path.strip():
+            return path.strip()
+    return None
+
+
+def _attempts(events: Iterable[Any]) -> list[dict[str, Any]]:
+    """Попытки дела по журналу: начало, конец и всё, что попытка о себе сказала.
+
+    Попытка — это процесс, поэтому у неё есть pid, начало, конец, код выхода,
+    исход, класс отказа, токены и число инструментов. Факты берутся из двух
+    событий одной попытки (`attempt_started` + `attempt_ended`) по `run_id`:
+    конец без начала — не попытка, а мусор, и он пропускается.
+
+    Повтор `attempt_started` с тем же `run_id` (движок пишет его один раз на
+    попытку) не удваивает строку: первое начало и есть начало.
+    """
+    started: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for event in sorted(
+        (item for item in events or () if isinstance(item, dict)),
+        key=lambda item: _int(item.get("id")),
+    ):
+        payload = _payload(event)
+        run_id = str(payload.get("run_id") or "") or f"#{_int(event.get('id'))}"
+        kind = str(event.get("kind") or "")
+        if kind == ATTEMPT_STARTED and run_id not in started:
+            started[run_id] = {"start": event, "start_payload": payload, "end": None, "end_payload": {}}
+            order.append(run_id)
+        elif kind == ATTEMPT_ENDED and run_id in started:
+            started[run_id]["end"] = event
+            started[run_id]["end_payload"] = payload
+
+    rows: list[dict[str, Any]] = []
+    for run_id in order:
+        item = started[run_id]
+        start, start_payload = item["start"], item["start_payload"]
+        end, end_payload = item["end"], item["end_payload"]
+        details = end_payload.get("details")
+        details = details if isinstance(details, dict) else {}
+        contract = start_payload.get("contract")
+        contract = contract if isinstance(contract, dict) else {}
+        lease = _maybe_int(start_payload.get("lease_expires"))
+        started_at = _int(start.get("ts"))
+        finished_at = None if end is None else _int(end.get("ts"))
+        rows.append(
+            {
+                "n": _int(start_payload.get("attempt")) or len(rows) + 1,
+                "run_id": run_id,
+                "stage": str(start_payload.get("stage") or ""),
+                "role": str(contract.get("role") or start_payload.get("role") or ""),
+                "pid": _maybe_int(start_payload.get("pid")),
+                "started_at": started_at or None,
+                "finished_at": finished_at or None,
+                "duration_sec": None
+                if finished_at is None
+                else max(0, finished_at - started_at),
+                "lease_expires": lease,
+                "exit": _maybe_int(details.get("exit_code")),
+                "outcome": str(end_payload.get("outcome") or ""),
+                "kind": str(end_payload.get("kind") or ""),
+                "tokens": _maybe_int(details.get("usage_tokens")),
+                "tools": _maybe_int(details.get("tools")),
+                "reason": str(end_payload.get("reason") or ""),
+                "evidence": _records(end_payload.get("result")),
+                "end": end is not None,
+            }
+        )
+    return rows
+
+
+def _records(result: Any) -> list[dict[str, Any]]:
+    """Записи объявленных команд из отчёта попытки: `{cmd, exit, started_at}`.
+
+    `result.json` — факт попытки о себе: гейт (`dashboard/evidence.py`) сверяет
+    его с деревом, а лента показывает тем же списком. Запись без `cmd` не
+    команда, и в ленту не идёт: пустая строка и «команда не названа» — разные
+    факты.
+    """
+    if not isinstance(result, dict):
+        return []
+    raw = result.get("evidence")
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        cmd = _normalise(entry.get("cmd"))
+        if not cmd:
+            continue
+        out.append(
+            {
+                "cmd": cmd,
+                "exit": _maybe_int(entry.get("exit")),
+                "started_at": _maybe_int(entry.get("started_at")),
+            }
+        )
+    return out
+
+
+def _alive(row: dict[str, Any], now: int) -> dict[str, Any]:
+    """Живость попытки по журналу: `live`/`dead` плюс `lease` текстом.
+
+    Три ответа, а не два. Закрытая попытка (`attempt_ended`) — `live: false`
+    всегда: процесса уже нет по факту, а не по сроку. Незакрытая с действующим
+    лизингом — `live: true`. Незакрытая с истёкшим лизингом — `live: false` и
+    `dead: true`: это и есть «процесс мёртв», увиденное без `ps`.
+    """
+    if row["end"]:
+        return {"live": False, "dead": False, "lease": "ended"}
+    expires = row["lease_expires"]
+    if expires is None:
+        return {"live": None, "dead": None, "lease": UNKNOWN}
+    if int(now) < int(expires):
+        return {"live": True, "dead": False, "lease": LIVE}
+    return {"live": False, "dead": True, "lease": DEAD}
+
+
+def _public(row: dict[str, Any], now: int) -> dict[str, Any]:
+    """Попытка в форме ответа: без внутреннего флага `end`, с живостью."""
+    alive = _alive(row, now)
+    return {
+        "n": row["n"],
+        "run_id": row["run_id"],
+        "stage": row["stage"],
+        "role": row["role"],
+        "pid": row["pid"],
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+        "duration_sec": row["duration_sec"],
+        "lease_expires": row["lease_expires"],
+        "exit": row["exit"],
+        "outcome": row["outcome"],
+        "kind": row["kind"],
+        "tokens": row["tokens"],
+        "tools": row["tools"],
+        "reason": row["reason"],
+        "live": alive["live"],
+        "dead": alive["dead"],
+        "lease": alive["lease"],
+        "evidence": row["evidence"],
+    }
+
+
+def _join_evidence(declared: Any, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Объявленные команды против записей последней попытки: что доказано.
+
+    `must` — из спеки, `got` — из отчёта, `ok` — «доказано»: запись есть и код
+    совпал. Записи, которых спека не объявляла, тоже показываются (`must: null`):
+    молча выкинуть лишний факт значило бы спрятать, что попытка запускала ещё
+    что-то.
+    """
+    out: list[dict[str, Any]] = []
+    used: set[int] = set()
+    for item in declared or ():
+        cmd = _normalise(getattr(item, "cmd", ""))
+        must = _int(getattr(item, "must", 0))
+        match = next(
+            ((index, record) for index, record in enumerate(records) if record["cmd"] == cmd),
+            None,
+        )
+        if match is None:
+            out.append({"cmd": cmd, "must": must, "got": None, "ok": False, "at": None})
+            continue
+        index, record = match
+        used.add(index)
+        out.append(
+            {
+                "cmd": cmd,
+                "must": must,
+                "got": record["exit"],
+                "ok": record["exit"] == must,
+                "at": record["started_at"],
+            }
+        )
+    for index, record in enumerate(records):
+        if index in used:
+            continue
+        out.append(
+            {
+                "cmd": record["cmd"],
+                "must": None,
+                "got": record["exit"],
+                "ok": None,
+                "at": record["started_at"],
+            }
+        )
+    return out
+
+
+def _waits(state: str, question_id: Optional[str], reason: str) -> Optional[dict[str, Any]]:
+    """Чего этап ждёт: вопрос человека или гейт графа. Иначе ожидания нет.
+
+    `wait_human` без номера вопроса — ожидание человека без вопроса (ответить
+    некуда), и это сказано видом `human`, а не подставленным номером.
+    """
+    if state == transit.WAIT_HUMAN:
+        return {
+            "kind": "question" if question_id else "human",
+            "question_id": _number(question_id),
+            "reason": reason,
+        }
+    if state == transit.WAIT_GATE:
+        return {"kind": "gate", "question_id": None, "reason": reason}
+    return None
+
+
+def stages(spec: Any, events: Iterable[Any], now: Any) -> list[dict[str, Any]]:
+    """Этапы спеки со срезом, попытками и доказательствами — в порядке объявления.
+
+    Состояние и номер попытки — из `transit.stage_states` (единый предикат «готов»
+    для консоли и движка). Попытки — из журнала. Ни одного процесса, ни одной
+    карточки: этапы, до которых дело не дошло, видны как `pending`/`wait_gate`
+    именно потому, что спека их объявляет, а не потому, что кто-то их запускал.
+    """
+    moment = _int(now)
+    states = transit.stage_states(spec, events)
+    rows = [_public(row, moment) for row in _attempts(events)]
+    out: list[dict[str, Any]] = []
+    for stage in spec.stages:
+        state = states[stage.id]
+        mine = [row for row in rows if row["stage"] == stage.id]
+        last_with_records = next((row for row in reversed(mine) if row["evidence"]), None)
+        out.append(
+            {
+                "id": stage.id,
+                "role": stage.role,
+                "state": state.state,
+                "attempt": state.attempt,
+                "rounds": state.rounds,
+                "needs": list(state.needs),
+                "reason": state.reason,
+                "waits": _waits(state.state, state.question_id, state.reason),
+                "attempts": mine,
+                "evidence": _join_evidence(
+                    getattr(stage, "evidence", ()),
+                    last_with_records["evidence"] if last_with_records else [],
+                ),
+            }
+        )
+    return out
+
+
+def current(events: Iterable[Any], now: Any) -> Optional[dict[str, Any]]:
+    """Этап и номер попытки для `/now`: «что сейчас» без открытия дела.
+
+    Источник — только журнал: последняя попытка дела. Её `state` — факт попытки
+    (`running` — не закрыта, `done`/`failed` — чем кончилась), а не состояние
+    графа: граф без спеки не считается, и подставлять сюда `wait_gate` значило бы
+    выдумать факт. Живость — тем же правилом лизинга, что у ленты этапов.
+    """
+    rows = _attempts(events)
+    if not rows:
+        return None
+    row = _public(rows[-1], _int(now))
+    if row["finished_at"] is None:
+        state = transit.RUNNING
+    elif row["outcome"] in transit.OK_OUTCOMES and not row["kind"]:
+        state = transit.DONE
+    else:
+        state = transit.FAILED
+    return {
+        "id": row["stage"],
+        "role": row["role"],
+        "attempt": row["n"],
+        "state": state,
+        "live": row["live"],
+        "since": row["started_at"],
+    }
+
+
+def snapshot(events: Iterable[Any], now: Any, *, spec_path: Optional[str] = None) -> dict[str, Any]:
+    """Блок `stages` для `GET /deal`: граф дела по журналу и файлу спеки.
+
+    `spec_path` — путь, названный вызывающим (событие `created` или `?spec=`);
+    приоритет решает роут, а не этот слой. Путь принимается только абсолютный:
+    относительный не восстановить из журнала (`docs/SPEC.md`, «Путь к спеке»).
+    """
+    events = list(events or ())
+    if not spec_path:
+        return {"spec": None, "stages": [], "note": NO_SPEC}
+    path = Path(spec_path).expanduser()
+    if not path.is_absolute():
+        return {"spec": str(path), "stages": [], "note": RELATIVE_SPEC}
+    try:
+        spec = spec_module.load_spec(path)
+    except Exception as exc:  # noqa: BLE001 - спека не читается: это ответ, а не падение
+        reason = str(exc) or type(exc).__name__
+        return {"spec": str(path), "stages": [], "note": f"спека не читается: {reason}"}
+    if not spec.stages:
+        return {"spec": str(path), "stages": [], "note": NO_STAGES}
+    try:
+        return {"spec": str(path), "stages": stages(spec, events, now), "note": ""}
+    except Exception as exc:  # noqa: BLE001 - мусор в журнале не роняет карточку
+        reason = str(exc) or type(exc).__name__
+        return {"spec": str(path), "stages": [], "note": f"срез этапов не посчитан: {reason}"}

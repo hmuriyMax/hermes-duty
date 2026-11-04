@@ -189,13 +189,26 @@ def journal_path(home: Path) -> Path:
     return Path(home) / JOURNAL_SUBDIR / JOURNAL_FILE
 
 
-def connect_ro(path: Path, timeout: float = BUSY_TIMEOUT_MS / 1000) -> sqlite3.Connection:
+def connect_ro(
+    path: Path, timeout: float = BUSY_TIMEOUT_MS / 1000, *, settled_only: bool = False
+) -> sqlite3.Connection:
     """Read-only соединение со снимком: `?mode=ro` + `BEGIN`.
 
     Единственный способ, которым duty открывает чужую БД: `mode=ro` не создаёт
     файл и не берёт write-lock, а `BEGIN` фиксирует одно состояние на срез.
+
+    `settled_only` — открыть **неизменяемым** (`immutable=1`), если рядом нет
+    `-wal`: тогда всё уже в самом файле, и SQLite не заводит спутники
+    `-shm`/`-wal` рядом с журналом. Это важно для читающих ручек: «показал
+    экран» не должно оставлять новых файлов. Есть `-wal` — обычный `?mode=ro`:
+    неизменяемое чтение не увидело бы незачекпойнченные события, то есть
+    срез молча отстал бы от журнала.
     """
-    conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, timeout=timeout)
+    base = Path(path).resolve().as_uri() + "?mode=ro"
+    wal = Path(path).resolve().with_name(Path(path).name + "-wal")
+    if settled_only and not wal.exists():
+        base += "&immutable=1"
+    conn = sqlite3.connect(base, uri=True, timeout=timeout)
     conn.row_factory = sqlite3.Row
     conn.execute("BEGIN")
     return conn

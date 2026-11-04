@@ -62,6 +62,8 @@ JOURNAL_MODULE_NAME = "hermes_duty_journal"
 ASK_MODULE_NAME = "hermes_duty_ask"
 # `dashboard/deals.py` — свой store дел и мутации (`docs/OWNERSHIP.md`).
 DEALS_MODULE_NAME = "hermes_duty_deals"
+# `dashboard/stagefeed.py` — лента этапов и попыток дела (`GET /deal`, `GET /now`).
+STAGEFEED_MODULE_NAME = "hermes_duty_stagefeed"
 
 
 def _load_journal() -> Any:
@@ -116,6 +118,24 @@ def _load_deals() -> Any:
 
 
 deals = _load_deals()
+
+
+def _load_stagefeed() -> Any:
+    """Загрузить `dashboard/stagefeed.py` — лента этапов и попыток дела."""
+    loaded = sys.modules.get(STAGEFEED_MODULE_NAME)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / "stagefeed.py"
+    spec = importlib.util.spec_from_file_location(STAGEFEED_MODULE_NAME, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise ImportError(f"stagefeed module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[STAGEFEED_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+stagefeed = _load_stagefeed()
 
 
 # Один набор заголовков на все ответы: и 200, и ошибки. Кэш промежуточного
@@ -206,6 +226,20 @@ def _connect_ro(path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("BEGIN")
     return conn
+
+
+def _open_journal_ro(home: Path) -> Optional[sqlite3.Connection]:
+    """Свой журнал **на чтение**: `?mode=ro` и без создания файла.
+
+    Отсутствие журнала — не ошибка, а «журнала ещё нет»: `None`. Чтение через
+    обычное соединение (`sqlite3.connect(path)`) запрещено: журнал в WAL, и
+    закрытие такого соединения вправе сделать checkpoint — то есть чтение
+    меняло бы файл, хотя ни одного события не записано (`?mode=ro`, P0-контракт).
+    """
+    path = journal.journal_path(home)
+    if not path.is_file():
+        return None
+    return journal.connect_ro(path, settled_only=True)
 
 
 def _fetch(
@@ -447,7 +481,7 @@ def _journal_health(
     totals = {"events": 0, "deals": 0}
     known: set[str] = set()
     try:
-        conn = journal.open_journal(home, create=False)
+        conn = _open_journal_ro(home)
     except Exception as exc:  # noqa: BLE001 - свой журнал не открылся
         conn = None
         notes.append(f"journal unreadable: {type(exc).__name__}: {exc}")
@@ -904,9 +938,13 @@ def _journal_context(
     «открыл экран» и «включил журнал» стали бы одним действием, а срез отвечал бы
     за запись. Недоступный журнал не валит ответ: причина уходит в `errors`, а
     состояние дел считается по kanban с пометкой в `evidence`.
+
+    Без `ingest` соединение открывается строго на чтение (`?mode=ro`): журнал
+    живёт в WAL, и обычное соединение при закрытии вправе сделать checkpoint —
+    тогда «посмотрел срез» меняло бы файл, хотя ни одного события не записано.
     """
     try:
-        conn = journal.open_journal(home, create=ingest)
+        conn = journal.open_journal(home, create=ingest) if ingest else _open_journal_ro(home)
     except Exception as exc:  # noqa: BLE001 - свой журнал не открылся
         reason = f"{type(exc).__name__}: {exc}"
         return {}, f"journal: недоступен ({reason}) — состояние из kanban", [
@@ -1170,6 +1208,11 @@ def _board_deals(
                     "started_at": last_run.get("started_at"),
                     "ended_at": last_run.get("ended_at"),
                 },
+                # Этап и номер попытки — из журнала (`dashboard/stagefeed.py`):
+                # «что сейчас» видно без открытия дела. Вложенный объект, потому
+                # что поле `attempt` в этой же форме уже занято фактом рана
+                # kanban — одно имя не может значить две вещи.
+                "stage": stagefeed.current(journal_events.get(task_id, []), now),
                 "waiting": waiting,
                 "_age_sec": (attempt or {}).get("age_sec")
                 if attempt is not None
@@ -1309,6 +1352,9 @@ def _own_shaped(
             else _payload_summary(json.dumps(last.get("payload") or {}, ensure_ascii=False)),
         },
         "last_run": None,
+        # Этап и номер попытки — из журнала, как и у наблюдаемых дел: экран не
+        # знает, откуда дело, и форма одна (`dashboard/stagefeed.py`).
+        "stage": stagefeed.current(events, now),
         "waiting": _own_waiting(folded, question, str(row["status"]), journal_note, pool_note),
         "_age_sec": _age_sec(row.get("created_at"), now),
     }
@@ -1330,7 +1376,7 @@ def _own_deals(
     причины выглядел бы как «своих дел нет», а это разные факты.
     """
     try:
-        conn = deals.open_store(home, create=False)
+        conn = deals.open_store(home, create=False, readonly=True)
     except Exception as exc:  # noqa: BLE001 - свой store не открылся
         return [], [{"board": DEALS_SOURCE, "reason": f"{type(exc).__name__}: {exc}"}]
     if conn is None:
@@ -1371,6 +1417,9 @@ def _deal_response(
     comments: list[dict[str, Any]],
     attachments: list[dict[str, Any]],
     timeline: list[dict[str, Any]],
+    stages: Optional[list[dict[str, Any]]] = None,
+    stages_note: str = "",
+    spec: Optional[str] = None,
     errors: Optional[list[dict[str, str]]] = None,
 ) -> dict[str, Any]:
     """Ответ «одно дело» — одна форма и для kanban-дела, и для своего.
@@ -1378,6 +1427,11 @@ def _deal_response(
     Экран не должен знать, откуда дело: ключи одинаковые, различаются только
     значения. У наблюдаемого дела нет наших комментариев и вложений — там пустые
     списки, а не отсутствие полей, иначе клиент держал бы две ветки разбора.
+
+    `stages` — лента этапов (`dashboard/stagefeed.py`): состояние графа и попытки
+    из журнала. Пустой список без причины выглядел бы как «этапов нет», поэтому
+    `stages_note` называет, почему лента пуста (нет спеки, спека не читается),
+    а `spec` — какой граф прочитан.
     """
     body_text = str(row.get("body") or "")
     status = str(row.get("status") or "")
@@ -1396,8 +1450,26 @@ def _deal_response(
         "comments": comments,
         "attachments": attachments,
         "timeline": timeline,
+        "spec": spec,
+        "stages": list(stages or []),
+        "stages_note": stages_note,
         "errors": list(errors or []),
     }
+
+
+def _stages_block(
+    events: list[dict[str, Any]], now: int, spec_override: Optional[str] = None
+) -> dict[str, Any]:
+    """Лента этапов: граф читается по спеке, названной в журнале или в `?spec=`.
+
+    Приоритет у явного `?spec=`: это просьба смотреть конкретный граф (дело
+    завели раньше, чем журнал узнал спеку). Иначе — `created.payload.spec`, то
+    есть та спека, по которой дело создавалось. Ни одного процесса: граф — файл,
+    состояние — журнал (`dashboard/stagefeed.py`).
+    """
+    path = spec_override or stagefeed.spec_of(events)
+    return stagefeed.snapshot(events, now, spec_path=path)
+
 
 
 def _own_response(
@@ -1408,6 +1480,7 @@ def _own_response(
     questions: Optional[dict[str, dict[str, Any]]] = None,
     pool_note: Optional[str] = None,
     journal_note: Optional[str] = None,
+    spec: Optional[str] = None,
 ) -> dict[str, Any]:
     """Полный ответ по делу своего store (та же форма, что `/deal`)."""
     deal_id = str(row["id"])
@@ -1418,6 +1491,7 @@ def _own_response(
         if folded["active"]
         else None
     )
+    feed = _stages_block(events, now, spec)
     return _deal_response(
         now=now,
         board=str(row["board"]),
@@ -1427,6 +1501,9 @@ def _own_response(
         comments=deals.comments_of(conn, deal_id),
         attachments=deals.attachments_of(conn, deal_id),
         timeline=_timeline(events, now),
+        stages=feed["stages"],
+        stages_note=feed["note"],
+        spec=feed["spec"],
     )
 
 
@@ -1791,7 +1868,7 @@ def stats(board: Optional[str] = None, since: Optional[int] = None) -> dict[str,
 
 
 @router.get("/deal/{board}/{task_id}")
-def deal(board: str, task_id: str) -> dict[str, Any]:
+def deal(board: str, task_id: str, spec: Optional[str] = None) -> dict[str, Any]:
     """Одно дело: спецификация плюс тот же факт-набор, что в `/now`.
 
     Дело ищется по префиксу id: `d_<hex>` — своё (store), `t_<hex>` — наблюдаемое
@@ -1800,11 +1877,16 @@ def deal(board: str, task_id: str) -> dict[str, Any]:
 
     `deal` — `null` для закрытого дела (`done`/`archived`): состояний ожидания у
     него нет, и придумывать их нельзя. Таймлайн попыток живёт отдельно —
-    `GET /duty/{board}/{task_id}/attempts`.
+    `GET /duty/{board}/{task_id}/attempts`. Лента этапов (`stages`) есть и у
+    закрытого дела: что было — факт, он не перестаёт быть им после закрытия.
+
+    `?spec=<абсолютный путь>` — граф для ленты этапов, если в журнале спека не
+    записана. Файл читается `load_spec()` (`yaml.safe_load`), не исполняется;
+    процессов роут не открывает ни одного.
     """
     home = _hermes_home()
     if deals.is_own(task_id):
-        return _own_deal(home, board, task_id)
+        return _own_deal(home, board, task_id, spec=spec)
     entry = _board_entry(home, board)
     rows, err = _query_checked(Path(entry["path"]), "SELECT * FROM tasks WHERE id = ?", (task_id,))
     if err:
@@ -1820,11 +1902,13 @@ def deal(board: str, task_id: str) -> dict[str, Any]:
     task = rows[0]
     now = _now_sec()
     journal_events, journal_note, _ = _journal_context(home, [])
+    events = journal_events.get(task_id, [])
     shaped: Optional[dict[str, Any]] = None
     if str(task.get("status") or "") not in TERMINAL_STATUSES:
         questions, pool_note, _ = _pool_context(home)
         collected = _board_deals(entry, now, questions, pool_note, journal_events, journal_note)
         shaped = next((item for item in collected["deals"] if item["id"] == task_id), None)
+    feed = _stages_block(events, now, spec)
     return _deal_response(
         now=now,
         board=board,
@@ -1835,7 +1919,10 @@ def deal(board: str, task_id: str) -> dict[str, Any]:
         # и пустой список здесь означает «duty их не держит», а не «их нет».
         comments=[],
         attachments=[],
-        timeline=_timeline(journal_events.get(task_id, []), now),
+        timeline=_timeline(events, now),
+        stages=feed["stages"],
+        stages_note=feed["note"],
+        spec=feed["spec"],
     )
 
 
@@ -1849,7 +1936,7 @@ def _resolve_deal(home: Path, board: str, deal_id: str) -> dict[str, Any]:
     """
     if deals.is_own(deal_id):
         try:
-            conn = deals.open_store(home, create=False)
+            conn = deals.open_store(home, create=False, readonly=True)
         except Exception as exc:  # noqa: BLE001 - свой store не открылся
             raise HTTPException(
                 status_code=503,
@@ -1902,10 +1989,10 @@ def _resolve_deal(home: Path, board: str, deal_id: str) -> dict[str, Any]:
     }
 
 
-def _own_deal(home: Path, board: str, deal_id: str) -> dict[str, Any]:
+def _own_deal(home: Path, board: str, deal_id: str, *, spec: Optional[str] = None) -> dict[str, Any]:
     """Своё дело по id: строка store плюс журнал; 404, если его нет или не та доска."""
     try:
-        conn = deals.open_store(home, create=False)
+        conn = deals.open_store(home, create=False, readonly=True)
     except Exception as exc:  # noqa: BLE001 - свой store не открылся
         raise HTTPException(
             status_code=503,
@@ -1929,7 +2016,13 @@ def _own_deal(home: Path, board: str, deal_id: str) -> dict[str, Any]:
         questions, pool_note, _ = _pool_context(home)
         _, journal_note, _ = _journal_context(home, [])
         return _own_response(
-            conn, row, _now_sec(), questions=questions, pool_note=pool_note, journal_note=journal_note
+            conn,
+            row,
+            _now_sec(),
+            questions=questions,
+            pool_note=pool_note,
+            journal_note=journal_note,
+            spec=spec,
         )
     finally:
         conn.close()
@@ -2044,6 +2137,9 @@ def deals_create(home: Path, payload: dict[str, Any], *, source: str = "api") ->
     body = payload.get("body")
     if body is not None and not isinstance(body, str):
         raise deals.DealError("create: 'body' — строка")
+    spec = payload.get("spec")
+    if spec is not None and not isinstance(spec, str):
+        raise deals.DealError("create: 'spec' — абсолютный путь к спеке (duty.yaml) или null")
     conn = _store_for_write(home)
     try:
         return _mutation(
@@ -2058,6 +2154,7 @@ def deals_create(home: Path, payload: dict[str, Any], *, source: str = "api") ->
                 parents=parents,
                 known_boards=_known_boards(home),
                 source=source,
+                spec_path=spec,
             ),
         )
     finally:

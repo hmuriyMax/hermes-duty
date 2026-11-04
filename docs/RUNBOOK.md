@@ -337,6 +337,38 @@ pid), повторный ingest → `0` новых строк и тот же `fo
 `tests/test_evidence.py` (30 кейсов: по тесту на каждое правило отказа плюс happy
 path без коммита и с коммитом).
 
+Лента этапов — `tests/test_stagefeed.py` (14 кейсов). Как проверить её руками:
+
+```bash
+~/.hermes/hermes-agent/venv/bin/python -m pytest tests/test_stagefeed.py -q   # 14 passed
+```
+
+- «Попытка — процесс, а не строка статуса»:
+  `test_deal_returns_stages_with_attempts` требует у первой попытки `pid`,
+  `started_at`, `finished_at`, `duration_sec`, `exit`, `outcome`, `kind`, `tokens`,
+  `tools`, `reason` и записи о командах. Красная проба: убрать из `_attempts`
+  любое из полей — тест падает.
+- «Мёртвый процесс виден без выдуманного статуса»:
+  `test_dead_attempt_is_visible_without_invented_state` — попытка без
+  `attempt_ended` и с истёкшим лизингом даёт `state: running` (так записано) плюс
+  `live: false`, `dead: true`. Красная проба: подставить в `_alive` состояние
+  `failed` вместо флагов — тест падает.
+- «Чтение ничего не пишет»:
+  `test_reading_routes_do_not_write_journal` сверяет размер, `mtime`, `sha256`,
+  число строк и набор файлов вокруг `/now` и `/deal`, а
+  `test_read_connection_refuses_writes` пробует `INSERT` в соединение ручки и ждёт
+  отказ `readonly`. Одного слепка файла мало: открытое на запись соединение,
+  которое ничего не записало, оставляет файл точно таким же. Красная проба: убрать
+  `?mode=ro` из `journal.connect_ro` — `INSERT` проходит, тест падает.
+- «Лента не смотрит на процессы»: `test_stagefeed_has_no_process_lookups` —
+  AST-проверка импортов `dashboard/stagefeed.py`. Красная проба: добавить
+  `import subprocess` или `os.kill` — тест падает.
+
+Глазами (без браузера): `duty create --spec examples/duty.yaml …`, затем
+`GET /deal/<board>/<id>` — в ответе `stages[]` с этапами графа и
+`stages_note: ""`; дело без `--spec` даёт пустой `stages[]` и причину в
+`stages_note`.
+
 `python3 -m pytest` из системы падает с `No module named pytest` — это окружение,
 а не плагин: нужен venv, где `fastapi` и `pytest` стоят.
 
@@ -354,7 +386,7 @@ path без коммита и с коммитом).
 ## 7. Проверить шейпер и версии
 
 ```bash
-node --test tests/model.test.mjs tests/web.test.mjs   # 37 pass (28 + 9)
+node --test tests/model.test.mjs tests/web.test.mjs   # 48 pass (36 + 12)
 bin/duty-model-sync --check         # OK: inlined model matches desktop/model.js
 bin/duty-version check              # OK (последняя строка), код 0
 ```

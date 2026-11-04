@@ -1402,6 +1402,10 @@ def test_now_deal_shape_is_pinned(home: Path, client: TestClient) -> None:
         "lease",
         "last_action",
         "last_run",
+        # W6: этап графа и номер попытки из журнала — «что сейчас» без открытия
+        # дела. Вложенный объект, потому что имя `attempt` в этой форме уже
+        # занято фактом рана kanban.
+        "stage",
         "waiting",
     ]
     assert list(deal["attempt"]) == [

@@ -27,6 +27,8 @@ import {
   shapeAttempts,
   shapeDeal,
   shapeNow,
+  shapeStages,
+  stageMeta,
   stateMeta,
 } from '../desktop/model.js'
 
@@ -45,6 +47,7 @@ const PRIORITY = [
 
 const nowPayload = JSON.parse(readFileSync(new URL('./fixtures/now.json', import.meta.url), 'utf8'))
 const attemptsPayload = JSON.parse(readFileSync(new URL('./fixtures/attempts.json', import.meta.url), 'utf8'))
+const dealPayload = JSON.parse(readFileSync(new URL('./fixtures/deal-stages.json', import.meta.url), 'utf8'))
 const modelSource = readFileSync(new URL('../desktop/model.js', import.meta.url), 'utf8')
 const pluginSource = readFileSync(new URL('../desktop/plugin.js', import.meta.url), 'utf8')
 
@@ -449,6 +452,130 @@ test('таймлайн попыток: пустой ответ и попытка
   assert.equal(one.attempts[0].durationText, '—')
   assert.equal(one.attempts[0].barPct, 2)
   assert.equal(one.attempts[0].outcomeTone, 'green')
+})
+
+/* ------------------------------------- лента этапов дела (W6) ------------- */
+
+const feed = shapeStages(dealPayload)
+
+test('лента этапов: этапы в порядке графа, у попытки — факты процесса', () => {
+  assert.deepEqual(
+    feed.stages.map((stage) => stage.id),
+    ['impl', 'review', 'ask'],
+  )
+  assert.equal(feed.count, 3)
+  assert.equal(feed.attempts, 2)
+  assert.equal(feed.spec, '/home/mshchemilkin/repo/duty.yaml')
+
+  const impl = feed.stages[0]
+  assert.equal(impl.role, 'implementer')
+  assert.equal(impl.stateLabel, 'идёт')
+  assert.equal(impl.tone, 'blue')
+  assert.equal(impl.attemptText, 'попытка 2')
+
+  // попытка — процесс: время, длительность, код выхода, токены, инструменты, причина
+  const first = impl.attempts[0]
+  assert.equal(first.number, '#1')
+  assert.equal(first.pidText, 'pid 20658')
+  assert.equal(first.duration, 300)
+  assert.equal(first.durationText, '5 мин')
+  assert.equal(first.exitText, '0')
+  assert.equal(first.tokensText, '15 234')
+  assert.equal(first.toolsText, '17')
+  assert.equal(first.kind, 'contract')
+  assert.equal(first.reason, 'нет evidence по go build ./...')
+  assert.equal(first.liveText, 'исход: failed')
+  assert.equal(first.tone, 'red')
+})
+
+test('идущая попытка не меряет себя: длительности нет, живость словом', () => {
+  const live = feed.stages[0].attempts[1]
+  assert.equal(live.duration, null)
+  assert.equal(live.durationText, 'идёт')
+  assert.equal(live.liveText, 'идёт')
+  assert.equal(live.tone, 'blue')
+  assert.equal(live.exitText, '—')
+  assert.equal(live.tokensText, '—')
+})
+
+test('мёртвая попытка называется мёртвой, а не «идёт»', () => {
+  const dead = shapeStages({
+    stages: [{ id: 'impl', state: 'running', attempts: [{ n: 1, live: false, dead: true, lease: 'dead' }] }],
+  }).stages[0].attempts[0]
+  assert.equal(dead.liveText, 'процесс мёртв: лизинг истёк, завершения нет')
+  assert.equal(dead.tone, 'red')
+  // живость не записана — «неизвестна», а не «мёртв»
+  const unknown = shapeStages({
+    stages: [{ id: 'impl', state: 'running', attempts: [{ n: 1, live: null, lease: 'unknown' }] }],
+  }).stages[0].attempts[0]
+  assert.equal(unknown.liveText, 'живость неизвестна: лизинг не записан')
+  assert.equal(unknown.tone, 'gray')
+})
+
+test('ожидание вопроса — отдельной строкой со ссылкой на панель пула', () => {
+  const ask = feed.stages[2]
+  assert.equal(ask.waitKind, 'question')
+  assert.equal(ask.questionId, '284')
+  assert.equal(ask.questionHref, '/imsg')
+  assert.match(ask.waitText, /#284/)
+
+  const review = feed.stages[1]
+  assert.equal(review.waitKind, 'gate')
+  assert.equal(review.questionHref, '')
+  assert.match(review.waitText, /ждёт needs: impl/)
+})
+
+test('состояние этапа цветом: done спокойный, running акцент, wait_* янтарный, failed красный', () => {
+  assert.equal(stageMeta('done').tone, 'green')
+  assert.equal(stageMeta('running').tone, 'blue')
+  assert.equal(stageMeta('wait_human').tone, 'yellow')
+  assert.equal(stageMeta('wait_gate').tone, 'yellow')
+  assert.equal(stageMeta('failed').tone, 'red')
+  assert.equal(stageMeta('pending').tone, 'gray')
+  // незнакомое состояние не переклассифицируется
+  assert.deepEqual(stageMeta('своё'), { label: 'своё', tone: 'gray' })
+})
+
+test('evidence: «не доказано» и «код не совпал» — разные подписи', () => {
+  const mismatched = feed.stages[0].evidence[0]
+  assert.equal(mismatched.label, 'exit 1, объявлено 0')
+  assert.equal(mismatched.tone, 'red')
+
+  const entry = (evidence) => shapeStages({ stages: [{ id: 'x', evidence: [evidence] }] }).stages[0].evidence[0]
+  const missing = entry({ cmd: 'go vet ./...', must: 0, got: null, ok: false })
+  assert.equal(missing.label, 'не доказано: записи нет')
+  assert.equal(missing.tone, 'gray')
+  const proved = entry({ cmd: 'go build ./...', must: 0, got: 0, ok: true })
+  assert.equal(proved.label, 'exit 0 — как объявлено')
+  assert.equal(proved.tone, 'green')
+})
+
+test('пустая лента и этап без попыток не роняют рендер', () => {
+  for (const empty of [null, {}, { stages: [] }, { stages: null }]) {
+    const bare = shapeStages(empty)
+    assert.equal(bare.count, 0)
+    assert.equal(bare.empty, true)
+    assert.deepEqual(bare.stages, [])
+    assert.equal(bare.note, '')
+  }
+  // причину пустоты называет бэкенд, а не экран
+  assert.equal(shapeStages({ stages: [], stages_note: 'у дела нет спеки' }).note, 'у дела нет спеки')
+
+  const stage = shapeStages({ stages: [{ id: 'impl', state: 'pending' }] }).stages[0]
+  assert.equal(stage.hasAttempts, false)
+  assert.deepEqual(stage.attempts, [])
+  assert.equal(stage.hasEvidence, false)
+  assert.equal(stage.role, '—')
+  assert.equal(stage.waitText, '')
+})
+
+test('/now: этап и номер попытки видны в строке, без открытия дела', () => {
+  const withStage = shapeDeal({ board: 'b', id: 'd_1', stage: { id: 'impl', attempt: 2, state: 'running', live: true } })
+  assert.equal(withStage.stageText, 'impl · попытка 2 · идёт')
+  assert.equal(withStage.stageId, 'impl')
+  assert.equal(withStage.stageAttempt, 2)
+  // без попыток строки нет: «этап 0» был бы выдуманным графом
+  assert.equal(shapeDeal({ board: 'b', id: 'd_2' }).stageText, '')
 })
 
 test('вшитый в plugin.js шейпер дословно совпадает с desktop/model.js', () => {

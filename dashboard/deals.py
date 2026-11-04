@@ -179,14 +179,26 @@ def store_path(home: Path) -> Path:
     return journal.journal_path(home)
 
 
-def open_store(home: Path, *, create: bool = True) -> Optional[sqlite3.Connection]:
+def open_store(
+    home: Path, *, create: bool = True, readonly: bool = False
+) -> Optional[sqlite3.Connection]:
     """Соединение со store: `create=True` заводит файл, схему журнала и схему дел.
 
     Читающие роуты (`/now`, `/deal`) зовут `create=False`: смотр экрана не должен
     создавать файл и таблицы как побочный эффект, иначе «посмотрел» и «включил
     store» стали бы одним действием. Отсутствие файла — не ошибка, а «дел ещё
     нет»: возвращается `None`.
+
+    `readonly=True` — соединение `?mode=ro`: store живёт в том же WAL-файле, что и
+    журнал, и обычное соединение при закрытии вправе сделать checkpoint. Экран не
+    имеет права менять файл хотя бы на байт, поэтому чтение и запись идут разными
+    соединениями.
     """
+    if readonly:
+        path = journal.journal_path(home)
+        if not path.is_file():
+            return None
+        return journal.connect_ro(path, settled_only=True)
     conn = journal.open_journal(home, create=create)
     if conn is None:
         return None
@@ -509,6 +521,7 @@ def create_deal(
     parents: Iterable[str] = (),
     known_boards: Iterable[str] = (),
     source: str = "cli",
+    spec_path: Optional[str] = None,
     now: Optional[int] = None,
 ) -> dict[str, Any]:
     """Завести своё дело: строка store плюс событие `created` в одной транзакции.
@@ -517,6 +530,13 @@ def create_deal(
     закрыты, иначе `todo` (`docs/OWNERSHIP.md`: «`ready` ставится, когда все
     родители `done`»). Родитель, которого нет, или родитель из пространства
     `t_…` — ошибка входа, а не 500: гейт обязан считаться по своим делам.
+
+    `spec_path` — спека дела (`duty.yaml`), по которой строится лента этапов
+    (`docs/SPEC.md`). Путь записывается в `created.payload.spec`, потому что
+    консоль читает журнал: «по какому графу завели дело» — факт дела, а не
+    настройка экрана. Принимается только абсолютный путь к читаемому файлу:
+    относительный не восстановить из журнала, а несуществующий сделал бы ленту
+    пустой без причины.
 
     `create` намеренно не дедуплицируется: id порождает сам вызов, поэтому
     повтор — это второе дело (как в kanban), а не идемпотентный повтор.
@@ -532,6 +552,14 @@ def create_deal(
         raise DealError(
             f"create: доски {slug!r} нет — ни своей в store, ни kanban-доски с таким слагом"
         )
+    spec_file = "" if spec_path is None else str(spec_path).strip()
+    if spec_file:
+        path = Path(spec_file).expanduser()
+        if not path.is_absolute():
+            raise DealError(f"create: путь к спеке должен быть абсолютным: {spec_file!r}")
+        if not path.is_file():
+            raise DealError(f"create: спека не читается: {path}")
+        spec_file = str(path)
     parent_ids: list[str] = []
     for raw in parents:
         parent = own_id(raw)
@@ -545,7 +573,13 @@ def create_deal(
     created = _event(
         deal,
         "created",
-        {"title": clean_title, "assignee": assignee, "status": None, "parents": parent_ids},
+        {
+            "title": clean_title,
+            "assignee": assignee,
+            "status": None,
+            "parents": parent_ids,
+            "spec": spec_file or None,
+        },
         source,
         {
             "board": slug,
@@ -553,6 +587,7 @@ def create_deal(
             "body": str(body or ""),
             "assignee": assignee,
             "parents": parent_ids,
+            "spec": spec_file or None,
         },
         now,
     )

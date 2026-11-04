@@ -633,6 +633,33 @@ def load_spec(path: str | Path) -> Spec:
 
 _profiles_cache: Optional[frozenset[str]] = None
 
+# Имя модуля политики в `sys.modules`: плагин грузит модули по пути, пакета нет,
+# поэтому второй экземпляр `failures.py` в процессе означал бы второй словарь
+# классов — и «единственное место, где они определены» перестало бы быть правдой.
+FAILURES_MODULE_NAME = "hermes_duty_failures"
+
+
+def failure_classes() -> tuple[str, ...]:
+    """Классы отказа из `dashboard/failures.py` — словарь живёт там, а не здесь.
+
+    Спека сверяет `retry.on` с этим кортежем: опечатка в классе иначе молча
+    выключила бы повтор, а спека при этом считалась бы объявленной.
+    """
+    import importlib.util
+    import sys
+
+    loaded = sys.modules.get(FAILURES_MODULE_NAME)
+    if loaded is not None:
+        return tuple(loaded.CLASSES)
+    path = Path(__file__).resolve().parent / "failures.py"
+    module_spec = importlib.util.spec_from_file_location(FAILURES_MODULE_NAME, path)
+    if module_spec is None or module_spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        return ()
+    module = importlib.util.module_from_spec(module_spec)
+    sys.modules[FAILURES_MODULE_NAME] = module
+    module_spec.loader.exec_module(module)
+    return tuple(module.CLASSES)
+
 
 def known_profiles(root: Optional[Path] = None) -> frozenset[str]:
     """Профили Hermes: `~/.hermes/profiles/*` плюс `default`, снимок один раз на процесс.
@@ -1038,6 +1065,7 @@ def _check_budget(spec: Spec) -> list[Issue]:
 
 def _check_retry(spec: Spec) -> list[Issue]:
     issues: list[Issue] = []
+    classes = failure_classes()
     for stage in spec.stages:
         retry = stage.retry
         if retry is None:
@@ -1054,6 +1082,20 @@ def _check_retry(spec: Spec) -> list[Issue]:
                     stage.lines.get("retry.on", line),
                     "retry.on",
                     "retry.on пуст: ретрай без классов отказов не сработает",
+                )
+            )
+        # Класс сравнивается со словарём `dashboard/failures.py`: опечатка в
+        # `retry.on` иначе молча выключила бы повтор, и спека выглядела бы
+        # объявленной, а политика — без классов.
+        for kind in retry.on:
+            if kind in classes:
+                continue
+            issues.append(
+                Issue(
+                    spec.path,
+                    stage.lines.get("retry.on", line),
+                    "retry.on",
+                    f"retry.on: класса {kind!r} нет среди {', '.join(classes)}",
                 )
             )
     return issues

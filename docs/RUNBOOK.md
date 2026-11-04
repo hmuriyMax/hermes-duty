@@ -471,7 +471,27 @@ curl -s http://127.0.0.1:18742/api/plugins/hermes-duty/sources \
 даёт `outcome=done`; иначе тот же `attempt_ended` пишется с `outcome=failed`,
 `kind` из вердикта и первыми тремя отказами в `reason`. Схема отчёта лежит в
 контракте (`report_schema`), так что исполнитель видит требования до работы.
-Разбор отказа: `bin/duty why <board> <id> <этап>`.
+Разбор отказа: `bin/duty why <board> <id> <этап>` — приговор последней попытки
+плюс последние пять упавших попыток с классом, счётчиком по классу (`3/2 infra`)
+и `retry_at`. Счётчик и паузу считает `dashboard/failures.py`, терминал их не
+пересчитывает.
+
+### Парковка: попытки исчерпаны, решает человек
+
+Отказ классифицируется политикой (`dashboard/failures.py`): `infra` — процесс не
+дожил, `contract` — отчёт не по контракту или его нет, `capability` — стена
+(бюджет, доступ). Повтор разрешён спекой этапа
+(`retry: {max: N, on: [...]}`, умолчание `{max: 1, on: [infra]}`), между
+попытками — пауза от 30 с до 5 мин, движок при этом не спит: дело ждёт
+`retry_at`, а `next_stage` отвечает `wait("retry")`.
+
+Когда лимит класса исчерпан (или за дело набралось 6 упавших попыток), дело
+**паркуется**: `blocked` с `block_kind='parked'` (класс, этап, `attempts/limit`,
+причина) плюс вопрос в пул с опциями `continue`/`stop`. В `/now` это `wait_human`
+с причиной — отдельного состояния нет. Ответ в пуле попытку не поднимает:
+продолжение — явное решение человека, `bin/duty unblock <дело>` (`unblocked` со
+`previous_kind='parked'`), и оно сбрасывает счётчики класса; иначе первый же новый
+отказ снова упёрся бы в исчерпанный лимит.
 
 ### Продолжение после вопроса: выбран резюм (`RESUME-OK`)
 
@@ -521,7 +541,16 @@ curl -s http://127.0.0.1:18742/api/plugins/hermes-duty/sources \
   падает `test_risky_wins_over_declared_default`;
 - не писать адрес в `question_asked` — падают
   `test_routing_failed_reaches_the_journal_event` и
-  `test_factual_question_is_addressed_to_the_declared_role`.
+  `test_factual_question_is_addressed_to_the_declared_role`;
+- пустить этап в ready, не спросив паузу (`_runnable`) — падает
+  `test_pause_holds_the_stage_until_retry_at` (и то же, если `_pause_until` всегда
+  возвращает `None`: «повтор сейчас же» обошёл бы паузу);
+- перестать запоминать парковку (`_park_fact` не пишет `board.parked`) — падают
+  `test_answer_on_parked_deal_does_not_raise_attempt` и
+  `test_late_park_answer_is_visible_but_does_not_resurrect`: ответ в пуле поднял бы
+  попытку, то есть ровно то, что парковка запрещает;
+- не сбрасывать счётчики класса на `unblocked` — падает
+  `test_unblock_after_park_resets_counters_and_runs`.
 
 ## 11. Что делать не нужно
 

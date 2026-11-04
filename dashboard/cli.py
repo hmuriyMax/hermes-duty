@@ -50,6 +50,10 @@ EXIT_SOURCE = 2
 # лежит в событии и в `--json`, в терминале нужны первые.
 VERDICT_DETAILS = 5
 
+# Сколько последних упавших попыток показывает `duty why`: свежие факты и счётчики
+# важнее всей истории, а полная лента — `duty attempts`.
+FAILURE_LOG_LIMIT = 5
+
 # Метка «я уже перезапускался»: без неё неудачный поиск интерпретатора дал бы
 # бесконечную цепочку `execv`.
 REEXEC_MARK = "DUTY_CLI_REEXEC"
@@ -90,6 +94,7 @@ DEMO_MODULE_NAME = "hermes_duty_demo"
 SPEC_MODULE_NAME = "hermes_duty_spec"
 # Журнал: `why <доска> <id> <этап>` читает те же события, что и движок.
 JOURNAL_MODULE_NAME = "hermes_duty_journal"
+FAILURES_MODULE_NAME = "hermes_duty_failures"
 
 
 def _load_demo() -> Any:
@@ -142,6 +147,25 @@ def _load_journal() -> Any:
         raise SourceFailure(f"journal module not found: {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[JOURNAL_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_failures() -> Any:
+    """Загрузить `dashboard/failures.py` — политику ретраев, один экземпляр на процесс.
+
+    Счётчик `3/2 infra` и `retry_at` считает политика, а не CLI: иначе терминал
+    показывал бы лимиты по своей копии правил.
+    """
+    loaded = sys.modules.get(FAILURES_MODULE_NAME)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / "failures.py"
+    spec = importlib.util.spec_from_file_location(FAILURES_MODULE_NAME, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise SourceFailure(f"failures module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[FAILURES_MODULE_NAME] = module
     spec.loader.exec_module(module)
     return module
 
@@ -817,6 +841,10 @@ def render_why(payload: dict[str, Any]) -> str:
     if isinstance(verdict, dict):
         lines.append("")
         lines.append(render_stage_verdict(verdict))
+    failures = payload.get("failures")
+    if isinstance(failures, dict):
+        lines.append("")
+        lines.append(render_failure_log(failures))
     return "\n".join(lines)
 
 
@@ -1142,6 +1170,140 @@ def render_stage_verdict(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def failure_log(home: Path, deal_id: str) -> dict[str, Any]:
+    """Последние упавшие попытки дела: класс, счётчик по классу и `retry_at`.
+
+    Читается только журнал: `attempt_ended` с `outcome=failed` — факт движка, класс
+    взят из `payload.kind` (его пишет `dashboard/failures.py`), а не выведен из
+    текста причины. Счётчик считается в порядке журнала по паре «этап + класс»:
+    `3/2 infra` читается как «три отказа класса infra при лимите две повторные
+    попытки». Лимит и пауза берутся из политики этапа (`failures.policy`), а
+    спека — из `created.payload.spec`; нет спеки — политика по умолчанию, и это
+    сказано в `note`, а не выдано за объявленное дело.
+
+    `park` в записи — правило, по которому повтор невозможен
+    (`retries_exhausted` / `too_many_failures`): тогда `retry_at` не считается.
+    """
+    journal = _load_journal()
+    failures = _load_failures()
+    payload: dict[str, Any] = {"found": False, "items": [], "parked": None, "note": ""}
+    home = Path(home)
+    conn = journal.open_journal(home, create=False)
+    if conn is None:
+        payload["note"] = f"журнала ещё нет: {journal.journal_path(home)}"
+        return payload
+    try:
+        events = journal.read_events(conn, str(deal_id))
+    finally:
+        conn.close()
+
+    stages, spec_note = _spec_stages(events)
+    payload["note"] = spec_note
+    counts: dict[tuple[str, str], int] = {}
+    total = 0
+    items: list[dict[str, Any]] = []
+    for event in events:
+        if str(event.get("kind") or "") != "attempt_ended":
+            continue
+        item = journal.payload_of(event)
+        if str(item.get("outcome") or "").strip().lower() != failures.OUTCOME_FAILED:
+            continue
+        stage = str(item.get("stage") or "")
+        kind = str(item.get("kind") or "").strip() or failures.UNCLASSIFIED
+        attempts_of_class = counts.get((stage, kind), 0) + 1
+        counts[(stage, kind)] = attempts_of_class
+        total += 1
+        policy = failures.policy(stages.get(stage))
+        rule = failures.decide_park(
+            kind=kind, attempts=attempts_of_class, total=total, policy_=policy
+        )
+        at = int(event.get("ts") or 0)
+        items.append(
+            {
+                "stage": stage,
+                "attempt": item.get("attempt"),
+                "kind": kind,
+                "at": at,
+                "attempts": attempts_of_class,
+                "limit": failures.park_limit(rule, policy) if rule else policy.max,
+                "counter": failures.counter(kind, attempts_of_class, policy.max),
+                "retry_at": None if rule else failures.retry_at(attempts_of_class, at),
+                "park": rule,
+                "reason": str(item.get("reason") or ""),
+            }
+        )
+    payload["found"] = bool(items)
+    payload["items"] = items[-FAILURE_LOG_LIMIT:]
+    payload["parked"] = journal.parked_of(events)
+    if not items:
+        payload["note"] = payload["note"] or f"в журнале нет упавших попыток у дела {deal_id}"
+    return payload
+
+
+def _spec_stages(events: list[dict[str, Any]]) -> tuple[dict[str, Any], str]:
+    """Этапы спеки дела по журналу: (id → этап, замечание, если спеки нет).
+
+    Путь берётся из `created.payload.spec`: журнал — единственная правда о том, по
+    какому графу дело создавалось. Спека не названа или не читается — политика
+    этапа неизвестна, и тогда работает умолчание (`failures.policy`), о чём сказано
+    в замечании.
+    """
+    journal = _load_journal()
+    path = ""
+    for event in events:
+        if str(event.get("kind") or "") != "created":
+            continue
+        raw = journal.payload_of(event).get("spec")
+        if isinstance(raw, str) and raw.strip():
+            path = raw.strip()
+            break
+    if not path:
+        return {}, "спеки в журнале нет: лимиты взяты по умолчанию (max=1, on=[infra])"
+    try:
+        spec = _load_spec().load_spec(Path(path))
+    except Exception as exc:  # noqa: BLE001 - нечитаемая спека не должна валить why
+        return {}, f"спека не читается ({path}): {type(exc).__name__} — лимиты по умолчанию"
+    return {stage.id: stage for stage in spec.stages}, ""
+
+
+def render_failure_log(payload: dict[str, Any]) -> str:
+    """Факты отказов словами: этап, класс, счётчик и когда разрешён повтор."""
+    lines = ["факты отказов (последние {}):".format(FAILURE_LOG_LIMIT)]
+    if not payload.get("found"):
+        lines.append(f"  {payload.get('note') or 'упавших попыток нет'}")
+    for item in payload.get("items") or []:
+        retry = (
+            f"retry_at {_fmt_stamp(item['retry_at'])}"
+            if item.get("retry_at")
+            else f"повтора нет ({item.get('park') or 'класс не повторяется'})"
+        )
+        lines.append(
+            "  {}#{} · {} · счётчик {} · {}".format(
+                item.get("stage") or "—",
+                item.get("attempt") if item.get("attempt") is not None else "—",
+                item.get("kind"),
+                item.get("counter"),
+                retry,
+            )
+        )
+    parked = payload.get("parked")
+    if isinstance(parked, dict):
+        lines.append(
+            "  парковка: {} на этапе {} — {} (вопрос #{})".format(
+                f"{parked.get('attempts')}/{parked.get('limit')} {parked.get('kind')}"
+                if parked.get("kind")
+                else "попытки исчерпаны",
+                parked.get("stage") or "—",
+                parked.get("reason") or "решение человека",
+                parked.get("question_id") or "—",
+            )
+        )
+    note = payload.get("note")
+    if note and payload.get("found"):
+        lines.append(f"  {note}")
+    return "\n".join(lines)
+
+
 # ------------------------------------------------------------------------ main
 
 
@@ -1193,10 +1355,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             return _payload_code(payload)
         if args.command == "why":
             payload = _route(api().deal, args.board, args.task_id)
+            # Факты отказов и приговор последней попытки берутся из журнала плагина:
+            # то же, что видит движок, плюс к форме роута — отдельными ключами
+            # (`failures`, `verdict`), чтобы `--json` оставался дословным ответом
+            # роута с добавленными фактами, а не второй формой.
+            payload = {**payload, "failures": failure_log(api().hermes_home(), args.task_id)}
             if args.stage:
-                # Приговор берётся из журнала плагина: тот же факт, что видит движок,
-                # плюс к форме роута — отдельным ключом `verdict`, чтобы `--json`
-                # оставался дословным ответом роута.
                 payload = {**payload, "verdict": stage_verdict(api().hermes_home(), args.task_id, args.stage)}
             _emit_json(payload, out) if args.json else print(render_why(payload), file=out)
             return _payload_code(payload)

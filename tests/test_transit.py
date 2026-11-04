@@ -478,8 +478,14 @@ def test_unclassified_failure_is_not_retried(spec: Any) -> None:
     assert "не сошлось" not in decision.reason  # текст ошибки в класс не превращается
 
 
-def test_failure_without_retry_spec_fails_stage(tmp_path: Path) -> None:
-    """Этап без `retry` не повторяется вообще: провал попытки — провал этапа."""
+def test_failure_without_retry_spec_uses_default_policy(tmp_path: Path) -> None:
+    """Этап без `retry` живёт по умолчанию: `{max: 1, on: [infra]}` (docs/SPEC.md).
+
+    Политика — часть контракта, а не удобство: `infra` повторяется один раз и без
+    объявления, а `contract` не повторяется вовсе, потому что умолчание называет
+    только инфра-сбой. Пустая политика вместо объявленной заводила бы второй
+    набор правил в спеке и в коде.
+    """
     spec = write_spec(
         tmp_path,
         """
@@ -489,9 +495,12 @@ def test_failure_without_retry_spec_fails_stage(tmp_path: Path) -> None:
             role: implementer
         """,
     )
-    journal = [started("impl", 1), crashed("impl", 1, "infra")]
+    infra = [started("impl", 1), crashed("impl", 1, "infra")]
+    assert transit.next_stage(spec, infra, NOW).pair == [("impl", 2)]
 
-    assert transit.next_stage(spec, journal, NOW).kind == "failed"
+    contract = [started("impl", 1), crashed("impl", 1, "contract")]
+    decision = transit.next_stage(spec, contract, NOW)
+    assert (decision.kind, decision.fail_kind) == ("failed", "contract")
 
 
 # ------------------------------------------------------------------ правило 5

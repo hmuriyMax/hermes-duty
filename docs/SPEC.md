@@ -113,7 +113,7 @@ stages:
 | `needs` | `[]` | этапы-предшественники: этап начинается, когда они закончены |
 | `parallel_with` | `[]` | этапы, которые можно вести одновременно (порядок не задаёт) |
 | `evidence` | `[]` | список `{cmd, must, timeout_sec}`: что движок проверит сам |
-| `retry` | нет | `{max, on}`: сколько раз повторять и на каких классах отказов (`infra`, `contract`, …) |
+| `retry` | `{max: 1, on: [infra]}` | `{max, on}`: сколько раз повторять и на каких классах отказов (`infra`, `contract`, `capability`). Класс без объявления не повторяется; `max: 0` — повторов нет, первый отказ паркует дело (`docs/JOURNAL.md`) |
 | `budget` | нет | `{tokens, minutes}`: бюджет одной попытки |
 | `ask` | нет | адрес вопросов: `{allowed, to_human, max_hops}` либо `{q, options, risky}` |
 | `verdict` | нет | приговор ревью: `{approve, changes, max_rounds}` |
@@ -206,7 +206,7 @@ verdict: {approve: next, changes: impl, max_rounds: 2}
 | `ask.options` | `options` не список строк-вариантов |
 | `budget` | `tokens`/`minutes` не положительное целое |
 | `retry.max` | не целое или меньше нуля |
-| `retry.on` | пустой список классов отказов |
+| `retry.on` | пустой список классов отказов или класс не из `CLASSES` (`infra`, `contract`, `capability`) — опечатка молча выключила бы повтор |
 
 ### Профили роли
 

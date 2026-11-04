@@ -988,6 +988,7 @@ def test_tool_events_become_progress_events(tmp_path: Path) -> None:
             {"type": "result", "session_id": "local-777", "tokens": {"total": 100}},
         ],
         result={"status": "done"},
+        pack=True,
     )
     run(conn, spec, deal, home, fake)
 
@@ -1111,7 +1112,7 @@ def test_started_event_records_the_real_command(tmp_path: Path) -> None:
     conn = open_store(home)
     deal = make_deal(conn)
     spec = none_spec(tmp_path)
-    fake = Fake(result={"status": "done"})
+    fake = Fake(result={"status": "done"}, pack=True)
     run(conn, spec, deal, home, fake)
     started = only(conn, deal, "attempt_started")
     command = started["payload"]["cmd"]

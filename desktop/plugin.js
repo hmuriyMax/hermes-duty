@@ -614,6 +614,18 @@ function shapeStage(stage) {
   if (kind === 'question') waitText = `вопрос ${questionId ? `#${questionId}` : 'без номера'} — ждёт ответа`
   else if (kind === 'human') waitText = 'ждёт человека: вопроса в пуле нет'
   else if (kind === 'gate') waitText = `ждёт гейт: ${String(waits.reason || 'граф не пускает')}`
+  else if (kind === 'parked') {
+    // Парковка — не отдельное состояние: экран называет счётчик и правило,
+    // а решение остаётся за человеком (docs/JOURNAL.md).
+    const cls = String(waits.class || '')
+    const spent = waits.attempts === null || waits.attempts === undefined ? '?' : String(waits.attempts)
+    const limit = waits.limit === null || waits.limit === undefined ? '?' : String(waits.limit)
+    const counter = cls ? `${spent}/${limit} ${cls}` : 'попытки исчерпаны'
+    const park = String(waits.park_reason || '')
+    waitText = `попытки исчерпаны: ${counter}${park ? ` (${park})` : ''} — решает человек${questionId ? `, вопрос #${questionId}` : ''}`
+  } else if (kind === 'retry') {
+    waitText = `пауза до ${fmtClock(waits.retry_at)}: повтор после отказа`
+  }
   const attempt = Number(s.attempt) || 0
   return {
     id: String(s.id || '—'),

@@ -46,6 +46,13 @@
    `docs/PROBES.md`): id сессии из события `result` хранится в
    `attempt_ended.details.session_id`, следующая попытка идёт с `--resume`.
    Выбор зафиксирован в `docs/RUNBOOK.md`.
+9. **Политика ретраев** (`dashboard/failures.py`): класс отказа уже записан в
+   `attempt_ended.kind`, а политика говорит, повторяется ли он. Если нет —
+   `retries_exhausted`; если за дело набралось `max_rounds_per_deal` упавших
+   попыток — `too_many_failures`. В обоих случаях дело **паркуется**: `ask()` с
+   властным вопросом «продолжать ли» и `blocked` с `block_kind='parked'`, где
+   едут класс, этап, число попыток и лимит. Отдельного вида события для парковки
+   нет: набор журнала закрыт, а парковка ждёт человека так же, как любой вопрос.
 
 Чего модуль не делает: не считает состояние дела (это `journal.fold`), не
 назначает попытки (это `transit`), не запускает команды из `evidence` (их уже
@@ -76,6 +83,7 @@ ASK_MODULE_NAME = "hermes_duty_ask"
 SPEC_MODULE_NAME = "hermes_duty_spec"
 EVIDENCE_MODULE_NAME = "hermes_duty_evidence"
 ROUTING_MODULE_NAME = "hermes_duty_routing"
+FAILURES_MODULE_NAME = "hermes_duty_failures"
 
 
 def _load(name: str, filename: str) -> Any:
@@ -99,6 +107,9 @@ ask = _load(ASK_MODULE_NAME, "ask.py")
 spec_module = _load(SPEC_MODULE_NAME, "spec.py")
 evidence_module = _load(EVIDENCE_MODULE_NAME, "evidence.py")
 routing = _load(ROUTING_MODULE_NAME, "routing.py")
+# Классы отказа и политика ретраев — одно место на плагин (`dashboard/failures.py`):
+# движок берёт класс оттуда и не выводит его из текста ошибки.
+failures = _load(FAILURES_MODULE_NAME, "failures.py")
 
 # Источник событий движка в журнале: `engine`, а не `cli`/`api`/`ingest` — по нему
 # видно, что факт записал движок, а не человек и не проход по чужой доске.
@@ -120,22 +131,23 @@ STDERR_TAIL = 20
 
 # Исходы попытки в журнале (`attempt_ended.outcome`): различаются полем, а не
 # вторым видом события (`docs/JOURNAL.md`).
-OUTCOME_DONE = "done"
-OUTCOME_FAILED = "failed"
+OUTCOME_DONE = failures.OUTCOME_DONE
+OUTCOME_FAILED = failures.OUTCOME_FAILED
 
 # Классы отказа попытки (`attempt_ended.kind`): `infra` — упал сам процесс,
-# `contract` — исполнитель не отчитался, `capability` — упёрся в бюджет.
-FAIL_INFRA = "infra"
-FAIL_CONTRACT = "contract"
-FAIL_CAPABILITY = "capability"
+# `contract` — исполнитель не отчитался, `capability` — упёрся в бюджет. Словарь
+# один на плагин (`dashboard/failures.py`); здесь — только имена для читаемости.
+FAIL_INFRA = failures.INFRA
+FAIL_CONTRACT = failures.CONTRACT
+FAIL_CAPABILITY = failures.CAPABILITY
 
 # Статусы `result.json`, которые считаются успехом: `status` не назван — тоже
 # успех (процесс дошёл до конца и отчитался).
-OK_STATUSES = ("done", "ok", "success", "passed", "accepted")
+OK_STATUSES = failures.OK_STATUSES
 
 # Статусы `result.json`, которые паркуют дело на человеке и на отказе контракта.
-BLOCKED_STATUSES = ("blocked", "needs_input", "wait_human")
-REFUSED_STATUSES = ("refused", "rejected")
+BLOCKED_STATUSES = failures.BLOCKED_STATUSES
+REFUSED_STATUSES = failures.REFUSED_STATUSES
 
 # Решение `transit`: запускать попытку. Остальные значения — не наш шаг.
 DECISION_RUN = "run"
@@ -916,29 +928,20 @@ def classify(
 ) -> tuple[str, str, str]:
     """Чем кончилась попытка: `(outcome, kind, reason)` — по трём источникам.
 
-    Порядок источников — не догадка, а их природа: таймаут и бюджет — наши
-    собственные факты (их проверили мы), дальше отчёт исполнителя, и только
-    потом код выхода. Текст ошибки в stderr причиной не считается: процесс может
-    ругаться и при успехе, а может умереть молча.
+    Классификация не живёт здесь: правило «источник → класс» одно на плагин и
+    лежит в `dashboard/failures.py`. Движок только собирает факты (отчёт, его
+    отсутствие, код выхода, наши собственные таймаут и бюджет) и отдаёт их
+    политике — иначе «почему класс именно такой» отвечалось бы в двух местах.
     """
-    if followed.timed_out:
-        return (
-            OUTCOME_FAILED,
-            FAIL_INFRA,
-            f"таймаут попытки: процесс не уложился в бюджет времени ({timeout_sec} с)",
-        )
-    if followed.over_budget:
-        return OUTCOME_FAILED, FAIL_CAPABILITY, "бюджет токенов попытки исчерпан"
-    if result is not None:
-        status = str(result.get("status") or "done").strip().lower()
-        if status in BLOCKED_STATUSES:
-            return OUTCOME_DONE, "", f"попытка отчиталась статусом {status}: ждёт человека"
-        if status in REFUSED_STATUSES:
-            return OUTCOME_FAILED, FAIL_CONTRACT, f"исполнитель отказался: status={status}"
-        return OUTCOME_DONE, "", ""
-    if exit_code not in (0, None):
-        return OUTCOME_FAILED, FAIL_INFRA, f"процесс упал сам: код выхода {exit_code}"
-    return OUTCOME_FAILED, FAIL_CONTRACT, result_error or "исполнитель не отчитался: result.json нет"
+    ended = failures.classify(
+        result=result,
+        result_error=result_error,
+        exit_code=exit_code,
+        timed_out=followed.timed_out,
+        over_budget=followed.over_budget,
+        timeout_sec=timeout_sec,
+    )
+    return ended.outcome, ended.kind, ended.reason
 
 
 # ---------------------------------------------------------------------- шаг
@@ -1015,6 +1018,9 @@ def run_stage(
             now,
         )
         journal.append(conn, [event])
+        park = park_exhausted(
+            conn, spec, deal, stage, attempt, FAIL_INFRA, str(exc), home=home, clock=clock
+        )
         return {
             "started": True,
             "stage": stage_id,
@@ -1024,6 +1030,7 @@ def run_stage(
             "reason": str(exc),
             "workdir": str(workdir),
             "tree": None,
+            "park": park,
         }
 
     previous = previous_reports(conn, deal, spec, stage_id)
@@ -1153,7 +1160,9 @@ def run_stage(
             base=spec.base,
         )
         if not verdict.ok:
-            outcome, kind, reason = OUTCOME_FAILED, verdict.kind, verdict.reason()
+            # Класс отказа гейта — из вердикта (`Verdict.kind`, W4), а не из текста:
+            # `contract` для несходящегося пакета, `capability` для бюджета.
+            outcome, kind, reason = OUTCOME_FAILED, failures.verdict_kind(verdict), verdict.reason()
 
     cleaned = False
     cleanup = ""
@@ -1205,6 +1214,13 @@ def run_stage(
         question_id, address = _parked(conn, deal, stage, attempt, result or {}, home, clock)
         question_target, question_reason = address.address, address.reason
 
+    # Политика ретраев: если этот класс больше не повторяется (или дело набрало
+    # потолок упавших попыток), дело паркуется — вопрос человеку и `blocked` с
+    # `block_kind='parked'`. Класс берётся из события, а не из текста причины.
+    park = None
+    if outcome == OUTCOME_FAILED:
+        park = park_exhausted(conn, spec, deal, stage, attempt, kind, reason, home=home, clock=clock)
+
     return {
         "started": True,
         "stage": stage_id,
@@ -1222,6 +1238,106 @@ def run_stage(
         "question_target": question_target,
         "question_reason": question_reason,
         "verdict": verdict.as_payload() if verdict is not None else None,
+        "park": park,
+    }
+
+
+def park_exhausted(
+    conn: sqlite3.Connection,
+    spec: Any,
+    deal: Any,
+    stage: Any,
+    attempt: int,
+    kind: str,
+    reason: str,
+    *,
+    home: Path,
+    clock: Callable[[], float],
+) -> Optional[dict[str, Any]]:
+    """Попытки исчерпаны — припарковать дело: вопрос человеку и `blocked`.
+
+    Парковка пишется существующим `blocked` с `block_kind='parked'` (решение
+    координатора по W7): отдельного вида события журнала нет, а состояние
+    ожидания остаётся `wait_human` — парковка ждёт **человека**. В payload едут
+    класс отказа, этап, число попыток и лимит: без них поверхность показывала бы
+    «ждёт ответа» и заставляла пересчитывать причину.
+
+    Политика (`dashboard/failures.py`) решает, парковка это или повтор:
+    `retries_exhausted` — класс не повторяется (или лимит класса исчерпан),
+    `too_many_failures` — сработал предохранитель на дело. `None` — повтор ещё
+    разрешён, парковать нечего.
+
+    Вопрос задаёт движок, а не процесс (`clarify` в `--oneshot` ответа не
+    получает): продолжение — властное решение человека, поэтому адрес `human`.
+    Автоподъёма нет: ответ на вопрос попытку не поднимает, продолжение — только
+    явное `unblocked` (`dashboard/transit.py`, правило 9).
+    """
+    events = journal.read_events(conn, str(deal["id"]))
+    policy = failures.policy(stage)
+    counts = failures.failures_of(events, stage.id)
+    attempts = counts.get(kind, 0)
+    total = failures.total_failures(events)
+    rule = failures.decide_park(kind=kind, attempts=attempts, total=total, policy_=policy)
+    if rule is None:
+        return None
+    limit = failures.park_limit(rule, policy)
+    counter = failures.counter(kind, attempts, limit)
+    if rule == failures.REASON_TOO_MANY:
+        headline = (
+            f"Попытки исчерпаны: у дела {total} упавших попыток из "
+            f"{failures.MAX_ROUNDS_PER_DEAL} (последний класс — {kind} на этапе {stage.id})."
+        )
+    else:
+        headline = (
+            f"Попытки исчерпаны: {counter} на этапе {stage.id} "
+            f"(политика этапа: max={policy.max}, on=[{', '.join(policy.on) or '—'}])."
+        )
+    question = (
+        f"{headline} Продолжать? continue — новая попытка со сбросом счётчиков "
+        f"класса, stop — закрыть дело."
+    )
+    text_full = (
+        f"{headline}\n\nПричина последнего отказа: {reason or 'не записана'}\n"
+        f"Этап {stage.id}, попытка {attempt}, класс {kind}, счётчик {counter}."
+    )
+    address = routing.route(stage, {"kind": "authority", "risky": True})
+    asked = ask.ask(
+        conn,
+        {**deal, "home": Path(home)},
+        question,
+        text_full,
+        list(failures.PARK_OPTIONS),
+        routing={**address.as_payload(), "stage": stage.id, "attempt": int(attempt)},
+    )
+    now = _now_sec(int(clock()))
+    deals.set_blocked(
+        conn,
+        str(deal["id"]),
+        kind=failures.PARKED_KIND,
+        reason=f"{headline} причина последнего отказа: {reason or 'не записана'}",
+        author=ENGINE_SOURCE,
+        source=ENGINE_SOURCE,
+        details={
+            "kind": kind,
+            "stage": stage.id,
+            "attempts": attempts,
+            "limit": limit,
+            "park_reason": rule,
+            "question_id": int(asked.question_id),
+        },
+        now=now,
+    )
+    return {
+        "reason": rule,
+        "kind": kind,
+        "stage": stage.id,
+        "attempt": int(attempt),
+        "attempts": attempts,
+        "limit": limit,
+        "total": total,
+        "question_id": int(asked.question_id),
+        "question_target": address.address,
+        "question_reason": address.reason,
     }
 
 

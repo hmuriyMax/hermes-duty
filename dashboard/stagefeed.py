@@ -321,18 +321,41 @@ def _join_evidence(declared: Any, records: list[dict[str, Any]]) -> list[dict[st
     return out
 
 
-def _waits(state: str, question_id: Optional[str], reason: str) -> Optional[dict[str, Any]]:
-    """Чего этап ждёт: вопрос человека или гейт графа. Иначе ожидания нет.
+def _waits(
+    state: str,
+    question_id: Optional[str],
+    reason: str,
+    parked: Optional[dict[str, Any]] = None,
+    retry_at: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
+    """Чего этап ждёт: решения по парковке, вопрос человека, паузу или гейт графа.
 
     `wait_human` без номера вопроса — ожидание человека без вопроса (ответить
     некуда), и это сказано видом `human`, а не подставленным номером.
+
+    Парковка (`parked`) — ожидание того же человека, но с причиной: класс отказа и
+    счётчик попыток видны на экране, а не выводятся из текста. Вид ждёт первым:
+    исчерпанный этап в графе `failed`, и без этой ветки «почему стоит» отвечал бы
+    отказ без единого слова о том, что человек уже решает, продолжать ли.
     """
+    if parked is not None:
+        return {
+            "kind": "parked",
+            "question_id": _number(question_id),
+            "reason": reason,
+            "class": parked.get("kind") or "",
+            "attempts": parked.get("attempts"),
+            "limit": parked.get("limit"),
+            "park_reason": parked.get("reason") or "",
+        }
     if state == transit.WAIT_HUMAN:
         return {
             "kind": "question" if question_id else "human",
             "question_id": _number(question_id),
             "reason": reason,
         }
+    if retry_at is not None:
+        return {"kind": "retry", "question_id": None, "reason": reason, "retry_at": retry_at}
     if state == transit.WAIT_GATE:
         return {"kind": "gate", "question_id": None, "reason": reason}
     return None
@@ -345,15 +368,20 @@ def stages(spec: Any, events: Iterable[Any], now: Any) -> list[dict[str, Any]]:
     для консоли и движка). Попытки — из журнала. Ни одного процесса, ни одной
     карточки: этапы, до которых дело не дошло, видны как `pending`/`wait_gate`
     именно потому, что спека их объявляет, а не потому, что кто-то их запускал.
+
+    Парковка читается из журнала (`journal.parked_of`): у неё нет состояния этапа,
+    потому что исчерпанный этап в графе `failed`, — а ждёт он человека.
     """
     moment = _int(now)
     states = transit.stage_states(spec, events)
     rows = [_public(row, moment) for row in _attempts(events)]
+    parked = journal.parked_of(events)
     out: list[dict[str, Any]] = []
     for stage in spec.stages:
         state = states[stage.id]
         mine = [row for row in rows if row["stage"] == stage.id]
         last_with_records = next((row for row in reversed(mine) if row["evidence"]), None)
+        mine_parked = parked if parked is not None and str(parked.get("stage") or "") == stage.id else None
         out.append(
             {
                 "id": stage.id,
@@ -363,7 +391,14 @@ def stages(spec: Any, events: Iterable[Any], now: Any) -> list[dict[str, Any]]:
                 "rounds": state.rounds,
                 "needs": list(state.needs),
                 "reason": state.reason,
-                "waits": _waits(state.state, state.question_id, state.reason),
+                "failures": {kind: count for kind, count in state.failures},
+                "waits": _waits(
+                    state.state,
+                    state.question_id,
+                    state.reason,
+                    mine_parked,
+                    state.retry_at if state.retry_at is not None and moment < state.retry_at else None,
+                ),
                 "attempts": mine,
                 "evidence": _join_evidence(
                     getattr(stage, "evidence", ()),

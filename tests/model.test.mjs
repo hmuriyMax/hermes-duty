@@ -550,6 +550,42 @@ test('evidence: «не доказано» и «код не совпал» — р
   assert.equal(proved.tone, 'green')
 })
 
+test('парковка и пауза — своими строками: счётчик класса и время повтора', () => {
+  const parked = shapeStages({
+    stages: [
+      {
+        id: 'impl',
+        state: 'failed',
+        waits: {
+          kind: 'parked',
+          question_id: 91,
+          reason: 'Попытки исчерпаны: 2/1 infra',
+          class: 'infra',
+          attempts: 2,
+          limit: 1,
+          park_reason: 'retries_exhausted',
+        },
+      },
+    ],
+  }).stages[0]
+  assert.equal(parked.waitKind, 'parked')
+  assert.equal(parked.questionId, '91')
+  assert.match(parked.waitText, /2\/1 infra/)
+  assert.match(parked.waitText, /retries_exhausted/)
+  assert.match(parked.waitText, /#91/)
+
+  // счётчик называет класс; без класса не выдумывает его
+  const bare = shapeStages({ stages: [{ id: 'x', waits: { kind: 'parked', attempts: 3, limit: 2 } }] }).stages[0]
+  assert.match(bare.waitText, /попытки исчерпаны: попытки исчерпаны/)
+  assert.doesNotMatch(bare.waitText, /infra/)
+
+  const retry = shapeStages({
+    stages: [{ id: 'impl', waits: { kind: 'retry', retry_at: 1790000030 } }],
+  }).stages[0]
+  assert.equal(retry.waitKind, 'retry')
+  assert.match(retry.waitText, /пауза до \d\d:\d\d:\d\d/)
+})
+
 test('пустая лента и этап без попыток не роняют рендер', () => {
   for (const empty of [null, {}, { stages: [] }, { stages: null }]) {
     const bare = shapeStages(empty)

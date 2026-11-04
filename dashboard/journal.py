@@ -21,9 +21,11 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import sqlite3
+import sys
 import time
 from contextlib import closing
 from pathlib import Path
@@ -118,6 +120,32 @@ EVENT_KINDS = (
 # Набор один на весь модуль: расползаться по `if` в вызывающих это правило не
 # должно.
 NON_STATE_KINDS = ("commented", "attached", "patched", "question_answered", "attempt_progress")
+
+# Вид `block_kind` парковки (`dashboard/failures.py`): попытки исчерпаны, дело
+# ждёт решения человека. Отдельного вида события для парковки нет — она выражена
+# существующим `blocked` (решение координатора по W7), поэтому набор видов
+# остаётся закрытым, а состояние ожидания — тем же `wait_human`.
+FAILURES_MODULE_NAME = "hermes_duty_failures"
+
+
+def _failures() -> Any:
+    """`dashboard/failures.py` — словарь классов и код парковки, один на процесс."""
+    loaded = sys.modules.get(FAILURES_MODULE_NAME)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / "failures.py"
+    spec = importlib.util.spec_from_file_location(FAILURES_MODULE_NAME, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise ImportError(f"failures module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[FAILURES_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+# Код вида берётся из модуля политики, а не переписывается строкой: одно слово на
+# весь плагин, иначе движок и fold разошлись бы в написании.
+PARKED_BLOCK_KIND = _failures().PARKED_KIND
 
 # Виды kanban-событий, которые переносятся в журнал один-к-одному.
 INGEST_EVENT_KINDS = ("created", "claimed", "blocked", "unblocked", "completed", "archived")
@@ -392,6 +420,9 @@ def fold(
     - `state` из восьми состояний — сработал живой факт (правила 3–6, 8, 9, 11):
       блок, вопрос человеку, лизинг без попытки, попытка без завершения,
       снимок `created` с незакрытыми родителями;
+    - `parked` — факты парковки, если открытый блок назван `block_kind='parked'`
+      (попытки исчерпаны, класс, этап, число попыток). Состояние при этом остаётся
+      `wait_human`: парковка ждёт **человека**, девятого состояния нет;
     - `state: None` с `reason: "empty"` — событий нет вовсе (правило 7), а с
       `reason: "no_live_fact"` — события есть, но живого факта в них нет
       (например, только `created`). В обоих случаях состояние считает
@@ -441,13 +472,27 @@ def fold(
 
     # 3. Блок без последующего `unblocked`. Доступ/права — отдельное состояние
     #    `capability`, как в 0.0.2: это не «человек решает», а «человек даёт доступ».
+    #    Парковка (`block_kind='parked'`) — `wait_human` без разбора текста причины:
+    #    класс и число попыток пришли полями, и словесное совпадение («token» в
+    #    причине) не должно превращать её в `capability`.
     block = _open_block(ordered)
+    parked_fact: Optional[dict[str, Any]] = None
     if block is not None:
         payload = _payload(block[1])
         block_kind = str(payload.get("block_kind") or "")
         reason = str(payload.get("reason") or "")
         text = f"blocked: block_kind={block_kind or '—'}, причина: {_short(reason) or 'не записана'}"
-        if block_kind == "capability" or any(word in reason.lower() for word in CAPABILITY_WORDS):
+        if block_kind == PARKED_BLOCK_KIND:
+            parked_fact = _parked_fact(payload)
+            facts.setdefault("wait_human", []).append(
+                f"blocked: block_kind=parked, парковка: "
+                f"{parked_fact['attempts']}/{parked_fact['limit']} {parked_fact['kind']}"
+                f"{' на этапе ' + parked_fact['stage'] if parked_fact['stage'] else ''}, "
+                f"причина: {_short(reason) or 'не записана'}"
+                + (f", вопрос #{parked_fact['question_id']}" if parked_fact["question_id"] else "")
+                + " — ждёт решения человека"
+            )
+        elif block_kind == "capability" or any(word in reason.lower() for word in CAPABILITY_WORDS):
             facts.setdefault("capability", []).append(text)
         else:
             facts.setdefault("wait_human", []).append(text)
@@ -561,13 +606,13 @@ def fold(
 
     state = next((name for name in WAITING_PRIORITY if name in facts), None)
     if state is None:
-        return _verdict(None, None, None, "no_live_fact", last_kind, progress=progress)
+        return _verdict(None, None, None, "no_live_fact", last_kind, progress=progress, parked=parked_fact)
 
     human_kind = None
     if state == "wait_human":
         human_kind = "question" if question is not None else "status"
     return _verdict(
-        True, state, _evidence(facts, state), "live_fact", last_kind, human_kind, progress
+        True, state, _evidence(facts, state), "live_fact", last_kind, human_kind, progress, parked_fact
     )
 
 
@@ -579,12 +624,18 @@ def _verdict(
     last_kind: Optional[str],
     human_kind: Optional[str] = None,
     progress: Optional[dict[str, Any]] = None,
+    parked: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Ответ fold одной формы: состояние, его доказательство и причина, почему его нет.
 
     `progress` — счётчик телеметрии попытки (`attempt_progress`): `tools`,
     `last_tool`, `last_at`. Состояние он не меняет, но консоль читает его отсюда,
     а не из хвоста логов (`docs/JOURNAL.md`, правило 14).
+
+    `parked` — факты парковки (класс, этап, число попыток, лимит, вопрос), если
+    дело запарковано: попытки исчерпаны и человек решает, продолжать ли. Это не
+    отдельное состояние ожидания (`wait_human` остаётся им), а причина, по которой
+    человек нужен, — поэтому она едет рядом с состоянием, а не вместо него.
     """
     return {
         "active": True if active is None else bool(active),
@@ -594,6 +645,7 @@ def _verdict(
         "reason": reason,
         "last_kind": last_kind,
         "progress": progress,
+        "parked": parked,
     }
 
 
@@ -665,6 +717,54 @@ def _open_block(ordered: list[dict[str, Any]]) -> Optional[tuple[int, dict[str, 
         elif kind == "unblocked":
             found = None
     return found
+
+
+def parked_of(events: Iterable[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Факты открытой парковки дела: `blocked` с `block_kind='parked'` без `unblocked`.
+
+    Публичная форма того же разбора, что делает `fold`: консоли и `duty why`
+    нужен класс, этап и число попыток, и второй разбор этих полей разошёлся бы с
+    журналом. `None` — парковки нет (или она уже снята явным решением человека).
+    """
+    ordered = sorted(
+        (item for item in events or () if isinstance(item, dict)),
+        key=lambda item: int(item.get("id") or 0),
+    )
+    block = _open_block(ordered)
+    if block is None:
+        return None
+    payload = _payload(block[1])
+    if str(payload.get("block_kind") or "") != PARKED_BLOCK_KIND:
+        return None
+    return _parked_fact(payload)
+
+
+def _parked_fact(payload: dict[str, Any]) -> dict[str, Any]:
+    """Поля парковки из `blocked`: класс, этап, сколько попыток, лимит, правило.
+
+    `reason` payload — текст для человека (его пишет `set_blocked`), поэтому код
+    правила едет отдельным ключом `park_reason` (`retries_exhausted` /
+    `too_many_failures`). `stage` — адрес отказа, а не принадлежность события
+    этапу; `fold` читает такой `blocked` как факт дела.
+    """
+    return {
+        "kind": str(payload.get("kind") or payload.get("fail_kind") or ""),
+        "stage": str(payload.get("stage") or ""),
+        "attempts": _number(payload.get("attempts")),
+        "limit": _number(payload.get("limit")),
+        "reason": str(payload.get("park_reason") or ""),
+        "question_id": payload.get("question_id"),
+    }
+
+
+def _number(value: Any) -> int:
+    """Целое из payload: `True` числом не считается, мусор — нулём."""
+    if value is None or isinstance(value, bool):
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _open_attempt(ordered: list[dict[str, Any]]) -> Optional[tuple[int, dict[str, Any]]]:

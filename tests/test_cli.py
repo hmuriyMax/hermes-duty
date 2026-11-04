@@ -261,10 +261,20 @@ def test_attempts_json_is_exactly_the_route_payload(home, client, frozen_now, ca
     assert json.loads(out) == client.get("/duty/b1/t_aaa001/attempts").json()
 
 
+# Ключи, которые `why` добавляет к форме роута: факты журнала, которых в роуте
+# нет. Их ровно два, и набор закрыт — иначе «--json = форма роута» перестанет быть
+# проверяемым утверждением.
+WHY_EXTRA_KEYS = ("verdict", "failures")
+
+
 def test_why_json_is_the_deal_route_payload(home, client, frozen_now, capsys):
     code, out, _ = run(["why", "b1", "t_aaa001", "--json"], capsys)
     assert code == 0
-    assert json.loads(out) == client.get("/deal/b1/t_aaa001").json()
+    payload = json.loads(out)
+    route = client.get("/deal/b1/t_aaa001").json()
+    assert {key: value for key, value in payload.items() if key not in WHY_EXTRA_KEYS} == route
+    assert payload["failures"]["found"] is False
+    assert payload["failures"]["note"].startswith("журнала ещё нет")
 
 
 def test_json_flag_works_before_the_command_too(home, client, frozen_now, capsys):
@@ -500,10 +510,15 @@ def test_why_json_with_stage_adds_verdict_without_touching_the_route_form(home, 
 
     assert code == 0
     route = client.get("/deal/b1/t_aaa001").json()
-    assert {key: value for key, value in payload.items() if key != "verdict"} == route
+    assert {key: value for key, value in payload.items() if key not in WHY_EXTRA_KEYS} == route
     assert payload["verdict"]["attempt"] == 1
     assert payload["verdict"]["kind"] == "contract"
     assert len(payload["verdict"]["details"]) == 2
+    # Факты отказов едут отдельным ключом: класс, счётчик и `retry_at` считает
+    # политика, а не терминал.
+    assert payload["failures"]["found"] is True
+    assert payload["failures"]["items"][-1]["kind"] == "contract"
+    assert payload["failures"]["items"][-1]["counter"] == "1/1 contract"
 
 
 def test_stats_prints_percentiles_and_first_try(home, frozen_now, capsys):

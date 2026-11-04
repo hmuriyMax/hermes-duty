@@ -737,25 +737,33 @@ def set_blocked(
     reason: str,
     author: str = "max",
     source: str = "cli",
+    details: Optional[dict[str, Any]] = None,
     now: Optional[int] = None,
 ) -> dict[str, Any]:
     """Заблокировать дело: `status='blocked'` плюс событие `blocked`.
 
-    `block_kind` — типизированная причина (`needs_input`, `capability`, …): по нему
-    fold отличает «нужен человек» от «нужен доступ», и подменять его текстом
+    `block_kind` — типизированная причина (`needs_input`, `capability`, `parked`, …):
+    по нему fold отличает «нужен человек» от «нужен доступ», и подменять его текстом
     причины нельзя. `author` — кто блокирует: факт человека, а не дела.
+
+    `details` — дополнительные поля факта (`kind`, `stage`, `attempts`, `limit`,
+    `question_id` у парковки): блок бывает не только «нужен ввод», и причина без
+    класса и числа попыток заставляла бы поверхность их пересчитывать. Поля
+    уникальны и перетирать `block_kind`/`reason` не могут — они добавляются рядом.
     """
     now = _now_sec() if now is None else int(now)
     deal = _require_row(conn, deal_id)
     _reject_archived(deal, "block")
     block_kind = " ".join(str(kind or "").split()) or "needs_input"
     text = " ".join(str(reason or "").split())
+    extra = {str(key): value for key, value in (details or {}).items() if key not in ("block_kind", "reason")}
+    payload = {"block_kind": block_kind, "reason": text, "author": author, **extra}
     event = _event(
         deal,
         "blocked",
-        {"block_kind": block_kind, "reason": text, "author": author},
+        payload,
         source,
-        {"kind": block_kind, "reason": text, "author": author},
+        {"kind": block_kind, "reason": text, "author": author, **extra},
         now,
     )
     return _apply(conn, deal, [event], "blocked", now)

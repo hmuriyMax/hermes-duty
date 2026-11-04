@@ -37,6 +37,8 @@
 | `completed` | без `stage` | дело закрыто целиком |
 | `question_asked` | без `stage` (так пишет `ask()`), адрес — в `routing.stage`/`routing.attempt` | вопрос этого этапа → `wait_human`; адреса нет — последней попытки |
 | `question_answered` | без `stage` | ответ на этот вопрос → новая попытка того же этапа |
+| `blocked` | `block_kind='parked'`, `kind`, `stage`, `attempts`, `limit`, `reason` | дело запарковано: `wait(parked)`, подъёма нет |
+| `unblocked` | `previous_kind='parked'` | человек решил продолжать: счётчики класса сброшены, этап снова `pending` |
 
 Исход попытки различается **полем** `outcome`, а не вторым видом события
 (`docs/JOURNAL.md`, `dashboard/runner.py`): отдельного `attempt_failed` в
@@ -61,7 +63,10 @@ payload: события дел его не пишут.
 3. `parallel_with` разрешает одновременный запуск; без объявления этапы идут по
    одному, порядок — объявления в спеке;
 4. провал попытки → следующая попытка того же этапа, пока для этого класса не
-   исчерпан `retry.max`; исчерпан → `failed` этапа;
+   исчерпан лимит политики (`dashboard/failures.py`: `retry.max`, по умолчанию
+   `{max: 1, on: [infra]}`); между попытками — пауза от 30 с с потолком 5 мин, и
+   до `retry_at` решение — `wait("retry", retry_at)`, а не `run`; исчерпан →
+   `failed` этапа, а движок паркует дело (`blocked` с `block_kind='parked'`);
 5. вопрос в журнале без ответа → `wait`; ответ → новая попытка (номер растёт);
    вопрос, закрытый по сроку без ответа, → `park`;
 6. гейт по родителям: для этапов это `needs`, правило дел (`deals.py`) не
@@ -71,12 +76,20 @@ payload: события дел его не пишут.
    попытки их не меняют;
 8. тотальность: на любой последовательности событий (чужие id, повторы, не по
    порядку, пустой журнал, мусор вместо словаря) функция возвращает `Decision`,
-   а не падает.
+   а не падает;
+9. парковка: пока открыт `blocked` с `block_kind='parked'`, ничего не
+   запускается, а ответ на вопрос парковки попытку не поднимает — продолжение
+   только явным `unblocked`, и оно сбрасывает счётчики класса.
 
 ## Исходы `Decision` — ровно пять
 
 `run` (запустить попытку), `wait` (ждать факта, который придёт в журнал сам),
 `done`, `failed`, `park` (припарковать вопрос человеку). Никаких «а ещё».
+
+`wait` называет, чего ждёт: `attempt` (попытка идёт), `question` (ответ
+человека), `verdict` (приговор ревьюера), `gate` (нужный этап/гейт),
+`retry` (пауза перед повтором — с моментом `retry_at`), `parked` (дело
+запарковано, ждёт решения человека).
 
 **Несколько этапов сразу — это `run` с кортежем `stages`, а не отдельный
 `run_many`:** форма одна, значит и обрабатывать её в движке один раз.
@@ -98,24 +111,29 @@ from typing import Any, Iterable, Optional
 # берём из `sys.modules` под тем же именем, что и остальной код, — второй
 # загрузки (и второго набора `NON_STATE_KINDS`) в процессе быть не должно.
 JOURNAL_MODULE_NAME = "hermes_duty_journal"
+FAILURES_MODULE_NAME = "hermes_duty_failures"
 
 
-def _journal() -> Any:
-    """`dashboard/journal.py` — модуль журнала, один на процесс."""
-    loaded = sys.modules.get(JOURNAL_MODULE_NAME)
+def _load(name: str, filename: str) -> Any:
+    """`dashboard/<filename>` — тот же модуль, что грузит остальной плагин."""
+    loaded = sys.modules.get(name)
     if loaded is not None:
         return loaded
-    path = Path(__file__).resolve().parent / "journal.py"
-    spec = importlib.util.spec_from_file_location(JOURNAL_MODULE_NAME, path)
+    path = Path(__file__).resolve().parent / filename
+    spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
-        raise ImportError(f"journal module not found: {path}")
+        raise ImportError(f"module not found: {path}")
     module = importlib.util.module_from_spec(spec)
-    sys.modules[JOURNAL_MODULE_NAME] = module
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 
 
-journal = _journal()
+journal = _load(JOURNAL_MODULE_NAME, "journal.py")
+
+# Политика ретраев и словарь классов живут в одном месте (`dashboard/failures.py`):
+# слой перехода читает их оттуда, а не держит вторую копию правил.
+failures = _load(FAILURES_MODULE_NAME, "failures.py")
 
 # ------------------------------------------------------------- состояния и виды
 
@@ -151,7 +169,13 @@ WAIT_ATTEMPT = "attempt"
 WAIT_QUESTION = "question"
 WAIT_VERDICT = "verdict"
 WAIT_FOR_GATE = "gate"
-WAIT_KINDS = (WAIT_ATTEMPT, WAIT_QUESTION, WAIT_VERDICT, WAIT_FOR_GATE)
+# Пауза перед повтором: этап упал, но политика класса разрешает ещё попытку —
+# дело не крутится, а ждёт `retry_at` (её считает `dashboard/failures.py`).
+WAIT_RETRY = "retry"
+# Парковка: попытки исчерпаны, дело ждёт решения человека (`blocked` с
+# `block_kind='parked'`). Подъёма автоматически нет — только `unblocked`.
+WAIT_PARKED = "parked"
+WAIT_KINDS = (WAIT_ATTEMPT, WAIT_QUESTION, WAIT_VERDICT, WAIT_FOR_GATE, WAIT_RETRY, WAIT_PARKED)
 
 # Исходы попытки, которые считаются успехом. Набор объявлен, а не угадан по
 # подстроке: `contract_refused` тоже содержит «contract», и «похоже на успех»
@@ -160,7 +184,8 @@ OK_OUTCOMES = ("ok", "done", "success", "passed", "accepted")
 
 # Класс отказа, которого в событии нет. Это не догадка о причине, а честное имя
 # отсутствия класса: такой отказ не ретраится (`retry.on` его не называет).
-UNCLASSIFIED = "unknown"
+# Словарь классов один на плагин — он живёт в `dashboard/failures.py`.
+UNCLASSIFIED = failures.UNCLASSIFIED
 
 # Вердикт «дальше по графу»: так пишет спека и так пишет событие.
 NEXT = "next"
@@ -205,6 +230,9 @@ class StageState:
 
     `failures` — пары «класс отказа → сколько раз» в стабильном порядке: срез
     должен быть сравнимым (`==`) и воспроизводимым, а не «словарь как получится».
+    `retry_at` — момент, раньше которого повтор запрещён паузой политики
+    (`dashboard/failures.py`); `None` — паузы нет: класс не повторяется или
+    отказов не было.
     """
 
     id: str
@@ -216,6 +244,7 @@ class StageState:
     fail_kind: str = ""
     failures: tuple[tuple[str, int], ...] = ()
     reason: str = ""
+    retry_at: Optional[int] = None
 
     @property
     def terminal(self) -> bool:
@@ -230,7 +259,8 @@ class Decision:
     `run` несёт кортеж `stages` (один этап — кортеж из одного): несколько
     этапов сразу — это по-прежнему `run`, отдельного `run_many` нет. `wait`
     называет, чего ждём (`what`), `failed` — класс отказа (`fail_kind`), `park` —
-    этап и вопрос человека.
+    этап и вопрос человека. `retry_at` заполняется только у `wait("retry")`:
+    это момент, раньше которого повторять нельзя.
     """
 
     kind: str
@@ -240,6 +270,7 @@ class Decision:
     fail_kind: str = ""
     question_id: Optional[str] = None
     reason: str = ""
+    retry_at: Optional[int] = None
 
     @property
     def stage(self) -> Optional[str]:
@@ -291,9 +322,13 @@ def run(stages: Any, attempts: Any = None, reason: str = "") -> Decision:
     return Decision(kind=RUN, stages=ids, attempts=numbers, reason=reason)
 
 
-def wait(what: str, reason: str = "") -> Decision:
-    """Ждать факта: идущей попытки, ответа человека, приговора или `needs`."""
-    return Decision(kind=WAIT, what=str(what), reason=reason)
+def wait(what: str, reason: str = "", retry_at: Optional[int] = None) -> Decision:
+    """Ждать факта: идущей попытки, ответа человека, приговора или `needs`.
+
+    `retry_at` — только у `wait("retry")`: момент, раньше которого пауза политики
+    не пускает повтор (`dashboard/failures.py`). У остальных ожиданий его нет.
+    """
+    return Decision(kind=WAIT, what=str(what), reason=reason, retry_at=retry_at)
 
 
 def done(reason: str = "") -> Decision:
@@ -334,6 +369,9 @@ class _Stage:
     run_id: str = ""
     since: int = 0
     reason: str = ""
+    # Время последнего отказа: от него считается пауза перед повтором
+    # (`retry_at`). Ноль — отказа не было.
+    failed_at: int = 0
 
 
 @dataclass
@@ -349,6 +387,10 @@ class _Board:
     # Открытый вопрос дела и этап, которому он принадлежит: ("", id) — вопрос есть,
     # адресат неизвестен (мусорный журнал), и тогда он всё равно держит дело.
     question: tuple[str, str] = ("", "")
+    # Открытая парковка: `blocked` с `block_kind='parked'` без `unblocked`.
+    # Парковка — не состояние ожидания, а факт «попытки исчерпаны, человек решает»;
+    # подъём автоматически запрещён, и это правило держится здесь.
+    parked: Optional[dict[str, Any]] = None
 
     def state_of(self, stage_id: str) -> str:
         """Состояние этапа или `wait_gate` для этапа, которого нет в спеке."""
@@ -462,14 +504,31 @@ def _stage_spec(spec: Any, stage_id: str) -> Any:
 def _retriable(stage_spec: Any, node: _Stage, fail_kind: str) -> bool:
     """Есть ли ещё попытка для этого класса отказа (правило 4).
 
-    Считается по классу: `retry.max` — сколько раз повторять отказ **этого**
-    класса, а класс, которого нет в `retry.on`, не повторяется вовсе. Инфра-сбой
-    и отказ контракта — разные причины, и общий счётчик склеил бы их в один.
+    Считается по классу: лимит повторов — сколько раз повторять отказ **этого**
+    класса, а класс, которого нет в политике `on`, не повторяется вовсе.
+    Инфра-сбой и отказ контракта — разные причины, и общий счётчик склеил бы их
+    в один. Сама политика (лимит по умолчанию, пауза, предохранитель) живёт в
+    `dashboard/failures.py`: здесь только чтение её ответа.
     """
-    retry = getattr(stage_spec, "retry", None)
-    if retry is None or fail_kind not in tuple(retry.on or ()):
-        return False
-    return node.failures.get(fail_kind, 0) <= _int(retry.max)
+    return failures.retriable(
+        failures.policy(stage_spec), fail_kind, node.failures.get(fail_kind, 0)
+    )
+
+
+def _retry_at(stage_spec: Any, node: _Stage) -> Optional[int]:
+    """Когда политика позволит повторить упавший этап; `None` — повтора не будет.
+
+    Пауза считается от времени отказа и растёт с числом отказов класса
+    (`dashboard/failures.py`). Возвращаемое время — факт из журнала плюс
+    объявленная пауза, а не «сколько подождать»: часы слой не читает.
+    """
+    if not node.fail_kind or node.failed_at <= 0:
+        return None
+    policy = failures.policy(stage_spec)
+    attempts = node.failures.get(node.fail_kind, 0)
+    if not failures.retriable(policy, node.fail_kind, attempts):
+        return None
+    return failures.retry_at(attempts, node.failed_at)
 
 
 def _expired(payload: dict[str, Any]) -> bool:
@@ -484,16 +543,18 @@ def _expired(payload: dict[str, Any]) -> bool:
     return _int(payload.get("answer_len")) == 0
 
 
-def _fail(node: _Stage, fail_kind: str, text: str) -> None:
-    """Записать провал попытки: счётчик по классу и класс последнего отказа.
+def _fail(node: _Stage, fail_kind: str, text: str, at: int = 0) -> None:
+    """Записать провал попытки: счётчик по классу, класс и время отказа.
 
     Состояние здесь не ставится: решает политика ретрая (`_retriable`), и это
     решение принимает вызывающий — иначе «провал» и «этап остановлен» склеились
-    бы в одно место и разошлись с `retry`.
+    бы в одно место и разошлись с политикой. `at` — время отказа из события: от
+    него считается пауза перед повтором, и часы слою для этого не нужны.
     """
     node.failures[fail_kind] = node.failures.get(fail_kind, 0) + 1
     node.fail_kind = fail_kind
     node.reason = text
+    node.failed_at = at or node.failed_at
 
 
 def _reopen(board: _Board, spec: Any, stage_id: str, extra: Iterable[str] = ()) -> None:
@@ -570,6 +631,7 @@ def _stage_event(
         node.attempt = max(node.attempt, _int(payload.get("attempt")) or node.attempt + 1)
         node.state = RUNNING
         node.question_id = None
+        node.failed_at = 0
         node.since = at or node.since
         node.reason = f"попытка {node.attempt} идёт"
         board.last_attempt = (node.id, node.attempt)
@@ -591,7 +653,7 @@ def _stage_event(
         fail_kind = fail_kind or UNCLASSIFIED
         stage_spec = _stage_spec(spec, node.id)
         text = f"попытка {node.attempt}: отказ {fail_kind}"
-        _fail(node, fail_kind, text)
+        _fail(node, fail_kind, text, at)
         if not _retriable(stage_spec, node, fail_kind):
             node.state = FAILED
             node.reason = f"{text}: попытки для этого класса исчерпаны"
@@ -629,6 +691,11 @@ def _stage_event(
             node.reason = f"вопрос #{node.question_id} закрыт по сроку без ответа"
             return
         node.question_id = None
+        if board.parked is not None:
+            # Ответ на вопрос запаркованного дела попытку не поднимает: продолжение
+            # — только явное решение человека (`unblocked`), а не ответ в пуле.
+            node.reason = f"ответ #{question_id or '—'}: дело запарковано — ждёт решения"
+            return
         node.state = PENDING
         node.reason = f"ответ #{question_id or '—'}: новая попытка {node.attempt + 1}"
 
@@ -660,6 +727,10 @@ def _deal_question(board: _Board, payload: dict[str, Any]) -> None:
         return
     node.question_id = question_id
     node.attempt = max(node.attempt, attempt)
+    if node.state in (FAILED, PARKED) or board.parked is not None:
+        # Вопрос запаркованного дела — факт парковки, а не повод поднять этап:
+        # исчерпанный этап остаётся `failed`, а дело — ждёт решения человека.
+        return
     node.state = WAIT_HUMAN
     node.reason = f"попытка {node.attempt} закончилась вопросом #{question_id}"
 
@@ -696,8 +767,60 @@ def _deal_answer(board: _Board, payload: dict[str, Any]) -> None:
         node.reason = f"вопрос #{asked} закрыт по сроку без ответа"
         return
     node.question_id = None
+    if board.parked is not None:
+        # Парковка: ответ на вопрос — ещё не решение продолжать. Подъём только
+        # явным `unblocked` (`continue`), иначе дело крутилось бы само.
+        node.reason = f"ответ #{asked}: дело запарковано — ждёт решения человека"
+        return
     node.state = PENDING
     node.reason = f"ответ #{asked}: новая попытка {node.attempt + 1}"
+
+
+def _park_fact(board: _Board, kind: str, payload: dict[str, Any]) -> None:
+    """Парковка дела: `blocked` с `block_kind='parked'` и снятие её `unblocked`.
+
+    Парковка — не девятое состояние ожидания (его нет, `docs/DESIGN.md`), а факт
+    «попытки исчерпаны, человек решает»: он приходит существующим `blocked`
+    (`dashboard/runner.py`, `deals.set_blocked`). Здесь слой запоминает его, чтобы
+    (а) не запускать попытки, пока парковка открыта, и (б) поднять этап **только**
+    явным решением человека: `unblocked` со `previous_kind='parked'` сбрасывает
+    счётчики класса — иначе новый отказ сразу упёрся бы в исчерпанный лимит.
+
+    Ответ на вопрос парковки (`question_answered`) сюда не относится и разбирается
+    отдельно: он попытку не поднимает.
+    """
+    if kind == "blocked":
+        if str(payload.get("block_kind") or "") != failures.PARKED_KIND:
+            return
+        board.parked = _parked_payload(payload)
+        return
+    if kind != "unblocked" or board.parked is None:
+        return
+    if str(payload.get("previous_kind") or "") != failures.PARKED_KIND:
+        return
+    parked = board.parked
+    board.parked = None
+    stage_id = str(parked.get("stage") or "")
+    node = board.stages.get(stage_id)
+    if node is None:
+        return
+    node.failures.clear()
+    node.fail_kind = ""
+    node.failed_at = 0
+    node.state = PENDING
+    node.reason = "человек решил продолжать: счётчики отказа сброшены"
+
+
+def _parked_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Факты парковки из `blocked`: класс, этап, сколько попыток, лимит и вопрос."""
+    return {
+        "kind": str(payload.get("kind") or payload.get("fail_kind") or UNCLASSIFIED),
+        "stage": str(payload.get("stage") or ""),
+        "attempts": _int(payload.get("attempts")),
+        "limit": _int(payload.get("limit")),
+        "reason": str(payload.get("park_reason") or payload.get("reason") or ""),
+        "question_id": _question_id(payload),
+    }
 
 
 def _fold(spec: Any, events: Iterable[Any]) -> _Board:
@@ -715,6 +838,12 @@ def _fold(spec: Any, events: Iterable[Any]) -> _Board:
     for event in _ordered(events):
         kind = str(event.get("kind") or "")
         payload = _payload(event)
+        if kind in ("blocked", "unblocked"):
+            # Парковка — факт **дела**, даже когда в payload назван этап: `blocked`
+            # с `stage` не делает блок фактом этапа (`stage` в журнале блокировки —
+            # адрес отказа, а не принадлежность событию).
+            _park_fact(board, kind, payload)
+            continue
         stage_id = payload.get("stage")
         if not isinstance(stage_id, str) or not stage_id:
             if kind == "completed":
@@ -791,13 +920,29 @@ def _first(spec: Any, states: dict[str, str], wanted: str) -> Any:
     return None
 
 
-def _runnable(spec: Any, board: _Board) -> list[Any]:
-    """Этапы, которые можно запускать прямо сейчас, в порядке объявления."""
-    return [
-        stage
-        for stage in spec.stages
-        if board.state_of(stage.id) == PENDING and not _gate_reason(spec, board, stage)
-    ]
+def _runnable(spec: Any, board: _Board, now: int) -> list[Any]:
+    """Этапы, которые можно запускать прямо сейчас, в порядке объявления.
+
+    Этап, у которого пауза политики ещё не вышла, в список не попадает: повтор
+    «когда захочется» обошёл бы и паузу, и её смысл.
+    """
+    ready: list[Any] = []
+    for stage in spec.stages:
+        if board.state_of(stage.id) != PENDING or _gate_reason(spec, board, stage):
+            continue
+        until = _pause_until(stage, board)
+        if until is not None and now < until:
+            continue
+        ready.append(stage)
+    return ready
+
+
+def _pause_until(stage: Any, board: _Board) -> Optional[int]:
+    """До какого момента повтор этапа запрещён паузой; `None` — запрета нет."""
+    node = board.stages.get(stage.id)
+    if node is None or node.state != PENDING:
+        return None
+    return _retry_at(stage, node)
 
 
 def _parallel(left: Any, right: Any) -> bool:
@@ -851,6 +996,7 @@ def stage_states(spec: Any, events: Iterable[Any]) -> dict[str, StageState]:
             fail_kind=node.fail_kind,
             failures=tuple(sorted(node.failures.items())),
             reason=reason,
+            retry_at=_pause_until(stage, board),
         )
     return result
 
@@ -875,16 +1021,19 @@ def next_stage(spec: Any, events: Iterable[Any], now: Any) -> Decision:
     Порядок разбора (он же приоритет, он же контракт):
 
     1. дело закрыто событием `completed` без `stage` → `done`;
-    2. любой этап `failed` → `failed` (класс — из события, `contract` — из раундов);
-    3. любой этап `parked` (вопрос закрыт без ответа) → `park`;
-    4. есть готовые этапы → `run` пачкой по правилу 3;
-    5. идёт попытка → `wait(attempt)`;
-    6. есть открытый вопрос → `wait(question)`;
-    7. все этапы `done` → `done`;
-    8. иначе граф стоит → `wait(gate)`.
+    2. дело запарковано (`blocked` с `block_kind='parked'`) → `wait(parked)`: без
+       решения человека ничего не запускается и ничего не поднимается;
+    3. любой этап `failed` → `failed` (класс — из события, `contract` — из раундов);
+    4. любой этап `parked` (вопрос закрыт без ответа) → `park`;
+    5. есть готовые этапы → `run` пачкой по правилу 3;
+    6. идёт попытка → `wait(attempt)`;
+    7. есть открытый вопрос → `wait(question)`;
+    8. этап ждёт паузы перед повтором → `wait(retry, retry_at)`;
+    9. все этапы `done` → `done`;
+    10. иначе граф стоит → `wait(gate)`.
 
-    `now` нужен только тексту причины («попытка идёт 12мин»); выбор от него не
-    зависит, и часов модуль не читает.
+    `now` нужен тексту причины («попытка идёт 12мин») и решению о паузе перед
+    повтором: до `retry_at` повтор не выдаётся. Часов модуль не читает.
     """
     board = _fold(spec, events)
     seconds = _int(now)
@@ -892,6 +1041,19 @@ def next_stage(spec: Any, events: Iterable[Any], now: Any) -> Decision:
         return done(board.closed_reason)
     if not spec.stages:
         return done("в спеке нет этапов: решать нечего")
+
+    if board.parked is not None:
+        parked = board.parked
+        return wait(
+            WAIT_PARKED,
+            "дело запарковано: {} на этапе {!r} — {}".format(
+                failures.counter(parked["kind"], parked["attempts"], parked["limit"]),
+                parked["stage"] or "—",
+                parked["reason"] or "попытки исчерпаны",
+            )
+            + (f"; вопрос #{parked['question_id']}" if parked["question_id"] else "")
+            + "; продолжение — только решением человека",
+        )
 
     states = _slice(spec, board)
 
@@ -910,7 +1072,7 @@ def next_stage(spec: Any, events: Iterable[Any], now: Any) -> Decision:
     if board.question[1] and not board.question[0]:
         return wait(WAIT_QUESTION, f"вопрос #{board.question[1]} без адресата в спеке: ответа нет")
 
-    runnable = _runnable(spec, board)
+    runnable = _runnable(spec, board, seconds)
     if runnable:
         batch = _batch(spec, runnable)
         numbers = tuple(board.stages[stage_id].attempt + 1 for stage_id in batch)
@@ -933,6 +1095,20 @@ def next_stage(spec: Any, events: Iterable[Any], now: Any) -> Decision:
             f"{_age(node.since, seconds)}",
         )
 
+    waiting_retry = _waiting_retry(spec, board, seconds)
+    if waiting_retry is not None:
+        stage, until = waiting_retry
+        node = board.stages[stage.id]
+        return wait(
+            WAIT_RETRY,
+            "этап {!r}: пауза перед повтором после отказа {}, повтор не раньше чем через {}с".format(
+                stage.id,
+                failures.counter(node.fail_kind, node.failures.get(node.fail_kind, 0), failures.policy(stage).max),
+                max(0, until - seconds),
+            ),
+            retry_at=until,
+        )
+
     if all(state == DONE for state in states.values()):
         return done("все этапы закрыты")
 
@@ -941,18 +1117,33 @@ def next_stage(spec: Any, events: Iterable[Any], now: Any) -> Decision:
     return wait(what or WAIT_FOR_GATE, f"этап {gated.id!r}: {why or 'граф стоит'}")
 
 
+def _waiting_retry(spec: Any, board: _Board, now: int) -> Optional[tuple[Any, int]]:
+    """Первый по спеке этап, который ждёт паузы перед повтором, и её конец."""
+    for stage in spec.stages:
+        if board.state_of(stage.id) != PENDING:
+            continue
+        until = _pause_until(stage, board)
+        if until is not None and now < until:
+            return stage, until
+    return None
+
+
 def deal_state(spec: Any, events: Iterable[Any]) -> str:
     """Состояние дела целиком — одно из `DEAL_STATES`.
 
     Приоритет повторяет журнальный порядок ожиданий: человек (`wait_human`),
-    припаркованный вопрос, отказ, работа. `pending` — есть что запускать;
-    `wait_gate` — запускать нечего, а дело не закрыто (граф стоит).
+    припаркованный вопрос, отказ, работа. Запаркованное дело — `wait_human`:
+    парковка ждёт **человека**, и отдельного состояния для неё нет
+    (`docs/DESIGN.md`). `pending` — есть что запускать; `wait_gate` — запускать
+    нечего, а дело не закрыто (граф стоит).
     """
     board = _fold(spec, events)
     if board.closed:
         return DONE
     if not spec.stages:
         return DONE
+    if board.parked is not None:
+        return WAIT_HUMAN
     states = _slice(spec, board)
     for wanted in (FAILED, PARKED):
         if _first(spec, states, wanted) is not None:

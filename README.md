@@ -94,6 +94,11 @@ duty.yaml ──▶ bin/duty spec check ──▶ годна (или «file:line
    (`dashboard/reaper.py`). Драйвер зовёт уборку перед каждым решением, поэтому
    `bin/duty run`, убитый снаружи во время попытки, лечится следующим запуском;
    `bin/duty reap [--dry-run]` делает то же вручную.
+8. **Ответ человека двигает дело без ручного синка.** Драйвер перед каждым решением
+   (и в `--once`) дочитывает пул (`ask.sync_answers`): закрытый вопрос становится
+   фактом `question_answered`, блок `needs_input` снимается, этап получает новую
+   попытку. Ошибки разбора (`errors[]`) не глотаются — они строкой `! ответы пула: …`
+   в выводе и ключом `answers_errors` в `--json`.
 
 ### Чем 0.0.4 **ещё не** является
 
@@ -371,9 +376,10 @@ CommonJS — `node --check plugin.js` пропускает то, что вали
 `hermes chat -p`, телеметрия `attempt_progress`), evidence-гейт `evidence.verify`,
 адресация вопросов `routing.route`, классы отказа и политика ретраев `failures.py`
 (исчерпание паркует дело), лента этапов `stagefeed.py`, `external_ref` у дела,
-драйвер `dashboard/driver.py` (`bin/duty run`) и уборка осиротевших попыток
+драйвер `dashboard/driver.py` (`bin/duty run`), дочитывание ответов пула самим
+движком (`ask.sync_answers` на каждом шаге) и уборка осиротевших попыток
 `reaper.sweep` (`bin/duty reap`, `reaped: true`). Регрессия
-**555 pytest + 1 skipped**, **49 node** (37 + 12), `bin/duty demo` — 7/7.
+**563 pytest + 1 skipped**, **49 node** (37 + 12), `bin/duty demo` — 7/7.
 
 `v0.0.3` — свой журнал событий (`state = fold(events)`, `POST /ingest`, `journal` в
 `/health`), единственный канал вопросов `ask()`, CLI `bin/duty` (чтение и мутации),

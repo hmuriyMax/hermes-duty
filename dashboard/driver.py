@@ -37,6 +37,16 @@ Python — то есть гейт «дело проходит impl → verify �
    срок, закрывается движком как `infra` (`reaped: true`). Так `bin/duty run`,
    убитый снаружи во время попытки, лечится следующим запуском без ручных
    действий: факт появляется в журнале, и решение перестаёт быть «попытка идёт».
+7. **Ответы пула дочитываются сами.** Сразу после `reaper.sweep` и до решения
+   драйвер зовёт `ask.sync_answers`: закрытый вопрос пула (`answered`/`expired`)
+   становится фактом журнала `question_answered`. Без этого движок, запущенный
+   из терминала или как процесс, ответов пула не видел вовсе — дело навсегда
+   оставалось `wait_human`, хотя человек уже ответил («вопрос, на который
+   ответили, но никто не забрал»). Порядок обязателен: ответ — факт журнала, а
+   решение считается по журналу, поэтому синк идёт **до** `transit.next_stage`.
+   Ошибки разбора (`errors[]`: пул недоступен, `session_key` не разобран) не
+   глотаются: они попадают в отчёт (`answers_errors`) и в вывод шага, чтобы
+   «вопрос закрыт, но не разобран» не читалось как «ответа нет».
 
 ## Коды возврата — контракт `bin/duty run`
 
@@ -74,6 +84,7 @@ TRANSIT_MODULE_NAME = "hermes_duty_transit"
 RUNNER_MODULE_NAME = "hermes_duty_runner"
 STAGEFEED_MODULE_NAME = "hermes_duty_stagefeed"
 REAPER_MODULE_NAME = "hermes_duty_reaper"
+ASK_MODULE_NAME = "hermes_duty_ask"
 
 
 def _load(name: str, filename: str) -> Any:
@@ -103,6 +114,10 @@ stagefeed = _load(STAGEFEED_MODULE_NAME, "stagefeed.py")
 # Уборка осиротевших попыток (`dashboard/reaper.py`) грузится после ленты: она
 # берёт у неё «какая спека у дела», а не читает журнал своим разбором.
 reaper = _load(REAPER_MODULE_NAME, "reaper.py")
+# Ответы пула (`ask.sync_answers`) — обратный ход того же модуля, которым движок
+# задаёт вопросы: второй канал вопросов не заводится, и «прочитать ответ» обязан
+# тот же код, что «записал вопрос».
+ask = _load(ASK_MODULE_NAME, "ask.py")
 
 # Коды возврата драйвера. Первые три совпадают с кодами остального CLI: дело
 # закрыто / отказ / припарковано. Остальные — только у прогона: ожидание, предел
@@ -281,11 +296,18 @@ def _report(
     outcome: str,
     note: str,
     reaped: Optional[list[dict[str, Any]]] = None,
+    answers: Optional[dict[str, Any]] = None,
+    answers_errors: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
-    """Отчёт прогона: шаги, уборка, финальное решение, исход и код возврата.
+    """Отчёт прогона: шаги, уборка, ответы пула, финальное решение, исход и код.
 
     `reaped` — попытки, закрытые движком как осиротевшие (`reaper.sweep`): это
     факт прогона, а не шаг, поэтому он рядом со шагами, а не среди них.
+    `answers` — сколько фактов `question_answered` дописал `ask.sync_answers` за
+    прогон (ключи есть всегда: «нечего дочитывать» — ответ, а не отсутствие поля).
+    `answers_errors` — что пул закрыл, а журнал не узнал (пул недоступен,
+    `session_key` не разобран): пустой список вместо тишины, иначе «вопрос
+    закрыт, но не разобран» выглядело бы как «ответа нет».
     """
     return {
         "deal": str(deal.get("id") or ""),
@@ -293,6 +315,8 @@ def _report(
         "spec": str(getattr(spec, "path", "") or ""),
         "steps": list(steps),
         "reaped": list(reaped or ()),
+        "answers": {"appended": int((answers or {}).get("appended") or 0)},
+        "answers_errors": list(answers_errors or ()),
         "outcome": outcome,
         "note": note,
         "decision": _decision_dict(decision),
@@ -325,41 +349,61 @@ def run(
     monotonic: Optional[Callable[[], float]] = None,
     on_step: Optional[Callable[[dict[str, Any]], None]] = None,
     on_reap: Optional[Callable[[dict[str, Any]], None]] = None,
+    on_answer_error: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> dict[str, Any]:
     """Довести дело до терминального исхода: решение → шаг → перечитать журнал.
 
     Возвращает отчёт (`_report`): шаги попыток, уборка осиротевших попыток,
-    финальное решение, исход и код возврата. `on_step` зовётся на каждую строку
-    сразу после шага, `on_reap` — на каждую попытку, закрытую движком; консоль
-    может печатать по строке, не дожидаясь конца прогона, а форматирования здесь
-    нет, потому что оформление живёт в CLI.
+    дочитанные ответы пула, финальное решение, исход и код возврата. `on_step`
+    зовётся на каждую строку сразу после шага, `on_reap` — на каждую попытку,
+    закрытую движком, `on_answer_error` — на каждый закрытый вопрос пула, который
+    журнал не узнал; консоль может печатать по строке, не дожидаясь конца прогона,
+    а форматирования здесь нет, потому что оформление живёт в CLI.
 
     `spawn`, `clock`, `monotonic` — те же швы, что у `runner.step`: тесты
     подменяют спавн фейком, а живые часы — неподвижными.
     """
     tick = clock or time.time
     measure = monotonic or time.monotonic
+    home = Path(home)
     children = _Children(spawn or runner.spawn_process)
     limit = int(max_steps)
     steps: list[dict[str, Any]] = []
     reaped: list[dict[str, Any]] = []
+    answers: dict[str, Any] = {"appended": 0}
+    answers_errors: list[dict[str, Any]] = []
     made = 0
     outcome = ""
     note = ""
 
     def decide() -> Any:
-        """Решение по журналу, а перед ним — уборка осиротевших попыток.
+        """Уборка осиротевших попыток, дочитывание ответов пула, решение по журналу.
 
         Уборка идёт **до** расчёта решения (правило 4 карточки): попытка без
         конца и с истёкшим лизингом иначе навсегда осталась бы «идущей», и
         решение вернуло бы `wait(attempt)` — то самое вечное стояние, ради
         которого уборка и заведена. Кладётся она в отчёт отдельным списком: это
         факт прогона, а не шаг.
+
+        Ответы пула читаются сразу после уборки и **до** решения (правило 7):
+        ответ человека — факт журнала, а решение считается по журналу. Обратный
+        порядок оставил бы дело в `wait_human` ещё на один шаг, хотя человек уже
+        ответил. Ошибки разбора (`errors[]`) не глотаются: они копятся в отчёте и
+        отдаются вызывающему по одной строке.
         """
         for row in reaper.sweep(conn, int(tick()), spec=spec):
             reaped.append(row)
             if on_reap is not None:
                 on_reap(row)
+        synced = ask.sync_answers(conn, home)
+        answers["appended"] = int(answers.get("appended") or 0) + int(synced.get("appended") or 0)
+        for error in synced.get("errors") or ():
+            row = dict(error) if isinstance(error, dict) else {"board": "", "reason": str(error)}
+            if row in answers_errors:
+                continue  # один и тот же сбой пула не повторяется на каждом шаге
+            answers_errors.append(row)
+            if on_answer_error is not None:
+                on_answer_error(row)
         return _decide(conn, deal, spec, tick)
 
     decision = decide()
@@ -420,7 +464,7 @@ def run(
     finally:
         children.stop()
         _release_mine(conn, deal, spec)
-    return _report(deal, spec, steps, decision, outcome, note, reaped)
+    return _report(deal, spec, steps, decision, outcome, note, reaped, answers, answers_errors)
 
 
 # --------------------------------------------------------------- вход прогона
@@ -443,6 +487,7 @@ def drive(
     monotonic: Optional[Callable[[], float]] = None,
     on_step: Optional[Callable[[dict[str, Any]], None]] = None,
     on_reap: Optional[Callable[[dict[str, Any]], None]] = None,
+    on_answer_error: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> dict[str, Any]:
     """Вход `bin/duty run`: открыть store, найти спеку и довести дело.
 
@@ -473,6 +518,7 @@ def drive(
             monotonic=monotonic,
             on_step=on_step,
             on_reap=on_reap,
+            on_answer_error=on_answer_error,
         )
     finally:
         conn.close()

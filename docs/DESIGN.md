@@ -158,6 +158,14 @@ failures.classify → policy → decide_park
 одного правила перехода: спрашивает `transit`, отдаёт `runner`, снова читает
 журнал. Поэтому `bin/duty run`, убитый после `impl`, продолжает с `verify`.
 
+Перед каждым решением драйвер делает две вещи, обе — факты, а не выводы: закрывает
+осиротевшие попытки (`reaper.sweep`) и дочитывает ответы пула
+(`ask.sync_answers` → `question_answered`). Порядок обязателен: решение считается
+по журналу, поэтому ответ человека обязан стать фактом **до** `transit.next_stage`,
+иначе дело простоит в `wait_human` лишний шаг, хотя человек уже ответил. Ошибки
+разбора (`errors[]`: пул недоступен, `session_key` не разобран) не глотаются — они
+в отчёте прогона (`answers_errors`) и в выводе шага.
+
 ### Где живёт каждое решение
 
 | вопрос | кто отвечает | модуль |
@@ -174,6 +182,7 @@ failures.classify → policy → decide_park
 | Как вопрос попадает человеку? | `ask()` — единственный канал записи в пул | `dashboard/ask.py` |
 | Состояние дела и ожидание (восемь состояний) | `fold(events)` | `dashboard/journal.py` |
 | Сколько шагов делать и когда выйти? | `run()`/`drive()`: `--once`, `--max-steps`, SIGINT, коды `0/1/2/3/4/130` | `dashboard/driver.py` |
+| Человек ответил в пуле — кто это заберёт? | `sync_answers(conn, home)` перед каждым решением: `answered`/`expired` → `question_answered`; блок `needs_input`, который держал вопрос, снимает шаг движка (`close_answered_block`) | `dashboard/ask.py`, `dashboard/runner.py` |
 | Попытка начата и не отчиталась — кто её закроет? | `sweep(conn, now)`: `attempt_started` без `attempt_ended`, лизинг истёк и возраст больше `ttl + max(60 с, ttl/3)` → `attempt_ended` (`kind=infra`, `reaped: true`); живой лизинг не трогается, `ps` не смотрится | `dashboard/reaper.py` |
 | Чьё это дело и не дубль ли? | `create_deal(external_ref=…, dedup_window=…)`, id `d_<hex>` | `dashboard/deals.py` |
 | Что видно на экране и в терминале? | `stages[]` / `stage`; `--json` = дословный ответ роута | `dashboard/stagefeed.py`, `dashboard/cli.py`, `dashboard/plugin_api.py` |

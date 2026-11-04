@@ -1431,6 +1431,12 @@ def render_run_step(row: dict[str, Any]) -> str:
     if outcome == _load_failures().OUTCOME_DONE:
         duration = row.get("duration_sec")
         took = f" ({float(duration):.1f}s)" if isinstance(duration, (int, float)) else ""
+        asked = row.get("question_id")
+        if asked:
+            # Попытка отчиталась, но не работой: она задала вопрос. Без этой
+            # строки шаг читался бы как «ok», хотя дело ждёт человека, — та же
+            # путаница «работа идёт» и «ответа нет», что и у глотания `errors[]`.
+            return f"{stage} · попытка {attempt} · ждёт ответа: вопрос #{asked}{took}"
         return f"{stage} · попытка {attempt} · ok{took}"
     detail = f"{kind}: {row.get('reason')}" if kind else str(row.get("reason") or outcome or "исход не записан")
     return f"{stage} · попытка {attempt} · {detail}"
@@ -1501,36 +1507,55 @@ def _decision_text(decision: dict[str, Any]) -> str:
     return kind
 
 
+def render_answer_error(row: dict[str, Any]) -> str:
+    """Строка о закрытом вопросе пула, который журнал не узнал.
+
+    «Пул недоступен» и «`session_key` не разобран» — разные сбои одного прохода
+    (`ask.sync_answers` → `errors[]`), и оба обязаны быть видны: без этой строки
+    дело выглядело бы просто ждущим ответа, которого уже нет.
+    """
+    return "! ответы пула: {} — {}".format(
+        row.get("board") or "—", row.get("reason") or "причина не записана"
+    )
+
+
 def render_run_final(report: dict[str, Any]) -> str:
     """Итог прогона одной строкой: что сделано и чего ждём.
 
     Ожидание называется тем, чего не хватает (`wait(question)` плюс номер
     вопроса в причине, `wait(retry)` плюс `retry_at`, `wait(gate)` плюс кто
     держит): «вышел с кодом 3» без этих слов человеку ничего не говорит.
+    Дочитанные ответы пула называются числом: «движок сам забрал ответ» и «дела
+    не касались» — разные исходы, и второй не должен читаться как первый.
     """
     outcome = str(report.get("outcome") or "")
     decision = report.get("decision") or {}
     steps = report.get("steps") or []
     made = len({row.get("n") for row in steps})
     note = str(report.get("note") or decision.get("reason") or "")
+    answers = int((report.get("answers") or {}).get("appended") or 0)
+    picked = f" · ответов пула дочитано: {answers}" if answers else ""
     if outcome == "done":
-        return f"итог: дело закрыто — {note or 'все этапы закрыты'} (шагов: {made})"
+        return f"итог: дело закрыто — {note or 'все этапы закрыты'} (шагов: {made}){picked}"
     if outcome == "failed":
-        return f"итог: дело остановлено отказом {decision.get('fail_kind') or '—'} — {note} (шагов: {made})"
+        return (
+            f"итог: дело остановлено отказом {decision.get('fail_kind') or '—'} — "
+            f"{note} (шагов: {made}){picked}"
+        )
     if outcome == "park":
         return (
             f"итог: дело припарковано, решает человек — вопрос #{decision.get('question_id') or '—'}, "
-            f"{note} (шагов: {made})"
+            f"{note} (шагов: {made}){picked}"
         )
     if outcome == "wait":
-        return f"итог: ждём {_decision_text(decision)} — {note}"
+        return f"итог: ждём {_decision_text(decision)} — {note}{picked}"
     if outcome == "limit":
-        return f"итог: предел шагов — {note}"
+        return f"итог: предел шагов — {note}{picked}"
     if outcome == "interrupted":
-        return f"итог: прервано — {note} (шагов: {made})"
+        return f"итог: прервано — {note} (шагов: {made}){picked}"
     if outcome == "step":
-        return f"итог: сделан один шаг (--once) — дальше {_decision_text(decision)}"
-    return f"итог: {outcome or '—'} — {note}"
+        return f"итог: сделан один шаг (--once) — дальше {_decision_text(decision)}{picked}"
+    return f"итог: {outcome or '—'} — {note}{picked}"
 
 
 def _emit_json(payload: dict[str, Any], stream: Any) -> None:
@@ -1567,6 +1592,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 once=args.once,
                 on_step=None if args.json else (lambda row: print(render_run_step(row), file=out)),
                 on_reap=None if args.json else (lambda row: print(render_reap_row(row), file=out)),
+                on_answer_error=None if args.json else (lambda row: print(render_answer_error(row), file=out)),
             )
             _emit_json(report, out) if args.json else print(render_run_final(report), file=out)
             return int(report.get("exit_code") or EXIT_OK)

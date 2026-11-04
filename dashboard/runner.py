@@ -1693,6 +1693,67 @@ def _parked(
     return int(asked.question_id), address
 
 
+def close_answered_block(conn: sqlite3.Connection, deal: Any, *, clock: Optional[Callable[[], float]] = None) -> bool:
+    """Закрыть блок `needs_input`, который держал вопрос, — ответ уже в журнале.
+
+    `blocked` с `block_kind='needs_input'` пишет движок, когда попытка спросила
+    человека (`_parked`). Ответ приходит отдельным фактом `question_answered`, и
+    блок сам по себе не снимается: `fold` видит `blocked` без `unblocked` и
+    называет дело `wait_human`, хотя движок уже поднял новую попытку. Это и есть
+    «вторая правда о ждёт ответа» — срез говорил бы «нужен человек» про дело,
+    которое человек уже разблокировал ответом.
+
+    Поэтому шаг движка, взявший работу после ответа, пишет `unblocked`: блок
+    писал он же, и снимает его он же. Парковка (`block_kind='parked'`) не
+    трогается вовсе — её снимает только решение человека (`continue`), иначе
+    ответ поднимал бы исчерпанный этап сам.
+
+    Снимается ровно тот блок, после которого в журнале есть ответ: чужой
+    `needs_input` (поставленный человеком уже после ответа) остаётся открытым.
+    """
+    if not _answered_needs_input(conn, deal):
+        return False
+    # Статус читается заново: шаг мог поднять блок уже после того, как вызывающий
+    # прочитал строку дела (прогон берёт её один раз на старте).
+    row = deals.deal_row(conn, str(deal["id"]))
+    if row is None or str(row.get("status") or "") != "blocked":
+        # Блока в статусе дела уже нет (его сняли другим путём) — придумывать
+        # второй `unblocked` нечего.
+        return False
+    deals.set_unblocked(
+        conn,
+        str(deal["id"]),
+        author=ENGINE_SOURCE,
+        source=ENGINE_SOURCE,
+        now=_now_sec(int((clock or time.time)())),
+    )
+    return True
+
+
+def _answered_needs_input(conn: sqlite3.Connection, deal: Any) -> bool:
+    """Ждёт ли дело ответа, который уже пришёл: открытый `needs_input` после ответа.
+
+    «Блока нет», «блок не наш» и «блока ждут, ответа ещё нет» — один ответ, потому
+    что действие во всех трёх случаях одно и то же: ничего не писать.
+    """
+    events = journal.read_events(conn, str(deal["id"]))
+    opened: Optional[dict[str, Any]] = None
+    answered = False
+    for event in events:
+        kind = str(event.get("kind") or "")
+        if kind == "blocked":
+            opened = event
+            answered = False
+        elif kind == "unblocked":
+            opened = None
+            answered = False
+        elif kind == "question_answered":
+            answered = True
+    if opened is None or not answered:
+        return False
+    return str(journal.payload_of(opened).get("block_kind") or "") == "needs_input"
+
+
 def step(
     conn: sqlite3.Connection,
     spec: Any,
@@ -1710,10 +1771,15 @@ def step(
     Не `run` — делать нечего: ждать факта, закрыть дело или припарковать вопрос
     решает не этот слой, и выдумывать здесь шаг нельзя. `answer` относится к
     продолжению после вопроса и передаётся в каждую попытку этого шага.
+
+    Перед попытками движок закрывает блок, который ждал ответа
+    (`close_answered_block`): ответ человека — уже факт журнала, а открытый
+    `blocked` держал бы дело в `wait_human`, хотя движок снова взялся за работу.
     """
     kind = str(getattr(decision, "kind", "") or "")
     if kind != DECISION_RUN:
         return {"started": 0, "skipped": f"решение {kind or '—'} не запускает попыток", "runs": []}
+    close_answered_block(conn, deal, clock=clock)
     runs: list[dict[str, Any]] = []
     for stage_id, attempt in getattr(decision, "pair", []) or []:
         runs.append(

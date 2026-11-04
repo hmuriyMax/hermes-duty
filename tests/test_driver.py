@@ -14,7 +14,10 @@
 3. `--once` — ровно один шаг;
 4. предел шагов — код 4, дело не тронуто;
 5. процессы не остаются сиротами: SIGINT гасит ребёнка, лизинг отпускается;
-6. человеческий вывод — строка на шаг, `--json` — машинная форма.
+6. человеческий вывод — строка на шаг, `--json` — машинная форма;
+7. ответы пула дочитываются сами: `ask.sync_answers` идёт после `reaper.sweep` и
+   до решения, поэтому `bin/duty run --once` забирает ответ без ручного синка
+   (регрессия ровно на кейс `d_a2a26b55`), а `errors[]` синка не глотаются.
 """
 
 from __future__ import annotations
@@ -27,6 +30,8 @@ import signal
 import sqlite3
 import sys
 import textwrap
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -178,6 +183,51 @@ def leases(conn: sqlite3.Connection, deal: dict[str, Any]) -> list[dict[str, Any
         "SELECT stage, pid, attempt, expires_at FROM leases WHERE deal_id = ?", (str(deal["id"]),)
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def answer_in_pool(
+    home: Path,
+    question_id: int,
+    *,
+    status: str = "answered",
+    answer: str = "режем скоуп",
+    session_key: Optional[str] = None,
+) -> None:
+    """Закрыть вопрос пула так, как это делает сам пул (`msgq resolve`/срок).
+
+    Пишет в свою фикстуру, а не в живой пул: ответ человека приходит от демона
+    моста, и тест изображает ровно его эффект — `answered` с `answered_at` и
+    `answered_via`, либо `expired` без ответа. `session_key` перекрывается для
+    случая «пул закрыл, а ключ не разобран»: это `errors[]` синка, не ответ.
+    """
+    db = home / "messaging" / "pool.db"
+    pool = sqlite3.connect(db)
+    try:
+        if status == "answered":
+            # `answered_at` — настоящий момент ответа: `question_asked` движок
+            # пишет живыми часами, и время ответа из прошлого переупорядочило бы
+            # журнал (ответ раньше вопроса), и fold снял бы нечего.
+            answered_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            pool.execute(
+                "UPDATE questions SET status='answered', answer=?, answered_via='manual', "
+                "answered_at=? WHERE id = ?",
+                (answer, answered_at, int(question_id)),
+            )
+        else:
+            pool.execute("UPDATE questions SET status=? WHERE id = ?", (status, int(question_id)))
+        if session_key is not None:
+            pool.execute("UPDATE questions SET session_key = ? WHERE id = ?", (session_key, int(question_id)))
+        pool.commit()
+    finally:
+        pool.close()
+
+
+def asked_question_id(conn: sqlite3.Connection, deal: dict[str, Any]) -> int:
+    """Номер вопроса пула по последнему `question_asked` журнала дела."""
+    for event in reversed(events(conn, deal)):
+        if event["kind"] == "question_asked":
+            return int(journal.payload_of(event)["question_id"])
+    raise AssertionError("в журнале нет question_asked: вопроса не было")
 
 
 class Proc:
@@ -631,6 +681,8 @@ def test_json_report_schema(tmp_path: Path) -> None:
         "spec",
         "steps",
         "reaped",
+        "answers",
+        "answers_errors",
         "outcome",
         "note",
         "decision",
@@ -642,6 +694,10 @@ def test_json_report_schema(tmp_path: Path) -> None:
     # всегда, иначе читатель `--json` не отличил бы «нечего убирать» от
     # «поле забыли».
     assert restored["reaped"] == []
+    # Ответов пула в чистом прогоне не было — но ключи есть: «нечего дочитывать»
+    # и «синк не звали» читатель `--json` обязан различать.
+    assert restored["answers"] == {"appended": 0}
+    assert restored["answers_errors"] == []
     assert set(restored["steps"][0]) == {
         "n",
         "stage",
@@ -770,3 +826,324 @@ def test_cli_run_json_prints_report(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert payload["outcome"] == "done"
     assert payload["deal"] == deal["id"]
     assert payload["steps"] == []
+
+
+# ------------------------------------ правило 7: движок сам дочитывает ответы пула
+
+
+def start_orphan(
+    conn: sqlite3.Connection,
+    deal: dict[str, Any],
+    *,
+    stage: str = "impl",
+    attempt: int = 1,
+    ttl: int = 1800,
+) -> None:
+    """Попытка без конца и живой лизинг, который истечёт: сырьё для `reaper.sweep`.
+
+    Уборка судит по журналу и сроку лизинга (`docs/PROBES.md`), поэтому сирота
+    собирается теми же двумя фактами, что пишет движок: `attempt_started` и
+    строка `leases`. Процесса нет вовсе — и это ровно случай «прогон убили».
+    """
+    seed(
+        conn,
+        deal,
+        "attempt_started",
+        {
+            "run_id": f"{stage}#{attempt}",
+            "stage": stage,
+            "attempt": attempt,
+            "pid": 64511,
+            "lease_expires": NOW + ttl,
+            "workdir": f"/tmp/{deal['id']}-{stage}-{attempt}",
+        },
+        key=f"orphan:{deal['id']}:{stage}#{attempt}",
+    )
+    with conn:
+        conn.execute(
+            "INSERT INTO leases (deal_id, stage, attempt, pid, taken_at, expires_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(deal_id, stage) DO UPDATE SET pid = excluded.pid, expires_at = excluded.expires_at",
+            (str(deal["id"]), stage, int(attempt), 64511, NOW, NOW + ttl),
+        )
+
+
+def test_once_picks_up_pool_answer_without_manual_sync(tmp_path: Path) -> None:
+    """Регрессия `d_a2a26b55`: ответ в пуле забирает сам `--once`, без ручного синка.
+
+    До W15 движок ответов пула не читал вовсе: человек отвечал, `run --once`
+    снова говорил «ждём вопрос #N», и дело стояло в `wait_human` навсегда.
+    Здесь между двумя прогонами нет ни одного вызова `sync_answers` — только
+    строка пула, закрытая штатным путём пула.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, CHAIN)
+    deal = make_deal(conn, spec_path=spec.path)
+    fake = Fake({"impl": "ask"})
+
+    # Живые часы: `question_asked` и `question_answered` пишутся настоящим
+    # временем пула, а журнал применяет факты по `ts` — с неподвижными часами
+    # ответ из будущего переупорядочил бы попытки и снял бы не тот факт.
+    first = run(conn, spec, deal, home, fake, once=True, clock=time.time)
+    assert first["outcome"] == "step", "--once делает шаг и выходит"
+    assert first["decision"]["what"] == "question"
+    question_id = first["steps"][0]["question_id"]
+    assert question_id, "вопрос задан и его номер попал в отчёт"
+    assert deal_state(conn, deal, spec) == "wait_human"
+    assert "question_answered" not in kinds(conn, deal)
+
+    answer_in_pool(home, question_id)
+    fake.plan["impl"] = "ok"
+
+    second = run(conn, spec, deal, home, fake, once=True, clock=time.time)
+
+    assert second["answers"]["appended"] == 1, "движок дочитал ответ пула сам"
+    assert second["answers_errors"] == []
+    assert kinds(conn, deal).count("question_answered") == 1
+    # Ответ снимает и блок, который держал вопрос: иначе срез показывал бы
+    # wait_human, хотя движок уже работает.
+    assert "unblocked" in kinds(conn, deal)
+    assert journal.fold(events(conn, deal))["state"] != "wait_human", "ответ сдвинул дело с человека"
+    assert transit.deal_state(spec, events(conn, deal)) == "pending", "этап снова в работе"
+    # Ответ — повод для новой попытки того же этапа: impl#2 пошёл в работу.
+    assert [(call["stage"], call["attempt"]) for call in fake.calls] == [("impl", 1), ("impl", 2)]
+    assert "ответов пула дочитано: 1" in cli.render_run_final(second)
+
+
+def test_cli_run_once_and_deal_show_pool_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`bin/duty run --once` → ответ в пуле → `bin/duty run --once` → `bin/duty deal`.
+
+    Ровно транскрипт приёмки: оба прогона идут через CLI (`HERMES_HOME` — своя
+    песочница), спавн подменён фейком, ручного `sync_answers` нет ни одного.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, CHAIN)
+    deal = make_deal(conn, spec_path=spec.path)
+    fake = Fake({"impl": "ask"})
+    monkeypatch.setattr(driver.runner, "spawn_process", fake)
+
+    assert _cli_run(monkeypatch, home, ["run", deal["id"], "--once"]) == 0
+    assert "wait(question)" in capsys.readouterr().out
+    question_id = asked_question_id(conn, deal)
+
+    answer_in_pool(home, question_id)
+    fake.plan["impl"] = "ok"
+
+    assert _cli_run(monkeypatch, home, ["run", deal["id"], "--once"]) == 0
+    out = capsys.readouterr().out
+    assert "ответов пула дочитано: 1" in out
+    assert "question_answered" in kinds(conn, deal)
+
+    assert _cli_run(monkeypatch, home, ["deal", "duty", deal["id"]]) == 0
+    card = capsys.readouterr().out
+    assert "состояние ожидания: wait_human" not in card, card
+    assert "impl#2" in card, "карточка называет попытку, которую поднял ответ"
+    assert "ответа нет" not in card, "отвеченный вопрос больше не выдаётся за ожидание"
+
+
+def test_pool_answer_closes_orphan_and_order_is_sweep_sync_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Порядок шага: `reaper.sweep` → `ask.sync_answers` → решение по журналу.
+
+    На одном решении сходятся оба факта — осиротевшая попытка и ответ пула.
+    Проверяется и порядок вызовов (иначе ответ читался бы уже после решения и
+    терялся бы на один шаг), и что оба факта попали в журнал до приговора.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, CHAIN)
+    deal = make_deal(conn, spec_path=spec.path)
+    start_orphan(conn, deal)
+    # Вопрос дела, закрытый в пуле: journal его ещё не знает — это и есть работа синка.
+    pool = sqlite3.connect(home / "messaging" / "pool.db")
+    with pool:
+        pool.execute(
+            "INSERT INTO questions (session_key, project, text, origin, status, answer,"
+            " answered_at, answered_via, kind) "
+            "VALUES (?, 'duty', 'режем скоуп?', 'duty', 'answered', 'режем',"
+            " '2026-11-03T10:00:00.000Z', 'manual', 'decision')",
+            (f"t_{deal['id']}",),
+        )
+    pool.close()
+
+    order: list[str] = []
+    real_sweep, real_sync, real_next = driver.reaper.sweep, driver.ask.sync_answers, driver.transit.next_stage
+
+    def sweep(*args: Any, **kwargs: Any) -> Any:
+        order.append("sweep")
+        return real_sweep(*args, **kwargs)
+
+    def sync(*args: Any, **kwargs: Any) -> Any:
+        order.append("sync")
+        return real_sync(*args, **kwargs)
+
+    def next_stage(*args: Any, **kwargs: Any) -> Any:
+        order.append("decision")
+        return real_next(*args, **kwargs)
+
+    monkeypatch.setattr(driver.reaper, "sweep", sweep)
+    monkeypatch.setattr(driver.ask, "sync_answers", sync)
+    monkeypatch.setattr(driver.transit, "next_stage", next_stage)
+
+    report = run(conn, spec, deal, home, Fake(), clock=lambda: NOW + 2401)
+
+    assert order[:3] == ["sweep", "sync", "decision"], order
+    assert [row["stage"] for row in report["reaped"]] == ["impl"], "сирота закрыта до решения"
+    assert report["answers"]["appended"] == 1
+    # Оба факта — в журнале, и приговор считается уже по ним: попытка impl упала
+    # как infra, поэтому дело остановлено, а не «ждёт вопрос #—».
+    assert kinds(conn, deal).count("question_answered") == 1
+    assert report["outcome"] in ("failed", "wait"), report["outcome"]
+
+
+def test_answer_errors_go_to_output_and_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Пул закрыл вопрос, а `session_key` не разобран — это `errors[]`, а не тишина.
+
+    «Вопрос закрыт, но не разобран» не должно выглядеть как «ответа нет»: строка
+    уходит в вывод шага и в `--json` (`answers_errors`), а решение остаётся
+    прежним — факта в журнале нет.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, CHAIN)
+    deal = make_deal(conn, spec_path=spec.path)
+    fake = Fake({"impl": "ask"})
+    monkeypatch.setattr(driver.runner, "spawn_process", fake)
+
+    assert _cli_run(monkeypatch, home, ["run", deal["id"], "--once"]) == 0
+    question_id = asked_question_id(conn, deal)
+    capsys.readouterr()
+    answer_in_pool(home, question_id, session_key="zzz-чужой-ключ")
+
+    seen: list[dict[str, Any]] = []
+    report = run(conn, spec, deal, home, fake, once=True, on_answer_error=seen.append)
+
+    assert len(seen) == 1 and seen[0] == report["answers_errors"][0]
+    assert "не разобран" in str(seen[0]["reason"])
+    assert report["answers"] == {"appended": 0}, "факта нет — дочитывать нечего"
+    assert deal_state(conn, deal, spec) == "wait_human", "решение осталось прежним"
+    assert "question_answered" not in kinds(conn, deal)
+
+    assert _cli_run(monkeypatch, home, ["run", deal["id"], "--once"]) == 3
+    out = capsys.readouterr().out
+    assert "! ответы пула:" in out and "не разобран" in out
+
+    assert _cli_run(monkeypatch, home, ["run", deal["id"], "--once", "--json"]) == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["answers_errors"] and "не разобран" in payload["answers_errors"][0]["reason"]
+
+
+def test_pool_without_answer_keeps_wait_human_and_writes_nothing(tmp_path: Path) -> None:
+    """Живой вопрос (ответа нет) — поведение как раньше: `wait_human`, без записи."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, CHAIN)
+    deal = make_deal(conn, spec_path=spec.path)
+    fake = Fake({"impl": "ask"})
+
+    first = run(conn, spec, deal, home, fake, once=True)
+    question_id = first["steps"][0]["question_id"]
+    before = kinds(conn, deal)
+
+    second = run(conn, spec, deal, home, fake, once=True)
+
+    assert second["outcome"] == "wait"
+    assert second["exit_code"] == 3
+    assert second["answers"] == {"appended": 0}
+    assert kinds(conn, deal) == before, "синк без закрытого вопроса журнал не трогает"
+    assert deal_state(conn, deal, spec) == "wait_human"
+    assert f"#{question_id}" in second["note"]
+    assert len(fake.calls) == 1, "второй попытки до ответа нет"
+
+
+def test_expired_question_is_closed_by_sync_and_keeps_parking(tmp_path: Path) -> None:
+    """Истёкший вопрос закрывает синк, и попытку это не поднимает: парковка — парковка."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, CHAIN)
+    deal = make_deal(conn, spec_path=spec.path)
+    fake = Fake({"impl": "ask"})
+
+    first = run(conn, spec, deal, home, fake, once=True)
+    question_id = first["steps"][0]["question_id"]
+    # Пул перевёл строку в `expired` своим чистящим циклом: ответа нет, но и
+    # вопроса, которого ждут, тоже нет.
+    answer_in_pool(home, question_id, status="expired")
+
+    second = run(conn, spec, deal, home, fake, once=True)
+
+    assert second["answers"]["appended"] == 1
+    assert second["outcome"] == "park", "срок вышел — этап припаркован, а не поднят"
+    assert second["exit_code"] == 2
+    assert second["decision"]["question_id"] == str(question_id)
+    assert len(fake.calls) == 1, "истёкший вопрос не повод для новой попытки"
+    answered = [event for event in events(conn, deal) if event["kind"] == "question_answered"]
+    assert len(answered) == 1
+    assert journal.payload_of(answered[0])["answered_via"] == "expired"
+    assert journal.payload_of(answered[0])["answer_len"] == 0
+    assert "unblocked" not in kinds(conn, deal), "парковку движок не снимает"
+    assert deal_state(conn, deal, spec) == "wait_human", "парковка остаётся парковкой"
+
+
+def test_answer_arriving_mid_run_is_picked_up_before_next_step(tmp_path: Path) -> None:
+    """Ответ, пришедший по ходу прогона, читается перед следующим шагом.
+
+    Синк стоит в начале **каждого** шага, а не только первого: иначе ответ,
+    данный между `impl` и `verify`, ждал бы внешнего вызова, и прогон упирался бы
+    в `wait_human` на уже отвеченном вопросе.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, CHAIN)
+    deal = make_deal(conn, spec_path=spec.path)
+    fake = Fake({"verify": "ask"})
+    answered: list[int] = []
+
+    def close_after_first_step(row: dict[str, Any]) -> None:
+        # Человек отвечает ровно между шагами: пул закрыт, журнал ещё нет.
+        if row["stage"] != "verify" or answered:
+            return
+        answered.append(int(row["question_id"]))
+        answer_in_pool(home, int(row["question_id"]))
+        fake.plan["verify"] = "ok"
+
+    report = run(conn, spec, deal, home, fake, on_step=close_after_first_step, clock=time.time)
+
+    assert answered, "вопрос по verify был задан"
+    assert report["outcome"] == "done"
+    assert [call["stage"] for call in fake.calls] == ["impl", "verify", "verify", "review"]
+    assert report["answers"]["appended"] == 1
+    assert "unblocked" in kinds(conn, deal), "ответ снял блок, который держал вопрос"
+    assert journal.fold(events(conn, deal))["state"] != "wait_human"
+    assert transit.deal_state(spec, events(conn, deal)) == "done"
+
+
+def test_manual_block_after_answer_is_not_lifted_by_the_step(tmp_path: Path) -> None:
+    """Чужой `needs_input` (человек заблокировал уже после ответа) движок не снимает.
+
+    Движок закрывает ровно тот блок, который держал вопрос: если ответ пришёл
+    раньше, а блок поставил человек, снимать его — решение человека, а не шага.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, CHAIN)
+    deal = make_deal(conn, spec_path=spec.path)
+    seed(conn, deal, "question_asked", {"question_id": 5, "session_key": f"t_{deal['id']}"}, key="q5-asked")
+    seed(conn, deal, "question_answered", {"question_id": 5, "answer_len": 4, "answered_via": "manual"}, key="q5-done")
+    deals.set_blocked(
+        conn, str(deal["id"]), kind="needs_input", reason="человек снял дело с очереди", author="max", now=NOW
+    )
+
+    report = run(conn, spec, deal, home, Fake(), clock=time.time)
+
+    assert report["steps"], "шаг всё равно идёт: блок не парковка"
+    assert "unblocked" not in kinds(conn, deal), "блок человека движок не снимает"
+    assert journal.fold(events(conn, deal))["state"] == "wait_human"
+

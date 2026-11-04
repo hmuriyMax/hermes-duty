@@ -468,6 +468,30 @@ def test_archived_deal_is_not_reopened_by_commands(home: Path, client: TestClien
     assert deal_rows(home)[0]["status"] == "archived"
 
 
+def test_own_claim_without_expiry_is_not_dead_lease(
+    home: Path, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Своё дело: срок у `claim` не пишется, поэтому «протухший лизинг» не называется.
+
+    `claim` своего дела пишет `claim_expires: NULL` (аренды в 0.0.3 нет), и через
+    час после взятия дело не выдаётся за `dead_lease`: тот же ответ по тому же
+    делу отдаёт `lease.state = "none"`, и два поля не должны противоречить.
+    """
+    deal = create(client)
+    conn = store(home)
+    try:
+        deals.claim_deal(conn, deal["id"], owner="implementer", now=NOW)
+    finally:
+        conn.close()
+    monkeypatch.setattr(plugin_api, "_now_sec", lambda: NOW + 3600)
+
+    waiting = waiting_of(client, deal["id"])
+
+    assert waiting["state"] != "dead_lease"
+    assert "dead_lease" not in waiting["evidence"]
+    assert now_deals(client)[deal["id"]]["waiting"]["state"] != "dead_lease"
+
+
 # ----------------------------------------------------------------- ревью (4)
 
 
@@ -528,6 +552,53 @@ def test_child_ready_only_when_parent_done(home: Path, client: TestClient) -> No
     opened = events(home, child["id"])[-1]
     assert opened["payload"] == {"from": "todo", "to": "ready", "parent": parent["id"]}
     assert now_deals(client)[child["id"]]["status"] == "ready"
+
+
+def test_child_created_under_closed_parent_is_ready_not_wait_gate(
+    home: Path, client: TestClient
+) -> None:
+    """Ребёнок, заведённый при уже закрытом родителе, не висит в `wait_gate`.
+
+    `create` ставит `status=ready` по открытому гейту, и переход обязан быть
+    фактом: снимок `created` говорит только «родители были», а не «гейт закрыт»,
+    поэтому по нему fold называл `wait_gate` делу, готовому к работе.
+    """
+    parent = create(client, title="родитель")
+    mutate(client, "POST", f"/deals/{parent['id']}/complete", json={"summary": "ok"})
+
+    child = create(client, title="ребёнок", parents=[parent["id"]])
+
+    assert child["status"] == "ready"
+    assert kinds(home, child["id"]) == ["created", "gate_opened"]
+    opened = events(home, child["id"])[-1]
+    assert opened["payload"] == {
+        "from": "todo",
+        "to": "ready",
+        "parent": parent["id"],
+        "cause": "created",
+    }
+    assert now_deals(client)[child["id"]]["waiting"]["state"] != "wait_gate"
+    assert waiting_of(client, child["id"])["state"] != "wait_gate"
+
+
+def test_child_of_two_closed_parents_names_the_last_closed_one(
+    home: Path, client: TestClient
+) -> None:
+    """Два закрытых родителя: событие называет того, чьё закрытие открыло гейт последним."""
+    first = create(client, title="родитель 1")
+    second = create(client, title="родитель 2")
+    conn = store(home)
+    try:
+        deals.complete_deal(conn, first["id"], summary="ok", now=NOW)
+        deals.complete_deal(conn, second["id"], summary="ok", now=NOW + 60)
+    finally:
+        conn.close()
+
+    child = create(client, title="ребёнок", parents=[first["id"], second["id"]])
+
+    opened = events(home, child["id"])[-1]
+    assert opened["kind"] == "gate_opened"
+    assert opened["payload"]["parent"] == second["id"]
 
 
 def test_parent_leaving_done_closes_gate_with_event(home: Path, client: TestClient) -> None:

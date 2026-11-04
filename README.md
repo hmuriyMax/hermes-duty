@@ -216,7 +216,7 @@ hermes plugins enable hermes-duty     # или Capabilities → Plugins в де�
 Из каталога плагина (`cd ~/.hermes/plugins/hermes-duty`):
 
 ```bash
-~/.hermes/hermes-agent/venv/bin/python -m pytest -q        # 213 passed
+~/.hermes/hermes-agent/venv/bin/python -m pytest -q        # 220 passed
 node --test tests/model.test.mjs tests/web.test.mjs        # 37 pass (28 + 9)
 bin/duty-model-sync --check                                # OK
 bin/duty-version check                                     # OK
@@ -241,7 +241,7 @@ CommonJS — `node --check plugin.js` пропускает то, что вали
 `journal` в `/health`), единственный канал вопросов `ask()`, CLI `bin/duty` (чтение и
 мутации), **владение делом** (свой store, мутации `/deals…`, id `d_<hex>`, контракт
 `docs/OWNERSHIP.md`) и перцентили ожидания p50/p90/p99 в `/stats`. Регрессия
-204 pytest + 37 node.
+220 pytest + 37 node.
 
 `v0.0.2` — четыре экрана (`Сейчас`, `Дело`, `Почему стоит`, `Здоровье`) в десктопе и
 в браузере поверх роутов `/now`, `/deal/{board}/{id}`, `/duty/{board}/{id}/attempts`,

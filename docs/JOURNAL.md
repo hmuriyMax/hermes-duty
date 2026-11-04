@@ -115,7 +115,10 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
    Исключение — доступ и права: `block_kind='capability'` (или причина блока со словом
    из `CAPABILITY_WORDS`) даёт состояние `capability`, а не `wait_human`: человек тут
    не решает, а даёт доступ. Таксономия — `docs/DESIGN.md`.
-4. `claimed` без `attempt_started` старше `CLAIM_STALE_SEC` (сейчас 900) → `dead_lease`.
+4. `claimed`, за которым нет `attempt_started`, и у которого в журнале записан срок
+   (`claim_expires`) и этот срок уже прошёл, → `dead_lease`. «Протух» — свойство
+   срока: `claimed` без срока (своё дело — `duty claim` пишет `claim_expires: null`)
+   `dead_lease` не даёт никогда, сколько бы времени ни прошло.
 5. `attempt_started` без `attempt_ended`, pid мёртв → `crashed`; pid не читается →
    `no_signal` (tri-state, как в 0.0.2).
 6. `question_asked` без `question_answered` → `wait_human` с `human_kind="question"`;

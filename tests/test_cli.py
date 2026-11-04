@@ -536,6 +536,35 @@ def test_watch_json_is_one_route_payload_per_tick(home, client, frozen_now):
     assert json.loads(lines[0]) == json.loads(lines[1]) == client.get("/now").json()
 
 
+def test_watch_json_keeps_stdout_parsable_on_source_degradation(home, frozen_now, monkeypatch, capsys):
+    """`watch --json` при отказе источника: stdout — только JSON, причина в stderr.
+
+    Построчный потребитель (`duty --json watch | jq -c`) не должен получать из
+    stdout строку `! источники: …`: в json-режиме деградация идёт в stderr, а
+    stdout остаётся потоком ответов роута.
+    """
+    route = cli.api().now
+    calls = {"n": 0}
+
+    def flaky(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise cli.SourceFailure("journal: недоступен")
+        return route(**kwargs)
+
+    monkeypatch.setattr(cli.api(), "now", flaky)
+    stream = io.StringIO()
+    code = cli.run_watch(interval=0, ticks=3, as_json=True, stream=stream)
+
+    lines = [line for line in stream.getvalue().splitlines() if line.strip()]
+    assert code == cli.EXIT_OK
+    assert calls["n"] == 3
+    assert len(lines) == 2
+    for line in lines:
+        json.loads(line)
+    assert "! источники: journal: недоступен" in capsys.readouterr().err
+
+
 # ---------------------------------------------------------- чтение без записи
 
 

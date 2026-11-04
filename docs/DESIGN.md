@@ -94,7 +94,7 @@ desktop-страница `/duty` (внутренний роут приложен
 
 | роут | что отдаёт | ошибки |
 |---|---|---|
-| `GET /health` | версия, корень, число БД и читаемых, строки `tasks`, наличие пула, `mode: "read-only"` | — |
+| `GET /health` | версия, корень, число БД и читаемых, строки `tasks`, наличие пула, `journal: {events, deals, drift: {empty_journal}}` (сколько журнал знает и чего не догнал), `mode: "read-only"` | — |
 | `GET /sources` | доски с размером/`mtime`/счётчиками, выбывшие доски (`archived[]`: `slug`, `path`, `reason`), пул по `origin × status`, список профилей | — |
 | `GET /board/{slug}/tasks` | сырой срез активных карточек доски (до 200) | 404 — доски нет |
 | `GET /now?board=<slug>&state=<waiting.state>` | срез «сейчас» (форма ниже) | 404 — доски нет; 400 — состояние не из таксономии |
@@ -129,7 +129,7 @@ desktop-страница `/duty` (внутренний роут приложен
 
 | что | где контракт | что видно на поверхности |
 |---|---|---|
-| журнал: схема, набор из 18 видов событий, идемпотентность, правила fold 1–12, ingest | `docs/JOURNAL.md` | `journal: {events, deals, drift: {empty_journal}}` в `/health`; `journal: empty — состояние из kanban` в `waiting.evidence` |
+| журнал: схема, набор из 18 видов событий, идемпотентность, правила fold 1–13, ingest | `docs/JOURNAL.md` | `journal: {events, deals, drift: {empty_journal}}` в `/health`; `journal: empty — состояние из kanban` в `waiting.evidence` |
 | владение: свой store `deals`/`deal_links`/`comments`/`attachments`, мутации, гейт, id `d_<hex>` | `docs/OWNERSHIP.md` | `POST`/`PATCH /deals…`, поле `mutation` в ответе, `comments[]`/`attachments[]` в `/deal` |
 | `ask()`: пул как единственный канал вопросов, дедуп, `adopted`, критичность | `docs/JOURNAL.md`, раздел «`ask()`» | `POST /ask/{board}/{task_id}`, `waiting.human_kind` |
 
@@ -207,7 +207,7 @@ store и `note` «только свои дела: kanban-доски с таки�
 |---|---|---|
 | 1 | `wait_human` | живой вопрос пула (`pending`/`sent`, `ask.LIVE_STATUSES`), связанный с делом: `session_key` = id дела или id упомянут в `text`/`text_full` |
 | 2 | `capability` | `status=blocked` и (`block_kind='capability'` или причина блока содержит слово из `CAPABILITY_WORDS`: доступ, права, разрешение, `permission`, `access`, `credential`, `token`, `forbidden`, `403`) |
-| 3 | `dead_lease` | ран `running`, а его pid мёртв; **или** лизинг истёк, и последнего рана нет либо он `running` |
+| 3 | `dead_lease` | ран `running`, а его pid мёртв; **или** лизинг истёк (срок `claim_expires` записан и прошёл, попытки за лизингом не было — fold правило 4: `claimed` без срока `dead_lease` не даёт) |
 | 4 | `crashed` | `consecutive_failures > 0`; **или** исход последнего рана ∈ `crashed`/`gave_up`/`spawn_failed`/`timed_out`; **или** ран `running`, pid не мёртв, но heartbeat старше 300 с |
 | 5 | `working` | ран `running`, pid не мёртв, heartbeat не старше 300 с |
 | 6 | `no_signal` | `status=running`, но ни рана, ни pid, ни heartbeat нет: живого сигнала нет, дело не выдаётся за работающее |

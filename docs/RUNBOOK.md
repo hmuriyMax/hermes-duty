@@ -181,7 +181,8 @@ HERMES_HOME=~/.hermes bin/duty now
 Мутации своего дела (`docs/OWNERSHIP.md`) — те же функции, что у роутов `/deals…`:
 
 ```bash
-# завести дело; человеческий вывод id не печатает — его берут из --json
+# завести дело; человеческий вывод печатает его в строке `СОЗДАНО <board>/d_<hex> · ready`,
+# а машинный id берут из --json
 bin/duty --json create --board duty-demo --title "проверка владения" | grep -o "d_[0-9a-f]*"
 bin/duty comment d_<hex> "первый комментарий"
 bin/duty block d_<hex> --kind needs_input "нужен доступ"
@@ -266,7 +267,7 @@ PY
 
 ```bash
 cd ~/.hermes/plugins/hermes-duty
-~/.hermes/hermes-agent/venv/bin/python -m pytest -q      # 213 passed
+~/.hermes/hermes-agent/venv/bin/python -m pytest -q      # 220 passed
 ```
 
 Новые кейсы 0.0.2 — `tests/test_screens.py`: `/deal` (активное дело, завершённое

@@ -41,10 +41,6 @@ JOURNAL_SOURCE = f"{JOURNAL_SUBDIR}/{JOURNAL_FILE}"
 # Сколько ждать чужую запись, а не сколько живёт запрос (как в `plugin_api`).
 BUSY_TIMEOUT_MS = 2000
 
-# Лизинг, за которым не началась попытка, считается протухшим через этот порог
-# (`docs/JOURNAL.md`, fold правило 4).
-CLAIM_STALE_SEC = 900
-
 # Восемь взаимоисключающих состояний ожидания (`docs/DESIGN.md`) — и порядок
 # приоритета при совпадении фактов. Одна таблица на весь бэкенд: журнал и
 # поверхность берут порядок отсюда, второй копии нет.
@@ -428,17 +424,24 @@ def fold(
         else:
             facts.setdefault("wait_human", []).append(text)
 
-    # 4. Лизинг, за которым не началась попытка: дело «взяли» и не пришли.
+    # 4. Лизинг, за которым не началась попытка: дело «взяли» и не пришли. Факт
+    #    называется «протухшим» только тогда, когда в журнале записан срок
+    #    (`claim_expires`) и он уже прошёл: «протух» — это свойство срока, а не
+    #    возраста строки. У своего дела срока нет вовсе (`claim` пишет `NULL`,
+    #    аренды в 0.0.3 не существует), и время по такому факту ничего не
+    #    доказывает — иначе ответ противоречил бы `lease.state = "none"` того же
+    #    дела. Срок — данные, а не происхождение записи: проверяется он, а не
+    #    `source = "ingest"`.
     claim = _last_of_kind(ordered, "claimed")
     if claim is not None:
         claim_index, claim_event = claim
+        payload = _payload(claim_event)
+        expires = payload.get("claim_expires")
         started = any(str(ev.get("kind")) == "attempt_started" for ev in ordered[claim_index + 1 :])
-        claim_ts = int(claim_event.get("ts") or 0)
-        if not started and now_sec - claim_ts > CLAIM_STALE_SEC:
-            payload = _payload(claim_event)
+        if not started and isinstance(expires, int) and expires <= now_sec:
             facts.setdefault("dead_lease", []).append(
-                f"лизинг {payload.get('claim_lock') or '—'} взят {_ago(claim_ts, now_sec)}, "
-                f"attempt_started за ним нет (expires {payload.get('claim_expires') or '—'})"
+                f"лизинг {payload.get('claim_lock') or '—'} взят {_ago(claim_event.get('ts'), now_sec)}, "
+                f"срок истёк {_ago(expires, now_sec)} — attempt_started за ним нет"
             )
 
     # 5. Попытка без завершения: живость pid — единственный сигнал, который в

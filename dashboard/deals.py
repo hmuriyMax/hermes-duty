@@ -552,7 +552,31 @@ def create_deal(
         status = "ready" if gate_open(conn, deal_id) else "todo"
         _set_status(conn, deal, status, now)
         created["payload"]["status"] = status
-        written = journal.append_in_tx(conn, [created])
+        events = [created]
+        if status == "ready" and parent_ids:
+            # Гейт был открыт уже в момент создания, и переход пишется фактом
+            # рядом со снимком `created`: по одному снимку «родители были» нельзя
+            # отличить закрытый гейт от незакрытого, и дело висело бы в
+            # `wait_gate` при `status=ready`. Родитель в payload — тот, чьё
+            # закрытие открыло гейт последним (у него самый свежий `updated_at`);
+            # при равном времени — по `id`, чтобы выбор был воспроизводим.
+            last_closed = conn.execute(
+                "SELECT id FROM deals WHERE id IN ({}) ORDER BY updated_at DESC, id DESC LIMIT 1".format(
+                    ", ".join("?" * len(parent_ids))
+                ),
+                tuple(parent_ids),
+            ).fetchone()
+            events.append(
+                _event(
+                    deal,
+                    "gate_opened",
+                    {"from": "todo", "to": status, "parent": str(last_closed["id"]), "cause": "created"},
+                    source,
+                    {"cause": "created", "parents": parent_ids},
+                    now,
+                )
+            )
+        written = journal.append_in_tx(conn, events)
     return {"deal": deal_row(conn, deal_id), "events": written, "idempotent": written == 0}
 
 

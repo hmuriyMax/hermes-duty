@@ -596,10 +596,14 @@ def test_fold_answered_question_is_not_waiting() -> None:
     assert folded["reason"] == "no_live_fact"
 
 
-def test_fold_claim_without_attempt_older_than_stale_is_dead_lease() -> None:
-    """Правило 4: лизинг взят, попытки не было, прошло больше `CLAIM_STALE_SEC`."""
+def test_fold_claim_with_expired_lease_is_dead_lease() -> None:
+    """Правило 4: срок лизинга записан и прошёл, а попытки за лизингом не было.
+
+    Возраст `claimed` здесь меньше прежнего порога: «протух» — это факт о сроке,
+    и называет его срок из события, а не время с момента записи.
+    """
     folded = journal.fold(
-        events(("created", None), ("claimed", {"claim_lock": "L", "claim_expires": NOW - 100}), ts=NOW - 1000),
+        events(("created", None), ("claimed", {"claim_lock": "L", "claim_expires": NOW - 100}), ts=NOW - 200),
         now=NOW,
     )
 
@@ -607,8 +611,34 @@ def test_fold_claim_without_attempt_older_than_stale_is_dead_lease() -> None:
     assert "claim_lock" not in folded["evidence"] and "L" in folded["evidence"]
 
 
+def test_fold_claim_without_expiry_is_not_dead_lease() -> None:
+    """Правило 4: у `claimed` без срока нет свойства «протух».
+
+    Своё дело пишет `claim_expires: NULL` (`claim`, `dashboard/deals.py`): аренды в
+    0.0.3 нет, и срока у факта не записано. Возраст такого `claimed` ничего не
+    доказывает — «протухший лизинг» это факт о сроке, а не о возрасте строки.
+    """
+    folded = journal.fold(
+        events(("created", None), ("claimed", {"claim_lock": "L", "claim_expires": None}), ts=NOW - 3600),
+        now=NOW,
+    )
+
+    assert folded["state"] != "dead_lease"
+    assert folded["reason"] == "no_live_fact"
+
+
+def test_fold_claim_with_unexpired_lease_is_not_dead_lease() -> None:
+    """Правило 4: пока записанный срок не прошёл, старый `claimed` не «протух»."""
+    folded = journal.fold(
+        events(("created", None), ("claimed", {"claim_lock": "L", "claim_expires": NOW + 900}), ts=NOW - 3600),
+        now=NOW,
+    )
+
+    assert folded["state"] != "dead_lease"
+
+
 def test_fold_fresh_claim_is_not_dead_lease() -> None:
-    """Только что взятый лизинг — не «протухший»: порог `CLAIM_STALE_SEC` не пройден."""
+    """Только что взятый лизинг — не «протухший»: срок ещё не прошёл."""
     folded = journal.fold(
         events(("created", None), ("claimed", {"claim_lock": "L", "claim_expires": NOW + 900}), ts=NOW - 10),
         now=NOW,
@@ -701,6 +731,41 @@ def test_fold_priority_wait_human_beats_crashed() -> None:
 
     assert folded["state"] == "wait_human"
     assert "ещё: crashed:" in folded["evidence"]
+
+
+def test_ingest_expired_kanban_lease_still_folds_to_dead_lease(home: Path) -> None:
+    """Правило 4 для чужого факта: истёкший срок kanban-лизинга — по-прежнему `dead_lease`.
+
+    `claimed` от ingest несёт срок из payload источника, срок прошёл, попытки за
+    лизингом не было — факт называется. Изменение правила касается только
+    `claimed` без срока, а не проверки срока у чужих фактов.
+    """
+    board = make_board(home)
+    conn = sqlite3.connect(board)
+    try:
+        add_task(conn, "t_expired", status="running", claim_lock="L", claim_expires=NOW - 100)
+        add_kanban_event(
+            conn,
+            "claimed",
+            task_id="t_expired",
+            payload={"lock": "L", "expires": NOW - 100},
+            created_at=NOW - 200,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    ingest(board, home)
+
+    conn = journal.open_journal(home, create=False)
+    assert conn is not None
+    try:
+        folded = journal.fold(journal.read_events(conn, "t_expired"), now=NOW)
+    finally:
+        conn.close()
+
+    assert folded["state"] == "dead_lease"
+    assert "L" in folded["evidence"]
 
 
 # -------------------------------------------------------------------- ingest

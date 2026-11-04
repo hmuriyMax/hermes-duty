@@ -9,7 +9,9 @@ Duty до 0.0.3 только наблюдал kanban. Здесь он **влад
 
 - таблицы `boards`/`deals`/`deal_links`/`comments`/`attachments` живут в **той же**
   `duty/duty.db`, что и журнал (`dashboard/journal.py`), отдельными таблицами;
-  схема `events` не меняется;
+  схема `events` не меняется. Там же `leases` — лизинг этапа движка
+  (`dashboard/runner.py`): store у дела один, и взаимное исключение двух
+  процессов живёт рядом со строкой дела, а не во второй БД;
 - каждая мутация — **одна транзакция**: строка store и событие журнала вместе.
   Журнал пишется `journal.append_in_tx` (без собственного `commit`), поэтому сбой
   записи события откатывает и строку: две правды не разъезжаются;
@@ -128,6 +130,22 @@ CREATE TABLE IF NOT EXISTS attachments (
   content_type TEXT,
   size_bytes   INTEGER NOT NULL,
   created_at   INTEGER NOT NULL
+);
+
+-- Лизинг этапа движка (0.0.4): кто ведёт этап и до какого срока. Строка одна на
+-- пару (дело, этап) — это и есть взаимное исключение двух процессов; продление
+-- сдвигает `expires_at`, отпускание удаляет строку. Таблица заведена здесь, а не
+-- в `runner.py`, потому что store у дела один: `CREATE TABLE IF NOT EXISTS` при
+-- каждом открытии и есть миграция уже существующей `duty.db` (схема `events` не
+-- меняется).
+CREATE TABLE IF NOT EXISTS leases (
+  deal_id    TEXT NOT NULL REFERENCES deals(id),
+  stage      TEXT NOT NULL,
+  attempt    INTEGER NOT NULL,
+  pid        INTEGER NOT NULL,
+  taken_at   INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  PRIMARY KEY (deal_id, stage)
 );
 CREATE INDEX IF NOT EXISTS deals_board ON deals(board, status);
 CREATE INDEX IF NOT EXISTS comments_deal ON comments(deal_id, id);

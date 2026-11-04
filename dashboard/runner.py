@@ -1,0 +1,1275 @@
+"""Один шаг движка: лизинг, дерево попытки, контракт файлом, спавн, телеметрия.
+
+Модуль **действует**: поднимает процесс роли, держит лизинг этапа и пишет факты в
+журнал. Поэтому решений здесь нет — что запускать и с каким номером попытки,
+решает `dashboard/transit.py` (`Decision.run(stage, attempt)`), что означает
+спека — `dashboard/spec.py` (валидатор отработал до процесса). Здесь только
+исполнение одного шага и запись того, что произошло.
+
+Что модуль делает по шагам (`run_stage`):
+
+1. **Лизинг** этапа в своей `duty/duty.db` (таблица `leases`). Взятие атомарно
+   (`INSERT … ON CONFLICT … WHERE expires_at <= now`): два процесса не поведут
+   один этап — второй получит `False` и не сделает ничего. TTL — из
+   `stage.budget.minutes` (по умолчанию 30 мин), продление — по heartbeat'у
+   попытки не реже TTL/3.
+2. **Дерево попытки**. `worktree` — `git worktree add <каталог попытки>/tree
+   <base>` от `spec.base`; `dir` — каталог дела из `repo` спеки; `none` — дерева
+   нет (этапы-гейты). Каталог попытки лежит под
+   `<home>/kanban/boards/<board>/workspaces/<deal>-<stage>-<attempt>` — это
+   разрешённый корень `role-access` (`docs/PROBES.md`, проба 3): иначе read-only
+   роль не прочитает ни дерево, ни отчёт. Успешная попытка дерево оставляет,
+   упавшая — удаляет (`git worktree remove --force`), путь и причина уходят в
+   событие.
+3. **Входной контракт файлом** `<каталог попытки>/.duty/in-<stage>-<attempt>.json`:
+   дело, этап, попытка, роль, каталог, цель, границы, отчёты предшественников,
+   что доказать, куда задавать вопросы, куда писать отчёт. Пишется до спавна и
+   целиком уходит в событие `attempt_started` — консоль показывает вход, а не
+   догадывается о нём.
+4. **Спавн** `hermes chat -p <role> --query-file <контракт> --format stream-json
+   --oneshot` с cwd дерева этапа. Профиль роли — из спеки, права не эскалируются.
+   Бюджет: `minutes` → жёсткий таймаут (SIGTERM, затем SIGKILL через 10 с),
+   `tokens` → превышение по `usage` из потока останавливает попытку.
+5. **Телеметрия**: каждый `tool_use`/`tool_result` потока — событие
+   `attempt_progress` (фаза, имя инструмента, длительность). Журнал отвечает
+   «что делается прямо сейчас» без ps и хвостов логов.
+6. **Смерть попытки** — три источника, без догадок по тексту ошибки: разобранный
+   `result.json`; его отсутствие; код выхода процесса. Таймаут — наш собственный
+   факт и потому проверяется первым (`failed(infra)`), результат до таймаута всё
+   равно попадает в `details`.
+7. **Вопрос из попытки**: `question` в `result.json` → `ask()` (единственный
+   канал) и дело в `wait_human`. Продолжение — резюмом сессии (`RESUME-OK`,
+   `docs/PROBES.md`): id сессии из события `result` хранится в
+   `attempt_ended.details.session_id`, следующая попытка идёт с `--resume`.
+   Выбор зафиксирован в `docs/RUNBOOK.md`.
+
+Чего модуль не делает: не считает состояние дела (это `journal.fold`), не
+назначает попытки (это `transit`), не проверяет evidence (следующий слой), не
+ходит в продовые системы и не пишет ни в чужую БД, ни в `kanban.db`.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import queue
+import shutil
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Any, Callable, Iterable, Optional
+
+# Модули плагина грузятся по пути и живут в `sys.modules` под общими именами:
+# вторая загрузка означала бы вторую копию схемы и констант в одном процессе.
+JOURNAL_MODULE_NAME = "hermes_duty_journal"
+DEALS_MODULE_NAME = "hermes_duty_deals"
+ASK_MODULE_NAME = "hermes_duty_ask"
+SPEC_MODULE_NAME = "hermes_duty_spec"
+
+
+def _load(name: str, filename: str) -> Any:
+    """`dashboard/<filename>` — тот же модуль, что грузит остальной плагин."""
+    loaded = sys.modules.get(name)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / filename
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise ImportError(f"module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+journal = _load(JOURNAL_MODULE_NAME, "journal.py")
+deals = _load(DEALS_MODULE_NAME, "deals.py")
+ask = _load(ASK_MODULE_NAME, "ask.py")
+spec_module = _load(SPEC_MODULE_NAME, "spec.py")
+
+# Источник событий движка в журнале: `engine`, а не `cli`/`api`/`ingest` — по нему
+# видно, что факт записал движок, а не человек и не проход по чужой доске.
+ENGINE_SOURCE = "engine"
+
+# TTL лизинга по умолчанию: `budget.minutes` в спеке не задан — 30 минут
+# (`docs/PROBES.md`: тривиальная попытка 3–6 с, значит запас огромный).
+DEFAULT_TTL_MIN = 30
+
+# Продление лизинга — не реже TTL/3: два пропущенных heartbeat'а и лизинг ещё жив.
+RENEW_DIVISOR = 3
+
+# Сколько ждать процесс после SIGTERM, прежде чем убить его SIGKILL.
+KILL_GRACE_SEC = 10
+
+# Сколько последних строк stderr попытки попадает в событие: хвост ошибки нужен,
+# а весь лог — нет (журнал не место для логов).
+STDERR_TAIL = 20
+
+# Исходы попытки в журнале (`attempt_ended.outcome`): различаются полем, а не
+# вторым видом события (`docs/JOURNAL.md`).
+OUTCOME_DONE = "done"
+OUTCOME_FAILED = "failed"
+
+# Классы отказа попытки (`attempt_ended.kind`): `infra` — упал сам процесс,
+# `contract` — исполнитель не отчитался, `capability` — упёрся в бюджет.
+FAIL_INFRA = "infra"
+FAIL_CONTRACT = "contract"
+FAIL_CAPABILITY = "capability"
+
+# Статусы `result.json`, которые считаются успехом: `status` не назван — тоже
+# успех (процесс дошёл до конца и отчитался).
+OK_STATUSES = ("done", "ok", "success", "passed", "accepted")
+
+# Статусы `result.json`, которые паркуют дело на человеке и на отказе контракта.
+BLOCKED_STATUSES = ("blocked", "needs_input", "wait_human")
+REFUSED_STATUSES = ("refused", "rejected")
+
+# Решение `transit`: запускать попытку. Остальные значения — не наш шаг.
+DECISION_RUN = "run"
+
+# Каталог попытки внутри дерева Hermes: разрешённый корень `role-access`
+# (`docs/PROBES.md`, проба 3). Менять его на `mktemp`/`~` нельзя — read-only роль
+# тогда не прочитает ни дерево, ни отчёт.
+WORKSPACES_SUBDIR = ("kanban", "boards")
+
+# Служебный каталог попытки рядом с деревом: контракт и отчёт.
+DUTY_SUBDIR = ".duty"
+
+# Сколько ждать `git worktree add`/`remove`: checkout большого репозитория — не
+# мгновенный, но и не бесконечный.
+WORKTREE_TIMEOUT_SEC = 300
+
+# Шаг опроса потока: короткий, чтобы heartbeat лизинга и таймаут срабатывали
+# вовремя, но без busy-loop.
+POLL_SEC = 0.2
+
+# Чем запускается попытка: тот же `hermes`, что и у человека в PATH.
+HERMES_BIN = shutil.which("hermes") or "hermes"
+
+
+class RunnerError(RuntimeError):
+    """Шаг не может быть выполнен по причине ниже движка: спека, каталог, лизинг.
+
+    Отдельный тип, потому что «этап не запускался» и «попытка упала» — разные
+    факты: первый не пишет событий вовсе, второй обязан быть в журнале.
+    """
+
+
+# ------------------------------------------------------------------- лизинг
+
+
+def ttl_sec(stage: Any) -> int:
+    """TTL лизинга этапа: `budget.minutes` или 30 минут по умолчанию."""
+    budget = getattr(stage, "budget", None)
+    minutes = getattr(budget, "minutes", None) if budget is not None else None
+    return int(minutes or DEFAULT_TTL_MIN) * 60
+
+
+def _take(
+    conn: sqlite3.Connection, deal_id: str, stage: str, attempt: int, pid: int, ttl: int, now: int
+) -> int:
+    """Строка лизинга атомарно: 1 — лизинг наш, 0 — этап уже за живым процессом.
+
+    Без собственной транзакции: вызывающий решает, чем этот факт закрывается
+    (в шаге движка — транзакцией вызывающего, в `lease()` — своей).
+    """
+    cursor = conn.execute(
+        "INSERT INTO leases (deal_id, stage, attempt, pid, taken_at, expires_at) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(deal_id, stage) DO UPDATE SET "
+        "attempt = excluded.attempt, pid = excluded.pid, taken_at = excluded.taken_at, "
+        "expires_at = excluded.expires_at "
+        "WHERE leases.expires_at <= ?",
+        (deal_id, stage, attempt, pid, now, now + ttl, now),
+    )
+    return int(cursor.rowcount)
+
+
+def lease(
+    conn: sqlite3.Connection,
+    *,
+    deal: Any,
+    stage: str,
+    attempt: int,
+    pid: int,
+    ttl: int,
+    now: Optional[int] = None,
+) -> bool:
+    """Взять лизинг этапа; `False` — этап ведёт кто-то живой.
+
+    Взятие — одна транзакция и одно условие в SQL: срок истёк или строки нет.
+    Проверка «прочитал, потом записал» здесь не годится — между чтением и
+    записью второй процесс успел бы взять тот же этап.
+    """
+    at = _now_sec(now)
+    with conn:
+        taken = _take(conn, str(deal["id"]), stage, int(attempt), int(pid), int(ttl), at)
+    return taken == 1
+
+
+def _hand_over(
+    conn: sqlite3.Connection,
+    deal_id: str,
+    stage: str,
+    from_pid: int,
+    pid: int,
+    attempt: int,
+    ttl: int,
+    now: int,
+) -> int:
+    """Передать лизинг процессу попытки: pid и срок; 1 — лизинг был наш."""
+    cursor = conn.execute(
+        "UPDATE leases SET pid = ?, attempt = ?, expires_at = ? "
+        "WHERE deal_id = ? AND stage = ? AND pid = ?",
+        (int(pid), int(attempt), now + int(ttl), deal_id, stage, int(from_pid)),
+    )
+    return int(cursor.rowcount)
+
+
+def hand_over(
+    conn: sqlite3.Connection,
+    *,
+    deal: Any,
+    stage: str,
+    from_pid: int,
+    pid: int,
+    attempt: int,
+    ttl: int,
+    now: Optional[int] = None,
+) -> bool:
+    """Лизинг, взятый движком, становится лизингом попытки (её pid и срок).
+
+    Взять лизинг до спавна нельзя иначе: pid появляется только вместе с
+    процессом, а взаимное исключение нужно **до** него. Две строки на это не
+    нужны — pid просто переезжает к тому, кто теперь ведёт этап.
+    """
+    at = _now_sec(now)
+    with conn:
+        moved = _hand_over(conn, str(deal["id"]), stage, int(from_pid), int(pid), int(attempt), int(ttl), at)
+    return moved == 1
+
+
+def renew(
+    conn: sqlite3.Connection, *, deal: Any, stage: str, pid: int, ttl: int, now: Optional[int] = None
+) -> bool:
+    """Продлить лизинг по heartbeat'у; `False` — этап уже не наш (не продлеваем)."""
+    at = _now_sec(now)
+    with conn:
+        cursor = conn.execute(
+            "UPDATE leases SET expires_at = ? WHERE deal_id = ? AND stage = ? AND pid = ?",
+            (at + int(ttl), str(deal["id"]), stage, int(pid)),
+        )
+    return int(cursor.rowcount) == 1
+
+
+def release(conn: sqlite3.Connection, *, deal: Any, stage: str, pid: int) -> bool:
+    """Отпустить лизинг своего этапа: строка удаляется, а не помечается.
+
+    Помеченная строка означала бы «срок ещё не истёк, но этап свободен», и
+    следующее взятие упёрлось бы в неё же. История лизинга — это события
+    попытки, а не строка в таблице.
+    """
+    with conn:
+        cursor = conn.execute(
+            "DELETE FROM leases WHERE deal_id = ? AND stage = ? AND pid = ?",
+            (str(deal["id"]), stage, int(pid)),
+        )
+    return int(cursor.rowcount) == 1
+
+
+def lease_of(conn: sqlite3.Connection, deal: Any, stage: str) -> Optional[dict[str, Any]]:
+    """Строка лизинга этапа или `None` — факт для консоли и тестов."""
+    row = conn.execute(
+        "SELECT deal_id, stage, attempt, pid, taken_at, expires_at FROM leases "
+        "WHERE deal_id = ? AND stage = ?",
+        (str(deal["id"]), stage),
+    ).fetchone()
+    return None if row is None else dict(row)
+
+
+# --------------------------------------------------------------------- пути
+
+
+def attempt_dir(home: Path, deal: Any, stage: str, attempt: int) -> Path:
+    """Каталог попытки: `<home>/kanban/boards/<board>/workspaces/<deal>-<stage>-<n>`.
+
+    Под `kanban/boards/**` — потому что это разрешённый корень чтения read-only
+    роли: каталог в `mktemp` или профильном `cache/scratch` роль не увидит, и
+    ревью окажется пустым не из-за отсутствия находок, а из-за отсутствия
+    доступа.
+    """
+    base = Path(home)
+    for part in WORKSPACES_SUBDIR:
+        base = base / part
+    return base / str(deal["board"]) / "workspaces" / f"{deal['id']}-{stage}-{int(attempt)}"
+
+
+def contract_path(workdir: Path, stage: str, attempt: int) -> Path:
+    """Файл входного контракта попытки."""
+    return Path(workdir) / DUTY_SUBDIR / f"in-{stage}-{int(attempt)}.json"
+
+
+def result_path(workdir: Path) -> Path:
+    """Файл отчёта попытки — то, что контракт называет `report_to`."""
+    return Path(workdir) / DUTY_SUBDIR / "result.json"
+
+
+def answer_path(workdir: Path, stage: str, attempt: int) -> Path:
+    """Файл запроса для резюма: ответ человека — единственный вход продолжения."""
+    return Path(workdir) / DUTY_SUBDIR / f"answer-{stage}-{int(attempt)}.txt"
+
+
+def _git(args: Iterable[str], cwd: Path) -> tuple[int, str]:
+    """`git` в каталоге `cwd`: код возврата и хвост stderr как причина отказа."""
+    try:
+        done = subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=WORKTREE_TIMEOUT_SEC,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, " ".join(str(exc).split())
+    return done.returncode, " ".join((done.stderr or done.stdout or "").split())
+
+
+# --------------------------------------------------------------------- дерево
+
+
+def prepare_tree(spec: Any, stage: Any, workdir: Path) -> tuple[Optional[Path], Path]:
+    """Дерево попытки по `workspace` этапа: (дерево или None, cwd процесса).
+
+    `worktree` — своё дерево от `spec.base` (валидатор уже проверил, что rev
+    существует); `dir` — каталог дела из `repo` спеки, без worktree; `none` —
+    дерева нет, cwd — сам каталог попытки.
+    """
+    workdir = Path(workdir)
+    if stage.workspace == "worktree":
+        repo = Path(str(spec.repo or "")).expanduser()
+        tree = workdir / "tree"
+        code, reason = _git(["worktree", "add", str(tree), str(spec.base or "")], repo)
+        if code != 0:
+            raise RunnerError(f"git worktree add {tree} от {spec.base!r} в {repo}: {reason or code}")
+        return tree, tree
+    if stage.workspace == "dir":
+        if spec.repo is None:
+            raise RunnerError(
+                f"этап {stage.id!r} просит workspace: dir, а repo в спеке не задан — каталога нет"
+            )
+        repo = Path(str(spec.repo)).expanduser()
+        if not repo.is_dir():
+            raise RunnerError(f"каталог дела {repo} не найден (workspace: dir этапа {stage.id!r})")
+        return None, repo
+    return None, workdir
+
+
+def remove_tree(spec: Any, stage: Any, workdir: Path) -> tuple[bool, str]:
+    """Убрать дерево упавшей попытки; `(убрано, причина)` — оба факта в событие.
+
+    Уборка — не гарантия, а попытка: `git worktree remove --force` может
+    отказать (занятый каталог, чужой лок). Тогда это видно причиной в событии, а
+    не молчанием и не выдуманным «убрано». Зовётся только для `workspace:
+    worktree`: у остальных видов дерева нет, и «убирать нечего» — не факт о
+    попытке.
+    """
+    tree = Path(workdir) / "tree"
+    if not tree.exists():
+        return False, f"дерева уже нет: {tree}"
+    repo = Path(str(spec.repo or "")).expanduser()
+    code, reason = _git(["worktree", "remove", "--force", str(tree)], repo)
+    if code != 0:
+        return False, f"git worktree remove отказал: {reason or code}"
+    return True, ""
+
+
+# ------------------------------------------------------- контракт и предыстория
+
+
+def previous_reports(
+    conn: sqlite3.Connection, deal: Any, spec: Any, stage_id: str
+) -> list[dict[str, Any]]:
+    """Отчёты предшественников из журнала: этап, артефакты, резюме, вердикт.
+
+    Собирается только по фактам: `attempt_ended` с результатом даёт `summary` и
+    `artifacts`, `collected`/`changes_requested` — вердикт. Порядок — объявление
+    этапов в спеке, чтобы файл контракта не зависел от порядка событий.
+    """
+    results: dict[str, dict[str, Any]] = {}
+    verdicts: dict[str, str] = {}
+    for event in journal.read_events(conn, str(deal["id"])):
+        payload = journal.payload_of(event)
+        stage = payload.get("stage")
+        if not isinstance(stage, str) or not stage:
+            continue
+        kind = str(event.get("kind") or "")
+        if kind == "attempt_ended":
+            result = payload.get("result")
+            if isinstance(result, dict):
+                results[stage] = result
+        elif kind in ("collected", "changes_requested"):
+            verdicts[stage] = "approve" if kind == "collected" else "changes"
+    out: list[dict[str, Any]] = []
+    for stage in getattr(spec, "stages", ()):
+        if stage.id == stage_id or (stage.id not in results and stage.id not in verdicts):
+            continue
+        result = results.get(stage.id) or {}
+        artifacts = result.get("artifacts")
+        out.append(
+            {
+                "stage": stage.id,
+                "artifacts": artifacts if isinstance(artifacts, list) else [],
+                "summary": str(result.get("summary") or ""),
+                "verdict": verdicts.get(stage.id),
+            }
+        )
+    return out
+
+
+def last_session(conn: sqlite3.Connection, deal: Any, stage_id: str) -> str:
+    """`session_id` последней попытки этапа — точка возврата для резюма.
+
+    Проба 1 (`docs/PROBES.md`) дала `RESUME-OK`: id из события `result` держит
+    контекст и после `clarify`, поэтому продолжение после ответа человека идёт
+    `--resume`, а не новым процессом с прозой в запросе.
+    """
+    for event in reversed(journal.read_events(conn, str(deal["id"]))):
+        payload = journal.payload_of(event)
+        if payload.get("stage") != stage_id:
+            continue
+        kind = str(event.get("kind") or "")
+        if kind == "attempt_ended":
+            details = payload.get("details")
+            session = ""
+            if isinstance(details, dict):
+                session = str(details.get("session_id") or "")
+            if not session:
+                result = payload.get("result")
+                if isinstance(result, dict):
+                    session = str(result.get("session_id") or "")
+            return session
+        if kind == "attempt_started":
+            return str(payload.get("session_id") or "")
+    return ""
+
+
+def build_contract(
+    spec: Any,
+    deal: Any,
+    stage: Any,
+    attempt: int,
+    *,
+    workdir: Path,
+    tree: Optional[Path],
+    cwd: Path,
+    previous: list[dict[str, Any]],
+    deadline_sec: int,
+    answer: Optional[str] = None,
+    session_id: str = "",
+) -> dict[str, Any]:
+    """Входной контракт попытки: файл, а не проза в командной строке.
+
+    Состав — то, что попытке нужно знать и не нужно додумывать: цель (дело),
+    границы (куда можно писать и куда отчитываться), отчёты предшественников
+    (артефакты и вердикты из журнала), что доказать (`evidence`), кому задавать
+    фактовые вопросы (`ask`) и куда положить отчёт. `answer_this_attempt`
+    появляется только у попытки, поднятой после ответа человека.
+    """
+    report_to = result_path(workdir)
+    boundaries = [
+        "дерева нет: этап только читает и выносит приговор"
+        if stage.workspace == "none"
+        else f"рабочий каталог попытки: {cwd} — писать только в него",
+        f"отчёт — файл {report_to}; вопрос — полем question в нём "
+        "(clarify в режиме --oneshot ответа не получает)",
+    ]
+    evidence: list[dict[str, Any]] = []
+    for item in getattr(stage, "evidence", ()):
+        command: dict[str, Any] = {"cmd": item.cmd, "must": item.must}
+        if item.timeout_sec != spec_module.DEFAULT_TIMEOUT_SEC:
+            command["timeout_sec"] = item.timeout_sec
+        evidence.append(command)
+    stage_ask = getattr(stage, "ask", None)
+    questions = {
+        "allowed": list(stage_ask.allowed) if stage_ask is not None else [],
+        "to_human": stage_ask.to_human if stage_ask is not None else "decisions_only",
+        "max_hops": stage_ask.max_hops if stage_ask is not None else 0,
+    }
+    goal = str(deal.get("title") or "").strip()
+    body = str(deal.get("body") or "").strip()
+    if body:
+        goal = f"{goal}\n\n{body}" if goal else body
+    contract: dict[str, Any] = {
+        "deal": str(deal["id"]),
+        "stage": stage.id,
+        "attempt": int(attempt),
+        "role": stage.role,
+        "workdir": str(workdir),
+        "tree": str(tree) if tree is not None else None,
+        "goal": goal,
+        "boundaries": boundaries,
+        "previous": previous,
+        "evidence_to_produce": evidence,
+        "questions": questions,
+    }
+    if answer is not None:
+        contract["answer_this_attempt"] = answer
+    if session_id:
+        contract["session_id"] = session_id
+    contract["report_to"] = str(report_to)
+    contract["deadline_sec"] = int(deadline_sec)
+    return contract
+
+
+def write_contract(path: Path, contract: dict[str, Any]) -> Path:
+    """Записать контракт на диск до спавна: процесс читает файл, а не аргументы."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(contract, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def write_answer(path: Path, answer: str, contract: Path) -> Path:
+    """Запрос продолжения: ответ человека плюс адрес контракта и отчёта.
+
+    `--query-file` не экранирует ничего, поэтому ответ попадает в процесс
+    дословно (`docs/PROBES.md`, проба 1) — кавычки и `$(...)` в нём безопасны.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = (
+        f"Ответ человека на вопрос прошлой попытки:\n{answer}\n\n"
+        f"Контракт попытки: {contract}\n"
+        f"Отчёт: {result_path(path.parent.parent)}\n"
+    )
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def spawn_command(role: str, query_file: Path, session_id: str = "") -> list[str]:
+    """Команда спавна: ровно те ключи, что сверены с `hermes chat --help` и пробой.
+
+    `--format stream-json` подразумевает `--quiet` и одиночный запрос; `-p` —
+    профиль роли из спеки, права не расширяются. `--resume` появляется только у
+    продолжения (после ответа человека).
+    """
+    command = [HERMES_BIN, "chat", "-p", str(role)]
+    if session_id:
+        command.extend(["--resume", str(session_id)])
+    command.extend(["--query-file", str(query_file), "--format", "stream-json", "--oneshot"])
+    return command
+
+
+# -------------------------------------------------------------------- процесс
+
+
+class Process:
+    """Запущенный процесс попытки: строки потока, код выхода, остановка.
+
+    Поток читается отдельным потоком в очередь: иначе `for line in stdout`
+    заблокировал бы heartbeat лизинга и таймаут до самого конца процесса, и
+    «что делает прямо сейчас» снова стало бы невидимым.
+    """
+
+    def __init__(self, cmd: list[str], cwd: Path, env: Optional[dict[str, str]] = None) -> None:
+        self.cmd = list(cmd)
+        self._queue: "queue.Queue[Optional[str]]" = queue.Queue()
+        self._stderr: list[str] = []
+        self._eof = False
+        self._proc = subprocess.Popen(
+            self.cmd,
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+        self._out = threading.Thread(target=self._read_stdout, daemon=True)
+        self._err = threading.Thread(target=self._read_stderr, daemon=True)
+        self._out.start()
+        self._err.start()
+
+    @property
+    def pid(self) -> int:
+        return int(self._proc.pid)
+
+    @property
+    def exit_code(self) -> Optional[int]:
+        return self._proc.returncode
+
+    @property
+    def stderr_tail(self) -> list[str]:
+        return list(self._stderr)
+
+    def _read_stdout(self) -> None:
+        try:
+            for line in self._proc.stdout or ():
+                self._queue.put(line)
+        finally:
+            self._queue.put(None)
+
+    def _read_stderr(self) -> None:
+        for line in self._proc.stderr or ():
+            text = line.rstrip("\n")
+            if not text:
+                continue
+            self._stderr.append(text)
+            del self._stderr[:-STDERR_TAIL]
+
+    @property
+    def stderr_text(self) -> str:
+        """Хвост stderr (последние `STDERR_TAIL` строк): пишется файлом, не в журнал."""
+        return "\n".join(self._stderr)
+
+    def next_line(self, timeout: float = 0.0) -> Optional[str]:
+        """Следующая строка потока; `None` — строки пока нет или поток закрыт."""
+        if self._eof and self._queue.empty():
+            return None
+        try:
+            item = self._queue.get(timeout=timeout) if timeout > 0 else self._queue.get_nowait()
+        except queue.Empty:
+            return None
+        if item is None:
+            self._eof = True
+            return None
+        return item
+
+    def finished(self) -> bool:
+        """Процесс завершился и потока больше нет: читать нечего."""
+        return self._proc.poll() is not None and self._eof
+
+    def wait(self, timeout: Optional[float] = None) -> Optional[int]:
+        """Код возврата или `None`, если за отведённое время процесс не вышел."""
+        try:
+            return self._proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return None
+
+    def stop(self, grace: float = KILL_GRACE_SEC) -> Optional[int]:
+        """Остановить попытку: SIGTERM, затем SIGKILL через `grace` секунд."""
+        if self._proc.poll() is not None:
+            return self._proc.returncode
+        try:
+            self._proc.terminate()
+        except ProcessLookupError:  # pragma: no cover - вышел между poll и terminate
+            pass
+        code = self.wait(grace)
+        if code is None:
+            try:
+                self._proc.kill()
+            except ProcessLookupError:  # pragma: no cover - вышел между wait и kill
+                pass
+            code = self.wait(grace)
+        return code
+
+
+def spawn_process(cmd: list[str], cwd: Path, env: Optional[dict[str, str]] = None) -> Process:
+    """Запустить попытку. Единственный шов: тесты подменяют его фейком.
+
+    Ни один тест движка не поднимает модель: подмена пишет заданный поток и
+    `result.json`, а шаг проходит те же ветки, что и с живым процессом.
+    """
+    return Process(cmd, cwd, env=env)
+
+
+# ------------------------------------------------------------ поток и события
+
+
+def _now_sec(now: Optional[int] = None) -> int:
+    """Текущее время в unix-секундах — как все `*_at` журнала и store."""
+    return int(time.time()) if now is None else int(now)
+
+
+def _int(value: Any) -> Optional[int]:
+    """Целое из потока или `None`: `true`/строка без цифр целым не считаются."""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _event(
+    deal: Any, kind: str, payload: dict[str, Any], args: dict[str, Any], now: int
+) -> dict[str, Any]:
+    """Событие движка: тот же ключ идемпотентности, что у остальных мутаций."""
+    return {
+        "ts": now,
+        "recorded_at": now,
+        "deal_id": str(deal["id"]),
+        "board": str(deal["board"]),
+        "kind": kind,
+        "payload": payload,
+        "source": ENGINE_SOURCE,
+        "idempotency_key": deals.event_key(ENGINE_SOURCE, str(deal["id"]), kind, args),
+    }
+
+
+def _progress_event(
+    deal: Any, stage: str, attempt: int, seq: int, data: dict[str, Any], now: int
+) -> dict[str, Any]:
+    """Событие телеметрии по одному шагу попытки: инструмент и его результат.
+
+    В payload нет ни текста команд, ни содержимого файлов: журнал отвечает «что
+    делается», а не заменяет лог. Длительность есть только у результата — у
+    вызова её в потоке нет, и выдумывать ноль нельзя.
+    """
+    phase = "tool_use" if str(data.get("type")) == "tool_use" else "tool_result"
+    payload: dict[str, Any] = {
+        "stage": stage,
+        "attempt": int(attempt),
+        "seq": int(seq),
+        "phase": phase,
+        "name": str(data.get("name") or ""),
+        "ts": now,
+    }
+    if phase == "tool_result":
+        duration = _int(data.get("duration_ms"))
+        if duration is not None:
+            payload["duration_ms"] = duration
+    return _event(
+        deal,
+        "attempt_progress",
+        payload,
+        {"stage": stage, "attempt": int(attempt), "seq": int(seq), "phase": phase},
+        now,
+    )
+
+
+def _stream_line(line: str) -> Optional[dict[str, Any]]:
+    """Строка потока объектом; не JSON или не объект — не факт, а мусор."""
+    try:
+        data = json.loads(line)
+    except (TypeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+class Followed:
+    """Что дал поток: таймаут, бюджет, usage, id сессии, сколько шагов увидено."""
+
+    def __init__(self) -> None:
+        self.timed_out = False
+        self.over_budget = False
+        self.usage = 0
+        self.session_id = ""
+        self.tools = 0
+
+    def __repr__(self) -> str:  # pragma: no cover - для отладки руками
+        return (
+            f"Followed(timed_out={self.timed_out}, over_budget={self.over_budget}, "
+            f"usage={self.usage}, tools={self.tools}, session_id={self.session_id!r})"
+        )
+
+
+def follow(
+    conn: sqlite3.Connection,
+    process: Any,
+    *,
+    deal: Any,
+    stage: Any,
+    attempt: int,
+    ttl: int,
+    deadline: float,
+    budget_tokens: Optional[int],
+    monotonic: Callable[[], float],
+    clock: Callable[[], float],
+) -> Followed:
+    """Читать поток до конца, писать телеметрию, держать лизинг и бюджет.
+
+    Три вещи делаются по ходу, а не после: heartbeat лизинга (не реже TTL/3),
+    проверка бюджета токенов по `usage` из `result` и таймаут. Иначе «процесс
+    идёт» и «процесс висит» отличались бы только по ps.
+    """
+    state = Followed()
+    seq = 0
+    last_renew = monotonic()
+    renew_every = max(float(ttl) / RENEW_DIVISOR, POLL_SEC)
+    pid = int(process.pid)
+
+    def handle(line: str) -> None:
+        nonlocal seq
+        data = _stream_line(line)
+        if data is None:
+            return
+        kind = str(data.get("type") or "")
+        if kind in ("tool_use", "tool_result"):
+            seq += 1
+            if kind == "tool_use":
+                state.tools += 1
+            journal.append(conn, [_progress_event(deal, stage.id, attempt, seq, data, _now_sec(int(clock())))])
+            return
+        if kind != "result":
+            return
+        session = data.get("session_id")
+        if isinstance(session, str) and session:
+            state.session_id = session
+        tokens = data.get("tokens")
+        total = _int(tokens.get("total")) if isinstance(tokens, dict) else None
+        if total is not None:
+            state.usage += total
+            if budget_tokens is not None and state.usage > int(budget_tokens):
+                state.over_budget = True
+
+    while True:
+        if monotonic() - last_renew >= renew_every:
+            renew(
+                conn,
+                deal=deal,
+                stage=stage.id,
+                pid=pid,
+                ttl=ttl,
+                now=_now_sec(int(clock())),
+            )
+            last_renew = monotonic()
+        line = process.next_line(POLL_SEC)
+        if line is None:
+            if state.over_budget:
+                process.stop()
+                break
+            if process.finished():
+                break
+            if monotonic() >= deadline:
+                state.timed_out = True
+                process.stop()
+                break
+            continue
+        handle(line)
+        if state.over_budget:
+            process.stop()
+            break
+
+    # Хвост очереди: процесс мог выйти, оставив строки в буфере. Без этого
+    # последний `result` (а с ним id сессии и usage) терялся бы ровно на выходе.
+    while True:
+        line = process.next_line(0)
+        if line is None:
+            break
+        handle(line)
+    return state
+
+
+def write_stderr(workdir: Path, text: str) -> Optional[Path]:
+    """Хвост stderr попытки — файлом рядом с отчётом.
+
+    В журнал он не идёт: «журнал не место для логов», и причина смерти попытки
+    считается по трём источникам (отчёт, его отсутствие, код выхода), а не по
+    тексту ошибки. Файл нужен человеку, который разбирает отказ, и путь на него
+    попадает в событие.
+    """
+    if not text.strip():
+        return None
+    path = Path(workdir) / DUTY_SUBDIR / "stderr.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text + "\n", encoding="utf-8")
+    return path
+
+
+def read_result(path: Path) -> tuple[Optional[dict[str, Any]], str]:
+    """`result.json` объектом или причина, почему его нет: отчёт — один источник.
+
+    Битый файл — не «нет файла»: причина называется словами, чтобы в событии не
+    было молчания вместо факта.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return None, f"result.json нет: {path}"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        return None, f"result.json не читается: {exc}"
+    except (TypeError, ValueError) as exc:
+        return None, f"result.json не разбирается: {exc}"
+    if not isinstance(data, dict):
+        return None, f"result.json не объект: {type(data).__name__}"
+    return data, ""
+
+
+def classify(
+    *,
+    result: Optional[dict[str, Any]],
+    result_error: str,
+    exit_code: Optional[int],
+    followed: Followed,
+    timeout_sec: int,
+) -> tuple[str, str, str]:
+    """Чем кончилась попытка: `(outcome, kind, reason)` — по трём источникам.
+
+    Порядок источников — не догадка, а их природа: таймаут и бюджет — наши
+    собственные факты (их проверили мы), дальше отчёт исполнителя, и только
+    потом код выхода. Текст ошибки в stderr причиной не считается: процесс может
+    ругаться и при успехе, а может умереть молча.
+    """
+    if followed.timed_out:
+        return (
+            OUTCOME_FAILED,
+            FAIL_INFRA,
+            f"таймаут попытки: процесс не уложился в бюджет времени ({timeout_sec} с)",
+        )
+    if followed.over_budget:
+        return OUTCOME_FAILED, FAIL_CAPABILITY, "бюджет токенов попытки исчерпан"
+    if result is not None:
+        status = str(result.get("status") or "done").strip().lower()
+        if status in BLOCKED_STATUSES:
+            return OUTCOME_DONE, "", f"попытка отчиталась статусом {status}: ждёт человека"
+        if status in REFUSED_STATUSES:
+            return OUTCOME_FAILED, FAIL_CONTRACT, f"исполнитель отказался: status={status}"
+        return OUTCOME_DONE, "", ""
+    if exit_code not in (0, None):
+        return OUTCOME_FAILED, FAIL_INFRA, f"процесс упал сам: код выхода {exit_code}"
+    return OUTCOME_FAILED, FAIL_CONTRACT, result_error or "исполнитель не отчитался: result.json нет"
+
+
+# ---------------------------------------------------------------------- шаг
+
+
+def run_stage(
+    conn: sqlite3.Connection,
+    spec: Any,
+    deal: Any,
+    stage_id: str,
+    attempt: int,
+    *,
+    home: Path,
+    answer: Optional[str] = None,
+    spawn: Optional[Callable[..., Any]] = None,
+    clock: Optional[Callable[[], float]] = None,
+    monotonic: Optional[Callable[[], float]] = None,
+) -> dict[str, Any]:
+    """Одна попытка этапа: лизинг, дерево, контракт, процесс, факты в журнал.
+
+    Возвращает отчёт о шаге: `started` (попытка действительно пошла),
+    `outcome`/`kind`/`reason` — как в событии, `question_id` — если попытка
+    задала вопрос, `workdir`/`tree` — где она работала.
+
+    `answer` — ответ человека на вопрос прошлой попытки: с ним процесс
+    продолжается резюмом (`RESUME-OK`), без него начинается новая сессия.
+    """
+    spawner = spawn or spawn_process
+    clock = clock or time.time
+    monotonic = monotonic or time.monotonic
+    stage = next((item for item in spec.stages if item.id == stage_id), None)
+    if stage is None:
+        raise RunnerError(f"этапа {stage_id!r} нет в спеке {getattr(spec, 'path', '')}")
+    attempt = int(attempt)
+    if attempt < 1:
+        raise RunnerError(f"номер попытки {attempt}: попытки считаются с 1")
+    ttl = ttl_sec(stage)
+    deadline_sec = ttl
+    engine_pid = os.getpid()
+    workdir = attempt_dir(home, deal, stage_id, attempt)
+    run_id = f"{stage_id}#{attempt}"
+
+    held_at = _now_sec(int(clock()))
+    if not lease(
+        conn, deal=deal, stage=stage_id, attempt=attempt, pid=engine_pid, ttl=ttl, now=held_at
+    ):
+        held = lease_of(conn, deal, stage_id) or {}
+        return {
+            "started": False,
+            "stage": stage_id,
+            "attempt": attempt,
+            "reason": f"этап уже за процессом pid={held.get('pid')}, срок до {held.get('expires_at')}",
+        }
+
+    try:
+        workdir.mkdir(parents=True, exist_ok=True)
+        tree, cwd = prepare_tree(spec, stage, workdir)
+    except (RunnerError, OSError) as exc:
+        release(conn, deal=deal, stage=stage_id, pid=engine_pid)
+        now = _now_sec(int(clock()))
+        event = _event(
+            deal,
+            "attempt_ended",
+            {
+                "run_id": run_id,
+                "stage": stage_id,
+                "attempt": attempt,
+                "outcome": OUTCOME_FAILED,
+                "kind": FAIL_INFRA,
+                "reason": str(exc),
+                "details": {"workdir": str(workdir), "tree": None},
+            },
+            {"stage": stage_id, "attempt": attempt, "outcome": OUTCOME_FAILED},
+            now,
+        )
+        journal.append(conn, [event])
+        return {
+            "started": True,
+            "stage": stage_id,
+            "attempt": attempt,
+            "outcome": OUTCOME_FAILED,
+            "kind": FAIL_INFRA,
+            "reason": str(exc),
+            "workdir": str(workdir),
+            "tree": None,
+        }
+
+    previous = previous_reports(conn, deal, spec, stage_id)
+    session_id = last_session(conn, deal, stage_id) if answer is not None else ""
+    contract = build_contract(
+        spec,
+        deal,
+        stage,
+        attempt,
+        workdir=workdir,
+        tree=tree,
+        cwd=cwd,
+        previous=previous,
+        deadline_sec=deadline_sec,
+        answer=answer,
+        session_id=session_id,
+    )
+    contract_file = write_contract(contract_path(workdir, stage_id, attempt), contract)
+    query_file = contract_file
+    if session_id:
+        # Продолжение: вход — ответ человека, а не второй контракт. Контракт уже
+        # записан и назван здесь же, чтобы попытка могла перечитать его целиком.
+        query_file = write_answer(answer_path(workdir, stage_id, attempt), answer or "", contract_file)
+
+    result_file = result_path(workdir)
+    if result_file.exists():
+        # Свой отчёт пишет только эта попытка: остаток прошлой (при совпавшем
+        # номере) читался бы как её отчёт.
+        result_file.unlink()
+    command = spawn_command(stage.role, query_file, session_id)
+    now = _now_sec(int(clock()))
+    try:
+        process = spawner(command, cwd)
+    except OSError as exc:
+        # Процесс не поднялся: лизинг отпускаем, дерево убираем — иначе
+        # следующая попытка упрётся в чужой каталог, которого никто не занимает.
+        release(conn, deal=deal, stage=stage_id, pid=engine_pid)
+        if stage.workspace == "worktree":
+            remove_tree(spec, stage, workdir)
+        raise RunnerError(f"спавн попытки не удался: {exc}") from exc
+
+    pid = int(process.pid)
+    started = _event(
+        deal,
+        "attempt_started",
+        {
+            "run_id": run_id,
+            "stage": stage_id,
+            "attempt": attempt,
+            "pid": pid,
+            "cmd": command,
+            "cwd": str(cwd),
+            "workdir": str(workdir),
+            "tree": str(tree) if tree is not None else None,
+            "lease_expires": now + ttl,
+            "contract_path": str(contract_file),
+            "contract": contract,
+            "session_id": session_id or None,
+        },
+        {"stage": stage_id, "attempt": attempt},
+        now,
+    )
+    try:
+        # Одна транзакция: лизинг переезжает к процессу, дело становится
+        # `running`, событие ложится рядом. Сбой записи откатывает всё — тогда
+        # процесс останавливается, а лизинг возвращается движку.
+        # `deals._set_status` — та же запись строки, что у мутаций store: вторая
+        # реализация «status + updated_at» разошлась бы с первой.
+        with conn:
+            written = journal.append_in_tx(conn, [started])
+            _hand_over(conn, str(deal["id"]), stage_id, engine_pid, pid, attempt, ttl, now)
+            if written:
+                deals._set_status(conn, deal, "running", now)
+    except sqlite3.Error:
+        process.stop()
+        if not release(conn, deal=deal, stage=stage_id, pid=pid):
+            release(conn, deal=deal, stage=stage_id, pid=engine_pid)
+        raise
+
+    budget_tokens = getattr(getattr(stage, "budget", None), "tokens", None)
+    try:
+        followed = follow(
+            conn,
+            process,
+            deal=deal,
+            stage=stage,
+            attempt=attempt,
+            ttl=ttl,
+            deadline=monotonic() + deadline_sec,
+            budget_tokens=budget_tokens,
+            monotonic=monotonic,
+            clock=clock,
+        )
+    except sqlite3.Error:
+        # Журнал не пишется — попытку не бросаем без присмотра: процесс гасим,
+        # лизинг отпускаем, отказ идёт вызывающему. Иначе «шаг упал» оставил бы
+        # живой процесс и занятый этап.
+        process.stop()
+        release(conn, deal=deal, stage=stage_id, pid=pid)
+        raise
+    exit_code = process.exit_code if process.exit_code is not None else process.wait(KILL_GRACE_SEC)
+    result, result_error = read_result(result_file)
+    outcome, kind, reason = classify(
+        result=result,
+        result_error=result_error,
+        exit_code=exit_code,
+        followed=followed,
+        timeout_sec=deadline_sec,
+    )
+    status = str((result or {}).get("status") or "").strip().lower()
+    parked = outcome == OUTCOME_DONE and status in BLOCKED_STATUSES
+    stderr_file = write_stderr(workdir, process.stderr_text)
+
+    cleaned = False
+    cleanup = ""
+    if outcome != OUTCOME_DONE and stage.workspace == "worktree":
+        cleaned, cleanup = remove_tree(spec, stage, workdir)
+
+    now = _now_sec(int(clock()))
+    payload: dict[str, Any] = {
+        "run_id": run_id,
+        "stage": stage_id,
+        "attempt": attempt,
+        "outcome": outcome,
+        "kind": kind or None,
+        "reason": reason,
+        "details": {
+            "exit_code": exit_code,
+            "session_id": followed.session_id or session_id or None,
+            "usage_tokens": followed.usage or None,
+            "tools": followed.tools,
+            "timed_out": followed.timed_out,
+            "over_budget": followed.over_budget,
+            "workdir": str(workdir),
+            "tree": str(tree) if tree is not None else None,
+            "cleaned": cleaned,
+            "cleanup": cleanup or None,
+            "stderr_path": str(stderr_file) if stderr_file is not None else None,
+        },
+    }
+    if result is not None:
+        payload["result"] = result
+    ended = _event(
+        deal,
+        "attempt_ended",
+        payload,
+        {"stage": stage_id, "attempt": attempt, "outcome": outcome},
+        now,
+    )
+    with conn:
+        journal.append_in_tx(conn, [ended])
+        conn.execute(
+            "DELETE FROM leases WHERE deal_id = ? AND stage = ? AND pid = ?",
+            (str(deal["id"]), stage_id, pid),
+        )
+
+    question_id = None
+    if parked:
+        question_id = _parked(conn, deal, stage, attempt, result or {}, home, clock)
+
+    return {
+        "started": True,
+        "stage": stage_id,
+        "attempt": attempt,
+        "outcome": outcome,
+        "kind": kind or None,
+        "reason": reason,
+        "run_id": run_id,
+        "workdir": str(workdir),
+        "tree": str(tree) if tree is not None else None,
+        "session_id": followed.session_id or session_id or "",
+        "usage_tokens": followed.usage,
+        "tools": followed.tools,
+        "question_id": question_id,
+    }
+
+
+def _parked(
+    conn: sqlite3.Connection,
+    deal: Any,
+    stage: Any,
+    attempt: int,
+    result: dict[str, Any],
+    home: Path,
+    clock: Callable[[], float],
+) -> Optional[int]:
+    """Попытка задала вопрос: единственный канал `ask()` и дело в `wait_human`.
+
+    `clarify` внутри `--oneshot` ответа не получает (`undelivered`,
+    `docs/PROBES.md`), поэтому вопрос задаёт движок, а не процесс; текст вопроса
+    приходит в `result.json` полем `question`.
+    """
+    question = result.get("question")
+    if isinstance(question, str):
+        question = {"text": question}
+    text = ""
+    options: list[str] = []
+    if isinstance(question, dict):
+        text = str(question.get("text") or question.get("q") or "").strip()
+        raw_options = question.get("options")
+        if isinstance(raw_options, list):
+            options = [str(item) for item in raw_options]
+    if not text:
+        text = str(result.get("summary") or "").strip()
+    if not text:
+        text = f"попытка {stage.id}#{attempt} просит решения: текста вопроса в отчёте нет"
+    asked = ask.ask(
+        conn,
+        {**deal, "home": Path(home)},
+        text,
+        question.get("text_full") if isinstance(question, dict) else None,
+        options or None,
+    )
+    deals.set_blocked(
+        conn,
+        str(deal["id"]),
+        kind="needs_input",
+        reason=f"попытка {stage.id}#{attempt}: вопрос #{asked.question_id} без ответа",
+        author=ENGINE_SOURCE,
+        source=ENGINE_SOURCE,
+        now=_now_sec(int(clock())),
+    )
+    return int(asked.question_id)
+
+
+def step(
+    conn: sqlite3.Connection,
+    spec: Any,
+    deal: Any,
+    decision: Any,
+    *,
+    home: Path,
+    answer: Optional[str] = None,
+    spawn: Optional[Callable[..., Any]] = None,
+    clock: Optional[Callable[[], float]] = None,
+    monotonic: Optional[Callable[[], float]] = None,
+) -> dict[str, Any]:
+    """Исполнить решение `transit`: запустить те попытки, которые оно назвало.
+
+    Не `run` — делать нечего: ждать факта, закрыть дело или припарковать вопрос
+    решает не этот слой, и выдумывать здесь шаг нельзя. `answer` относится к
+    продолжению после вопроса и передаётся в каждую попытку этого шага.
+    """
+    kind = str(getattr(decision, "kind", "") or "")
+    if kind != DECISION_RUN:
+        return {"started": 0, "skipped": f"решение {kind or '—'} не запускает попыток", "runs": []}
+    runs: list[dict[str, Any]] = []
+    for stage_id, attempt in getattr(decision, "pair", []) or []:
+        runs.append(
+            run_stage(
+                conn,
+                spec,
+                deal,
+                str(stage_id),
+                int(attempt),
+                home=home,
+                answer=answer,
+                spawn=spawn,
+                clock=clock,
+                monotonic=monotonic,
+            )
+        )
+    return {"started": sum(1 for run in runs if run.get("started")), "runs": runs}

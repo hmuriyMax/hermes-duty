@@ -267,8 +267,15 @@ PY
 
 ```bash
 cd ~/.hermes/plugins/hermes-duty
-~/.hermes/hermes-agent/venv/bin/python -m pytest -q      # 220 passed
+~/.hermes/hermes-agent/venv/bin/python -m pytest -q              # все кейсы, live пропущен
+~/.hermes/hermes-agent/venv/bin/python -m pytest -m live -q     # живой прогон попытки
 ```
+
+Живой прогон движка — `tests/test_runner.py::test_live_trivial_stage`: поднимает
+настоящий `hermes chat` под профилем `tester` (`workspace: none`, бюджет 2 мин) и
+проверяет связку «движок → процесс → поток → событие». Маркер `live` объявлен в
+`tests/conftest.py` и без `-m live` такие тесты пропускаются: обычный прогон
+модель не вызывает.
 
 Новые кейсы 0.0.2 — `tests/test_screens.py`: `/deal` (активное дело, завершённое
 дело без выдуманного состояния, 404, обрезка `body`), `/stats` (первая попытка,
@@ -300,6 +307,14 @@ pid), повторный ingest → `0` новых строк и тот же `fo
   проверяет файл как CommonJS и висячую запятую перед `}` пропускает — так в 0.0.3
   десктопный плагин на день выпал из приложения. Красная проба: вернуть запятую — тест
   падает.
+
+Кейсы движка 0.0.4 — `tests/test_runner.py` (32 кейса, модель не вызывается: спавн
+подменён фейком, который пишет заданный поток и `result.json`): лизинг не берётся
+дважды и забирается после срока, worktree создаётся живым git и убирается у упавшей
+попытки, контракт несёт отчёты предшественников и `answer_this_attempt`, таймаут →
+`infra`, отсутствие отчёта → `contract`, `blocked` → вопрос в пуле и `wait_human`,
+телеметрия по каждому `tool_use`, сбой store откатывает `attempt_started` целиком.
+Спека — `tests/test_spec.py` (61 кейс, по тесту на правило отказа).
 
 `python3 -m pytest` из системы падает с `No module named pytest` — это окружение,
 а не плагин: нужен venv, где `fastapi` и `pytest` стоят.
@@ -371,7 +386,59 @@ curl -s http://127.0.0.1:18742/api/plugins/hermes-duty/sources \
 камень `archived`), а не править плагин: `_archived/` — это то, как ядро хранит
 историю, и P0 не переписывает чужие статусы.
 
-## 10. Что делать не нужно
+## 10. Движок: один шаг попытки (`dashboard/runner.py`)
+
+Шаг движка действует: берёт лизинг этапа, готовит дерево, пишет контракт файлом,
+поднимает процесс роли, читает поток и пишет факты в журнал. Модель внутри
+движка не вызывается; исполнитель — процесс `hermes chat`.
+
+Что где лежит и куда смотреть:
+
+- **каталог попытки** — `~/.hermes/kanban/boards/<board>/workspaces/<deal>-<stage>-<n>`
+  (разрешённый корень `role-access`, `docs/PROBES.md` проба 3). Внутри:
+  `.duty/in-<stage>-<n>.json` — входной контракт (цель, границы, отчёты
+  предшественников, evidence, адрес вопросов), `.duty/result.json` — отчёт
+  попытки, `tree/` — дерево `git worktree`, если этап его просил;
+- **лизинг** — строка в таблице `leases` своей `duty/duty.db` (одна на пару
+  «дело, этап»). Взятие атомарно, продление — не реже TTL/3, TTL —
+  `budget.minutes` или 30 минут. Смотреть: `SELECT * FROM leases`;
+- **факты в журнале**: `attempt_started` (pid, фактическая команда, весь контракт),
+  `attempt_progress` (по каждому `tool_use`/`tool_result`), `attempt_ended`
+  (`outcome`, `kind`, `reason`, `details`, `result`).
+
+Почему в журнале видно «что делается прямо сейчас»: прогресс пишется по ходу
+потока, а `fold` копит его счётчиком `progress: {tools, last_tool, last_at}`.
+`ps` и хвосты логов для этого не нужны.
+
+### Продолжение после вопроса: выбран резюм (`RESUME-OK`)
+
+Проба 1 (`docs/PROBES.md`) дала `RESUME-OK`: id сессии из события `result` держит
+контекст на трёх продолжениях подряд и после `clarify`. Поэтому выбор один:
+
+- вопрос задаёт **движок** (`ask()`), а не процесс: `clarify` внутри `--oneshot`
+  возвращает `undelivered` и не паркует процесс;
+- ответ человека возвращается **резюмом той же сессии**: следующая попытка идёт
+  `hermes chat -p <role> --resume <session_id> --query-file <ответ>
+  --format stream-json --oneshot`, а `session_id` берётся из
+  `attempt_ended.details.session_id`;
+- новый процесс «с ответом в контракте» остаётся запасным вариантом на случай
+  `RESUME-BROKEN`; сейчас он не используется.
+
+Цена резюма названа там же: +8 тыс. input-токенов на ход и риск, что продолжение
+уйдёт гулять по инструментам — поэтому в отчёте попытки видно `usage_tokens`.
+
+### Красные пробы к слою
+
+- убрать `WHERE leases.expires_at <= now` из взятия лизинга — падают
+  `test_lease_taken_only_once` и `test_busy_stage_is_not_started_again`;
+- вернуть в `fold` учёт `attempt_progress` как state-changing — падает
+  `test_attempt_progress_keeps_state_and_closed_deal`;
+- заменить `contract` в событии `attempt_started` на путь — падает
+  `test_started_event_records_the_real_command`;
+- снять уборку дерева у упавшей попытки — падает
+  `test_worktree_removed_when_attempt_failed`.
+
+## 11. Что делать не нужно
 
 - не перезапускать gateway ради страницы;
 - не править номер версии руками — только `bin/duty-version`;

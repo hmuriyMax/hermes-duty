@@ -475,8 +475,80 @@ def test_fold_closed_deal_is_not_reopened_by_non_state_kinds() -> None:
     # решением о закрытости и есть правило 2.
     assert folded["last_kind"] == "patched"
     # Набор «не открывающих живое ожидание» видов назван в одном месте и ровно этими
-    # четырьмя: ответ на вопрос — закрывающий факт, а не переход.
-    assert journal.NON_STATE_KINDS == ("commented", "attached", "patched", "question_answered")
+    # пятью: ответ на вопрос — закрывающий факт, телеметрия попытки — не факт о деле.
+    assert journal.NON_STATE_KINDS == (
+        "commented",
+        "attached",
+        "patched",
+        "question_answered",
+        "attempt_progress",
+    )
+
+
+def test_attempt_progress_keeps_state_and_closed_deal(tmp_path: Path) -> None:
+    """Правило 14: телеметрия копится счётчиком и состояния не меняет.
+
+    Прогресс до и после `attempt_ended` не двигает `state`; поздний прогресс на
+    закрытом деле его не воскрешает; мусорный payload сверку не роняет.
+    """
+    folded = journal.fold(
+        events(
+            ("created", {"title": "дело"}),
+            ("attempt_started", {"stage": "impl", "attempt": 1, "run_id": "impl#1", "pid": 99}),
+            ("attempt_progress", {"stage": "impl", "attempt": 1, "phase": "tool_use", "name": "read_file"}),
+            (
+                "attempt_progress",
+                {"stage": "impl", "attempt": 1, "phase": "tool_result", "name": "read_file", "duration_ms": 7},
+            ),
+            ("attempt_ended", {"stage": "impl", "attempt": 1, "run_id": "impl#1", "outcome": "done"}),
+            ("attempt_progress", {"stage": "impl", "attempt": 1, "phase": "tool_use", "name": "terminal"}),
+        ),
+        now=NOW,
+        pid_probe=lambda pid: False,
+    )
+
+    # Последний state-changing факт — `attempt_ended`, поэтому «попытка идёт» не
+    # поднимается; прогресс лишь дописывает счётчик.
+    assert folded["active"] is True
+    assert folded["state"] is None
+    assert folded["reason"] == "no_live_fact"
+    assert folded["progress"] == {"tools": 2, "last_tool": "terminal", "last_at": NOW - 100 + 5}
+
+    closed = journal.fold(
+        events(
+            ("created", {"status": "ready"}),
+            ("completed", {"status": "done"}),
+            ("attempt_progress", {"phase": "tool_use", "name": "terminal"}),
+        ),
+        now=NOW,
+    )
+    assert closed["active"] is False
+    assert closed["state"] is None
+    assert closed["reason"] == "closed"
+    assert closed["progress"]["tools"] == 1
+
+    garbage = journal.fold(
+        [
+            {"id": 1, "ts": NOW, "kind": "created", "deal_id": "t_1", "payload": {"title": "дело"}},
+            {"id": 2, "ts": NOW, "kind": "attempt_progress", "deal_id": "t_1", "payload": "не JSON"},
+            {"id": 3, "ts": NOW, "kind": "attempt_progress", "deal_id": "t_1", "payload": {"phase": 42}},
+        ],
+        now=NOW,
+    )
+    assert garbage["progress"] is None
+    assert garbage["reason"] == "no_live_fact"
+
+
+def test_attempt_progress_is_the_only_new_kind(home: Path) -> None:
+    """Расширение набора — одно слово: `attempt_progress` пишется, `tool_used` — нет."""
+    conn = journal.open_journal(home)
+    assert journal.append(conn, events(("attempt_progress", {"phase": "tool_use", "name": "read_file"}))) == 1
+    with pytest.raises(ValueError) as excinfo:
+        journal.append(conn, [dict(events(("attempt_progress", None))[0], kind="tool_used")])
+    assert "tool_used" in str(excinfo.value)
+    # Порядок применения: прогресс раньше конца попытки при том же `ts`.
+    assert journal.KIND_ORDER.index("attempt_progress") < journal.KIND_ORDER.index("attempt_ended")
+    conn.close()
 
 
 def test_state_changing_kind_after_completed_reopens_honestly() -> None:

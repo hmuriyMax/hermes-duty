@@ -83,11 +83,15 @@ CAPABILITY_WORDS = (
 # `patched` — правка спецификации своего дела (title/body/assignee).
 # `commented`/`attached` — сами по себе факты ожидания не создают, но нужны
 # таймлайну: без них «почему дело стоит» теряет последнее действие человека.
+# `attempt_progress` — шаг попытки движка (вызов инструмента или его результат):
+# состояние дела он не меняет, но без него «что делает прямо сейчас» не видно в
+# журнале и разбор зависаний снова требует ps и хвостов логов.
 EVENT_KINDS = (
     "created",
     "claimed",
     "lease_lost",
     "attempt_started",
+    "attempt_progress",
     "attempt_ended",
     "blocked",
     "unblocked",
@@ -107,11 +111,13 @@ EVENT_KINDS = (
 # Виды, которые живое ожидание не открывают (правило 12 `docs/JOURNAL.md`):
 # комментарий, вложение и правка спецификации — факты таймлайна, а не перехода;
 # `question_answered` — закрывающий факт (ответ на вопрос, в том числе пришедший
-# уже после `completed`). Закрытость и гейт считаются по последнему state-changing
-# событию, поэтому любое из них поверх `completed` закрытое дело не воскрешает.
+# уже после `completed`); `attempt_progress` — телеметрия попытки, а не факт о
+# деле (движок пишет её по каждому вызову инструмента). Закрытость и гейт
+# считаются по последнему state-changing событию, поэтому любое из них поверх
+# `completed` закрытое дело не воскрешает.
 # Набор один на весь модуль: расползаться по `if` в вызывающих это правило не
 # должно.
-NON_STATE_KINDS = ("commented", "attached", "patched", "question_answered")
+NON_STATE_KINDS = ("commented", "attached", "patched", "question_answered", "attempt_progress")
 
 # Виды kanban-событий, которые переносятся в журнал один-к-одному.
 INGEST_EVENT_KINDS = ("created", "claimed", "blocked", "unblocked", "completed", "archived")
@@ -130,6 +136,9 @@ KIND_ORDER = (
     "patched",
     "claimed",
     "attempt_started",
+    # Прогресс — сразу после начала попытки и до её конца: с одинаковым `ts`
+    # он не может примениться после смерти той же попытки.
+    "attempt_progress",
     "blocked",
     "unblocked",
     "question_asked",
@@ -393,10 +402,16 @@ def fold(
     #    и дело снова попадало в состояние ожидания. Самый частый такой хвост —
     #    `question_answered` по делу, которое успели завершить до ответа.
     changed = _last_state_event(ordered)
+    progress = _progress(ordered)
     if _closed_kind(str(changed.get("kind") or "")):
         status = _payload(changed).get("status") or "done"
         return _verdict(
-            False, None, f"журнал: закрыто событием completed (status={status})", "closed", last_kind
+            False,
+            None,
+            f"журнал: закрыто событием completed (status={status})",
+            "closed",
+            last_kind,
+            progress=progress,
         )
 
     facts: dict[str, list[str]] = {}
@@ -533,12 +548,14 @@ def fold(
 
     state = next((name for name in WAITING_PRIORITY if name in facts), None)
     if state is None:
-        return _verdict(None, None, None, "no_live_fact", last_kind)
+        return _verdict(None, None, None, "no_live_fact", last_kind, progress=progress)
 
     human_kind = None
     if state == "wait_human":
         human_kind = "question" if question is not None else "status"
-    return _verdict(True, state, _evidence(facts, state), "live_fact", last_kind, human_kind)
+    return _verdict(
+        True, state, _evidence(facts, state), "live_fact", last_kind, human_kind, progress
+    )
 
 
 def _verdict(
@@ -548,8 +565,14 @@ def _verdict(
     reason: str,
     last_kind: Optional[str],
     human_kind: Optional[str] = None,
+    progress: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    """Ответ fold одной формы: состояние, его доказательство и причина, почему его нет."""
+    """Ответ fold одной формы: состояние, его доказательство и причина, почему его нет.
+
+    `progress` — счётчик телеметрии попытки (`attempt_progress`): `tools`,
+    `last_tool`, `last_at`. Состояние он не меняет, но консоль читает его отсюда,
+    а не из хвоста логов (`docs/JOURNAL.md`, правило 14).
+    """
     return {
         "active": True if active is None else bool(active),
         "state": state,
@@ -557,7 +580,40 @@ def _verdict(
         "evidence": evidence,
         "reason": reason,
         "last_kind": last_kind,
+        "progress": progress,
     }
+
+
+def _progress(ordered: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Счётчик телеметрии попытки: сколько вызовов инструментов и какой последний.
+
+    `tools` считает `tool_use` (вызов), а не `tool_result`: один вызов — один
+    инструмент, и пара «вызов + результат» не должна выглядеть двумя. Мусорный
+    `payload` не роняет сверку: неизвестная фаза пропускается, как и в остальных
+    правилах fold. `last_at` — метка времени последнего факта телеметрии, а не
+    текущее время.
+    """
+    tools = 0
+    last_tool = ""
+    last_at: Optional[int] = None
+    for event in ordered:
+        if str(event.get("kind") or "") != "attempt_progress":
+            continue
+        payload = _payload(event)
+        phase = str(payload.get("phase") or "")
+        if phase not in ("tool_use", "tool_result"):
+            continue
+        if phase == "tool_use":
+            tools += 1
+        name = payload.get("name")
+        if isinstance(name, str) and name:
+            last_tool = name
+        ts = event.get("ts")
+        if isinstance(ts, int) and not isinstance(ts, bool):
+            last_at = ts
+    if last_at is None and tools == 0:
+        return None
+    return {"tools": tools, "last_tool": last_tool, "last_at": last_at}
 
 
 def _evidence(facts: dict[str, list[str]], state: str) -> str:

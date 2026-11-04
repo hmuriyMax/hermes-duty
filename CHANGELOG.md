@@ -31,6 +31,29 @@
   `examples/duty-minimal.yaml` (два этапа, без evidence/ask), `tests/test_spec.py`
   — по тесту на каждое правило плюс happy path на обоих примерах.
 
+**Движок, шаг первый: лизинг, дерево попытки, контракт файлом, спавн**
+
+- `dashboard/runner.py` — один шаг движка: взял лизинг этапа (атомарно, таблица
+  `leases` в той же `duty/duty.db`; TTL из `budget.minutes`, продление по
+  heartbeat'у не реже TTL/3), подготовил дерево (`git worktree add` от `spec.base`
+  либо каталог дела, либо ничего), записал контракт файлом, заспавнил
+  `hermes chat -p <role> --query-file <контракт> --format stream-json --oneshot`
+  с cwd дерева, прочитал поток и записал факты.
+- Каталог попытки — `~/.hermes/kanban/boards/<board>/workspaces/<deal>-<stage>-<n>`:
+  разрешённый корень `role-access` (`docs/PROBES.md`, проба 3), иначе read-only
+  роль не увидит ни дерева, ни отчёта.
+- Телеметрия: каждый `tool_use`/`tool_result` — событие `attempt_progress`, и
+  `fold` копит его счётчиком (`progress: {tools, last_tool, last_at}`). Набор
+  `kind` расширен одним словом — вместе с правилом fold 14 и тестами.
+- Смерть попытки — три источника без догадок: разобранный `result.json` →
+  `attempt_ended` с `outcome=done`; нет отчёта → `failed(contract)`; код выхода
+  ≠ 0 → `failed(infra)`; бюджет токенов → `failed(capability)`; таймаут →
+  `failed(infra)`. `status: blocked` в отчёте — вопрос через `ask()` и дело в
+  `wait_human`; продолжение после ответа — резюмом сессии (`RESUME-OK`).
+- `tests/test_runner.py` — 32 теста без модели (спавн подменён фейком) плюс
+  живой прогон одного тривиального этапа под `@pytest.mark.live`
+  (`pytest -m live` включается руками).
+
 ## [0.0.3] — в разработке
 
 - **«Дело» стало табом.** В навигации теперь все четыре экрана спеки в её же

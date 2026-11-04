@@ -1353,7 +1353,7 @@ function DutyPage() {
           h('div', { className: 'duty-why-meta' }, 'выбери дело из активных'),
           ...view.groups.map((group) => h(DealGroup, { key: `pick-${group.state}`, group, selectedKey, onPick: pick })),
         )
-      : h('div', { className: 'duty-scroll' }, h('div', { className: 'duty-skel-row' }, ...Array.from({ length: 4 }, (_, i) => h('div', { className: 'duty-skel', key: `ds-${i}`, style: { width: `${92 - i * 9}%` } })))),
+      : h('div', { className: 'duty-scroll' }, h('div', { className: 'duty-skel-row' }, ...Array.from({ length: 4 }, (_, i) => h('div', { className: 'duty-skel', key: `ds-${i}`, style: { width: `${92 - i * 9}%` } }))))
   } else if (screen === 'why') {
     content = model
       ? h(WhyScreen, { model, stale, onOpen: pick })

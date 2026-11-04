@@ -1302,20 +1302,23 @@ DEALS_SOURCE = journal.JOURNAL_SOURCE
 
 # Остаточная ветка для своего дела: живого факта в журнале нет, а kanban тут ни
 # при чём — своего дела в kanban нет, и «состояние из kanban» было бы выдумкой.
-# Поэтому состояние называет `deals.status`, а текст говорит вслух, что спавна в
-# 0.0.3 нет: дело берут руками (`duty claim`).
+# Поэтому состояние называет `deals.status`, а текст говорит **только то, что
+# подтверждено**: у `todo`/`ready` нет ни одного шага движка, у `running` — ни
+# одного живого факта журнала. Приписывать движку прошлую версию («спавна в 0.0.3
+# нет», «попыток нет») нельзя: он спавнит попытки и берёт лизинг (`runner.py`), и
+# та же ложь рядом уже исправлена — `OWN_NO_ATTEMPTS`.
 OWN_WAITING_FALLBACK = {
     "todo": (
         "wait_slot",
-        "status=todo без живых фактов: ждёт исполнителя (спавна в 0.0.3 нет — берут вручную: duty claim)",
+        "status=todo без живых фактов: шага движка ещё не было (bin/duty run)",
     ),
     "ready": (
         "wait_slot",
-        "status=ready без живых фактов: ждёт исполнителя (спавна в 0.0.3 нет — берут вручную: duty claim)",
+        "status=ready без живых фактов: шага движка ещё не было (bin/duty run)",
     ),
     "running": (
         "no_signal",
-        "status=running без попытки: в 0.0.3 попыток нет (аренда и спавн — следующая версия)",
+        "status=running без живого факта журнала: идёт ли попытка — неизвестно",
     ),
     "blocked": ("wait_human", "status=blocked: нужен человек"),
     "review": ("wait_human", "status=review: ждёт вердикта ревьюера"),
@@ -1376,6 +1379,68 @@ def _own_waiting(
     return {"state": state, "evidence": f"{head}; {evidence}", "human_kind": human_kind}
 
 
+def _own_attempt_facts(
+    events: list[dict[str, Any]],
+    leases: dict[tuple[str, int], int],
+    now: int,
+) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
+    """Попытка и лизинг своего дела: `(попытка, лизинг)` — факты, а не константы.
+
+    Попытка — последняя незакрытая в журнале (`attempt_started` без
+    `attempt_ended`): у своего дела нет записи рана kanban, и называть живую
+    попытку «попытки нет» значит противоречить собственному таймлайну
+    (`GET /duty/{board}/{id}/attempts`). Все попытки закрыты — идущей нет, и это
+    тоже факт журнала.
+
+    Живость доказывается теми же двумя источниками, что у `stagefeed._alive`:
+    `pid` из `attempt_started` (проверка сигналом, `journal.pid_alive`) и срок
+    лизинга — строка store у пары `(этап, попытка)`, а если строки нет — срок из
+    самого события. `run_status` и `heartbeat_age_sec` пусты: журнал heartbeat'а
+    не пишет (лизинг продлевается в store), рана kanban у своего дела нет.
+
+    Лизинг — три ответа, как у незакрытой попытки: `live`/`expired` по сроку,
+    `unknown` — попытка идёт, а срока нет ни в store, ни в событии («мёртв» здесь
+    был бы догадкой), `none` — ни строки store, ни идущей попытки. `claim_lock` у
+    своего дела не бывает: этап держит pid, и он назван в попытке.
+    """
+    open_rows = [row for row in stagefeed.attempts(events, now, leases=leases) if row["finished_at"] is None]
+    row = open_rows[-1] if open_rows else None
+    expires = row["lease_expires"] if row is not None else None
+    if row is None and leases:
+        # Строка лизинга без попытки — тоже факт store (лизинг взяли, а
+        # `attempt_started` не успел лечь): молчать о ней значило бы «лизинга нет».
+        expires = max(leases.values())
+    if expires is None:
+        lease: dict[str, Any] = {
+            "claim_lock": None,
+            "expires_at": None,
+            "expires_in_sec": None,
+            "state": "unknown" if row is not None else "none",
+        }
+    else:
+        lease = {
+            "claim_lock": None,
+            "expires_at": int(expires),
+            "expires_in_sec": int(expires) - int(now),
+            "state": "expired" if int(expires) <= int(now) else "live",
+        }
+    if row is None:
+        return None, lease
+    return (
+        {
+            "run_id": row["run_id"],
+            "source": "journal",
+            "start": row["started_at"],
+            "age_sec": _age_sec(row["started_at"], now),
+            "pid": row["pid"],
+            "pid_alive": _pid_alive(row["pid"]),
+            "heartbeat_age_sec": None,
+            "run_status": None,
+        },
+        lease,
+    )
+
+
 def _own_shaped(
     row: dict[str, Any],
     events: list[dict[str, Any]],
@@ -1384,15 +1449,20 @@ def _own_shaped(
     journal_note: Optional[str],
     pool_note: Optional[str],
     home: Optional[Path] = None,
+    leases: Optional[dict[tuple[str, int], int]] = None,
 ) -> dict[str, Any]:
     """Дело своего store в той же форме, что дело kanban в `/now`.
 
-    Пустые факты названы пустыми, а не выброшены: у своего дела нет рана и
-    лизинга (в 0.0.3 их нет вовсе), и это видно полем, а не отсутствием ключа —
-    иначе экран не отличил бы «нечего показывать» от «не посчитали».
+    Пустые факты названы пустыми, а не выброшены: `last_run`/`priority`/
+    `workspace_kind` у своего дела нет вовсе, и это видно полем, а не отсутствием
+    ключа — иначе экран не отличил бы «нечего показывать» от «не посчитали».
+    Попытка и лизинг — наоборот, читаются из журнала и store (`_own_attempt_facts`):
+    движок спавнит попытки и держит лизинг, и постоянные `null`/`none` на этом
+    месте врали бы про идущую работу.
     """
     last = events[-1] if events else None
     folded = journal.fold(events, now=now)
+    attempt, lease = _own_attempt_facts(events, leases or {}, now)
     return {
         "board": str(row["board"]),
         "id": str(row["id"]),
@@ -1403,8 +1473,8 @@ def _own_shaped(
         "consecutive_failures": 0,
         "created_at": row.get("created_at"),
         "workspace_kind": None,
-        "attempt": None,
-        "lease": {"claim_lock": None, "expires_at": None, "expires_in_sec": None, "state": "none"},
+        "attempt": attempt,
+        "lease": lease,
         "last_action": {
             "kind": None if last is None else last.get("kind"),
             "at": None if last is None else last.get("ts"),
@@ -1422,6 +1492,22 @@ def _own_shaped(
             home=home, deal_id=str(row["id"]),
         ),
         "_age_sec": _age_sec(row.get("created_at"), now),
+    }
+
+
+def _own_leases(conn: sqlite3.Connection, task_id: str) -> dict[tuple[str, int], int]:
+    """Сроки лизингов дела из store: `{(этап, попытка): expires_at}`.
+
+    Лизинг продлевается heartbeat'ом (`runner.follow`), поэтому строка store —
+    актуальный срок этапа, а `attempt_started.lease_expires` — только начальный.
+    Пара `(этап, попытка)` не даёт чужому сроку (лизинг уже следующей попытки
+    того же этапа) оживить старую (`stagefeed.attempts`).
+    """
+    return {
+        (str(row["stage"]), int(row["attempt"])): int(row["expires_at"])
+        for row in conn.execute(
+            "SELECT stage, attempt, expires_at FROM leases WHERE deal_id = ?", (task_id,)
+        )
     }
 
 
@@ -1464,6 +1550,7 @@ def _own_deals(
                     journal_note,
                     pool_note,
                     home,
+                    _own_leases(conn, str(row["id"])),
                 )
             )
         return out, []
@@ -1559,7 +1646,16 @@ def _own_response(
     events = journal.read_events(conn, deal_id)
     folded = journal.fold(events, now=now)
     shaped = (
-        _own_shaped(row, events, now, (questions or {}).get(deal_id), journal_note, pool_note, home)
+        _own_shaped(
+            row,
+            events,
+            now,
+            (questions or {}).get(deal_id),
+            journal_note,
+            pool_note,
+            home,
+            _own_leases(conn, deal_id),
+        )
         if folded["active"]
         else None
     )
@@ -2960,16 +3056,9 @@ def _own_attempts(home: Path, board: str, task_id: str) -> dict[str, Any]:
         ) from exc
     try:
         events = journal.read_events(conn, task_id)
-        # Лизинг продлевается heartbeat'ом (`runner.follow`), поэтому строка
-        # store — актуальный срок этапа, а `attempt_started.lease_expires` —
-        # только начальный. Пара `(stage, attempt)` не даёт чужому сроку
-        # (лизинг уже следующей попытки того же этапа) оживить старую.
-        leases = {
-            (str(row["stage"]), int(row["attempt"])): int(row["expires_at"])
-            for row in conn.execute(
-                "SELECT stage, attempt, expires_at FROM leases WHERE deal_id = ?", (task_id,)
-            )
-        }
+        # Срок из store важнее срока из `attempt_started`: лизинг продлевается
+        # heartbeat'ом (`_own_leases`).
+        leases = _own_leases(conn, task_id)
     finally:
         conn.close()
     now = _now_sec()

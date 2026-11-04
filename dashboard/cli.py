@@ -75,7 +75,16 @@ class NotFound(RuntimeError):
 
 
 class SourceFailure(RuntimeError):
-    """Источники не прочитались (503/400 роута или `errors[]` ответа) — код 2."""
+    """Источники не прочитались (503/400 роута или `errors[]` ответа) — код 2.
+
+    `code` — код, который отказ назвал сам, когда общий 2 неточен: прогон
+    отличает «спека не годна» (1, как у `spec check`) от «спека не читается» (2).
+    `None` — обычная деградация источников.
+    """
+
+    def __init__(self, message: str, code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 # --------------------------------------------------------------- бэкенд роутов
@@ -250,7 +259,10 @@ def _route(fn: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
         )
         if missing:
             raise NotFound(str(detail)) from exc
-        raise SourceFailure(str(detail)) from exc
+        # Код, названный самим отказом (`driver.DriverError`: негодная спека — 1),
+        # не подменяется общим 2: иначе `run` возвращал бы не тот код, что
+        # `spec check` на той же спеке.
+        raise SourceFailure(str(detail), code=getattr(exc, "code", None)) from exc
 
 
 def _payload_code(payload: dict[str, Any]) -> int:
@@ -939,9 +951,17 @@ def _fact_lines(shaped: dict[str, Any], now: Any) -> list[str]:
         alive = {True: "pid жив", False: "pid мёртв", None: "pid не записан или неизвестен"}[
             attempt.get("pid_alive")
         ]
+        # Статус рана и возраст heartbeat есть только у kanban-дела (запись рана);
+        # у своего дела их нет — печатается только то, что записано.
+        status = f" {attempt['run_status']}" if attempt.get("run_status") else ""
+        heartbeat = (
+            "heartbeat не записан"
+            if attempt.get("heartbeat_age_sec") is None
+            else f"heartbeat {_fmt_age(attempt.get('heartbeat_age_sec'))} назад"
+        )
         lines.append(
-            f"  попытка: ран {attempt.get('run_id')} {attempt.get('run_status') or '—'}, "
-            f"{alive} ({attempt.get('pid') or '—'}), heartbeat {_fmt_age(attempt.get('heartbeat_age_sec'))} назад, "
+            f"  попытка: ран {attempt.get('run_id')}{status}, "
+            f"{alive} ({attempt.get('pid') or '—'}), {heartbeat}, "
             f"факты из {attempt.get('source')}"
         )
     lease = shaped.get("lease") or {}
@@ -949,9 +969,11 @@ def _fact_lines(shaped: dict[str, Any], now: Any) -> list[str]:
     if lease_state == "none":
         lines.append("  лизинг: нет")
     else:
+        # `claim_lock` — поле kanban-дела: у своего дела этап держит pid, и
+        # строку блокировки сюда подставлять нечем.
+        lock = f" ({lease['claim_lock']})" if lease.get("claim_lock") else ""
         lines.append(
-            f"  лизинг: {lease_state}, истекает через {_fmt_age(lease.get('expires_in_sec'))} "
-            f"({lease.get('claim_lock') or '—'})"
+            f"  лизинг: {lease_state}, истекает через {_fmt_age(lease.get('expires_in_sec'))}{lock}"
         )
     action = shaped.get("last_action") or {}
     lines.append(
@@ -1670,17 +1692,29 @@ def main(argv: Optional[list[str]] = None) -> int:
             # построчный вывод шагов и итог. Код возврата — из отчёта драйвера
             # (`0/1/2/3/4/130`), а не выдуманный терминалом.
             driver = _load_driver()
-            report = _route(
-                driver.drive,
-                api().hermes_home(),
-                args.deal_id,
-                spec_path=args.spec,
-                max_steps=driver.DEFAULT_MAX_STEPS if args.max_steps is None else args.max_steps,
-                once=args.once,
-                on_step=None if args.json else (lambda row: print(render_run_step(row), file=out)),
-                on_reap=None if args.json else (lambda row: print(render_reap_row(row), file=out)),
-                on_answer_error=None if args.json else (lambda row: print(render_answer_error(row), file=out)),
-            )
+            try:
+                report = _route(
+                    driver.drive,
+                    api().hermes_home(),
+                    args.deal_id,
+                    spec_path=args.spec,
+                    max_steps=driver.DEFAULT_MAX_STEPS if args.max_steps is None else args.max_steps,
+                    once=args.once,
+                    on_step=None if args.json else (lambda row: print(render_run_step(row), file=out)),
+                    on_reap=None if args.json else (lambda row: print(render_reap_row(row), file=out)),
+                    on_answer_error=None if args.json else (lambda row: print(render_answer_error(row), file=out)),
+                )
+            except SourceFailure as exc:
+                if not args.json:
+                    raise
+                # `--json` — машинная форма и у отказа: строки отказа едут в
+                # `errors[]`, как у любого ответа роута, а не только в stderr.
+                # Строк может быть несколько (по одной на нарушенное правило).
+                code = int(exc.code or EXIT_SOURCE)
+                _emit_json(
+                    {"deal": args.deal_id, "errors": str(exc).splitlines(), "exit_code": code}, out
+                )
+                return code
             _emit_json(report, out) if args.json else print(render_run_final(report), file=out)
             return int(report.get("exit_code") or EXIT_OK)
         if args.command == "reap":
@@ -1854,7 +1888,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return EXIT_NOT_FOUND
     except SourceFailure as exc:
         print(f"! {exc}", file=sys.stderr)
-        return EXIT_SOURCE
+        return int(getattr(exc, "code", None) or EXIT_SOURCE)
     return EXIT_SOURCE  # pragma: no cover - неизвестная команда сюда не доходит
 
 

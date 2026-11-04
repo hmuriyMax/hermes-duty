@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -516,6 +517,77 @@ def test_attempts_of_own_deal_without_attempts_prints_the_note(home, frozen_now,
     assert code == 0
     assert "попыток не было" in out
     assert "0.0.3" not in out
+
+
+# -------------------- факты попытки своего дела в консоли (FIX-4 / B2)
+#
+# `bin/duty deal` и строка «Сейчас» — одна карточка: попытка и лизинг читаются из
+# журнала и store. До FIX-4 консоль печатала «попытка: нет» прямо перед
+# таймлайном этой же попытки.
+
+def start_live_attempt(
+    home: Path, deal_id: str, *, pid: int, started_at: int, expires_at: int
+) -> None:
+    """Живая попытка своего дела: `attempt_started` плюс строка лизинга в store."""
+    api = cli.api()
+    journal = cli._load_journal()
+    conn = api.deals.open_store(home)
+    assert conn is not None
+    try:
+        journal.append(
+            conn,
+            [
+                {
+                    "deal_id": deal_id,
+                    "board": "b1",
+                    "kind": "attempt_started",
+                    "ts": started_at,
+                    "recorded_at": started_at,
+                    "source": "engine",
+                    "payload": {
+                        "run_id": f"{deal_id}:impl#1",
+                        "stage": "impl",
+                        "attempt": 1,
+                        "pid": pid,
+                        "lease_expires": expires_at,
+                        "contract": {"role": "implementer"},
+                    },
+                    "idempotency_key": f"test:{deal_id}:impl#1",
+                }
+            ],
+        )
+        conn.execute(
+            "INSERT INTO leases (deal_id, stage, attempt, pid, taken_at, expires_at) VALUES (?,?,?,?,?,?)",
+            (deal_id, "impl", 1, pid, started_at, expires_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_deal_of_own_deal_with_live_attempt_does_not_say_attempt_absent(home, frozen_now, capsys):
+    """B2: консоль печатает ту же живую попытку, что и «Сейчас», а не «попытки нет»."""
+    deal_id = own_deal(home)
+    start_live_attempt(home, deal_id, pid=os.getpid(), started_at=NOW - 60, expires_at=NOW + 600)
+
+    code, out, _ = run(["deal", "b1", deal_id], capsys)
+
+    assert code == cli.EXIT_OK
+    assert "попытка: нет" not in out
+    assert "pid жив" in out
+    assert "факты из journal" in out
+    # Чего в карточке нет, то и не подставляется: ни `—` вместо статуса рана,
+    # ни возраста heartbeat, которого журнал не пишет, ни `(—)` вместо claim_lock.
+    assert "heartbeat не записан" in out
+    assert "heartbeat — назад" not in out
+    assert "(—)" not in out
+    assert "лизинг: live, истекает через 10 мин" in out
+
+    # Вторая поверхность того же факта: строка «Сейчас» не противоречит карточке.
+    row = next(item for item in cli.api().now()["deals"] if item["id"] == deal_id)
+    assert row["attempt"]["pid"] == os.getpid()
+    assert row["attempt"]["pid_alive"] is True
+    assert row["lease"]["state"] == "live"
 
 
 def test_terminal_deal_has_no_invented_waiting_state(home, frozen_now, capsys):

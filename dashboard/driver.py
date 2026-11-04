@@ -164,7 +164,15 @@ class DriverError(RuntimeError):
     Отдельный тип, потому что «дело не доведено» и «дело довести нельзя» — разные
     ответы: первый называет исход прогона и его код, второй не начинался вовсе и
     код у него — ошибка источников (2).
+
+    `code` — код возврата, если отказ называет его точнее: негодная спека — код 1,
+    ровно как у `bin/duty spec check` (`cli.spec_exit_code`); нечитаемая спека
+    остаётся кодом 2, как и там.
     """
+
+    def __init__(self, message: str, *, code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 # ---------------------------------------------------------------- дети прогона
@@ -475,6 +483,30 @@ def spec_path_of(conn: sqlite3.Connection, deal: Any) -> Optional[str]:
     return stagefeed.spec_of(journal.read_events(conn, str(deal["id"])))
 
 
+def _checked_spec(path: Path) -> Any:
+    """Спека прогона, проверенная правилами `bin/duty spec check` до первого шага.
+
+    `drive()` не исполняет спеку, которую `spec check` назвал бы отказом
+    (`docs/SPEC.md`: каждое правило — отказ, случающийся раньше первого процесса).
+    Иначе цикл в графе давал бы вечный `wait("gate")` вместо отказа,
+    `verdict.changes` не на предшественника проходил бы молча, и публикация без
+    ревью в `needs` — тоже.
+
+    Отказы и коды — те же, что у `spec check`: `file:line: правило: текст` и код 1
+    для негодной спеки (`cli.spec_exit_code`), код 2 для нечитаемой. Предупреждения
+    (`check_base`: репозитория нет на этой машине, `git` не ответил) прогон не
+    останавливают: это «правило проверить не удалось», а не отказ.
+    """
+    try:
+        spec = spec_module.load_spec(path)
+    except spec_module.SpecError as exc:
+        raise DriverError(str(exc.issue())) from exc
+    refusals = spec_module.errors(spec_module.validate_spec(spec) + spec_module.check_base(spec))
+    if refusals:
+        raise DriverError("\n".join(str(issue) for issue in refusals), code=EXIT_FAILED)
+    return spec
+
+
 def drive(
     home: Path,
     deal_id: str,
@@ -489,13 +521,17 @@ def drive(
     on_reap: Optional[Callable[[dict[str, Any]], None]] = None,
     on_answer_error: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> dict[str, Any]:
-    """Вход `bin/duty run`: открыть store, найти спеку и довести дело.
+    """Вход `bin/duty run`: открыть store, найти спеку, проверить её и довести дело.
 
     Спека берётся из журнала дела (`created.payload.spec`), а `--spec` её
     перекрывает: у дела может не быть записанного пути (заведено до появления
     спеки в `create`) или хочется прогнать другой граф по тому же журналу.
     Store открывается **без создания файла**: прогон по несуществующему store —
     это «дела нет», а не «завёл пустую БД».
+
+    Спека проверяется правилами `bin/duty spec check` **до** `run()` — то есть до
+    первого процесса (`_checked_spec`): отказ раньше попытки, а не вечное
+    `wait("gate")` посреди прогона (`docs/SPEC.md`).
     """
     home = Path(home)
     conn = deals.open_store(home, create=False)
@@ -509,7 +545,7 @@ def drive(
         return run(
             conn,
             deal,
-            spec=spec_module.load_spec(path),
+            spec=_checked_spec(path),
             home=home,
             max_steps=max_steps,
             once=once,

@@ -544,11 +544,40 @@
   «последней попытке журнала» (без этого этап, закончивший попытку вопросом, читался
   бы `done` и движок шёл бы дальше по графу).
 
+**FIX-4: три места, где 0.0.4 говорила о себе неправду (RV-FINAL)**
+
+- `dashboard/plugin_api.py` — `OWN_WAITING_FALLBACK` своего дела: у `todo`/`ready`
+  текст был «ждёт исполнителя (спавна в 0.0.3 нет — берут вручную: duty claim)», у
+  `running` — «в 0.0.3 попыток нет (аренда и спавн — следующая версия)». Движок
+  спавнит попытки и берёт лизинг (`runner.py`), поэтому фолбэк говорит только
+  подтверждённое: «шага движка ещё не было (bin/duty run)» и «status=running без
+  живого факта журнала: идёт ли попытка — неизвестно». Тот же класс дефекта рядом
+  уже был исправлен (`OWN_NO_ATTEMPTS`), до `/now` правка не доходила.
+- `dashboard/plugin_api.py` — у своего дела с живой попыткой `attempt` и `lease`
+  были постоянными (`null` и `state: "none"`): строка «Сейчас» показывала
+  «impl · попытка 1 · идёт» и рядом «попытки нет / лизинг: нет», а `bin/duty deal`
+  печатал «попытка: нет» прямо перед таймлайном этой же попытки. Теперь факты
+  читаются из журнала и store (`_own_attempt_facts()`): попытка — последняя
+  незакрытая пара `attempt_started`/`attempt_ended` (`source: "journal"`, `pid`,
+  проверка сигналом, возраст), лизинг — срок пары `(этап, попытка)` из таблицы
+  `leases`, а если строки нет — из `attempt_started.lease_expires`. Факта нет — это
+  `unknown`/`no_signal` с причиной, а не «нет». `docs/DESIGN.md`, `docs/RUNBOOK.md`
+  и `docs/SPEC.md` приведены к коду.
+- `dashboard/driver.py` — `bin/duty run` исполнял непроверенную спеку:
+  `validate_spec()`/`check_base()` звались только из `bin/duty spec check`
+  (`cli.py`), и прогон шёл по спеке с циклом (вечный `wait("gate")` вместо отказа),
+  с `verdict.changes` не на предшественника и с публикацией без ревью в `needs`.
+  Теперь `drive()` проверяет спеку до первого процесса (`_checked_spec()`), отказ —
+  теми же строками `file:line: правило: текст` и теми же кодами, что у `spec check`
+  (`1` — отказы правил, `2` — спека не читается), а `--json` кладёт строки в
+  `errors[]`. Предупреждения (`check_base` без репозитория на машине) прогон не
+  останавливают.
+
 ### Тесты 0.0.4
 
 | прогон | результат |
 |---|---|
-| `pytest tests/ -q` | `602 passed, 1 skipped` (skip — живой прогон под `@pytest.mark.live`, включается `pytest -m live`) |
+| `pytest tests/ -q` | `617 passed, 1 skipped` (skip — живой прогон под `@pytest.mark.live`, включается `pytest -m live`) |
 | `node --test tests/model.test.mjs` | `37 pass` |
 | `node --test tests/web.test.mjs` | `12 pass` |
 | `bin/duty demo` | 7 проверок OK, код 0 |
@@ -556,10 +585,10 @@
 | `hermes plugins validate .` | Validation passed |
 | `bin/duty spec check examples/duty.yaml` / `examples/duty-minimal.yaml` | OK, код 0 |
 
-По файлам (собрано 603 = 602 passed + 1 skipped, снято `pytest --collect-only` на
-вершине `release/v0.0.4` после W18): `test_spec` 80, `test_journal` 61, `test_transit` 56,
-`test_runner` 52, `test_deals` 59, `test_cli` 49, `test_evidence` 34,
-`test_failures` 34, `test_aggregate` 30, `test_driver` 30, `test_ask` 29,
+По файлам (собрано 618 = 617 passed + 1 skipped, снято `pytest --collect-only` на
+вершине `release/v0.0.4` после FIX-4): `test_spec` 80, `test_journal` 61, `test_transit` 56,
+`test_runner` 52, `test_deals` 64, `test_cli` 50, `test_evidence` 34,
+`test_failures` 34, `test_aggregate` 30, `test_driver` 39, `test_ask` 29,
 `test_routing` 25, `test_reaper` 16, `test_stagefeed` 15, `test_screens` 12,
 `test_demo` 9, `test_p0_contract` 6, `test_worktree_base` 4,
 `test_frontend_syntax` 2.

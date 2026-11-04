@@ -768,6 +768,115 @@ def test_drive_without_spec_names_the_reason(tmp_path: Path) -> None:
     assert "нет спеки" in str(caught.value)
 
 
+# ------------------------------------- спека проверяется до первого процесса
+#
+# `docs/SPEC.md`: каждое правило спеки — отказ, случающийся **раньше первого
+# процесса**. До FIX-4 `drive()` читал спеку через `load_spec()` и отдавал её
+# движку как есть: цикл в графе давал вечный `wait("gate")` вместо отказа.
+
+# Та же тройка отказов, которую проверяет `bin/duty spec check` (`tests/test_spec.py`).
+BAD_SPECS = {
+    "cycle": """
+        duty: probe
+        stages:
+          - id: impl
+            role: implementer
+            needs: [review]
+            workspace: none
+          - id: review
+            role: reviewer
+            needs: [impl]
+            workspace: none
+        """,
+    "verdict.changes": """
+        duty: probe
+        stages:
+          - id: impl
+            role: implementer
+          - id: review
+            role: reviewer
+            needs: [impl]
+            workspace: none
+            verdict: {approve: next, changes: publish, max_rounds: 2}
+          - id: publish
+            role: publisher
+            needs: [review]
+            workspace: none
+        """,
+    "review-gate": """
+        duty: probe
+        stages:
+          - id: impl
+            role: implementer
+          - id: publish
+            role: publisher
+            needs: [impl]
+            workspace: none
+        """,
+}
+
+
+@pytest.mark.parametrize("rule", sorted(BAD_SPECS))
+def test_drive_refuses_invalid_spec_before_the_first_process(tmp_path: Path, rule: str) -> None:
+    """Негодная спека — отказ `drive()`, а не первый шаг: в журнале нет попытки.
+
+    Отказ называется тем же `file:line: правило: текст`, что у `spec check`, — за
+    это отвечает сверка ниже; здесь важно, что прогон не начался вовсе.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, BAD_SPECS[rule])
+    deal = make_deal(conn, spec_path=spec.path)
+    fake = Fake()
+
+    with pytest.raises(driver.DriverError) as caught:
+        driver.drive(home, deal["id"], spawn=fake, clock=lambda: NOW)
+
+    assert caught.value.code == driver.EXIT_FAILED, "код 1 — как у `spec check`"
+    assert f"{spec.path}:" in str(caught.value)
+    assert rule in str(caught.value)
+    assert fake.calls == [], "процесс не спавнился"
+    assert "attempt_started" not in kinds(conn, deal)
+    assert leases(conn, deal) == []
+    conn.close()
+
+
+@pytest.mark.parametrize("rule", sorted(BAD_SPECS))
+def test_drive_refusal_is_the_same_as_spec_check(tmp_path: Path, rule: str) -> None:
+    """Строки отказа и код — те же, что у `bin/duty spec check` на том же файле."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, BAD_SPECS[rule])
+    deal = make_deal(conn, spec_path=spec.path)
+    conn.close()
+
+    with pytest.raises(driver.DriverError) as caught:
+        driver.drive(home, deal["id"], spawn=Fake(), clock=lambda: NOW)
+
+    payload = cli.spec_report(str(spec.path))
+    assert cli.spec_exit_code(payload) == caught.value.code
+    rendered = cli.render_spec_check(payload)
+    for line in str(caught.value).splitlines():
+        assert line in rendered, line
+
+
+def test_drive_unreadable_spec_exits_2_like_spec_check(tmp_path: Path) -> None:
+    """Нечитаемая спека — код 2 (как `spec check`), а не список отказов."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    path = tmp_path / "duty.yaml"
+    path.write_text("duty: probe\nstages: [\n", encoding="utf-8")
+    deal = make_deal(conn, spec_path=path)
+    conn.close()
+
+    with pytest.raises(driver.DriverError) as caught:
+        driver.drive(home, deal["id"], spawn=Fake(), clock=lambda: NOW)
+
+    assert caught.value.code is None, "общий код 2 — как у нечитаемой спеки в `spec check`"
+    assert f"{path}:" in str(caught.value) and "yaml" in str(caught.value)
+    assert cli.spec_exit_code(cli.spec_report(str(path))) == 2
+
+
 # ------------------------------------------------------------------ CLI `run`
 
 
@@ -813,6 +922,50 @@ def test_cli_run_parked_deal_exits_2(tmp_path: Path, monkeypatch: pytest.MonkeyP
     out = capsys.readouterr().out
     assert "#91" in out
     assert "припарковано" in out
+
+
+def test_cli_run_refuses_invalid_spec_with_file_line_and_exit_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Негодная спека: `run` отказывает кодом 1 и называет `file:line: правило`.
+
+    Тот же код и та же строка, что у `bin/duty spec check`: отказ один на оба
+    входа, иначе скрипт, проверяющий спеку заранее, и прогон говорили бы разное.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, BAD_SPECS["cycle"])
+    deal = make_deal(conn, spec_path=spec.path)
+    conn.close()
+
+    code = _cli_run(monkeypatch, home, ["run", deal["id"]])
+
+    captured = capsys.readouterr()
+    assert code == cli.spec_exit_code(cli.spec_report(str(spec.path))) == 1
+    assert "cycle" in captured.err
+    assert f"{spec.path}:" in captured.err
+    assert captured.out == "", "до первого шага дела нет — и строк шагов тоже"
+
+
+def test_cli_run_json_refusal_is_a_line_in_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`run --json` на негодной спеке: код 1 и строка отказа в `errors[]`."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, BAD_SPECS["review-gate"])
+    deal = make_deal(conn, spec_path=spec.path)
+    conn.close()
+
+    code = _cli_run(monkeypatch, home, ["run", deal["id"], "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert payload["deal"] == deal["id"]
+    assert payload["exit_code"] == 1
+    assert payload["errors"], payload
+    assert all(line.startswith(f"{spec.path}:") for line in payload["errors"]), payload["errors"]
+    assert any("review-gate" in line for line in payload["errors"])
 
 
 def test_cli_run_json_prints_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:

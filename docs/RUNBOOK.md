@@ -86,7 +86,7 @@ app.include_router(mod.router, prefix="/api/plugins/hermes-duty")
 client = TestClient(app)
 
 print(client.get("/api/plugins/hermes-duty/health").json())
-# {'ok': True, 'version': '0.0.3', 'hermes_home': '/Users/…/.hermes',
+# {'ok': True, 'version': '0.0.4', 'hermes_home': '/Users/…/.hermes',
 #  'kanban': {'databases': 19, 'readable': 19, 'task_rows': N},
 #  'pool': {'present': True, 'total': N},
 #  'journal': {'events': 16, 'deals': 12, 'drift': {'empty_journal': 0}},
@@ -840,9 +840,11 @@ bin/duty --json deal <board> d_1e990f38 | grep -A 40 '"stages"'
   «в спеке нет этапов») — «этапов нет» и «спеки нет» остаются разными фактами.
 
 `GET /now` отдаёт то же коротко — `deals[].stage {id, role, attempt, state, live,
-since}`, `null` у дела без попыток. `bin/duty deal` текстом печатает попытки из
-kanban (`task_runs`), поэтому у своего дела с журнальными попытками он может
-показать «попыток нет» — лента этапов живёт в `/deal` и `--json`.
+since}`, `null` у дела без попыток. `bin/duty deal` печатает таймлайн из того же
+источника, что и лента этапов: у своего дела — по журналу (`impl#1 · implementer ·
+done (1 мин 40 с)`), у kanban-дела — по `task_runs`. Строка «попытка:» в карточке
+берётся тоже из фактов: у своего дела это последняя незакрытая попытка журнала и
+её лизинг (`attempt.source = journal`), у kanban-дела — запись рана.
 
 ### Шаг 5. Что делать при парковке
 

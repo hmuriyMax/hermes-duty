@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sqlite3
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -1519,3 +1521,172 @@ def test_cli_create_with_external_ref_is_idempotent(
     assert "ДЕЛО УЖЕ ЕСТЬ" in text
     assert "jira:RP-14080" in text
     assert "нового дела нет" in text
+
+
+# ------------------- попытка и лизинг своего дела в «Сейчас» (FIX-4 / B1, B2)
+#
+# Движок 0.0.4 спавнит попытки и держит лизинг (`runner.py`), поэтому у своего
+# дела `attempt`/`lease` — факты журнала и store, а не постоянные `null`/`none`.
+# Рядом — честная ветка: факта нет — это `no_signal`/`unknown`, а не «нет».
+
+def append_attempt(
+    home: Path,
+    deal_id: str,
+    *,
+    stage: str = "impl",
+    attempt: int = 1,
+    pid: int,
+    started_at: int,
+    lease_expires: Any = None,
+) -> None:
+    """`attempt_started` своего дела — той же формой, что пишет `runner.step`."""
+    conn = store(home)
+    try:
+        journal.append(
+            conn,
+            [
+                {
+                    "deal_id": deal_id,
+                    "board": BOARD,
+                    "kind": "attempt_started",
+                    "ts": started_at,
+                    "recorded_at": started_at,
+                    "source": "engine",
+                    "payload": {
+                        "run_id": f"{deal_id}:{stage}#{attempt}",
+                        "stage": stage,
+                        "attempt": attempt,
+                        "pid": pid,
+                        "lease_expires": lease_expires,
+                        "contract": {"role": "implementer"},
+                    },
+                    "idempotency_key": f"test:{deal_id}:{stage}:{attempt}",
+                }
+            ],
+        )
+    finally:
+        conn.close()
+
+
+def hold_lease(home: Path, deal_id: str, *, stage: str = "impl", attempt: int = 1, pid: int, expires_at: int) -> None:
+    """Строка лизинга в store — то, что видит движок, взявший этап."""
+    conn = store(home)
+    try:
+        conn.execute(
+            "INSERT INTO leases (deal_id, stage, attempt, pid, taken_at, expires_at) VALUES (?,?,?,?,?,?)",
+            (deal_id, stage, attempt, pid, expires_at - 1800, expires_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_own_deal_now_does_not_claim_the_engine_cannot_spawn(client: TestClient) -> None:
+    """B1: `/now` своего дела не приписывает движку 0.0.3 — спавн и лизинг есть."""
+    deal = create(client)
+
+    listed = now_deals(client)[deal["id"]]
+
+    evidence = listed["waiting"]["evidence"]
+    assert listed["waiting"]["state"] == "wait_slot"
+    assert "0.0.3" not in json.dumps(listed, ensure_ascii=False)
+    assert "bin/duty run" in evidence
+    assert "вручную" not in evidence
+
+
+def test_own_deal_running_without_journal_fact_is_no_signal(home: Path, client: TestClient) -> None:
+    """B1: `status=running` без живого факта журнала — `no_signal`, а не «попыток нет»."""
+    deal = create(client)
+    conn = store(home)
+    try:
+        conn.execute("UPDATE deals SET status = 'running' WHERE id = ?", (deal["id"],))
+        conn.commit()
+    finally:
+        conn.close()
+
+    listed = now_deals(client)[deal["id"]]
+
+    assert listed["waiting"]["state"] == "no_signal"
+    evidence = listed["waiting"]["evidence"]
+    assert "идёт ли попытка — неизвестно" in evidence
+    assert "0.0.3" not in evidence
+
+
+def test_own_deal_live_attempt_and_lease_come_from_journal(home: Path, client: TestClient) -> None:
+    """B2: живая попытка своего дела видна полем, а не постоянным `null`/`none`.
+
+    Строка «Сейчас» показывает этап «impl · попытка 1 · идёт» из журнала; рядом
+    та же попытка и её лизинг — из журнала и store, иначе одна карточка говорила
+    бы два разных факта.
+    """
+    deal = create(client)
+    moment = int(time.time())
+    pid = os.getpid()
+    append_attempt(home, deal["id"], pid=pid, started_at=moment - 90, lease_expires=moment + 300)
+    hold_lease(home, deal["id"], pid=pid, expires_at=moment + 600)
+
+    listed = now_deals(client)[deal["id"]]
+
+    attempt = listed["attempt"]
+    assert attempt is not None
+    assert attempt["source"] == "journal"
+    assert attempt["pid"] == pid
+    assert attempt["pid_alive"] is True
+    assert attempt["age_sec"] >= 90
+    assert listed["stage"]["attempt"] == 1
+    # Срок из store важнее срока из `attempt_started`: лизинг продлевается
+    # heartbeat'ом, поэтому истекает через ~10 минут, а не через 5.
+    assert listed["lease"]["state"] == "live"
+    assert listed["lease"]["expires_in_sec"] > 300
+
+
+def test_own_deal_attempt_without_lease_term_is_unknown_not_none(home: Path, client: TestClient) -> None:
+    """B2: срока лизинга нет ни в store, ни в событии — `unknown`, а не «нет»."""
+    deal = create(client)
+    moment = int(time.time())
+    append_attempt(home, deal["id"], pid=os.getpid(), started_at=moment - 30)
+
+    listed = now_deals(client)[deal["id"]]
+
+    assert listed["attempt"] is not None
+    assert listed["lease"]["state"] == "unknown"
+    assert listed["lease"]["expires_in_sec"] is None
+
+
+def test_own_deal_with_closed_attempt_has_no_current_one(home: Path, client: TestClient) -> None:
+    """B2: все попытки закрыты — идущей нет, и лизинг не выдумывается."""
+    deal = create(client)
+    moment = int(time.time())
+    append_attempt(home, deal["id"], pid=os.getpid(), started_at=moment - 300, lease_expires=moment - 100)
+    conn = store(home)
+    try:
+        journal.append(
+            conn,
+            [
+                {
+                    "deal_id": deal["id"],
+                    "board": BOARD,
+                    "kind": "attempt_ended",
+                    "ts": moment - 200,
+                    "recorded_at": moment - 200,
+                    "source": "engine",
+                    "payload": {
+                        "run_id": f"{deal['id']}:impl#1",
+                        "stage": "impl",
+                        "attempt": 1,
+                        "outcome": "done",
+                        "kind": None,
+                        "reason": "",
+                        "commit": "8a2d5cb6bb4a380d53fdcf77af758f0b6e71a598",
+                    },
+                    "idempotency_key": f"test:{deal['id']}:ended",
+                }
+            ],
+        )
+    finally:
+        conn.close()
+
+    listed = now_deals(client)[deal["id"]]
+
+    assert listed["attempt"] is None
+    assert listed["lease"]["state"] == "none"

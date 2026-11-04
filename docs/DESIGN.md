@@ -316,9 +316,16 @@ failures.classify → policy → decide_park
 ```
 
 **Своё дело в том же срезе.** Элемент списка у своего дела (`d_<hex>`) имеет ту же форму,
-но пустые факты названы пустыми, а не выброшены: `attempt: null`, `last_run: null`,
-`lease.state: "none"`, `priority: null`, `workspace_kind: null` — иначе экран не отличил
-бы «нечего показывать» от «не посчитали». В `boards[]` у доски со своими делами
+но пустые факты названы пустыми, а не выброшены: `last_run: null`, `priority: null`,
+`workspace_kind: null` — иначе экран не отличил бы «нечего показывать» от «не посчитали».
+Попытка и лизинг — наоборот, читаются из фактов, потому что движок 0.0.4 спавнит
+попытки и держит лизинг: `attempt` строится по журналу (последняя незакрытая пара
+`attempt_started`/`attempt_ended`, `source: "journal"`, `run_status`/`heartbeat_age_sec`
+пусты — записи рана kanban и heartbeat-события у своего дела нет), `lease.state` — по
+сроку из таблицы `leases` (а если строки нет — по `attempt_started.lease_expires`):
+`live`/`expired` по сроку, `unknown` — попытка идёт, а срока нет ни там, ни там,
+`none` — ни строки store, ни идущей попытки (`_own_attempt_facts()` в
+`dashboard/plugin_api.py`). В `boards[]` у доски со своими делами
 появляется `own_deals`; доска, которая есть только в store, идёт с `read: true`, путём
 store и `note` «только свои дела: kanban-доски с таким слагом нет».
 
@@ -387,9 +394,11 @@ store и `note` «только свои дела: kanban-доски с таки�
   `лизинг истёк <N>с назад (<claim_lock>), ран <status>` (`_waiting()`).
 - `wait_slot` — `status=ready, профиль <assignee> занят делом <id> (running)`;
   `wait_gate` — `незавершённые родители: <id> (<status>), …` (`_waiting()`).
-- `attempt.source` — `run` или `task`: если pid/start/heartbeat добраны из
-  карточки, а не из записи рана, подпись попытки на странице получает хвост
-  «, факты карточки» (`_attempt()` в `dashboard/plugin_api.py`, `desktop/model.js`).
+- `attempt.source` — `run`, `task` или `journal`: `run` — все факты из записи рана,
+  `task` — pid/start/heartbeat добраны из карточки (подпись попытки на странице
+  получает хвост «, факты карточки»), `journal` — попытка своего дела, прочитанная
+  по журналу движка (`_attempt()` и `_own_attempt_facts()` в
+  `dashboard/plugin_api.py`, `desktop/model.js`).
 
 Если ни один факт не сработал, статус доразбирается оглавлением
 `WAITING_FALLBACK`: `triage`/`blocked`/`review`/`awaiting_merge` → `wait_human`,

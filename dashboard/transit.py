@@ -35,7 +35,7 @@
 | `collected` | `stage`, `target` | приговор `approve`: `target` или `next` |
 | `changes_requested` | `stage`, `target`, `reason` | приговор `changes`: возврат на `target` |
 | `completed` | без `stage` | дело закрыто целиком |
-| `question_asked` | без `stage` (так пишет `ask()`) | вопрос последней попытки: её этап → `wait_human` |
+| `question_asked` | без `stage` (так пишет `ask()`), адрес — в `routing.stage`/`routing.attempt` | вопрос этого этапа → `wait_human`; адреса нет — последней попытки |
 | `question_answered` | без `stage` | ответ на этот вопрос → новая попытка того же этапа |
 
 Исход попытки различается **полем** `outcome`, а не вторым видом события
@@ -642,22 +642,18 @@ def _question_id(payload: dict[str, Any]) -> Optional[str]:
 
 
 def _deal_question(board: _Board, payload: dict[str, Any]) -> None:
-    """Вопрос **без** `stage`: адресовать его некому, кроме последней попытки.
+    """Вопрос **без** `stage`: адресовать его некому, кроме названного адреса.
 
     `ask()` пишет `question_asked` на уровне дела (`dashboard/ask.py`): вопросам
-    он не знает этапа, и это правильно — этап знает движок. Но вопрос задаёт
-    попытка, и в журнале есть ровно один факт о том, какая попытка только что
-    закончилась. Адресация по нему — не догадка о содержании, а чтение
-    причинности: другого источника вопроса в журнале нет.
-
-    Этап, у которого попытка закончилась вопросом, не `done`, а `wait_human`:
-    работа не сделана, её ждёт человек, и после ответа нужна **новая** попытка
-    (правило 5). Поэтому вопрос переводит последнюю закрытую попытку назад в
-    ожидание — иначе движок пошёл бы на следующий этап, а вопрос остался бы без
-    адреса.
+    он не знает этапа, и это правильно — этап знает движок. Движок и записывает
+    его в `payload.routing` (`dashboard/runner.py`), поэтому адрес берётся оттуда,
+    а `board.last_attempt` — запасной источник для вопросов, заданных мимо
+    движка (`POST /ask`) и для фактов до W5. Без адресации этап, у которого
+    попытка закончилась вопросом, не `done`, а `wait_human`: работа не сделана,
+    её ждёт человек, и после ответа нужна **новая** попытка (правило 5).
     """
     question_id = _question_id(payload)
-    stage_id, attempt = board.last_attempt
+    stage_id, attempt = _addressed(board, payload)
     board.question = (stage_id, question_id or "")
     node = board.stages.get(stage_id)
     if node is None or question_id is None:
@@ -666,6 +662,23 @@ def _deal_question(board: _Board, payload: dict[str, Any]) -> None:
     node.attempt = max(node.attempt, attempt)
     node.state = WAIT_HUMAN
     node.reason = f"попытка {node.attempt} закончилась вопросом #{question_id}"
+
+
+def _addressed(board: _Board, payload: dict[str, Any]) -> tuple[str, int]:
+    """Этап и попытка, которым принадлежит вопрос: адрес движка, иначе последняя.
+
+    `payload.routing.stage` пишет `_parked` (`dashboard/routing.py` решает, кому
+    вопрос адресован, движок знает, кто спросил). При параллельных этапах
+    «последняя попытка журнала» — не обязательно спросившая, поэтому объявленный
+    адрес важнее догадки. Мусор и незнакомый этап адресом не считаются.
+    """
+    routing = payload.get("routing")
+    if isinstance(routing, dict):
+        stage_id = str(routing.get("stage") or "")
+        node = board.stages.get(stage_id)
+        if node is not None:
+            return stage_id, _int(routing.get("attempt")) or node.attempt
+    return board.last_attempt
 
 
 def _deal_answer(board: _Board, payload: dict[str, Any]) -> None:

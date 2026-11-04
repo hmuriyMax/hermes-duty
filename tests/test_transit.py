@@ -570,6 +570,52 @@ def test_deal_level_question_waits_and_answer_raises_attempt(spec: Any) -> None:
     assert decision.pair == [("impl", 2)]
 
 
+def addressed_asked(question_id: int, stage: str, attempt: int = 1) -> dict[str, Any]:
+    """Вопрос дела с адресом движка: `payload.routing` вместо `stage` верхнего уровня.
+
+    Так его пишет `_parked` (`dashboard/runner.py`): `ask()` не знает этапа, а
+    движок — знает и кладёт адрес вложенным ключом.
+    """
+    return ev(
+        "question_asked",
+        question_id=question_id,
+        session_key="t_d_probe",
+        routing={"target": "role:researcher", "stage": stage, "attempt": attempt},
+    )
+
+
+def test_addressed_question_belongs_to_its_own_stage(spec: Any) -> None:
+    """Адрес вопроса важнее «последней попытки»: при параллельных этапах это разные вещи.
+
+    Вопрос задал этап `verify`, а последняя попытка журнала — `impl`. Если
+    адресовать вопрос последней, `impl` встал бы в `wait_human` на вопрос,
+    которого не задавал, а `verify` остался бы `pending` — и движок запустил бы
+    его поверх открытого вопроса.
+    """
+    journal = [started("impl", 1), ok("impl", 1), addressed_asked(284, "verify")]
+
+    states = transit.stage_states(spec, journal)
+
+    assert states["verify"].state == "wait_human"
+    assert states["verify"].question_id == "284"
+    assert states["impl"].state == "done"
+    assert states["impl"].question_id is None
+    assert transit.deal_state(spec, journal) == "wait_human"
+    decision = transit.next_stage(spec, journal, NOW)
+    assert decision.kind == "wait"
+    assert decision.what == "question"
+
+
+def test_question_with_unknown_stage_falls_back_to_the_last_attempt(spec: Any) -> None:
+    """Незнакомый этап в адресе — не адрес: вопрос достаётся последней попытке."""
+    journal = [started("impl", 1), ok("impl", 1), addressed_asked(284, "no-such-stage")]
+
+    states = transit.stage_states(spec, journal)
+
+    assert states["impl"].state == "wait_human"
+    assert states["impl"].question_id == "284"
+
+
 def test_expired_deal_question_parks_the_stage(spec: Any) -> None:
     """Срок вопроса дела истёк — этап припаркован, а не перезапущен."""
     journal = [started("impl", 1), ok("impl", 1), deal_asked(284), deal_answered(284, 0, "expired")]

@@ -425,6 +425,8 @@ def test_contract_file_holds_the_attempt_input(tmp_path: Path) -> None:
         "allowed": ["researcher"],
         "to_human": "decisions_only",
         "max_hops": 2,
+        "risky": False,
+        "default": "",
     }
     assert contract["boundaries"], "границы попытки обязаны быть названы"
     assert "answer_this_attempt" not in contract
@@ -799,6 +801,115 @@ def test_blocked_result_parks_the_deal_with_question(tmp_path: Path) -> None:
     folded = journal.fold(events(conn, deal), now=NOW)
     assert (folded["state"], folded["human_kind"]) == ("wait_human", "question")
     assert "question_asked" in kinds(conn, deal)
+
+
+def asking_spec(tmp_path: Path, ask_line: str) -> Any:
+    """Спека с объявленным адресом вопросов у единственного этапа."""
+    return write_spec(
+        tmp_path,
+        f"""
+        duty: probe
+        stages:
+          - id: impl
+            role: implementer
+            workspace: none
+            ask: {ask_line}
+        """,
+    )
+
+
+def blocked(question: dict[str, Any]) -> Fake:
+    """Отчёт попытки, которая просит решения: движок обязан его адресовать."""
+    return Fake(
+        result={"status": "blocked", "summary": "нужен ответ", "question": question},
+    )
+
+
+def addressed(conn, deal) -> dict[str, Any]:
+    """Адрес из факта `question_asked`: `{target, reason, stage, attempt}`."""
+    payload = only(conn, deal, "question_asked")["payload"]
+    address = payload.get("routing")
+    assert isinstance(address, dict), "вопрос без адреса: кому он задан — неизвестно"
+    return address
+
+
+def test_factual_question_is_addressed_to_the_declared_role(tmp_path: Path) -> None:
+    """Фактовый вопрос → роль из `ask.allowed`; адрес и причина — в журнале.
+
+    Решает спека, а не модель: в контракте попытки адрес объявлен, и тот же адрес
+    попадает в `question_asked.payload.routing` — иначе через месяц никто не
+    скажет, почему вопрос ушёл роли, а не человеку.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = asking_spec(tmp_path, "{allowed: [researcher], to_human: decisions_only, max_hops: 2}")
+    report = run(conn, spec, deal, home, blocked({"text": "где лежат миграции?", "kind": "fact"}))
+
+    assert report["question_target"] == "role:researcher"
+    assert report["question_reason"] == "declared_role"
+    assert addressed(conn, deal) == {
+        "target": "role:researcher",
+        "reason": "declared_role",
+        "stage": "impl",
+        "attempt": 1,
+    }
+    block = only(conn, deal, "blocked")["payload"]
+    assert "role:researcher" in block["reason"], "причина блока обязана называть адрес"
+
+
+def test_factual_question_without_roles_is_routing_failed(tmp_path: Path) -> None:
+    """`allowed` пуст → человек, причина `allowed_empty` в событии, а не догадка."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = asking_spec(tmp_path, "{allowed: [], to_human: decisions_only, max_hops: 2}")
+    report = run(conn, spec, deal, home, blocked({"text": "где лежат миграции?", "kind": "fact"}))
+
+    assert report["question_target"] == "human_routing_failed"
+    assert addressed(conn, deal)["reason"] == "allowed_empty"
+    assert addressed(conn, deal)["target"] == "human_routing_failed"
+
+
+def test_risky_question_goes_to_human_even_with_roles(tmp_path: Path) -> None:
+    """Властный вопрос (`risky: true`) — человек, даже когда роли объявлены."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = asking_spec(tmp_path, "{allowed: [publisher], risky: true, max_hops: 2}")
+    fake = blocked({"text": "Публикуем diff?", "options": ["пушить", "стоп"]})
+    report = run(conn, spec, deal, home, fake)
+
+    assert report["question_target"] == "human"
+    assert addressed(conn, deal)["reason"] == "risky"
+
+
+def test_hops_are_counted_by_the_journal(tmp_path: Path) -> None:
+    """Передачи по цепочке считаются фактами журнала, а не счётом в памяти.
+
+    Вопрос без адреса (заданный до W5 или мимо движка) хопом не считается:
+    приписать его этапу значило бы оборвать цепочку раньше объявленного.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    seed(conn, deal, "question_asked", {"question_id": 1}, key="old-without-address")
+    seed(
+        conn,
+        deal,
+        "question_asked",
+        {"question_id": 2, "routing": {"target": "role:researcher", "stage": "impl"}},
+        key="first-hop",
+    )
+    seed(
+        conn,
+        deal,
+        "question_asked",
+        {"question_id": 3, "routing": {"target": "role:researcher", "stage": "review"}},
+        key="other-stage",
+    )
+
+    assert runner.hops_done(conn, deal, "impl") == 1
 
 
 def test_stderr_goes_to_file_not_journal(tmp_path: Path) -> None:

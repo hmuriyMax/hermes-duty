@@ -490,6 +490,17 @@ curl -s http://127.0.0.1:18742/api/plugins/hermes-duty/sources \
 Цена резюма названа там же: +8 тыс. input-токенов на ход и риск, что продолжение
 уйдёт гулять по инструментам — поэтому в отчёте попытки видно `usage_tokens`.
 
+**Точка возврата ответа (W5, 2026-11-04):** ответ человека возвращается резюмом
+сессии вопроса — `--resume <session_id>` из `attempt_started.payload.session_id`
+(он же `attempt_ended.details.session_id`), номер попытки при этом **растёт**:
+ответ — новый вход, а не та же попытка, иначе учёт токенов и исходов смешался бы.
+Выбор сделан по пробе 1 (`docs/PROBES.md`): три резюма подряд держат контекст
+(`787` на всех трёх шагах, `local-4388c999…`), а `clarify` внутри `--oneshot`
+ответа не получает (`undelivered`) — поэтому вопрос задаёт движок. Фолбэк «новый
+процесс с `answer_this_attempt` в контракте» включается **только** если резюм
+реально отвалится в живом прогоне и это будет записано событием; сейчас он не
+используется.
+
 ### Красные пробы к слою
 
 - убрать `WHERE leases.expires_at <= now` из взятия лизинга — падают
@@ -503,7 +514,14 @@ curl -s http://127.0.0.1:18742/api/plugins/hermes-duty/sources \
 - отключить гейт в `run_stage` — падают
   `test_gate_refuses_bare_done_and_puts_the_issue_into_the_reason` и
   `test_done_without_evidence_cannot_close_the_stage_this_is_the_p3_gate`
-  (второй — прямой тезис фазы P3).
+  (второй — прямой тезис фазы P3);
+- поставить `hops_exhausted` выше проверки `allowed` в `routing.route` — падает
+  `test_stage_without_ask_is_routing_failed_not_exhausted_chain`;
+- пустить властный вопрос по объявленному дефолту (снять проверку `risky`) —
+  падает `test_risky_wins_over_declared_default`;
+- не писать адрес в `question_asked` — падают
+  `test_routing_failed_reaches_the_journal_event` и
+  `test_factual_question_is_addressed_to_the_declared_role`.
 
 ## 11. Что делать не нужно
 

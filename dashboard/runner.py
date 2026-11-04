@@ -75,6 +75,7 @@ DEALS_MODULE_NAME = "hermes_duty_deals"
 ASK_MODULE_NAME = "hermes_duty_ask"
 SPEC_MODULE_NAME = "hermes_duty_spec"
 EVIDENCE_MODULE_NAME = "hermes_duty_evidence"
+ROUTING_MODULE_NAME = "hermes_duty_routing"
 
 
 def _load(name: str, filename: str) -> Any:
@@ -97,6 +98,7 @@ deals = _load(DEALS_MODULE_NAME, "deals.py")
 ask = _load(ASK_MODULE_NAME, "ask.py")
 spec_module = _load(SPEC_MODULE_NAME, "spec.py")
 evidence_module = _load(EVIDENCE_MODULE_NAME, "evidence.py")
+routing = _load(ROUTING_MODULE_NAME, "routing.py")
 
 # Источник событий движка в журнале: `engine`, а не `cli`/`api`/`ingest` — по нему
 # видно, что факт записал движок, а не человек и не проход по чужой доске.
@@ -493,6 +495,8 @@ def build_contract(
         else f"рабочий каталог попытки: {cwd} — писать только в него",
         f"отчёт — файл {report_to}; вопрос — полем question в нём "
         "(clarify в режиме --oneshot ответа не получает)",
+        "размечай вопрос: kind (fact | authority), risky (true) и default — "
+        "без разметки вопрос считается властным и уходит человеку",
     ]
     evidence: list[dict[str, Any]] = []
     for item in getattr(stage, "evidence", ()):
@@ -505,6 +509,8 @@ def build_contract(
         "allowed": list(stage_ask.allowed) if stage_ask is not None else [],
         "to_human": stage_ask.to_human if stage_ask is not None else "decisions_only",
         "max_hops": stage_ask.max_hops if stage_ask is not None else 0,
+        "risky": bool(getattr(stage_ask, "risky", False)),
+        "default": str(getattr(stage_ask, "default", "") or ""),
     }
     goal = str(deal.get("title") or "").strip()
     body = str(deal.get("body") or "").strip()
@@ -1193,8 +1199,11 @@ def run_stage(
         )
 
     question_id = None
+    question_target = ""
+    question_reason = ""
     if parked:
-        question_id = _parked(conn, deal, stage, attempt, result or {}, home, clock)
+        question_id, address = _parked(conn, deal, stage, attempt, result or {}, home, clock)
+        question_target, question_reason = address.address, address.reason
 
     return {
         "started": True,
@@ -1210,8 +1219,30 @@ def run_stage(
         "usage_tokens": followed.usage,
         "tools": followed.tools,
         "question_id": question_id,
+        "question_target": question_target,
+        "question_reason": question_reason,
         "verdict": verdict.as_payload() if verdict is not None else None,
     }
+
+
+def hops_done(conn: sqlite3.Connection, deal: Any, stage_id: str) -> int:
+    """Сколько передач по цепочке этот этап уже сделал — по журналу, не по счёту в памяти.
+
+    Считаются `question_asked` с адресом этого этапа (`payload.routing.stage`,
+    который пишет `_parked`): каждая такая запись — уже сделанный хоп
+    (`dashboard/routing.py`, правило `max_hops`). Вопросы, заданные до появления
+    адреса в журнале, не считаются: их этап неизвестен, и приписывать их
+    этому — догадка, из-за которой цепочка кончилась бы раньше объявленного.
+    """
+    count = 0
+    for event in journal.read_events(conn, str(deal["id"])):
+        if str(event.get("kind") or "") != "question_asked":
+            continue
+        address = journal.payload_of(event).get("routing")
+        if not isinstance(address, dict) or str(address.get("stage") or "") != stage_id:
+            continue
+        count += 1
+    return count
 
 
 def _parked(
@@ -1222,14 +1253,20 @@ def _parked(
     result: dict[str, Any],
     home: Path,
     clock: Callable[[], float],
-) -> Optional[int]:
+) -> tuple[int, Any]:
     """Попытка задала вопрос: единственный канал `ask()` и дело в `wait_human`.
 
     `clarify` внутри `--oneshot` ответа не получает (`undelivered`,
     `docs/PROBES.md`), поэтому вопрос задаёт движок, а не процесс; текст вопроса
     приходит в `result.json` полем `question`.
+
+    Адрес вопроса решает `routing.route()` — без модели и по объявлениям спеки:
+    фактовый вопрос — роли из `ask.allowed`, властный и неразмеченный — человеку,
+    исчерпанная цепочка — человеку, несуществующий адресат — человеку с
+    `routing_failed`. Здесь только исполнение: факт в пул и адрес в журнал.
     """
     question = result.get("question")
+    address = routing.route(stage, question, hops_done(conn, deal, stage.id))
     if isinstance(question, str):
         question = {"text": question}
     text = ""
@@ -1249,17 +1286,21 @@ def _parked(
         text,
         question.get("text_full") if isinstance(question, dict) else None,
         options or None,
+        routing={**address.as_payload(), "stage": stage.id, "attempt": int(attempt)},
     )
     deals.set_blocked(
         conn,
         str(deal["id"]),
         kind="needs_input",
-        reason=f"попытка {stage.id}#{attempt}: вопрос #{asked.question_id} без ответа",
+        reason=(
+            f"попытка {stage.id}#{attempt}: вопрос #{asked.question_id} "
+            f"адресован {address.address} ({address.reason}) — без ответа"
+        ),
         author=ENGINE_SOURCE,
         source=ENGINE_SOURCE,
         now=_now_sec(int(clock())),
     )
-    return int(asked.question_id)
+    return int(asked.question_id), address
 
 
 def step(

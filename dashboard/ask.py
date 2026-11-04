@@ -220,11 +220,17 @@ def ask(
     text_full: Optional[str],
     options: Optional[Iterable[str]] = None,
     critical: Optional[bool] = None,
+    routing: Optional[dict[str, Any]] = None,
 ) -> AskResult:
     """Задать вопрос по делу; вернуть id вопроса и что именно произошло.
 
     `conn` — соединение с журналом (`journal.open_journal`), `deal` — факты дела:
     обязательны `id`, `board` и `home` (корень Hermes, где лежит пул).
+
+    `routing` — адрес вопроса и причина решения (`dashboard/routing.py`): движок
+    знает этап и попытку, которые спросили, и кладёт их в факт `question_asked`.
+    В пул адрес не пишется: у пула своя схема, и возврат ответа держится на
+    `session_key` и `question_id`, а этап и попытка — свойство журнала.
 
     `critical=None` означает «решить по фактам журнала»: дело ждёт человека дольше
     `ASK_CRITICAL_SEC` — вопрос критичный, иначе у него есть срок
@@ -270,6 +276,7 @@ def ask(
             critical=int(live.get("critical") or 0),
             timeout=live.get("timeout"),
             ts=_iso_sec(live.get("created_at")) or int(time.time()),
+            routing=routing,
         )
         return AskResult(question_id=question_id, created=False, adopted=False)
 
@@ -298,6 +305,7 @@ def ask(
         critical=flag,
         timeout=timeout,
         ts=int(time.time()),
+        routing=routing,
     )
     return AskResult(question_id=question_id, created=True, adopted=False)
 
@@ -456,14 +464,29 @@ def _record_asked(
     critical: int,
     timeout: Any,
     ts: int,
+    routing: Optional[dict[str, Any]] = None,
 ) -> None:
     """Факт «вопрос создан» в журнал — после успешной вставки в пул, идемпотентно.
 
     Сбой журнала здесь — не 500: строка пула уже создана, и вызывающий обязан
     узнать, что вопрос есть, а факта нет. `AskError` говорит это словами, а
     повторное действие лечит расхождение идемпотентным ключом.
+
+    `routing` (адрес и причина решения) кладётся **вложенным** ключом
+    `payload.routing`, а не на верхний уровень: верхний уровень `payload` —
+    словарь пула (`question_id`, `session_key`), а `stage` верхнего уровня читают
+    `transit`/`journal.fold` как «событие относится к этапу». Адрес этапа знает
+    движок, и он же читает его оттуда — форма журнала от этого не меняется.
     """
     now = int(time.time())
+    payload: dict[str, Any] = {
+        "question_id": question_id,
+        "session_key": key,
+        "critical": critical,
+        "timeout": timeout,
+    }
+    if routing:
+        payload["routing"] = dict(routing)
     try:
         _journal().append(
             conn,
@@ -474,12 +497,7 @@ def _record_asked(
                     "deal_id": deal_id,
                     "board": board,
                     "kind": "question_asked",
-                    "payload": {
-                        "question_id": question_id,
-                        "session_key": key,
-                        "critical": critical,
-                        "timeout": timeout,
-                    },
+                    "payload": payload,
                     "source": ASK_SOURCE,
                     "idempotency_key": f"ask:{question_id}:question_asked",
                 }

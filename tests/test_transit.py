@@ -906,3 +906,121 @@ def test_deal_state_wait_gate_when_graph_stalls(spec: Any) -> None:
     assert decision.kind == "wait"
     assert decision.what == "gate"
     assert "нет-такого-этапа" in decision.reason
+
+
+# ------------------------------------------- решение человека: ответ и команда
+#
+# Запаркованное дело ждёт **решения**, а не ответа: `question_answered` закрывает
+# вопрос и попытку не поднимает, `unblocked` — решение продолжать. Слой обязан
+# назвать оба факта: иначе из строки ожидания не видно, что ответ уже есть и чего
+# именно не хватает (`docs/RUNBOOK.md`, «ответ — текст, решение — команда»).
+
+
+def parked(
+    stage: str = "impl",
+    question_id: int = 284,
+    attempts: int = 1,
+    limit: int = 1,
+    kind: str = "capability",
+) -> dict[str, Any]:
+    """Парковка дела как её пишет движок: `blocked` с `block_kind='parked'`.
+
+    Класс по умолчанию — `capability`: он не входит в `retry.on` спеки, поэтому
+    этап после отказа терминален (`failed`) — ровно так выглядит живая парковка,
+    и ответ человека до разбора этапа уже не доходит.
+    """
+    return ev(
+        "blocked",
+        stage,
+        block_kind="parked",
+        reason="Попытки исчерпаны: 1/1 capability",
+        park_reason="retries_exhausted",
+        kind=kind,
+        attempts=attempts,
+        limit=limit,
+        question_id=question_id,
+    )
+
+
+def unparked(previous_kind: str = "parked") -> dict[str, Any]:
+    """Решение человека продолжать: `unblocked` с видом снятой блокировки."""
+    return ev("unblocked", previous_kind=previous_kind, author="max")
+
+
+def test_parked_deal_without_answer_waits_for_the_human(spec: Any) -> None:
+    """Ответа нет — так и говорится: продолжение только решением человека."""
+    journal = [started("impl", 1), crashed("impl", 1, "contract"), parked(), deal_asked(284)]
+
+    decision = transit.next_stage(spec, journal, NOW)
+
+    assert (decision.kind, decision.what) == ("wait", transit.WAIT_PARKED)
+    assert "вопрос #284" in decision.reason
+    assert "продолжение — только решением человека" in decision.reason
+
+
+def test_parked_deal_with_answer_names_the_decision(spec: Any) -> None:
+    """Ответ получен — слой называет, чего не хватает: команды `duty decide`."""
+    journal = [
+        started("impl", 1),
+        crashed("impl", 1, "contract"),
+        parked(),
+        deal_asked(284),
+        deal_answered(284),
+    ]
+
+    decision = transit.next_stage(spec, journal, NOW)
+
+    assert (decision.kind, decision.what) == ("wait", transit.WAIT_PARKED)
+    assert "ответ #284 получен — нужно решение: duty decide d_probe continue|stop" in decision.reason
+
+
+def test_answer_to_a_parked_deal_does_not_raise_the_stage(spec: Any) -> None:
+    """Ответ попытку не поднимает: этап остаётся `failed`, дело — ждёт человека."""
+    journal = [
+        started("impl", 1),
+        crashed("impl", 1, "capability"),
+        parked(),
+        deal_asked(284),
+        deal_answered(284),
+    ]
+
+    states = transit.stage_states(spec, journal)
+
+    assert states["impl"].state == "failed"
+    assert transit.deal_state(spec, journal) == "wait_human"
+
+
+def test_answer_to_a_foreign_question_does_not_mark_the_park(spec: Any) -> None:
+    """Чужой ответ парковку не трогает: строка ожидания остаётся про человека."""
+    journal = [
+        started("impl", 1),
+        crashed("impl", 1, "contract"),
+        parked(),
+        deal_asked(284),
+        deal_answered(999),
+    ]
+
+    decision = transit.next_stage(spec, journal, NOW)
+
+    assert (decision.kind, decision.what) == ("wait", transit.WAIT_PARKED)
+    assert "продолжение — только решением человека" in decision.reason
+
+
+def test_decide_continue_after_park_runs_a_new_attempt(spec: Any) -> None:
+    """`continue` — решение человека: парковка снята, этап снова `pending`."""
+    journal = [
+        started("impl", 1),
+        crashed("impl", 1, "capability"),
+        parked(),
+        deal_asked(284),
+        deal_answered(284),
+        unparked(),
+    ]
+
+    decision = transit.next_stage(spec, journal, NOW)
+
+    assert decision.kind == "run"
+    assert decision.pair == [("impl", 2)]
+    states = transit.stage_states(spec, journal)
+    assert states["impl"].state == "pending"
+    assert states["impl"].failures == ()

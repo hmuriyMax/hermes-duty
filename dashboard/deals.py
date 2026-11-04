@@ -1054,6 +1054,128 @@ def complete_deal(
     return _apply(conn, deal, events, "done", now)
 
 
+# Решение человека, которым закрывается дело (`completed.payload.cause`). Класс
+# нужен, чтобы закрытие человеком не читалось как закрытие движком (у того в
+# payload `summary`) и чтобы «закрыто» отличалось от «остановлено» без разбора
+# текста причины.
+CLOSE_CAUSE_HUMAN = "closed_by_human"
+CLOSE_CAUSE_STOP = "stopped_by_human"
+
+# Два решения человека одной командой (`duty decide`): слова закрытого набора,
+# чтобы «продолжить» и «остановить» не угадывались по тексту ответа.
+DECISION_CONTINUE = "continue"
+DECISION_STOP = "stop"
+DECISION_WORDS = (DECISION_CONTINUE, DECISION_STOP)
+
+
+def close_deal(
+    conn: sqlite3.Connection,
+    deal_id: str,
+    *,
+    reason: str = "",
+    cause: str = CLOSE_CAUSE_HUMAN,
+    source: str = "cli",
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Закрыть дело решением человека: одно `completed` и строка дела.
+
+    Это вторая половина решения по запаркованному делу: движок паркует работу и
+    не поднимает её без человека, а «остановить» до 0.0.4 записать было нечем —
+    запаркованное дело с ответом «stop» оставалось запаркованным навсегда.
+
+    Payload называет, откуда закрыли, а не догадку о том: `cause` (кто решил),
+    `reason` (слова человека, как их сказали), `stage` (этап, если он был) и
+    `from` (состояние ожидания до закрытия). Схема `events` не меняется:
+    `completed` — существующий вид, отдельного «закрыто человеком» нет
+    (`docs/JOURNAL.md`).
+
+    Ключ идемпотентности считается от `cause` и `reason`, а не от payload:
+    `from` меняется после первого закрытия, и повтор того же вызова иначе
+    записал бы второй `completed`. Закрытие **другим** фактом (иная причина или
+    `complete` с итогом) — не повтор: дело уже терминально, и молча переписать
+    причину закрытия нельзя.
+    """
+    now = _now_sec() if now is None else int(now)
+    deal = _require_row(conn, deal_id)
+    _reject_archived(deal, "close")
+    text = " ".join(str(reason or "").split())
+    events = journal.read_events(conn, str(deal["id"]))
+    if str(deal["status"]) in CLOSED_STATUSES:
+        last = _last_completion(events)
+        if last is None or str(last.get("cause") or "") != cause or str(last.get("reason") or "") != text:
+            raise DealError(
+                f"close: дело {deal['id']} уже закрыто (status={deal['status']}) — "
+                "закрывать нечего, а причину закрытия не переписываем"
+            )
+    folded = journal.fold(events, now=now)
+    before = folded["state"] or str(deal["status"])
+    if folded.get("human_kind"):
+        before = f"{before}/{folded['human_kind']}"
+    stage = str((journal.parked_of(events) or {}).get("stage") or "")
+    if not stage:
+        for event in reversed(events):
+            candidate = str(journal.payload_of(event).get("stage") or "")
+            if candidate:
+                stage = candidate
+                break
+    payload: dict[str, Any] = {"cause": cause, "reason": text, "from": before}
+    if stage:
+        payload["stage"] = stage
+    event = _event(deal, "completed", payload, source, {"cause": cause, "reason": text}, now)
+    return _apply(conn, deal, [event], "done", now)
+
+
+def _last_completion(events: Iterable[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Payload последнего `completed` дела — чем именно оно закрыто."""
+    for event in reversed(list(events)):
+        if str(event.get("kind") or "") == "completed":
+            return journal.payload_of(event)
+    return None
+
+
+def decide_deal(
+    conn: sqlite3.Connection,
+    deal_id: str,
+    *,
+    decision: str,
+    reason: str = "",
+    author: str = "max",
+    source: str = "cli",
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Одно решение человека по делу, которое его ждёт: `continue` или `stop`.
+
+    Половин решения две, и обе — факты, которые уже есть: `continue` идёт тем же
+    путём, что `duty unblock` (`unblocked` со `previous_kind='parked'` снимает
+    парковку и поднимает этап), `stop` закрывает дело `completed` с
+    `cause='stopped_by_human'`. Своего набора правил здесь нет — команда только
+    выбирает, какой из двух путей позвать, чтобы человеку не помнить два.
+
+    Дело, которое человека не ждёт (не запарковано и не в `blocked`), — отказ
+    входа и **ни одной записи**: «закрыть» без открытого вопроса закрывало бы
+    работу, о которой никто не спрашивал.
+    """
+    now = _now_sec() if now is None else int(now)
+    deal = _require_row(conn, deal_id)
+    choice = " ".join(str(decision or "").lower().split())
+    if choice not in DECISION_WORDS:
+        raise DealError(
+            f"decide: решение {str(decision or '')!r} неизвестно — ожидалось "
+            f"{' или '.join(DECISION_WORDS)}"
+        )
+    parked = journal.parked_of(journal.read_events(conn, str(deal["id"])))
+    if parked is None and str(deal["status"]) != "blocked":
+        raise DealError(
+            f"decide {choice}: дело {deal['id']} не запарковано и не заблокировано "
+            f"(status={deal['status']}) — решения человека оно не ждёт"
+        )
+    if choice == DECISION_CONTINUE:
+        return set_unblocked(conn, deal_id, author=author, source=source, now=now)
+    return close_deal(
+        conn, str(deal["id"]), reason=reason, cause=CLOSE_CAUSE_STOP, source=source, now=now
+    )
+
+
 def request_review(
     conn: sqlite3.Connection,
     deal_id: str,

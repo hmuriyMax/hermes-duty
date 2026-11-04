@@ -391,6 +391,9 @@ class _Board:
     # Парковка — не состояние ожидания, а факт «попытки исчерпаны, человек решает»;
     # подъём автоматически запрещён, и это правило держится здесь.
     parked: Optional[dict[str, Any]] = None
+    # id дела из событий: нужен тексту решения («`duty decide <id>`»), и брать его
+    # из журнала честнее, чем передавать вторым аргументом — событие знает своё дело.
+    deal_id: str = ""
 
     def state_of(self, stage_id: str) -> str:
         """Состояние этапа или `wait_gate` для этапа, которого нет в спеке."""
@@ -776,6 +779,24 @@ def _deal_answer(board: _Board, payload: dict[str, Any]) -> None:
     node.reason = f"ответ #{asked}: новая попытка {node.attempt + 1}"
 
 
+def _park_answered(board: _Board, payload: dict[str, Any]) -> None:
+    """Запомнить, что ответ на вопрос парковки получен (а решения — ещё нет).
+
+    Считается до разбора этапа: этап запаркованного дела обычно `failed`, а это
+    терминальное состояние, и до ветки ответа разбор не дошёл бы. Сравнение по
+    `question_id` то же, что у остальных ответов: чужой ответ парковку не трогает,
+    а истёкший срок ответом не считается (`_expired`) — человек ничего не решал.
+    """
+    parked = board.parked
+    if parked is None or _expired(payload):
+        return
+    asked = str(parked.get("question_id") or "")
+    answered = _question_id(payload)
+    if asked and answered and asked != answered:
+        return
+    parked["answered"] = True
+
+
 def _park_fact(board: _Board, kind: str, payload: dict[str, Any]) -> None:
     """Парковка дела: `blocked` с `block_kind='parked'` и снятие её `unblocked`.
 
@@ -820,6 +841,8 @@ def _parked_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "limit": _int(payload.get("limit")),
         "reason": str(payload.get("park_reason") or payload.get("reason") or ""),
         "question_id": _question_id(payload),
+        # Ответ человека по вопросу парковки: `False` до `question_answered`.
+        "answered": False,
     }
 
 
@@ -838,6 +861,10 @@ def _fold(spec: Any, events: Iterable[Any]) -> _Board:
     for event in _ordered(events):
         kind = str(event.get("kind") or "")
         payload = _payload(event)
+        if not board.deal_id:
+            board.deal_id = str(event.get("deal_id") or "")
+        if kind == "question_answered":
+            _park_answered(board, payload)
         if kind in ("blocked", "unblocked"):
             # Парковка — факт **дела**, даже когда в payload назван этап: `blocked`
             # с `stage` не делает блок фактом этапа (`stage` в журнале блокировки —
@@ -1044,6 +1071,15 @@ def next_stage(spec: Any, events: Iterable[Any], now: Any) -> Decision:
 
     if board.parked is not None:
         parked = board.parked
+        # Ответ получен, а решение — нет: без этой половины фразы («продолжение —
+        # только решением человека») не видно, что ответ уже есть и чего не хватает.
+        tail = (
+            "; ответ #{} получен — нужно решение: duty decide {} continue|stop".format(
+                parked["question_id"], board.deal_id or "<id>"
+            )
+            if parked.get("answered")
+            else "; продолжение — только решением человека"
+        )
         return wait(
             WAIT_PARKED,
             "дело запарковано: {} на этапе {!r} — {}".format(
@@ -1052,7 +1088,7 @@ def next_stage(spec: Any, events: Iterable[Any], now: Any) -> Decision:
                 parked["reason"] or "попытки исчерпаны",
             )
             + (f"; вопрос #{parked['question_id']}" if parked["question_id"] else "")
-            + "; продолжение — только решением человека",
+            + tail,
         )
 
     states = _slice(spec, board)

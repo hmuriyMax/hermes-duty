@@ -606,6 +606,16 @@ QUESTION_LIMIT = 200
 # Длина текстовой выжимки payload'а события в ответе.
 SUMMARY_LIMIT = 240
 
+# Вид ожидания «человеку осталось выбрать решение» (`waiting.human_kind`):
+# ответ на вопрос запаркованного дела получен, и `continue|stop` пишется командой
+# (`duty decide`). Третий вид рядом с `question` (ждёт ответа) и `status` (ждёт
+# решения по статусу) — их не подменяет, а называет другой факт.
+DECISION_KIND = "decision"
+
+# Сколько символов ответа человека попадает в строку доказательства: решение
+# принимается по ответу, но таблица `duty now` не переносит строк.
+DECISION_ANSWER_LIMIT = 80
+
 # Сколько задач берёт экран «Здоровье» с доски. Это не срез «сейчас»: тут важна
 # доля, а не мгновенная картина, поэтому лимит больше. Сработавший лимит виден
 # как `truncated` доски и назван в `warnings[]` итога — молча урезать выборку
@@ -981,15 +991,20 @@ def _deal_waiting(
     kanban_waiting: dict[str, str],
     question: Optional[dict[str, Any]],
     journal_note: Optional[str],
+    *,
+    home: Optional[Path] = None,
+    deal_id: str = "",
 ) -> dict[str, Any]:
     """`waiting` дела: журнал первым, kanban — только с честной пометкой, откуда факт.
 
     `human_kind` отделяет два разных «нужен человек»: `question` — ждёт ответа на
-    вопрос, `status` — ждёт решения по статусу (блок, разбор, ревью, мердж). Это
-    закрывает п.5 заметки 0.0.2, где оба случая назывались «ждёт ответа».
+    вопрос, `status` — ждёт решения по статусу (блок, разбор, ревью, мердж), а
+    `decision` — ответ по запаркованному делу уже получен, и человеку осталось
+    выбрать `continue|stop` (`duty decide`). Это закрывает п.5 заметки 0.0.2, где
+    оба первых случая назывались «ждёт ответа».
     """
     if folded["state"] is not None:
-        return _journal_waiting(folded, question)
+        return _journal_waiting(folded, question, home=home, deal_id=deal_id)
     if journal_note:
         head = journal_note
     elif folded["reason"] == "empty":
@@ -1007,14 +1022,40 @@ def _deal_waiting(
     }
 
 
-def _journal_waiting(folded: dict[str, Any], question: Optional[dict[str, Any]]) -> dict[str, Any]:
+def _journal_waiting(
+    folded: dict[str, Any],
+    question: Optional[dict[str, Any]],
+    *,
+    home: Optional[Path] = None,
+    deal_id: str = "",
+) -> dict[str, Any]:
     """Состояние из журнала плюс живой вопрос пула, которого журнал ещё не знает.
 
     `ask()` станет единственным каналом вопросов и будет писать `question_asked`
     в журнал (W2). Пока журнал вопросов не знает, живой вопрос пула — факт, а не
     догадка, и он важнее прочих состояний (приоритет 1 таксономии); в `evidence`
     при этом сказано, что факт из пула, а не из журнала.
+
+    Запаркованное дело с полученным ответом (`wait_human/decision`) получает
+    строку решения: что именно человек ответил и какой командой это записать.
+    Текст ответа читается из пула (`ask.answer_of`, только чтение) — в журнале
+    его нет, и без него строка «ждёт решения» не отвечает на вопрос «чего не
+    хватает».
     """
+    waiting = _pool_waiting(folded, question)
+    if waiting.get("human_kind") != DECISION_KIND:
+        return waiting
+    parked = folded.get("parked") or {}
+    answer = None if home is None else ask.answer_of(home, parked.get("question_id"))
+    return {
+        **waiting,
+        "evidence": f"{waiting.get('evidence') or ''}; "
+        + _decision_line(deal_id, parked.get("question_id"), answer),
+    }
+
+
+def _pool_waiting(folded: dict[str, Any], question: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Состояние журнала и живой вопрос пула в одном ответе (до строки решения)."""
     state = folded["state"]
     human_kind = folded["human_kind"]
     if question is None or human_kind == "question":
@@ -1032,6 +1073,20 @@ def _journal_waiting(folded: dict[str, Any], question: Optional[dict[str, Any]])
     return {"state": state, "evidence": f"{folded['evidence']}; ещё: {pool_fact}", "human_kind": "question"}
 
 
+def _decision_line(deal_id: str, question_id: Any, answer: Optional[str]) -> str:
+    """Строка ожидания запаркованного дела с ответом: что ответили и что сделать.
+
+    Движок не угадывает решение по словам ответа (`docs/RUNBOOK.md`): текст
+    остаётся текстом, а решение приходит командой. Поэтому здесь названо и то и
+    другое — ответ как факт и команда как единственный способ его записать.
+    """
+    head = "" if not answer else answer[:DECISION_ANSWER_LIMIT] + (
+        "…" if len(answer) > DECISION_ANSWER_LIMIT else ""
+    )
+    said = f"ответ #{question_id or '—'} получен: {head}" if head else f"ответ #{question_id or '—'} получен"
+    return f"{said}; нужно решение: bin/duty decide {deal_id or '<id>'} continue|stop"
+
+
 def _board_deals(
     entry: dict[str, Any],
     now: int,
@@ -1039,6 +1094,7 @@ def _board_deals(
     pool_note: Optional[str],
     journal_events: dict[str, list[dict[str, Any]]],
     journal_note: Optional[str] = None,
+    home: Optional[Path] = None,
 ) -> dict[str, Any]:
     """Активные дела одной доски с лизингом, попыткой, последним действием и ожиданием.
 
@@ -1179,6 +1235,8 @@ def _board_deals(
             ),
             question,
             journal_note,
+            home=home,
+            deal_id=task_id,
         )
         deals.append(
             {
@@ -1290,6 +1348,9 @@ def _own_waiting(
     status: str,
     journal_note: Optional[str],
     pool_note: Optional[str],
+    *,
+    home: Optional[Path] = None,
+    deal_id: str = "",
 ) -> dict[str, Any]:
     """`waiting` своего дела: журнал первым, остальное — по `deals.status`.
 
@@ -1298,7 +1359,7 @@ def _own_waiting(
     `evidence` говорит, откуда взято состояние, — как и у наблюдаемых дел.
     """
     if folded["state"] is not None:
-        return _journal_waiting(folded, question)
+        return _journal_waiting(folded, question, home=home, deal_id=deal_id)
     if journal_note:
         head = journal_note
     else:
@@ -1322,6 +1383,7 @@ def _own_shaped(
     question: Optional[dict[str, Any]],
     journal_note: Optional[str],
     pool_note: Optional[str],
+    home: Optional[Path] = None,
 ) -> dict[str, Any]:
     """Дело своего store в той же форме, что дело kanban в `/now`.
 
@@ -1355,7 +1417,10 @@ def _own_shaped(
         # Этап и номер попытки — из журнала, как и у наблюдаемых дел: экран не
         # знает, откуда дело, и форма одна (`dashboard/stagefeed.py`).
         "stage": stagefeed.current(events, now),
-        "waiting": _own_waiting(folded, question, str(row["status"]), journal_note, pool_note),
+        "waiting": _own_waiting(
+            folded, question, str(row["status"]), journal_note, pool_note,
+            home=home, deal_id=str(row["id"]),
+        ),
         "_age_sec": _age_sec(row.get("created_at"), now),
     }
 
@@ -1398,6 +1463,7 @@ def _own_deals(
                     questions.get(str(row["id"])),
                     journal_note,
                     pool_note,
+                    home,
                 )
             )
         return out, []
@@ -1486,13 +1552,14 @@ def _own_response(
     pool_note: Optional[str] = None,
     journal_note: Optional[str] = None,
     spec: Optional[str] = None,
+    home: Optional[Path] = None,
 ) -> dict[str, Any]:
     """Полный ответ по делу своего store (та же форма, что `/deal`)."""
     deal_id = str(row["id"])
     events = journal.read_events(conn, deal_id)
     folded = journal.fold(events, now=now)
     shaped = (
-        _own_shaped(row, events, now, (questions or {}).get(deal_id), journal_note, pool_note)
+        _own_shaped(row, events, now, (questions or {}).get(deal_id), journal_note, pool_note, home)
         if folded["active"]
         else None
     )
@@ -1551,7 +1618,7 @@ def collect_now(
     items: list[dict[str, Any]] = []
     for entry in scope:
         try:
-            collected = _board_deals(entry, now, questions, pool_note, journal_events, journal_note)
+            collected = _board_deals(entry, now, questions, pool_note, journal_events, journal_note, home)
         except Exception as exc:  # noqa: BLE001 - любая ошибка доски не валит срез
             # Тип исключения важен: `ValueError` из чужой схемы (`int('soon')` по
             # `claim_expires`) иначе не отличить от сбоя БД. RuntimeError несёт
@@ -1911,7 +1978,7 @@ def deal(board: str, task_id: str, spec: Optional[str] = None) -> dict[str, Any]
     shaped: Optional[dict[str, Any]] = None
     if str(task.get("status") or "") not in TERMINAL_STATUSES:
         questions, pool_note, _ = _pool_context(home)
-        collected = _board_deals(entry, now, questions, pool_note, journal_events, journal_note)
+        collected = _board_deals(entry, now, questions, pool_note, journal_events, journal_note, home)
         shaped = next((item for item in collected["deals"] if item["id"] == task_id), None)
     feed = _stages_block(events, now, spec)
     return _deal_response(
@@ -2028,6 +2095,7 @@ def _own_deal(home: Path, board: str, deal_id: str, *, spec: Optional[str] = Non
             pool_note=pool_note,
             journal_note=journal_note,
             spec=spec,
+            home=home,
         )
     finally:
         conn.close()
@@ -2128,6 +2196,7 @@ def _mutation(conn: sqlite3.Connection, home: Path, result: dict[str, Any]) -> d
         questions=questions,
         pool_note=pool_note,
         journal_note=journal_note,
+        home=home,
     )
     body["mutation"] = {"events": result["events"], "idempotent": result["idempotent"]}
     if "attachment" in result:
@@ -2348,6 +2417,73 @@ def deals_changes(
         conn.close()
 
 
+def deals_decide(
+    home: Path, deal_id: str, payload: dict[str, Any], *, source: str = "api"
+) -> dict[str, Any]:
+    """`POST /deals/{id}/decide`: одно решение человека — `continue` или `stop`.
+
+    `stop` без `reason` закрывает дело словами самого человека: ответ пула — его
+    текст, и подставлять вместо него «решено остановить» значило бы переписать
+    ответ. Пул только читается (`ask.answer_of`); решения по тексту ответа никто
+    не выводит — оно приходит выбранным словом (`docs/RUNBOOK.md`).
+    """
+    conn = _store_for_write(home)
+    try:
+        decision = str(payload.get("decision") or "")
+        reason = str(payload.get("reason") or "")
+        if decision.strip().lower() == deals.DECISION_STOP and not reason.strip():
+            reason = _parked_answer(home, conn, deal_id) or ""
+        return _mutation(
+            conn,
+            home,
+            deals.decide_deal(
+                conn,
+                deal_id,
+                decision=decision,
+                reason=reason,
+                author=str(payload.get("author") or "max"),
+                source=source,
+            ),
+        )
+    finally:
+        conn.close()
+
+
+def deals_close(
+    home: Path, deal_id: str, payload: dict[str, Any], *, source: str = "api"
+) -> dict[str, Any]:
+    """`POST /deals/{id}/close`: закрыть дело решением человека (`completed`).
+
+    Одна транзакция: событие `completed` с `cause='closed_by_human'`, причиной
+    человека и состоянием ожидания до закрытия — и строка дела.
+    """
+    conn = _store_for_write(home)
+    try:
+        return _mutation(
+            conn,
+            home,
+            deals.close_deal(
+                conn, deal_id, reason=str(payload.get("reason") or ""), source=source
+            ),
+        )
+    finally:
+        conn.close()
+
+
+def _parked_answer(home: Path, conn: sqlite3.Connection, deal_id: str) -> Optional[str]:
+    """Текст ответа человека на вопрос открытой парковки — только чтение пула.
+
+    `decide stop` без причины закрывает дело словами человека, которые он уже
+    сказал в ответе: второй раз спрашивать нечего. Нет парковки, нет вопроса или
+    пул не прочитался — `None`, и `close` честно запишет пустую причину.
+    """
+    parked = journal.parked_of(journal.read_events(conn, deal_id)) or {}
+    question_id = parked.get("question_id")
+    if question_id is None:
+        return None
+    return ask.answer_of(home, question_id)
+
+
 def deals_attach(
     home: Path,
     deal_id: str,
@@ -2427,6 +2563,28 @@ def unblock_deal_route(deal_id: str, payload: dict[str, Any] = Body(default={}))
     """`POST /deals/{id}/unblock {}` → дело снова в очереди."""
     try:
         return deals_unblock(_hermes_home(), deal_id, payload or {})
+    except deals.DealError as exc:
+        return _deal_error(exc, None, deal_id)
+
+
+@router.post("/deals/{deal_id}/decide")
+def decide_deal_route(deal_id: str, payload: dict[str, Any] = Body(...)) -> Any:
+    """`POST /deals/{id}/decide {decision: continue|stop, reason?}` → факт решения.
+
+    `continue` — тот же факт, что `unblock`; `stop` — `completed` с
+    `cause='stopped_by_human'`. Оба идемпотентны: повтор не пишет второй факт.
+    """
+    try:
+        return deals_decide(_hermes_home(), deal_id, payload)
+    except deals.DealError as exc:
+        return _deal_error(exc, None, deal_id)
+
+
+@router.post("/deals/{deal_id}/close")
+def close_deal_route(deal_id: str, payload: dict[str, Any] = Body(default={})) -> Any:
+    """`POST /deals/{id}/close {reason}` → дело закрыто решением человека."""
+    try:
+        return deals_close(_hermes_home(), deal_id, payload or {})
     except deals.DealError as exc:
         return _deal_error(exc, None, deal_id)
 

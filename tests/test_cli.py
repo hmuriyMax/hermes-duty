@@ -79,7 +79,8 @@ CREATE TABLE task_events (
 CREATE TABLE task_links (parent_id TEXT NOT NULL, child_id TEXT NOT NULL);
 """
 
-# Схема пула: `_pool_questions` читает `status`, `session_key`, `text`, `text_full`.
+# Схема пула: `_pool_questions` читает `status`, `session_key`, `text`, `text_full`,
+# а `ask.answer_of` — текст ответа (`answer`) у запаркованного дела.
 POOL_SCHEMA = """
 CREATE TABLE questions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -88,7 +89,8 @@ CREATE TABLE questions (
     text_full   TEXT,
     origin      TEXT,
     status      TEXT,
-    kind        TEXT
+    kind        TEXT,
+    answer      TEXT
 );
 """
 
@@ -165,10 +167,19 @@ def make_pool(home: Path, rows=()) -> Path:
     conn = sqlite3.connect(path)
     conn.executescript(POOL_SCHEMA)
     for row in rows:
-        values = {"session_key": "t_000001", "text": "", "text_full": "", "origin": "duty", "status": "sent", "kind": "decision"}
+        values = {
+            "session_key": "t_000001",
+            "text": "",
+            "text_full": "",
+            "origin": "duty",
+            "status": "sent",
+            "kind": "decision",
+            "answer": None,
+        }
         values.update(row)
         conn.execute(
-            "INSERT INTO questions (session_key, text, text_full, origin, status, kind) VALUES (?,?,?,?,?,?)",
+            "INSERT INTO questions (session_key, text, text_full, origin, status, kind, answer)"
+            " VALUES (?,?,?,?,?,?,?)",
             tuple(values.values()),
         )
     conn.commit()
@@ -700,3 +711,264 @@ def test_help_without_command_is_not_an_error(capsys):
     code, out, _ = run([], capsys)
     assert code == cli.EXIT_OK
     assert "usage: duty" in out
+
+
+# --------------------------------------------- решение человека: close и decide
+#
+# Запаркованное дело ждёт **решения**, а не ответа: ответ приходит текстом
+# (`question_answered`), а `continue|stop` — командой. Эти тесты держат обе
+# половины: закрытие дела (`close`) и одну команду на оба решения (`decide`),
+# плюс границу «текст ответа — не сигнал» (`docs/RUNBOOK.md`).
+
+ANSWER = "stop: прогон закрыт координатором — это E2E-дело, продолжать не нужно"
+
+
+def own_deal(home: Path, *, title: str = "своё дело") -> str:
+    """Своё дело в store (`d_<hex>`): у него есть журнал и переходы."""
+    payload = cli.api().deals_create(home, {"board": "b1", "title": title}, source="cli")
+    return str(payload["id"])
+
+
+def park_deal(home: Path, deal_id: str, *, question_id: int = 293, answer: str = ANSWER) -> None:
+    """Запарковать дело как движок: вопрос, парковка и ответ человека в пуле.
+
+    Порядок фактов — журнальный: вопрос, парковка, ответ. Текст ответа живёт
+    только в пуле (`questions.answer`), в журнале остаётся `answer_len` — ровно
+    так их пишут `ask()` и `sync_answers`.
+    """
+    api = cli.api()
+    journal = cli._load_journal()
+    conn = api.deals.open_store(home)
+    assert conn is not None
+    try:
+        journal.append(
+            conn,
+            [
+                {
+                    "deal_id": deal_id,
+                    "board": "b1",
+                    "kind": "question_asked",
+                    "ts": NOW - 30,
+                    "recorded_at": NOW - 30,
+                    "source": "ask",
+                    "payload": {
+                        "question_id": question_id,
+                        "session_key": f"t_{deal_id}",
+                        "routing": {"target": "human", "reason": "risky", "stage": "verify", "attempt": 1},
+                    },
+                    "idempotency_key": f"test:{deal_id}:asked:{question_id}",
+                }
+            ],
+        )
+        api.deals.set_blocked(
+            conn,
+            deal_id,
+            kind="parked",
+            reason="Попытки исчерпаны: 1/1 contract на этапе verify",
+            author="engine",
+            source="engine",
+            details={
+                "kind": "contract",
+                "stage": "verify",
+                "attempts": 1,
+                "limit": 1,
+                "question_id": question_id,
+                "park_reason": "retries_exhausted",
+            },
+        )
+        journal.append(
+            conn,
+            [
+                {
+                    "deal_id": deal_id,
+                    "board": "b1",
+                    "kind": "question_answered",
+                    "ts": NOW - 10,
+                    "recorded_at": NOW - 10,
+                    "source": "ask",
+                    "payload": {"question_id": question_id, "answer_len": len(answer), "answered_via": "manual"},
+                    "idempotency_key": f"test:{deal_id}:answered:{question_id}",
+                }
+            ],
+        )
+    finally:
+        conn.close()
+    pool = sqlite3.connect(home / "messaging" / "pool.db")
+    try:
+        pool.execute(
+            "INSERT INTO questions (id, session_key, text, origin, status, kind, answer)"
+            " VALUES (?,?,?,'duty','answered','question',?)",
+            (question_id, f"t_{deal_id}", "вопрос по делу", answer),
+        )
+        pool.commit()
+    finally:
+        pool.close()
+
+
+def journal_events(home: Path, deal_id: str) -> list[dict]:
+    """События журнала дела — то, против чего сверяются тесты мутаций."""
+    journal = cli._load_journal()
+    conn = journal.open_journal(home, create=False)
+    assert conn is not None
+    try:
+        return journal.read_events(conn, deal_id)
+    finally:
+        conn.close()
+
+
+def deal_status(home: Path, deal_id: str) -> str:
+    """Статус своего дела из store — намерение жизненного цикла."""
+    api = cli.api()
+    conn = api.deals.open_store(home, create=False, readonly=True)
+    assert conn is not None
+    try:
+        row = api.deals.deal_row(conn, deal_id)
+        assert row is not None
+        return str(row["status"])
+    finally:
+        conn.close()
+
+
+def test_close_writes_completed_with_human_cause(home, frozen_now, capsys):
+    """`close` пишет один `completed` с причиной человека и закрывает дело."""
+    deal_id = own_deal(home)
+    park_deal(home, deal_id)
+
+    code, out, _ = run(["close", deal_id, "--reason", "прогон закрыт координатором"], capsys)
+
+    assert code == cli.EXIT_OK
+    assert "ЗАКРЫТО" in out and "done" in out
+    completed = [event for event in journal_events(home, deal_id) if event["kind"] == "completed"]
+    assert len(completed) == 1
+    payload = cli._load_journal().payload_of(completed[0])
+    assert payload["cause"] == "closed_by_human"
+    assert payload["reason"] == "прогон закрыт координатором"
+    assert payload["stage"] == "verify"
+    assert payload["from"] == "wait_human/decision"
+    assert deal_status(home, deal_id) == "done"
+    # Закрытое дело больше не в ожидающих: журнал говорит `completed`.
+    assert deal_id not in [item["id"] for item in cli.api().now()["deals"]]
+
+
+def test_close_is_idempotent(home, frozen_now, capsys):
+    """Повторный `close` с теми же словами не пишет второй факт."""
+    deal_id = own_deal(home)
+    park_deal(home, deal_id)
+
+    first, _, _ = run(["close", deal_id, "--reason", "закрыто"], capsys)
+    code, out, _ = run(["close", deal_id, "--reason", "закрыто"], capsys)
+
+    assert (first, code) == (cli.EXIT_OK, cli.EXIT_OK)
+    assert "событий записано: 0" in out and "повтор" in out
+    kinds = [event["kind"] for event in journal_events(home, deal_id)]
+    assert kinds.count("completed") == 1
+
+
+def test_close_refuses_to_rewrite_another_close(home, frozen_now, capsys):
+    """Закрытое другим фактом дело не перезакрывается молча."""
+    deal_id = own_deal(home)
+    park_deal(home, deal_id)
+    run(["close", deal_id, "--reason", "закрыто"], capsys)
+
+    code, _, err = run(["close", deal_id, "--reason", "другие слова"], capsys)
+
+    assert code == cli.EXIT_SOURCE
+    assert "уже закрыто" in err
+    assert [e["kind"] for e in journal_events(home, deal_id)].count("completed") == 1
+
+
+def test_decide_stop_closes_with_stopped_cause_and_the_answer_as_reason(home, frozen_now, capsys):
+    """`decide stop` без `--reason` закрывает дело словами самого человека."""
+    deal_id = own_deal(home)
+    park_deal(home, deal_id)
+
+    code, out, _ = run(["decide", deal_id, "stop"], capsys)
+
+    assert code == cli.EXIT_OK
+    assert "ОСТАНОВЛЕНО" in out
+    completed = [event for event in journal_events(home, deal_id) if event["kind"] == "completed"]
+    assert len(completed) == 1
+    payload = cli._load_journal().payload_of(completed[0])
+    assert payload["cause"] == "stopped_by_human"
+    assert payload["reason"] == ANSWER  # ответ человека, а не выдуманная причина
+    assert deal_status(home, deal_id) == "done"
+
+
+def test_decide_continue_unparks_the_deal(home, frozen_now, capsys):
+    """`decide continue` пишет тот же факт, что `unblock`: парковка снята."""
+    deal_id = own_deal(home)
+    park_deal(home, deal_id)
+
+    code, out, _ = run(["decide", deal_id, "continue"], capsys)
+
+    assert code == cli.EXIT_OK
+    assert "ПРОДОЛЖЕНО" in out
+    events = journal_events(home, deal_id)
+    last = cli._load_journal().payload_of(events[-1])
+    assert events[-1]["kind"] == "unblocked"
+    assert last["previous_kind"] == "parked"
+    assert deal_status(home, deal_id) in ("ready", "todo")
+    assert [e["kind"] for e in events].count("completed") == 0
+
+
+def test_decide_on_a_deal_nobody_asked_about_refuses_without_writing(home, frozen_now, capsys):
+    """Дело без парковки и без блока — отказ входа, а не тихая запись."""
+    deal_id = own_deal(home)
+    before = [event["kind"] for event in journal_events(home, deal_id)]
+
+    code, out, err = run(["decide", deal_id, "stop"], capsys)
+
+    assert code == cli.EXIT_SOURCE
+    assert out == ""
+    assert "не запарковано" in err and "status=ready" in err
+    assert [event["kind"] for event in journal_events(home, deal_id)] == before
+    assert deal_status(home, deal_id) == "ready"
+
+
+def test_decide_rejects_an_unknown_decision_word(home, frozen_now, capsys):
+    """Решений ровно два: иначе слово не решение, а опечатка."""
+    deal_id = own_deal(home)
+    park_deal(home, deal_id)
+
+    code, _, err = run(["decide", deal_id, "maybe"], capsys)
+
+    assert code == cli.EXIT_SOURCE
+    assert "неизвестно" in err and "continue" in err and "stop" in err
+    assert [e["kind"] for e in journal_events(home, deal_id)].count("completed") == 0
+
+
+def test_answer_text_is_not_a_command(home, frozen_now, capsys):
+    """`stop: …` в ответе пула — текст, а не сигнал: дело остаётся запаркованным."""
+    deal_id = own_deal(home)
+    park_deal(home, deal_id, answer="stop: закрываем, продолжать не нужно")
+
+    payload = cli.api().collect_now(home, NOW, ingest=True)
+    shown = next(item for item in payload["deals"] if item["id"] == deal_id)
+
+    assert shown["waiting"]["state"] == "wait_human"
+    assert shown["waiting"]["human_kind"] == "decision"
+    assert [e["kind"] for e in journal_events(home, deal_id)].count("completed") == 0
+    # Та же граница и во вторую сторону: `continue: …` тоже ничего не поднимает.
+    park_deal(home, own_deal(home), question_id=294, answer="continue: давай дальше")
+    assert len([item for item in cli.api().now()["deals"] if item["waiting"]["human_kind"] == "decision"]) == 2
+
+
+def test_evidence_names_the_answer_and_the_decision_command(home, frozen_now, capsys):
+    """Доказательство говорит, что ответ есть и чего не хватает: команды."""
+    deal_id = own_deal(home)
+    park_deal(home, deal_id)
+
+    code, out, _ = run(["why", "b1", deal_id], capsys)
+    evidence = next(
+        item for item in cli.api().now()["deals"] if item["id"] == deal_id
+    )["waiting"]["evidence"]
+
+    assert code == cli.EXIT_OK
+    assert "ответ #293 получен: stop: прогон закрыт координатором" in evidence
+    assert f"нужно решение: bin/duty decide {deal_id} continue|stop" in evidence
+    assert evidence in out  # CLI не переписывает текст бэкенда
+    # В таблице «сейчас» доказательство обрезано по ширине колонки, но состояние
+    # названо целиком: `wait_human/decision` — это и есть «ответ есть, решение нет».
+    code, out, _ = run(["now"], capsys)
+    assert code == cli.EXIT_OK
+    assert "wait_human/decision" in out

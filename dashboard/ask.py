@@ -177,6 +177,36 @@ def deal_id_of(key: str) -> Optional[str]:
     return None
 
 
+def answer_of(home: Path, question_id: Any) -> Optional[str]:
+    """Текст ответа человека на вопрос пула — только чтение, `None` без ответа.
+
+    Нужен поверхности: у запаркованного дела с полученным ответом доказательство
+    обязано назвать, **что именно** человек ответил, а журнал хранит только
+    `answer_len` (текст — факт пула, а не журнала). Возвращается одна строка:
+    переводы строк ломают таблицу `duty now`. Вопрос без ответа, чужой номер и
+    недоступный пул отвечают `None` — это «текста нет», а не ошибка чтения среза.
+    """
+    db = pool_path(Path(home))
+    if not db.is_file():
+        return None
+    try:
+        number = int(str(question_id).strip())
+    except (TypeError, ValueError):
+        return None
+    try:
+        conn = sqlite3.connect(
+            db.resolve().as_uri() + "?mode=ro", uri=True, timeout=BUSY_TIMEOUT_MS / 1000
+        )
+        try:
+            row = conn.execute("SELECT answer FROM questions WHERE id = ?", (number,)).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    text = "" if row is None or row[0] is None else " ".join(str(row[0]).split())
+    return text or None
+
+
 def find_live(home: Path, deal_id: str) -> Optional[dict[str, Any]]:
     """Живой вопрос дела в пуле (`pending`/`sent`) или `None`.
 

@@ -450,6 +450,21 @@ def build_parser() -> argparse.ArgumentParser:
     unblock = command("unblock", "снять блокировку своего дела")
     unblock.add_argument("deal_id")
 
+    # Решение человека одной командой (`docs/RUNBOOK.md`): `continue` — тот же
+    # факт, что `unblock`, `stop` — `completed` с `cause='stopped_by_human'`.
+    decide = command("decide", "решение человека по делу: continue (продолжить) | stop (закрыть)")
+    decide.add_argument("deal_id")
+    decide.add_argument("decision", help="continue — снять парковку и продолжить, stop — закрыть дело")
+    decide.add_argument(
+        "--reason",
+        default="",
+        help="слова решения: у `stop` без причины берётся ответ человека из пула",
+    )
+
+    close_cmd = command("close", "закрыть своё дело решением человека (`completed`, cause=closed_by_human)")
+    close_cmd.add_argument("deal_id")
+    close_cmd.add_argument("--reason", default="", help="почему закрыто — слова человека")
+
     claim = command("claim", "взять своё дело в работу")
     claim.add_argument("deal_id")
     claim.add_argument("--owner", help="профиль-владелец (по умолчанию HERMES_PROFILE или пользователь)")
@@ -1705,6 +1720,22 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.command == "unblock":
             return _mutate(
                 api().deals_unblock, "РАЗБЛОКИРОВАНО", api().hermes_home(), args.deal_id, {},
+                source="cli", as_json=args.json,
+            )
+        if args.command == "decide":
+            # Два решения — один вход: `continue` пишет тот же факт, что `unblock`,
+            # `stop` — `completed` с `cause='stopped_by_human'`. Правил здесь нет,
+            # команда только выбирает путь (`dashboard/deals.py`).
+            request = {"decision": args.decision, "reason": args.reason}
+            action = "ПРОДОЛЖЕНО" if args.decision.strip().lower() == "continue" else "ОСТАНОВЛЕНО"
+            return _mutate(
+                api().deals_decide, action, api().hermes_home(), args.deal_id, request,
+                source="cli", as_json=args.json,
+            )
+        if args.command == "close":
+            request = {"reason": args.reason}
+            return _mutate(
+                api().deals_close, "ЗАКРЫТО", api().hermes_home(), args.deal_id, request,
                 source="cli", as_json=args.json,
             )
         if args.command == "claim":

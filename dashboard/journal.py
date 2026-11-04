@@ -484,13 +484,23 @@ def fold(
         text = f"blocked: block_kind={block_kind or '—'}, причина: {_short(reason) or 'не записана'}"
         if block_kind == PARKED_BLOCK_KIND:
             parked_fact = _parked_fact(payload)
+            # Ответ человека на вопрос парковки: факт «ответ есть» без текста.
+            # Чем именно ответили, называет поверхность по пулу (`/now`,
+            # `/deal`): журнал хранит `answer_len`, а не текст ответа.
+            parked_fact["answered"] = _answered_question(ordered, parked_fact["question_id"])
+            # Ожидание называется по тому, чего не хватает: до ответа — решения
+            # человека, после — той же команды, и её называет поверхность
+            # (`ответ #N получен: …; нужно решение: bin/duty decide …`). Две
+            # половины одного факта не повторяются: «ждёт решения» поверх
+            # «ответ получен» читается как противоречие.
+            needs = "" if parked_fact["answered"] else " — ждёт решения человека"
             facts.setdefault("wait_human", []).append(
                 f"blocked: block_kind=parked, парковка: "
                 f"{parked_fact['attempts']}/{parked_fact['limit']} {parked_fact['kind']}"
                 f"{' на этапе ' + parked_fact['stage'] if parked_fact['stage'] else ''}, "
                 f"причина: {_short(reason) or 'не записана'}"
                 + (f", вопрос #{parked_fact['question_id']}" if parked_fact["question_id"] else "")
-                + " — ждёт решения человека"
+                + needs
             )
         elif block_kind == "capability" or any(word in reason.lower() for word in CAPABILITY_WORDS):
             facts.setdefault("capability", []).append(text)
@@ -611,6 +621,12 @@ def fold(
     human_kind = None
     if state == "wait_human":
         human_kind = "question" if question is not None else "status"
+        if question is None and parked_fact is not None and parked_fact["answered"]:
+            # Запаркованное дело с полученным ответом: человек нужен не как
+            # ответчик (ответ есть) и не «по статусу», а как тот, кто выбирает
+            # continue|stop (`duty decide`). Текст ответа живёт в пуле, а не в
+            # журнале, поэтому вид ожидания называют здесь, а слова — поверхность.
+            human_kind = "decision"
     return _verdict(
         True, state, _evidence(facts, state), "live_fact", last_kind, human_kind, progress, parked_fact
     )
@@ -736,7 +752,30 @@ def parked_of(events: Iterable[dict[str, Any]]) -> Optional[dict[str, Any]]:
     payload = _payload(block[1])
     if str(payload.get("block_kind") or "") != PARKED_BLOCK_KIND:
         return None
-    return _parked_fact(payload)
+    fact = _parked_fact(payload)
+    fact["answered"] = _answered_question(ordered, fact["question_id"])
+    return fact
+
+
+def _answered_question(ordered: list[dict[str, Any]], question_id: Any) -> bool:
+    """Получен ли ответ человека на вопрос парковки — по факту `question_answered`.
+
+    Текст ответа в журнале не хранится (`answer_len` — факт, а не текст): здесь
+    только «ответ есть», а чем именно ответили, называет поверхность по пулу.
+    Истёкший срок ответом не считается — его пишет `answered_via='expired'`, и
+    человек ничего не решал.
+    """
+    number = str(question_id or "")
+    if not number:
+        return False
+    for event in reversed(ordered):
+        if str(event.get("kind") or "") != "question_answered":
+            continue
+        payload = _payload(event)
+        if str(payload.get("question_id") or "") != number:
+            continue
+        return str(payload.get("answered_via") or "").strip().lower() != "expired"
+    return False
 
 
 def _parked_fact(payload: dict[str, Any]) -> dict[str, Any]:

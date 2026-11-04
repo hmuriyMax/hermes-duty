@@ -79,6 +79,24 @@ def _load_plugin_api() -> Any:
     return module
 
 
+DEMO_MODULE_NAME = "hermes_duty_demo"
+
+
+def _load_demo() -> Any:
+    """Загрузить `dashboard/demo.py` — прогон задачи по спеке (не роут)."""
+    loaded = sys.modules.get(DEMO_MODULE_NAME)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / "demo.py"
+    spec = importlib.util.spec_from_file_location(DEMO_MODULE_NAME, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise SourceFailure(f"demo module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[DEMO_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 _API: Any = None
 
 
@@ -290,6 +308,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     archive = command("archive", "пометить своё дело archived (PATCH {status: archived})")
     archive.add_argument("deal_id")
+
+    # Прогон задачи по спеке на песочном корне: не роут, а демонстрация модели
+    # (`dashboard/demo.py`). Живые БД только читаются — и это проверяется самим
+    # прогоном, поэтому команда безопасна для боевой машины.
+    demo = command("demo", "прогон дела по спеке на песочном корне (живые БД не трогает)")
+    demo.add_argument("--home", help="песочный корень (по умолчанию временный)")
+    demo.add_argument("--keep", action="store_true", help="не удалять песочный корень после прогона")
     return parser
 
 
@@ -863,6 +888,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             return run_watch(
                 args.interval, board=args.board, state=args.state, as_json=args.json, stream=out
             )
+        if args.command == "demo":
+            report = _load_demo().run_demo(
+                api(), home=Path(args.home) if args.home else None, keep=args.keep,
+                echo=None if args.json else (lambda line: print(line, file=out)),
+            )
+            _emit_json(report, out) if args.json else print(_load_demo().render_demo(report), file=out)
+            return EXIT_OK
         if args.command == "now":
             payload = _route(api().now, board=args.board, state=args.state)
             _emit_json(payload, out) if args.json else print(render_now(payload), file=out)

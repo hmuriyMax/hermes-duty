@@ -1,0 +1,40 @@
+# Спека дела — пример из целевой модели (`~/.hermes/widgets/duty-model.html`,
+# раздел «Как выглядит спека на настоящем деле»). Печатается прогоном
+# `bin/duty demo` целиком, чтобы было видно границу: учёт 0.0.3 — журнал,
+# вопрос, гейт, владение; исполнение спеки (этапы, спавн роли, проверка
+# evidence, ретраи) — движок 0.1.0.
+#
+# Файл не читается кодом 0.0.3 и не валидируется: движка ещё нет. Это образец
+# контракта, по которому прогон идёт руками, — чтобы спека и учёт не разъехались
+# в голове, пока движка нет.
+
+duty: sx-widgets-tristate
+repo: ~/GolandProjects/sx-widgets-api
+base: origin/master
+
+stages:
+  - id: impl
+    role: implementer
+    workspace: worktree      # отдельное дерево, чужое не трогаем
+    evidence:
+      - {cmd: "go build ./...", must: 0}
+      - {cmd: "go test ./widget/...", must: 0}
+
+  - id: verify
+    role: tester
+    needs: [impl]
+
+  - id: review
+    role: reviewer
+    needs: [verify]
+    verdict: {approve: done, changes: impl, max_rounds: 2}
+
+# Вопросы объявляются в спеке, а не решаются моделью на ходу: движок резолвит
+# объявленный адрес без модели (спека, раздел «Что объявляет спека»).
+questions:
+  impl:
+    ask:
+      allowed: [researcher, planner]   # фактовые — им
+      to_human: decisions_only         # властные — в пул, к человеку
+    max_hops: 2
+    budget: {tokens: 200k, minutes: 30}

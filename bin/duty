@@ -7,6 +7,7 @@
     bin/duty stats [--board B] [--since D]
     bin/duty why <board> <id>
     bin/duty watch [--interval 10]
+    bin/duty demo [--keep]
     --json  (глобальный флаг: ровно форма роута)
 
 Здесь только запуск: разбор команд, вызовы бэкенда и оформление живут в

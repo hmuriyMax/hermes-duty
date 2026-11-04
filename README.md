@@ -1,9 +1,11 @@
 # Hermes Duty — desktop-плагин «Дела» (P0: наблюдаемость)
 
 Плагин к Hermes Desktop: **дело** (duty) вместо карточки, **этап** вместо подзадачи,
-**попытка** вместо рана. P0 — только чтение: собирает лизинги и события из живых
-источников, показывает, кто что держит и что делает прямо сейчас. Ни одного файла
-ядра Hermes, ни одного патча, ни одной записи в существующие БД.
+**попытка** вместо рана. Начиналось с наблюдения: собрать лизинги и события из живых
+источников и показать, кто что держит и что делает прямо сейчас. В 0.0.3 к этому
+добавились свой журнал (`state = fold(events)`), свой store дел и CLI. Ядро Hermes не
+патчится, `kanban.db` и `state.db` открываются только на чтение — единственная запись в
+чужой файл идёт через `ask()` в пул вопросов, и только по явному запросу.
 
 ## Зачем
 
@@ -21,9 +23,10 @@ Duty выводит состояние из журнала (`state = fold(events
 
 ## Что уже работает (`v0.0.3`)
 
-Роуты (монтируются под `/api/plugins/hermes-duty`; источники открываются только на
-чтение, пишет плагин только в свой журнал `duty/duty.db` — по требованию — и в пул
-`messaging/pool.db` — единственным каналом вопросов `ask()`):
+Роуты (монтируются под `/api/plugins/hermes-duty`; чужие источники открываются только
+на чтение, пишет плагин только в свою БД `duty/duty.db` — журнал событий и store своих
+дел, по требованию и по явной мутации — и в пул `messaging/pool.db` единственным
+каналом вопросов `ask()`):
 
 | роут | что отдаёт | ошибки |
 |---|---|---|
@@ -34,8 +37,29 @@ Duty выводит состояние из журнала (`state = fold(events
 | `POST /ingest` | проход ingest: дописать в свой журнал недостающие события (`appended`, `events`, `deals`, отчёт по доскам, `errors[]`); в том же проходе — `answers` (ответы пула `question_answered`); повторный вызов — `appended: 0` | 503 — журнал не открылся |
 | `POST /ask/{board}/{task_id}` | вопрос по делу в пул (`origin='duty'`, `kind='decision'`) + событие `question_asked`; тело `{text, text_full, options, critical}`, ответ `{question_id, created, deduped, adopted, errors[]}`; живой вопрос по делу возвращается как есть (`deduped: true`), дубль в пуле не создаётся; подхваченный чужой вопрос (`origin != 'duty'`) отличается полем `adopted: true` и в журнал не пишется | 404 — нет доски/дела; 400 — пустой `text` или `options` не список строк; 503 — пул или журнал недоступны (`errors[]`) |
 | `GET /duty/{board}/{task_id}/attempts` | таймлайн попыток дела: раны, длительность, исход, ошибка, события | 404 — нет доски/дела; 503 — доска не читается |
-| `GET /deal/{board}/{task_id}` | одно дело: элемент `/now` (если оно активно), `body` спецификации, `terminal` | 404 — нет доски/дела; 503 — доска не читается |
-| `GET /stats` | здоровье: доля с первой попытки, распределение ожидания до неё (`waiting_sec`: p50/p90/p99, `count`, `max`), таксономия исходов по доскам и итогом | — (деградация в `errors[]`, неполная выборка — в `warnings[]`) |
+| `GET /deal/{board}/{task_id}` | одно дело: элемент `/now` (если оно активно), `body` спецификации, `terminal`, `comments[]`, `attachments[]`, `timeline[]`. `id` решается префиксом: `t_<hex>` — наблюдаемое дело kanban, `d_<hex>` — своё (store) | 404 — нет доски/дела; 503 — доска или store не читается |
+| `GET /stats?board=<slug>&since=<unix>` | здоровье: доля с первой попытки, распределение ожидания до неё (`waiting_sec`: p50/p90/p99, `count`, `max`), таксономия исходов по доскам и итогом; `?board=` — одна доска, `?since=` — только дела, созданные не раньше этой секунды | 404 — доски нет; — (деградация в `errors[]`, неполная выборка — в `warnings[]`) |
+| `POST /deals` | завести своё дело (`status=todo`, id `d_<hex>`): `{board, title, body?, assignee?, parents?[]}` | 400 — вход не тот; 503 — store не открылся |
+| `PATCH /deals/{id}` | правка спецификации (`title`/`body`/`assignee`) или `{status: archived}`; `origin` и `id` не меняются, смена статуса — только командами | 404 — дела нет; 400 — статус мимо команды |
+| `POST /deals/{id}/comment` | комментарий в своё дело: `{author, body}` | 404 — дела нет; 400 — пустой `body` |
+| `POST /deals/{id}/block` | блокировка: `{kind, reason}` (`block_kind`, по умолчанию `needs_input`) | 404 — дела нет; 400 — архивное дело |
+| `POST /deals/{id}/unblock` | снять блокировку | 404 — дела нет; 400 — архивное дело |
+| `POST /deals/{id}/claim` | взять в работу: `{owner}` | 404 — дела нет; 400 — архивное дело |
+| `POST /deals/{id}/complete` | закрыть дело или сдать в ревью: `{summary, review?, reviewer?}` | 404 — дела нет; 400 — архивное дело |
+| `POST /deals/{id}/review` | сдать в ревью: `{reviewer?, summary?}` | 404 — дела нет; 400 — архивное дело |
+| `POST /deals/{id}/changes` | вернуть на доработку: `{reason, reviewer?}` (причина обязательна) | 404 — дела нет; 400 — пустая причина |
+| `POST /deals/{id}/attach` | приложить файл (multipart `file`): метаданные в `attachments`, копия в `duty/attachments/<id>/` | 404 — дела нет; 400 — пустой файл |
+
+Мутации своих дел отвечают той же формой, что `GET /deal` (дело + факты + таймлайн),
+плюс блок `mutation: {events, idempotent}`: повтор того же вызова не плодит событий
+(`events: 0`, `idempotent: true`), а «делать нечего» — это ошибка входа с причиной.
+Контракт владения — `docs/OWNERSHIP.md`, правила журнала — `docs/JOURNAL.md`.
+
+**Два пространства id.** `t_<hex>` — дело kanban, которое плагин только наблюдает;
+`d_<hex>` — своё дело, которым он владеет. Префикс — единственный способ их различить
+в API, в CLI и на экранах: `d_` не ищется на доске kanban, `t_` — в своём store.
+Свои дела попадают в тот же срез `/now` и в те же счётчики досок (`boards[].own_deals`),
+поэтому «сколько дел» одно, а не два.
 
 `waiting` в `/now` и `/deal` считается **fold'ом по своему журналу** (контракт
 `docs/JOURNAL.md`): дело без событий считается по kanban, и `waiting.evidence`
@@ -74,6 +98,47 @@ Duty выводит состояние из журнала (`state = fold(events
 Недоступные доски и упавшие источники видны в ответе (`boards[].read`, `errors[]`)
 и на экранах — жёлтой полосой и списком в пустом состоянии.
 
+## CLI `bin/duty`
+
+Тот же бэкенд, что у роутов, но из терминала: команды вызывают те же функции
+(`dashboard/plugin_api.py`), а не ходят в HTTP и не пересчитывают состояния. `--json`
+печатает ответ роута дословно — второй формы у CLI нет, поэтому «терминал сказал одно,
+экран другое» невозможно по построению.
+
+```bash
+~/.hermes/plugins/hermes-duty/bin/duty now
+# в профильной оболочке (HERMES_HOME=~/.hermes/profiles/<role>) досок там нет — корень задаётся явно:
+HERMES_HOME=~/.hermes ~/.hermes/plugins/hermes-duty/bin/duty now
+```
+
+| команда | что делает |
+|---|---|
+| `duty now [--board B] [--state S]` | таблица активных дел: доска, `id`, состояние (у `wait_human` — с `/human_kind`), ожидание, возраст, доказательство |
+| `duty deal <board> <id>` | карточка дела: те же факты плюс таймлайн попыток |
+| `duty attempts <board> <id>` | только таймлайн попыток |
+| `duty stats [--board B] [--since D]` | p50/p90/p99 ожидания, исходы ранов, доля с первой попытки, таблица по доскам; `--since` — unix, `YYYY-MM-DD` или `YYYY-MM-DDTHH:MM` |
+| `duty why <board> <id>` | доказательство `waiting.evidence` словами бэкенда плюс факты, из которых оно собрано |
+| `duty watch [--interval 10] [--board B] [--state S]` | тот же `now`, перерисовка в терминале (в пайпе — блоками, без escape-последовательностей) |
+| `duty create --board B --title "…" [--body-file F] [--assignee ROLE] [--parent d_…]…` | завести своё дело; `--json` отдаёт `id` для следующих команд |
+| `duty comment d_… "текст" [--author …]` | комментарий в своё дело (`--author`, по умолчанию `max`) |
+| `duty block d_… [причина] [--kind needs_input]` | заблокировать своё дело |
+| `duty unblock d_…` | снять блокировку |
+| `duty claim d_… [--owner …]` | взять в работу (владелец — `--owner`, иначе `HERMES_PROFILE`, иначе пользователь ОС) |
+| `duty complete d_… [--summary …] [--review] [--reviewer …]` | закрыть дело или сдать в ревью |
+| `duty review d_… [--reviewer …] [--summary …]` | сдать в ревью |
+| `duty changes d_… "причина" [--reviewer …]` | вернуть на доработку |
+| `duty attach d_… FILE` | приложить файл (копия в `duty/attachments/<deal_id>/`) |
+| `duty archive d_…` | `PATCH {status: archived}` — архив назван командой |
+
+Коды возврата: `0` — ответ получен целиком и `errors[]` пуст; `1` — доски или дела нет
+(404 роута); `2` — источники не прочитались (503/400 роута или непустой `errors[]`)
+либо неверный вход мутации. `--json` работает и до команды, и после неё.
+
+Интерпретатор: `dashboard/plugin_api.py` импортирует `fastapi`, которого в системном
+`python3` нет, поэтому `bin/duty` перезапускает себя интерпретатором агента
+(`~/.hermes/hermes-agent/venv/bin/python3`, `~/.hermes/bvenv/bin/python3`). Свой путь —
+`DUTY_PYTHON=/path/to/python`.
+
 ## Структура
 
 ```
@@ -84,6 +149,8 @@ Duty выводит состояние из журнала (`state = fold(events
     manifest.json        # манифест dashboard-половины (api: plugin_api.py)
     plugin_api.py        # backend-роутер (FastAPI): роуты и kanban-факты
     journal.py           # свой журнал событий, fold и ingest (docs/JOURNAL.md)
+    deals.py             # свой store дел: мутации, гейт, комментарии, вложения (docs/OWNERSHIP.md)
+    cli.py               # CLI: разбор команд и оформление вывода поверх тех же роутов
     ask.py               # единственный канал вопросов: пул + question_asked/answered
   desktop/
     plugin.js            # четыре экрана (/duty) + пункт сайдбара «Дела»
@@ -92,9 +159,12 @@ Duty выводит состояние из журнала (`state = fold(events
     index.html           # веб-версия тех же экранов (не-/api путь /web/hermes-duty/)
     app.js               # SPA: #/now, #/why, #/health, #/deal/<board>/<id>
     styles.css           # авто-тема (prefers-color-scheme), как у hermes-tickets
+  bin/duty               # CLI: now/deal/attempts/stats/why/watch + мутации своих дел
   bin/duty-version       # версия: check / bump / finalize
   bin/duty-model-sync    # вшить model.js в plugin.js (загрузчик не резолвит ./)
   docs/DESIGN.md         # контракт P0: источники, роуты, таксономия, деградация
+  docs/JOURNAL.md        # контракт журнала: набор событий, fold, ingest, ask()
+  docs/OWNERSHIP.md      # контракт владения: store дел, мутации, id, инварианты
   docs/VERSIONING.md     # контракт версий и ритуал bin/duty-version
   docs/RUNBOOK.md        # как проверить плагин руками
   tests/                 # pytest (агрегатор, контракт роутов) + node --test (шейпер)
@@ -102,11 +172,12 @@ Duty выводит состояние из журнала (`state = fold(events
 
 ## Принципы P0
 
-1. **Только чтение чужого.** Источники открываются в режиме `?mode=ro`; плагин не
-   пишет ни в `kanban.db`, ни в `state.db`. Единственные файлы, которые он пишет, —
-   свой журнал `duty/duty.db` (по явному `POST /ingest` или `GET /now?ingest=1`) и
-   пул вопросов `messaging/pool.db` — и пул только через `ask()` (`dashboard/ask.py`),
-   по явному `POST /ask/{board}/{task_id}`.
+1. **Только чтение чужого.** Чужие источники открываются в режиме `?mode=ro`; плагин
+   не пишет ни в `kanban.db`, ни в `state.db` (инвариант проверяется тестом по `mtime`).
+   Что он пишет — только своё: БД `duty/duty.db` (журнал событий и store своих дел —
+   по явному `POST /ingest`/`GET /now?ingest=1` и по явным мутациям `/deals…`) и пул
+   вопросов `messaging/pool.db` — и пул только через `ask()` (`dashboard/ask.py`), по
+   явному `POST /ask/{board}/{task_id}`.
 2. **Источники не смешиваются с истиной.** Консоль не пересчитывает статусы карточек
    и не пытается «угадать» состояние — она показывает лизинг, процесс и последнее
    действие, как они записаны в источниках.
@@ -134,25 +205,39 @@ hermes plugins enable hermes-duty     # или Capabilities → Plugins в де�
 Из каталога плагина (`cd ~/.hermes/plugins/hermes-duty`):
 
 ```bash
-~/.hermes/hermes-agent/venv/bin/python -m pytest -q        # 42 passed
-node --test tests/model.test.mjs tests/web.test.mjs        # 30 pass
+~/.hermes/hermes-agent/venv/bin/python -m pytest -q        # 204 passed
+node --test tests/model.test.mjs tests/web.test.mjs        # 37 pass (28 + 9)
 bin/duty-model-sync --check                                # OK
 bin/duty-version check                                     # OK
+HERMES_HOME=~/.hermes bin/duty now                         # таблица дел, код 0
 ```
 
 Живой рендер смотрится в приложении (после включения плагина) и в браузере —
 `http://127.0.0.1:8360/duty`. Пошаговая проверка руками (включая «страница
 пустая» и «доска недоступна») — `docs/RUNBOOK.md`.
 
+Десктопная половина грузится как **ES-модуль**: загрузчик берёт `desktop/plugin.js`,
+подменяет импорты и делает `import(blob)`. Поэтому файл нельзя проверять как
+CommonJS — `node --check plugin.js` пропускает то, что валит парсер модуля (так в 0.0.3
+плагин на день выпал из приложения из-за висячей запятой). Синтаксис проверяет
+`tests/test_frontend_syntax.py`: он копирует `desktop/plugin.js` и
+`dashboard/web/app.js` в `.mjs` и разбирает их парсером модуля.
+
 ## Статус
 
-`v0.0.2` (в разработке) — четыре экрана (`Сейчас`, `Дело`, `Почему стоит`,
-`Здоровье`) в десктопе и в браузере поверх роутов `/now`, `/deal/{board}/{id}`,
-`/duty/{board}/{id}/attempts`, `/stats`; регрессия 42 pytest + 30 node.
+`v0.0.3` (в разработке) — свой журнал событий (`state = fold(events)`, `POST /ingest`,
+`journal` в `/health`), единственный канал вопросов `ask()`, CLI `bin/duty` (чтение и
+мутации), **владение делом** (свой store, мутации `/deals…`, id `d_<hex>`, контракт
+`docs/OWNERSHIP.md`) и перцентили ожидания p50/p90/p99 в `/stats`. Регрессия
+204 pytest + 37 node.
+
+`v0.0.2` — четыре экрана (`Сейчас`, `Дело`, `Почему стоит`, `Здоровье`) в десктопе и
+в браузере поверх роутов `/now`, `/deal/{board}/{id}`, `/duty/{board}/{id}/attempts`,
+`/stats`; регрессия 42 pytest + 30 node.
 
 `v0.0.1` (опубликована) — P0 в объёме «смотреть»: каркас плагина (манифесты),
 backend на read-only источниках, агрегатор `/now` с таксономией ожиданий,
 таймлайн попыток, desktop-страница `/duty`.
 
-Дальше (не сделано): CLI `bin/duty`, затем P1 — собственный журнал плагина вместо
-чтения kanban. План по версиям — `docs/DESIGN.md`, раздел «Дальше».
+Дальше (не сделано): движок — аренда, спавн воркеров, учёт попыток и ретраи в своём
+store. План по версиям — `docs/DESIGN.md`, раздел «Дальше».

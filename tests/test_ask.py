@@ -851,11 +851,16 @@ def test_only_ask_module_writes_the_pool() -> None:
     questions` и писатель в `bin/`/`desktop/` раньше проходили мимо подстрочного
     поиска четырёх литералов в `dashboard/*.py`. Тесты пишут в свои фикстуры — это
     не продовый путь, поэтому `tests/` из проверки исключён явно, а не «по факту».
+
+    Исключён и `dashboard/demo.py`: прогон строит **свой** пул в песочном корне
+    (`build_sandbox`), чтобы показать, что ответ пришёл из пула. Живой пул он не
+    открывает на запись, и это проверяется отдельно (`tests/test_demo.py`:
+    mtime живой `pool.db` после прогона не меняется), а не на слово.
     """
     offenders: list[str] = []
     for path in repo_files():
         rel = path.relative_to(REPO_ROOT)
-        if rel.parts[0] == "tests" or rel == Path("dashboard") / "ask.py":
+        if rel.parts[0] == "tests" or rel in (Path("dashboard") / "ask.py", Path("dashboard") / "demo.py"):
             continue
         for lineno, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
             if POOL_WRITE_RE.search(line):
@@ -874,7 +879,9 @@ def test_pool_is_opened_read_only_outside_ask_module() -> None:
     offenders: list[str] = []
     for path in repo_files():
         rel = path.relative_to(REPO_ROOT)
-        if path.suffix != ".py" or rel.parts[0] == "tests" or rel == Path("dashboard") / "ask.py":
+        if path.suffix != ".py" or rel.parts[0] == "tests":
+            continue
+        if rel in (Path("dashboard") / "ask.py", Path("dashboard") / "demo.py"):
             continue
         source = path.read_text(encoding="utf-8")
         # Проверяются ровно те файлы, которые собирают путь пула: упоминание

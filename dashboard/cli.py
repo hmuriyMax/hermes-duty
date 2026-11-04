@@ -6,6 +6,7 @@
     duty stats [--board B] [--since D]    p50/p90/p99, исходы, «с первой попытки»
     duty why <board> <id>                 доказательство словами бэкенда
     duty watch [--interval 10]            тот же `now`, перерисовка в терминале
+    duty spec check <file>                спека дела до запуска: OK или file:line: правило: текст
     --json (глобальный флаг)              машиночитаемый вывод: ровно форма роута
 
 Ни одного собственного правила здесь нет: команды вызывают те же функции, что и
@@ -80,6 +81,8 @@ def _load_plugin_api() -> Any:
 
 
 DEMO_MODULE_NAME = "hermes_duty_demo"
+# Имя модуля спеки: рядом с demo — `dashboard/` грузится по пути, не пакетом.
+SPEC_MODULE_NAME = "hermes_duty_spec"
 
 
 def _load_demo() -> Any:
@@ -93,6 +96,25 @@ def _load_demo() -> Any:
         raise SourceFailure(f"demo module not found: {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[DEMO_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_spec() -> Any:
+    """Загрузить `dashboard/spec.py` — загрузчик и валидатор спеки дела.
+
+    Спека проверяется тем же модулем, что будет читать её движок: у CLI нет
+    своего набора правил, только оформление вывода.
+    """
+    loaded = sys.modules.get(SPEC_MODULE_NAME)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / "spec.py"
+    spec = importlib.util.spec_from_file_location(SPEC_MODULE_NAME, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise SourceFailure(f"spec module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[SPEC_MODULE_NAME] = module
     spec.loader.exec_module(module)
     return module
 
@@ -315,6 +337,21 @@ def build_parser() -> argparse.ArgumentParser:
     demo = command("demo", "прогон дела по спеке на песочном корне (живые БД не трогает)")
     demo.add_argument("--home", help="песочный корень (по умолчанию временный)")
     demo.add_argument("--keep", action="store_true", help="не удалять песочный корень после прогона")
+
+    # Спека дела до запуска (`docs/SPEC.md`): единственная команда слоя описания.
+    # Правила живут в `dashboard/spec.py`, здесь только разбор argv и вывод.
+    spec = command("spec", "спека дела: проверка до запуска")
+    spec_commands = spec.add_subparsers(dest="spec_command", metavar="подкоманда")
+    check = spec_commands.add_parser(
+        "check", help="проверить duty.yaml: OK или отказы с file:line", description="проверить duty.yaml до запуска"
+    )
+    check.add_argument(
+        "--json",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="машиночитаемый вывод: ok и список отказов",
+    )
+    check.add_argument("file", help="путь к спеке (только абсолютный)")
     return parser
 
 
@@ -867,6 +904,82 @@ def _write(stream: Any, text: str) -> None:
     stream.flush()
 
 
+# ---------------------------------------------------------------- спека дела
+
+
+def _issue_dict(issue: Any) -> dict[str, Any]:
+    """Один отказ спеки в форме `--json`: те же поля, что печатает человек."""
+    return {
+        "path": str(issue.path),
+        "line": issue.line,
+        "rule": issue.rule,
+        "message": issue.message,
+        "severity": issue.severity,
+    }
+
+
+def spec_report(path: str) -> dict[str, Any]:
+    """Проверка спеки: тот же ответ для человека и для `--json`.
+
+    Правила целиком в `dashboard/spec.py`; здесь — только вызов и форма ответа.
+    Вход CLI приводится к абсолютному пути здесь: движок принимает только
+    абсолютный (иначе «откуда взялась спека» не восстановить в журнале), а
+    человек у терминала вправе написать `examples/duty.yaml` — в ответе он
+    увидит, какой именно файл проверен.
+
+    Нечитаемая спека (путь, YAML, нет `duty`/`stages`) — не список отказов, а
+    отсутствие спеки: она помечается `unreadable`, код возврата 2.
+    """
+    module = _load_spec()
+    absolute = Path(path).expanduser().resolve()
+    payload: dict[str, Any] = {
+        "ok": False,
+        "path": str(absolute),
+        "duty": "",
+        "stages": 0,
+        "errors": 0,
+        "warnings": 0,
+        "issues": [],
+    }
+    try:
+        spec = module.load_spec(absolute)
+    except module.SpecError as exc:
+        payload["issues"] = [_issue_dict(exc.issue())]
+        payload["errors"] = 1
+        payload["unreadable"] = True
+        return payload
+    issues = module.validate_spec(spec) + module.check_base(spec)
+    payload["path"] = str(spec.path)
+    payload["duty"] = spec.duty
+    payload["stages"] = len(spec.stages)
+    payload["issues"] = [_issue_dict(issue) for issue in issues]
+    payload["errors"] = len(module.errors(issues))
+    payload["warnings"] = len(issues) - payload["errors"]
+    payload["ok"] = payload["errors"] == 0
+    return payload
+
+
+def render_spec_check(payload: dict[str, Any]) -> str:
+    """`file:line: правило: текст` — либо `OK` (предупреждения печатаются и при OK)."""
+    lines = [
+        f"{issue['path']}:{issue['line']}: {issue['rule']}: {issue['message']}"
+        for issue in payload.get("issues") or []
+    ]
+    if payload.get("ok"):
+        head = f"OK {payload['path']} · дело {payload['duty']} · этапов {payload['stages']}"
+        return "\n".join([head] + lines)
+    if payload.get("unreadable"):
+        return "\n".join(lines + [f"ОТКАЗ · спека не читается: {payload['path']}"])
+    return "\n".join(lines + [f"ОТКАЗ · ошибок {payload['errors']}, предупреждений {payload['warnings']}"])
+
+
+def spec_exit_code(payload: dict[str, Any]) -> int:
+    """0 — спека годна, 1 — отказы правил, 2 — спека не читается вовсе."""
+    if payload.get("unreadable"):
+        return EXIT_SOURCE
+    return EXIT_OK if payload.get("ok") else EXIT_NOT_FOUND
+
+
 # ------------------------------------------------------------------------ main
 
 
@@ -905,6 +1018,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             payload = _route(api().stats, board=args.board, since=args.since)
             _emit_json(payload, out) if args.json else print(render_stats(payload), file=out)
             return _payload_code(payload)
+        if args.command == "spec":
+            if getattr(args, "spec_command", None) != "check":
+                print("! нужна подкоманда: duty spec check <file>", file=sys.stderr)
+                return EXIT_SOURCE
+            payload = spec_report(args.file)
+            _emit_json(payload, out) if args.json else print(render_spec_check(payload), file=out)
+            return spec_exit_code(payload)
         if args.command == "attempts":
             payload = _route(api().duty_attempts, args.board, args.task_id)
             _emit_json(payload, out) if args.json else print(render_attempts(payload), file=out)

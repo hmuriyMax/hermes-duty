@@ -1,0 +1,50 @@
+# Спека дела — полный вид, ровно тот пример, что в спеке-источнике
+# (`~/.hermes/widgets/duty-model.html`, раздел «Как выглядит спека на настоящем
+# деле»). Проверяется тестом (`tests/test_spec.py`) и командой
+# `bin/duty spec check examples/duty.yaml` — файл не декорация, а фикстура.
+#
+# Читается как правило (контракт — `docs/SPEC.md`):
+#   duty    — имя дела, уникальное в пределах репозитория;
+#   repo    — репозиторий дела, абсолютный путь (`~` разворачивается);
+#   base    — от чего отводится дерево попытки (`git rev-parse --verify` в repo);
+#   stages  — этапы: кто, что доказывает, куда возвращает приговор, куда идёт вопрос.
+#
+# Поля этапа, которых здесь нет, берут значения по умолчанию: `workspace: none`
+# (этап только читает и выносит приговор), без evidence/ask/verdict.
+
+duty: sx-widgets-tristate
+repo: ~/GolandProjects/sx-widgets-api
+base: origin/master
+
+stages:
+  - id: impl
+    role: implementer
+    workspace: worktree             # отдельное дерево, чужое не трогаем
+    evidence:
+      - {cmd: "go build ./...", must: 0}
+      - {cmd: "go test ./widget/...", must: 0, timeout_sec: 600}
+    retry: {max: 2, on: [infra, contract]}   # классификация — из exit-кода/result.json
+    budget: {tokens: 200000, minutes: 30}
+    ask:
+      allowed: [researcher, planner]  # фактовые вопросы — ролям
+      to_human: decisions_only        # властные — в пул
+      max_hops: 2
+
+  - id: verify
+    role: tester
+    needs: [impl]
+
+  - id: review
+    role: reviewer
+    needs: [verify]
+    verdict: {approve: next, changes: impl, max_rounds: 2}   # approve: next|<stage-id>
+
+  - id: publish
+    role: publisher
+    needs: [review]
+    ask: {q: "Публикуем diff?", options: ["пушить", "стоп"], risky: true}
+
+  - id: docs
+    role: documenter
+    needs: [review]
+    parallel_with: [publish]

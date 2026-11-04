@@ -118,6 +118,7 @@ HERMES_HOME=~/.hermes ~/.hermes/plugins/hermes-duty/bin/duty now
 | `duty attempts <board> <id>` | только таймлайн попыток |
 | `duty stats [--board B] [--since D]` | p50/p90/p99 ожидания, исходы ранов, доля с первой попытки, таблица по доскам; `--since` — unix, `YYYY-MM-DD` или `YYYY-MM-DDTHH:MM` |
 | `duty why <board> <id>` | доказательство `waiting.evidence` словами бэкенда плюс факты, из которых оно собрано |
+| `duty spec check <file> [--json]` | спека дела **до запуска**: `OK` либо `file:line: правило: текст`; правила — `docs/SPEC.md`, ни одного процесса (кроме `git rev-parse` для `base`). Коды: `0` годна, `1` есть отказы, `2` спека не читается |
 | `duty demo [--home DIR] [--keep]` | прогон одного дела по спеке на **песочном корне** (временный каталог): create → claim → ask → answer → gate → comment/attach → ingest → complete → late answer. Сам проверяет 7 инвариантов (вопрос уводит в `wait_human`, ответ возвращает в работу, гейт открывается завершением родителя, закрытое дело уходит из `/now`, поздний ответ не воскрешает, повторный ingest не плодит, `kanban.db` не изменился) и печатает границу «чего ещё нет до движка 0.1.0». Живые БД только читаются; `--keep` оставляет песочницу для разбора |
 | `duty watch [--interval 10] [--board B] [--state S]` | тот же `now`, перерисовка в терминале (в пайпе — блоками, без escape-последовательностей) |
 | `duty create --board B --title "…" [--body-file F] [--assignee ROLE] [--parent d_…]…` | завести своё дело; `--json` отдаёт `id` для следующих команд |
@@ -161,6 +162,7 @@ HERMES_HOME=~/.hermes ~/.hermes/plugins/hermes-duty/bin/duty now
     deals.py             # свой store дел: мутации, гейт, комментарии, вложения (docs/OWNERSHIP.md)
     cli.py               # CLI: разбор команд и оформление вывода поверх тех же роутов
     demo.py              # прогон дела по спеке на песочном корне (bin/duty demo)
+    spec.py              # спека дела: загрузчик duty.yaml и валидатор до запуска (docs/SPEC.md)
     ask.py               # единственный канал вопросов: пул + question_asked/answered
   desktop/
     plugin.js            # четыре экрана (/duty) + пункт сайдбара «Дела»
@@ -177,8 +179,11 @@ HERMES_HOME=~/.hermes ~/.hermes/plugins/hermes-duty/bin/duty now
   docs/OWNERSHIP.md      # контракт владения: store дел, мутации, id, инварианты
   docs/VERSIONING.md     # контракт версий и ритуал bin/duty-version
   docs/RUNBOOK.md        # как проверить плагин руками
+  docs/SPEC.md           # контракт формата duty.yaml: поля и правила отказа до запуска
   examples/demo.yaml     # спека-образец для прогона (не читается кодом: движка 0.1.0 нет)
-  tests/                 # pytest (агрегатор, контракт роутов) + node --test (шейпер)
+  examples/duty.yaml     # полный вид duty.yaml из спеки-источника (проверяется test_spec)
+  examples/duty-minimal.yaml  # минимум: два этапа, без evidence/ask
+  tests/                 # pytest (агрегатор, контракт роутов, спека) + node --test (шейпер)
 ```
 
 ## Принципы P0

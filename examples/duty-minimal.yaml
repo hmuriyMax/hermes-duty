@@ -1,0 +1,23 @@
+# Спека дела — минимум, при котором дело уже имеет смысл: два этапа и один
+# приговор. Проверяется тем же тестом и той же командой:
+# `bin/duty spec check examples/duty-minimal.yaml`.
+#
+# Чего здесь нет и почему это законно:
+#   repo/base     — ни один этап не просит `workspace: worktree`;
+#   evidence      — этап без доказательств допустим (движку тогда нечего проверять);
+#   ask/budget    — вопросов и бюджета спека не объявляет;
+#   parallel_with — этапы идут строго по цепочке needs.
+#
+# Что остаётся обязательным: единственный вход (`impl` без needs), все этапы
+# достижимы от него, `verdict.changes` ведёт назад к предшественнику (иначе
+# возврат на доработку перескочил бы ревью).
+
+duty: fix-typo-in-header
+stages:
+  - id: impl
+    role: implementer
+
+  - id: review
+    role: reviewer
+    needs: [impl]
+    verdict: {approve: next, changes: impl, max_rounds: 1}

@@ -373,7 +373,12 @@ def prepare_tree(spec: Any, stage: Any, workdir: Path) -> tuple[Optional[Path], 
     if stage.workspace == "worktree":
         repo = Path(str(spec.repo or "")).expanduser()
         tree = workdir / "tree"
-        code, reason = _git(["worktree", "add", str(tree), str(spec.base or "")], repo)
+        # `--detach`: база — это коммит, а не ветка. Ветка может быть уже занята
+        # другим деревом (главный checkout, дерево прошлой попытки), и тогда
+        # `git worktree add <путь> <ветка>` отказывает «is already used by
+        # worktree». Попытка всегда отводится от коммита, поэтому detach —
+        # не обход, а верная модель: ветку двигает не попытка, а публикация.
+        code, reason = _git(["worktree", "add", "--detach", str(tree), str(spec.base or "")], repo)
         if code != 0:
             raise RunnerError(f"git worktree add {tree} от {spec.base!r} в {repo}: {reason or code}")
         return tree, tree

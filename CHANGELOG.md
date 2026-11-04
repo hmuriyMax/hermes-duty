@@ -123,7 +123,7 @@
   и ссылкой на панель пула `/imsg`. Ни прогресс-баров, ни кнопок: экран ничего не
   решает. Шейпер один на две поверхности (`shapeStages` в `desktop/model.js`,
   вшит в `plugin.js` через `bin/duty-model-sync`).
-- `tests/test_stagefeed.py` — 14 кейсов: две попытки (одна упала отказом
+- `tests/test_stagefeed.py` — 15 кейсов: две попытки (одна упала отказом
   контракта), дело без попыток, дело без спеки и с нечитаемой спекой, мёртвая
   попытка против «живость неизвестна», `/now.stage`, read-only по mtime/sha/строкам,
   `settled_only` с `-wal` и без, и grep-тест «в `stagefeed.py` нет доступа к
@@ -210,7 +210,7 @@
   #91»), а не пустым местом. `dashboard/demo.py`: граница «чего ещё нет» больше не
   перечисляет реализованное (этапы, лизинг, спавн, evidence, ретраи) — остались
   reap и декомпозиция.
-- `tests/test_failures.py` — 33 кейса: по тесту на источник и класс, «классы не
+- `tests/test_failures.py` — 34 кейса: по тесту на источник и класс, «классы не
   протекают друг в друга», `max: 0` паркует сразу, `on: [contract]` не повторяет
   `infra`, счётчик не смешивается, пауза растёт и упирается в потолок,
   `too_many_failures` после шести попыток, парковка создаёт вопрос и видна в `/now`
@@ -406,12 +406,33 @@
 - `examples/duty-minimal.yaml` — у `review` теперь явный `workspace: none`:
   минимум без `repo`/`base` иначе невалиден (умолчание `worktree` требует, чтобы
   дерево было от чего отвести).
-- `tests/test_spec.py` (9 кейсов: умолчание у этапа с `needs` и у входа, явный
+- `tests/test_spec.py` (8 кейсов: умолчание у этапа с `needs` и у входа, явный
   `none` с предупреждением и без него, предупреждение не делает спеку невалидной,
   отказ без `repo` называет умолчание, CLI печатает строку дерева и предупреждение
   отдельной строкой с кодом 0), `tests/test_evidence.py` (4 кейса на мерку и
   подсказку) и `tests/test_worktree_base.py` (движок отводит дерево второму этапу
   без объявленного `workspace` — артефакт `impl` в нём есть).
+
+**Решение человека по запаркованному делу: `decide continue|stop` и `close`**
+
+- `bin/duty decide <дело> continue|stop` — решение человека, отдельное от ответа:
+  ответ в пуле фиксирует, **что** человек сказал, а продолжить или остановить — это
+  команда. `continue` пишет `unblocked` со `previous_kind='parked'` и сбрасывает
+  счётчики класса (иначе первый же новый отказ снова упёрся бы в исчерпанный лимит);
+  `stop` закрывает дело фактом `completed` с `cause='stopped_by_human'` и причиной —
+  текстом ответа из пула (пул недоступен — причина пустая, а не выдуманная).
+- `bin/duty close <дело> --reason "…"` — закрытие **не** решением, а по обстоятельствам
+  (дубль, ошибка, дело больше не нужно): `completed` с `cause='closed_by_human'`, чтобы
+  в журнале было видно, что закрыл человек. Перезакрыть другой причиной нельзя — это
+  отказ входа, а не тихая правка истории.
+- Граница, которую нельзя размывать: текст ответа **не парсится** как команда
+  (`stop: …` в объяснении ничего не значит — человек объяснял, почему), и
+  запаркованное дело не закрывается по таймауту: «никто не ответил» ≠ «решено
+  остановить».
+- Тесты — `tests/test_cli.py` (+9 кейсов: идемпотентность обеих команд, `cause`,
+  отказ перезакрытия, `decide stop` без ответа) и `tests/test_transit.py` (+5 кейсов:
+  парковка держится до `unblocked` со `previous_kind='parked'`, ответ в пуле попытку не
+  поднимает, счётчики класса сбрасываются). После этого шага — 577 passed, 1 skipped.
 
 ### Изменено
 
@@ -474,6 +495,32 @@
 
 ### Исправлено
 
+- `dashboard/runner.py` (W14, `44a5fe9`): дерево **каждого** этапа отводилось от
+  `spec.base`, и второй этап получал чистое дерево — цепочка `impl → verify → review`
+  была неисполнима в принципе (живой прогон `d_a2a26b55`: `verify` отказал
+  `artifact.missing` на файле, который сделал `impl`). База стала базой **этапа**
+  (`base_of_stage`), принятую работу движок фиксирует сам (`commit_tree`), `base` и
+  `commit` поехали в события попытки; разбор — в «Этап отводится от коммита
+  предшественника».
+- `dashboard/runner.py` (`d09713a`): `git worktree add <каталог> <ветка>` отказывал
+  `is already used by worktree`, когда ветку уже отвёл другой worktree, — попытка
+  падала `infra` ещё до спавна. Дерево попытки отводится `--detach` от коммита базы,
+  ветку двигает публикация, а не попытка. Регрессия — `tests/test_worktree_base.py`.
+- `dashboard/driver.py` (W15, `4c91f7e`): движок не видел ответов пула — `sync_answers`
+  звали роуты и `demo`, а драйвер нет, поэтому `bin/duty run --once` снова говорил
+  «ждём вопрос #N» по уже отвеченному вопросу, и дело навсегда оставалось
+  `wait_human`. Теперь синк идёт перед каждым решением (и в `--once`, сразу после
+  `reaper.sweep` и до `transit.next_stage`), `answers`/`answers_errors` — в отчёте
+  прогона, блок `needs_input` снимает шаг движка (`close_answered_block`). Разбор — в
+  «Ответ пула двигает дело».
+- `dashboard/reaper.py` (W12, `02724eb`): попытка без `attempt_ended` оставалась двумя
+  правдами — срез (`fold`, смотрит pid) говорил `crashed`, переход
+  (`transit.stage_states`, только журнал) говорил «попытка идёт», и закрыть её было
+  некому. Теперь по сроку пишется `attempt_ended` с `kind=infra` и `reaped: true`,
+  лизинг умершей попытки отпускается; живой лизинг не трогается (`ps` уборка не
+  смотрит). Драйвер зовёт `reaper.sweep` перед каждым решением, `bin/duty reap
+  [--dry-run]` — то же вручную. Разбор — в «Осиротевшая попытка закрывается движком».
+
 - `dashboard/evidence.py`: отказ `artifact.missing` называет мерку — `файла нет:
   <путь>; искали относительно <дерево|каталог попытки>`. Если файл нашёлся в дереве
   попытки, отказ добавляет подсказку «укажи workspace: worktree, чтобы работать в
@@ -501,19 +548,21 @@
 
 | прогон | результат |
 |---|---|
-| `pytest tests/ -q` | `555 passed, 1 skipped` (skip — живой прогон под `@pytest.mark.live`, включается `pytest -m live`) |
+| `pytest tests/ -q` | `602 passed, 1 skipped` (skip — живой прогон под `@pytest.mark.live`, включается `pytest -m live`) |
 | `node --test tests/model.test.mjs` | `37 pass` |
 | `node --test tests/web.test.mjs` | `12 pass` |
 | `bin/duty demo` | 7 проверок OK, код 0 |
-| `bin/duty-version check` | OK |
+| `bin/duty-version check` | OK (0.0.4 в трёх файлах, ветка `release/v0.0.4`) |
 | `hermes plugins validate .` | Validation passed |
+| `bin/duty spec check examples/duty.yaml` / `examples/duty-minimal.yaml` | OK, код 0 |
 
-По файлам (собрано 556 = 555 passed + 1 skipped): `test_spec` 72, `test_journal`
-61, `test_runner` 52, `test_transit` 51, `test_deals` 50, `test_cli` 37,
-`test_failures` 34, `test_aggregate` 30, `test_evidence` 30, `test_ask` 29,
-`test_routing` 25, `test_driver` 22, `test_reaper` 16, `test_stagefeed` 15,
-`test_screens` 12, `test_demo` 9, `test_p0_contract` 6, `test_frontend_syntax` 2,
-`test_worktree_base` 3.
+По файлам (собрано 603 = 602 passed + 1 skipped, снято `pytest --collect-only` на
+вершине `release/v0.0.4` после W18): `test_spec` 80, `test_journal` 61, `test_transit` 56,
+`test_runner` 52, `test_deals` 59, `test_cli` 49, `test_evidence` 34,
+`test_failures` 34, `test_aggregate` 30, `test_driver` 30, `test_ask` 29,
+`test_routing` 25, `test_reaper` 16, `test_stagefeed` 15, `test_screens` 12,
+`test_demo` 9, `test_p0_contract` 6, `test_worktree_base` 4,
+`test_frontend_syntax` 2.
 
 ## [0.0.3] — в разработке
 

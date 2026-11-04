@@ -174,6 +174,7 @@ failures.classify → policy → decide_park
 | Что делать дальше: `run`, `wait`, `done`, `failed`, `park`? | `next_stage(spec, events, now)` — чистая функция, ни БД, ни сети, ни часов | `dashboard/transit.py` |
 | В каком состоянии каждый этап и какая у него попытка? | `stage_states(spec, events)` — тот же свёрточный проход, что у решения | `dashboard/transit.py` |
 | Как поднять попытку: лизинг, дерево, контракт, спавн, поток? | `run_stage()` / `step()` | `dashboard/runner.py` |
+| От чего отводится дерево этапа и кто коммитит принятую работу? | `base_of_stage(spec, stage, events)` — база **этапа** (`spec.base` у входа, коммит последней успешной попытки предшественника у следующего; расходящиеся коммиты предшественников — `BaseError` = `failed(contract)`); `commit_tree(tree, …)` — `git add -A` и коммит `duty: <deal> <stage> attempt <n>` в дереве попытки (detached HEAD, ветка не двигается) | `dashboard/runner.py` |
 | Где лизинг этапа и сколько он живёт? | таблица `leases` в своей `duty/duty.db`, TTL из `budget.minutes` | `dashboard/runner.py` |
 | «Что делается прямо сейчас»? | `attempt_progress` на каждый `tool_use`/`tool_result`; `fold` копит `progress: {tools, last_tool, last_at}` | `dashboard/runner.py` → `dashboard/journal.py` |
 | «Готово» доказано? | `verify(report, stage, workdir, …)` → `Verdict(ok, kind, details)` | `dashboard/evidence.py` |
@@ -213,6 +214,18 @@ failures.classify → policy → decide_park
 4. **Снимает парковку только человек** — `unblocked` со `previous_kind='parked'`, со
    сбросом счётчиков класса. Ответ в пуле попытку не поднимает: иначе «продолжаем»
    случилось бы само, а парковка затем и нужна, чтобы этого не произошло.
+5. **Убранная попытка — тоже не девятое состояние.** Осиротевшая попытка (движок
+   убили во время шага) закрывается **фактом**, а не новым состоянием:
+   `attempt_ended` с `outcome=failed`, `kind=infra`, `reaped: true`. Набор состояний
+   этапа (`transit.STAGE_STATES`) и ожиданий (восемь) не меняется — после записи
+   факта срез, переход и консоль сходятся **сами**, потому что исчезла причина
+   расхождения («попытка идёт» против «процесса нет»), а не потому, что в каждый из
+   них добавили `if`. Порог — срок, а не `ps`: попытка закрывается, когда истёк
+   лизинг **и** её возраст больше `ttl + max(60 с, ttl/3)`
+   (`reaper.threshold_sec`); живой лизинг не трогается никогда, даже при мёртвом
+   pid — движок может быть на другой машине или в другом namespace
+   (`docs/PROBES.md`). Поэтому `reaped: true` в консоли и `duty why` значит «отчёта
+   нет», а не «исполнитель упал».
 
 ## Лента этапов дела (0.0.4)
 
@@ -224,7 +237,7 @@ failures.classify → policy → decide_park
 | что на экране | откуда факт |
 |---|---|
 | этапы в порядке объявления графа, роль, состояние, номер попытки, раунды | `transit.stage_states(spec, events)` — тот же предикат «готов», что у движка |
-| попытка: pid, начало, конец, длительность, код выхода, исход, класс отказа, токены, инструменты, причина | `attempt_started` / `attempt_ended` журнала (по `run_id`) |
+| попытка: pid, начало, конец, длительность, код выхода, исход, класс отказа, токены, инструменты, причина, база дерева `base`, что произвела попытка `commit`, `reaped` (закрыл движок) | `attempt_started` / `attempt_ended` журнала (по `run_id`) |
 | живость попытки: `live` / `dead` / неизвестно | срок лизинга из `attempt_started`; `attempt_ended` значит «закрыта» |
 | ожидание: вопрос (номер + ссылка на панель пула `/imsg`) или гейт графа | `stage_states` (`question_id`, `reason`) |
 | evidence: объявленные команды против записей отчёта (`must`, `got`, `ok`) | `spec.evidence` + `result.evidence` последней попытки |

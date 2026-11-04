@@ -333,7 +333,7 @@ pid), повторный ingest → `0` новых строк и тот же `fo
   десктопный плагин на день выпал из приложения. Красная проба: вернуть запятую — тест
   падает.
 
-Кейсы движка 0.0.4 — `tests/test_runner.py` (52 кейса плюс живой прогон под
+Кейсы движка 0.0.4 — `tests/test_runner.py` (52 кейса, в том числе живой прогон под
 `-m live`; модель не вызывается: спавн подменён фейком, который пишет заданный
 поток и `result.json`): лизинг не берётся
 дважды и забирается после срока, worktree создаётся живым git и убирается у упавшей
@@ -341,11 +341,11 @@ pid), повторный ingest → `0` новых строк и тот же `fo
 `infra`, отсутствие отчёта → `contract`, `blocked` → вопрос в пуле и `wait_human`,
 телеметрия по каждому `tool_use`, сбой store откатывает `attempt_started` целиком,
 гейт не принимает голое «готово» и ставит `capability` на перерасход из отчёта.
-Спека — `tests/test_spec.py` (72 кейса, по тесту на правило отказа), гейт —
-`tests/test_evidence.py` (30 кейсов: по тесту на каждое правило отказа плюс happy
+Спека — `tests/test_spec.py` (80 кейсов, по тесту на правило отказа), гейт —
+`tests/test_evidence.py` (34 кейса: по тесту на каждое правило отказа плюс happy
 path без коммита и с коммитом).
 
-Драйвер — `tests/test_driver.py` (22 кейса без модели: линейная цепочка
+Драйвер — `tests/test_driver.py` (30 кейсов без модели: линейная цепочка
 impl → verify → review → done, перезапуск после `impl` идёт в `verify`, `--once`,
 `--max-steps` → код 4, вопрос → код 3, парковка → код 2, SIGINT → код 130, лизинги
 пусты после любого исхода; порядок шагов — раздел 11).
@@ -396,7 +396,7 @@ impl → verify → review → done, перезапуск после `impl` ид
 `'не записан'` вместо `'состояние pid … неизвестно'`) — соответствующий тест
 обязан упасть; зелёный тест на откатанном коде означает, что он ничего не проверяет.
 
-Внешнее имя дела — `tests/test_deals.py` (11 кейсов `*external_ref*`/`*dedup*`).
+Внешнее имя дела — `tests/test_deals.py` (9 кейсов `*external_ref*`/`*dedup*`).
 Руками: два `duty create --board B --title "…" --external-ref jira:RP-14080 --json`
 подряд — первый `created: true`, второй `created: false` и `existing: true` с тем же
 `deal_id`; после `duty complete <id>` третий вызов заводит новое дело
@@ -505,6 +505,31 @@ detached HEAD, ветка дела не двигается) и пишет sha в
 Почему в журнале видно «что делается прямо сейчас»: прогресс пишется по ходу
 потока, а `fold` копит его счётчиком `progress: {tools, last_tool, last_at}`.
 `ps` и хвосты логов для этого не нужны.
+
+### База этапа и автокоммит: как это прочитать
+
+Три места, где видно, от чего отведено дерево и что попытка произвела, — без захода
+в дерево:
+
+```bash
+bin/duty why <board> <id> <этап>     # строка «база дерева: <sha>» у последней попытки
+bin/duty --json deal <board> <id> | grep -A2 '"base"'   # попытки со своими base/commit
+```
+
+```bash
+# факты журнала (только чтение, живой файл в WAL)
+sqlite3 "file:$HOME/.hermes/duty/duty.db?mode=ro" \
+  "select kind, json_extract(payload,'\$.base'), json_extract(payload,'\$.commit')
+     from events where deal_id='<id>' and kind in ('attempt_started','attempt_ended')"
+# attempt_started.base — фактическая база (git rev-parse HEAD после отвода)
+# attempt_ended.commit — что произвела принятая попытка (sha коммита движка)
+```
+
+Автокоммит проверяется в самом дереве попытки: `git -C <каталог попытки>/tree log
+--oneline -1` даёт `duty: <deal> <stage> attempt <n>`, а `git -C <каталог
+попытки>/tree status --short` пуст — работа зафиксирована. Ветка дела при этом не
+двигается: дерево в detached HEAD, `git rev-parse <ветка>` в `repo` остаётся прежним
+(это и проверяет `tests/test_worktree_base.py`).
 
 ### «Готово» проверяется до записи факта
 
@@ -648,14 +673,20 @@ export HERMES_HOME=~/.hermes      # иначе досок и своего store 
 
 ```bash
 bin/duty spec check examples/duty-minimal.yaml
-# OK /…/hermes-duty/examples/duty-minimal.yaml · дело fix-typo-in-header · этапов 2   (код 0)
+# OK /…/hermes-duty/examples/duty-minimal.yaml · дело fix-typo-in-header · этапов 2
+# workspace: impl=none (по умолчанию) · review=none                            (код 0)
 bin/duty spec check examples/duty.yaml
 # OK … · дело sx-widgets-tristate · этапов 5
 #   …/examples/duty.yaml:17: base: репозитория /…/sx-widgets-api нет на этой машине:
-#   base 'origin/master' не проверен                                            (код 0, предупреждение)
+#   base 'origin/master' не проверен
+# workspace: impl=worktree · verify=worktree (по умолчанию) · review=worktree
+#   (по умолчанию) · publish=worktree (по умолчанию) · docs=worktree (по умолчанию)
+#                                                                  (код 0, предупреждение)
 bin/duty spec check examples/demo.yaml
 # …:35: unknown-key: неизвестный ключ 'questions'; допустимые: duty, repo, base, stages
 # …:30: verdict.approve: approve='done': допустимо next или id существующего этапа
+# …:13: base: репозитория /…/sx-widgets-api нет на этой машине: base 'origin/master' не проверен
+# workspace: impl=worktree · verify=worktree (по умолчанию) · review=worktree (по умолчанию)
 # ОТКАЗ · ошибок 2, предупреждений 1                                             (код 1)
 ```
 
@@ -761,7 +792,8 @@ bin/duty run d_a3ed4990 --once
 
 ```bash
 bin/duty run d_a3ed4990              # первым делом закроет осиротевшую попытку
-# убрано движком: impl · попытка 1 · лизинг истёк 1200с назад → failed(infra)
+# закрыто движком: duty/d_a3ed4990 · impl · попытка 1 · infra: процесс попытки
+#   не отчитался: лизинг истёк 1200с назад
 # итог: ждём wait(retry) — этап 'impl': пауза перед повтором после отказа 1/1 infra (код 3)
 ```
 
@@ -769,8 +801,11 @@ bin/duty run d_a3ed4990              # первым делом закроет о
 
 ```bash
 bin/duty reap --dry-run              # только показывает, ничего не пишет
+# УБОРКА (--dry-run) · store: /…/.hermes/duty/duty.db · было бы закрыто: 0
+#   осиротевших попыток нет                                                  (код 0)
 bin/duty reap                        # пишет факты и отпускает лизинг умерших попыток
 bin/duty why duty d_a3ed4990 impl    # в приговоре попытки видно reaped: true
+#   попытку закрыл движок (reaped): отчёта нет — это не падение исполнителя
 ```
 
 Живой лизинг не трогается никогда, даже если pid не отвечает: движок может работать на
@@ -852,10 +887,16 @@ bin/duty why <board> <id>            # почему дело стоит сейч
 bin/duty why <board> <id> impl       # плюс последняя попытка этапа impl
 # последняя попытка этапа impl:
 #   попытка #1 · старт — · финиш 2026-11-04 16:37:33 · outcome=done · kind=—
+#   база дерева: a00d17cb29e2f6f2dc65f1135ff517bb509a8309
 #   каталог попытки: /…/kanban/boards/<board>/workspaces/<id>-impl-1
 # факты отказов (последние 5):
 #   в журнале нет упавших попыток у дела <id>
 ```
+
+`база дерева` — та ревизия, от которой отведено дерево попытки (у этапа без `needs`
+это `spec.base`, у следующего — коммит предшественника): по ней видно, **что именно
+видел** исполнитель, не заходя в дерево. У убранной попытки рядом стоит строка
+`попытку закрыл движок (reaped)` — отчёта от неё не было.
 
 Порядок чтения: `состояние ожидания` → `доказательство` (одна строка, собранная
 кодом) → `факты` (попытка, лизинг, последнее действие, возраст) → `последняя попытка
@@ -889,5 +930,14 @@ exit 0
 
 - не перезапускать gateway ради страницы;
 - не править номер версии руками — только `bin/duty-version`;
+- не звать `sync_answers` руками, чтобы «забрать» ответ человека: `bin/duty run` (и
+  `--once`) дочитывает пул перед каждым решением сам, итог говорит числом
+  «ответов пула дочитано: N», а сбой разбора — строкой `! ответы пула: …`
+  (`answers_errors` в `--json`). Второй вызов того же синка — проход ingest
+  (`POST /ingest`, `/now?ingest=1`); для движка он не нужен: `bin/duty run`
+  синкает сам;
+- не закрывать запаркованное дело правкой `status` руками и не искать решение в
+  тексте ответа: продолжение — `bin/duty decide <дело> continue`, остановка —
+  `bin/duty decide <дело> stop`;
 - не читать живые БД вручную, если то же видно в `/now`: он открывает их
   `?mode=ro` и отдаёт причину сбоя в `errors[]`.

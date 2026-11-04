@@ -62,6 +62,22 @@ duty.yaml ──▶ bin/duty spec check ──▶ годна (или «file:line
   bin/duty why <board> <id> [этап] · экран «Дело» → stages[] · /now → stage
 ```
 
+База этапа — это **не** база дела: дерево отводится от того, что произвёл предшественник,
+а принятую работу движок коммитит сам (ветка дела при этом не двигается).
+
+```
+spec.base (origin/master)
+    │
+    ▼
+impl   попытка 1 ── дерево от spec.base ──────▶ evidence ok ──▶ движок коммитит
+    │                                                            attempt_ended.commit = c1
+    ▼
+verify попытка 1 ── дерево от коммита impl ────▶ файлы impl на месте ──▶ evidence ok
+    │
+    ▼
+review попытка 1 ── дерево от коммита verify ──▶ … ──▶ все этапы done
+```
+
 1. **Спека проверяется до запуска.** `bin/duty spec check duty.yaml` — `OK` либо
    `file:line: правило: текст`; правила (включая `review-gate`: публикация не
    обгоняет ревью) — `docs/SPEC.md`. Коды: `0` годна, `1` есть отказы, `2` спека не
@@ -75,26 +91,37 @@ duty.yaml ──▶ bin/duty spec check ──▶ годна (или «file:line
    журнал». Состояние прогона — журнал, а не память процесса: прогон, убитый после
    `impl`, при повторном запуске идёт в `verify`. `--once` — один шаг, `--max-steps N`
    — предел (по умолчанию 20), `wait` — **выход с кодом 3**, а не занятая петля.
-4. **«Готово» принимается только с пакетом.** Голословное «готово» не проходит:
+4. **Этап отводится от коммита предшественника.** У этапа без `needs` база —
+   `spec.base`; у следующего — коммит последней успешной попытки предшественника
+   (`runner.base_of_stage`). Принятую работу движок фиксирует сам
+   (`runner.commit_tree`: `git add -A` и коммит `duty: <дело> <этап> attempt <n>` в
+   дереве попытки, detached HEAD) и пишет sha в `attempt_ended.payload.commit`;
+   фактическая база едет в `attempt_started.base`/`attempt_ended.base`. Что это значит
+   для автора спеки: `base` — база **только первого этапа**, а `verify` после `impl`
+   видит файлы `impl`, потому что его дерево отведено от коммита `impl`. Этап с
+   `needs` по умолчанию получает `workspace: worktree`; «дерево не нужно» пишется
+   явно (`workspace: none`), иначе `bin/duty spec check` отказывает.
+5. **«Готово» принимается только с пакетом.** Голословное «готово» не проходит:
    гейт сверяет отчёт с деревом попытки (хеши файлов, резолв коммита, коды
    и свежесть объявленных команд, бюджет токенов), иначе пишет `attempt_ended` с
    `outcome=failed` и классом отказа.
-5. **Отказ классифицируется и повторяется по политике.** Три класса (`infra`,
+6. **Отказ классифицируется и повторяется по политике.** Три класса (`infra`,
    `contract`, `capability`) и лимиты — в одном модуле (`dashboard/failures.py`);
    исчерпание паркует дело: вопрос человеку в пул плюс `blocked` с
-   `block_kind='parked'`. Продолжает только человек — `bin/duty unblock`, со сбросом
-   счётчиков класса.
-6. **Каждая попытка видна в консоли.** `GET /deal` → `stages[]`, `GET /now` →
+   `block_kind='parked'`. Продолжает только человек — `bin/duty decide <дело>
+   continue` (он же `bin/duty unblock`), со сбросом счётчиков класса; ответ в пуле
+   решением не является.
+7. **Каждая попытка видна в консоли.** `GET /deal` → `stages[]`, `GET /now` →
    `deals[].stage`: состояние этапа, номер попытки, время, длительность, код выхода,
    токены, инструменты, причина отказа, ожидание вопроса. Источник один — журнал, ни
    `ps`, ни `lsof`.
-7. **Осиротевшая попытка закрывается движком, а не остаётся навсегда.** Попытка без
+8. **Осиротевшая попытка закрывается движком, а не остаётся навсегда.** Попытка без
    `attempt_ended`, у которой истёк лизинг и прошёл срок (`ttl + max(60 с, ttl/3)`),
    закрывается `attempt_ended` с `kind=infra` и `reaped: true`
    (`dashboard/reaper.py`). Драйвер зовёт уборку перед каждым решением, поэтому
    `bin/duty run`, убитый снаружи во время попытки, лечится следующим запуском;
    `bin/duty reap [--dry-run]` делает то же вручную.
-8. **Ответ человека двигает дело без ручного синка.** Драйвер перед каждым решением
+9. **Ответ человека двигает дело без ручного синка.** Драйвер перед каждым решением
    (и в `--once`) дочитывает пул (`ask.sync_answers`): закрытый вопрос становится
    фактом `question_answered`, блок `needs_input` снимается, этап получает новую
    попытку. Ошибки разбора (`errors[]`) не глотаются — они строкой `! ответы пула: …`
@@ -126,8 +153,11 @@ duty.yaml ──▶ bin/duty spec check ──▶ годна (или «file:line
   отводилось от базы дела, и второй этап не видел работу первого. После правки
   (`runner.base_of_stage` + коммит принятой работы движком) двухэтапная проба
   `d_a71a59e0` на копии кейса прошла оба этапа: `verify` получил дерево от коммита
-  `impl` и нашёл его файл. Гейт P2 целиком («… → review → публикация») закрывается
-  живым прогоном, где публикация требует «ок» Max.
+  `impl` и нашёл его файл. Следующая живая проба `d_221d021a` нашла вторую половину
+  той же дыры — `verify` не объявлял `workspace` и работал в каталоге попытки, поэтому
+  умолчанием этапа с `needs` стало `worktree` (`c3a5d77`). Гейт P2 целиком
+  («… → review → публикация») закрывается живым прогоном, где публикация требует
+  «ок» Max.
 
 ## Что уже работает (роуты и экраны)
 
@@ -145,7 +175,7 @@ duty.yaml ──▶ bin/duty spec check ──▶ годна (или «file:line
 | `POST /ingest` | проход ingest: дописать в свой журнал недостающие события (`appended`, `events`, `deals`, отчёт по доскам, `errors[]`); в том же проходе — `answers` (ответы пула `question_answered`); повторный вызов — `appended: 0` | 503 — журнал не открылся |
 | `POST /ask/{board}/{task_id}` | вопрос по делу в пул (`origin='duty'`, `kind='decision'`) + событие `question_asked`; тело `{text, text_full, options, critical}`, ответ `{question_id, created, deduped, adopted, errors[]}`; живой вопрос по делу возвращается как есть (`deduped: true`), дубль в пуле не создаётся; подхваченный чужой вопрос (`origin != 'duty'`) отличается полем `adopted: true` и в журнал не пишется | 404 — нет доски/дела; 400 — пустой `text` или `options` не список строк; 503 — пул или журнал недоступны (`errors[]`) |
 | `GET /duty/{board}/{task_id}/attempts` | таймлайн попыток дела: раны, длительность, исход, ошибка, события | 404 — нет доски/дела; 503 — доска не читается |
-| `GET /deal/{board}/{task_id}?spec=<абсолютный путь>` | одно дело: элемент `/now` (если оно активно), `body` спецификации, `terminal`, `comments[]`, `attachments[]`, `timeline[]`, лента этапов `stages[]` + `stages_note` (причина пустой ленты) + `spec`. Этапы считает `transit.stage_states` по журналу, попытки — из `attempt_started`/`attempt_ended`, граф читается `spec.py` из `created.payload.spec` (или `?spec=`); процессов ручка не открывает, в журнал не пишет. `id` решается префиксом: `t_<hex>` — наблюдаемое дело kanban, `d_<hex>` — своё (store) | 404 — нет доски/дела; 503 — доска или store не читается |
+| `GET /deal/{board}/{task_id}?spec=<абсолютный путь>` | одно дело: элемент `/now` (если оно активно), `body` спецификации, `terminal`, `comments[]`, `attachments[]`, `timeline[]`, лента этапов `stages[]` + `stages_note` (причина пустой ленты) + `spec`. Этапы считает `transit.stage_states` по журналу, попытки — из `attempt_started`/`attempt_ended` (у попытки `base` — от чего отведено дерево, `commit` — что она произвела, `reaped` — закрыл движок), граф читается `spec.py` из `created.payload.spec` (или `?spec=`); процессов ручка не открывает, в журнал не пишет. `id` решается префиксом: `t_<hex>` — наблюдаемое дело kanban, `d_<hex>` — своё (store) | 404 — нет доски/дела; 503 — доска или store не читается |
 | `GET /stats?board=<slug>&since=<unix>` | здоровье: доля с первой попытки, распределение ожидания до неё (`waiting_sec`: p50/p90/p99, `count`, `max`), таксономия исходов по доскам и итогом; `?board=` — одна доска, `?since=` — только дела, созданные не раньше этой секунды | 404 — доски нет; — (деградация в `errors[]`, неполная выборка — в `warnings[]`) |
 | `POST /deals` | завести своё дело (`status=todo`, id `d_<hex>`): `{board, title, body?, assignee?, parents?[], spec?, external_ref?, dedup_window?}`; `spec` — абсолютный путь к `duty.yaml`, по которому экран «Дело» строит ленту этапов (пишется в `created.payload.spec`); `external_ref` — внешнее имя дела (`jira:RP-14080`): живое дело с этим именем на этой доске возвращается как есть (`created: false`, `existing: true`, причина в `reason`, события не пишутся), закрытое (`done`/`archived`) не воскрешается — заводится новое (`created: true`); `dedup_window` — срок жизни имени в секундах | 400 — вход не тот; 503 — store не открылся |
 | `PATCH /deals/{id}` | правка спецификации (`title`/`body`/`assignee`) или `{status: archived}`; `origin` и `id` не меняются, смена статуса — только командами | 404 — дела нет; 400 — статус мимо команды |
@@ -236,6 +266,9 @@ HERMES_HOME=~/.hermes ~/.hermes/plugins/hermes-duty/bin/duty now
 | `duty comment d_… "текст" [--author …]` | комментарий в своё дело (`--author`, по умолчанию `max`) |
 | `duty block d_… [причина] [--kind needs_input]` | заблокировать своё дело |
 | `duty unblock d_…` | снять блокировку |
+| `duty decide d_… continue` | решение человека по запаркованному делу: `unblocked` со `previous_kind='parked'`, счётчики класса сброшены; ответ в пуле решением не является |
+| `duty decide d_… stop` | закрыть запаркованное дело решением человека: `completed` с `cause='stopped_by_human'`, причиной — текст ответа из пула (нет ответа — причина пустая, а не выдуманная) |
+| `duty close d_… --reason "…"` | закрыть дело не решением, а по обстоятельствам: `completed` с `cause='closed_by_human'`; перезакрыть другой причиной нельзя |
 | `duty claim d_… [--owner …]` | взять в работу (владелец — `--owner`, иначе `HERMES_PROFILE`, иначе пользователь ОС) |
 | `duty complete d_… [--summary …] [--review] [--reviewer …]` | закрыть дело или сдать в ревью |
 | `duty review d_… [--reviewer …] [--summary …]` | сдать в ревью |
@@ -308,7 +341,7 @@ HERMES_HOME=~/.hermes ~/.hermes/plugins/hermes-duty/bin/duty now
   examples/demo.yaml     # образец учёта для `duty demo` (формату 0.0.4 не отвечает: см. выше)
   examples/duty.yaml     # полный вид duty.yaml из спеки-источника (проверяется test_spec)
   examples/duty-minimal.yaml  # минимум: два этапа, без evidence/ask
-  tests/                 # pytest (16 файлов: агрегатор, роуты, спека, движок, журнал) + node --test
+  tests/                 # pytest (19 файлов: агрегатор, роуты, спека, движок, журнал) + node --test
 ```
 
 ## Принципы P0
@@ -348,7 +381,7 @@ hermes plugins enable hermes-duty     # или Capabilities → Plugins в де�
 Из каталога плагина (`cd ~/.hermes/plugins/hermes-duty`):
 
 ```bash
-~/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q  # 555 passed, 1 skipped
+~/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q  # 602 passed, 1 skipped
 node --test tests/model.test.mjs tests/web.test.mjs        # 49 pass (37 + 12)
 bin/duty-model-sync --check                                # OK
 bin/duty-version check                                     # OK
@@ -378,8 +411,10 @@ CommonJS — `node --check plugin.js` пропускает то, что вали
 (исчерпание паркует дело), лента этапов `stagefeed.py`, `external_ref` у дела,
 драйвер `dashboard/driver.py` (`bin/duty run`), дочитывание ответов пула самим
 движком (`ask.sync_answers` на каждом шаге) и уборка осиротевших попыток
-`reaper.sweep` (`bin/duty reap`, `reaped: true`). Регрессия
-**563 pytest + 1 skipped**, **49 node** (37 + 12), `bin/duty demo` — 7/7.
+`reaper.sweep` (`bin/duty reap`, `reaped: true`), база этапа `runner.base_of_stage`
+(дерево от коммита предшественника, автокоммит принятой работы) и решение человека
+по запаркованному делу (`bin/duty decide continue|stop`, `bin/duty close`). Регрессия
+**602 pytest + 1 skipped**, **49 node** (37 + 12), `bin/duty demo` — 7/7.
 
 `v0.0.3` — свой журнал событий (`state = fold(events)`, `POST /ingest`, `journal` в
 `/health`), единственный канал вопросов `ask()`, CLI `bin/duty` (чтение и мутации),

@@ -350,6 +350,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="спека дела (duty.yaml): по ней экран «Дело» рисует этапы; путь разворачивается в абсолютный",
     )
     create.add_argument("--parent", action="append", default=[], help="id своего родителя (d_…); можно несколько")
+    create.add_argument(
+        "--external-ref",
+        help=(
+            "внешнее имя дела (например jira:RP-14080): живое дело с этим именем "
+            "не дублируется, закрытое — не воскрешается"
+        ),
+    )
 
     comment = command("comment", "комментарий в своё дело")
     comment.add_argument("deal_id")
@@ -863,6 +870,8 @@ def render_mutation(payload: dict[str, Any], action: str) -> str:
         f"{action} {payload.get('board')}/{payload.get('id')} · {payload.get('status') or '—'}",
         f"заголовок: {payload.get('title') or '—'}",
     ]
+    if payload.get("external_ref"):
+        lines.append(f"внешнее имя: {payload['external_ref']}")
     if payload.get("assignee"):
         lines.append(f"исполнитель: {payload.get('assignee')}")
     shaped = payload.get("deal")
@@ -882,6 +891,11 @@ def render_mutation(payload: dict[str, Any], action: str) -> str:
     events = mutation.get("events")
     tail = "" if not mutation.get("idempotent") else " · повтор: store не тронут"
     lines.append(f"событий записано: {events if events is not None else '—'}{tail}")
+    if payload.get("created") is False:
+        # Дело нашлось по внешнему имени: это ответ, а не ошибка, и причина
+        # называется словами — иначе «СОЗДАНО d_…» читалось бы как второе дело.
+        reason = payload.get("reason") or "живое дело с тем же внешним именем уже есть"
+        lines.append(f"нового дела нет: {reason}")
     if payload.get("comments"):
         lines.append(f"комментариев в деле: {len(payload['comments'])}")
     if payload.get("attachments"):
@@ -1395,14 +1409,25 @@ def main(argv: Optional[list[str]] = None) -> int:
             }
             if args.assignee:
                 request["assignee"] = args.assignee
+            if args.external_ref:
+                request["external_ref"] = args.external_ref
             if args.spec:
                 # Путь разворачивается здесь, как у `duty spec check`: store
                 # принимает только абсолютный, иначе «откуда взялась спека» не
                 # восстановить из журнала (`docs/SPEC.md`).
                 request["spec"] = str(Path(args.spec).expanduser().resolve())
-            return _mutate(
-                api().deals_create, "СОЗДАНО", api().hermes_home(), request, source="cli", as_json=args.json
-            )
+            payload = _route(api().deals_create, api().hermes_home(), request, source="cli")
+            if args.json:
+                # К форме роута добавлен `deal_id` — имя, которым дело называют
+                # скрипты (`docs/OWNERSHIP.md`, CLI): у роута это поле зовётся
+                # `id`, и переименовывать его там ради терминала нельзя. Больше
+                # добавленных ключей нет: `created`/`existing`/`status` уже в
+                # ответе роута.
+                _emit_json({**payload, "deal_id": payload.get("id")}, out)
+            else:
+                action = "СОЗДАНО" if payload.get("created") else "ДЕЛО УЖЕ ЕСТЬ"
+                print(render_mutation(payload, action), file=out)
+            return _payload_code(payload)
         if args.command == "comment":
             request = {"author": args.author, "body": args.body}
             return _mutate(

@@ -383,6 +383,25 @@ path без коммита и с коммитом).
 `'не записан'` вместо `'состояние pid … неизвестно'`) — соответствующий тест
 обязан упасть; зелёный тест на откатанном коде означает, что он ничего не проверяет.
 
+Внешнее имя дела — `tests/test_deals.py` (11 кейсов `*external_ref*`/`*dedup*`).
+Руками: два `duty create --board B --title "…" --external-ref jira:RP-14080 --json`
+подряд — первый `created: true`, второй `created: false` и `existing: true` с тем же
+`deal_id`; после `duty complete <id>` третий вызов заводит новое дело
+(`created: true`, другой `deal_id`). Красные пробы (все проверены откатом):
+
+- убрать поиск живого дела (`existing = None`) — падают
+  `test_second_create_with_live_external_ref_returns_same_deal`,
+  `test_dedup_window_lets_a_stale_live_deal_go`,
+  `test_cli_create_with_external_ref_is_idempotent`;
+- снять фильтр закрытых статусов в `live_deal_by_ref` — падают
+  `test_create_after_complete_is_new_deal_not_resurrection`,
+  `test_archived_deal_is_not_resurrected_by_external_ref`;
+- не писать `external_ref` в `created.payload` — падает
+  `test_create_with_external_ref_records_it_in_row_and_journal`;
+- не звать `_migrate` при открытии на запись — падает
+  `test_old_store_without_external_ref_column_is_still_readable`
+  (`no such column: external_ref`).
+
 ## 7. Проверить шейпер и версии
 
 ```bash

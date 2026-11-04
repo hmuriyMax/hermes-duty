@@ -1050,3 +1050,205 @@ def test_cli_create_comment_complete(home: Path, client: TestClient, capsys: pyt
     assert kinds(home, deal_id) == ["created", "commented", "completed"]
     assert deal_rows(home)[0]["status"] == "done"
     assert cli.main(["comment", "d_00000000", "нет такого"]) == 1
+
+
+# -------------------------------------------- внешнее имя дела (W8a)
+
+
+def cli_module() -> Any:
+    """`dashboard/cli.py` — как его грузит плагин: по пути, без пакета."""
+    name = "hermes_duty_cli_deals"
+    loaded = sys.modules.get(name)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parents[1] / "dashboard" / "cli.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_create_with_external_ref_records_it_in_row_and_journal(
+    home: Path, client: TestClient
+) -> None:
+    """Внешнее имя дела — в строке store, в снимке `created` и в карточке."""
+    body = create(client, external_ref="jira:RP-14080")
+
+    assert body["created"] is True
+    assert "existing" not in body
+    assert body["external_ref"] == "jira:RP-14080"
+    assert deal_rows(home)[0]["external_ref"] == "jira:RP-14080"
+
+    created = events(home, body["id"])[0]
+    assert created["payload"]["external_ref"] == "jira:RP-14080"
+    card = client.get(f"/deal/{BOARD}/{body['id']}").json()
+    assert card["external_ref"] == "jira:RP-14080"
+
+
+def test_second_create_with_live_external_ref_returns_same_deal(
+    home: Path, client: TestClient
+) -> None:
+    """Повторное «продолжить» при живом деле: тот же id, `created: false`, без событий."""
+    first = create(client, external_ref="jira:RP-14080")
+    second = create(client, external_ref="jira:RP-14080", title="нажали ещё раз")
+
+    assert second["created"] is False
+    assert second["existing"] is True
+    assert second["id"] == first["id"]
+    assert second["status"] == first["status"]
+    assert first["id"] in second["reason"]
+    assert second["mutation"] == {"events": 0, "idempotent": True}
+    assert len(deal_rows(home)) == 1
+    assert kinds(home, first["id"]) == ["created"]
+
+
+def test_create_after_complete_is_new_deal_not_resurrection(home: Path, client: TestClient) -> None:
+    """Закрытое дело не воскрешается: продолжение — новое дело, видно отдельно."""
+    first = create(client, external_ref="jira:RP-14080")
+    mutate(client, "POST", f"/deals/{first['id']}/complete", json={"summary": "пауза"})
+    second = create(client, external_ref="jira:RP-14080")
+
+    assert second["created"] is True
+    assert "existing" not in second
+    assert second["id"] != first["id"]
+
+    rows = {row["id"]: row for row in deal_rows(home)}
+    assert set(rows) == {first["id"], second["id"]}
+    assert {row["external_ref"] for row in rows.values()} == {"jira:RP-14080"}
+    assert rows[first["id"]]["status"] == "done"
+    assert rows[second["id"]]["status"] == "ready"
+
+
+def test_archived_deal_is_not_resurrected_by_external_ref(home: Path, client: TestClient) -> None:
+    """`archived` — тоже закрытое: имя не возвращает дело с доски в работу."""
+    first = create(client, external_ref="jira:RP-14080")
+    mutate(client, "PATCH", f"/deals/{first['id']}", json={"status": "archived"})
+    second = create(client, external_ref="jira:RP-14080")
+
+    assert second["created"] is True
+    assert second["id"] != first["id"]
+
+
+def test_external_ref_dedups_only_on_its_own_board(home: Path, client: TestClient) -> None:
+    """Внешнее имя ищется в пределах доски: на другой доске это другое дело."""
+    other = "another"
+    board = home / "kanban" / "boards" / other / "kanban.db"
+    board.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(board)
+    conn.executescript(KANBAN_SCHEMA)
+    conn.commit()
+    conn.close()
+
+    first = create(client, external_ref="jira:RP-14080")
+    second = create(client, board=other, external_ref="jira:RP-14080")
+
+    assert second["created"] is True
+    assert second["id"] != first["id"]
+    assert second["board"] == other
+
+
+def test_dedup_window_lets_a_stale_live_deal_go(home: Path) -> None:
+    """`dedup_window` — срок жизни имени: дело старше окна не переиспользуется."""
+    conn = store(home)
+    try:
+        first = deals.create_deal(
+            conn, board=BOARD, title="первое", external_ref="jira:RP-7",
+            known_boards=[BOARD], now=NOW,
+        )
+        same = deals.create_deal(
+            conn, board=BOARD, title="повтор", external_ref="jira:RP-7",
+            known_boards=[BOARD], now=NOW + 10, dedup_window=60,
+        )
+        stale = deals.create_deal(
+            conn, board=BOARD, title="продолжение", external_ref="jira:RP-7",
+            known_boards=[BOARD], now=NOW + 600, dedup_window=60,
+        )
+    finally:
+        conn.close()
+
+    assert same["created"] is False
+    assert same["deal"]["id"] == first["deal"]["id"]
+    assert stale["created"] is True
+    assert stale["deal"]["id"] != first["deal"]["id"]
+
+
+def test_empty_external_ref_is_input_error(home: Path, client: TestClient) -> None:
+    """Пустое имя — ошибка входа, а не второй способ сказать «без имени»."""
+    response = client.post("/deals", json={"board": BOARD, "title": "дело", "external_ref": "   "})
+
+    assert response.status_code == 400
+    assert "external_ref" in response.json()["errors"][0]["reason"]
+    assert deal_rows(home) == []
+
+
+def test_deal_without_external_ref_is_unchanged(home: Path, client: TestClient) -> None:
+    """Регрессия: без имени `create` по-прежнему заводит новое дело на каждый вызов."""
+    first = create(client)
+    second = create(client)
+
+    assert first["created"] is True
+    assert second["created"] is True
+    assert first["id"] != second["id"]
+    assert {row["external_ref"] for row in deal_rows(home)} == {None}
+    assert events(home, first["id"])[0]["payload"]["external_ref"] is None
+
+
+def test_old_store_without_external_ref_column_is_still_readable(
+    home: Path, client: TestClient
+) -> None:
+    """Чтение не мигрирует схему: старая `duty.db` читается, имени просто нет."""
+    deal = create(client, external_ref="jira:RP-14080")
+    raw = sqlite3.connect(deals.store_path(home))
+    raw.execute("ALTER TABLE deals DROP COLUMN external_ref")
+    raw.commit()
+    raw.close()
+
+    names = {item["id"] for item in client.get("/now").json()["deals"]}
+    assert deal["id"] in names
+    card = client.get(f"/deal/{BOARD}/{deal['id']}").json()
+    assert card["external_ref"] is None
+
+    # смотр экрана схему не доводит: колонки после чтения по-прежнему нет
+    checked = sqlite3.connect(deals.store_path(home))
+    columns = {row[1] for row in checked.execute("PRAGMA table_info(deals)")}
+    checked.close()
+    assert "external_ref" not in columns
+
+    # запись доводит схему: колонка заводится миграцией при открытии на запись
+    again = create(client, external_ref="jira:RP-14080", title="после миграции")
+    assert again["created"] is True
+    assert {row["external_ref"] for row in deal_rows(home)} == {None, "jira:RP-14080"}
+
+
+def test_cli_create_with_external_ref_is_idempotent(
+    home: Path, client: TestClient, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """CLI: флаг `--external-ref` и `--json` с `deal_id`, `created`, `status`."""
+    cli = cli_module()
+    argv = [
+        "create", "--board", BOARD, "--title", "из терминала",
+        "--external-ref", "jira:RP-14080", "--json",
+    ]
+
+    assert cli.main(argv) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first["created"] is True
+    assert first["deal_id"].startswith("d_")
+    assert first["status"] == "ready"
+
+    assert cli.main(argv) == 0
+    second = json.loads(capsys.readouterr().out)
+    assert second["created"] is False
+    assert second["existing"] is True
+    assert second["deal_id"] == first["deal_id"]
+    assert len(deal_rows(home)) == 1
+    assert kinds(home, first["deal_id"]) == ["created"]
+
+    # человеческий вывод второго вызова называет повтор, а не создание
+    assert cli.main(argv[:-1]) == 0
+    text = capsys.readouterr().out
+    assert "ДЕЛО УЖЕ ЕСТЬ" in text
+    assert "jira:RP-14080" in text
+    assert "нового дела нет" in text

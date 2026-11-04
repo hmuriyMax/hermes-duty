@@ -1432,6 +1432,10 @@ def _deal_response(
     из журнала. Пустой список без причины выглядел бы как «этапов нет», поэтому
     `stages_note` называет, почему лента пуста (нет спеки, спека не читается),
     а `spec` — какой граф прочитан.
+
+    `external_ref` — внешнее имя дела (`jira:RP-14080`), по которому его находят
+    повторно. У наблюдаемого kanban-дела его нет: имя ставит тот, кто заводит
+    дело в store (`docs/OWNERSHIP.md`, «Внешнее имя дела»).
     """
     body_text = str(row.get("body") or "")
     status = str(row.get("status") or "")
@@ -1442,6 +1446,7 @@ def _deal_response(
         "title": row.get("title"),
         "status": status,
         "assignee": row.get("assignee"),
+        "external_ref": row.get("external_ref"),
         "terminal": status in TERMINAL_STATUSES,
         "created_at": row.get("created_at"),
         "body": body_text[:DEAL_BODY_LIMIT],
@@ -2109,6 +2114,10 @@ def _mutation(conn: sqlite3.Connection, home: Path, result: dict[str, Any]) -> d
     что вызов повторил уже сделанное (0 новых событий, store не тронут). Оба
     факта в ответе, потому что «сделано» и «уже было» — разные ответы, и CLI не
     должен угадывать их по коду возврата.
+
+    У `create` рядом стоят `created` и, когда дело нашлось по внешнему имени,
+    `existing: true` с причиной в `reason`: «нового дела нет, вернули живое» —
+    это ответ, а не ошибка, и скрипт обязан отличить его от создания.
     """
     questions, pool_note, _ = _pool_context(home)
     _, journal_note, _ = _journal_context(home, [])
@@ -2123,6 +2132,11 @@ def _mutation(conn: sqlite3.Connection, home: Path, result: dict[str, Any]) -> d
     body["mutation"] = {"events": result["events"], "idempotent": result["idempotent"]}
     if "attachment" in result:
         body["attachment"] = result["attachment"]
+    if "created" in result:
+        body["created"] = bool(result["created"])
+        if not result["created"]:
+            body["existing"] = True
+            body["reason"] = str(result.get("reason") or "")
     return body
 
 
@@ -2140,6 +2154,12 @@ def deals_create(home: Path, payload: dict[str, Any], *, source: str = "api") ->
     spec = payload.get("spec")
     if spec is not None and not isinstance(spec, str):
         raise deals.DealError("create: 'spec' — абсолютный путь к спеке (duty.yaml) или null")
+    external_ref = payload.get("external_ref")
+    if external_ref is not None and not isinstance(external_ref, str):
+        raise deals.DealError("create: 'external_ref' — строка (например jira:RP-14080) или null")
+    dedup_window = payload.get("dedup_window")
+    if dedup_window is not None and (not isinstance(dedup_window, int) or isinstance(dedup_window, bool)):
+        raise deals.DealError("create: 'dedup_window' — целое число секунд или null")
     conn = _store_for_write(home)
     try:
         return _mutation(
@@ -2155,6 +2175,8 @@ def deals_create(home: Path, payload: dict[str, Any], *, source: str = "api") ->
                 known_boards=_known_boards(home),
                 source=source,
                 spec_path=spec,
+                external_ref=external_ref,
+                dedup_window=dedup_window,
             ),
         )
     finally:
@@ -2357,11 +2379,15 @@ def deals_attach(
 
 @router.post("/deals")
 def create_deal_route(payload: dict[str, Any] = Body(...)) -> Any:
-    """`POST /deals {board, title, body?, assignee?, parents?[]}` → дело.
+    """`POST /deals {board, title, body?, assignee?, parents?[], spec?, external_ref?}` → дело.
 
     Отвечает той же формой, что `/deal/{board}/{id}`, плюс блок `mutation`. Ошибка
     входа (нет доски, нет родителя, пустой title) — 400 с `errors[]`: контракт
     прямо запрещает 500 на битом входе.
+
+    `external_ref` — внешнее имя дела: если живое дело с этим именем на этой доске
+    уже есть, ответ несёт `created: false` и `existing: true` с причиной в
+    `reason`, а второе дело не заводится (`docs/OWNERSHIP.md`).
     """
     try:
         return deals_create(_hermes_home(), payload)

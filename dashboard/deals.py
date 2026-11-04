@@ -27,8 +27,10 @@ Duty до 0.0.3 только наблюдал kanban. Здесь он **влад
 Повторный вызов с теми же аргументами — no-op: `idempotency_key` события
 (`<source>:<deal_id>:<kind>:<sha1(аргументы)>`), поэтому повтор даёт `events: 0` и
 не двигает ни `status`, ни `updated_at`, ни комментарии. Исключение одно и
-названо вслух: `create` не дедуплицируется — id порождает сам вызов, и «ещё одно
-такое же дело» это второе дело, а не повтор (как в kanban).
+названо вслух: `create` без внешнего имени не дедуплицируется — id порождает сам
+вызов, и «ещё одно такое же дело» это второе дело, а не повтор (как в kanban).
+С внешним именем (`external_ref`) дело находится повторно: живое не дублируется,
+закрытое не воскрешается (`docs/OWNERSHIP.md`, «Внешнее имя дела»).
 """
 
 from __future__ import annotations
@@ -104,6 +106,10 @@ CREATE TABLE IF NOT EXISTS deals (
   assignee   TEXT,
   status     TEXT NOT NULL,
   origin     TEXT NOT NULL DEFAULT 'duty',
+  -- Внешнее имя дела (0.0.4): `jira:RP-14080`, `jira:RP-14080#2`, … Строка без
+  -- разбора — формат задаёт тот, кто заводит дело. Уникального индекса нет: у
+  -- одного тикета бывает несколько дел (продолжение после паузы — новое дело).
+  external_ref TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -154,6 +160,25 @@ CREATE INDEX IF NOT EXISTS attachments_deal ON attachments(deal_id, id);
 
 # Каталог вложений рядом с БД: `<home>/duty/attachments/<deal_id>/`.
 ATTACH_SUBDIR = "attachments"
+
+# Колонки строки дела, которые читает и пишет store. `external_ref` появилась в
+# 0.0.4, и старая `duty.db` её не имеет: `CREATE TABLE IF NOT EXISTS` колонку в
+# заведённую таблицу не добавляет, а файла миграций у плагина нет — схема
+# доводится при открытии на запись (`_migrate`). Читающее соединение файл не
+# меняет, поэтому список колонок собирается по факту схемы (`_deal_fields`), и
+# «колонки ещё нет» читается как «внешнего имени нет», а не как ошибка.
+DEAL_FIELDS = (
+    "id",
+    "board",
+    "title",
+    "body",
+    "assignee",
+    "status",
+    "origin",
+    "created_at",
+    "updated_at",
+)
+EXTERNAL_REF_FIELD = "external_ref"
 
 
 class DealError(RuntimeError):
@@ -207,7 +232,40 @@ def open_store(
     conn.execute("PRAGMA foreign_keys = ON")
     if create:
         conn.executescript(SCHEMA)
+        _migrate(conn)
     return conn
+
+
+def _deal_columns(conn: sqlite3.Connection) -> set[str]:
+    """Колонки таблицы `deals` по факту схемы — то, чем проверяется миграция."""
+    return {str(row["name"]) for row in conn.execute("PRAGMA table_info(deals)")}
+
+
+def _deal_fields(conn: sqlite3.Connection) -> str:
+    """Список колонок строки дела для `SELECT`: `external_ref` — если она есть.
+
+    Читающая ручка не имеет права доводить схему (смотр экрана не меняет файл),
+    поэтому `external_ref` попадает в выборку только когда колонка уже заведена
+    миграцией. Отсутствие колонки — это «внешнего имени нет», а не ошибка чтения.
+    """
+    fields: list[str] = list(DEAL_FIELDS)
+    if EXTERNAL_REF_FIELD in _deal_columns(conn):
+        fields.insert(fields.index("origin") + 1, EXTERNAL_REF_FIELD)
+    return ", ".join(fields)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Довести уже существующую `duty.db` до схемы 0.0.4: колонка `external_ref`.
+
+    Отдельного файла миграций у плагина нет (`CREATE TABLE IF NOT EXISTS` при
+    каждом открытии и есть миграция), но колонку в заведённую таблицу так не
+    добавить. Поэтому при открытии **на запись** схема доводится здесь: ALTER
+    идемпотентен по проверке и коммитится сразу, чтобы не оказаться частью
+    чужой транзакции мутации.
+    """
+    if EXTERNAL_REF_FIELD not in _deal_columns(conn):
+        conn.execute(f"ALTER TABLE deals ADD COLUMN {EXTERNAL_REF_FIELD} TEXT")
+        conn.commit()
 
 
 def has_store(conn: Optional[sqlite3.Connection]) -> bool:
@@ -268,6 +326,24 @@ def new_id() -> str:
     return OWN_PREFIX + hashlib.sha1(seed).hexdigest()[:8]
 
 
+def external_ref_of(value: Any) -> Optional[str]:
+    """Внешнее имя дела: строка без пробелов по краям; `None` — имени нет.
+
+    Формат задаёт тот, кто заводит дело (`jira:RP-14080`, `jira:RP-14080#2`):
+    duty его не разбирает и не сверяет с тикетом — знание о Jira живёт там, где
+    дело создают. Проверяется одно: имя не пустое, иначе `external_ref=''` стал
+    бы вторым способом сказать «без имени», и поиск повторно нашёл бы пустоту.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        raise DealError(
+            "create: 'external_ref' — непустая строка (например jira:RP-14080) или null"
+        )
+    return text
+
+
 # -------------------------------------------------------------------- чтение
 
 
@@ -278,8 +354,7 @@ def deal_row(conn: sqlite3.Connection, deal_id: str) -> Optional[dict[str, Any]]
     ошибка это или нет, вызывающий (роут — 404, `/now` — просто без дела).
     """
     row = conn.execute(
-        "SELECT id, board, title, body, assignee, status, origin, created_at, updated_at "
-        "FROM deals WHERE id = ?",
+        f"SELECT {_deal_fields(conn)} FROM deals WHERE id = ?",
         (own_id(deal_id),),
     ).fetchone()
     return None if row is None else dict(row)
@@ -289,9 +364,7 @@ def deal_rows(
     conn: sqlite3.Connection, *, board: Optional[str] = None, open_only: bool = True
 ) -> list[dict[str, Any]]:
     """Свои дела (по умолчанию — активные), по возрастанию `created_at`."""
-    sql = (
-        "SELECT id, board, title, body, assignee, status, origin, created_at, updated_at FROM deals"
-    )
+    sql = f"SELECT {_deal_fields(conn)} FROM deals"
     params: list[Any] = []
     where: list[str] = []
     if open_only:
@@ -343,6 +416,44 @@ def attachments_of(conn: sqlite3.Connection, deal_id: str) -> list[dict[str, Any
         (own_id(deal_id),),
     )
     return [dict(row) for row in rows]
+
+
+def live_deal_by_ref(
+    conn: sqlite3.Connection,
+    board: str,
+    external_ref: str,
+    *,
+    now: Optional[int] = None,
+    window: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
+    """Живое дело с этим внешним именем на этой доске — то, что не дублируется.
+
+    Закрытое (`done`/`archived`) не возвращается никогда: продолжение после паузы
+    — это новое дело, и оно должно быть видно отдельно, а не как воскрешение
+    старого. Нескольких живых дел с одним именем штатный путь не создаёт; если они
+    есть (заведены руками), берётся самое свежее — «продолжить» возвращает то, чем
+    дело кончилось в последний раз, а не первое из истории.
+
+    `window` — окно дедупликации в секундах: если задано, живое дело, созданное
+    раньше окна, не переиспользуется (заводится новое — старое продолжение видно
+    отдельно). По умолчанию окна нет: любое живое дело с этим именем — то же дело.
+    """
+    where = [
+        "board = ?",
+        "external_ref = ?",
+        "status NOT IN ({})".format(", ".join("?" * len(CLOSED_STATUSES))),
+    ]
+    params: list[Any] = [str(board), external_ref, *CLOSED_STATUSES]
+    if window is not None:
+        base = _now_sec() if now is None else int(now)
+        where.append("created_at > ?")
+        params.append(base - int(window))
+    row = conn.execute(
+        f"SELECT {_deal_fields(conn)} FROM deals WHERE {' AND '.join(where)} "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        tuple(params),
+    ).fetchone()
+    return None if row is None else dict(row)
 
 
 def gate_open(conn: sqlite3.Connection, deal_id: str) -> bool:
@@ -522,6 +633,8 @@ def create_deal(
     known_boards: Iterable[str] = (),
     source: str = "cli",
     spec_path: Optional[str] = None,
+    external_ref: Optional[str] = None,
+    dedup_window: Optional[int] = None,
     now: Optional[int] = None,
 ) -> dict[str, Any]:
     """Завести своё дело: строка store плюс событие `created` в одной транзакции.
@@ -538,8 +651,17 @@ def create_deal(
     относительный не восстановить из журнала, а несуществующий сделал бы ленту
     пустой без причины.
 
-    `create` намеренно не дедуплицируется: id порождает сам вызов, поэтому
-    повтор — это второе дело (как в kanban), а не идемпотентный повтор.
+    `external_ref` — внешнее имя дела (`jira:RP-14080`), по которому его находят
+    повторно (`docs/OWNERSHIP.md`, «Внешнее имя дела»). Если живое дело с этим
+    именем на этой доске уже есть, новое не заводится: возвращается оно с
+    `created: false` и причиной в `reason` — повторный клик «продолжить» не
+    плодит второе дело. Закрытое дело не воскрешается: это продолжение, и оно
+    заводится новым (`created: true`). `dedup_window` ограничивает поиск свежими
+    делами (секунды); по умолчанию окна нет.
+
+    Без `external_ref` `create` намеренно не дедуплицируется: id порождает сам
+    вызов, поэтому повтор — это второе дело (как в kanban), а не идемпотентный
+    повтор.
     """
     now = _now_sec() if now is None else int(now)
     slug = " ".join(str(board or "").split())
@@ -568,6 +690,32 @@ def create_deal(
         if parent not in parent_ids:
             parent_ids.append(parent)
 
+    ref = external_ref_of(external_ref)
+    window: Optional[int] = None
+    if dedup_window is not None:
+        window = int(dedup_window)
+        if window < 0:
+            raise DealError(
+                f"create: 'dedup_window' — неотрицательное число секунд, получено {window}"
+            )
+    if ref is not None:
+        existing = live_deal_by_ref(conn, slug, ref, now=now, window=window)
+        if existing is not None:
+            # Живое дело с этим внешним именем уже есть — повтор («продолжить»
+            # нажали дважды) не заводит второе. События не пишутся: создавать
+            # нечего, и «уже было» отличается от «сделано» в ответе.
+            return {
+                "deal": existing,
+                "events": 0,
+                "idempotent": True,
+                "created": False,
+                "reason": (
+                    f"живое дело {existing['id']} с external_ref={ref!r} на доске {slug!r} "
+                    "уже есть — вернули его (закрытое дело с этим именем не воскрешается: "
+                    "продолжение заводится новым)"
+                ),
+            }
+
     deal_id = new_id()
     deal = {"id": deal_id, "board": slug}
     created = _event(
@@ -579,6 +727,7 @@ def create_deal(
             "status": None,
             "parents": parent_ids,
             "spec": spec_file or None,
+            "external_ref": ref,
         },
         source,
         {
@@ -588,15 +737,16 @@ def create_deal(
             "assignee": assignee,
             "parents": parent_ids,
             "spec": spec_file or None,
+            "external_ref": ref,
         },
         now,
     )
     with conn:  # одна транзакция: доска, строка дела, связи, событие
         _ensure_board(conn, slug, now)
         conn.execute(
-            "INSERT INTO deals (id, board, title, body, assignee, status, origin, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            (deal_id, slug, clean_title, str(body or ""), assignee, "todo", "duty", now, now),
+            "INSERT INTO deals (id, board, title, body, assignee, status, origin, external_ref, "
+            "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (deal_id, slug, clean_title, str(body or ""), assignee, "todo", "duty", ref, now, now),
         )
         for parent_id in parent_ids:
             conn.execute(
@@ -630,7 +780,12 @@ def create_deal(
                 )
             )
         written = journal.append_in_tx(conn, events)
-    return {"deal": deal_row(conn, deal_id), "events": written, "idempotent": written == 0}
+    return {
+        "deal": deal_row(conn, deal_id),
+        "events": written,
+        "idempotent": written == 0,
+        "created": True,
+    }
 
 
 def patch_deal(

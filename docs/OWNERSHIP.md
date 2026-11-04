@@ -112,8 +112,9 @@ CREATE TABLE IF NOT EXISTS attachments (
 поэтому повтор той же причины перехода не плодит событий, а новый переход родителя даёт
 новый ключ. У `gate_opened` от `create` причины-события родителя нет: ключ строится по
 общим аргументам события — `<source>:<child_id>:gate_opened:sha1({cause: "created",
-parents})` (`event_key()`), а родитель в payload — тот, чьё закрытие открыло гейт
-последним.
+parents})` (`event_key()`), а родитель в payload — с самым свежим `updated_at` (при
+равенстве — по `id`): при обычном ходе это последний закрывший родитель, но `updated_at`
+двигают и комментарий, и `patch`.
 
 ## API
 
@@ -139,8 +140,9 @@ POST   /deals/{id}/attach        multipart: file  → {attachment}
 
 Правила:
 
-- `POST /deals` порождает `status='todo'`; `ready` ставится, когда все родители `done`
-  (это то же правило гейта, что в kanban, но считаем сами);
+- `POST /deals` порождает `status='todo'`; `ready` ставится, когда все родители
+  `done`/`archived` (`CLOSED_STATUSES`), а дело без родителей получает `ready` сразу —
+  это то же правило гейта, что в kanban, но считаем сами;
 - `PATCH` не даёт менять `origin` и переписывать `id`; смена `status` — только через
   команды, кроме `PATCH {status: archived}`;
 - `complete` без `review` закрывает дело; `complete {review: true}` и `/review` —

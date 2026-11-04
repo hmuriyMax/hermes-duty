@@ -89,6 +89,40 @@
   классы отказа; `docs/RUNBOOK.md` — разбор отказа через `duty why` и красная
   проба «отключить гейт».
 
+**Контракт попытки: отчёт — файл `report_to`, право записи даёт контракт**
+
+- `dashboard/runner.py` — `build_contract()` кладёт в контракт попытки поле
+  `report_to` = `<workdir>/.duty/result.json` (`result_path`), а `boundaries` называет
+  это же словами: «отчёт — файл <путь>; вопрос — полем question в нём» и «отчёт
+  пишется инструментом `write_file` (валидный JSON по `report_schema`) — текстом в
+  ответе движок его не увидит». Требование к форме отчёта попадает к исполнителю
+  **до** работы (в контракте), а не выясняется из отказа гейта. `read_result`
+  различает «нет файла», «не читается», «не разбирается» и «не объект» — причина
+  всегда называется словами: `result.json нет: <путь>` → `failed(contract)`.
+- `role-access` (отдельный плагин, `~/.hermes/plugins/role-access/__init__.py`) —
+  `check_attempt_report()`: read-only роль получает право записи **одного** файла —
+  отчёта своей попытки. Сходиться должно всё: этап, номер и каталог из транскрипта
+  сессии, контракт `<workdir>/.duty/in-<этап>-<n>.json`, записанный движком,
+  совпадение `role`/`stage`/`attempt`/`workdir` в нём, `report_to` ровно
+  `<workdir>/.duty/result.json` и каталог попытки под `~/.hermes/kanban/boards/**`.
+  Иначе — отказ `роль read-only; разрешена запись только отчёта попытки: <путь>`
+  (без контракта — `…но контракта попытки с report_to у сессии нет`). Репозиторий,
+  `tree/` и `.git` остаются закрытыми: разрешён файл, а не каталог. Профилю
+  `reviewer` выдан бандл `role_file_write` — guard разрешает вызов, инструмент должен
+  быть ещё и выдан профилем.
+- Живой прогон `d_6e764042` (04.11) — то же в журнале: у `review#1` (роль `reviewer`)
+  `attempt_progress` содержит только `search_files` (14), `read_file` (10) и
+  `write_file` (1), ни одного `terminal`; на диске после попытки лежит
+  `…/d_6e764042-review-1/.duty/result.json` (6 998 Б), по которому гейт принял этап.
+  У `verify#1` (роль `tester`) наоборот: `terminal` (8), `read_file` (4) — и ни одного
+  `write_file`, потому что этой роли `write_file` не выдан; отчёт (1 592 Б) написан
+  из shell.
+- `docs/SPEC.md` — раздел «Контракт попытки: что этап получает и куда пишет» (поля
+  контракта, `report_to`, право записи read-only роли), `docs/PROBES.md` — раздел
+  «Права ролей» (таблица `implementer`/`tester`/`reviewer`/`documenter`: чтение,
+  запись, отчёт, shell, и что именно режет guard вне `report_to`), `docs/RUNBOOK.md`
+  — сценарий «дело дошло до `review`, ревьюер пишет отчёт файлом».
+
 **Лента этапов дела: каждая попытка видна в консоли (read-only)**
 
 - `dashboard/stagefeed.py` — блок `stages` для `GET /deal` и этап для `GET /now`.
@@ -597,11 +631,25 @@
   `errors[]`. Предупреждения (`check_base` без репозитория на машине) прогон не
   останавливают.
 
+### Живые прогоны 0.0.4
+
+Числа — из журнала `~/.hermes/duty/duty.db` (`bin/duty attempts <board> <id>`), кроме
+строки, где рядом указан вывод самого прогона: драйвер мерит свои часы с десятыми, а в
+журнале `ts` — целые секунды, поэтому `d_6e764042` в двух видах.
+
+| дело (04.11) | что проверялось | факты журнала |
+|---|---|---|
+| `d_a2a26b55` | база этапа | `impl` прошёл, `verify` — `failed(contract)`, `artifact.missing` на файле, который сделал `impl`: дерево второго этапа отводилось от `spec.base` |
+| `d_221d021a` | умолчание `workspace` | `verify` не объявлял `workspace` и работал в каталоге попытки — верный отчёт получил отказ гейта; после правки умолчание этапа с `needs` — `worktree` (`c3a5d77`) |
+| `d_76edb225` | таймлайн попыток | в журнале три попытки, `bin/duty attempts` печатал «0 попыток»: консоль считала, что спавна в 0.0.3 нет |
+| `d_6e764042` | цепочка целиком + отчёт ревьюера файлом | `impl#1` 99 с (`base 8d31ede` → `commit abdc475`), `verify#1` 73 с (`base abdc475`), `review#1` 135 с (`base abdc475`, из инструментов — `search_files` 14 / `read_file` 10 / `write_file` 1, `terminal` ни одного); `completed cause=all_stages_done`, этапы `impl, verify, review` в 19:37:35. Вывод прогона того же дела (его собственные часы): `98.5s` / `73.7s` / `135.6s` |
+| `d_f8389a4b` | парковка и ответ пула | `blocked` с `block_kind='parked'`: `1/1 contract` на этапе `review`, причина — `result.json нет`, вопрос `#301`; ответ `#301` получен (`answered_via=tg-button`), дело ждёт **решения**: `bin/duty decide d_f8389a4b continue\|stop` |
+
 ### Тесты 0.0.4
 
 | прогон | результат |
 |---|---|
-| `pytest tests/ -q` | `617 passed, 1 skipped` (skip — живой прогон под `@pytest.mark.live`, включается `pytest -m live`) |
+| `pytest tests/ -q` | `626 passed, 1 skipped` (skip — живой прогон под `@pytest.mark.live`, включается `pytest -m live`) |
 | `node --test tests/model.test.mjs` | `37 pass` |
 | `node --test tests/web.test.mjs` | `12 pass` |
 | `bin/duty demo` | 7 проверок OK, код 0 |
@@ -609,10 +657,10 @@
 | `hermes plugins validate .` | Validation passed |
 | `bin/duty spec check examples/duty.yaml` / `examples/duty-minimal.yaml` | OK, код 0 |
 
-По файлам (собрано 618 = 617 passed + 1 skipped, снято `pytest --collect-only` на
-вершине `release/v0.0.4` после FIX-4): `test_spec` 80, `test_journal` 61, `test_transit` 56,
-`test_runner` 52, `test_deals` 64, `test_cli` 50, `test_evidence` 34,
-`test_failures` 34, `test_aggregate` 30, `test_driver` 39, `test_ask` 29,
+По файлам (собрано 627 = 626 passed + 1 skipped, снято `pytest --collect-only` на
+вершине `release/v0.0.4` после W21 (`43a99b4`)): `test_spec` 80, `test_journal` 61, `test_transit` 56,
+`test_runner` 52, `test_deals` 64, `test_cli` 54, `test_evidence` 34,
+`test_failures` 34, `test_aggregate` 30, `test_driver` 44, `test_ask` 29,
 `test_routing` 25, `test_reaper` 16, `test_stagefeed` 15, `test_screens` 12,
 `test_demo` 9, `test_p0_contract` 6, `test_worktree_base` 4,
 `test_frontend_syntax` 2.

@@ -217,7 +217,7 @@ HERMES_PROBE_MARKER=ENVPASS-1 HERMES_KANBAN_TASK=… hermes chat -p tester --for
 
 | профиль | shell | корни чтения | что запрещено |
 |---|---|---|---|
-| `reviewer` (read-only) | **нет** — ответ `NO-TERMINAL-TOOL`, `terminal` в `agent.disabled_toolsets` | `~/GolandProjects`, `~/.hermes/skills`, `<profile>/skills`, `~/.hermes/tasks`, `~/.hermes/plans`, `~/.hermes/kanban/attachments`, `~/.hermes/kanban/boards`, `<profile>/cache/spillover` (по коду ещё `$HERMES_KANBAN_WORKSPACE`, но только при заданном `$HERMES_KANBAN_TASK` — живьём не сработало, см. ниже) | всё, чего нет в allowlist: запись (`write_file`/`patch`), shell, browser, `computer_use`; чтение вне корней |
+| `reviewer` (read-only) | **нет** — ответ `NO-TERMINAL-TOOL`, `terminal` в `agent.disabled_toolsets` | `~/GolandProjects`, `~/.hermes/skills`, `<profile>/skills`, `~/.hermes/tasks`, `~/.hermes/plans`, `~/.hermes/kanban/attachments`, `~/.hermes/kanban/boards`, `<profile>/cache/spillover` (по коду ещё `$HERMES_KANBAN_WORKSPACE`, но только при заданном `$HERMES_KANBAN_TASK` — живьём не сработало, см. ниже) | всё, чего нет в allowlist: shell, browser, `computer_use`, чтение вне корней; запись (`write_file`/`patch`) — **только** `<workdir>/.duty/result.json` своей попытки по контракту движка (см. «Права ролей» в конце файла) |
 | `tester` (worker) | **есть** — `terminal` отработал, `id -un` = `mshchemilkin`, backend `local`, cwd = каталог вызывающего | **ограничений нет** — прочитал `~/.hermes/profiles/implementer/cache/scratch/envprobe/marker.txt` | `write_file`, `patch`, `browser*`, `computer_use` (роль), плюс `memory`, `skill_manage`, `delegate_task`, `cronjob_manage`, `manage_catalog`, `desktop_project` |
 | `implementer` (worker) | есть (эта же проба идёт под ним) | ограничений нет | те же `WORKER_DENY`, запись разрешена |
 | `lead` / `researcher` / `ops` | по коду — как `reviewer` (все входят в `READONLY`); **живьём не мерил** | те же корни | то же |
@@ -253,6 +253,13 @@ HERMES_PROBE_MARKER=ENVPASS-1 HERMES_KANBAN_TASK=… hermes chat -p tester --for
 в контракте и держать под `~/.hermes/kanban/boards/<board>/workspaces/` — только так read-only
 роль его прочитает.**
 
+
+**Поправка после W19 (04.11): «read-only не пишет ничего» больше не верно в одном месте.**
+Право записи выдаёт не роль, а контракт попытки: read-only профиль пишет ровно
+`<workdir>/.duty/result.json` своей попытки — и ничего кроме него (репозиторий, `tree/`,
+`.git` остаются закрытыми). Проба 3 мерила мир **до** этой правки, поэтому её строка
+«запись (`write_file`/`patch`) запрещена» относилась ко времени замера; действующая
+таблица прав — раздел «Права ролей» в конце файла.
 ### Что это значит для движка
 
 1. Контракт попытки обязан объявлять **каталог попытки** явным полем, а движок — создавать его
@@ -269,3 +276,59 @@ HERMES_PROBE_MARKER=ENVPASS-1 HERMES_KANBAN_TASK=… hermes chat -p tester --for
 4. `tester` и `implementer` не ограничены по путям чтения — изоляция «попытка видит только свой
    каталог» **не обеспечивается** `role-access`; если движку нужна такая граница, её даёт
    только сам движок (chroot/контейнер/явный cwd), а не профиль.
+
+---
+
+## Права ролей: что можно роли и что режет `role-access`
+
+Действующая таблица прав — по коду guard, не по памяти о пробе 3 выше. Источник —
+`~/.hermes/plugins/role-access/__init__.py` (`READONLY`, `WORKERS`, `WORKER_DENY`,
+`check_read`, `check_attempt_report`); профиль поверх этого решает, какие инструменты
+вообще выданы (`platform_toolsets.cli` минус `agent.disabled_toolsets`).
+
+| роль | семейство в guard | чтение | запись файлов (`write_file`/`patch`) | отчёт попытки `.duty/result.json` | shell (`terminal`) |
+|---|---|---|---|---|---|
+| `implementer` | `WORKERS` | guard пути не проверяет | **разрешена** (профиль выдаёт бандл `file`) | пишет как обычную запись в каталоге попытки | есть |
+| `tester` | `WORKERS` | guard пути не проверяет | **запрещена**: роль в списке `tester`/`publisher`/`documenter` — guard режет `write_file`, `patch`, `browser*`, `computer_use`; правка идёт через shell | пишет **из shell** (`terminal`), потому что `write_file` роли не выдан | есть |
+| `reviewer` | `READONLY` | только разрешённые корни (`check_read`: `~/GolandProjects`, `~/.hermes/skills`, `<профиль>/skills`, `~/.hermes/tasks`, `~/.hermes/plans`, `~/.hermes/kanban/attachments`, `~/.hermes/kanban/boards`, `<профиль>/cache/spillover`) | **только** `<workdir>/.duty/result.json` своей попытки (`check_attempt_report`); всё прочее — отказ | **единственная разрешённая запись.** Нужен бандл `role_file_write` в профиле: guard разрешает вызов, но инструмент должен быть выдан | **нет** (`terminal` в `agent.disabled_toolsets`) |
+| `documenter` | `WORKERS` | guard пути не проверяет | **запрещена** (та же тройка) — правка через shell | пишет из shell, как `tester` | есть |
+
+Что именно режет guard вне `report_to` (одна проверка, а не набор запретов):
+
+1. **Read-only роль пишет только отчёт своей попытки.** Сходиться должно всё: этап,
+   номер и каталог из транскрипта сессии; файл `<workdir>/.duty/in-<этап>-<n>.json`,
+   записанный движком; роль/этап/номер/`workdir` в этом файле; `report_to` ровно
+   `<workdir>/.duty/result.json`; каталог под `~/.hermes/kanban/boards/**`. Не сошлось —
+   `role-access: роль read-only; разрешена запись только отчёта попытки: <путь>`, без
+   контракта — `…но контракта попытки с report_to у сессии нет`.
+2. **Репозиторий и дерево остаются закрытыми на запись даже с контрактом:** разрешён один
+   файл, а не каталог. `tree/`, `.git`, код и `docs/` read-only роли не пишутся.
+3. **Read-only роль не получает shell** — `terminal` не в `READ_TOOLS`, поэтому «попытка с
+   evidence-командой» под `reviewer` физически неисполнима: evidence собирает процесс с
+   профилем из `WORKERS` (`tester`/`implementer`), а ревьюер получает готовые файлы и
+   выносит приговор.
+4. **Вне allowlist — отказ, а не тишина:** `tool is not in the readonly allowlist` для
+   любого инструмента read-only роли, которого нет в списке; `read path is outside
+   permitted roots` для чтения вне корней; `generic dispatch is forbidden` для `tool_call`.
+5. **Рабочая роль не пишет в чужой файл-источник:** у `WORKERS` guard сужает не запись, а
+   инструменты — `skill_manage`, `memory`, `cronjob_manage`, `delegate_task`,
+   `manage_catalog`, `desktop_project` закрыты всем рабочим ролям (`WORKER_DENY`).
+
+Живая проверка (прогон `d_6e764042`, 04.11, журнал `attempt_progress`):
+
+| попытка | роль | инструменты из журнала | отчёт на диске |
+|---|---|---|---|
+| `impl#1` | `implementer` | `terminal` 17, `write_file` 4, `read_file` 1, `patch` 1 | `…/d_6e764042-impl-1/.duty/result.json` (1 646 Б) |
+| `verify#1` | `tester` | `terminal` 8, `read_file` 4, `tool_search` 2, `process_manage` 1 — **ни одного `write_file`** | `…/d_6e764042-verify-1/.duty/result.json` (1 592 Б) — написан из shell |
+| `review#1` | `reviewer` | `search_files` 14, `read_file` 10, `write_file` 1 — **ни одного `terminal`** | `…/d_6e764042-review-1/.duty/result.json` (6 998 Б) |
+
+То есть `reviewer` пишет **только** `.duty/result.json` (одна запись за попытку), а
+`tester` вообще не имеет `write_file` и кладёт отчёт из `terminal`. Профиль `reviewer` при
+этом выдаёт бандл `role_file_write` в `platform_toolsets.cli` и держит `terminal` в
+`agent.disabled_toolsets` — без первого отчёт было бы нечем писать, без второго ревьюер
+имел бы shell.
+
+**Чего эта таблица не гарантирует.** Guard — это проверка имён инструментов и аргументов,
+а не изоляция ОС: у `WORKERS` есть shell, и произвольная команда остаётся возможной
+(`role-access/README.md`, «Limits — not a sandbox»). Изоляция «попытка видит только свой
+каталог» профилем не обеспечивается — её даёт только сам движок (cwd/дерево попытки).

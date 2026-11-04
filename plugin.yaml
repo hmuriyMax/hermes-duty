@@ -1,5 +1,5 @@
 name: hermes-duty
-version: "0.0.4"
+version: "0.0.5"
 manifest_version: 2
 description: >-
   Hermes Duty — «дело» вместо карточки: этапы, попытки, доказательства и вопросы.

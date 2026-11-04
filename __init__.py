@@ -8,7 +8,7 @@ dashboard-половине (`dashboard/plugin_api.py`) и работает то�
 `on_duty_attempt_*` — они пишут в собственный журнал плагина, а не в kanban.
 """
 
-__version__ = "0.0.4"
+__version__ = "0.0.5"
 
 
 def register(ctx):  # noqa: ARG001 - контракт плагина Hermes

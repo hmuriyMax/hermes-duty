@@ -17,7 +17,10 @@
    `commit`|`artifacts`, `evidence`, `summary`. Лишнее поле — предупреждение, а не
    отказ: исполнитель вправе добавить контекст.
 2. **Артефакты**: путь относительный и не выводит из дерева попытки, файл есть,
-   `sha256` заявлен целиком и совпадает с содержимым.
+   `sha256` заявлен целиком и совпадает с содержимым. У отсутствующего файла
+   отказ называет мерку («искали относительно дерево/каталог попытки») и, если
+   файл нашёлся в дереве попытки, подсказывает `workspace: worktree`: этот
+   диагноз человек разбирал руками (E2E `d_221d021a`).
 3. **Коммит**: `git -C <дерево> rev-parse --verify <commit>^{commit}` и он **не
    предок базы**: предок базы означает «принёс готовое», то есть чужое.
 4. **Команды этапа**: по каждой объявленной `{cmd, must}` есть запись с тем же
@@ -110,6 +113,18 @@ SHA_LEN = 64
 # С какого сходства команда считается «почти той же»: ниже — уже не подмена, а
 # другая команда (и тогда отказ называется «нет записи», а не «подменил»).
 SIMILAR = 0.8
+
+# Дерево попытки лежит внутри её каталога (`dashboard/runner.py`,
+# `prepare_tree`). Путь нужен отказу `artifact.missing`: «файла нет вовсе» и
+# «файл есть, но этап смотрел в каталог, а не в дерево» — разные диагнозы, и
+# второй человек разбирал руками (E2E `d_221d021a`).
+TREE_SUBDIR = "tree"
+
+# Мерка, относительно которой ищется артефакт: отказ обязан её назвать, иначе
+# «файла нет» не отвечает на вопрос «где искали».
+MEASURE_TREE = "дерево попытки"
+MEASURE_ATTEMPT = "каталог попытки"
+MEASURE_DIR = "каталог дела"
 
 
 @dataclass(frozen=True)
@@ -320,8 +335,16 @@ def _check_schema(result: dict[str, Any], stage: Any, issues: list[Issue]) -> Op
     return status
 
 
-def _check_artifacts(entries: list[Any], root: Path, issues: list[Issue]) -> None:
-    """Артефакты в дереве попытки: путь внутри, файл есть, sha256 совпадает."""
+def _check_artifacts(
+    entries: list[Any], root: Path, issues: list[Issue], *, measure: str, tree: Path
+) -> None:
+    """Артефакты в дереве попытки: путь внутри, файл есть, sha256 совпадает.
+
+    `measure` — как называется мерка в отказе (`дерево попытки` / `каталог
+    попытки` / `каталог дела`), `tree` — где лежало бы дерево этой попытки.
+    Отсутствующий файл называется вместе с меркой: без неё «файла нет» не
+    говорит, чего не хватило — файла или дерева, которое никто не создавал.
+    """
     for index, entry in enumerate(entries):
         where = _where("artifacts", index)
         if not isinstance(entry, dict):
@@ -361,7 +384,19 @@ def _check_artifacts(entries: list[Any], root: Path, issues: list[Issue]) -> Non
             )
             continue
         if not target.is_file():
-            issues.append(Issue(f"{where}.path", RULE_ARTIFACT_MISSING, f"файла нет: {target}"))
+            # Мерка в отказе — часть контракта: «файла нет» без неё заставляет
+            # человека гадать, чего не хватило — файла или дерева.
+            message = f"файла нет: {target}; искали относительно {measure}"
+            if tree != root:
+                in_tree = (tree / relative).resolve()
+                if in_tree.is_file():
+                    # Файл в дереве попытки есть, а этап работал в каталоге —
+                    # ровно случай E2E `d_221d021a`: отчёт верный, мерка чужая.
+                    message += (
+                        f"; файл есть в дереве попытки ({in_tree}) — этап работает в каталоге "
+                        "попытки, укажи workspace: worktree, чтобы работать в дереве"
+                    )
+            issues.append(Issue(f"{where}.path", RULE_ARTIFACT_MISSING, message))
             continue
         claimed = entry.get("sha256")
         claimed_text = claimed.strip().lower() if isinstance(claimed, str) else ""
@@ -577,7 +612,10 @@ def verify(
     `root` — рабочий каталог попытки (cwd процесса: дерево `worktree`, каталог
     дела `dir`, каталог попытки `none`): относительные пути артефактов режутся по
     нему, а не по `workdir`, где лежит отчёт. `base` — база спеки: по ней
-    проверяется, что заявленный коммит не был готов до попытки.
+    проверяется, что заявленный коммит не был готов до попытки. `workdir` — не
+    только место отчёта: дерево попытки лежит внутри него (`TREE_SUBDIR`), и
+    отказ `artifact.missing` по этому пути отличает «файла нет» от «этап смотрел
+    в каталог, а файл — в дереве».
     """
     if not isinstance(result, dict):
         return Verdict(
@@ -587,13 +625,21 @@ def verify(
         )
 
     root_path = Path(root if root is not None else workdir).resolve()
+    # Мерка называется по `workspace` этапа: `worktree` ищет в дереве, `dir` — в
+    # каталоге дела, `none` — в каталоге попытки. Это тот же выбор, что делает
+    # движок (`runner.prepare_tree`), названный словами в отказе.
+    measure = {
+        "worktree": MEASURE_TREE,
+        "dir": MEASURE_DIR,
+    }.get(str(getattr(stage, "workspace", "") or ""), MEASURE_ATTEMPT)
+    tree_path = (Path(workdir) / TREE_SUBDIR).resolve()
     issues: list[Issue] = []
     status = _check_schema(result, stage, issues)
     if status is None:
         return Verdict(ok=False, kind=KIND_CONTRACT, details=issues)
     if status == STATUS_DONE:
         artifacts = result.get("artifacts")
-        _check_artifacts(list(artifacts or []), root_path, issues)
+        _check_artifacts(list(artifacts or []), root_path, issues, measure=measure, tree=tree_path)
         commit = result.get("commit")
         commit_text = commit.strip() if isinstance(commit, str) else ""
         if commit_text:

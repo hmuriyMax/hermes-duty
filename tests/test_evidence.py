@@ -219,6 +219,57 @@ def test_missing_artifact_file_is_refused(tmp_path: Path) -> None:
     assert rules(verdict) == [evidence.RULE_ARTIFACT_MISSING]
 
 
+def test_missing_artifact_names_the_measure(tmp_path: Path) -> None:
+    """«Файла нет» называет мерку: иначе не понять, чего не хватило — файла или дерева.
+
+    Этап без дерева (`workspace: none`) ищет в каталоге попытки, и отказ обязан
+    это сказать: без мерки человек читает код вместо причины.
+    """
+    built = report(tmp_path, artifacts=[{"path": "нет-такого.go", "sha256": "1" * 64}])
+    verdict = verify(built, make_stage(), tmp_path)
+    message = str(verdict.errors[0])
+    assert f"файла нет: {tmp_path.resolve() / 'нет-такого.go'}" in message
+    assert "искали относительно каталог попытки" in message
+    assert "workspace: worktree" not in message
+
+
+def test_missing_artifact_in_a_tree_stage_names_the_tree(tmp_path: Path) -> None:
+    """Этап с деревом (`workspace: worktree`) ищет в дереве — это и называется."""
+    tree = tmp_path / "tree"
+    report(tmp_path)
+    built = report(tree, artifacts=[{"path": "нет-такого.go", "sha256": "1" * 64}])
+    verdict = verify(built, make_stage(workspace="worktree"), tmp_path, root=tree)
+    message = str(verdict.errors[0])
+    assert rules(verdict) == [evidence.RULE_ARTIFACT_MISSING]
+    assert "искали относительно дерево попытки" in message
+
+
+def test_artifact_in_the_attempt_tree_hints_workspace_worktree(tmp_path: Path) -> None:
+    """Регрессия на E2E `d_221d021a`: файл есть в дереве, а мерка — каталог попытки.
+
+    Тестер скопировал дерево `impl` в свою рабочую область, прогнал тесты и
+    отчитался артефактом — гейт честно отказывал, потому что по мерке каталога
+    попытки файла нет. Отказ обязан назвать подсказку, а не только «нету».
+    """
+    path, digest = write(tmp_path / "tree", "dashboard/failures.py", "классы отказа\n")
+    built = report(tmp_path, artifacts=[{"path": path, "sha256": digest}])
+    verdict = verify(built, make_stage(), tmp_path)
+    message = str(verdict.errors[0])
+    assert rules(verdict) == [evidence.RULE_ARTIFACT_MISSING]
+    assert f"файл есть в дереве попытки ({(tmp_path / 'tree' / path).resolve()})" in message
+    assert "укажи workspace: worktree, чтобы работать в дереве" in message
+
+
+def test_artifact_hint_is_not_invented_when_the_tree_has_no_file(tmp_path: Path) -> None:
+    """Подсказки нет, если файла нет и в дереве: это «файла нет вовсе», а не мерка."""
+    (tmp_path / "tree").mkdir()
+    built = report(tmp_path, artifacts=[{"path": "нет-такого.go", "sha256": "1" * 64}])
+    verdict = verify(built, make_stage(), tmp_path)
+    message = str(verdict.errors[0])
+    assert "файл есть в дереве попытки" not in message
+    assert "workspace: worktree" not in message
+
+
 @pytest.mark.parametrize("path", ["../снаружи.txt", "/etc/passwd"])
 def test_artifact_path_outside_the_attempt_tree_is_refused(tmp_path: Path, path: str) -> None:
     """Путь наружу (`..` или абсолютный) — отказ, даже если файл существует."""

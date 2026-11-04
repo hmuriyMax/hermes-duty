@@ -301,7 +301,7 @@ fold (14), а не второй вид на каждое событие попы
 | шаг | что сверяется | правило отказа | класс |
 |---|---|---|---|
 | 1 | `status` ∈ {`done`, `blocked`, `refused`}; для `done` есть `commit`\|`artifacts`, `evidence`, `summary`; лишнее поле — предупреждение | `status`, `required`, `extra` | `contract` |
-| 2 | артефакт: относительный путь внутри дерева попытки, файл есть, `sha256` полный и совпадает | `artifact.path`, `artifact.missing`, `artifact.sha256` | `contract` |
+| 2 | артефакт: относительный путь внутри дерева попытки, файл есть, `sha256` полный и совпадает; отказ называет мерку («искали относительно дерево/каталог попытки») и подсказывает `workspace: worktree`, если файл нашёлся в дереве попытки | `artifact.path`, `artifact.missing`, `artifact.sha256` | `contract` |
 | 3 | `git rev-parse --verify <commit>^{commit}` в дереве; коммит не предок базы (предок = «принёс чужое готовое») | `commit.resolve`, `commit.foreign`; `commit.base` — предупреждение, если база не резолвится | `contract` |
 | 4 | по каждой `{cmd, must}` из `stage.evidence` есть запись с тем же `cmd`, `exit == must` и `started_at` ≥ начала попытки (и не позже «сейчас») | `evidence.missing`, `evidence.exit`, `evidence.stale`, `evidence.future` | `contract` |
 | 5 | `cmd` совпадает со спекой посимвольно после нормализации пробелов: «почти та же команда» | `evidence.substituted` | `contract` |

@@ -1132,6 +1132,10 @@ def spec_report(path: str) -> dict[str, Any]:
     payload["path"] = str(spec.path)
     payload["duty"] = spec.duty
     payload["stages"] = len(spec.stages)
+    payload["workspaces"] = [
+        {"id": stage.id, "workspace": stage.workspace, "default": stage.workspace_default}
+        for stage in spec.stages
+    ]
     payload["issues"] = [_issue_dict(issue) for issue in issues]
     payload["errors"] = len(module.errors(issues))
     payload["warnings"] = len(issues) - payload["errors"]
@@ -1140,17 +1144,31 @@ def spec_report(path: str) -> dict[str, Any]:
 
 
 def render_spec_check(payload: dict[str, Any]) -> str:
-    """`file:line: правило: текст` — либо `OK` (предупреждения печатаются и при OK)."""
+    """`file:line: правило: текст` — либо `OK` (предупреждения печатаются и при OK).
+
+    Строка `workspace:` называет дерево каждого этапа и то, взято ли оно по
+    умолчанию: молчаливое умолчание — ровно то, из-за чего цепочка ломалась
+    (E2E `d_221d021a`: `verify` без `workspace` работал в каталоге попытки, и
+    артефактов предшественника там не было).
+    """
     lines = [
         f"{issue['path']}:{issue['line']}: {issue['rule']}: {issue['message']}"
         for issue in payload.get("issues") or []
     ]
+    trees = " · ".join(
+        f"{item['id']}={item['workspace']}" + (" (по умолчанию)" if item.get("default") else "")
+        for item in payload.get("workspaces") or []
+    )
     if payload.get("ok"):
         head = f"OK {payload['path']} · дело {payload['duty']} · этапов {payload['stages']}"
-        return "\n".join([head] + lines)
+        return "\n".join([head] + lines + ([f"workspace: {trees}"] if trees else []))
     if payload.get("unreadable"):
         return "\n".join(lines + [f"ОТКАЗ · спека не читается: {payload['path']}"])
-    return "\n".join(lines + [f"ОТКАЗ · ошибок {payload['errors']}, предупреждений {payload['warnings']}"])
+    return "\n".join(
+        lines
+        + ([f"workspace: {trees}"] if trees else [])
+        + [f"ОТКАЗ · ошибок {payload['errors']}, предупреждений {payload['warnings']}"]
+    )
 
 
 def spec_exit_code(payload: dict[str, Any]) -> int:

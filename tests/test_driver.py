@@ -95,6 +95,8 @@ CREATE TABLE questions (
 """
 
 # Три этапа подряд: ровно та цепочка, которую карточка называет гейтом P2.
+# Дерево выключено явно (`workspace: none`): драйвер проверяется без git, а
+# умолчание этапа с `needs` — `worktree`, которому нужны `repo`/`base`.
 CHAIN = """
 duty: probe
 stages:
@@ -103,9 +105,11 @@ stages:
   - id: verify
     role: tester
     needs: [impl]
+    workspace: none
   - id: review
     role: reviewer
     needs: [verify]
+    workspace: none
 """
 
 

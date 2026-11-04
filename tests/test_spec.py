@@ -73,7 +73,12 @@ def rules(found: list) -> set[str]:
 
 
 def two_stages(extra: str = "", verdict: str = "verdict: {approve: next, changes: impl, max_rounds: 1}") -> str:
-    """Минимальный скелет годной спеки: вход impl и ревью за ним."""
+    """Минимальный скелет годной спеки: вход impl и ревью за ним.
+
+    У `review` дерево выключено явно: умолчание этапа с `needs` — `worktree`, а
+    отводить его здесь не от чего (`repo`/`base` не объявлены). Тесты этого
+    файла проверяют правила графа и приговора, а не дерево.
+    """
     return f"""
     duty: probe
     stages:
@@ -82,6 +87,7 @@ def two_stages(extra: str = "", verdict: str = "verdict: {approve: next, changes
       - id: review
         role: reviewer
         needs: [impl]
+        workspace: none
         {verdict}
     {extra}
     """
@@ -408,9 +414,11 @@ def test_verdict_changes_transitive_predecessor_is_allowed(tmp_path: Path):
           - id: verify
             role: tester
             needs: [impl]
+            workspace: none
           - id: review
             role: reviewer
             needs: [verify]
+            workspace: none
             verdict: {approve: next, changes: impl, max_rounds: 2}
         """,
     )
@@ -451,6 +459,7 @@ stages:
   - id: publish
     role: publisher
     needs: [impl]
+    workspace: none
 """,
     )
     found = spec_module.validate_spec(spec_module.load_spec(path), profiles=PROFILES)
@@ -471,10 +480,12 @@ def test_publish_after_review_is_ok(tmp_path: Path):
           - id: review
             role: reviewer
             needs: [impl]
+            workspace: none
             verdict: {approve: next, changes: impl, max_rounds: 1}
           - id: publish
             role: publisher
             needs: [review]
+            workspace: none
         """,
     )
     assert found == []
@@ -492,13 +503,16 @@ def test_publish_after_stage_that_itself_after_review_is_ok(tmp_path: Path):
           - id: review
             role: reviewer
             needs: [impl]
+            workspace: none
             verdict: {approve: next, changes: impl, max_rounds: 1}
           - id: verify
             role: tester
             needs: [review]
+            workspace: none
           - id: publish
             role: publisher
             needs: [verify]
+            workspace: none
         """,
     )
     assert found == []
@@ -516,9 +530,11 @@ def test_review_downstream_of_publish_does_not_count(tmp_path: Path):
           - id: publish
             role: publisher
             needs: [impl]
+            workspace: none
           - id: review
             role: reviewer
             needs: [publish]
+            workspace: none
             verdict: {approve: next, changes: impl, max_rounds: 1}
         """,
     )
@@ -540,6 +556,7 @@ def test_every_publishing_role_needs_review(tmp_path: Path, role: str):
               - id: publish
                 role: {role}
                 needs: [impl]
+                workspace: none
             """,
         )
     )
@@ -559,6 +576,7 @@ def test_risky_stage_without_review_is_error(tmp_path: Path):
           - id: ask
             role: documenter
             needs: [impl]
+            workspace: none
             ask: {q: "Публикуем diff?", options: ["пушить", "стоп"], risky: true}
         """,
     )
@@ -578,10 +596,12 @@ def test_risky_stage_after_review_is_ok(tmp_path: Path):
           - id: review
             role: reviewer
             needs: [impl]
+            workspace: none
             verdict: {approve: next, changes: impl, max_rounds: 1}
           - id: ask
             role: documenter
             needs: [review]
+            workspace: none
             ask: {q: "Публикуем diff?", options: ["пушить", "стоп"], risky: true}
         """,
     )
@@ -600,6 +620,7 @@ def test_plain_stage_needs_no_review(tmp_path: Path):
           - id: docs
             role: documenter
             needs: [impl]
+            workspace: none
         """,
     )
     assert found == []
@@ -823,6 +844,139 @@ def test_base_rev_is_checked_by_git(tmp_path: Path):
     assert [issue.rule for issue in spec_module.check_base(bad)] == ["base"]
 
 
+# ------------------------------------------------- умолчание workspace (W17)
+
+
+def test_stage_with_needs_defaults_to_worktree(tmp_path: Path):
+    """Умолчание этапа с предшественником — `worktree` (E2E `d_221d021a`).
+
+    Молчание в спеке больше не значит «дерева нет»: этап, продолжающий работу
+    предшественника, получает дерево, отведённое от его коммита.
+    """
+    loaded = spec_module.load_spec(
+        write(
+            tmp_path,
+            f"""
+            duty: probe
+            repo: {tmp_path}
+            base: origin/master
+            stages:
+              - id: impl
+                role: implementer
+                workspace: worktree
+              - id: verify
+                role: tester
+                needs: [impl]
+            """,
+        )
+    )
+    verify_stage = loaded.stage("verify")
+    assert verify_stage.workspace == "worktree"
+    assert verify_stage.workspace_default is True
+    assert loaded.stage("impl").workspace_default is False
+    assert spec_module.validate_spec(loaded, profiles=PROFILES) == []
+
+
+def test_entry_stage_keeps_none_default(tmp_path: Path):
+    """У входа дерево не отводится: прежнее умолчание `none` осталось как было."""
+    loaded = spec_module.load_spec(
+        write(
+            tmp_path,
+            """
+            duty: probe
+            stages:
+              - id: impl
+                role: implementer
+            """,
+        )
+    )
+    impl = loaded.stage("impl")
+    assert (impl.workspace, impl.workspace_default) == ("none", True)
+
+
+def test_explicit_none_after_predecessor_warns_about_artifacts(tmp_path: Path):
+    """Явный `none` у этапа с `needs` и доказательствами — предупреждение, не отказ."""
+    path = write(
+        tmp_path,
+        """duty: probe
+stages:
+  - id: impl
+    role: implementer
+  - id: verify
+    role: tester
+    needs: [impl]
+    workspace: none
+    evidence:
+      - {cmd: "go test ./...", must: 0}
+""",
+    )
+    found = spec_module.validate_spec(spec_module.load_spec(path), profiles=PROFILES)
+    assert [(issue.rule, issue.line, issue.severity) for issue in found] == [
+        ("artifacts-without-tree", 8, "warning")
+    ]
+    assert "не получает дерево предшественника" in found[0].message
+    assert "артефакты предшественника в нём не появятся" in found[0].message
+
+
+def test_warning_about_tree_does_not_make_the_spec_invalid(tmp_path: Path):
+    """Предупреждение годную спеку отказом не делает: `none` бывает осознанным."""
+    found = issues(
+        tmp_path,
+        """
+        duty: probe
+        stages:
+          - id: impl
+            role: implementer
+          - id: verify
+            role: tester
+            needs: [impl]
+            workspace: none
+            evidence:
+              - {cmd: "go test ./...", must: 0}
+        """,
+    )
+    assert spec_module.errors(found) == []
+    assert [issue.rule for issue in found] == ["artifacts-without-tree"]
+
+
+def test_none_without_evidence_is_silent(tmp_path: Path):
+    """Этап без дерева и без доказательств ничего не теряет: предупреждения нет."""
+    found = issues(
+        tmp_path,
+        """
+        duty: probe
+        stages:
+          - id: impl
+            role: implementer
+          - id: ask
+            role: documenter
+            needs: [impl]
+            workspace: none
+        """,
+    )
+    assert found == []
+
+
+def test_default_worktree_without_repo_names_the_default(tmp_path: Path):
+    """Умолчание без `repo`/`base` — отказ, и он называет умолчание, а не «просьбу»."""
+    found = issues(
+        tmp_path,
+        """
+        duty: probe
+        stages:
+          - id: impl
+            role: implementer
+          - id: verify
+            role: tester
+            needs: [impl]
+        """,
+    )
+    assert rules(found) == {"workspace"}
+    assert any("получает worktree по умолчанию" in issue.message for issue in found)
+    assert any("дерево не нужно — укажи workspace: none" in issue.message for issue in found)
+    assert {issue.severity for issue in found} == {"error"}
+
+
 # ------------------------------------------------------------ вопрос и бюджет
 
 
@@ -969,6 +1123,7 @@ stages:
   - id: review
     role: reviewer
     needs: [impl]
+    workspace: none
     verdict: {approve: next, changes: impl, max_rounds: 1}
 """,
     )
@@ -998,6 +1153,50 @@ def test_cli_check_relative_path_is_resolved(capsys):
     code, out = run_cli(["spec", "check", "examples/duty-minimal.yaml"], capsys)
     assert code == 0
     assert os.path.isabs(out.split()[1])
+
+
+def test_cli_check_names_the_defaulted_workspace(capsys, tmp_path: Path):
+    """Приёмка W17: старая спека E2E без `workspace` — видно, что этап получает дерево."""
+    path = write(
+        tmp_path,
+        f"""duty: probe
+repo: {tmp_path}/нет-репозитория
+base: origin/master
+stages:
+  - id: impl
+    role: implementer
+    workspace: worktree
+  - id: verify
+    role: tester
+    needs: [impl]
+""",
+    )
+    code, out = run_cli(["spec", "check", str(path)], capsys)
+    assert code == 0
+    assert "impl=worktree · verify=worktree (по умолчанию)" in out
+
+
+def test_cli_check_prints_warning_on_its_own_line(capsys, tmp_path: Path):
+    """Предупреждение печатается отдельной строкой и код возврата не меняет."""
+    path = write(
+        tmp_path,
+        """duty: probe
+stages:
+  - id: impl
+    role: implementer
+  - id: verify
+    role: tester
+    needs: [impl]
+    workspace: none
+    evidence:
+      - {cmd: "go test ./...", must: 0}
+""",
+    )
+    code, out = run_cli(["spec", "check", str(path)], capsys)
+    assert code == 0
+    lines = out.splitlines()
+    assert lines[0].startswith("OK ")
+    assert any(line.startswith(f"{path}:8: artifacts-without-tree:") for line in lines)
 
 
 def test_cli_check_broken_spec_names_line(capsys, tmp_path: Path):

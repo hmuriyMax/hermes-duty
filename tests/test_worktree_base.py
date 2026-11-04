@@ -94,6 +94,57 @@ def test_attempt_tree_is_detached_not_on_the_branch(tmp_path: Path) -> None:
     ).stdout.strip() == head
 
 
+def test_stage_with_needs_gets_a_tree_by_default(tmp_path: Path) -> None:
+    """Умолчание этапа с `needs` работает и в движке: дерево создаётся.
+
+    Это ровно та дыра, на которой сломался E2E `d_221d021a`: `verify` не объявлял
+    `workspace`, получал каталог попытки и не видел файла `impl`. Здесь дерево
+    второго этапа отведено от коммита предшественника, и артефакт предшественника
+    в нём есть.
+    """
+    runner = _load("duty_runner_worktree_default", "runner.py")
+    spec_module = _load("duty_spec_worktree_default", "spec.py")
+    repo = _repo(tmp_path)
+    made = repo / "dashboard"
+    made.mkdir()
+    (made / "failures.py").write_text("классы\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+         "commit", "-qm", "работа impl"],
+        check=True,
+    )
+    impl_commit = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    path = tmp_path / "duty.yaml"
+    path.write_text(
+        textwrap.dedent(
+            f"""
+            duty: probe
+            repo: {repo}
+            base: main
+            stages:
+              - id: impl
+                role: implementer
+                workspace: worktree
+              - id: verify
+                role: tester
+                needs: [impl]
+            """
+        ),
+        encoding="utf-8",
+    )
+    spec = spec_module.load_spec(path)
+    verify_stage = spec.stages[1]
+    assert verify_stage.workspace == "worktree", "умолчание этапа с needs — worktree"
+
+    tree, cwd = runner.prepare_tree(spec, verify_stage, tmp_path / "verify-1", base=impl_commit)
+
+    assert tree is not None and cwd == tree and tree.is_dir()
+    assert (tree / "dashboard" / "failures.py").read_text(encoding="utf-8") == "классы\n"
+
+
 def test_two_attempts_from_same_base_do_not_collide(tmp_path: Path) -> None:
     """Два дела с одной базой: второе дерево не падает на «already used»."""
     runner = _load("duty_runner_worktree_two", "runner.py")

@@ -196,7 +196,11 @@ class Stage:
 
     id: str
     role: str
+    # Умолчание зависит от `needs` (см. `_parse_stage`): этап с предшественником
+    # получает дерево, вход — нет. `workspace_default` помнит, что значения в
+    # спеке не было: отказ и `spec check` обязаны называть умолчание умолчанием.
     workspace: str = "none"
+    workspace_default: bool = False
     needs: tuple[str, ...] = ()
     parallel_with: tuple[str, ...] = ()
     evidence: tuple[Evidence, ...] = ()
@@ -555,16 +559,28 @@ def _parse_stage(
             Issue(path, lines.get(prefix + ("parallel_with",), line), "parallel_with", "parallel_with — список id этапов")
         )
         parallel = ()
-    workspace = mapping.get("workspace", "none")
+    workspace = mapping.get("workspace")
+    workspace_default = workspace is None
+    if workspace is None:
+        # Этап с предшественником по смыслу продолжает его работу: цепочка
+        # «сделал → проверил → принял» иначе неисполнима — артефактов
+        # предшественника в каталоге попытки нет (E2E `d_221d021a`: `verify` без
+        # `workspace` работал в каталоге попытки и честно не нашёл файл `impl`).
+        # Поэтому умолчание — `worktree`, а «дерева нет» стало явным
+        # `workspace: none`. У входа предшественника нет и отводить нечего:
+        # там умолчание остаётся `none`.
+        workspace = "worktree" if needs else "none"
     if not isinstance(workspace, str):
         issues.append(
             Issue(path, lines.get(prefix + ("workspace",), line), "workspace", f"workspace — одно из {', '.join(WORKSPACES)}")
         )
         workspace = ""
+        workspace_default = False
     return Stage(
         id=stage_id,
         role=role if isinstance(role, str) else "",
         workspace=workspace,
+        workspace_default=workspace_default,
         needs=needs,
         parallel_with=parallel,
         evidence=_parse_evidence(mapping, path, lines, prefix, issues),
@@ -1051,13 +1067,22 @@ def _check_workspace(spec: Spec) -> list[Issue]:
             continue
         if stage.workspace != "worktree":
             continue
+        # Откуда взялось `worktree`: этап его попросил или получил по умолчанию
+        # (у этапа с `needs`). Второй случай обязан называться умолчанием —
+        # иначе человек ищет в своей спеке строку, которой он не писал.
+        asked = (
+            f"этап {stage.id!r} получает worktree по умолчанию (у этапа есть needs), а"
+            if stage.workspace_default
+            else f"этап {stage.id!r} просит worktree, а"
+        )
+        hint = " (дерево не нужно — укажи workspace: none)" if stage.workspace_default else ""
         if spec.repo is None:
             issues.append(
                 Issue(
                     spec.path,
                     stage.line_of("workspace"),
                     "workspace",
-                    f"этап {stage.id!r} просит worktree, а repo не задан: от чего отводить дерево",
+                    f"{asked} repo не задан: от чего отводить дерево{hint}",
                 )
             )
         if spec.base is None:
@@ -1066,9 +1091,43 @@ def _check_workspace(spec: Spec) -> list[Issue]:
                     spec.path,
                     stage.line_of("workspace"),
                     "workspace",
-                    f"этап {stage.id!r} просит worktree, а base не задан: от чего отводить дерево",
+                    f"{asked} base не задан: от чего отводить дерево{hint}",
                 )
             )
+    return issues
+
+
+def _check_artifacts_without_tree(spec: Spec) -> list[Issue]:
+    """Этап в каталоге попытки после предшественника — предупреждение, а не отказ.
+
+    `workspace: none` у этапа с `needs` — законный выбор (этап только спрашивает
+    человека или выносит приговор по чужим словам), но с доказательствами он
+    противоречив: команды прогоняются в каталоге попытки, где артефактов
+    предшественника нет, и объявленное «сделано» проверить не на чем. Ровно на
+    этом сломался E2E `d_221d021a`. Отказом это не делается: спека — контракт, а
+    осознанный `none` остаётся её правом.
+    """
+    issues: list[Issue] = []
+    for stage in spec.stages:
+        if not stage.needs or stage.workspace != "none":
+            continue
+        # Признак — `evidence` с командами: ожидаемые артефакты спека не
+        # описывает (их называет отчёт попытки), а команда уже говорит, что
+        # этап что-то прогоняет и что-то предъявляет.
+        if not any(evidence.cmd.strip() for evidence in stage.evidence):
+            continue
+        issues.append(
+            Issue(
+                spec.path,
+                stage.line_of("workspace"),
+                "artifacts-without-tree",
+                f"этап {stage.id!r} не получает дерево предшественника (workspace: none): "
+                "артефакты предшественника в нём не появятся — доказательства считаются "
+                "в каталоге попытки; если этап работает по работе предшественника, укажи "
+                "workspace: worktree",
+                WARNING,
+            )
+        )
     return issues
 
 
@@ -1194,6 +1253,7 @@ def validate_spec(spec: Spec, *, profiles: Optional[frozenset[str]] = None) -> l
     issues += _check_verdicts(spec)
     issues += _check_review_gate(spec)
     issues += _check_workspace(spec)
+    issues += _check_artifacts_without_tree(spec)
     issues += _check_ask(spec)
     issues += _check_budget(spec)
     issues += _check_retry(spec)

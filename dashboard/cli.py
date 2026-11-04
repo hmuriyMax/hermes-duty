@@ -791,18 +791,57 @@ def render_stats(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _fmt_duration(sec: Any) -> str:
+    """Длительность попытки: `52 с`, `1 мин 39 с`, `1 ч 04 мин`.
+
+    Не `_fmt_age`: у попытки секунды важны (`98.9 с` в карточке W18), а округление
+    до минут склеило бы «думала секунду» и «думала полминуты».
+    """
+    if sec is None or sec == "":
+        return "—"
+    value = max(0, int(sec))
+    if value < 60:
+        return f"{value} с"
+    if value < 3600:
+        return f"{value // 60} мин {value % 60:02d} с"
+    return f"{value // 3600} ч {value % 3600 // 60:02d} мин"
+
+
 def _attempt_head(attempt: dict[str, Any]) -> str:
-    """Первая строка попытки: кто, чем закончилось, сколько шло."""
-    bits = [f"#{attempt.get('run_id')}", str(attempt.get("profile") or "—"), str(attempt.get("status") or "—")]
-    if attempt.get("outcome"):
-        bits.append(f"outcome={attempt.get('outcome')}")
+    """Первая строка попытки: этап и номер, кто, исход (длительность), старт.
+
+    Этап и номер печатаются, только если роут их назвал: у своего дела попытка —
+    это этап движка (`impl#1`), у наблюдаемого kanban-дела — ран доски, и этапа в
+    ответе нет. Выдумывать его из `run_id` нельзя.
+
+    Исход и статус — одно слово: закрытая попытка называет `outcome`
+    (`done`/`failed`), незакрытая — статус (`running`/`orphan`/`unknown`), потому
+    что исхода у неё ещё нет. Класс отказа — рядом в скобках: `failed(contract)`.
+    """
+    bits: list[str] = []
+    stage_ref = f"{attempt.get('stage')}#{attempt.get('attempt')}" if attempt.get("stage") else ""
+    if stage_ref:
+        bits.append(stage_ref)
+    run_ref = str(attempt.get("run_id") or "")
+    if run_ref and run_ref != stage_ref:
+        bits.append(f"#{run_ref}")
+    bits.append(str(attempt.get("profile") or "—"))
+    verdict = str(attempt.get("outcome") or attempt.get("status") or "—")
+    if attempt.get("kind"):
+        verdict = f"{verdict}({attempt.get('kind')})"
+    bits.append(f"{verdict} ({_fmt_duration(attempt.get('duration_sec'))})")
     bits.append(f"старт {_fmt_clock(attempt.get('start'))}")
-    bits.append(f"длительность {_fmt_age(attempt.get('duration_sec'))}")
     return " · ".join(bits)
 
 
+def _sha(value: Any) -> str:
+    """Короткий sha для консоли: семи знаков хватает, чтобы сверить с `git log`."""
+    text = str(value or "")
+    return text[:7] if text else "—"
+
+
 def render_attempts(payload: dict[str, Any]) -> str:
-    """Таймлайн попыток: раны по возрастанию старта плюс их события."""
+    """Таймлайн попыток: попытки по возрастанию старта плюс их события."""
     lines = [
         "ПОПЫТКИ · {}/{} · {} · {}".format(
             payload.get("board"),
@@ -814,15 +853,30 @@ def render_attempts(payload: dict[str, Any]) -> str:
     attempts = payload.get("attempts") or []
     if not attempts:
         lines.append("")
-        lines.append("попыток нет")
+        # Причина пустого таймлайна — из ответа роута: «попыток нет» без причины
+        # не отличить от «роут не умеет» (W18).
+        lines.append(payload.get("note") or "попыток нет")
         return "\n".join(lines)
     for attempt in attempts:
         lines.append("")
         lines.append(_attempt_head(attempt))
+        refs: list[str] = []
+        if attempt.get("base"):
+            refs.append(f"base {_sha(attempt.get('base'))}")
+        if attempt.get("commit"):
+            refs.append(f"commit {_sha(attempt.get('commit'))}")
+        if refs:
+            lines.append(f"  {' · '.join(refs)}")
+        if attempt.get("pid"):
+            lines.append(f"  pid {attempt.get('pid')}")
         if attempt.get("summary"):
             lines.append(f"  итог: {attempt.get('summary')}")
-        if attempt.get("error"):
+        if attempt.get("reason"):
+            lines.append(f"  причина: {attempt.get('reason')}")
+        if attempt.get("error") and attempt.get("error") != attempt.get("reason"):
             lines.append(f"  ошибка: {attempt.get('error')}")
+        if attempt.get("progress"):
+            lines.append(f"  событий прогресса: {attempt.get('progress')}")
         for event in attempt.get("events") or []:
             summary = event.get("summary") or ""
             lines.append(f"  {_fmt_clock(event.get('at'))}  {event.get('kind')}  {summary}".rstrip())

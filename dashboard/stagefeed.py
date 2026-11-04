@@ -21,6 +21,11 @@
 - `snapshot(...)` — блок `stages` для `GET /deal`: этапы спеки в порядке
   объявления, у каждого состояние, номер попытки, раунды, ожидание, что делала
   каждая попытка и что доказано из объявленных команд;
+- `attempts(...)` — попытки дела в форме таймлайна (`GET /duty/{board}/{id}/attempts`):
+  тот же разбор пары `attempt_started` ↔ `attempt_ended`, плюс `base`/`commit`,
+  `reaped` и число событий прогресса. Живость незакрытой попытки может уточняться
+  строкой лизинга (`leases`), если вызывающий её прочитал: лизинг продлевается
+  heartbeat'ом, а срок в `attempt_started` — только начальный;
 - `current(...)` — этап и номер попытки для среза `/now`: «что сейчас» видно без
   открытия дела;
 - `spec_of(...)` — спека, записанная в журнале при создании дела
@@ -68,6 +73,7 @@ spec_module = _load(SPEC_MODULE_NAME, "spec.py")
 
 ATTEMPT_STARTED = "attempt_started"
 ATTEMPT_ENDED = "attempt_ended"
+ATTEMPT_PROGRESS = "attempt_progress"
 
 # Живость попытки: три ответа, а не два. `None` — журнал не записал срок лизинга
 # (старая запись или событие без `lease_expires`), и тогда «жив» было бы догадкой.
@@ -136,7 +142,9 @@ def spec_of(events: Iterable[Any]) -> Optional[str]:
     return None
 
 
-def _attempts(events: Iterable[Any]) -> list[dict[str, Any]]:
+def _attempts(
+    events: Iterable[Any], leases: Optional[dict[tuple[str, int], int]] = None
+) -> list[dict[str, Any]]:
     """Попытки дела по журналу: начало, конец и всё, что попытка о себе сказала.
 
     Попытка — это процесс, поэтому у неё есть pid, начало, конец, код выхода,
@@ -146,9 +154,21 @@ def _attempts(events: Iterable[Any]) -> list[dict[str, Any]]:
 
     Повтор `attempt_started` с тем же `run_id` (движок пишет его один раз на
     попытку) не удваивает строку: первое начало и есть начало.
+
+    `base`/`commit` — два факта о дереве попытки: от чего этап отводился и что
+    произвёл. `reaped` — попытку закрыла уборка (`dashboard/reaper.py`), а не
+    исполнитель. `progress` — сколько шагов попытка сообщила о себе
+    (`attempt_progress`): у этих событий нет `run_id`, пара ищется по
+    `(stage, attempt)`, которые они несут.
+
+    `leases` — срок лизинга из таблицы store (`{(stage, attempt): expires_at}`),
+    если вызывающий его прочитал. Он важнее срока из `attempt_started`: тот
+    записан один раз при старте, а лизинг продлевается heartbeat'ом, и попытка,
+    которая думает дольше TTL, без этого выглядела бы мёртвой.
     """
     started: dict[str, dict[str, Any]] = {}
     order: list[str] = []
+    progress: dict[tuple[str, int], int] = {}
     for event in sorted(
         (item for item in events or () if isinstance(item, dict)),
         key=lambda item: _int(item.get("id")),
@@ -156,7 +176,10 @@ def _attempts(events: Iterable[Any]) -> list[dict[str, Any]]:
         payload = _payload(event)
         run_id = str(payload.get("run_id") or "") or f"#{_int(event.get('id'))}"
         kind = str(event.get("kind") or "")
-        if kind == ATTEMPT_STARTED and run_id not in started:
+        if kind == ATTEMPT_PROGRESS:
+            key = (str(payload.get("stage") or ""), _int(payload.get("attempt")))
+            progress[key] = progress.get(key, 0) + 1
+        elif kind == ATTEMPT_STARTED and run_id not in started:
             started[run_id] = {"start": event, "start_payload": payload, "end": None, "end_payload": {}}
             order.append(run_id)
         elif kind == ATTEMPT_ENDED and run_id in started:
@@ -172,14 +195,18 @@ def _attempts(events: Iterable[Any]) -> list[dict[str, Any]]:
         details = details if isinstance(details, dict) else {}
         contract = start_payload.get("contract")
         contract = contract if isinstance(contract, dict) else {}
+        stage = str(start_payload.get("stage") or "")
+        number = _int(start_payload.get("attempt")) or len(rows) + 1
         lease = _maybe_int(start_payload.get("lease_expires"))
+        if leases and (stage, number) in leases:
+            lease = _maybe_int(leases[(stage, number)])
         started_at = _int(start.get("ts"))
         finished_at = None if end is None else _int(end.get("ts"))
         rows.append(
             {
-                "n": _int(start_payload.get("attempt")) or len(rows) + 1,
+                "n": number,
                 "run_id": run_id,
-                "stage": str(start_payload.get("stage") or ""),
+                "stage": stage,
                 "role": str(contract.get("role") or start_payload.get("role") or ""),
                 "pid": _maybe_int(start_payload.get("pid")),
                 "started_at": started_at or None,
@@ -194,6 +221,10 @@ def _attempts(events: Iterable[Any]) -> list[dict[str, Any]]:
                 "tokens": _maybe_int(details.get("usage_tokens")),
                 "tools": _maybe_int(details.get("tools")),
                 "reason": str(end_payload.get("reason") or ""),
+                "base": str(end_payload.get("base") or start_payload.get("base") or ""),
+                "commit": str(end_payload.get("commit") or ""),
+                "reaped": bool(end_payload.get("reaped")),
+                "progress": progress.get((stage, number), 0),
                 "evidence": _records(end_payload.get("result")),
                 "end": end is not None,
             }
@@ -268,11 +299,34 @@ def _public(row: dict[str, Any], now: int) -> dict[str, Any]:
         "tokens": row["tokens"],
         "tools": row["tools"],
         "reason": row["reason"],
+        "base": row["base"],
+        "commit": row["commit"],
+        "reaped": row["reaped"],
+        "progress": row["progress"],
         "live": alive["live"],
         "dead": alive["dead"],
         "lease": alive["lease"],
         "evidence": row["evidence"],
     }
+
+
+def attempts(
+    events: Iterable[Any], now: Any, *, leases: Optional[dict[tuple[str, int], int]] = None
+) -> list[dict[str, Any]]:
+    """Попытки дела в порядке старта — из журнала, без взгляда на процессы.
+
+    Форма — та же, что у ленты этапов, потому что разбор пары
+    `attempt_started` ↔ `attempt_ended` один на модуль: вторая копия этого
+    правила разошлась бы с первой на первом же повторе `run_id`.
+
+    Живость незакрытой попытки считается по сроку лизинга (`_alive`): лизинг жив
+    — `live`, истёк — `dead` (попытку закроет `dashboard/reaper.py`), срока нет —
+    ни то, ни другое. `ps` здесь не спрашивается: журнал и лизинг — те факты,
+    которые есть у плагина.
+    """
+    moment = _int(now)
+    rows = [_public(row, moment) for row in _attempts(events, leases)]
+    return sorted(rows, key=lambda row: (row["started_at"] or 0, row["n"]))
 
 
 def _join_evidence(declared: Any, records: list[dict[str, Any]]) -> list[dict[str, Any]]:

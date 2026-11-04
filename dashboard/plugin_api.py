@@ -2796,24 +2796,24 @@ def ask_deal(board: str, task_id: str, payload: dict[str, Any] = Body(...)) -> A
 
 @router.get("/duty/{board}/{task_id}/attempts")
 def duty_attempts(board: str, task_id: str) -> dict[str, Any]:
-    """Таймлайн попыток дела: все раны по возрастанию старта плюс их события.
+    """Таймлайн попыток дела: все попытки по возрастанию старта плюс их события.
 
-    У своего дела попыток нет и быть не может: спавна в 0.0.3 нет (`docs/OWNERSHIP.md`,
-    «что НЕ входит»). Роут отвечает пустым таймлайном с пометкой, а не 404: дело
-    существует, и «попыток не было» — это факт о нём, а не отсутствие дела.
+    У своего дела (`d_…`) попытки строятся по журналу: в 0.0.4 движок спавнит
+    процесс и пишет `attempt_started`/`attempt_progress`/`attempt_ended`, а
+    живость незакрытой попытки берётся из лизинга — без `ps` и `/proc`
+    (`docs/PROBES.md`). Форма у обоих пространств одна: этап, номер, начало,
+    конец, длительность, исход, класс отказа, причина, `base`, `commit`, `pid`,
+    `reaped`, число событий прогресса — чтобы консоль и страница рисовали одну
+    форму, а не две.
+
+    Пустой список — законный ответ: дело существует, и «попыток не было» — это
+    факт о нём, а не отсутствие дела. `note` в этом случае называет настоящую
+    причину; у наблюдаемого kanban-дела `note` пуст, потому что его попытки
+    читаются из `task_runs` доски.
     """
     home = _hermes_home()
     if deals.is_own(task_id):
-        resolved = _resolve_deal(home, board, task_id)
-        return {
-            "board": board,
-            "task_id": task_id,
-            "title": resolved.get("title"),
-            "count": 0,
-            "crash_outcomes": list(CRASH_OUTCOMES),
-            "attempts": [],
-            "note": "своё дело: попыток нет (аренда и спавн — следующая версия)",
-        }
+        return _own_attempts(home, board, task_id)
     path = Path(_board_entry(home, board)["path"])
     tasks, err = _query_checked(path, "SELECT id, title FROM tasks WHERE id = ?", (task_id,))
     if err:
@@ -2873,6 +2873,115 @@ def duty_attempts(board: str, task_id: str) -> dict[str, Any]:
         "count": len(attempts),
         "crash_outcomes": list(CRASH_OUTCOMES),
         "attempts": attempts,
+        # Пометка о пустом ответе — в одной форме у обоих пространств: у
+        # kanban-дела попытки читаются из `task_runs`, и объяснять нечего.
+        "note": "",
+    }
+
+
+# Причина пустого таймлайна своего дела: попыток правда не было. Прежняя
+# формулировка («спавна в 0.0.3 нет») после W11/W12 стала ложью — движок спавнит
+# попытки и пишет их в журнал, — и врать про отсутствие механизма нельзя.
+OWN_NO_ATTEMPTS = "попыток не было: в журнале дела нет ни одного attempt_started"
+
+# Подсказка к осиротевшей попытке: её закроет уборка, а не человек руками.
+ORPHAN_HINT = "попытку закроет уборка: bin/duty reap"
+
+
+def _own_attempt(row: dict[str, Any], now: int) -> dict[str, Any]:
+    """Попытка своего дела в форме таймлайна: те же имена, что у kanban-дела.
+
+    Источник — журнал и лизинг (`stagefeed.attempts`): ни `ps`, ни `/proc`.
+    Незакрытая попытка называется честно: лизинг жив — `running` (а
+    `duration_sec` у неё — возраст, как у незакрытого рана kanban), лизинг истёк —
+    `orphan` с подсказкой про `bin/duty reap`. Срока лизинга в журнале нет —
+    `unknown`: «жив» и «мёртв» здесь были бы догадкой.
+
+    `start`/`end` — те же два факта, что `started_at`/`ended_at`: консоль и веб
+    читают одно имя (`desktop/model.js`), спека и `stagefeed` — другое, а
+    переименовывать одно ради другого значило бы держать две формы таймлайна.
+    `error` — то же слово, что `reason`: отдельного поля ошибки у своей попытки
+    нет, а страница печатает причину отказа именно оттуда.
+    """
+    ended_at = row["finished_at"]
+    duration = None
+    if row["started_at"] is not None:
+        stop = int(ended_at if ended_at is not None else now)
+        duration = max(0, stop - int(row["started_at"]))
+    status = "unknown"
+    reason = row["reason"]
+    if ended_at is not None:
+        status = "completed" if row["outcome"] in SUCCESS_OUTCOMES else "failed"
+    elif row["live"]:
+        status = "running"
+    elif row["dead"]:
+        status = "orphan"
+        expired = int(now) - int(row["lease_expires"] or now)
+        reason = f"лизинг истёк {max(0, expired)}с назад — {ORPHAN_HINT}"
+    else:
+        reason = "срок лизинга в журнале не записан: жив ли процесс — неизвестно"
+    return {
+        "run_id": row["run_id"],
+        "profile": row["role"],
+        "stage": row["stage"],
+        "attempt": row["n"],
+        "status": status,
+        "start": row["started_at"],
+        "end": ended_at,
+        "started_at": row["started_at"],
+        "ended_at": ended_at,
+        "duration_sec": duration,
+        "outcome": row["outcome"],
+        "kind": row["kind"],
+        "reason": reason,
+        "error": reason,
+        "summary": "",
+        "base": row["base"],
+        "commit": row["commit"],
+        "pid": row["pid"],
+        "reaped": row["reaped"],
+        "progress": row["progress"],
+        # Событий доски у своей попытки нет: шаги процесса считаны числом
+        # (`progress`), а не подставлены чужими по виду строками.
+        "events": [],
+    }
+
+
+def _own_attempts(home: Path, board: str, task_id: str) -> dict[str, Any]:
+    """Таймлайн попыток своего дела: журнал плюс таблица лизингов, без `ps`."""
+    resolved = _resolve_deal(home, board, task_id)
+    try:
+        conn = deals.open_store(home, create=False, readonly=True)
+    except Exception as exc:  # noqa: BLE001 - свой store не открылся
+        raise HTTPException(
+            status_code=503,
+            headers=NO_STORE_HEADERS,
+            detail=f"store unreadable: {type(exc).__name__}: {exc}",
+        ) from exc
+    try:
+        events = journal.read_events(conn, task_id)
+        # Лизинг продлевается heartbeat'ом (`runner.follow`), поэтому строка
+        # store — актуальный срок этапа, а `attempt_started.lease_expires` —
+        # только начальный. Пара `(stage, attempt)` не даёт чужому сроку
+        # (лизинг уже следующей попытки того же этапа) оживить старую.
+        leases = {
+            (str(row["stage"]), int(row["attempt"])): int(row["expires_at"])
+            for row in conn.execute(
+                "SELECT stage, attempt, expires_at FROM leases WHERE deal_id = ?", (task_id,)
+            )
+        }
+    finally:
+        conn.close()
+    now = _now_sec()
+    attempts = [_own_attempt(row, now) for row in stagefeed.attempts(events, now, leases=leases)]
+    return {
+        "board": board,
+        "task_id": task_id,
+        "title": resolved.get("title"),
+        "count": len(attempts),
+        "crash_outcomes": list(CRASH_OUTCOMES),
+        "attempts": attempts,
+        "note": "" if attempts else OWN_NO_ATTEMPTS,
     }
 
 

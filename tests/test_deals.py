@@ -1011,18 +1011,285 @@ def test_unparsed_session_key_is_reported_not_skipped(home: Path, client: TestCl
     assert "чужой-ключ" in json.dumps(report["errors"], ensure_ascii=False)
 
 
-# ------------------------------------------------------------------ attempts
+# ------------------------------------------------- таймлайн попыток (W18)
+#
+# Попытки своего дела видны в консоли: они строятся по журналу
+# (`attempt_started` / `attempt_progress` / `attempt_ended`) и лизингу, а не по
+# `ps`. Проверяется форма (`stage`, `attempt`, `started_at`, `ended_at`,
+# `outcome`, `kind`, `reason`, `base`, `commit`, `pid`, `reaped`, `progress`),
+# исходы (`ok`/`failed(kind)`/`running`/`orphan`/`unknown`), настоящая причина
+# пустого таймлайна и то, что kanban-дело по-прежнему читается из `task_runs`.
+
+BASE_ONE = "8d31edee15f8b15136b4ff1def2a49709621975d"
+COMMIT_ONE = "8a2d5cb6bb4a380d53fdcf77af758f0b6e71a598"
 
 
-def test_attempts_of_own_deal_are_empty_with_reason(client: TestClient) -> None:
-    """Своё дело существует, попыток у него нет: пустой таймлайн с пометкой, не 404."""
+@pytest.fixture()
+def frozen(monkeypatch: pytest.MonkeyPatch) -> int:
+    """Один `now` у роутов: длительность и возраст попыток не зависят от часов."""
+    monkeypatch.setattr(plugin_api, "_now_sec", lambda: NOW)
+    return NOW
+
+
+def append_journal(home: Path, deal_id: str, items: list[tuple[str, int, dict[str, Any]]]) -> None:
+    """Дописать факты журнала так, как их пишет движок: через `journal.append`."""
+    conn = store(home)
+    try:
+        journal.append(
+            conn,
+            [
+                {
+                    "deal_id": deal_id,
+                    "board": BOARD,
+                    "kind": kind,
+                    "ts": ts,
+                    "recorded_at": ts,
+                    "source": "engine",
+                    "payload": payload,
+                    "idempotency_key": f"test:{deal_id}:{kind}:{ts}:{index}",
+                }
+                for index, (kind, ts, payload) in enumerate(items)
+            ],
+        )
+    finally:
+        conn.close()
+
+
+def set_lease(home: Path, deal_id: str, stage: str, attempt: int, *, expires_at: int) -> None:
+    """Строка лизинга этапа — как её держит движок (`runner.lease_of` читает её же)."""
+    conn = store(home)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO leases (deal_id, stage, attempt, pid, taken_at, expires_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (deal_id, stage, attempt, 4242, expires_at - 60, expires_at),
+            )
+    finally:
+        conn.close()
+
+
+def three_attempts(deal_id: str) -> list[tuple[str, int, dict[str, Any]]]:
+    """Журнал дела с тремя попытками: `impl` ok, `verify` ok, `review` failed(contract).
+
+    Форма payload — та же, что пишет `runner.spawn`: `base` (от чего этап
+    отводился), `commit` (что произвёл), `lease_expires` при старте. Плюс шаги
+    прогресса — у них нет `run_id`, пара ищется по `(stage, attempt)`.
+    """
+    return [
+        ("attempt_started", NOW - 600, {
+            "run_id": f"{deal_id}:impl#1", "stage": "impl", "attempt": 1, "pid": 111,
+            "base": BASE_ONE, "lease_expires": NOW - 400, "contract": {"role": "implementer"},
+        }),
+        ("attempt_progress", NOW - 590, {"stage": "impl", "attempt": 1, "seq": 1, "phase": "tool_use"}),
+        ("attempt_progress", NOW - 580, {"stage": "impl", "attempt": 1, "seq": 2, "phase": "tool_result"}),
+        ("attempt_ended", NOW - 500, {
+            "run_id": f"{deal_id}:impl#1", "stage": "impl", "attempt": 1, "outcome": "done",
+            "kind": None, "reason": "", "base": BASE_ONE, "commit": COMMIT_ONE,
+        }),
+        ("attempt_started", NOW - 480, {
+            "run_id": f"{deal_id}:verify#1", "stage": "verify", "attempt": 1, "pid": 222,
+            "base": COMMIT_ONE, "lease_expires": NOW - 280, "contract": {"role": "tester"},
+        }),
+        ("attempt_ended", NOW - 420, {
+            "run_id": f"{deal_id}:verify#1", "stage": "verify", "attempt": 1, "outcome": "done",
+            "kind": None, "reason": "", "base": COMMIT_ONE, "commit": COMMIT_ONE,
+        }),
+        ("attempt_started", NOW - 400, {
+            "run_id": f"{deal_id}:review#1", "stage": "review", "attempt": 1, "pid": 333,
+            "base": COMMIT_ONE, "lease_expires": NOW - 200, "contract": {"role": "reviewer"},
+        }),
+        ("attempt_ended", NOW - 300, {
+            "run_id": f"{deal_id}:review#1", "stage": "review", "attempt": 1, "outcome": "failed",
+            "kind": "contract", "reason": "result.json нет", "base": COMMIT_ONE, "commit": None,
+        }),
+    ]
+
+
+def test_own_attempts_come_from_the_journal(client: TestClient, home: Path, frozen: int) -> None:
+    """Три попытки в журнале → count=3, порядок по старту и поля таймлайна на месте."""
+    deal = create(client)
+    append_journal(home, deal["id"], three_attempts(deal["id"]))
+
+    body = client.get(f"/duty/{BOARD}/{deal['id']}/attempts").json()
+
+    assert body["count"] == 3
+    assert body["note"] == ""
+    assert [attempt["stage"] for attempt in body["attempts"]] == ["impl", "verify", "review"]
+    assert [attempt["attempt"] for attempt in body["attempts"]] == [1, 1, 1]
+    first = body["attempts"][0]
+    assert first["started_at"] == NOW - 600
+    assert first["ended_at"] == NOW - 500
+    assert first["duration_sec"] == 100
+    assert first["profile"] == "implementer"
+    assert first["pid"] == 111
+    assert first["run_id"] == f"{deal['id']}:impl#1"
+
+
+def test_own_attempts_are_ordered_by_start_not_by_row(client: TestClient, home: Path) -> None:
+    """Порядок — по старту, а не по `id` строки: ingest может отставать по времени."""
+    deal = create(client)
+    conn = store(home)
+    try:
+        with conn:
+            # id 900 — стартовала позже, id 901 — раньше: по `id` порядок обратный.
+            for ident, stage, ts in ((900, "impl", NOW - 100), (901, "verify", NOW - 500)):
+                conn.execute(
+                    "INSERT INTO events (id, ts, recorded_at, deal_id, board, kind, payload, source, "
+                    "idempotency_key) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (
+                        ident, ts, ts, deal["id"], BOARD, "attempt_started",
+                        json.dumps({"run_id": f"{deal['id']}:{stage}#1", "stage": stage, "attempt": 1}),
+                        "engine", f"test:{deal['id']}:{stage}",
+                    ),
+                )
+    finally:
+        conn.close()
+
+    body = client.get(f"/duty/{BOARD}/{deal['id']}/attempts").json()
+
+    assert [attempt["stage"] for attempt in body["attempts"]] == ["verify", "impl"]
+
+
+def test_own_attempt_outcomes_and_failure_class(client: TestClient, home: Path, frozen: int) -> None:
+    """Исходы доезжают словами движка: `done` — успех, `failed(contract)` — отказ гейта."""
+    deal = create(client)
+    append_journal(home, deal["id"], three_attempts(deal["id"]))
+
+    impl, _, review = client.get(f"/duty/{BOARD}/{deal['id']}/attempts").json()["attempts"]
+
+    assert (impl["outcome"], impl["kind"], impl["status"]) == ("done", "", "completed")
+    assert (review["outcome"], review["kind"], review["status"]) == ("failed", "contract", "failed")
+    assert review["reason"] == "result.json нет"
+    # Страница печатает причину отказа из `error` — там то же слово, что в `reason`.
+    assert review["error"] == review["reason"]
+
+
+def test_own_attempt_base_commit_and_progress_arrive(client: TestClient, home: Path, frozen: int) -> None:
+    """`base`/`commit`/`progress` — факты о дереве и шагах попытки, а не догадки."""
+    deal = create(client)
+    append_journal(home, deal["id"], three_attempts(deal["id"]))
+
+    impl, verify, review = client.get(f"/duty/{BOARD}/{deal['id']}/attempts").json()["attempts"]
+
+    assert (impl["base"], impl["commit"]) == (BASE_ONE, COMMIT_ONE)
+    assert impl["progress"] == 2
+    assert verify["commit"] == COMMIT_ONE
+    assert review["commit"] == ""  # неудача коммита не производит — поля нет, а не «нет коммита»
+    assert review["progress"] == 0
+
+
+def test_own_open_attempt_with_live_lease_is_running(client: TestClient, home: Path, frozen: int) -> None:
+    """Незакрытая попытка с живым лизингом — `running`, длительность = возраст."""
+    deal = create(client)
+    append_journal(home, deal["id"], [
+        ("attempt_started", NOW - 120, {
+            "run_id": f"{deal['id']}:impl#1", "stage": "impl", "attempt": 1, "pid": 999,
+            "lease_expires": NOW - 60,  # срок из старта уже прошёл…
+        }),
+    ])
+    # …но лизинг продлён heartbeat'ом: живой срок — в таблице store.
+    set_lease(home, deal["id"], "impl", 1, expires_at=NOW + 600)
+
+    body = client.get(f"/duty/{BOARD}/{deal['id']}/attempts").json()
+
+    attempt = body["attempts"][0]
+    assert attempt["status"] == "running"
+    assert attempt["outcome"] == ""
+    assert attempt["ended_at"] is None
+    assert attempt["duration_sec"] == 120
+    assert attempt["reason"] == ""
+
+
+def test_own_open_attempt_with_expired_lease_is_orphan(client: TestClient, home: Path, frozen: int) -> None:
+    """Лизинг истёк — попытка осиротела, и подсказка называет уборку."""
+    deal = create(client)
+    append_journal(home, deal["id"], [
+        ("attempt_started", NOW - 600, {
+            "run_id": f"{deal['id']}:impl#1", "stage": "impl", "attempt": 1, "pid": 999,
+            "lease_expires": NOW - 300,
+        }),
+    ])
+
+    attempt = client.get(f"/duty/{BOARD}/{deal['id']}/attempts").json()["attempts"][0]
+
+    assert attempt["status"] == "orphan"
+    assert attempt["ended_at"] is None
+    assert "bin/duty reap" in attempt["reason"]
+    assert "лизинг истёк 300с назад" in attempt["reason"]
+
+
+def test_own_open_attempt_without_lease_is_unknown(client: TestClient, home: Path, frozen: int) -> None:
+    """Срока лизинга нет ни в журнале, ни в store — «неизвестно», а не «жив»."""
+    deal = create(client)
+    append_journal(home, deal["id"], [
+        ("attempt_started", NOW - 60, {
+            "run_id": f"{deal['id']}:impl#1", "stage": "impl", "attempt": 1, "pid": 999,
+        }),
+    ])
+
+    attempt = client.get(f"/duty/{BOARD}/{deal['id']}/attempts").json()["attempts"][0]
+
+    assert attempt["status"] == "unknown"
+    assert "неизвестно" in attempt["reason"]
+
+
+def test_own_attempt_reaped_flag_arrives(client: TestClient, home: Path, frozen: int) -> None:
+    """`reaped` доезжает: в консоли видно, что попытку закрыла уборка, а не исполнитель."""
+    deal = create(client)
+    append_journal(home, deal["id"], [
+        ("attempt_started", NOW - 600, {
+            "run_id": f"{deal['id']}:impl#1", "stage": "impl", "attempt": 1, "pid": 999,
+            "lease_expires": NOW - 400,
+        }),
+        ("attempt_ended", NOW - 300, {
+            "run_id": f"{deal['id']}:impl#1", "stage": "impl", "attempt": 1, "outcome": "failed",
+            "kind": "infra", "reason": "процесс попытки не отчитался", "reaped": True,
+        }),
+    ])
+
+    attempt = client.get(f"/duty/{BOARD}/{deal['id']}/attempts").json()["attempts"][0]
+
+    assert attempt["reaped"] is True
+    assert attempt["kind"] == "infra"
+    assert attempt["status"] == "failed"
+
+
+def test_attempts_of_own_deal_without_attempts_name_the_real_reason(client: TestClient) -> None:
+    """Своё дело без попыток: count=0 и настоящая причина, а не «спавна в 0.0.3 нет»."""
     deal = create(client)
     body = client.get(f"/duty/{BOARD}/{deal['id']}/attempts").json()
 
     assert body["count"] == 0
     assert body["attempts"] == []
-    assert "попыток нет" in body["note"]
     assert body["task_id"] == deal["id"]
+    assert "попыток не было" in body["note"]
+    assert "0.0.3" not in body["note"]
+
+
+def test_kanban_attempts_still_come_from_task_runs(client: TestClient, home: Path, frozen: int) -> None:
+    """Регрессия: `t_`-дело по-прежнему читается из `task_runs` доски, а не из журнала."""
+    board = home / "kanban" / "boards" / BOARD / "kanban.db"
+    conn = sqlite3.connect(board)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, summary, error, started_at, ended_at) "
+                "VALUES (?, 'implementer', 'awaiting_merge', 'completed', 'готово', NULL, ?, ?)",
+                (KANBAN_DEAL, NOW - 300, NOW - 120),
+            )
+    finally:
+        conn.close()
+
+    body = client.get(f"/duty/{BOARD}/{KANBAN_DEAL}/attempts").json()
+
+    assert body["count"] == 1
+    assert body["note"] == ""
+    attempt = body["attempts"][0]
+    assert attempt["profile"] == "implementer"
+    assert attempt["outcome"] == "completed"
+    assert attempt["start"] == NOW - 300
+    assert attempt["duration_sec"] == 180
 
 
 # ------------------------------------------------------------------ CLI (5)

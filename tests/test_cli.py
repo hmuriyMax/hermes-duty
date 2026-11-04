@@ -395,7 +395,9 @@ def test_deal_prints_facts_and_attempt_timeline(home, frozen_now, capsys):
     assert "попытка:" in out
     assert "лизинг:" in out
     assert "ПОПЫТКИ" in out
-    assert "outcome=crashed" in out
+    # Исход попытки и её ошибка — из `task_runs` доски; формат строки один на оба
+    # пространства дел (`W18`): исход (длительность).
+    assert "crashed (1 мин 40 с)" in out
     assert "ошибка: boom" in out
     assert "итог: готово" in out
     assert "worker_bound" in out
@@ -412,6 +414,108 @@ def test_attempts_prints_only_the_timeline(home, frozen_now, capsys):
     assert code == 0
     assert out.startswith("ПОПЫТКИ")
     assert "лизинг:" not in out
+
+
+# ------------------------------- попытки своего дела в консоли (W18)
+#
+# Таймлайн своего дела строится по журналу: консоль печатает этап и номер,
+# исход с длительностью и причину отказа, а `base`/`commit` — коротким sha.
+
+BASE_ONE = "8d31edee15f8b15136b4ff1def2a49709621975d"
+COMMIT_ONE = "8a2d5cb6bb4a380d53fdcf77af758f0b6e71a598"
+
+
+def write_three_attempts(home: Path, deal_id: str) -> None:
+    """Журнал своего дела с тремя попытками — той же формой, что пишет движок."""
+    conn = cli.api().deals.open_store(home)
+    assert conn is not None
+    try:
+        cli._load_journal().append(
+            conn,
+            [
+                {
+                    "deal_id": deal_id,
+                    "board": "b1",
+                    "kind": kind,
+                    "ts": ts,
+                    "recorded_at": ts,
+                    "source": "engine",
+                    "payload": payload,
+                    "idempotency_key": f"test:{deal_id}:{kind}:{ts}:{index}",
+                }
+                for index, (kind, ts, payload) in enumerate(
+                    [
+                        ("attempt_started", NOW - 600, {
+                            "run_id": f"{deal_id}:impl#1", "stage": "impl", "attempt": 1,
+                            "pid": 111, "base": BASE_ONE, "lease_expires": NOW - 400,
+                            "contract": {"role": "implementer"},
+                        }),
+                        ("attempt_progress", NOW - 590, {
+                            "stage": "impl", "attempt": 1, "seq": 1, "phase": "tool_use",
+                        }),
+                        ("attempt_progress", NOW - 580, {
+                            "stage": "impl", "attempt": 1, "seq": 2, "phase": "tool_result",
+                        }),
+                        ("attempt_ended", NOW - 500, {
+                            "run_id": f"{deal_id}:impl#1", "stage": "impl", "attempt": 1,
+                            "outcome": "done", "kind": None, "reason": "",
+                            "base": BASE_ONE, "commit": COMMIT_ONE,
+                        }),
+                        ("attempt_started", NOW - 400, {
+                            "run_id": f"{deal_id}:review#1", "stage": "review", "attempt": 1,
+                            "pid": 333, "base": COMMIT_ONE, "lease_expires": NOW - 200,
+                            "contract": {"role": "reviewer"},
+                        }),
+                        ("attempt_ended", NOW - 300, {
+                            "run_id": f"{deal_id}:review#1", "stage": "review", "attempt": 1,
+                            "outcome": "failed", "kind": "contract", "reason": "result.json нет",
+                            "base": COMMIT_ONE, "commit": None,
+                        }),
+                    ]
+                )
+            ],
+        )
+    finally:
+        conn.close()
+
+
+def test_attempts_json_of_own_deal_is_exactly_the_route_payload(home, client, frozen_now, capsys):
+    """`--json` своего дела — дословно ответ роута, как и у kanban-дела."""
+    deal_id = own_deal(home)
+    write_three_attempts(home, deal_id)
+
+    code, out, _ = run(["attempts", "b1", deal_id, "--json"], capsys)
+
+    assert code == 0
+    assert json.loads(out) == client.get(f"/duty/b1/{deal_id}/attempts").json()
+
+
+def test_attempts_of_own_deal_prints_stage_outcome_reason_and_short_sha(home, frozen_now, capsys):
+    """Строка попытки: этап и номер, исход (длительность), причина плюс `base`/`commit`."""
+    deal_id = own_deal(home)
+    write_three_attempts(home, deal_id)
+
+    code, out, _ = run(["attempts", "b1", deal_id], capsys)
+
+    assert code == 0
+    assert out.startswith("ПОПЫТКИ")
+    assert "impl#1 · implementer · done (1 мин 40 с)" in out
+    assert "review#1 · reviewer · failed(contract)" in out
+    assert "причина: result.json нет" in out
+    assert "base 8d31ede" in out
+    assert "commit 8a2d5cb" in out
+    assert "событий прогресса: 2" in out
+
+
+def test_attempts_of_own_deal_without_attempts_prints_the_note(home, frozen_now, capsys):
+    """Пустой таймлайн своего дела называет настоящую причину, а не «спавна нет»."""
+    deal_id = own_deal(home)
+
+    code, out, _ = run(["attempts", "b1", deal_id], capsys)
+
+    assert code == 0
+    assert "попыток не было" in out
+    assert "0.0.3" not in out
 
 
 def test_terminal_deal_has_no_invented_waiting_state(home, frozen_now, capsys):

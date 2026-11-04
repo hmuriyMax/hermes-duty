@@ -1690,3 +1690,116 @@ def test_own_deal_with_closed_attempt_has_no_current_one(home: Path, client: Tes
 
     assert listed["attempt"] is None
     assert listed["lease"]["state"] == "none"
+
+
+# ------------------- «шага движка не было» — факт журнала (FIX-6 / остаток B1)
+#
+# Путь из вердикта RV-FINALb: попытки в журнале были, дело запарковано, человек
+# снял блок (`unblock`/`decide continue`) → `status=ready`, живого факта нет.
+# `fold` на таком журнале даёт `state=None`, и остаточная ветка говорила «шага
+# движка ещё не было» **над** таймлайном тех самых попыток — одна команда называла
+# шаги и отрицала их. Теперь фраза выбирается по числу попыток из журнала.
+
+
+def end_attempt(
+    home: Path,
+    deal_id: str,
+    *,
+    stage: str = "impl",
+    attempt: int = 1,
+    started_at: int,
+    outcome: str = "failed",
+) -> None:
+    """`attempt_ended` своего дела — той же формой, что пишет движок."""
+    conn = store(home)
+    try:
+        journal.append(
+            conn,
+            [
+                {
+                    "deal_id": deal_id,
+                    "board": BOARD,
+                    "kind": "attempt_ended",
+                    "ts": started_at + 120,
+                    "recorded_at": started_at + 120,
+                    "source": "engine",
+                    "payload": {
+                        "run_id": f"{deal_id}:{stage}#{attempt}",
+                        "stage": stage,
+                        "attempt": attempt,
+                        "outcome": outcome,
+                        "kind": "contract",
+                        "reason": "result.json нет",
+                        "base": None,
+                        "commit": None,
+                    },
+                    "idempotency_key": f"test:{deal_id}:{stage}:{attempt}:ended",
+                }
+            ],
+        )
+    finally:
+        conn.close()
+
+
+def park_and_unblock(client: TestClient, deal_id: str) -> None:
+    """Парковка движком и снятие блока человеком — ровно два факта из вердикта."""
+    mutate(
+        client,
+        "POST",
+        f"/deals/{deal_id}/block",
+        json={"kind": "parked", "reason": "исчерпаны попытки: 2/2"},
+    )
+    mutate(client, "POST", f"/deals/{deal_id}/unblock", json={})
+
+
+def test_own_deal_with_attempts_does_not_say_the_engine_never_started(
+    home: Path, client: TestClient
+) -> None:
+    """FIX-6: попытки были — «шага движка ещё не было» неправда, и это один текст.
+
+    Своё дело + `attempt_started`/`attempt_ended` ×2 + `blocked(parked)` +
+    `unblocked` + `status=ready`: живого факта нет, но шаги движка в журнале есть.
+    Доказательство называет именно это — и `deal`, и `/now` читают одну строку.
+    """
+    deal = create(client)
+    moment = int(time.time())
+    for number in (1, 2):
+        started = moment - 3600 + number * 600
+        append_attempt(
+            home, deal["id"], attempt=number, pid=40_000 + number, started_at=started,
+            lease_expires=started + 300,
+        )
+        end_attempt(home, deal["id"], attempt=number, started_at=started)
+    park_and_unblock(client, deal["id"])
+
+    assert client.get(f"/deal/{BOARD}/{deal['id']}").json()["status"] == "ready"
+    listed = now_deals(client)[deal["id"]]
+
+    evidence = listed["waiting"]["evidence"]
+    assert listed["waiting"]["state"] == "wait_slot"
+    assert "шага движка ещё не было" not in evidence
+    assert "идущей попытки нет" in evidence
+    assert "попыток в журнале: 2" in evidence
+    assert "bin/duty run" in evidence
+    # Тот же факт виден полем: идущей попытки нет, а закрытые — есть в таймлайне.
+    assert listed["attempt"] is None
+    timeline = client.get(f"/duty/{BOARD}/{deal['id']}/attempts").json()
+    assert [row["attempt"] for row in timeline["attempts"]] == [1, 2]
+    # Одна строка на обе поверхности: `/deal` не считает доказательство заново.
+    card = client.get(f"/deal/{BOARD}/{deal['id']}").json()["deal"]
+    assert card["waiting"] == listed["waiting"]
+
+
+def test_own_deal_without_attempts_still_says_the_engine_never_started(
+    home: Path, client: TestClient
+) -> None:
+    """FIX-6: у дела без попыток прежняя фраза остаётся — она про него и сказана."""
+    deal = create(client)
+
+    listed = now_deals(client)[deal["id"]]
+
+    evidence = listed["waiting"]["evidence"]
+    assert listed["waiting"]["state"] == "wait_slot"
+    assert "шага движка ещё не было" in evidence
+    assert "попыток в журнале" not in evidence
+    assert "bin/duty run" in evidence

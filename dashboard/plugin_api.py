@@ -1303,19 +1303,19 @@ DEALS_SOURCE = journal.JOURNAL_SOURCE
 # Остаточная ветка для своего дела: живого факта в журнале нет, а kanban тут ни
 # при чём — своего дела в kanban нет, и «состояние из kanban» было бы выдумкой.
 # Поэтому состояние называет `deals.status`, а текст говорит **только то, что
-# подтверждено**: у `todo`/`ready` нет ни одного шага движка, у `running` — ни
-# одного живого факта журнала. Приписывать движку прошлую версию («спавна в 0.0.3
+# подтверждено**: у `todo`/`ready` живого факта в журнале нет, у `running` — нет
+# живого сигнала о попытке. Приписывать движку прошлую версию («спавна в 0.0.3
 # нет», «попыток нет») нельзя: он спавнит попытки и берёт лизинг (`runner.py`), и
 # та же ложь рядом уже исправлена — `OWN_NO_ATTEMPTS`.
+#
+# Вторая половина «только подтверждённого» — история попыток: фраза «шага движка
+# ещё не было» верна лишь тогда, когда попыток в журнале нет вовсе. У дела с
+# попытками (запарковано и разблокировано) таймлайн ниже показывает те самые
+# шаги, и та же фраза читалась бы как «движок не начинал». Поэтому хвост про шаг
+# выбирает `_own_waiting_fallback` — по числу попыток из журнала, а не словарь.
 OWN_WAITING_FALLBACK = {
-    "todo": (
-        "wait_slot",
-        "status=todo без живых фактов: шага движка ещё не было (bin/duty run)",
-    ),
-    "ready": (
-        "wait_slot",
-        "status=ready без живых фактов: шага движка ещё не было (bin/duty run)",
-    ),
+    "todo": ("wait_slot", "status=todo без живых фактов"),
+    "ready": ("wait_slot", "status=ready без живых фактов"),
     "running": (
         "no_signal",
         "status=running без живого факта журнала: идёт ли попытка — неизвестно",
@@ -1323,6 +1323,31 @@ OWN_WAITING_FALLBACK = {
     "blocked": ("wait_human", "status=blocked: нужен человек"),
     "review": ("wait_human", "status=review: ждёт вердикта ревьюера"),
 }
+
+
+def _own_waiting_fallback(status: str, attempts: int) -> tuple[str, str]:
+    """Состояние и доказательство своего дела, когда живого факта в журнале нет.
+
+    Один текст на три поверхности: `/now` (строка и подсказка «Сейчас»),
+    `bin/duty deal` и `why` печатают `waiting.evidence` дословно, поэтому фраза
+    живёт здесь, а не в каждой из них.
+
+    Про шаг движка говорит факт журнала, а не постоянная формулировка: попыток
+    `0` — «шага ещё не было», попытки есть — «идущей попытки нет, следующего шага
+    не было». Второе не противоречит таймлайну тех же попыток, первое — не
+    выдумка для свежего дела.
+    """
+    state, head = OWN_WAITING_FALLBACK.get(
+        status, ("wait_slot", f"status={status or '—'}: нет живых фактов")
+    )
+    if state != "wait_slot":
+        return state, head
+    if attempts:
+        return state, (
+            f"{head}: идущей попытки нет (попыток в журнале: {attempts}, все закрыты), "
+            "следующего шага движка не было (bin/duty run)"
+        )
+    return state, f"{head}: шага движка ещё не было (bin/duty run)"
 
 
 def _timeline(events: list[dict[str, Any]], now: int) -> list[dict[str, Any]]:
@@ -1354,12 +1379,17 @@ def _own_waiting(
     *,
     home: Optional[Path] = None,
     deal_id: str = "",
+    attempts: int = 0,
 ) -> dict[str, Any]:
     """`waiting` своего дела: журнал первым, остальное — по `deals.status`.
 
     Kanban-ветки здесь нет и быть не может: своего дела в kanban не существует, и
     подставить туда «состояние из kanban» значило бы выдумать факт. Пометка в
     `evidence` говорит, откуда взято состояние, — как и у наблюдаемых дел.
+
+    `attempts` — сколько попыток записано в журнале (`_own_attempt_facts`): без
+    этого числа остаточная ветка говорила бы «шага движка ещё не было» и над
+    таймлайном тех самых попыток.
     """
     if folded["state"] is not None:
         return _journal_waiting(folded, question, home=home, deal_id=deal_id)
@@ -1370,9 +1400,7 @@ def _own_waiting(
             f"journal: нет живых фактов (последнее событие: {folded['last_kind'] or '—'}) "
             "— состояние из status своего дела"
         )
-    state, evidence = OWN_WAITING_FALLBACK.get(
-        status, ("wait_slot", f"status={status or '—'}: нет живых фактов")
-    )
+    state, evidence = _own_waiting_fallback(status, attempts)
     human_kind = "question" if question is not None else ("status" if state == "wait_human" else None)
     if pool_note and state == "wait_human" and question is None:
         evidence = f"{evidence}; {pool_note}"
@@ -1383,14 +1411,15 @@ def _own_attempt_facts(
     events: list[dict[str, Any]],
     leases: dict[tuple[str, int], int],
     now: int,
-) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
-    """Попытка и лизинг своего дела: `(попытка, лизинг)` — факты, а не константы.
+) -> tuple[Optional[dict[str, Any]], dict[str, Any], int]:
+    """Факты попыток своего дела: `(идущая попытка, лизинг, попыток в журнале)`.
 
     Попытка — последняя незакрытая в журнале (`attempt_started` без
     `attempt_ended`): у своего дела нет записи рана kanban, и называть живую
     попытку «попытки нет» значит противоречить собственному таймлайну
     (`GET /duty/{board}/{id}/attempts`). Все попытки закрыты — идущей нет, и это
-    тоже факт журнала.
+    тоже факт журнала, поэтому рядом едет их число: без него поверхность не
+    отличила бы «движок ещё не начинал» от «попытки были и закрыты».
 
     Живость доказывается теми же двумя источниками, что у `stagefeed._alive`:
     `pid` из `attempt_started` (проверка сигналом, `journal.pid_alive`) и срок
@@ -1403,7 +1432,8 @@ def _own_attempt_facts(
     был бы догадкой), `none` — ни строки store, ни идущей попытки. `claim_lock` у
     своего дела не бывает: этап держит pid, и он назван в попытке.
     """
-    open_rows = [row for row in stagefeed.attempts(events, now, leases=leases) if row["finished_at"] is None]
+    rows = stagefeed.attempts(events, now, leases=leases)
+    open_rows = [row for row in rows if row["finished_at"] is None]
     row = open_rows[-1] if open_rows else None
     expires = row["lease_expires"] if row is not None else None
     if row is None and leases:
@@ -1425,7 +1455,7 @@ def _own_attempt_facts(
             "state": "expired" if int(expires) <= int(now) else "live",
         }
     if row is None:
-        return None, lease
+        return None, lease, len(rows)
     return (
         {
             "run_id": row["run_id"],
@@ -1438,6 +1468,7 @@ def _own_attempt_facts(
             "run_status": None,
         },
         lease,
+        len(rows),
     )
 
 
@@ -1462,7 +1493,7 @@ def _own_shaped(
     """
     last = events[-1] if events else None
     folded = journal.fold(events, now=now)
-    attempt, lease = _own_attempt_facts(events, leases or {}, now)
+    attempt, lease, attempts = _own_attempt_facts(events, leases or {}, now)
     return {
         "board": str(row["board"]),
         "id": str(row["id"]),
@@ -1489,7 +1520,7 @@ def _own_shaped(
         "stage": stagefeed.current(events, now),
         "waiting": _own_waiting(
             folded, question, str(row["status"]), journal_note, pool_note,
-            home=home, deal_id=str(row["id"]),
+            home=home, deal_id=str(row["id"]), attempts=attempts,
         ),
         "_age_sec": _age_sec(row.get("created_at"), now),
     }

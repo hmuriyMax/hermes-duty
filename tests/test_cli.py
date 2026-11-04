@@ -1298,3 +1298,45 @@ def test_decide_continue_on_a_running_deal_still_refuses(home, frozen_deals_now,
     assert [event["kind"] for event in journal_events(home, deal_id)] == before
     assert deal_status(home, deal_id) == "running"
 
+
+# ------------- «шага движка не было» над таймлайном (FIX-6 / остаток B1)
+#
+# Своё дело с попытками, запаркованное и разблокированное человеком, живого факта
+# не имеет — и `bin/duty deal` печатал «шага движка ещё не было» прямо над
+# таймлайном этих попыток. Теперь доказательство называет то, что подтверждено:
+# идущей попытки нет, следующего шага не было. Текст — один на три поверхности.
+
+
+def test_deal_of_unblocked_own_deal_does_not_contradict_its_attempt_timeline(
+    home, frozen_now, capsys
+):
+    """FIX-6: «доказательство:» не отрицает шаги, которые напечатаны ниже."""
+    deal_id = own_deal(home)
+    write_three_attempts(home, deal_id)
+
+    code, _, _ = run(["block", deal_id, "исчерпаны попытки: 2/2", "--kind", "parked"], capsys)
+    assert code == cli.EXIT_OK
+    code, _, _ = run(["unblock", deal_id], capsys)
+    assert code == cli.EXIT_OK
+    assert deal_status(home, deal_id) in ("ready", "todo")
+
+    code, out, _ = run(["deal", "b1", deal_id], capsys)
+
+    assert code == cli.EXIT_OK
+    evidence = next(line for line in out.splitlines() if line.startswith("доказательство:"))
+    assert "шага движка ещё не было" not in evidence
+    assert "идущей попытки нет" in evidence
+    assert "попыток в журнале: 2" in evidence
+    # Таймлайн ниже — те же шаги: строка доказательства и он больше не спорят.
+    assert "impl#1" in out and "review#1" in out
+
+    # Тот же факт на остальных поверхностях: `/now` и `why` называют то же
+    # состояние ожидания и ту же строку доказательства.
+    row = next(item for item in cli.api().now()["deals"] if item["id"] == deal_id)
+    assert row["waiting"]["state"] == "wait_slot"
+    assert row["waiting"]["evidence"].endswith(evidence.split("доказательство: ", 1)[1])
+
+    code, why_out, _ = run(["why", "b1", deal_id], capsys)
+    assert code == cli.EXIT_OK
+    assert row["waiting"]["evidence"] in why_out
+    assert "состояние ожидания: wait_slot" in why_out

@@ -86,7 +86,7 @@ CREATE TABLE IF NOT EXISTS attachments (
 
 | команда | событие |
 |---|---|
-| создать дело | `created` (`source='cli'/'api'`) |
+| создать дело | `created` (`source='cli'/'api'`); плюс `gate_opened` с `cause: "created"`, если все родители уже закрыты |
 | правка спецификации (`PATCH` без `status`) | `patched` (`fields`) |
 | архив (`PATCH {status: archived}`) | `completed` со `status='archived'` |
 | блокировка | `blocked` (`block_kind`, `reason`) |
@@ -97,7 +97,7 @@ CREATE TABLE IF NOT EXISTS attachments (
 | вердикт ревью и закрытие | `collected`, `completed` (одной транзакцией) |
 | комментарий | `commented` (`author`, `len`) |
 | вложение (метаданные) | `attached` (`filename`, `size_bytes`, `content_type`) |
-| переход гейта ребёнка (пишет мутация родителя) | `gate_opened` / `gate_closed` (`from`, `to`, `parent`) |
+| переход гейта ребёнка (пишет мутация родителя — или `create`, когда гейт открыт в момент создания) | `gate_opened` / `gate_closed` (`from`, `to`, `parent`; у перехода при создании ещё `cause`) |
 
 Закрытость дела считается по последнему **state-changing** событию журнала
 (`completed`), а виды из набора `journal.NON_STATE_KINDS` — `commented`, `attached`,
@@ -107,10 +107,13 @@ CREATE TABLE IF NOT EXISTS attachments (
 
 `idempotency_key` для мутаций: `cli:<deal_id>:<kind>:<sha1(аргументы)>`, для API —
 `api:<deal_id>:<kind>:<sha1(тело запроса)>`; повторный тот же вызов не плодит событий.
-У `gate_opened`/`gate_closed` ключ считается от причины перехода, а не от аргументов:
+У `gate_closed` ключ считается от причины перехода, а не от аргументов:
 `<source>:<child_id>:<kind>:sha1(<idempotency_key события родителя>|<child_id>|<kind>)`,
 поэтому повтор той же причины перехода не плодит событий, а новый переход родителя даёт
-новый ключ.
+новый ключ. У `gate_opened` от `create` причины-события родителя нет: ключ строится по
+общим аргументам события — `<source>:<child_id>:gate_opened:sha1({cause: "created",
+parents})` (`event_key()`), а родитель в payload — тот, чьё закрытие открыло гейт
+последним.
 
 ## API
 

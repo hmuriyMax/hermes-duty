@@ -32,6 +32,11 @@ Python — то есть гейт «дело проходит impl → verify �
    таймаут уже внутри `runner`), на SIGINT гасит детей и выходит, а лизинг
    отпускается в любом исходе — иначе следующая попытка увидела бы чужой лизинг и
    отказалась бы работать.
+6. **Сироты лечатся сами.** Перед каждым решением драйвер зовёт
+   `reaper.sweep`: попытка без `attempt_ended`, у которой истёк лизинг и прошёл
+   срок, закрывается движком как `infra` (`reaped: true`). Так `bin/duty run`,
+   убитый снаружи во время попытки, лечится следующим запуском без ручных
+   действий: факт появляется в журнале, и решение перестаёт быть «попытка идёт».
 
 ## Коды возврата — контракт `bin/duty run`
 
@@ -41,10 +46,11 @@ Python — то есть гейт «дело проходит impl → verify �
 
 ## Чего модуль не делает
 
-Не пишет в журнал (это `runner`: одна транзакция на факт), не задаёт вопросов
-(только `ask()`), не классифицирует отказы (только `failures.py`), не проверяет
-пакет (только `evidence.py`), не запускает модель сам (только
-`runner.spawn_process`), не открывает чужие БД.
+Сам не пишет в журнал: факт попытки — дело `runner` (одна транзакция на факт), а
+закрытие осиротевшей попытки — `reaper` (тоже один факт и одна транзакция);
+драйвер их только зовёт. Не задаёт вопросов (только `ask()`), не классифицирует
+отказы (только `failures.py`), не проверяет пакет (только `evidence.py`), не
+запускает модель сам (только `runner.spawn_process`), не открывает чужие БД.
 """
 
 from __future__ import annotations
@@ -67,6 +73,7 @@ SPEC_MODULE_NAME = "hermes_duty_spec"
 TRANSIT_MODULE_NAME = "hermes_duty_transit"
 RUNNER_MODULE_NAME = "hermes_duty_runner"
 STAGEFEED_MODULE_NAME = "hermes_duty_stagefeed"
+REAPER_MODULE_NAME = "hermes_duty_reaper"
 
 
 def _load(name: str, filename: str) -> Any:
@@ -93,6 +100,9 @@ runner = _load(RUNNER_MODULE_NAME, "runner.py")
 # (`stagefeed.spec_of` — `created.payload.spec`): второго чтения «какая спека у
 # дела» в плагине быть не должно.
 stagefeed = _load(STAGEFEED_MODULE_NAME, "stagefeed.py")
+# Уборка осиротевших попыток (`dashboard/reaper.py`) грузится после ленты: она
+# берёт у неё «какая спека у дела», а не читает журнал своим разбором.
+reaper = _load(REAPER_MODULE_NAME, "reaper.py")
 
 # Коды возврата драйвера. Первые три совпадают с кодами остального CLI: дело
 # закрыто / отказ / припарковано. Остальные — только у прогона: ожидание, предел
@@ -259,14 +269,25 @@ def _decision_dict(decision: Any) -> dict[str, Any]:
 
 
 def _report(
-    deal: Any, spec: Any, steps: list[dict[str, Any]], decision: Any, outcome: str, note: str
+    deal: Any,
+    spec: Any,
+    steps: list[dict[str, Any]],
+    decision: Any,
+    outcome: str,
+    note: str,
+    reaped: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
-    """Отчёт прогона: шаги, финальное решение, исход и код возврата."""
+    """Отчёт прогона: шаги, уборка, финальное решение, исход и код возврата.
+
+    `reaped` — попытки, закрытые движком как осиротевшие (`reaper.sweep`): это
+    факт прогона, а не шаг, поэтому он рядом со шагами, а не среди них.
+    """
     return {
         "deal": str(deal.get("id") or ""),
         "board": str(deal.get("board") or ""),
         "spec": str(getattr(spec, "path", "") or ""),
         "steps": list(steps),
+        "reaped": list(reaped or ()),
         "outcome": outcome,
         "note": note,
         "decision": _decision_dict(decision),
@@ -298,13 +319,15 @@ def run(
     clock: Optional[Callable[[], float]] = None,
     monotonic: Optional[Callable[[], float]] = None,
     on_step: Optional[Callable[[dict[str, Any]], None]] = None,
+    on_reap: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> dict[str, Any]:
     """Довести дело до терминального исхода: решение → шаг → перечитать журнал.
 
-    Возвращает отчёт (`_report`): шаги попыток, финальное решение, исход и код
-    возврата. `on_step` зовётся на каждую строку сразу после шага — консоль может
-    печатать по строке, не дожидаясь конца прогона; форматирования здесь нет,
-    потому что оформление живёт в CLI.
+    Возвращает отчёт (`_report`): шаги попыток, уборка осиротевших попыток,
+    финальное решение, исход и код возврата. `on_step` зовётся на каждую строку
+    сразу после шага, `on_reap` — на каждую попытку, закрытую движком; консоль
+    может печатать по строке, не дожидаясь конца прогона, а форматирования здесь
+    нет, потому что оформление живёт в CLI.
 
     `spawn`, `clock`, `monotonic` — те же швы, что у `runner.step`: тесты
     подменяют спавн фейком, а живые часы — неподвижными.
@@ -314,10 +337,27 @@ def run(
     children = _Children(spawn or runner.spawn_process)
     limit = int(max_steps)
     steps: list[dict[str, Any]] = []
+    reaped: list[dict[str, Any]] = []
     made = 0
     outcome = ""
     note = ""
-    decision = _decide(conn, deal, spec, tick)
+
+    def decide() -> Any:
+        """Решение по журналу, а перед ним — уборка осиротевших попыток.
+
+        Уборка идёт **до** расчёта решения (правило 4 карточки): попытка без
+        конца и с истёкшим лизингом иначе навсегда осталась бы «идущей», и
+        решение вернуло бы `wait(attempt)` — то самое вечное стояние, ради
+        которого уборка и заведена. Кладётся она в отчёт отдельным списком: это
+        факт прогона, а не шаг.
+        """
+        for row in reaper.sweep(conn, int(tick()), spec=spec):
+            reaped.append(row)
+            if on_reap is not None:
+                on_reap(row)
+        return _decide(conn, deal, spec, tick)
+
+    decision = decide()
     try:
         with _Interrupt(children) as watch:
             while True:
@@ -325,7 +365,7 @@ def run(
                     # Прервали между шагами: шаг уже записан, но продолжать нельзя.
                     outcome = OUTCOME_INTERRUPTED
                     note = "с клавиатуры: дети погашены, лизинг отпущен"
-                    decision = _decide(conn, deal, spec, tick)
+                    decision = decide()
                     break
                 if decision.kind != transit.RUN:
                     outcome = _outcome_of(decision)
@@ -360,7 +400,7 @@ def run(
                 if once:
                     outcome = OUTCOME_STEP
                     note = f"сделан один шаг ({made})"
-                    decision = _decide(conn, deal, spec, tick)
+                    decision = decide()
                     break
                 if not any(row["started"] for row in rows):
                     # Попытку поднял кто-то другой (лизинг занят живым процессом):
@@ -369,13 +409,13 @@ def run(
                     outcome = OUTCOME_WAIT
                     busy = [row["reason"] for row in rows if row["reason"]]
                     note = "; ".join(busy) or "попытка не поднялась"
-                    decision = _decide(conn, deal, spec, tick)
+                    decision = decide()
                     break
-                decision = _decide(conn, deal, spec, tick)
+                decision = decide()
     finally:
         children.stop()
         _release_mine(conn, deal, spec)
-    return _report(deal, spec, steps, decision, outcome, note)
+    return _report(deal, spec, steps, decision, outcome, note, reaped)
 
 
 # --------------------------------------------------------------- вход прогона
@@ -397,6 +437,7 @@ def drive(
     clock: Optional[Callable[[], float]] = None,
     monotonic: Optional[Callable[[], float]] = None,
     on_step: Optional[Callable[[dict[str, Any]], None]] = None,
+    on_reap: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> dict[str, Any]:
     """Вход `bin/duty run`: открыть store, найти спеку и довести дело.
 
@@ -426,6 +467,7 @@ def drive(
             clock=clock,
             monotonic=monotonic,
             on_step=on_step,
+            on_reap=on_reap,
         )
     finally:
         conn.close()

@@ -104,6 +104,7 @@ JOURNAL_MODULE_NAME = "hermes_duty_journal"
 FAILURES_MODULE_NAME = "hermes_duty_failures"
 # Драйвер дела: `run` зовёт его, а не собирает цикл «решение → шаг» в терминале.
 DRIVER_MODULE_NAME = "hermes_duty_driver"
+REAPER_MODULE_NAME = "hermes_duty_reaper"
 
 
 def _load_demo() -> Any:
@@ -195,6 +196,25 @@ def _load_driver() -> Any:
         raise SourceFailure(f"driver module not found: {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[DRIVER_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_reaper() -> Any:
+    """Загрузить `dashboard/reaper.py` — уборку осиротевших попыток.
+
+    `reap` не решает, что считать сиротой, у себя: срок, лизинг и запись факта
+    живут в reaper'е, а терминал только показывает, что он закрыл.
+    """
+    loaded = sys.modules.get(REAPER_MODULE_NAME)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / "reaper.py"
+    spec = importlib.util.spec_from_file_location(REAPER_MODULE_NAME, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise SourceFailure(f"reaper module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[REAPER_MODULE_NAME] = module
     spec.loader.exec_module(module)
     return module
 
@@ -383,6 +403,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="предел шагов прогона: превышение — код 4 (по умолчанию 20 — DEFAULT_MAX_STEPS драйвера)",
     )
     run.add_argument("--once", action="store_true", help="один шаг и выход (отладка и тесты)")
+
+    # Уборка осиротевших попыток (`dashboard/reaper.py`): попытка без
+    # `attempt_ended`, чей лизинг истёк и чей срок прошёл, закрывается движком
+    # как `infra`. `--dry-run` показывает, что было бы закрыто, ничего не записывая.
+    reap = command(
+        "reap",
+        "закрыть осиротевшие попытки: `attempt_started` без конца, лизинг истёк, срок прошёл",
+    )
+    reap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="показать, что было бы закрыто, ничего не записывая",
+    )
 
     # Мутации своего дела (`docs/OWNERSHIP.md`): те же функции, что у роутов
     # `/deals…`, — CLI не заводит второго набора правил.
@@ -1192,6 +1225,10 @@ def stage_verdict(home: Path, deal_id: str, stage: str) -> dict[str, Any]:
             "outcome": ended.get("outcome"),
             "kind": kind if isinstance(kind, str) and kind else None,
             "reason": str(ended.get("reason") or ""),
+            # Попытку закрыл движок, а не исполнитель (`dashboard/reaper.py`):
+            # «отчёта нет» и «исполнитель упал» — разные факты, и экран обязан
+            # называть тот, который записан.
+            "reaped": bool(ended.get("reaped")),
             "details": issues,
             "workdir": (details.get("workdir") if isinstance(details, dict) else None),
             "note": "" if ended else "попытка не закрыта: `attempt_ended` ещё нет",
@@ -1219,6 +1256,8 @@ def render_stage_verdict(payload: dict[str, Any]) -> str:
     )
     if payload.get("note"):
         lines.append(f"  {payload['note']}")
+    if payload.get("reaped"):
+        lines.append("  попытку закрыл движок (reaped): отчёта нет — это не падение исполнителя")
     if payload.get("workdir"):
         lines.append(f"  каталог попытки: {payload['workdir']}")
     if payload.get("reason"):
@@ -1389,6 +1428,49 @@ def render_run_step(row: dict[str, Any]) -> str:
     return f"{stage} · попытка {attempt} · {detail}"
 
 
+def render_reap_row(row: dict[str, Any]) -> str:
+    """Строка уборки: что именно закрыл движок — и что это был он, а не исполнитель.
+
+    Дело и этап названы первыми: уборка проходит по всему store, и строка без
+    адреса не сказала бы, о каком деле речь. `--dry-run` меняет только начало
+    строки: набор кандидатов считается тем же кодом, что и настоящий проход.
+    """
+    head = "было бы закрыто" if row.get("dry_run") else "закрыто движком"
+    return "{}: {}/{} · {} · попытка {} · {}: {}".format(
+        head,
+        row.get("board") or "—",
+        row.get("deal") or "—",
+        row.get("stage") or "—",
+        row.get("attempt") or 0,
+        row.get("kind") or "—",
+        row.get("reason") or "причина не записана",
+    )
+
+
+def render_reap(report: dict[str, Any]) -> str:
+    """Итог `bin/duty reap`: сколько закрыто (или было бы) и что именно.
+
+    Пустой проход называется словами, а не пустотой: «осиротевших нет» и «не
+    посчитали» — разные ответы, и второй обязан быть виден.
+    """
+    dry = bool(report.get("dry_run"))
+    lines = [
+        "УБОРКА{} · store: {} · {}: {}".format(
+            " (--dry-run)" if dry else "",
+            report.get("store") or "—",
+            "было бы закрыто" if dry else "закрыто",
+            report.get("count") or 0,
+        )
+    ]
+    if report.get("note"):
+        lines.append(f"  {report['note']}")
+    rows = report.get("reaped") or []
+    if not rows:
+        lines.append("  осиротевших попыток нет")
+    lines.extend(f"  {render_reap_row(row)}" for row in rows)
+    return "\n".join(lines)
+
+
 def _decision_text(decision: dict[str, Any]) -> str:
     """Решение `transit` словами CLI: `run(verify#1)`, `wait(question)`, `done`."""
     kind = str(decision.get("kind") or "—")
@@ -1476,9 +1558,17 @@ def main(argv: Optional[list[str]] = None) -> int:
                 max_steps=driver.DEFAULT_MAX_STEPS if args.max_steps is None else args.max_steps,
                 once=args.once,
                 on_step=None if args.json else (lambda row: print(render_run_step(row), file=out)),
+                on_reap=None if args.json else (lambda row: print(render_reap_row(row), file=out)),
             )
             _emit_json(report, out) if args.json else print(render_run_final(report), file=out)
             return int(report.get("exit_code") or EXIT_OK)
+        if args.command == "reap":
+            # Уборка осиротевших попыток: правила — в `dashboard/reaper.py`,
+            # здесь только argv и вывод. Код возврата — «посчитано» (0):
+            # «нечего убирать» — это ответ, а не ошибка.
+            report = _route(_load_reaper().reap, api().hermes_home(), dry_run=bool(args.dry_run))
+            _emit_json(report, out) if args.json else print(render_reap(report), file=out)
+            return EXIT_OK
         if args.command == "demo":
             report = _load_demo().run_demo(
                 api(), home=Path(args.home) if args.home else None, keep=args.keep,

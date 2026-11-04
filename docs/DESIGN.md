@@ -172,6 +172,7 @@ failures.classify → policy → decide_park
 | Как вопрос попадает человеку? | `ask()` — единственный канал записи в пул | `dashboard/ask.py` |
 | Состояние дела и ожидание (восемь состояний) | `fold(events)` | `dashboard/journal.py` |
 | Сколько шагов делать и когда выйти? | `run()`/`drive()`: `--once`, `--max-steps`, SIGINT, коды `0/1/2/3/4/130` | `dashboard/driver.py` |
+| Попытка начата и не отчиталась — кто её закроет? | `sweep(conn, now)`: `attempt_started` без `attempt_ended`, лизинг истёк и возраст больше `ttl + max(60 с, ttl/3)` → `attempt_ended` (`kind=infra`, `reaped: true`); живой лизинг не трогается, `ps` не смотрится | `dashboard/reaper.py` |
 | Чьё это дело и не дубль ли? | `create_deal(external_ref=…, dedup_window=…)`, id `d_<hex>` | `dashboard/deals.py` |
 | Что видно на экране и в терминале? | `stages[]` / `stage`; `--json` = дословный ответ роута | `dashboard/stagefeed.py`, `dashboard/cli.py`, `dashboard/plugin_api.py` |
 
@@ -610,9 +611,11 @@ duty create|comment|block|unblock|claim|complete|review|changes|attach|archive �
 граница путей read-only роли).
 
 - `0.0.4` (сделано) — движок: лизинг в своём store, спавн попыток, учёт попыток,
-  evidence-гейт, классы отказа и `retry`, парковка, адресация вопросов, лента этапов и
-  драйвер `bin/duty run`. Осталось из фазы: `reap` (уборка мёртвой попытки) и
-  декомпозиция дела на подзадачи — они же названы в блоке «чего ещё нет» `duty demo`.
+  evidence-гейт, классы отказа и `retry`, парковка, адресация вопросов, лента этапов,
+  драйвер `bin/duty run` и уборка осиротевших попыток `reaper.sweep` (`bin/duty reap`:
+  попытка без `attempt_ended` с истёкшим лизингом закрывается `failed(infra)` с
+  `reaped: true`, поэтому срез и переход сходятся сами). Осталось из фазы:
+  декомпозиция дела на подзадачи — она же названа в блоке «чего ещё нет» `duty demo`.
   Наблюдение за kanban-делами продолжает работать, пока движок не заменит ядро целиком;
 - `0.1.0+` — P1: duty заменяет kanban для оркестрации — дела живут только в своём store,
   ядро kanban для наблюдаемости больше не нужно.

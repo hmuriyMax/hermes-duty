@@ -88,6 +88,12 @@ duty.yaml ──▶ bin/duty spec check ──▶ годна (или «file:line
    `deals[].stage`: состояние этапа, номер попытки, время, длительность, код выхода,
    токены, инструменты, причина отказа, ожидание вопроса. Источник один — журнал, ни
    `ps`, ни `lsof`.
+7. **Осиротевшая попытка закрывается движком, а не остаётся навсегда.** Попытка без
+   `attempt_ended`, у которой истёк лизинг и прошёл срок (`ttl + max(60 с, ttl/3)`),
+   закрывается `attempt_ended` с `kind=infra` и `reaped: true`
+   (`dashboard/reaper.py`). Драйвер зовёт уборку перед каждым решением, поэтому
+   `bin/duty run`, убитый снаружи во время попытки, лечится следующим запуском;
+   `bin/duty reap [--dry-run]` делает то же вручную.
 
 ### Чем 0.0.4 **ещё не** является
 
@@ -106,9 +112,10 @@ duty.yaml ──▶ bin/duty spec check ──▶ годна (или «file:line
   в журнале, но строка дела остаётся `running`: закрытие — бизнес-правило
   (`deals.complete_deal`), в драйвер не входит. В `/now` такое дело видно как
   `no_signal` («status=running без попытки»).
-- **Нет `reap` и декомпозиции.** Уборка мёртвой попытки (лизинг с истёкшим сроком и
-  дерево умершего процесса) и разбор дела на подзадачи — движок 0.1.0; это же
-  печатает `bin/duty demo` в блоке «чего ещё нет».
+- **Нет декомпозиции.** Разбор дела на подзадачи — движок 0.1.0; это же печатает
+  `bin/duty demo` в блоке «чего ещё нет». Уборка осиротевшей попытки (`reap`) в 0.0.4
+  уже есть — факт `attempt_ended`, лизинг умершей попытки отпускается; дерево попытки
+  уборка не трогает (`workspace: worktree` убирает сам движок при отказе попытки).
 - **E2E на настоящем репозитории ещё не прогнан.** Гейт P2 («дело проходит
   impl → verify → review на настоящем репозитории») закрывается живым прогоном, где
   публикация требует «ок» Max; в 0.0.4 сданы механизм и его тесты без модели.
@@ -213,6 +220,7 @@ HERMES_HOME=~/.hermes ~/.hermes/plugins/hermes-duty/bin/duty now
 | `duty why <board> <id> <этап>` | то же плюс приговор последней попытки этапа: исход, класс отказа, первые `details` evidence-гейта |
 | `duty run <deal_id> [--spec <duty.yaml>] [--max-steps N] [--json] [--once]` | довести своё дело: цикл «решение → шаг → перечитать журнал»; `--once` — один шаг, предел `--max-steps` (по умолчанию 20, дело при этом не меняется). Коды свои: `0` закрыто, `1` остановлено отказом, `2` припарковано, `3` ждёт (вопрос/`retry_at`/чужой лизинг/гейт — выход, а не петля), `4` предел шагов, `130` SIGINT |
 | `duty spec check <file> [--json]` | спека дела **до запуска**: `OK` либо `file:line: правило: текст`; правила — `docs/SPEC.md`, ни одного процесса (кроме `git rev-parse` для `base`). Коды: `0` годна, `1` есть отказы, `2` спека не читается |
+| `duty reap [--dry-run]` | закрыть осиротевшие попытки **своего** store: `attempt_started` без `attempt_ended`, лизинг истёк и возраст попытки больше `ttl + max(60 с, ttl/3)` → `attempt_ended` с `kind=infra` и `reaped: true`, лизинг умершей попытки отпускается. `--dry-run` показывает, что было бы закрыто, ничего не записывая. Живой лизинг не трогается: `ps` уборка не смотрит. Код `0` — «посчитано» (в том числе «убирать нечего») |
 | `duty demo [--home DIR] [--keep]` | прогон одного дела по спеке на **песочном корне** (временный каталог): create → claim → ask → answer → gate → comment/attach → ingest → complete → late answer. Сам проверяет 7 инвариантов (вопрос уводит в `wait_human`, ответ возвращает в работу, гейт открывается завершением родителя, закрытое дело уходит из `/now`, поздний ответ не воскрешает, повторный ingest не плодит, `kanban.db` не изменился) и печатает границу «чего ещё нет до движка 0.1.0». Живые БД только читаются; `--keep` оставляет песочницу для разбора |
 | `duty watch [--interval 10] [--board B] [--state S]` | тот же `now`, перерисовка в терминале (в пайпе — блоками, без escape-последовательностей) |
 | `duty create --board B --title "…" [--body-file F] [--assignee ROLE] [--spec duty.yaml] [--external-ref jira:RP-14080] [--parent d_…]…` | завести своё дело; `--spec` — граф дела (путь разворачивается в абсолютный, иначе лента этапов молчит с названной причиной); `--external-ref` — внешнее имя: живое дело с этим именем не дублируется (ответ `created: false`/`existing: true`), закрытое не воскрешается; `--json` отдаёт `deal_id`, `created` и `status` для следующих команд |
@@ -268,6 +276,7 @@ HERMES_HOME=~/.hermes ~/.hermes/plugins/hermes-duty/bin/duty now
     failures.py          # классы отказа (infra/contract/capability), политика ретраев, парковка
     routing.py           # адрес вопроса по объявлению спеки: роль / человек / дефолт
     driver.py            # цикл дела: решение → шаг → перечитать журнал (bin/duty run)
+    reaper.py            # уборка осиротевших попыток: attempt_ended с reaped (bin/duty reap)
     stagefeed.py         # лента этапов дела для /deal и /now: только журнал (docs/DESIGN.md)
     ask.py               # единственный канал вопросов: пул + question_asked/answered
   desktop/
@@ -330,7 +339,7 @@ hermes plugins enable hermes-duty     # или Capabilities → Plugins в де�
 Из каталога плагина (`cd ~/.hermes/plugins/hermes-duty`):
 
 ```bash
-~/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q  # 523 passed, 1 skipped
+~/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q  # 539 passed, 1 skipped
 node --test tests/model.test.mjs tests/web.test.mjs        # 49 pass (37 + 12)
 bin/duty-model-sync --check                                # OK
 bin/duty-version check                                     # OK
@@ -357,9 +366,10 @@ CommonJS — `node --check plugin.js` пропускает то, что вали
 исполнитель `runner.step` (лизинг, дерево попытки, контракт файлом, спавн
 `hermes chat -p`, телеметрия `attempt_progress`), evidence-гейт `evidence.verify`,
 адресация вопросов `routing.route`, классы отказа и политика ретраев `failures.py`
-(исчерпание паркует дело), лента этапов `stagefeed.py`, `external_ref` у дела и
-драйвер `dashboard/driver.py` (`bin/duty run`). Регрессия **523 pytest + 1 skipped**,
-**49 node** (37 + 12), `bin/duty demo` — 7/7.
+(исчерпание паркует дело), лента этапов `stagefeed.py`, `external_ref` у дела,
+драйвер `dashboard/driver.py` (`bin/duty run`) и уборка осиротевших попыток
+`reaper.sweep` (`bin/duty reap`, `reaped: true`). Регрессия
+**539 pytest + 1 skipped**, **49 node** (37 + 12), `bin/duty demo` — 7/7.
 
 `v0.0.3` — свой журнал событий (`state = fold(events)`, `POST /ingest`, `journal` в
 `/health`), единственный канал вопросов `ask()`, CLI `bin/duty` (чтение и мутации),
@@ -375,6 +385,5 @@ CommonJS — `node --check plugin.js` пропускает то, что вали
 backend на read-only источниках, агрегатор `/now` с таксономией ожиданий,
 таймлайн попыток, desktop-страница `/duty`.
 
-Дальше (не сделано): `reap` (уборка мёртвой попытки) и декомпозиция дела на
-подзадачи, затем фаза P5 — канбан в архив. План по версиям — `docs/DESIGN.md`,
-раздел «Дальше».
+Дальше (не сделано): декомпозиция дела на подзадачи, затем фаза P5 — канбан в
+архив. План по версиям — `docs/DESIGN.md`, раздел «Дальше».

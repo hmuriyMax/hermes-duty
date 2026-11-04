@@ -53,7 +53,7 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 | `lease_lost` | лизинг исчез без завершения | `previous_expires` |
 | `attempt_started` | открылся ран в `task_runs` (движок: попытка заспавнена) | `run_id`, `pid`, `stage`, `attempt`, `cmd`, `cwd`, `workdir`, `tree`, `lease_expires`, `contract` — фактическая команда и вход целиком |
 | `attempt_progress` | шаг попытки движка: вызов инструмента или его результат (телеметрия, состояние дела не меняет) | `stage`, `attempt`, `seq`, `phase` (`tool_use`/`tool_result`), `name`, `duration_ms` (только у результата), `ts` |
-| `attempt_ended` | ран закрыт (движок: попытка отчиталась, не отчиталась или упала; `done` — только при принятом evidence-пакете) | `run_id`, `stage`, `attempt`, `outcome` (`done`/`failed`), `kind` (`infra`/`contract`/`capability`/`null`), `reason`, `details` (в том числе `verdict`: вердикт гейта с `details`), `result` (если отчёт разобран) |
+| `attempt_ended` | ран закрыт (движок: попытка отчиталась, не отчиталась или упала; `done` — только при принятом evidence-пакете; `reaped: true` — попытку закрыл `reaper.sweep`, отчёта от неё не было) | `run_id`, `stage`, `attempt`, `outcome` (`done`/`failed`), `kind` (`infra`/`contract`/`capability`/`null`), `reason`, `details` (в том числе `verdict`: вердикт гейта с `details`), `result` (если отчёт разобран), `reaped` (только у убранных), `pid` (у убранных — из `attempt_started`) |
 | `blocked` | `status=blocked` | `block_kind`, `reason` |
 | `unblocked` | был `blocked`, стал иной статус | `previous_kind` |
 | `completed` | `status=done` (или `archived` как отдельный факт: переносится тем же `completed` со `status="archived"`) | `status` |
@@ -129,7 +129,12 @@ fold (14), а не второй вид на каждое событие попы
    срока: `claimed` без срока (своё дело — `duty claim` пишет `claim_expires: null`)
    `dead_lease` не даёт никогда, сколько бы времени ни прошло.
 5. `attempt_started` без `attempt_ended`, pid мёртв → `crashed`; pid не читается →
-   `no_signal` (tri-state, как в 0.0.2).
+   `no_signal` (tri-state, как в 0.0.2). Правило остаётся срезом, но вечно висеть такой
+   попытке больше не даёт `reaper.sweep`: после истечения лизинга и запаса
+   `ttl + max(60 с, ttl/3)` он пишет настоящий `attempt_ended` (`kind=infra`,
+   `reaped: true`), и дело уходит по обычной политике ретраев. `ps` уборка не смотрит —
+   живой лизинг не трогается даже при мёртвом pid, потому что движок может быть на
+   другой машине или в другом namespace (`docs/PROBES.md`).
 6. `question_asked` без `question_answered` → `wait_human` с `human_kind="question"`;
    это и закрывает п.5 заметки 0.0.2: «ждёт ответа» считается по вопросам, а блокировка
    без вопроса имеет `human_kind="status"`.

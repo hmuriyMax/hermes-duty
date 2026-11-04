@@ -284,6 +284,40 @@
   `retry_at`, чужой лизинг — код 3 без спавна, припаркованный этап — код 2 и дело
   остаётся `wait_human`, отказ без парковки — код 1, SIGINT гасит долгожителя (код
   130), лизинги пусты после любого исхода, схема `--json`.
+
+**Осиротевшая попытка закрывается движком: `reap`, `reaped: true`**
+
+- `dashboard/reaper.py` — `sweep(conn, now, dry_run=False) -> list[dict]`. Живой прогон
+  04.11 показал дыру: `bin/duty run` убили снаружи во время попытки, и одна попытка
+  стала двумя правдами — срез (`fold`, смотрит pid) говорил `crashed`, переход
+  (`transit.stage_states`, только журнал) говорил «попытка идёт», и закрыть её было
+  некому. Теперь у попытки без `attempt_ended` **по факту срока** появляется конец:
+  лизинг истёк и возраст больше `ttl + max(60 с, ttl/3)` → `attempt_ended` с
+  `outcome=failed`, `kind=infra`, `reaped: true` и `pid` из `attempt_started`; лизинг
+  умершей попытки отпускается. Это тот же класс, что B1/B2 в 0.0.3, только наоборот:
+  факт в мире есть (процесса нет), записи в журнале нет.
+- Ноль нового состояния: `fold` и `transit` не тронуты — поверхности сходятся потому,
+  что появился факт, а не потому, что в них добавили `if`. `ps`/`lsof`/`/proc` уборка
+  не смотрит (`docs/PROBES.md`): движок может быть на другой машине или в другом
+  namespace, поэтому **живой лизинг не трогается никогда**, даже если pid не отвечает,
+  а `reaped: true` значит ровно «отчёта нет», а не «исполнитель упал».
+- Самолечение: `driver.drive()` зовёт `reaper.sweep` перед каждым решением, поэтому
+  убитый движок лечится следующим запуском без ручных действий; отчёт драйвера несёт
+  ключ `reaped` всегда (пустой список = убирать нечего, а не «поле забыли»).
+- `bin/duty reap [--dry-run]` — то же вручную; `--dry-run` только показывает, что было
+  бы закрыто. Субкоманда не решает, что считать сиротой, у себя: срок, лизинг и запись
+  факта живут в `reaper`, терминал показывает результат. В `bin/duty why … <этап>`
+  у приговора попытки видно `reaped: true`.
+- `tests/test_reaper.py` — 16 тестов без модели и без `ps`: закрытие по сроку, живой
+  лизинг цел, повторный `sweep` не пишет второй факт (идемпотентность), запас TTL
+  соблюдён (попытка на секунду моложе порога не закрывается), `reaped`/`pid` в
+  payload, класс `infra` проходит политику `retry.on`, `--dry-run` ничего не пишет,
+  чужая доска и чужой store не задеваются, закрытая попытка не перезакрывается,
+  лизинг отпускается, а после уборки `transit.stage_states` даёт `failed(infra)`,
+  согласованный со срезом; отдельный тест — регрессия ровно на случай `d_18f1a6e5`:
+  `bin/duty run` на деле с осиротевшей попыткой трогается с места.
+- `dashboard/demo.py` — из блока «чего ещё нет» убран `reap` (осталась декомпозиция).
+
 ### Изменено
 
 - `dashboard/journal.py` — набор `kind` расширен одним словом: `attempt_progress`
@@ -342,18 +376,18 @@
 
 | прогон | результат |
 |---|---|
-| `pytest tests/ -q` | `523 passed, 1 skipped` (skip — живой прогон под `@pytest.mark.live`, включается `pytest -m live`) |
+| `pytest tests/ -q` | `539 passed, 1 skipped` (skip — живой прогон под `@pytest.mark.live`, включается `pytest -m live`) |
 | `node --test tests/model.test.mjs` | `37 pass` |
 | `node --test tests/web.test.mjs` | `12 pass` |
 | `bin/duty demo` | 7 проверок OK, код 0 |
 | `bin/duty-version check` | OK |
 | `hermes plugins validate .` | Validation passed |
 
-По файлам (собрано 524 = 523 passed + 1 skipped): `test_spec` 72, `test_journal`
+По файлам (собрано 540 = 539 passed + 1 skipped): `test_spec` 72, `test_journal`
 61, `test_transit` 51, `test_deals` 50, `test_runner` 39, `test_cli` 37,
 `test_failures` 34, `test_evidence` 30, `test_aggregate` 30, `test_ask` 29,
-`test_routing` 25, `test_driver` 22, `test_stagefeed` 15, `test_screens` 12,
-`test_demo` 9, `test_p0_contract` 6, `test_frontend_syntax` 2.
+`test_routing` 25, `test_driver` 22, `test_reaper` 16, `test_stagefeed` 15,
+`test_screens` 12, `test_demo` 9, `test_p0_contract` 6, `test_frontend_syntax` 2.
 
 ## [0.0.3] — в разработке
 

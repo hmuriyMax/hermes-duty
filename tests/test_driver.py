@@ -625,9 +625,23 @@ def test_json_report_schema(tmp_path: Path) -> None:
     # Отчёт обязан переживать `json.dumps` без посторонних объектов.
     restored = json.loads(json.dumps(report, ensure_ascii=False))
 
-    assert set(restored) == {"deal", "board", "spec", "steps", "outcome", "note", "decision", "exit_code"}
+    assert set(restored) == {
+        "deal",
+        "board",
+        "spec",
+        "steps",
+        "reaped",
+        "outcome",
+        "note",
+        "decision",
+        "exit_code",
+    }
     assert restored["deal"] == deal["id"]
     assert restored["spec"] == str(spec.path)
+    # Уборки в чистом прогоне нет: список пуст, а не отсутствует — ключ есть
+    # всегда, иначе читатель `--json` не отличил бы «нечего убирать» от
+    # «поле забыли».
+    assert restored["reaped"] == []
     assert set(restored["steps"][0]) == {
         "n",
         "stage",

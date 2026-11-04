@@ -596,7 +596,9 @@ def _apply(
     events: list[dict[str, Any]],
     status: str,
     now: int,
-    **fields: Any,
+    fields: Optional[dict[str, Any]] = None,
+    *,
+    expired_leases_at: Optional[int] = None,
 ) -> dict[str, Any]:
     """Записать события и строку дела одной транзакцией; вернуть итог мутации.
 
@@ -607,12 +609,23 @@ def _apply(
 
     Гейт детей пересчитывается здесь же: переход ребёнка — часть той же
     транзакции, иначе он остался бы без события.
+
+    `expired_leases_at` — момент, на который срок лизинга считается истёкшим:
+    задан — той же транзакцией снимаются лизинги дела со сроком не позже него
+    (`decide stop` бегущего дела: работа мертва, и держать её срок нечему).
+    Живой лизинг не снимается никогда, поэтому условие — по сроку, а не по факту
+    «останавливаем».
     """
     with conn:
         written = journal.append_in_tx(conn, events)
         if written == 0:
             return {"deal": deal_row(conn, str(deal["id"])), "events": 0, "idempotent": True}
-        _set_status(conn, deal, status, now, **fields)
+        _set_status(conn, deal, status, now, **(fields or {}))
+        if expired_leases_at is not None:
+            conn.execute(
+                "DELETE FROM leases WHERE deal_id = ? AND expires_at <= ?",
+                (str(deal["id"]), int(expired_leases_at)),
+            )
         gate = _gate_events(conn, deal, str(events[-1]["idempotency_key"]), str(events[0]["source"]), now)
         if gate:
             journal.append_in_tx(conn, gate)
@@ -842,7 +855,7 @@ def patch_deal(
         payload = {"fields": sorted(changes)}
     event = _event(deal, kind, payload, source, {"changes": dict(changes)}, now)
     target = str(changes.pop("status", deal["status"]))
-    return _apply(conn, deal, [event], target, now, **changes)
+    return _apply(conn, deal, [event], target, now, changes)
 
 
 def add_comment(
@@ -1007,7 +1020,7 @@ def claim_deal(
         now,
     )
     fields = {} if deal.get("assignee") else {"assignee": who}
-    return _apply(conn, deal, [event], "running", now, **fields)
+    return _apply(conn, deal, [event], "running", now, fields)
 
 
 def complete_deal(
@@ -1060,6 +1073,11 @@ def complete_deal(
 # текста причины.
 CLOSE_CAUSE_HUMAN = "closed_by_human"
 CLOSE_CAUSE_STOP = "stopped_by_human"
+# Причина закрытия движком: все этапы графа пройдены. Пишет её драйвер, а не
+# команда: до 0.0.4 прогон объявлял «дело закрыто» строкой stdout, а в журнале
+# дело оставалось живым (`status='running'` без `completed`) — движок называл
+# результат, которого в системе не было.
+CLOSE_CAUSE_ALL_STAGES = "all_stages_done"
 
 # Два решения человека одной командой (`duty decide`): слова закрытого набора,
 # чтобы «продолжить» и «остановить» не угадывались по тексту ответа.
@@ -1076,6 +1094,7 @@ def close_deal(
     cause: str = CLOSE_CAUSE_HUMAN,
     source: str = "cli",
     now: Optional[int] = None,
+    expired_leases_at: Optional[int] = None,
 ) -> dict[str, Any]:
     """Закрыть дело решением человека: одно `completed` и строка дела.
 
@@ -1122,6 +1141,65 @@ def close_deal(
     if stage:
         payload["stage"] = stage
     event = _event(deal, "completed", payload, source, {"cause": cause, "reason": text}, now)
+    return _apply(conn, deal, [event], "done", now, expired_leases_at=expired_leases_at)
+
+
+# Статусы, в которых дело держит человек: факт закрытия движком их не перебивает.
+# `blocked` — открытый блок (движок снимает только тот, что держал вопрос),
+# `review` — дело ждёт приговора ревьюера. Закрытие движком здесь значило бы
+# стереть решение человека фактом «все этапы пройдены».
+HUMAN_HOLD_STATUSES = ("blocked", "review")
+
+
+def close_stages_done(
+    conn: sqlite3.Connection,
+    deal_id: str,
+    *,
+    stages: Iterable[str] = (),
+    source: str = "engine",
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Закрыть дело по факту «все этапы пройдены»: одно `completed` и строка дела.
+
+    Это закрытие **движком**, а не человеком: `cause='all_stages_done'`, а
+    `stages` называет граф, который пройден (`["impl","verify","review"]`). Второй
+    причины закрытия не заводится — вид события тот же `completed`, что у
+    `close`/`complete` (`docs/JOURNAL.md`).
+
+    Идемпотентность — ключом события: он считается от одного `cause`, поэтому
+    повторный прогон на уже закрытом деле даёт `events: 0` и не трогает ни
+    строку, ни `updated_at`. Гонка двух прогонов решается там же, `INSERT OR
+    IGNORE`: второй факт не ляжет, и второй `completed` не появится.
+
+    Дело, которое держит человек, — отказ (`DealError`) и ни одной записи:
+    «все этапы пройдены» — факт графа, а не разрешение стереть блок или ожидание
+    вердикта. Блок читается **журналом** (`blocked` без `unblocked`), а не только
+    строкой store: шаг движка ставит делу `running`, и по одной строке открытый
+    блок человека уже не виден.
+    """
+    now = _now_sec() if now is None else int(now)
+    deal = _require_row(conn, deal_id)
+    _reject_archived(deal, "close")
+    block = _open_block_kind(conn, str(deal["id"]))
+    if block is not None:
+        raise DealError(
+            f"close: дело {deal['id']} заблокировано ({block}) — "
+            "закрытие движком не перебивает решение человека"
+        )
+    if str(deal["status"]) in HUMAN_HOLD_STATUSES:
+        raise DealError(
+            f"close: дело {deal['id']} держит человек (status={deal['status']}) — "
+            "закрытие движком не перебивает решение человека"
+        )
+    names = [str(stage) for stage in stages]
+    event = _event(
+        deal,
+        "completed",
+        {"cause": CLOSE_CAUSE_ALL_STAGES, "stages": names},
+        source,
+        {"cause": CLOSE_CAUSE_ALL_STAGES},
+        now,
+    )
     return _apply(conn, deal, [event], "done", now)
 
 
@@ -1131,6 +1209,25 @@ def _last_completion(events: Iterable[dict[str, Any]]) -> Optional[dict[str, Any
         if str(event.get("kind") or "") == "completed":
             return journal.payload_of(event)
     return None
+
+
+def live_lease_of(
+    conn: sqlite3.Connection, deal_id: str, *, now: Optional[int] = None
+) -> Optional[dict[str, Any]]:
+    """Живой лизинг дела или `None` — единственный признак «кто-то работает».
+
+    Срок лизинга и есть TTL попытки: его продлевает heartbeat движка
+    (`runner.follow`), поэтому «нет живого драйвера» — это отсутствие строки либо
+    срок в прошлом. Живой лизинг не снимается никогда: движок может быть на другой
+    машине, и `ps` про него ничего не доказывает (`docs/PROBES.md`).
+    """
+    at = _now_sec() if now is None else int(now)
+    row = conn.execute(
+        "SELECT deal_id, stage, attempt, pid, taken_at, expires_at FROM leases "
+        "WHERE deal_id = ? AND expires_at > ? ORDER BY expires_at DESC LIMIT 1",
+        (own_id(deal_id), at),
+    ).fetchone()
+    return None if row is None else dict(row)
 
 
 def decide_deal(
@@ -1151,9 +1248,16 @@ def decide_deal(
     `cause='stopped_by_human'`. Своего набора правил здесь нет — команда только
     выбирает, какой из двух путей позвать, чтобы человеку не помнить два.
 
-    Дело, которое человека не ждёт (не запарковано и не в `blocked`), — отказ
-    входа и **ни одной записи**: «закрыть» без открытого вопроса закрывало бы
-    работу, о которой никто не спрашивал.
+    `stop` разрешён и на **бегущем** деле, если у него нет живого драйвера: нет
+    лизинга либо его срок прошёл (`live_lease_of`). Живой случай: попытка погибла
+    при рестарте гейтвея, драйвера нет, а лизинг живёт ещё полчаса — остановить
+    было нечем. Тогда закрытие пишет `completed` с `cause='stopped_by_human'` и
+    тем же фактом снимает истёкший лизинг (одна транзакция). Живой лизинг —
+    по-прежнему отказ: чужую работу не рвём.
+
+    Дело, которое человека не ждёт (не запарковано, не в `blocked`, не бегущее
+    без драйвера), — отказ входа и **ни одной записи**: «закрыть» без открытого
+    вопроса закрывало бы работу, о которой никто не спрашивал.
     """
     now = _now_sec() if now is None else int(now)
     deal = _require_row(conn, deal_id)
@@ -1165,9 +1269,30 @@ def decide_deal(
         )
     parked = journal.parked_of(journal.read_events(conn, str(deal["id"])))
     if parked is None and str(deal["status"]) != "blocked":
-        raise DealError(
-            f"decide {choice}: дело {deal['id']} не запарковано и не заблокировано "
-            f"(status={deal['status']}) — решения человека оно не ждёт"
+        dead = choice == DECISION_STOP and str(deal["status"]) == "running"
+        if not dead:
+            raise DealError(
+                f"decide {choice}: дело {deal['id']} не запарковано и не заблокировано "
+                f"(status={deal['status']}) — решения человека оно не ждёт"
+            )
+        held = live_lease_of(conn, str(deal["id"]), now=now)
+        if held is not None:
+            raise DealError(
+                f"decide stop: дело {deal['id']} ведёт живой лизинг этапа "
+                f"{held['stage']!r} (pid {held['pid']}, срок до {held['expires_at']}) — "
+                f"чужую работу не рвём: остановить можно после истечения лизинга"
+            )
+        return close_deal(
+            conn,
+            str(deal["id"]),
+            reason=reason,
+            cause=CLOSE_CAUSE_STOP,
+            source=source,
+            now=now,
+            # Лизинг бегущего дела снимается тем же фактом, что закрытие: срок
+            # прошёл, а строка осталась бы единственным «признаком работы» у
+            # уже закрытого дела.
+            expired_leases_at=now,
         )
     if choice == DECISION_CONTINUE:
         return set_unblocked(conn, deal_id, author=author, source=source, now=now)

@@ -1148,3 +1148,153 @@ def test_evidence_names_the_answer_and_the_decision_command(home, frozen_now, ca
     code, out, _ = run(["now"], capsys)
     assert code == cli.EXIT_OK
     assert "wait_human/decision" in out
+
+
+# ------------------- W21: `decide stop` на бегущем деле без живого драйвера
+#
+# Живой случай: попытка погибла при рестарте гейтвея, драйвера нет, а лизинг
+# живёт ещё 40 минут — остановить было нечем, `decide stop` отказывал «дело
+# решения человека не ждёт». Правило: `running` без живого лизинга останавливать
+# можно (и факт этот пишется), живой лизинг — по-прежнему отказ и ни одной записи.
+
+def running_deal(home: Path, *, lease_expires: Optional[int] = None) -> str:
+    """Дело в работе, как его оставляет шаг движка: `claimed` плюс попытка.
+
+    `lease_expires` задан — в store лежит строка лизинга с этим сроком (живая или
+    протухшая, это решает тест); не задан — лизинга нет вовсе, то есть драйвера
+    тоже нет. pid в попытке — свой: «процесс попытки жив, а драйвера нет» — ровно
+    тот живой случай из карточки (гейтвей перезапустили, лизинг остался).
+    """
+    deal_id = own_deal(home)
+    api = cli.api()
+    conn = api.deals.open_store(home)
+    assert conn is not None
+    try:
+        api.deals.claim_deal(conn, deal_id, owner="duty", source="engine", now=NOW)
+        cli._load_journal().append(
+            conn,
+            [
+                {
+                    "deal_id": deal_id,
+                    "board": "b1",
+                    "kind": "attempt_started",
+                    "ts": NOW - 60,
+                    "recorded_at": NOW - 60,
+                    "source": "engine",
+                    "payload": {
+                        "run_id": f"{deal_id}:impl#1",
+                        "stage": "impl",
+                        "attempt": 1,
+                        "pid": os.getpid(),
+                        "lease_expires": lease_expires,
+                        "contract": {"role": "implementer"},
+                    },
+                    "idempotency_key": f"test:{deal_id}:impl#1",
+                }
+            ],
+        )
+        if lease_expires is not None:
+            conn.execute(
+                "INSERT INTO leases (deal_id, stage, attempt, pid, taken_at, expires_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (deal_id, "impl", 1, os.getpid(), NOW - 60, lease_expires),
+            )
+            conn.commit()
+    finally:
+        conn.close()
+    return deal_id
+
+
+@pytest.fixture()
+def frozen_deals_now(frozen_now, monkeypatch):
+    """Часы store заморожены: срок лизинга в тесте — `NOW`, а не живые часы.
+
+    `frozen_now` замораживает только часы роутов, а `deals._now_sec` читает
+    настоящий момент: лизинг «истёк 10 секунд назад» по часам теста оказался бы
+    живым ещё на годы, и правило «нет живого драйвера» проверить было бы нельзя.
+    """
+    monkeypatch.setattr(cli.api().deals, "_now_sec", lambda: NOW)
+    return NOW
+
+
+def leases_of(home: Path, deal_id: str) -> list[dict]:
+    """Строки лизинга дела — единственный признак «кто-то работает»."""
+    api = cli.api()
+    conn = api.deals.open_store(home, create=False, readonly=True)
+    assert conn is not None
+    try:
+        return [
+            dict(row)
+            for row in conn.execute(
+                "SELECT stage, pid, expires_at FROM leases WHERE deal_id = ?", (deal_id,)
+            )
+        ]
+    finally:
+        conn.close()
+
+
+def test_decide_stop_closes_a_running_deal_without_a_driver(home, frozen_deals_now, capsys):
+    """Бегущее дело без лизинга: остановка разрешена и пишется фактом."""
+    deal_id = running_deal(home)
+
+    code, out, _ = run(["decide", deal_id, "stop", "--reason", "попытка погибла"], capsys)
+
+    assert code == cli.EXIT_OK
+    assert "ОСТАНОВЛЕНО" in out and "done" in out
+    completed = [event for event in journal_events(home, deal_id) if event["kind"] == "completed"]
+    assert len(completed) == 1
+    payload = cli._load_journal().payload_of(completed[0])
+    assert payload["cause"] == "stopped_by_human"
+    assert payload["reason"] == "попытка погибла"
+    # `from` — состояние **журнала** на момент закрытия (`working`: попытка идёт),
+    # а не слово строки store: причина закрытия не пересказывает статус.
+    assert payload["from"] == "working"
+    assert deal_status(home, deal_id) == "done"
+    assert leases_of(home, deal_id) == []
+    # Закрытое дело уходит из «сейчас»: журнал и срез согласны.
+    assert deal_id not in [item["id"] for item in cli.api().now()["deals"]]
+
+
+def test_decide_stop_refuses_a_running_deal_held_by_a_live_lease(home, frozen_deals_now, capsys):
+    """Живой лизинг: отказ и **ни одной записи** — чужую работу не рвём."""
+    deal_id = running_deal(home, lease_expires=NOW + 600)
+    before = [event["kind"] for event in journal_events(home, deal_id)]
+
+    code, out, err = run(["decide", deal_id, "stop"], capsys)
+
+    assert code == cli.EXIT_SOURCE
+    assert out == ""
+    assert "живой лизинг" in err and "impl" in err
+    assert [event["kind"] for event in journal_events(home, deal_id)] == before
+    assert deal_status(home, deal_id) == "running"
+    assert leases_of(home, deal_id), "живой лизинг не снимается никогда"
+
+
+def test_decide_stop_after_the_lease_expired_is_allowed(home, frozen_deals_now, capsys):
+    """Срок лизинга прошёл — драйвера нет, остановка разрешена и лизинг снят."""
+    deal_id = running_deal(home, lease_expires=NOW - 10)
+
+    code, out, _ = run(["decide", deal_id, "stop", "--reason", "гейтвей перезапустили"], capsys)
+
+    assert code == cli.EXIT_OK
+    assert "ОСТАНОВЛЕНО" in out
+    assert deal_status(home, deal_id) == "done"
+    assert leases_of(home, deal_id) == [], "протухший лизинг снимается тем же фактом"
+    completed = [event for event in journal_events(home, deal_id) if event["kind"] == "completed"]
+    assert len(completed) == 1
+    assert cli._load_journal().payload_of(completed[0])["cause"] == "stopped_by_human"
+
+
+def test_decide_continue_on_a_running_deal_still_refuses(home, frozen_deals_now, capsys):
+    """Исключение ровно одно: `continue` бегущему делу нечего продолжать."""
+    deal_id = running_deal(home)
+    before = [event["kind"] for event in journal_events(home, deal_id)]
+
+    code, out, err = run(["decide", deal_id, "continue"], capsys)
+
+    assert code == cli.EXIT_SOURCE
+    assert out == ""
+    assert "status=running" in err
+    assert [event["kind"] for event in journal_events(home, deal_id)] == before
+    assert deal_status(home, deal_id) == "running"
+

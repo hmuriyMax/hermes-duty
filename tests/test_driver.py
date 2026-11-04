@@ -690,6 +690,7 @@ def test_json_report_schema(tmp_path: Path) -> None:
         "outcome",
         "note",
         "decision",
+        "closed",
         "exit_code",
     }
     assert restored["deal"] == deal["id"]
@@ -702,6 +703,19 @@ def test_json_report_schema(tmp_path: Path) -> None:
     # и «синк не звали» читатель `--json` обязан различать.
     assert restored["answers"] == {"appended": 0}
     assert restored["answers_errors"] == []
+    # Закрытие — не строка вывода, а факт: в отчёте он назван той же формой, что
+    # читает консоль, и `--json` не отличается от человеческой строки.
+    assert set(restored["closed"]) == {
+        "written",
+        "already",
+        "cause",
+        "at",
+        "stages",
+        "status",
+        "refused",
+    }
+    assert restored["closed"]["written"] is True
+    assert restored["closed"]["cause"] == "all_stages_done"
     assert set(restored["steps"][0]) == {
         "n",
         "stage",
@@ -887,7 +901,11 @@ def _cli_run(monkeypatch: pytest.MonkeyPatch, home: Path, args: list[str]) -> in
 
 
 def test_cli_run_closes_ready_deal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    """Закрытое дело: `duty run` говорит «закрыто» и выходит с кодом 0 (без спавна)."""
+    """Закрытое дело: `duty run` говорит «уже закрыто» и выходит с кодом 0 (без спавна).
+
+    Дело закрыто до прогона — второй `completed` не пишется, и что прогон ничего
+    не сделал, названо словом «уже», а не приписано себе (W21).
+    """
     home = make_home(tmp_path)
     conn = open_store(home)
     spec = write_spec(tmp_path, CHAIN)
@@ -898,7 +916,9 @@ def test_cli_run_closes_ready_deal(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
     assert code == 0
     out = capsys.readouterr().out
-    assert "итог: дело закрыто" in out
+    assert "итог: дело уже закрыто" in out
+    assert "completed" in out and "(шагов: 0)" in out
+    assert kinds(conn, deal).count("completed") == 1
 
 
 def test_cli_run_parked_deal_exits_2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -1303,4 +1323,230 @@ def test_manual_block_after_answer_is_not_lifted_by_the_step(tmp_path: Path) -> 
     assert report["steps"], "шаг всё равно идёт: блок не парковка"
     assert "unblocked" not in kinds(conn, deal), "блок человека движок не снимает"
     assert journal.fold(events(conn, deal))["state"] == "wait_human"
+    # W21: «все этапы пройдены» не даёт движку права закрыть дело, которое держит
+    # человек. Отказ не глотается: прогон говорит, что дело не закрыто, и почему.
+    assert report["closed"]["written"] is False
+    assert "заблокировано" in report["closed"]["refused"]
+    assert "completed" not in kinds(conn, deal)
+    line = cli.render_run_final(report)
+    assert line.startswith("итог: все этапы закрыты, но дело не закрыто"), line
 
+
+# ---------------------------- W21: закрытие — факт журнала, а не строка вывода
+#
+# Живой прогон `d_6e764042` (04.11 19:16) прошёл всю цепочку и напечатал «итог:
+# дело закрыто», а в журнале `completed` не было: дело осталось `status='running'`
+# и выпало из `/now` как «no_signal». Движок назвал результат, которого в системе
+# не было. Здесь проверяется обратное: закрытие пишется тем же путём, что
+# `bin/duty close`, второй раз не пишется, а три поверхности говорят одно.
+
+# Метка закрытия словами — та же, что печатает консоль (`cli._fmt_stamp`).
+STAMP = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(NOW))
+
+# Факт закрытия одной фразой: ровно он обязан появиться на всех трёх поверхностях.
+CLOSURE_FACT = "completed cause=all_stages_done, этапы: impl, verify, review"
+
+
+def seed_attempt(
+    conn: sqlite3.Connection, deal: dict[str, Any], stage: str, attempt: int
+) -> None:
+    """Попытка этапа в журнале: `attempt_started` и успешный `attempt_ended`.
+
+    Ровно те два факта, которые пишет `runner`, и ничего больше: так выглядит
+    журнал дела, у которого все этапы прошли, а закрытия никто не записал.
+    """
+    run_id = f"{deal['id']}:{stage}#{attempt}"
+    seed(
+        conn,
+        deal,
+        "attempt_started",
+        {
+            "run_id": run_id,
+            "stage": stage,
+            "attempt": attempt,
+            "pid": 4300 + attempt,
+            "lease_expires": NOW - 100,
+            "contract": {"role": stage},
+        },
+        key=f"start-{stage}-{attempt}",
+    )
+    seed(
+        conn,
+        deal,
+        "attempt_ended",
+        {
+            "run_id": run_id,
+            "stage": stage,
+            "attempt": attempt,
+            "outcome": "done",
+            "kind": None,
+            "reason": "",
+            "base": None,
+            "commit": None,
+        },
+        key=f"end-{stage}-{attempt}",
+    )
+
+
+def test_all_stages_done_writes_one_completed_and_closes_the_deal(tmp_path: Path) -> None:
+    """Все этапы закрыты → один `completed` с причиной и строка `status=done`."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, CHAIN)
+    deal = make_deal(conn, spec_path=spec.path)
+
+    report = run(conn, spec, deal, home, Fake())
+
+    completed = [event for event in events(conn, deal) if event["kind"] == "completed"]
+    assert len(completed) == 1, "закрытие — один факт, а не абзац"
+    payload = journal.payload_of(completed[0])
+    assert payload == {"cause": "all_stages_done", "stages": ["impl", "verify", "review"]}
+    assert completed[0]["source"] == "engine", "закрыл движок, и это видно в источнике"
+    assert deals.deal_row(conn, str(deal["id"]))["status"] == "done"
+    assert report["closed"]["written"] is True
+    assert report["closed"]["cause"] == "all_stages_done"
+    assert report["closed"]["at"] == NOW
+    # Журнал и строка говорят одно: дело закрыто и в активные не возвращается.
+    assert journal.fold(events(conn, deal))["active"] is False
+    assert deals.deal_rows(conn, open_only=True) == []
+    # Печать итога — по записанному факту, а не вместо него.
+    line = cli.render_run_final(report)
+    assert line.startswith("итог: дело закрыто"), line
+    assert CLOSURE_FACT in line and STAMP in line
+
+
+def test_repeated_run_on_closed_deal_writes_no_second_completed(tmp_path: Path) -> None:
+    """Повторный `run` на закрытом деле: второго `completed` нет, строка не тронута."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, CHAIN)
+    deal = make_deal(conn, spec_path=spec.path)
+
+    run(conn, spec, deal, home, Fake())
+    before = deals.deal_row(conn, str(deal["id"]))
+    fake = Fake()
+    second = run(conn, spec, deal, home, fake)
+
+    assert fake.calls == [], "закрытое дело не поднимает ни одной попытки"
+    assert kinds(conn, deal).count("completed") == 1
+    assert deals.deal_row(conn, str(deal["id"]))["updated_at"] == before["updated_at"]
+    assert second["closed"]["already"] is True
+    assert second["closed"]["written"] is False
+    assert second["closed"]["at"] == NOW, "время закрытия — из журнала, а не из часов"
+    line = cli.render_run_final(second)
+    assert line.startswith("итог: дело уже закрыто"), line
+    assert CLOSURE_FACT in line and STAMP in line
+
+
+def test_regression_d_6e764042_all_stages_done_without_completed(tmp_path: Path) -> None:
+    """Регрессия живого прогона `d_6e764042`: три попытки ok, `completed` нет.
+
+    Дело в работе (`status='running'`), журнал говорит «все этапы пройдены», а
+    закрытия в нём нет. Прогон обязан дописать `completed` и закрыть дело — а не
+    бодро отрапортовать «закрыто» в stdout.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, CHAIN)
+    deal = make_deal(conn, spec_path=spec.path)
+    for stage in ("impl", "verify", "review"):
+        seed_attempt(conn, deal, stage, 1)
+    deals.claim_deal(conn, str(deal["id"]), owner="duty", source="engine", now=NOW)
+    assert kinds(conn, deal).count("attempt_ended") == 3
+    assert "completed" not in kinds(conn, deal)
+    assert deals.deal_row(conn, str(deal["id"]))["status"] == "running"
+    fake = Fake()
+
+    report = run(conn, spec, deal, home, fake)
+
+    assert fake.calls == [], "этапы уже пройдены: новых попыток нет"
+    assert report["outcome"] == "done"
+    assert report["exit_code"] == 0
+    assert kinds(conn, deal).count("completed") == 1, "недостающий факт дописан"
+    assert report["closed"]["written"] is True
+    assert report["closed"]["stages"] == ["impl", "verify", "review"]
+    assert deals.deal_row(conn, str(deal["id"]))["status"] == "done"
+    assert journal.fold(events(conn, deal))["active"] is False
+
+
+def test_deal_why_and_run_name_the_same_closure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`deal`, `why` и `run` на закрытом деле говорят одно: чем и когда закрыто."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, CHAIN)
+    deal = make_deal(conn, spec_path=spec.path)
+    report = run(conn, spec, deal, home, Fake())
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    payload = cli.api().deal(str(deal["board"]), str(deal["id"]))
+    deal_out = cli.render_deal(payload, None, None)
+    why_out = cli.render_why(payload)
+    run_out = cli.render_run_final(report)
+
+    assert payload["closed"]["cause"] == "all_stages_done"
+    for out in (deal_out, why_out, run_out):
+        assert CLOSURE_FACT in out, out
+        assert STAMP in out, out
+    assert "состояние ожидания: закрыто" in deal_out
+    assert "состояние ожидания: закрыто" in why_out
+    # Закрытое дело не показывается в «сейчас»: факт журнала и срез согласны.
+    assert str(deal["id"]) not in [item["id"] for item in cli.api().now()["deals"]]
+
+
+
+
+def test_run_does_not_revive_a_deal_closed_by_human(tmp_path: Path) -> None:
+    """Дело, закрытое человеком, прогон не поднимает — даже с `stage` в payload.
+
+    Человеческое закрытие (`decide stop`, `close`) называет этап, на котором
+    стояло дело, и `transit` прочитал бы такой `completed` как закрытие **этапа**,
+    а не дела. Поэтому прогон спрашивает `journal.closed_fact` до шага: иначе
+    первая же попытка воскресила бы закрытое дело — та же подмена, что и «закрыто»
+    без факта, только наоборот.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, CHAIN)
+    deal = make_deal(conn, spec_path=spec.path)
+    seed_attempt(conn, deal, "impl", 1)
+    seed(
+        conn,
+        deal,
+        "blocked",
+        {
+            "block_kind": "parked",
+            "reason": "исчерпано",
+            "stage": "verify",
+            "kind": "infra",
+            "attempts": 3,
+            "limit": 2,
+        },
+        key="park-1",
+    )
+    deals.close_deal(
+        conn,
+        str(deal["id"]),
+        reason="дело больше не нужно",
+        cause=deals.CLOSE_CAUSE_STOP,
+        source="cli",
+        now=NOW,
+    )
+    closed_payload = journal.payload_of(
+        [event for event in events(conn, deal) if event["kind"] == "completed"][-1]
+    )
+    assert closed_payload["stage"] == "verify", "этап назван — так пишет decide stop"
+    fake = Fake()
+
+    report = run(conn, spec, deal, home, fake)
+
+    assert fake.calls == [], "закрытое дело попыток не поднимает"
+    assert report["outcome"] == "done"
+    assert report["exit_code"] == 0
+    assert report["closed"]["already"] is True
+    assert report["closed"]["written"] is False
+    assert report["closed"]["cause"] == "stopped_by_human"
+    assert kinds(conn, deal).count("completed") == 1, "второй факт не пишется"
+    assert deals.deal_row(conn, str(deal["id"]))["status"] == "done"
+    assert cli.render_run_final(report).startswith("итог: дело уже закрыто")

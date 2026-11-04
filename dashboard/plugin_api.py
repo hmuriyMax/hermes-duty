@@ -1560,6 +1560,25 @@ def _own_deals(
         conn.close()
 
 
+def _closed_block(fact: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Факт закрытия дела полями ответа: причина, время, этапы, статус.
+
+    `fact` — ответ `journal.closed_fact` (`{"at", "payload"}`). `None` — дело не
+    закрывалось фактом журнала, и подставлять сюда `status='done'` нельзя:
+    строка store и факт журнала — разные вещи, а экран обязан назвать именно
+    записанную причину.
+    """
+    if not fact:
+        return None
+    payload = fact.get("payload") or {}
+    return {
+        "at": int(fact.get("at") or 0),
+        "cause": str(payload.get("cause") or ""),
+        "stages": [str(stage) for stage in payload.get("stages") or ()],
+        "status": str(payload.get("status") or "done"),
+    }
+
+
 def _deal_response(
     *,
     now: int,
@@ -1574,6 +1593,7 @@ def _deal_response(
     stages_note: str = "",
     spec: Optional[str] = None,
     errors: Optional[list[dict[str, str]]] = None,
+    closed: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Ответ «одно дело» — одна форма и для kanban-дела, и для своего.
 
@@ -1589,6 +1609,11 @@ def _deal_response(
     `external_ref` — внешнее имя дела (`jira:RP-14080`), по которому его находят
     повторно. У наблюдаемого kanban-дела его нет: имя ставит тот, кто заводит
     дело в store (`docs/OWNERSHIP.md`, «Внешнее имя дела»).
+
+    `closed` — факт закрытия (`journal.closed_fact`): причина и время, `null` —
+    дело не закрывалось фактом журнала. Один ответ на вопрос «почему закрыто» для
+    `deal`, `why` и `run`: состояния ожидания у закрытого дела нет, и вместо него
+    называется записанный факт, а не пересказ статуса.
     """
     body_text = str(row.get("body") or "")
     status = str(row.get("status") or "")
@@ -1601,6 +1626,7 @@ def _deal_response(
         "assignee": row.get("assignee"),
         "external_ref": row.get("external_ref"),
         "terminal": status in TERMINAL_STATUSES,
+        "closed": _closed_block(closed),
         "created_at": row.get("created_at"),
         "body": body_text[:DEAL_BODY_LIMIT],
         "body_truncated": len(body_text) > DEAL_BODY_LIMIT,
@@ -1672,6 +1698,7 @@ def _own_response(
         stages=feed["stages"],
         stages_note=feed["note"],
         spec=feed["spec"],
+        closed=journal.closed_fact(events),
     )
 
 
@@ -2091,6 +2118,7 @@ def deal(board: str, task_id: str, spec: Optional[str] = None) -> dict[str, Any]
         stages=feed["stages"],
         stages_note=feed["note"],
         spec=feed["spec"],
+        closed=journal.closed_fact(events),
     )
 
 
@@ -2245,6 +2273,7 @@ def _error_body(board: Optional[str], deal_id: Optional[str], reason: str) -> di
         "status": None,
         "assignee": None,
         "terminal": False,
+        "closed": None,
         "created_at": None,
         "body": "",
         "body_truncated": False,

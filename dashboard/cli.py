@@ -895,11 +895,30 @@ def render_attempts(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _closure_text(closed: dict[str, Any]) -> str:
+    """Факт закрытия словами: `completed cause=…, этапы: … в 04.11 19:16`.
+
+    Один текст на три поверхности (`deal`, `why`, `run`): причина и время берутся
+    из записанного `completed` (`/deal` → `closed`), а не из статуса строки дела.
+    Отсюда «закрыто» читается одинаково везде — это и есть «один предикат, три
+    поверхности».
+    """
+    cause = str(closed.get("cause") or "") or "причина не записана"
+    stages = [str(stage) for stage in closed.get("stages") or ()]
+    tail = f", этапы: {', '.join(stages)}" if stages else ""
+    return f"completed cause={cause}{tail} в {_fmt_stamp(closed.get('at'))}"
+
+
 def _waiting_head(payload: dict[str, Any]) -> str:
     """Строка состояния ожидания: состояние, вид «нужен человек» и приговор журнала."""
     shaped = payload.get("deal")
     if shaped is None:
         if payload.get("terminal"):
+            closed = payload.get("closed")
+            if isinstance(closed, dict):
+                # У закрытого дела состояния ожидания нет — есть записанный факт
+                # закрытия: причина и время, как у `run` и `why`.
+                return f"закрыто — {_closure_text(closed)} (status={payload.get('status')})"
             return f"не считается: дело закрыто (status={payload.get('status')}), ждать нечего"
         return (
             "не посчитано: дела нет в срезе «сейчас» — журнал говорит completed "
@@ -1008,7 +1027,15 @@ def render_why(payload: dict[str, Any]) -> str:
     lines.append(f"состояние ожидания: {_waiting_head(payload)}")
     shaped = payload.get("deal")
     if shaped is None:
-        lines.append("доказательство: не записано — роут /deal не вернул фактов ожидания")
+        closed = payload.get("closed")
+        if isinstance(closed, dict):
+            # Дело закрыто — доказательство и есть факт закрытия, а не пустота:
+            # `why` обязан говорить то же, что `deal` и `run`.
+            lines.append(
+                f"доказательство: журнал: закрыто событием completed — {_closure_text(closed)}"
+            )
+        else:
+            lines.append("доказательство: не записано — роут /deal не вернул фактов ожидания")
     else:
         lines.append("доказательство (словами бэкенда):")
         lines.append(f"  {(shaped.get('waiting') or {}).get('evidence') or 'не записано'}")
@@ -1636,6 +1663,12 @@ def render_run_final(report: dict[str, Any]) -> str:
     держит): «вышел с кодом 3» без этих слов человеку ничего не говорит.
     Дочитанные ответы пула называются числом: «движок сам забрал ответ» и «дела
     не касались» — разные исходы, и второй не должен читаться как первый.
+
+    «Дело закрыто» печатается **по записанному факту** (`report["closed"]`): чем
+    закрыто и когда. Прогон, который нашёл дело уже закрытым, говорит «дело уже
+    закрыто» — второй `completed` он не писал, и выдавать это за свою работу
+    нельзя. Прогон, которому закрыть не дали (дело держит человек), говорит об
+    этом прямо: «все этапы закрыты», но «дело не закрыто» — это два разных факта.
     """
     outcome = str(report.get("outcome") or "")
     decision = report.get("decision") or {}
@@ -1644,7 +1677,24 @@ def render_run_final(report: dict[str, Any]) -> str:
     note = str(report.get("note") or decision.get("reason") or "")
     answers = int((report.get("answers") or {}).get("appended") or 0)
     picked = f" · ответов пула дочитано: {answers}" if answers else ""
+    closed = report.get("closed")
     if outcome == "done":
+        if isinstance(closed, dict) and closed.get("refused"):
+            # Этапы пройдены, а дело не закрыто: закрытие перебило бы решение
+            # человека. Два факта называются по отдельности, а не склеиваются в
+            # «закрыто» — ровно ту ложь, ради которой заведена карточка.
+            return (
+                f"итог: все этапы закрыты, но дело не закрыто — {closed['refused']} "
+                f"(шагов: {made}){picked}"
+            )
+        if isinstance(closed, dict):
+            fact = _closure_text(closed)
+            if closed.get("written"):
+                return (
+                    f"итог: дело закрыто — {note or 'все этапы закрыты'} "
+                    f"(шагов: {made}) · {fact}{picked}"
+                )
+            return f"итог: дело уже закрыто — {fact} (шагов: {made}){picked}"
         return f"итог: дело закрыто — {note or 'все этапы закрыты'} (шагов: {made}){picked}"
     if outcome == "failed":
         return (
@@ -1661,9 +1711,11 @@ def render_run_final(report: dict[str, Any]) -> str:
     if outcome == "limit":
         return f"итог: предел шагов — {note}{picked}"
     if outcome == "interrupted":
-        return f"итог: прервано — {note} (шагов: {made}){picked}"
+        fact = f" · {_closure_text(closed)}" if isinstance(closed, dict) else ""
+        return f"итог: прервано — {note} (шагов: {made}){fact}{picked}"
     if outcome == "step":
-        return f"итог: сделан один шаг (--once) — дальше {_decision_text(decision)}{picked}"
+        fact = f" · {_closure_text(closed)}" if isinstance(closed, dict) else ""
+        return f"итог: сделан один шаг (--once) — дальше {_decision_text(decision)}{fact}{picked}"
     return f"итог: {outcome or '—'} — {note}{picked}"
 
 

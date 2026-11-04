@@ -47,6 +47,14 @@ Python — то есть гейт «дело проходит impl → verify �
    Ошибки разбора (`errors[]`: пул недоступен, `session_key` не разобран) не
    глотаются: они попадают в отчёт (`answers_errors`) и в вывод шага, чтобы
    «вопрос закрыт, но не разобран» не читалось как «ответа нет».
+8. **«Все этапы закрыты» — это факт журнала, а не строка вывода.** Когда `transit`
+   отвечает `done`, драйвер пишет `completed` (`cause='all_stages_done'`, список
+   пройденных этапов) и строку дела **одной транзакцией** — тем же путём, что
+   `bin/duty close` (`deals.close_stages_done`). Без этого прогон объявлял
+   «итог: дело закрыто», а в журнале не было `completed`, и дело оставалось
+   `status='running'` (живой прогон `d_6e764042`). Печать итога — после записи и
+   по ней. Повторный прогон на закрытом деле второго `completed` не пишет и
+   отвечает «уже закрыто» с причиной и временем из журнала.
 
 ## Коды возврата — контракт `bin/duty run`
 
@@ -56,11 +64,14 @@ Python — то есть гейт «дело проходит impl → verify �
 
 ## Чего модуль не делает
 
-Сам не пишет в журнал: факт попытки — дело `runner` (одна транзакция на факт), а
-закрытие осиротевшей попытки — `reaper` (тоже один факт и одна транзакция);
-драйвер их только зовёт. Не задаёт вопросов (только `ask()`), не классифицирует
-отказы (только `failures.py`), не проверяет пакет (только `evidence.py`), не
-запускает модель сам (только `runner.spawn_process`), не открывает чужие БД.
+Сам не пишет факты попыток: факт попытки — дело `runner` (одна транзакция на
+факт), а закрытие осиротевшей попытки — `reaper` (тоже один факт и одна
+транзакция); драйвер их только зовёт. Единственная его запись — закрытие дела
+(правило 8), и она идёт через `deals` (`close_stages_done`), а не своим INSERT:
+второго пути записи `completed` в плагине нет. Не задаёт вопросов (только
+`ask()`), не классифицирует отказы (только `failures.py`), не проверяет пакет
+(только `evidence.py`), не запускает модель сам (только `runner.spawn_process`),
+не открывает чужие БД.
 """
 
 from __future__ import annotations
@@ -306,6 +317,7 @@ def _report(
     reaped: Optional[list[dict[str, Any]]] = None,
     answers: Optional[dict[str, Any]] = None,
     answers_errors: Optional[list[dict[str, Any]]] = None,
+    closed: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Отчёт прогона: шаги, уборка, ответы пула, финальное решение, исход и код.
 
@@ -316,6 +328,11 @@ def _report(
     `answers_errors` — что пул закрыл, а журнал не узнал (пул недоступен,
     `session_key` не разобран): пустой список вместо тишины, иначе «вопрос
     закрыт, но не разобран» выглядело бы как «ответа нет».
+    `closed` — факт закрытия дела (`_closure`): записано ли им `completed` или
+    дело уже было закрыто, с причиной и временем. `None` — прогон не кончился
+    закрытием. Строку «итог: дело закрыто» CLI печатает **по этому полю**, а не по
+    своему решению: состояние называет факт, который записан, а не намерение
+    напечатать.
     """
     return {
         "deal": str(deal.get("id") or ""),
@@ -328,7 +345,73 @@ def _report(
         "outcome": outcome,
         "note": note,
         "decision": _decision_dict(decision),
+        "closed": None if closed is None else dict(closed),
         "exit_code": EXIT_CODES[outcome],
+    }
+
+
+def _closure(conn: sqlite3.Connection, deal: Any, spec: Any, now: float) -> dict[str, Any]:
+    """Факт закрытия дела: записать `completed` или назвать уже записанный.
+
+    `transit` говорит «все этапы закрыты» — но это **решение**, а не факт: до
+    0.0.4 прогон печатал «итог: дело закрыто» и на этом кончал, оставляя дело
+    `status='running'` без `completed` (живой прогон `d_6e764042`). Здесь
+    недостающая половина: тот же путь, что у `bin/duty close` (W16) —
+    `deals.close_stages_done` пишет `completed` с
+    `cause='all_stages_done'` и строку дела одной транзакцией.
+
+    Идемпотентность не в памяти прогона, а в журнале: есть `completed` — второй не
+    пишется, и `updated_at` не двигается. Повторный `run` на закрытом деле поэтому
+    отвечает «уже закрыто» с причиной и временем, а не вторым фактом.
+
+    Ответ — `{written, already, cause, at, stages, status, refused}`: `written` —
+    факт лёг этим прогоном, `already` — он был раньше (время тогда из журнала, а
+    не из часов), `refused` — закрывать было нельзя (дело держит человек:
+    `blocked`/`review`/`archived`), и причина названа словами. Отказ здесь не
+    глотается: прогон обязан сказать «все этапы закрыты, но дело не закрыто», а
+    не выдать одно за другое.
+    """
+    events = journal.read_events(conn, str(deal["id"]))
+    fact = journal.closed_fact(events)
+    if fact is not None:
+        payload = fact["payload"]
+        return {
+            "written": False,
+            "already": True,
+            "cause": str(payload.get("cause") or ""),
+            "at": int(fact["at"]),
+            "stages": [str(stage) for stage in payload.get("stages") or ()],
+            "status": str(payload.get("status") or "done"),
+            "refused": "",
+        }
+    stages = [str(stage.id) for stage in getattr(spec, "stages", ())]
+    try:
+        result = deals.close_stages_done(
+            conn,
+            str(deal["id"]),
+            stages=stages,
+            source=runner.ENGINE_SOURCE,
+            now=int(now),
+        )
+    except deals.DealError as exc:
+        row = deals.deal_row(conn, str(deal["id"])) or {}
+        return {
+            "written": False,
+            "already": False,
+            "cause": deals.CLOSE_CAUSE_ALL_STAGES,
+            "at": int(now),
+            "stages": stages,
+            "status": str(row.get("status") or ""),
+            "refused": str(exc),
+        }
+    return {
+        "written": int(result.get("events") or 0) > 0,
+        "already": bool(result.get("idempotent")),
+        "cause": deals.CLOSE_CAUSE_ALL_STAGES,
+        "at": int(now),
+        "stages": stages,
+        "status": "done",
+        "refused": "",
     }
 
 
@@ -383,6 +466,7 @@ def run(
     made = 0
     outcome = ""
     note = ""
+    closed: Optional[dict[str, Any]] = None
 
     def decide() -> Any:
         """Уборка осиротевших попыток, дочитывание ответов пула, решение по журналу.
@@ -415,6 +499,14 @@ def run(
         return _decide(conn, deal, spec, tick)
 
     decision = decide()
+    # Дело, закрытое фактом журнала, попыток не поднимает — даже если `transit`
+    # прочитал `completed` со `stage` как закрытие **этапа** (так пишет
+    # `deals.close_deal`: `stage` там называет, где стояло дело) или увидел
+    # старый блок. Предикат закрытия один — `journal.closed_fact`, и он же
+    # правило 2 `fold`: закрытие терминально, поэтому прогон спрашивает его до
+    # шага. Иначе закрытое человеком дело воскресало бы первой же попыткой.
+    if journal.closed_fact(journal.read_events(conn, str(deal["id"]))) is not None:
+        decision = transit.done("журнал: дело закрыто событием completed")
     try:
         with _Interrupt(children) as watch:
             while True:
@@ -469,10 +561,17 @@ def run(
                     decision = decide()
                     break
                 decision = decide()
+        if getattr(decision, "kind", "") == transit.DECISION_DONE:
+            # Решение «все этапы закрыты» — ещё не факт: закрытие пишется тем же
+            # путём, что `bin/duty close` (`deals.close_stages_done`), и только
+            # потом CLI печатает «итог: дело закрыто» — по записанному.
+            closed = _closure(conn, deal, spec, tick())
     finally:
         children.stop()
         _release_mine(conn, deal, spec)
-    return _report(deal, spec, steps, decision, outcome, note, reaped, answers, answers_errors)
+    return _report(
+        deal, spec, steps, decision, outcome, note, reaped, answers, answers_errors, closed=closed
+    )
 
 
 # --------------------------------------------------------------- вход прогона

@@ -757,6 +757,30 @@ def parked_of(events: Iterable[dict[str, Any]]) -> Optional[dict[str, Any]]:
     return fact
 
 
+def closed_fact(events: Iterable[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Последний факт закрытия дела: `completed`, его время и payload.
+
+    Предикат тот же, что у `fold` (`_closed_kind`): дело закрыто, если в журнале
+    есть `completed`. Отдельного отбора «только без `stage`» здесь нет намеренно:
+    `deals.close_deal` называет в payload этап, на котором стояло дело, и такой
+    факт закрывает дело, а не этап — второй предикат разошёлся бы с первым и
+    «закрыто» читалось бы по-разному на трёх экранах.
+
+    `None` — дело не закрывалось фактом (даже если строка store уже `done`:
+    тогда закрытие назвать нечем, и выдумывать причину нельзя).
+    """
+    found: Optional[dict[str, Any]] = None
+    ordered = sorted(
+        (item for item in events or () if isinstance(item, dict)),
+        key=lambda item: int(item.get("id") or 0),
+    )
+    for event in ordered:
+        if str(event.get("kind") or "") != "completed":
+            continue
+        found = {"at": int(event.get("ts") or 0), "payload": _payload(event)}
+    return found
+
+
 def _answered_question(ordered: list[dict[str, Any]], question_id: Any) -> bool:
     """Получен ли ответ человека на вопрос парковки — по факту `question_answered`.
 

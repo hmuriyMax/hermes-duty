@@ -37,15 +37,20 @@
    `result.json`; его отсутствие; код выхода процесса. Таймаут — наш собственный
    факт и потому проверяется первым (`failed(infra)`), результат до таймаута всё
    равно попадает в `details`.
-7. **Вопрос из попытки**: `question` в `result.json` → `ask()` (единственный
+7. **Проверка пакета** (`dashboard/evidence.py`): заявленное «готово» сверяется с
+   деревом попытки — хеши файлов, резолв коммита, коды объявленных команд и их
+   свежесть, бюджет. Только принятый пакет закрывает попытку `done`; иначе
+   `failed(contract)` или `failed(capability)` с первыми отказами в `reason`.
+8. **Вопрос из попытки**: `question` в `result.json` → `ask()` (единственный
    канал) и дело в `wait_human`. Продолжение — резюмом сессии (`RESUME-OK`,
    `docs/PROBES.md`): id сессии из события `result` хранится в
    `attempt_ended.details.session_id`, следующая попытка идёт с `--resume`.
    Выбор зафиксирован в `docs/RUNBOOK.md`.
 
 Чего модуль не делает: не считает состояние дела (это `journal.fold`), не
-назначает попытки (это `transit`), не проверяет evidence (следующий слой), не
-ходит в продовые системы и не пишет ни в чужую БД, ни в `kanban.db`.
+назначает попытки (это `transit`), не запускает команды из `evidence` (их уже
+выполнил исполнитель — гейт только сверяет заявленное с деревом), не ходит в
+продовые системы и не пишет ни в чужую БД, ни в `kanban.db`.
 """
 
 from __future__ import annotations
@@ -69,6 +74,7 @@ JOURNAL_MODULE_NAME = "hermes_duty_journal"
 DEALS_MODULE_NAME = "hermes_duty_deals"
 ASK_MODULE_NAME = "hermes_duty_ask"
 SPEC_MODULE_NAME = "hermes_duty_spec"
+EVIDENCE_MODULE_NAME = "hermes_duty_evidence"
 
 
 def _load(name: str, filename: str) -> Any:
@@ -90,6 +96,7 @@ journal = _load(JOURNAL_MODULE_NAME, "journal.py")
 deals = _load(DEALS_MODULE_NAME, "deals.py")
 ask = _load(ASK_MODULE_NAME, "ask.py")
 spec_module = _load(SPEC_MODULE_NAME, "spec.py")
+evidence_module = _load(EVIDENCE_MODULE_NAME, "evidence.py")
 
 # Источник событий движка в журнале: `engine`, а не `cli`/`api`/`ingest` — по нему
 # видно, что факт записал движок, а не человек и не проход по чужой доске.
@@ -514,6 +521,7 @@ def build_contract(
         "boundaries": boundaries,
         "previous": previous,
         "evidence_to_produce": evidence,
+        "report_schema": evidence_module.report_schema(stage),
         "questions": questions,
     }
     if answer is not None:
@@ -1123,12 +1131,29 @@ def run_stage(
     parked = outcome == OUTCOME_DONE and status in BLOCKED_STATUSES
     stderr_file = write_stderr(workdir, process.stderr_text)
 
+    # Гейт пакета: слово «готово» принимается только вместе с проверяемыми
+    # доказательствами. Запускается после смерти процесса и до записи
+    # `attempt_ended`, чтобы отказ гейта был в журнале тем же фактом, что и смерть.
+    now = _now_sec(int(clock()))
+    verdict = None
+    if outcome == OUTCOME_DONE and not parked and result is not None:
+        verdict = evidence_module.verify(
+            result,
+            stage,
+            workdir,
+            attempt_started_at=int(started["ts"]),
+            now=now,
+            root=cwd,
+            base=spec.base,
+        )
+        if not verdict.ok:
+            outcome, kind, reason = OUTCOME_FAILED, verdict.kind, verdict.reason()
+
     cleaned = False
     cleanup = ""
     if outcome != OUTCOME_DONE and stage.workspace == "worktree":
         cleaned, cleanup = remove_tree(spec, stage, workdir)
 
-    now = _now_sec(int(clock()))
     payload: dict[str, Any] = {
         "run_id": run_id,
         "stage": stage_id,
@@ -1148,6 +1173,7 @@ def run_stage(
             "cleaned": cleaned,
             "cleanup": cleanup or None,
             "stderr_path": str(stderr_file) if stderr_file is not None else None,
+            "verdict": verdict.as_payload() if verdict is not None else None,
         },
     }
     if result is not None:
@@ -1184,6 +1210,7 @@ def run_stage(
         "usage_tokens": followed.usage,
         "tools": followed.tools,
         "question_id": question_id,
+        "verdict": verdict.as_payload() if verdict is not None else None,
     }
 
 

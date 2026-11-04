@@ -6,6 +6,7 @@
     bin/duty attempts <board> <id>
     bin/duty stats [--board B] [--since D]
     bin/duty why <board> <id>
+    bin/duty why <board> <id> <этап>   (плюс приговор последней попытки этапа)
     bin/duty watch [--interval 10]
     bin/duty demo [--keep]
     bin/duty spec check <file>   (OK либо file:line: правило: текст; --json — та же форма)

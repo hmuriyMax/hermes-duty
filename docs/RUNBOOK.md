@@ -170,6 +170,7 @@ HERMES_HOME=~/.hermes bin/duty now
 | `bin/duty now [--board B] [--state S]` | таблица активных дел: доска, `id`, состояние (у `wait_human` — с `/human_kind`), ожидание, возраст, доказательство |
 | `bin/duty deal <board> <id>` | карточка дела: факты и таймлайн попыток |
 | `bin/duty why <board> <id>` | доказательство `waiting.evidence` и факты, из которых оно собрано |
+| `bin/duty why <board> <id> <этап>` | то же плюс приговор последней попытки этапа: исход, класс отказа, причина и первые `details` гейта |
 | `bin/duty attempts <board> <id>` | только таймлайн попыток |
 | `bin/duty stats [--board B] [--since D]` | p50/p90/p99 ожидания, исходы ранов, доля с первой попытки, таблица по доскам |
 | `bin/duty watch [--interval 10]` | тот же `now`, перерисовка в терминале |
@@ -263,6 +264,23 @@ PY
 `waiting.state`, доказательство и факты, из которых оно собрано; `--json` у той же
 команды отдаёт ответ роута целиком.
 
+Почему этап не закрылся — `bin/duty why <board> <id> <этап>`: последняя попытка этапа
+(`attempt_started`/`attempt_ended` из `duty/duty.db`), исход, класс отказа
+(`infra`/`contract`/`capability`) и первые `details` evidence-гейта. Например:
+
+```
+последняя попытка этапа impl:
+  попытка #2 · старт 04.11 13:40 · финиш 04.11 13:47 · outcome=failed · kind=contract
+  каталог попытки: ~/.hermes/kanban/boards/duty/workspaces/d_1a2b-impl-2
+  причина: result.json:evidence[0].exit: evidence.exit: exit=1, а объявлен must=0 · …
+  отказы гейта (2):
+    - result.json:evidence[0].exit: evidence.exit: exit=1, а объявлен must=0
+    - result.json:artifacts[0].sha256: artifact.sha256: sha256 в отчёте 9f2c…, в дереве 4b71…
+```
+
+`--json` с этапом отдаёт форму роута плюс ключ `verdict` (сам ответ роута не
+переписывается). Правила гейта — `docs/JOURNAL.md`, раздел «Evidence-гейт».
+
 ## 6. Прогнать pytest
 
 ```bash
@@ -308,13 +326,16 @@ pid), повторный ingest → `0` новых строк и тот же `fo
   десктопный плагин на день выпал из приложения. Красная проба: вернуть запятую — тест
   падает.
 
-Кейсы движка 0.0.4 — `tests/test_runner.py` (32 кейса, модель не вызывается: спавн
+Кейсы движка 0.0.4 — `tests/test_runner.py` (34 кейса, модель не вызывается: спавн
 подменён фейком, который пишет заданный поток и `result.json`): лизинг не берётся
 дважды и забирается после срока, worktree создаётся живым git и убирается у упавшей
 попытки, контракт несёт отчёты предшественников и `answer_this_attempt`, таймаут →
 `infra`, отсутствие отчёта → `contract`, `blocked` → вопрос в пуле и `wait_human`,
-телеметрия по каждому `tool_use`, сбой store откатывает `attempt_started` целиком.
-Спека — `tests/test_spec.py` (61 кейс, по тесту на правило отказа).
+телеметрия по каждому `tool_use`, сбой store откатывает `attempt_started` целиком,
+гейт не принимает голое «готово» и ставит `capability` на перерасход из отчёта.
+Спека — `tests/test_spec.py` (61 кейс, по тесту на правило отказа), гейт —
+`tests/test_evidence.py` (30 кейсов: по тесту на каждое правило отказа плюс happy
+path без коммита и с коммитом).
 
 `python3 -m pytest` из системы падает с `No module named pytest` — это окружение,
 а не плагин: нужен venv, где `fastapi` и `pytest` стоят.
@@ -404,11 +425,21 @@ curl -s http://127.0.0.1:18742/api/plugins/hermes-duty/sources \
   `budget.minutes` или 30 минут. Смотреть: `SELECT * FROM leases`;
 - **факты в журнале**: `attempt_started` (pid, фактическая команда, весь контракт),
   `attempt_progress` (по каждому `tool_use`/`tool_result`), `attempt_ended`
-  (`outcome`, `kind`, `reason`, `details`, `result`).
+  (`outcome`, `kind`, `reason`, `details`, `verdict`, `result`).
 
 Почему в журнале видно «что делается прямо сейчас»: прогресс пишется по ходу
 потока, а `fold` копит его счётчиком `progress: {tools, last_tool, last_at}`.
 `ps` и хвосты логов для этого не нужны.
+
+### «Готово» проверяется до записи факта
+
+После смерти процесса и до `attempt_ended` движок зовёт гейт
+(`dashboard/evidence.py`): сверяет `result.json` с деревом попытки — хеши файлов,
+резолв коммита, коды и свежесть объявленных команд, бюджет. Только принятый пакет
+даёт `outcome=done`; иначе тот же `attempt_ended` пишется с `outcome=failed`,
+`kind` из вердикта и первыми тремя отказами в `reason`. Схема отчёта лежит в
+контракте (`report_schema`), так что исполнитель видит требования до работы.
+Разбор отказа: `bin/duty why <board> <id> <этап>`.
 
 ### Продолжение после вопроса: выбран резюм (`RESUME-OK`)
 
@@ -436,7 +467,11 @@ curl -s http://127.0.0.1:18742/api/plugins/hermes-duty/sources \
 - заменить `contract` в событии `attempt_started` на путь — падает
   `test_started_event_records_the_real_command`;
 - снять уборку дерева у упавшей попытки — падает
-  `test_worktree_removed_when_attempt_failed`.
+  `test_worktree_removed_when_attempt_failed`;
+- отключить гейт в `run_stage` — падают
+  `test_gate_refuses_bare_done_and_puts_the_issue_into_the_reason` и
+  `test_done_without_evidence_cannot_close_the_stage_this_is_the_p3_gate`
+  (второй — прямой тезис фазы P3).
 
 ## 11. Что делать не нужно
 

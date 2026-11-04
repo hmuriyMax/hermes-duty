@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import sqlite3
@@ -164,6 +165,11 @@ class Fake:
     Адрес отчёта берётся из контракта — того самого файла, что движок передал
     ключом `--query-file`: так тест проверяет контракт на диске до спавна, а не
     только в памяти.
+
+    `pack=True` — исполнитель следует контракту: кладёт в рабочий каталог файл
+    `notes.txt` и дописывает к отчёту пакет (артефакт с настоящим `sha256` и
+    записи evidence по объявленным командам с кодом `must`). Без пакета отчёт
+    проходит только у этапов, где заявлять нечего.
     """
 
     def __init__(
@@ -175,6 +181,7 @@ class Fake:
         hang: bool = False,
         pid: int = 4242,
         broken_result: bool = False,
+        pack: bool = False,
     ) -> None:
         self.lines = [json.dumps(line, ensure_ascii=False) + "\n" for line in (lines or [])]
         self.result = result
@@ -182,6 +189,7 @@ class Fake:
         self.hang = hang
         self.pid = pid
         self.broken_result = broken_result
+        self.pack = pack
         self.calls: list[dict[str, Any]] = []
         self.stopped = 0
         self.exit = None if hang else exit_code
@@ -190,10 +198,10 @@ class Fake:
     # --- то, что нужно `runner.follow`
     def __call__(self, cmd: list[str], cwd: Path, env: Any = None) -> "Fake":
         self.calls.append({"cmd": list(cmd), "cwd": Path(cwd)})
-        self._report(Path(cmd[list(cmd).index("--query-file") + 1]))
+        self._report(Path(cmd[list(cmd).index("--query-file") + 1]), Path(cwd))
         return self
 
-    def _report(self, query_file: Path) -> None:
+    def _report(self, query_file: Path, cwd: Path) -> None:
         target = query_file.parent / "result.json"
         try:
             contract = json.loads(query_file.read_text(encoding="utf-8"))
@@ -207,8 +215,32 @@ class Fake:
             return
         if self.result is None:
             return
+        report = self._packed(contract, cwd) if self.pack else self.result
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(self.result, ensure_ascii=False), encoding="utf-8")
+        target.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+
+    def _packed(self, contract: Any, cwd: Path) -> dict[str, Any]:
+        """Отчёт вместе с пакетом: артефакт в дереве и записи объявленных команд.
+
+        Хеш считается по настоящему файлу — тест проверяет гейт на тех же
+        правилах, что и живая попытка, а не на подставленном «совпало».
+        """
+        report = dict(self.result or {})
+        notes = cwd / "notes.txt"
+        notes.write_text("приговор: changes\n", encoding="utf-8")
+        digest = hashlib.sha256(notes.read_bytes()).hexdigest()
+        report.setdefault("artifacts", [{"path": notes.name, "sha256": digest}])
+        declared = contract.get("evidence_to_produce") if isinstance(contract, dict) else None
+        report.setdefault(
+            "evidence",
+            [
+                {"cmd": str(item.get("cmd")), "exit": int(item.get("must", 0)), "started_at": NOW}
+                for item in (declared or [])
+                if isinstance(item, dict)
+            ],
+        )
+        report.setdefault("summary", "готово")
+        return report
 
     def next_line(self, timeout: float = 0.0) -> Optional[str]:
         if self.lines:
@@ -502,7 +534,7 @@ def test_worktree_created_and_kept_on_success(tmp_path: Path) -> None:
     deal = make_deal(conn)
     repo = git_repo(tmp_path)
     spec = worktree_spec(tmp_path, repo)
-    fake = Fake(result={"status": "done", "summary": "готово"})
+    fake = Fake(result={"status": "done", "summary": "готово"}, pack=True)
     report = run(conn, spec, deal, home, fake)
 
     tree = runner.attempt_dir(home, deal, "impl", 1) / "tree"
@@ -641,19 +673,91 @@ def test_exit_code_without_result_is_infra(tmp_path: Path) -> None:
 
 
 def test_result_finished_is_done_with_payload(tmp_path: Path) -> None:
-    """Разобранный `result.json` — конец попытки: `done` плюс `payload.result`."""
+    """Принятый пакет — конец попытки: `done` плюс `payload.result` и вердикт гейта."""
     home = make_home(tmp_path)
     conn = open_store(home)
     deal = make_deal(conn)
     spec = none_spec(tmp_path)
-    result = {"status": "done", "summary": "приговор: changes", "artifacts": ["/tmp/a.txt"]}
-    fake = Fake(result=result, exit_code=0)
+    fake = Fake(result={"status": "done", "summary": "приговор: changes"}, pack=True)
     report = run(conn, spec, deal, home, fake)
     assert (report["outcome"], report["kind"]) == ("done", None)
+    assert report["verdict"]["ok"] is True
     ended = only(conn, deal, "attempt_ended")
-    assert ended["payload"]["result"] == result
+    assert ended["payload"]["result"]["status"] == "done"
+    assert ended["payload"]["result"]["artifacts"][0]["path"] == "notes.txt"
     assert ended["payload"]["details"]["exit_code"] == 0
+    assert ended["payload"]["details"]["verdict"]["ok"] is True
     assert report["question_id"] is None
+
+
+def test_gate_refuses_bare_done_and_puts_the_issue_into_the_reason(tmp_path: Path) -> None:
+    """«Готово» без пакета этап не закрывает: `failed(contract)` с `file:line` в причине."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = write_spec(
+        tmp_path,
+        """
+        duty: probe
+        stages:
+          - id: impl
+            role: implementer
+            evidence:
+              - {cmd: "go test ./...", must: 0}
+        """,
+    )
+    report = run(conn, spec, deal, home, Fake(result={"status": "done", "summary": "готово"}))
+
+    assert (report["outcome"], report["kind"]) == ("failed", "contract")
+    assert report["verdict"]["ok"] is False
+    ended = only(conn, deal, "attempt_ended")
+    assert ended["payload"]["outcome"] == "failed"
+    assert ended["payload"]["kind"] == "contract"
+    assert ended["payload"]["reason"] == report["reason"]
+    assert "result.json:" in report["reason"], "отказ обязан называть точку в отчёте"
+    assert ended["payload"]["details"]["verdict"]["details"]
+    # События «попытка закрыта done» не появилось: гейт стоит до записи факта.
+    assert ended["payload"]["outcome"] != "done"
+
+
+def test_gate_budget_overrun_in_the_report_is_capability(tmp_path: Path) -> None:
+    """Пакет сходится, но отчёт сам говорит о перерасходе — `failed(capability)`."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = write_spec(
+        tmp_path,
+        """
+        duty: probe
+        stages:
+          - id: impl
+            role: implementer
+            budget: {tokens: 1000}
+        """,
+    )
+    fake = Fake(result={"status": "done", "usage": {"total_tokens": 5000}}, pack=True)
+    report = run(conn, spec, deal, home, fake)
+
+    assert (report["outcome"], report["kind"]) == ("failed", "capability")
+    assert report["verdict"]["kind"] == "capability"
+    ended = only(conn, deal, "attempt_ended")
+    assert "budget.tokens" in ended["payload"]["reason"]
+
+
+def test_gate_refusal_removes_the_failed_worktree(tmp_path: Path) -> None:
+    """Отказ гейта — упавшая попытка: дерево убирается, путь и причина в событии."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    repo = git_repo(tmp_path)
+    spec = worktree_spec(tmp_path, repo)
+    report = run(conn, spec, deal, home, Fake(result={"status": "done", "summary": "готово"}))
+
+    tree = runner.attempt_dir(home, deal, "impl", 1) / "tree"
+    assert (report["outcome"], report["kind"]) == ("failed", "contract")
+    assert not tree.exists()
+    ended = only(conn, deal, "attempt_ended")
+    assert ended["payload"]["details"]["cleaned"] is True
 
 
 def test_broken_result_is_contract(tmp_path: Path) -> None:
@@ -952,7 +1056,7 @@ def test_step_and_transit_agree_on_what_happened(tmp_path: Path) -> None:
     spec = none_spec(tmp_path)
 
     done_deal = make_deal(conn, title="пройдёт")
-    run(conn, spec, done_deal, home, Fake(result={"status": "done"}))
+    run(conn, spec, done_deal, home, Fake(result={"status": "done"}, pack=True))
     assert transit.next_stage(spec, events(conn, done_deal), NOW).kind == "done"
 
     parked_deal = make_deal(conn, title="спросит")
@@ -989,11 +1093,15 @@ def _decision(kind: str, **fields: Any) -> Any:
 
 @pytest.mark.live
 def test_live_trivial_stage(tmp_path: Path) -> None:
-    """Живой прогон одного тривиального этапа (`workspace: none`).
+    """Живой прогон одного тривиального этапа (`workspace: none`) через гейт.
 
     Включается руками: `pytest -m live`. Поднимает настоящий `hermes chat` под
     профилем `tester`, поэтому в обычном прогоне пропущен: он проверяет связку
-    «движок → процесс → поток → событие», а не логику шага.
+    «движок → процесс → поток → событие → гейт», а не логику шага.
+
+    Исход зависит от исполнителя, и это честно: если модель предъявила пакет —
+    `done`; если отписалась словом «ок» без артефактов и evidence — гейт P3 её не
+    принимает, и попытка закрывается `failed(contract)` с отказом в причине.
     """
     home = make_home(tmp_path)
     conn = open_store(home)
@@ -1011,9 +1119,13 @@ def test_live_trivial_stage(tmp_path: Path) -> None:
     )
     started = time.monotonic()
     report = runner.run_stage(conn, spec, deal, "impl", 1, home=home)
-    assert report["outcome"] == "done", report
+    assert report["outcome"] in (runner.OUTCOME_DONE, runner.OUTCOME_FAILED), report
     assert report["session_id"].startswith("local-")
     assert time.monotonic() - started < 120
     ended = only(conn, deal, "attempt_ended")
     assert ended["payload"]["result"]["status"] in runner.OK_STATUSES
     assert ended["payload"]["details"]["usage_tokens"]
+    if report["outcome"] == runner.OUTCOME_FAILED:
+        assert report["kind"] == runner.FAIL_CONTRACT
+        assert report["verdict"] and report["verdict"]["ok"] is False
+

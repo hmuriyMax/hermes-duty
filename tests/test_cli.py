@@ -416,6 +416,96 @@ def test_why_prints_backend_evidence_verbatim(home, frozen_now, capsys):
     assert "факты, из которых оно собрано:" in out
 
 
+def seed_attempt(home: Path, *, deal_id: str = "t_aaa001", stage: str = "impl", attempt: int = 1) -> None:
+    """Факты попытки в журнал плагина: `why <этап>` читает именно их."""
+    journal = cli._load_journal()
+    conn = journal.open_journal(home)
+    assert conn is not None
+    base = {
+        "deal_id": deal_id,
+        "board": "b1",
+        "source": "engine",
+    }
+    event = {
+        **base,
+        "ts": NOW - 600,
+        "recorded_at": NOW - 600,
+        "kind": "attempt_started",
+        "payload": {"stage": stage, "attempt": attempt, "pid": 999, "run_id": f"{stage}#{attempt}"},
+        "idempotency_key": f"test:{deal_id}:{stage}:{attempt}:started",
+    }
+    journal.append(conn, [event])
+    ended = {
+        **base,
+        "ts": NOW - 540,
+        "recorded_at": NOW - 540,
+        "kind": "attempt_ended",
+        "payload": {
+            "stage": stage,
+            "attempt": attempt,
+            "run_id": f"{stage}#{attempt}",
+            "outcome": "failed",
+            "kind": "contract",
+            "reason": "result.json:evidence[0].exit: evidence.exit: exit=1, а объявлен must=0",
+            "details": {
+                "workdir": str(home / "kanban" / "boards" / "b1" / "workspaces" / f"{deal_id}-{stage}-{attempt}"),
+                "verdict": {
+                    "ok": False,
+                    "kind": "contract",
+                    "details": [
+                        "result.json:evidence[0].exit: evidence.exit: exit=1, а объявлен must=0",
+                        "result.json:artifacts[0].sha256: artifact.sha256: хеш не тот",
+                    ],
+                },
+            },
+        },
+        "idempotency_key": f"test:{deal_id}:{stage}:{attempt}:ended",
+    }
+    journal.append(conn, [ended])
+    conn.close()
+
+
+def test_why_with_stage_prints_last_attempt_and_verdict(home, frozen_now, capsys):
+    seed_attempt(home)
+    code, out, _ = run(["why", "b1", "t_aaa001", "impl"], capsys)
+
+    assert code == 0
+    assert "последняя попытка этапа impl:" in out
+    assert "попытка #1" in out
+    assert "outcome=failed" in out and "kind=contract" in out
+    assert "причина: result.json:evidence[0].exit" in out
+    assert "отказы гейта (2):" in out
+    assert "evidence.exit" in out and "artifact.sha256" in out
+
+
+def test_why_with_stage_reports_the_last_one_when_there_were_many(home, frozen_now, capsys):
+    seed_attempt(home, attempt=1)
+    seed_attempt(home, attempt=2)
+    code, out, _ = run(["why", "b1", "t_aaa001", "impl"], capsys)
+    assert code == 0
+    assert "попытка #2" in out
+
+
+def test_why_with_stage_says_when_attempts_are_missing(home, frozen_now, capsys):
+    code, out, _ = run(["why", "b1", "t_aaa001", "impl"], capsys)
+    assert code == 0
+    assert "последняя попытка этапа impl:" in out
+    assert "журнала ещё нет" in out
+
+
+def test_why_json_with_stage_adds_verdict_without_touching_the_route_form(home, client, frozen_now, capsys):
+    seed_attempt(home)
+    code, out, _ = run(["why", "b1", "t_aaa001", "impl", "--json"], capsys)
+    payload = json.loads(out)
+
+    assert code == 0
+    route = client.get("/deal/b1/t_aaa001").json()
+    assert {key: value for key, value in payload.items() if key != "verdict"} == route
+    assert payload["verdict"]["attempt"] == 1
+    assert payload["verdict"]["kind"] == "contract"
+    assert len(payload["verdict"]["details"]) == 2
+
+
 def test_stats_prints_percentiles_and_first_try(home, frozen_now, capsys):
     make_board(
         home / "kanban" / "boards" / "b1" / "kanban.db",

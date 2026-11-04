@@ -53,7 +53,7 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 | `lease_lost` | лизинг исчез без завершения | `previous_expires` |
 | `attempt_started` | открылся ран в `task_runs` (движок: попытка заспавнена) | `run_id`, `pid`, `stage`, `attempt`, `cmd`, `cwd`, `workdir`, `tree`, `lease_expires`, `contract` — фактическая команда и вход целиком |
 | `attempt_progress` | шаг попытки движка: вызов инструмента или его результат (телеметрия, состояние дела не меняет) | `stage`, `attempt`, `seq`, `phase` (`tool_use`/`tool_result`), `name`, `duration_ms` (только у результата), `ts` |
-| `attempt_ended` | ран закрыт (движок: попытка отчиталась, не отчиталась или упала) | `run_id`, `stage`, `attempt`, `outcome` (`done`/`failed`), `kind` (`infra`/`contract`/`capability`/`null`), `reason`, `details`, `result` (если отчёт разобран) |
+| `attempt_ended` | ран закрыт (движок: попытка отчиталась, не отчиталась или упала; `done` — только при принятом evidence-пакете) | `run_id`, `stage`, `attempt`, `outcome` (`done`/`failed`), `kind` (`infra`/`contract`/`capability`/`null`), `reason`, `details` (в том числе `verdict`: вердикт гейта с `details`), `result` (если отчёт разобран) |
 | `blocked` | `status=blocked` | `block_kind`, `reason` |
 | `unblocked` | был `blocked`, стал иной статус | `previous_kind` |
 | `completed` | `status=done` (или `archived` как отдельный факт: переносится тем же `completed` со `status="archived"`) | `status` |
@@ -269,6 +269,41 @@ fold (14), а не второй вид на каждое событие попы
 факт из пула, а не из журнала («в журнале вопроса нет»). Это не вторая правда о
 состоянии, а честно подписанный источник факта — иначе вопрос без ответа выглядел бы
 как «человеку ничего не нужно».
+
+## Evidence-гейт (0.0.4, `dashboard/evidence.py`)
+
+`attempt_ended` с `outcome=done` пишется **только** когда пакет попытки принят:
+движок зовёт `evidence.verify(result, stage, workdir, attempt_started_at, now)`
+после смерти процесса и **до** записи факта. Отказ гейта — тот же
+`attempt_ended`, но `outcome=failed` и `kind` из вердикта; первые три отказа
+лежат в `reason`, полный список — в `details.verdict.details`. Второго вида
+события на это нет: «попытка не принята» — свойство того же конца попытки.
+
+Слой ничего не запускает (команды из `evidence` уже выполнил исполнитель), в сеть
+не ходит и тексту `summary` не верит. Порядок проверок — от «что заявлено» к
+«чем подтверждено»:
+
+| шаг | что сверяется | правило отказа | класс |
+|---|---|---|---|
+| 1 | `status` ∈ {`done`, `blocked`, `refused`}; для `done` есть `commit`\|`artifacts`, `evidence`, `summary`; лишнее поле — предупреждение | `status`, `required`, `extra` | `contract` |
+| 2 | артефакт: относительный путь внутри дерева попытки, файл есть, `sha256` полный и совпадает | `artifact.path`, `artifact.missing`, `artifact.sha256` | `contract` |
+| 3 | `git rev-parse --verify <commit>^{commit}` в дереве; коммит не предок базы (предок = «принёс чужое готовое») | `commit.resolve`, `commit.foreign`; `commit.base` — предупреждение, если база не резолвится | `contract` |
+| 4 | по каждой `{cmd, must}` из `stage.evidence` есть запись с тем же `cmd`, `exit == must` и `started_at` ≥ начала попытки (и не позже «сейчас») | `evidence.missing`, `evidence.exit`, `evidence.stale`, `evidence.future` | `contract` |
+| 5 | `cmd` совпадает со спекой посимвольно после нормализации пробелов: «почти та же команда» | `evidence.substituted` | `contract` |
+| 6 | `usage.total_tokens` больше `stage.budget.tokens` — работа сделана, но за рамками | `budget.tokens` | `capability` |
+
+Классы: `contract` для шагов 1–5, `capability` для 6. `infra` гейт не выдаёт
+никогда — «процесс не дожил» остаётся фактом движка (таймаут, код выхода,
+отсутствие отчёта). Если пакет не сходится **и** бюджет превышен, класс —
+`contract`: подлог в отчёте важнее рамок.
+
+Схема отчёта уходит исполнителю в файл контракта (`report_schema` в
+`attempt_started.contract`): гейт, о правилах которого узнают только из отказа, —
+не контракт, а ловушка.
+
+Что гейт **не** делает: не запускает объявленные команды повторно, не считает
+дело закрытым (`fold` читает факт), не ставит ретраи — это `transit`/`failures`
+по классу из `attempt_ended.kind`.
 
 ## Инварианты (проверяются тестами)
 

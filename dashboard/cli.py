@@ -5,6 +5,7 @@
     duty attempts <board> <id>            только таймлайн попыток
     duty stats [--board B] [--since D]    p50/p90/p99, исходы, «с первой попытки»
     duty why <board> <id>                 доказательство словами бэкенда
+    duty why <board> <id> <этап>          то же плюс приговор последней попытки этапа
     duty watch [--interval 10]            тот же `now`, перерисовка в терминале
     duty spec check <file>                спека дела до запуска: OK или file:line: правило: текст
     --json (глобальный флаг)              машиночитаемый вывод: ровно форма роута
@@ -45,6 +46,10 @@ EXIT_OK = 0
 EXIT_NOT_FOUND = 1
 EXIT_SOURCE = 2
 
+# Сколько отказов гейта печатает `duty why` в человеческом выводе: полный список
+# лежит в событии и в `--json`, в терминале нужны первые.
+VERDICT_DETAILS = 5
+
 # Метка «я уже перезапускался»: без неё неудачный поиск интерпретатора дал бы
 # бесконечную цепочку `execv`.
 REEXEC_MARK = "DUTY_CLI_REEXEC"
@@ -83,6 +88,8 @@ def _load_plugin_api() -> Any:
 DEMO_MODULE_NAME = "hermes_duty_demo"
 # Имя модуля спеки: рядом с demo — `dashboard/` грузится по пути, не пакетом.
 SPEC_MODULE_NAME = "hermes_duty_spec"
+# Журнал: `why <доска> <id> <этап>` читает те же события, что и движок.
+JOURNAL_MODULE_NAME = "hermes_duty_journal"
 
 
 def _load_demo() -> Any:
@@ -115,6 +122,26 @@ def _load_spec() -> Any:
         raise SourceFailure(f"spec module not found: {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[SPEC_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_journal() -> Any:
+    """Загрузить `dashboard/journal.py` — те же события, что читает движок.
+
+    `duty why <доска> <id> <этап>` показывает приговор последней попытки по
+    журналу плагина, а не по своим представлениям о нём: второго чтения тех же
+    фактов в терминале быть не должно.
+    """
+    loaded = sys.modules.get(JOURNAL_MODULE_NAME)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / "journal.py"
+    spec = importlib.util.spec_from_file_location(JOURNAL_MODULE_NAME, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise SourceFailure(f"journal module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[JOURNAL_MODULE_NAME] = module
     spec.loader.exec_module(module)
     return module
 
@@ -273,9 +300,14 @@ def build_parser() -> argparse.ArgumentParser:
     stats.add_argument("--board", help="только одна доска (slug)")
     stats.add_argument("--since", type=since_arg, help="окно по created_at: unix, YYYY-MM-DD или YYYY-MM-DDTHH:MM")
 
-    why = command("why", "доказательство словами бэкенда")
+    why = command("why", "доказательство словами бэкенда; с этапом — приговор его последней попытки")
     why.add_argument("board")
     why.add_argument("task_id")
+    why.add_argument(
+        "stage",
+        nargs="?",
+        help="этап дела: печатает последнюю попытку, класс отказа и первые details",
+    )
 
     watch = command("watch", "тот же now, перерисовка в терминале")
     watch.add_argument("--interval", type=float, default=10.0, help="секунд между тиками (по умолчанию 10)")
@@ -754,7 +786,11 @@ def _fact_lines(shaped: dict[str, Any], now: Any) -> list[str]:
 
 
 def render_why(payload: dict[str, Any]) -> str:
-    """Доказательство словами бэкенда: тот же `waiting.evidence`, что на экране «Почему стоит»."""
+    """Доказательство словами бэкенда: тот же `waiting.evidence`, что на экране «Почему стоит».
+
+    Если этап назван (`duty why <доска> <id> <этап>`), ниже печатается приговор
+    его последней попытки — из журнала, тем же вердиктом, что записал движок.
+    """
     lines = [
         "ПОЧЕМУ СТОИТ {}/{} · {} · {}".format(
             payload.get("board"),
@@ -768,11 +804,15 @@ def render_why(payload: dict[str, Any]) -> str:
     shaped = payload.get("deal")
     if shaped is None:
         lines.append("доказательство: не записано — роут /deal не вернул фактов ожидания")
-        return "\n".join(lines)
-    lines.append("доказательство (словами бэкенда):")
-    lines.append(f"  {(shaped.get('waiting') or {}).get('evidence') or 'не записано'}")
-    lines.append("факты, из которых оно собрано:")
-    lines.extend(_fact_lines(shaped, payload.get("now")))
+    else:
+        lines.append("доказательство (словами бэкенда):")
+        lines.append(f"  {(shaped.get('waiting') or {}).get('evidence') or 'не записано'}")
+        lines.append("факты, из которых оно собрано:")
+        lines.extend(_fact_lines(shaped, payload.get("now")))
+    verdict = payload.get("verdict")
+    if isinstance(verdict, dict):
+        lines.append("")
+        lines.append(render_stage_verdict(verdict))
     return "\n".join(lines)
 
 
@@ -980,6 +1020,124 @@ def spec_exit_code(payload: dict[str, Any]) -> int:
     return EXIT_OK if payload.get("ok") else EXIT_NOT_FOUND
 
 
+# ------------------------------------------------- приговор последней попытки
+
+
+def stage_verdict(home: Path, deal_id: str, stage: str) -> dict[str, Any]:
+    """Последняя попытка этапа: исход, класс отказа, причина и первые details.
+
+    Читается ровно журнал (`dashboard/journal.py`): `attempt_started` даёт номер
+    попытки и её начало, `attempt_ended` — исход, класс и вердикт evidence-гейта
+    (`details.verdict`). Ничего не пересчитывается: «почему этап стоит» должно
+    отвечаться тем же фактом, что видит движок.
+
+    Нет попыток этапа в журнале — это ответ, а не ошибка: дело могло ещё не
+    дойти до этапа, и `note` говорит, чего именно нет.
+    """
+    journal = _load_journal()
+    payload: dict[str, Any] = {
+        "stage": stage,
+        "found": False,
+        "attempt": None,
+        "started_at": None,
+        "ended_at": None,
+        "outcome": None,
+        "kind": None,
+        "reason": "",
+        "details": [],
+        "workdir": None,
+        "note": "",
+    }
+    home = Path(home)
+    conn = journal.open_journal(home, create=False)
+    if conn is None:
+        payload["note"] = f"журнала ещё нет: {journal.journal_path(home)}"
+        return payload
+    try:
+        events = journal.read_events(conn, str(deal_id))
+    finally:
+        conn.close()
+
+    starts: dict[int, dict[str, Any]] = {}
+    ends: dict[int, dict[str, Any]] = {}
+    for event in events:
+        item = journal.payload_of(event)
+        if str(item.get("stage") or "") != stage:
+            continue
+        number = item.get("attempt")
+        if isinstance(number, bool) or not isinstance(number, (int, str)):
+            continue
+        try:
+            attempt = int(number)
+        except (TypeError, ValueError):
+            continue
+        kind = str(event.get("kind") or "")
+        if kind == "attempt_started":
+            starts[attempt] = item
+        elif kind == "attempt_ended":
+            # `ts` берётся из журнала: время закрытия попытки — факт, а не часы CLI.
+            ends[attempt] = {**item, "ts": event.get("ts")}
+
+    if not starts and not ends:
+        payload["note"] = f"в журнале нет попыток этапа {stage} у дела {deal_id}"
+        return payload
+
+    attempt = max(set(starts) | set(ends))
+    started = starts.get(attempt) or {}
+    ended = ends.get(attempt) or {}
+    details = ended.get("details")
+    verdict = details.get("verdict") if isinstance(details, dict) else None
+    issues: list[str] = []
+    if isinstance(verdict, dict) and isinstance(verdict.get("details"), list):
+        issues = [str(item) for item in verdict["details"]]
+    kind = ended.get("kind")
+    payload.update(
+        {
+            "found": True,
+            "attempt": attempt,
+            "started_at": started.get("ts"),
+            "ended_at": ended.get("ts"),
+            "outcome": ended.get("outcome"),
+            "kind": kind if isinstance(kind, str) and kind else None,
+            "reason": str(ended.get("reason") or ""),
+            "details": issues,
+            "workdir": (details.get("workdir") if isinstance(details, dict) else None),
+            "note": "" if ended else "попытка не закрыта: `attempt_ended` ещё нет",
+        }
+    )
+    return payload
+
+
+def render_stage_verdict(payload: dict[str, Any]) -> str:
+    """Приговор последней попытки словами: попытка, исход, класс, первые details."""
+    stage = payload.get("stage")
+    lines = [f"последняя попытка этапа {stage}:"]
+    if not payload.get("found"):
+        lines.append(f"  {payload.get('note') or 'попыток не было'}")
+        return "\n".join(lines)
+    kind = payload.get("kind") or "—"
+    lines.append(
+        "  попытка #{} · старт {} · финиш {} · outcome={} · kind={}".format(
+            payload.get("attempt"),
+            _fmt_stamp(payload.get("started_at")),
+            _fmt_stamp(payload.get("ended_at")),
+            payload.get("outcome") or "—",
+            kind,
+        )
+    )
+    if payload.get("note"):
+        lines.append(f"  {payload['note']}")
+    if payload.get("workdir"):
+        lines.append(f"  каталог попытки: {payload['workdir']}")
+    if payload.get("reason"):
+        lines.append(f"  причина: {payload['reason']}")
+    details = payload.get("details") or []
+    if details:
+        lines.append(f"  отказы гейта ({len(details)}):")
+        lines.extend(f"    - {item}" for item in details[:VERDICT_DETAILS])
+    return "\n".join(lines)
+
+
 # ------------------------------------------------------------------------ main
 
 
@@ -1031,6 +1189,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             return _payload_code(payload)
         if args.command == "why":
             payload = _route(api().deal, args.board, args.task_id)
+            if args.stage:
+                # Приговор берётся из журнала плагина: тот же факт, что видит движок,
+                # плюс к форме роута — отдельным ключом `verdict`, чтобы `--json`
+                # оставался дословным ответом роута.
+                payload = {**payload, "verdict": stage_verdict(api().hermes_home(), args.task_id, args.stage)}
             _emit_json(payload, out) if args.json else print(render_why(payload), file=out)
             return _payload_code(payload)
         if args.command == "deal":

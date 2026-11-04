@@ -440,6 +440,7 @@ duty deal <board> <id>                 карточка дела: факты п�
 duty attempts <board> <id>             только таймлайн попыток
 duty stats [--board B] [--since D]     p50/p90/p99, исходы, «с первой попытки»
 duty why <board> <id>                  доказательство словами бэкенда
+duty why <board> <id> <этап>           плюс приговор последней попытки этапа
 duty watch [--interval 10]             тот же now, перерисовка в терминале
 duty demo [--home DIR] [--keep]        прогон дела по спеке на песочном корне
 duty create|comment|block|unblock|claim|complete|review|changes|attach|archive …

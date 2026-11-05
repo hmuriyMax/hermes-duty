@@ -257,6 +257,22 @@ def test_known_profiles_reads_directory_once(tmp_path: Path):
     assert spec_module.known_profiles(tmp_path) == frozenset({"default", "tester", "implementer"})
 
 
+def test_known_profiles_honours_hermes_home(tmp_path: Path, monkeypatch):
+    """Корень профилей берётся из `HERMES_HOME`: на Windows home он вне `~`."""
+    (tmp_path / "profiles" / "implementer").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(spec_module, "_profiles_cache", None)
+    assert spec_module.profiles_dir() == tmp_path / "profiles"
+    assert "implementer" in spec_module.known_profiles()
+
+
+def test_known_profiles_without_hermes_home_uses_home_dir(tmp_path: Path, monkeypatch):
+    """Без `HERMES_HOME` остаётся прежний корень `~/.hermes/profiles`."""
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    assert spec_module.profiles_dir() == tmp_path / ".hermes" / "profiles"
+
+
 # ------------------------------------------------------------------- граф этапов
 
 

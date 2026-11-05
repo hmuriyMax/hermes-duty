@@ -32,6 +32,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -104,8 +105,19 @@ GIT_TIMEOUT_SEC = 10
 DEFAULT_TIMEOUT_SEC = MAX_TIMEOUT_SEC
 
 # Профили Hermes: снимок каталога читается один раз на процесс.
-PROFILES_DIR = Path.home() / ".hermes" / "profiles"
 IMPLICIT_PROFILES = ("default",)
+
+
+def profiles_dir() -> Path:
+    """Каталог профилей: `$HERMES_HOME/profiles`, иначе `~/.hermes/profiles`.
+
+    Корень берётся из `HERMES_HOME`, а не из домашней папки: на Windows home
+    Hermes живёт в `%LOCALAPPDATA%\\hermes`, и жёсткий `~/.hermes` давал валидатору
+    пустой снимок — спека с ролью `implementer` отказывала «профиля нет».
+    """
+    env = os.environ.get("HERMES_HOME")
+    root = Path(env).expanduser() if env else Path.home() / ".hermes"
+    return root / "profiles"
 
 ERROR = "error"
 WARNING = "warning"
@@ -820,7 +832,7 @@ def failure_class(name: str) -> str:
 
 
 def known_profiles(root: Optional[Path] = None) -> frozenset[str]:
-    """Профили Hermes: `~/.hermes/profiles/*` плюс `default`, снимок один раз на процесс.
+    """Профили Hermes: `$HERMES_HOME/profiles/*` плюс `default`, снимок один раз на процесс.
 
     `hermes profiles list` не вызывается: во-первых, это процесс на каждую
     проверку спеки, во-вторых, ответ CLI — не контракт каталога. Каталог и есть
@@ -829,7 +841,7 @@ def known_profiles(root: Optional[Path] = None) -> frozenset[str]:
     global _profiles_cache
     if root is None and _profiles_cache is not None:
         return _profiles_cache
-    base = Path(root) if root is not None else PROFILES_DIR
+    base = Path(root) if root is not None else profiles_dir()
     found: set[str] = set(IMPLICIT_PROFILES)
     try:
         found.update(item.name for item in base.iterdir() if item.is_dir() and not item.name.startswith("."))

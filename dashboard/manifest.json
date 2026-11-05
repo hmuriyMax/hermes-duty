@@ -3,6 +3,6 @@
   "label": "Дела",
   "description": "P0-наблюдаемость: лизинги, процессы и последнее действие по каждому делу. Только чтение.",
   "icon": "GitPullRequest",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "api": "plugin_api.py"
 }

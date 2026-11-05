@@ -295,6 +295,9 @@ def test_005_base_is_migrated_to_store_without_boards(home: Path) -> None:
         assert "boards" not in tables(conn)
         assert "board" not in columns(conn, "deals")
         assert "board" not in columns(conn, "events")
+        assert "deals_board" not in {
+            row[0] for row in conn.execute("select name from sqlite_master where type='index'")
+        }
         no_rebuild_leftovers(conn)
 
         # дело адресуется id, а группировка — repo: у старых дел он не выдуман

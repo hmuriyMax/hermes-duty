@@ -177,7 +177,7 @@ HERMES_HOME=~/.hermes bin/duty now --repo '' --state wait_human   # только
 | `bin/duty run <deal_id> [--once] [--max-steps N] [--spec F]` | довести своё дело: цикл «решение → шаг → перечитать журнал», коды `0/1/2/3/4/130` (раздел 11) |
 | `bin/duty spec check <file>` | спека до запуска: `OK` либо `file:line: правило: текст` |
 | `bin/duty reap [--dry-run]` | закрыть осиротевшие попытки своего store: `attempt_started` без `attempt_ended`, лизинг истёк и возраст больше `ttl + max(60 с, ttl/3)` → `attempt_ended` с `kind=infra`, `reaped: true`; лизинг умершей попытки отпускается. `--dry-run` ничего не пишет |
-| `bin/duty demo [--home DIR] [--keep]` | прогон дела по спеке на песочном корне: шаги учёта (create → claim → ask → answer → gate → comment/attach → ingest → complete → поздний ответ) и 7 проверок-инвариантов; живые БД только читаются |
+| `bin/duty demo [--home DIR] [--keep]` | прогон дела по спеке на песочном корне: шаги учёта (create → claim → ask → answer → gate → comment/attach → complete → поздний ответ) и 7 проверок-инвариантов; живые БД только читаются. Прохода `ingest` в нём нет с 0.0.6 |
 
 Идентификатор дела один: `d_<hex>` (0.0.6 — доски, которая делила id на два
 пространства, нет). Прежние `t_<hex>` из закладок делом не бывают: `duty deal t_…` и
@@ -309,9 +309,9 @@ cd ~/.hermes/plugins/hermes-duty
 Кейсы журнала 0.0.3 — `tests/test_journal.py`: схема по контракту (`events`,
 `UNIQUE(idempotency_key)`, индекс `(deal_id, id)`, WAL, `busy_timeout=2000`),
 `fold` без единой БД (инвариант 4), правила fold (включая `human_kind` и tri-state
-pid), повторный ingest → `0` новых строк и тот же `fold` (инвариант 3), `mtime`
-`kanban.db`/`state.db` не меняется (инвариант 1), `drift.empty_journal` падает
-после ingest, а `GET /now` без `?ingest=1` журнал не создаёт.
+pid), повторная запись того же события → `0` новых строк и тот же `fold` (инвариант 3),
+`mtime` `kanban.db`/`state.db` не меняется (инвариант 1), а `GET /now` журнал не создаёт
+(читающая ручка схему не доводит; прохода `?ingest=1` с 0.0.6 нет).
 
 Остальные поверхности 0.0.3 — отдельными файлами:
 
@@ -1300,9 +1300,9 @@ S2, S3, FIX-S4a и FIX-V; их отчёты называют имена упав
 - не звать `sync_answers` руками, чтобы «забрать» ответ человека: `bin/duty run` (и
   `--once`) дочитывает пул перед каждым решением сам, итог говорит числом
   «ответов пула дочитано: N», а сбой разбора — строкой `! ответы пула: …`
-  (`answers_errors` в `--json`). Второй вызов того же синка — проход ingest
-  (`POST /ingest`, `/now?ingest=1`); для движка он не нужен: `bin/duty run`
-  синкает сам;
+  (`answers_errors` в `--json`). Второго прохода у синка нет с 0.0.6: подбор событий
+  из kanban (`POST /ingest`, `/now?ingest=1`) снят вместе с досками — `bin/duty run`
+  синкает пул сам;
 - не закрывать запаркованное дело правкой `status` руками и не искать решение в
   тексте ответа: продолжение — `bin/duty decide <дело> continue`, остановка —
   `bin/duty decide <дело> stop`;

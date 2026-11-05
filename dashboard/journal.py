@@ -16,7 +16,8 @@
   Ни БД, ни файлов она не открывает. Внешние факты, без которых правила 4–5
   контракта не сформулировать, — часы и живость pid: это не чтение источников;
 - событие адресуется парой `deal_id` + `id`: доски в схеме журнала нет (0.0.6), а
-  поле `board` в payload старых событий остаётся историческим фактом.
+  значение доски у старых событий при пересборке переезжает в `payload.board` —
+  историческим фактом остаётся оно, а не колонка.
 """
 
 from __future__ import annotations
@@ -253,6 +254,23 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 # хоть один индекс или ограничение с этим именем, а строки обязаны сохраниться
 # вместе с `id` — порядок `id` и есть порядок применения фактов в `fold`.
 LEGACY_BOARD_FIELD = "board"
+
+# Куда переезжает значение снятой колонки: до 0.0.6 доска была **полем строки**, а
+# не ключом `payload`, поэтому при пересборке её нужно положить в payload — иначе
+# вместе с колонкой исчез бы сам факт, к какой доске относилось событие. Уже
+# записанный ключ не перезаписывается (payload — свидетельство, а не место для
+# догадок). Неразбираемый payload (и payload, который не объект) не выбрасывается:
+# он остаётся текстом в `payload_raw` — так же, как его читает `read_events`.
+_BOARD_INTO_PAYLOAD = (
+    "CASE "
+    "WHEN json_valid(payload) AND json_type(payload) = 'object' "
+    "AND json_type(payload, '$.board') IS NOT NULL THEN payload "
+    "WHEN json_valid(payload) AND json_type(payload) = 'object' "
+    "THEN json_set(payload, '$.board', board) "
+    "ELSE json_object('board', board, 'payload_raw', payload) "
+    "END"
+)
+
 EVENTS_COLUMNS = (
     "id",
     "ts",
@@ -341,8 +359,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
     Поэтому таблица **пересобирается** (create new → copy → drop → rename) в одной
     транзакции: строки сохраняются как есть, вместе с `id` (порядок `id` — это
     порядок применения фактов в `fold`) и `idempotency_key` (по нему дедуплицируются
-    мутации). Payload не трогается: `board` внутри старых событий остаётся
-    историческим фактом, а новые события его не пишут.
+    мутации).
+
+    Значение доски не теряется: до 0.0.6 `board` был полем строки, а не ключом
+    payload, поэтому при пересборке он переезжает в `payload.$.board` — у события
+    без этого ключа. Уже записанный ключ не перезаписывается.
+
+    Транзакция начинается явным `BEGIN IMMEDIATE` **до** DDL: в legacy-режиме
+    `sqlite3` ставит `BEGIN` только перед DML, и `CREATE TABLE events_v6` ушёл бы в
+    autocommit — падение после него оставило бы пустую `events_v6` в файле.
+    Остаток прерванного запуска снимается `DROP TABLE IF EXISTS` перед `CREATE`,
+    поэтому база лечится повторным запуском, без ручного `DROP`.
 
     Идемпотентность — по проверке схемы: на мигрированной базе функция ничего не
     делает, повторный запуск стоит одного `PRAGMA table_info`.
@@ -350,9 +377,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
     columns = _event_columns(conn)
     if not columns or LEGACY_BOARD_FIELD not in columns:
         return
-    with conn:  # одна транзакция: пересборка + оба индекса
+    conn.execute("BEGIN IMMEDIATE")
+    try:
         conn.execute("DROP INDEX IF EXISTS events_idem")
         conn.execute("DROP INDEX IF EXISTS events_deal")
+        conn.execute("DROP TABLE IF EXISTS events_v6")
         conn.execute(
             "CREATE TABLE events_v6 ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, "
@@ -360,12 +389,24 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "payload TEXT NOT NULL DEFAULT '{}', source TEXT NOT NULL, "
             "idempotency_key TEXT NOT NULL)"
         )
-        copied = ", ".join(name for name in EVENTS_COLUMNS if name in columns)
-        conn.execute(f"INSERT INTO events_v6 ({copied}) SELECT {copied} FROM events")
+        # `board` появилась в 0.0.3 вместе с `payload`, поэтому переносить есть куда:
+        # колонка старше самого payload в схеме журнала не бывает.
+        copied = [name for name in EVENTS_COLUMNS if name in columns]
+        taken = [
+            _BOARD_INTO_PAYLOAD if name == "payload" else name for name in copied
+        ]
+        conn.execute(
+            f"INSERT INTO events_v6 ({', '.join(copied)}) "
+            f"SELECT {', '.join(taken)} FROM events"
+        )
         conn.execute("DROP TABLE events")
         conn.execute("ALTER TABLE events_v6 RENAME TO events")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS events_idem ON events(idempotency_key)")
         conn.execute("CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id)")
+    except Exception:
+        conn.rollback()
+        raise
+    conn.commit()
 
 
 def append(conn: sqlite3.Connection, events: Iterable[dict[str, Any]]) -> int:

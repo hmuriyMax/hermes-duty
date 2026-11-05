@@ -284,6 +284,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
     при включённых FK упал бы на их строках. `id` копируются как есть — порядок
     `deals.id` не меняется, а `repo` у старых дел остаётся `NULL`: доски, из
     которой его можно вывести, больше нет.
+
+    Транзакция начинается явным `BEGIN IMMEDIATE` **до** DDL: в legacy-режиме
+    `sqlite3` ставит `BEGIN` только перед DML, и `CREATE TABLE deals_v6` ушёл бы в
+    autocommit — падение после него оставило бы пустую `deals_v6`, а следующее
+    открытие на запись падало бы на «table deals_v6 already exists». Остаток
+    прерванного запуска снимается `DROP TABLE IF EXISTS` перед `CREATE`, поэтому
+    база лечится повторным запуском, без ручного `DROP`.
     """
     columns = _deal_columns(conn)
     if not columns:  # таблицы ещё нет: её заведёт `SCHEMA`
@@ -293,8 +300,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # `PRAGMA foreign_keys` не действует внутри транзакции — выключаем до неё.
         conn.execute("PRAGMA foreign_keys = OFF")
         try:
-            with conn:  # одна транзакция на всю пересборку
+            conn.execute("BEGIN IMMEDIATE")  # одна транзакция на всю пересборку
+            try:
                 if rebuild:
+                    conn.execute("DROP TABLE IF EXISTS deals_v6")
                     conn.execute(
                         "CREATE TABLE deals_v6 ("
                         "id TEXT PRIMARY KEY, repo TEXT, title TEXT NOT NULL, "
@@ -316,6 +325,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
                     conn.execute("ALTER TABLE deals_v6 RENAME TO deals")
                 else:
                     conn.execute(f"ALTER TABLE deals ADD COLUMN {REPO_FIELD} TEXT")
+            except Exception:
+                conn.rollback()
+                raise
+            conn.commit()
         finally:
             conn.execute("PRAGMA foreign_keys = ON")
     with conn:
@@ -596,8 +609,9 @@ def _event(
     """Событие журнала по факту мутации своего дела.
 
     Доски в событии нет (0.0.6): дело адресуется своим `id`, а группировка —
-    по `repo` строки дела. Старые события при миграции не переписываются, и
-    поле `board` в их payload остаётся историческим фактом.
+    по `repo` строки дела. У старых событий доска при миграции переезжает из
+    колонки в `payload.board` — историческим фактом остаётся она, а новых
+    событий это не касается.
     """
     return {
         "ts": now,

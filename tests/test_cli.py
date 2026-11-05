@@ -313,11 +313,15 @@ def test_deal_is_addressed_by_id_only(home, deal, client, frozen_now, capsys):
 # ------------------------------------------------------------------- коды 0/1/2
 
 
-def test_missing_repo_is_code_1(home, deal, capsys):
+def test_unknown_repo_is_an_empty_slice_not_an_error(home, deal, capsys):
+    """Неизвестный `--repo` — фильтр: пустой ответ и код 0, а не «доски нет»."""
     code, out, err = run(["now", "--repo", "nope"], capsys)
-    assert code == cli.EXIT_NOT_FOUND
-    assert out == ""
-    assert "не назван ни одним делом" in err
+    assert code == cli.EXIT_OK
+    assert err == ""
+    assert "дел нет" in out
+    stats, _, stats_err = run(["stats", "--repo", "nope"], capsys)
+    assert stats == cli.EXIT_OK
+    assert stats_err == ""
 
 
 def test_missing_deal_is_code_1(home, deal, capsys):
@@ -941,11 +945,16 @@ def test_watch_survives_source_degradation(home, deal, frozen_now):
     assert deal in body
 
 
-def test_watch_of_missing_repo_exits_1_instead_of_looping(home, capsys):
-    # `ticks` — страховка теста: если сопоставление 404 сломается, прогон кончится
-    # тремя тиками с кодом 0, а не зависанием.
-    code = cli.run_watch(interval=0, repo="nope", ticks=3, stream=io.StringIO())
-    assert code == cli.EXIT_NOT_FOUND
+def test_watch_of_unknown_repo_keeps_looping_with_empty_slice(home, capsys):
+    # Неизвестный `--repo` — фильтр, а не ресурс (0.0.6): репозиторий — свойство
+    # дела, поэтому опечатка даёт пустой срез и код 0, а не «такого репозитория
+    # нет». `ticks` — страховка теста от зависания: прогон кончается сам.
+    stream = io.StringIO()
+    code = cli.run_watch(interval=0, repo="nope", ticks=3, stream=stream)
+    assert code == cli.EXIT_OK
+    body = stream.getvalue()
+    assert body.count("ДЕЛА СЕЙЧАС") == 3
+    assert "дел нет" in body
 
 
 def test_watch_with_bad_arguments_fails_fast_instead_of_looping(home):

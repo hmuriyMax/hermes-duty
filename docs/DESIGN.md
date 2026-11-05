@@ -1,10 +1,10 @@
-# Контракт плагина — от P0 («смотреть») к движку 0.0.4
+# Контракт плагина — от P0 («смотреть») к движку 0.0.6
 
 Фаза P0 из дизайна (`~/.hermes/widgets/duty-model.html`, вкладка 07): собрать
 видимость того, что происходит, **не меняя поведения** системы.
 
-Состояние на `v0.0.4`: работают агрегатор `GET /now`, таймлайн попыток
-`GET /duty/{board}/{task_id}/attempts`, дело `GET /deal/{board}/{task_id}`, здоровье
+Состояние на 0.0.6: работают агрегатор `GET /now`, таймлайн попыток
+`GET /duty/{deal_id}/attempts`, дело `GET /deal/{deal_id}`, здоровье
 `GET /stats` с распределением ожидания p50/p90/p99 — и четыре экрана поверх них:
 «Сейчас», «Дело», «Почему стоит», «Здоровье». Экраны есть в двух поверхностях:
 desktop-страница `/duty` (внутренний роут приложения) и веб-версия `/web/hermes-duty/`
@@ -19,95 +19,93 @@ desktop-страница `/duty` (внутренний роут приложен
 с политикой ретраев, адресация вопросов, лента этапов и драйвер, который доводит дело до
 терминального исхода — модель целиком в разделе «Модель 0.0.4» ниже.
 
+В 0.0.6 **досок нет**: дело адресуется своим `id` (`d_<hex>`), группируется по `repo`
+(`?repo=`), а карточки kanban живут только наблюдением `GET /cards`. Срез «сейчас»,
+здоровье и таймлайны читают исключительно свой store и свой журнал — единственное место,
+где плагин открывает `kanban.db`, это `/cards` (`docs/SPEC.md`, «Адресация дела»).
+
 ## Что P0 делает
 
-1. Находит все kanban-БД: корневую (доска `default`) и
-   `kanban/boards/<slug>/kanban.db`; файл нулевого размера не пропускается, а
-   помечается `note = "empty db"` и виден как непрочитанная доска
-   (`_discover_boards()` в `dashboard/plugin_api.py`) — иначе он молча исчезал бы
-   и из `boards[]`, и из `errors[]`, и срез выглядел бы полным.
-2. Открывает их строго на чтение — `?mode=ro`, одна транзакция-снимок `BEGIN` на
-   доску (`_ro()`/`_connect_ro()`).
-3. Собирает по каждому активному делу (`status NOT IN ('done','archived')`,
-   не больше `DEAL_LIMIT = 500` на доску): лизинг, текущую попытку, последнее
-   действие, исход последнего рана, незавершённых родителей и живой вопрос пула
-   (`_board_deals()`).
-4. Отдаёт срез «сейчас» — `GET /now`: дела всех досок в порядке приоритета
-   таксономии, с доказательством состояния в `waiting.evidence`.
-5. Отдаёт таймлайн попыток дела — `GET /duty/{board}/{task_id}/attempts`: раны по
-   возрастанию старта, длительность, исход, текст ошибки и события рана.
-6. Деградирует вместо падения: недоступная доска уходит в `errors[]` при HTTP 200,
-   сбой вспомогательной таблицы — в `warnings[]` доски
-   (`collect_now()` плюс `_board_deals()`: оба в `dashboard/plugin_api.py`).
-
-7. Ведёт **свой журнал** `duty/duty.db`: `POST /ingest` (и `GET /now?ingest=1`) переносит
-   недостающие факты источников в события, `fold(events)` считает из них состояние —
-   контракт `docs/JOURNAL.md`. Повторный проход ничего не добавляет.
+1. Читает **свой** store дел (`duty/duty.db`: `deals`, `deal_links`, `comments`,
+   `attachments`, `leases`) строго на чтение: `?mode=ro` и одна транзакция-снимок
+   `BEGIN` (`journal.connect_ro`, `deals.open_store(readonly=True)`).
+2. Считает состояние каждого дела `fold`'ом по своему журналу (`fold(events)` в
+   `dashboard/journal.py`): восемь взаимоисключающих состояний ожидания и
+   доказательство в `waiting.evidence`.
+3. Отдаёт срез «сейчас» — `GET /now`: активные дела в порядке приоритета таксономии,
+   `?repo=` — фильтр группировки, `?state=` — фильтр по состоянию ожидания.
+4. Отдаёт таймлайн попыток дела — `GET /duty/{deal_id}/attempts`: попытки по
+   возрастанию старта, длительность, исход, текст ошибки и события попытки.
+5. Наблюдает карточки kanban отдельным ответом — `GET /cards`: статус, ран и лизинг
+   карточки. Это не дела: ни адресации, ни таксономии у них нет.
+6. Деградирует вместо падения: нечитаемый store, журнал или пул уходит в `errors[]`
+   при HTTP 200 (`collect_now()`, `_own_deals()`, `_journal_context()`).
+7. Ведёт **свой журнал** `duty/duty.db`: `append`/`append_in_tx` дописывают факты,
+   `fold(events)` считает из них состояние — контракт `docs/JOURNAL.md`. Повторный
+   проход ничего не добавляет (`INSERT OR IGNORE` по `idempotency_key`).
 8. Ведёт **свои дела**: `POST /deals` и мутации `/deals/{id}/…` пишут строку дела и
-   событие в одной транзакции, id своих дел — `d_<hex>`, наблюдаемых — `t_<hex>`
-   (контракт `docs/OWNERSHIP.md`).
+   событие в одной транзакции, id своих дел — `d_<hex>`
+   (контракт `docs/OWNERSHIP.md`). Карточка kanban (`t_<hex>`) делом не бывает.
 9. Отдаёт то же из терминала — CLI `bin/duty`: команды зовут функции роутов, а не HTTP,
    `--json` печатает ответ роута дословно (раздел «CLI `bin/duty`»).
 
 ## Что P0 не делает никогда
 
-- не пишет в `kanban.db` и `state.db` (`_ro()` — единственный способ открыть источник,
-  `dashboard/plugin_api.py`); в `pool.db` пишет **только** `ask()` (`dashboard/ask.py`),
-  и только по явному `POST /ask/{board}/{task_id}` — больше ни одного пути записи в
-  чужой файл нет;
+- не пишет в `kanban.db` и `state.db` (`_connect_ro()` — единственное, чем плагин
+  открывает чужой файл, и только для `/cards`); в `pool.db` пишет **только** `ask()`
+  (`dashboard/ask.py`), и только по явному `POST /ask/{deal_id}` — больше ни одного
+  пути записи в чужой файл нет;
 - не импортирует диспетчер и не вызывает `hermes kanban`;
-- не пересчитывает статусы карточек — только то, что записано (состояние ожидания
-  выводится из набора фактов, но сами факты не переписываются);
+- не пересчитывает статусы — ни свои, ни карточные: состояние ожидания выводится из
+  набора фактов, но сами факты не переписываются;
 - не запускает фоновых процессов и не заводит launchd-джоб.
 
 ## Источники
 
 | источник | что берём |
 |---|---|
-| `<home>/kanban.db`, `<home>/kanban/boards/*/kanban.db` | `tasks` (лизинг, pid, статус, `current_run_id`), `task_runs` (попытки), `task_events` (журнал: последнее действие, причина блока), `task_links` (граф зависимостей) |
+| `<home>/duty/duty.db` | `deals`, `deal_links`, `comments`, `attachments`, `leases` (свой store) и журнал `events` — состояние ожидания, таймлайны, здоровье |
+| `<home>/kanban.db`, `<home>/kanban/boards/*/kanban.db` | только наблюдение `/cards`: `tasks` (статус, `block_kind`, `consecutive_failures`, `current_run_id`) и `task_runs` (лизинг и исход рана) |
 | `<home>/messaging/pool.db` | `questions` с живым статусом (`pending`/`sent`, `ask.LIVE_STATUSES`) — таксономия «ждёт ответа» |
 | `<home>/profiles/<role>/state.db` | только перечисление профилей в `/sources`; содержимое не читается |
 
 Пути не хардкодятся: корень вычисляется из `HERMES_HOME` или `~/.hermes`
 (`_hermes_home()`).
 
-**Выбывшие доски в срез не входят.** Ядро kanban убирает закрытые доски в
-`kanban/boards/_archived/` и ставит рядом камень `board.json` с
-`"archived": true`; открывать такую доску ядро отказывается. Для среза это не
-источник, а история, поэтому:
+**Карточки kanban — наблюдение, а не источник дел.** До 0.0.6 доска была тем, чем
+карточка попадала в «дела»; теперь эта связь снята, и у наблюдения свои правила:
 
-- `_archived/` — namespace, а не доска; сами выбывшие доски лежат в
+- `kanban/boards/_archived/` — namespace, а не доска; сами выбывшие доски лежат в
   `_archived/<slug>/kanban.db`;
 - доска с `"archived": true` в `board.json` считается выбывшей, даже если её БД
   лежит в `boards/<slug>/` и читается;
-- такие доски не сканируются в `/now` (не попадают ни в `boards[]`, ни в
-  `errors[]`), `/board/<slug>/tasks` по ним отдаёт 404;
-- но и не исчезают молча: они перечислены в `/sources.archived[]` с причиной
-  (`_archived: …` или `board.json: archived`), иначе «доски нет» и «доска в
-  архиве» стали бы неотличимы.
+- выбывшая доска в `/cards` не показывается вовсе (её карточки — история, а не
+  «что сейчас»), и молча не исчезает: `databases`/`count` считаются по живым;
+- пустая *живая* доска, наоборот, видна: `read: false` с `note: "empty db"` — иначе
+  «пустая доска» и «доски нет» стали бы неотличимы.
 
-Правило действует и для 0-байтных БД: пустая *живая* доска видна как `read:false`
-с `note: "empty db"`, а пустой архив — нет, потому что он не живой источник.
+Правила выбывания живут в одном месте — `plugin_api._retired()` (его зовёт
+`_card_databases()`), поэтому `/cards` и `/sources.cards.databases` считают одно и то
+же число.
 
 ## Эндпоинты
 
 Все роуты монтируются под `/api/plugins/hermes-duty`. Читающие — только читают; пишут
-только те, что названы явно: свой журнал (`POST /ingest`), пул вопросов (`POST /ask`) и
-свой store дел (`POST`/`PATCH /deals…`).
+только те, что названы явно: пул вопросов (`POST /ask/{deal_id}`) и свой store дел
+(`POST`/`PATCH /deals…`).
 
 | роут | что отдаёт | ошибки |
 |---|---|---|
-| `GET /health` | версия, корень, число БД и читаемых, строки `tasks`, наличие пула, `journal: {events, deals, drift: {empty_journal}}` (сколько журнал знает и чего не догнал), `mode: "read-only"` | — |
-| `GET /sources` | доски с размером/`mtime`/счётчиками, выбывшие доски (`archived[]`: `slug`, `path`, `reason`), пул по `origin × status`, список профилей | — |
-| `GET /board/{slug}/tasks` | сырой срез активных карточек доски (до 200) | 404 — доски нет |
-| `GET /now?board=<slug>&state=<waiting.state>` | срез «сейчас» (форма ниже); у дела — `stage {id, role, attempt, state, live, since}` из журнала (`null`, если попыток не было) | 404 — доски нет; 400 — состояние не из таксономии |
-| `GET /duty/{board}/{task_id}/attempts` | таймлайн попыток дела | 404 — нет доски или дела; 503 — доска/`task_runs` не читаются |
-| `GET /deal/{board}/{task_id}?spec=<путь>` | одно дело: спецификация + факты `/now`, `comments[]`, `attachments[]`, `timeline[]`, лента этапов `stages[]` + `stages_note` + `spec`; `d_<hex>` ищется в своём store, `t_<hex>` — на доске kanban | 404 — нет доски или дела; 503 — доска или store не читаются |
-| `GET /stats?board=<slug>&since=<unix>` | здоровье по доскам и итогом: `first_try`, `waiting_sec` (p50/p90/p99, `count`, `max`), `runs_by_outcome`; `?board=` — одна доска, `?since=` — окно по `created_at` | 404 — доски нет; — (деградация в `errors[]`, обрезанный срез — в `warnings[]`) |
-| `POST /ingest` | проход в свой журнал + `answers` (ответы пула) | — (деградация в `errors[]`) |
-| `POST /ask/{board}/{task_id}` | вопрос по делу в пул: `{question_id, created, deduped, adopted, errors[]}` | 404 — нет доски или дела; 400 — пустой `text`/кривые `options`; 503 — пул или журнал недоступны |
-| `POST /deals` | завести своё дело (`status=todo`): `{board, title, body?, assignee?, parents?[]}` | 400 — вход не тот; 503 — store не открылся |
-| `PATCH /deals/{id}` | спецификация (`title`/`body`/`assignee`) либо `{status: archived}` | 404 — дела нет; 400 — смена статуса мимо команды |
+| `GET /health` | версия, корень, наличие store и пула, `journal: {events, deals}` (сколько строк в журнале), `mode: "read-only"` | — |
+| `GET /sources` | store и его файл, репозитории дел (`repos`), пул по `origin × status`, список профилей, число живых kanban-БД наблюдения (`cards`) | — |
+| `GET /cards` | наблюдение за карточками: `databases`, `count`, `cards[]` по каждой живой БД (`name`, `path`, `read`, `note?`, `cards[]`, `truncated`) — без дел и без `waiting` | — (нечитаемая БД: `read: false` + причина в `note`) |
+| `GET /now?repo=<path>&state=<waiting.state>` | срез «сейчас» (форма ниже); у дела — `stage {id, role, attempt, state, live, since}` из журнала (`null`, если попыток не было) | 400 — состояние не из таксономии или `?board=`; неизвестный `repo` — 200 с пустым срезом |
+| `GET /duty/{deal_id}/attempts` | таймлайн попыток дела | 400 — id не `d_<hex>`; 404 — дела нет; 503 — store не читается |
+| `GET /deal/{deal_id}?spec=<путь>` | одно дело: спецификация + факты `/now`, `comments[]`, `attachments[]`, `timeline[]`, лента этапов `stages[]` + `stages_note` + `spec` | 400 — `t_<hex>` или битый id; 404 — дела нет; 503 — store не читается |
+| `GET /stats?repo=<path>&since=<unix>` | здоровье по репозиториям и итогом: `deals_by_status`, `attempts_by_outcome`, `first_try`, `waiting_sec` (p50/p90/p99, `count`, `max`); `?repo=` — один репозиторий, `?since=` — окно по `created_at` | 400 — `?board=`; неизвестный `repo` — 200 с пустым результатом; деградация — в `errors[]` |
+| `POST /ask/{deal_id}` | вопрос по делу в пул: `{question_id, created, deduped, adopted, errors[]}` | 400 — битый id, пустой `text`/кривые `options`; 404 — дела нет; 503 — пул или журнал недоступны |
+| `POST /deals` | завести своё дело (`status=todo`): `{repo?, title, body?, assignee?, parents?[], spec?, external_ref?, dedup_window?}` | 400 — вход не тот (в том числе `board`); 503 — store не открылся |
+| `PATCH /deals/{id}` | спецификация (`title`/`body`/`assignee`) либо `{status: archived}` | 404 — дела нет; 400 — смена статуса мимо команды или попытка поправить `repo` |
 | `POST /deals/{id}/comment` | комментарий: `{author, body}` | 404 — дела нет; 400 — пустой `body` |
 | `POST /deals/{id}/block` | блокировка: `{kind, reason}` | 404 — дела нет; 400 — архивное дело |
 | `POST /deals/{id}/unblock` | снять блокировку | 404 — дела нет; 400 — архивное дело |
@@ -121,8 +119,8 @@ desktop-страница `/duty` (внутренний роут приложен
 {events, idempotent}`: повтор вызова не плодит событий (`events: 0`), а «делать нечего» —
 ошибка входа с причиной. Все `POST /deals…` — под токеном сессии, как остальные роуты.
 
-`?state=` фильтрует только список `deals`: `by_state` и `boards[]` считаются по
-полному срезу до фильтра (`collect_now()`).
+`?state=` фильтрует только список `deals`: `by_state` и `repos` считаются по полному
+store, а не по срезу (`collect_now()`).
 
 ## Модель 0.0.4: спека → переход → попытка → evidence → класс отказа
 
@@ -279,14 +277,14 @@ failures.classify → policy → decide_park
 
 | что | где контракт | что видно на поверхности |
 |---|---|---|
-| журнал: схема, набор из 18 видов событий, идемпотентность, правила fold 1–13, ingest | `docs/JOURNAL.md` | `journal: {events, deals, drift: {empty_journal}}` в `/health`; `journal: empty — состояние из kanban` в `waiting.evidence` |
-| владение: свой store `deals`/`deal_links`/`comments`/`attachments`, мутации, гейт, id `d_<hex>` | `docs/OWNERSHIP.md` | `POST`/`PATCH /deals…`, поле `mutation` в ответе, `comments[]`/`attachments[]` в `/deal` |
-| `ask()`: пул как единственный канал вопросов, дедуп, `adopted`, критичность | `docs/JOURNAL.md`, раздел «`ask()`» | `POST /ask/{board}/{task_id}`, `waiting.human_kind` |
+| журнал: схема, набор из 20 видов событий, идемпотентность, правила fold 1–14 | `docs/JOURNAL.md` | `journal: {events, deals}` в `/health`; `waiting.evidence` у каждого дела |
+| владение: свой store `deals`/`deal_links`/`comments`/`attachments`/`leases`, мутации, гейт, id `d_<hex>` | `docs/OWNERSHIP.md` | `POST`/`PATCH /deals…`, поле `mutation` в ответе, `comments[]`/`attachments[]` в `/deal` |
+| `ask()`: пул как единственный канал вопросов, дедуп, `adopted`, критичность | `docs/JOURNAL.md`, раздел «`ask()`» | `POST /ask/{deal_id}`, `waiting.human_kind` |
 
 Три правила, которые нельзя перепутать местами:
 
 1. **Журнал не переписывается задним числом.** Дописываются только недостающие факты
-   (`INSERT OR IGNORE` по `idempotency_key`), поэтому повторный ingest — no-op, а
+   (`INSERT OR IGNORE` по `idempotency_key`), поэтому повторный `append` — no-op, а
    `fold` на тех же событиях даёт тот же ответ.
 2. **Закрытость — по последнему state-changing событию**, а не по последней строке
    журнала: `commented`, `attached`, `patched`, `question_answered`
@@ -301,52 +299,55 @@ failures.classify → policy → decide_park
   "now": 1793646565,              // unix-секунды среза
   "count": 12,
   "deals": [{
-    "board": "hermes-duty", "id": "t_827e3810", "title": "DOC: …",
-    "assignee": "documenter", "status": "running", "priority": 0,
+    "repo": "hermes-duty", "id": "d_6e764042", "title": "DOC: …",
+    "assignee": "documenter", "status": "running", "priority": null,
     "consecutive_failures": 0, "created_at": 1793635898,
-    "workspace_kind": "scratch",
-    "attempt": {                  // null, если у дела не было ранов
-      "run_id": 12, "source": "run",   // run|task: откуда взяты pid/start/heartbeat
+    "workspace_kind": null,                  // у своего дела этих фактов нет — и это видно
+    "attempt": {                             // null, если попыток не было
+      "run_id": "d_6e764042:impl#1", "source": "journal",   // попытка своего дела — из журнала
       "start": 1793646565, "age_sec": 41,
       "pid": 39899, "pid_alive": true,
-      "heartbeat_age_sec": 12, "run_status": "running"
+      "heartbeat_age_sec": null, "run_status": null
     },
-    "lease": { "claim_lock": "…", "expires_at": 1793647465,
-               "expires_in_sec": 858, "state": "live" },   // live|expired|none|unknown
-    "last_action": { "kind": "spawned", "at": 1793646565,
-                     "age_sec": 41, "summary": "pid 39899 …" },
-    "last_run": { "run_id": 12, "status": "running", "outcome": null,
-                  "started_at": 1793646565, "ended_at": null },   // null, если ранов нет
-    "waiting": { "state": "working", "evidence": "ран 12 running, pid 39899 жив, heartbeat 12с назад", "human_kind": null }
+    "lease": { "claim_lock": null, "expires_at": 1793647465,
+               "expires_in_sec": 858, "state": "live" },   // live|expired|unknown|none
+    "last_action": { "kind": "attempt_started", "at": 1793646565, "age_sec": 41,
+                     "summary": "impl · попытка 1" },
+    "last_run": null,                        // раны — факт kanban, у своего дела его нет
+    "stage": { "id": "impl", "role": "implementer", "attempt": 1,
+               "state": "running", "live": true, "since": 1793646565 },
+    "budget": null,                          // потолка на дело нет
+    "published": null,                       // публикации не было
+    "waiting": { "state": "working", "evidence": "попытка 1 этапа impl идёт, лизинг живой", "human_kind": null }
   }],
   "by_state": { "wait_human": 0, "capability": 0, "dead_lease": 0, "crashed": 0,
                 "working": 1, "no_signal": 0, "wait_slot": 3, "wait_gate": 8 },  // порядок = WAITING_PRIORITY
   "crash_outcomes": ["crashed", "gave_up", "spawn_failed", "timed_out"],
-  "boards": [{ "slug": "hermes-duty", "path": "…/kanban.db", "read": true,
-               "deals": 12, "truncated": false, "warnings": [] }],
-  "errors": [{ "board": "messaging/pool.db", "reason": "pool.db not found: …" }]
+  "repos": { "list": [{ "repo": "hermes-duty", "deals": 12 }], "without_repo": 0, "read": true },
+  "errors": [{ "source": "messaging/pool.db", "reason": "pool.db not found: …" }]
 }
 ```
 
-**Своё дело в том же срезе.** Элемент списка у своего дела (`d_<hex>`) имеет ту же форму,
-но пустые факты названы пустыми, а не выброшены: `last_run: null`, `priority: null`,
-`workspace_kind: null` — иначе экран не отличил бы «нечего показывать» от «не посчитали».
-Попытка и лизинг — наоборот, читаются из фактов, потому что движок 0.0.4 спавнит
-попытки и держит лизинг: `attempt` строится по журналу (последняя незакрытая пара
-`attempt_started`/`attempt_ended`, `source: "journal"`, `run_status`/`heartbeat_age_sec`
-пусты — записи рана kanban и heartbeat-события у своего дела нет), `lease.state` — по
-сроку из таблицы `leases` (а если строки нет — по `attempt_started.lease_expires`):
+**Пустые факты названы пустыми, а не выброшены:** `last_run: null`, `priority: null`,
+`workspace_kind: null` — иначе экран не отличил бы «нечего показывать» от «не
+посчитали». Попытка и лизинг, наоборот, читаются из фактов, потому что движок 0.0.4
+спавнит попытки и держит лизинг: `attempt` строится по журналу (последняя незакрытая
+пара `attempt_started`/`attempt_ended`, `source: "journal"`), `lease.state` — по сроку
+из таблицы `leases` (а если строки нет — по `attempt_started.lease_expires`):
 `live`/`expired` по сроку, `unknown` — попытка идёт, а срока нет ни там, ни там,
 `none` — ни строки store, ни идущей попытки (`_own_attempt_facts()` в
-`dashboard/plugin_api.py`). В `boards[]` у доски со своими делами
-появляется `own_deals`; доска, которая есть только в store, идёт с `read: true`, путём
-store и `note` «только свои дела: kanban-доски с таким слагом нет».
+`dashboard/plugin_api.py`).
 
-**Ожидание — из журнала, а не из колонок.** `waiting` элемента считается `fold(events)`;
-дело без единого события считается по kanban, и это сказано словами в начале
-`waiting.evidence`. `waiting.human_kind` отделяет два разных «нужен человек»:
-`question` — есть живой вопрос пула, `status` — человек нужен, вопроса нет (блок, ревью,
-мердж, разбор); у остальных состояний он `null`.
+**`repos` — группировка, а не список досок.** Уникальные непустые `repo` строк store
+плюс число дел без репозитория; считается по всему store, а не по фильтрованному срезу
+(`_repos_of()`).
+
+**Ожидание — из журнала, и только из него.** `waiting` элемента считается `fold(events)`
+по событиям дела; других источников у состояния нет (0.0.6: kanban в дела не
+подмешивается). `waiting.human_kind` отделяет виды «нужен человек»: `question` — есть
+живой вопрос пула, `status` — человек нужен, вопроса нет (блок, ревью, разбор),
+`decision` — вопрос отвечен, и человеку осталось выбрать `continue|stop`; у остальных
+состояний он `null`.
 
 Сортировка детерминирована: `waiting.state` по `WAITING_PRIORITY`, затем возраст
 текущей попытки по убыванию, затем `id` — иначе UI дёргается между опросами
@@ -356,24 +357,26 @@ store и `note` «только свои дела: kanban-доски с таки�
 ## Таксономия ожиданий (восемь взаимоисключающих состояний)
 
 Состояние — первое совпавшее по приоритету; все сработавшие факты уходят в
-`waiting.evidence` (`WAITING_PRIORITY`/`WAITING_FALLBACK` в `dashboard/journal.py`
-и `dashboard/plugin_api.py`).
-Порог свежести heartbeat — `HEARTBEAT_FRESH_SEC = 300` с.
+`waiting.evidence` (`WAITING_PRIORITY` в `dashboard/journal.py`, там же правила fold
+1–14). Всё считается по событиям журнала (`docs/JOURNAL.md`), не по колонкам store:
+других источников у состояния нет.
 
-| # | состояние | как определяется |
+| # | состояние | какой факт журнала его даёт |
 |---|---|---|
-| 1 | `wait_human` | живой вопрос пула (`pending`/`sent`, `ask.LIVE_STATUSES`), связанный с делом: `session_key` = id дела или id упомянут в `text`/`text_full` |
-| 2 | `capability` | `status=blocked` и (`block_kind='capability'` или причина блока содержит слово из `CAPABILITY_WORDS`: доступ, права, разрешение, `permission`, `access`, `credential`, `token`, `forbidden`, `403`) |
-| 3 | `dead_lease` | ран `running`, а его pid мёртв; **или** лизинг истёк (срок `claim_expires` записан и прошёл, попытки за лизингом не было — fold правило 4: `claimed` без срока `dead_lease` не даёт) |
-| 4 | `crashed` | `consecutive_failures > 0`; **или** исход последнего рана ∈ `crashed`/`gave_up`/`spawn_failed`/`timed_out`; **или** ран `running`, pid не мёртв, но heartbeat старше 300 с |
-| 5 | `working` | ран `running`, pid не мёртв, heartbeat не старше 300 с |
-| 6 | `no_signal` | `status=running`, но ни рана, ни pid, ни heartbeat нет: живого сигнала нет, дело не выдаётся за работающее |
-| 7 | `wait_slot` | `status=ready` и исполнитель уже держит другое дело (`running`) |
-| 8 | `wait_gate` | `status` ∈ `todo`/`ready` и есть незавершённый родитель в `task_links` |
+| 1 | `wait_human` | `question_asked` без `question_answered` (живой вопрос пула); `blocked` без `unblocked` с `block_kind≠capability` (в том числе `parked` — попытки исчерпаны); `review_requested` без `collected`/`changes_requested` |
+| 2 | `capability` | `blocked` без `unblocked`, где `block_kind='capability'` или причина блока содержит слово из `CAPABILITY_WORDS` (доступ, права, разрешение, `permission`, `access`, `credential`, `token`, `forbidden`, `403`) |
+| 3 | `dead_lease` | `claimed` со сроком `claim_expires`, который прошёл, и без `attempt_started` за ним |
+| 4 | `crashed` | `attempt_started` без `attempt_ended`, а записанный `pid` мёртв |
+| 5 | `working` | `attempt_started` без `attempt_ended`, а `pid` жив; heartbeat в журнал не пишется, и это сказано в evidence, а не подразумевается |
+| 6 | `no_signal` | `attempt_started` без `attempt_ended`, а `pid` неизвестен (нет в событии или `os.kill` вернул прочий `OSError`) |
+| 7 | `wait_slot` | `changes_requested` без последующей сдачи в ревью и без `claimed`: дело ждёт исполнителя, который переделает |
+| 8 | `wait_gate` | последнее state-changing событие — `created` с родителями; либо `gate_closed` без последующего `gate_opened` |
 
-Правило: состояние **не выводится из одной колонки**. Оно вычисляется по набору
-фактов (лизинг, pid, heartbeat, граф зависимостей, пул вопросов, исход последнего
-рана), и каждый сработавший факт показывается рядом как доказательство.
+Правило: состояние **не выводится из одной колонки**. Оно вычисляется `fold`'ом по
+событиям, и каждый сработавший факт показывается рядом как доказательство. Если живого
+факта в журнале нет (события есть, но ни одно состояние не подняли), поверхность берёт
+состояние из `deals.status` (`OWN_WAITING_FALLBACK`) и говорит это словами в
+`waiting.evidence` — «нет живого факта» нельзя выдавать за «всё спокойно».
 
 Исчерпанные попытки не добавляют состояния: запаркованное дело ждёт **человека**,
 то есть это `wait_human` — с причиной `block_kind=parked`, классом отказа и
@@ -387,37 +390,39 @@ store и `note` «только свои дела: kanban-доски с таки�
 Ссылки ниже — файл и имя функции, без номеров строк: номера на 0.0.3 уже разошлись
 с кодом, а имя символа — нет.
 
-Факт — строка, собранная кодом; при нескольких сработавших фактах победитель идёт
-первым, остальные дописываются через `; ещё: …`, а при недоступном/обрезанном пуле
-к `wait_human` без вопроса — `; … — факт wait_human не проверен`
-(`_waiting()` в `dashboard/plugin_api.py`).
+Факт — строка, собранная `fold`'ом (`dashboard/journal.py`); при нескольких сработавших
+фактах победитель идёт первым, остальные дописываются через `; ещё: …`, а при
+недоступном/обрезанном пуле к `wait_human` без вопроса — `; … — факт wait_human не
+проверен` (`_journal_waiting()`/`_own_waiting()` в `dashboard/plugin_api.py`).
 
-- `working` — `ран 12 running, pid 39899 жив, heartbeat 12с назад`. Про pid
-  называется ровно то, что известно: `pid <pid> жив` (сигнал прошёл),
-  `состояние pid <pid> неизвестно` (`os.kill` вернул прочий `OSError`,
-  `pid_alive=None`) или `pid не записан` (пустой `worker_pid`); «не записан» про
-  существующий pid не печатается. Формулировка одна на обе ветки — `_pid_text`
-  (и `_waiting()` для тех же строк).
-- `crashed` — `consecutive_failures=N` / `последний ран <id>: outcome=…` /
-  `ран <id> running, <pid-факт>, heartbeat <N>с назад`; pid-факт тот же самый
-  (та же `_pid_text`: «жив» только если живость подтверждена) — `_waiting()`.
-- `no_signal` — `status=running без живого сигнала: рана, pid и heartbeat нет`
-  (оглавление `WAITING_FALLBACK`).
-- `dead_lease` — `ран <id> в статусе running, а pid <pid> мёртв (лизинг …)` либо
-  `лизинг истёк <N>с назад (<claim_lock>), ран <status>` (`_waiting()`).
-- `wait_slot` — `status=ready, профиль <assignee> занят делом <id> (running)`;
-  `wait_gate` — `незавершённые родители: <id> (<status>), …` (`_waiting()`).
-- `attempt.source` — `run`, `task` или `journal`: `run` — все факты из записи рана,
-  `task` — pid/start/heartbeat добраны из карточки (подпись попытки на странице
-  получает хвост «, факты карточки»), `journal` — попытка своего дела, прочитанная
-  по журналу движка (`_attempt()` и `_own_attempt_facts()` в
-  `dashboard/plugin_api.py`, `desktop/model.js`).
+- `working` — `ран <run_id> начат <N>с назад, pid <pid> жив; heartbeat в журнале не
+  пишется — свежесть не проверена`. Про pid называется ровно то, что известно:
+  `pid <pid> жив` (сигнал прошёл), `состояние pid <pid> неизвестно` (`os.kill` вернул
+  прочий `OSError`, `pid_alive=None`) или `pid не записан` (в событии нет pid); «не
+  записан» про существующий pid не печатается (`journal.pid_text`).
+- `crashed` — `ран <run_id> начат <N>с назад, attempt_ended нет, pid <pid> мёртв`.
+- `no_signal` — тот же факт с неизвестным pid: `… — живого сигнала нет`.
+- `dead_lease` — `лизинг <claim_lock> взят <N>с назад, срок истёк <M>с назад —
+  attempt_started за ним нет`.
+- `wait_human` — `вопрос #<id> задан <N>с назад, ответа нет (session_key …)`;
+  `blocked: block_kind=<kind>, причина: …`; `сдано в ревью <N>с назад, ревьюер <role>
+  — вердикта в журнале нет`; у парковки — `blocked: block_kind=parked, парковка:
+  <attempts>/<limit> <class> на этапе <stage>, причина: …`.
+- `wait_slot` — `возвращено на доработку <N>с назад: <причина>`;
+- `wait_gate` — `родители на момент created: <id>, …` либо `гейт закрыт <N>с назад:
+  родитель <id> больше не закрыт (status=<to>)`.
+- `attempt.source` — `journal`: попытка своего дела прочитана по журналу движка
+  (`_own_attempt_facts()` в `dashboard/plugin_api.py`, `desktop/model.js`); рана kanban
+  у своего дела нет, поэтому `run_status` и `heartbeat_age_sec` пусты — и это видно
+  полем, а не отсутствием ключа.
 
-Если ни один факт не сработал, статус доразбирается оглавлением
-`WAITING_FALLBACK`: `triage`/`blocked`/`review`/`awaiting_merge` → `wait_human`,
-`scheduled` → `wait_gate`, `todo`/`ready` → `wait_slot`, `running` → `no_signal`
-(«без живого сигнала»), незнакомый статус → `wait_slot` с пометкой «нет живых
-фактов».
+Если ни один факт не сработал, состояние берётся из `deals.status` оглавлением
+`OWN_WAITING_FALLBACK` (`dashboard/plugin_api.py`): `todo`/`ready` → `wait_slot`,
+`running` → `no_signal` («без живого факта журнала: идёт ли попытка — неизвестно»),
+`blocked`/`review` → `wait_human`, незнакомый статус → `wait_slot` с пометкой «нет
+живых фактов». Что именно не сработало, сказано в начале `evidence`
+(`journal: нет живых фактов (последнее событие: <kind>) — состояние из status своего
+дела`), а не подразумевается.
 
 ## Деградация источников
 
@@ -425,91 +430,81 @@ store и `note` «только свои дела: kanban-доски с таки�
 
 | что сломалось | как видно в ответе |
 |---|---|
-| `tasks` доски не читается (не открылась, нет таблицы) | `boards[].read = false`, `errors[]` с `{board, reason}`, дела этой доски отсутствуют |
-| `kanban.db` нулевого размера | `boards[].read = false` + `boards[].note = "empty db"` и `errors[]` с причиной `empty db (...)` — доска не исчезает из ответа |
-| доска упала на чужой схеме (`int()` по текстовой колонке и т.п.) | `boards[].read = false` + `errors[]` с причиной `<ТипИсключения>: <текст>`; `RuntimeError` (готовые причины: нет таблицы, 0-байтная БД) идёт без префикса; ответ остаётся 200 (`collect_now()`) |
-| `task_runs`, `task_links`, `task_events` или `task_events(blocked)` не читаются | `boards[].warnings[]` строкой `<таблица>: <причина>` (для причин блока — ключ `task_events(blocked)`); факты деградируют, доска остаётся `read = true` (`_board_deals()`) |
-| `messaging/pool.db` нет или это не БД | `errors[]` с `board: "messaging/pool.db"` + в `waiting.evidence` пометка «факт `wait_human` не проверен» — иначе недоступный пул выглядел бы как «вопросов нет» |
-| живых вопросов в пуле больше `QUESTION_LIMIT = 200` (запрос берёт `LIMIT + 1`, поэтому пул ровно на 200 вопросов пометки не получает) | `errors[]` с `board: "messaging/pool.db"` и причиной `questions truncated: more than 200 live questions` + в `waiting.evidence` дел в состоянии `wait_human`, которым вопрос не нашёлся: `живых вопросов в пуле больше 200 (старые не вошли) — факт wait_human не проверен` (`_pool_context()`, `_waiting()`) |
-| дел на доске `>= DEAL_LIMIT = 500` (`truncated = len(tasks) >= DEAL_LIMIT`: лишней строки не берётся, поэтому ровно 500 дел тоже помечаются) | `boards[].truncated = true`; на странице `/duty` — строка `доска <slug>: срез обрезан лимитом, показано <N> дел` (`_board_deals()`, `desktop/model.js`) |
-| `duty/duty.db` не открылся или битый (журнал либо store своих дел) | `errors[]` с `board: "duty/duty.db"` и причиной `journal: …` / `store: …`; срез и `/deal` строятся из kanban, свои дела в ответ не попадают — «своих дел нет» и «store не прочитался» разные факты |
+| `duty/duty.db` не открылся или битый (store либо журнал) | `errors[]` с `source: "duty/duty.db"` и причиной `journal: …` / `store: …`; срез пуст — «дел нет» и «store не прочитался» разные факты (`_own_deals()`, `_journal_context()`) |
+| журнал читается, а таблицы `events` нет | `journal: …` в `errors[]`, у дел — `waiting.evidence` с пометкой, что фактов журнала нет (состояние из `deals.status`) |
+| `messaging/pool.db` нет или это не БД | `errors[]` с `source: "messaging/pool.db"` + в `waiting.evidence` пометка «факт `wait_human` не проверен» — иначе недоступный пул выглядел бы как «вопросов нет» |
+| живых вопросов в пуле больше `QUESTION_LIMIT = 200` (запрос берёт `LIMIT + 1`, поэтому пул ровно на 200 вопросов пометки не получает) | `errors[]` с `source: "messaging/pool.db"` и причиной `questions truncated: more than 200 live questions` + в `waiting.evidence` дел в состоянии `wait_human`, которым вопрос не нашёлся: `живых вопросов в пуле больше 200 (старые не вошли) — факт wait_human не проверен` (`_pool_context()`, `_own_waiting()`) |
+| kanban-БД наблюдения не читается (нет таблицы, чужая схема) | только в `/cards`: `cards[].read = false` и причина в `note`, остальное наблюдение остаётся; на дела это не влияет вовсе |
+| kanban-БД нулевого размера | `/cards`: `read: false`, `note: "empty db"` — живая пустая доска не исчезает из ответа |
+| карточек в наблюдении `>= CARD_LIMIT = 200` | `cards[].truncated = true` (`_cards_of()`): наблюдение назвало предел числом, а не молча урезало |
 
-`truncated` и `warnings[]` не только отдаются, но и рисуются. Шейпер сводит их в
-два списка строк — `доска <slug>: срез обрезан лимитом, показано <N> дел` и
-`доска <slug>: <причина из warnings>` (`desktop/model.js:205-210`, копия в
-`desktop/plugin.js:233-238`). Страница добавляет их к недоступным доскам и упавшим
-источникам одной жёлтой полосой над списком (`desktop/plugin.js:673-680`,
-`:775-785`) и тем же списком в пустом состоянии (`:682-699`). Счётчик «досок
-19/19» при этом остаётся честным: доска прочитана, но срез неполон — и это видно
-текстом.
+Упавшие источники рисуются. Шейпер сводит `errors[]` в строки `источник <source>
+недоступен: <reason>`, а непосчитанную группировку — в `store дел не прочитан:
+группировка по репозиториям не посчитана` (`desktop/model.js`, `noticeLines`);
+страница показывает их жёлтой полосой над списком, когда дела есть, и тем же
+списком в пустом состоянии (`desktop/plugin.js`, `dashboard/web/app.js`).
 
 Таймлайн попыток деградирует иначе: там 404/503 — это ответ про конкретное дело
-(нельзя показать пустой таймлайн вместо «не читается»), а сбой `task_events`
-просто оставляет `events: []` у ранов (`duty_attempts()`).
-
-Известные ограничения (не исправлены в `v0.0.1`, зафиксированы честно):
-причина сбоя `task_events` (события рана) в ответе таймлайна не отдаётся — там просто пустой `events`; если в `kanban/boards/` есть каталог `default`, его БД попадает в срез отдельной записью с тем же slug — и `?board=default` вернёт обе (корневую и каталог), потому что фильтр идёт по slug (`collect_now()`).
+(нельзя показать пустой таймлайн вместо «не читается»), а сбой чтения событий рана
+просто оставляет `events: []` (`duty_attempts()`).
 
 ## Экраны
 
-Сделано в `v0.0.2`, поправлено в `v0.0.3` — и в десктопе, и в веб-версии:
+Сделано в `v0.0.2`, поправлено в `v0.0.3` и `v0.0.6` — и в десктопе, и в веб-версии:
 
 - **Сейчас** — активные дела группами по `waiting.state`
-  (`доска · дело | заголовок | исполнитель | попытка | лизинг | действие | бейдж`),
-  локальные фильтры (доска, чипы состояний, поиск по `id`/заголовку/исполнителю),
+  (`репозиторий · дело | заголовок | исполнитель | попытка | лизинг | действие | бейдж`),
+  локальные фильтры (репозиторий, чипы состояний, поиск по `id`/заголовку/исполнителю),
   автообновление `/now` раз в 10 с;
-- **Дело** — спецификация карточки (`body`, `body_truncated`) плюс те же факты,
-  что в `/now`, и таймлайн попыток рядом. Это таб наравне с остальными: без
-  выбранного дела он показывает выбор из активных, а выбранное запоминается
-  (`lastDeal` в десктопе, `localStorage: duty:last-deal` в вебе), поэтому таб и
-  «← к списку дел» ведут в одно и то же место. У завершённого дела
-  (`terminal: true`) состояния ожидания нет — `deal: null`, и это сказано
-  словами, а не выдуманным бейджем. Внутри попытки показаны **события журнала
-  рана** (claim/spawn/bind/heartbeat/finish) с таймингом, а не вызовы
-  инструментов: в `task_events` ядрового kanban их нет, а P0 читает только
-  kanban. Вызовы инструментов по таймингу — шаг P1 (свой журнал);
+- **Дело** — спецификация дела (`body`, `body_truncated`) плюс те же факты,
+  что в `/now`, и таймлайн попыток рядом. Адрес — только `#/deal/<deal_id>`; прежний
+  адрес с доской (`#/deal/<board>/<id>`) даёт экран отказа с объяснением и ссылкой на
+  id из него. Это таб наравне с остальными: без выбранного дела он показывает выбор
+  из активных, а выбранное запоминается (`lastDeal` в десктопе,
+  `localStorage: duty:last-deal` в вебе), поэтому таб и «← к списку дел» ведут в одно
+  и то же место. У завершённого дела (`terminal: true`) состояния ожидания нет —
+  `deal: null`, и это сказано словами, а не выдуманным бейджем. Внутри попытки
+  показаны **события журнала попытки** (`attempt_started`/`attempt_progress`/
+  `attempt_ended`) с таймингом — из своего журнала, а не `task_events` ядрового kanban;
 - **Почему стоит** — карточки дел с `waiting.evidence` целиком: причину можно
   проверить, а не поверить. Группы — по состояниям, в порядке `WAITING_PRIORITY`;
-- **Здоровье** — три метрики из `/stats`: доля дел, у которых первый по времени
-  ран уже успешен; распределение ожидания до первой попытки (`created_at` →
-  `started_at` первого рана) — `p50`/`p90`/`p99`, `count` и `max`, а не одно число;
-  таксономия исходов по всем ранам. Плюс таблица по доскам с честной колонкой
-  «неполнота» (`truncated`, `warnings`).
+- **Здоровье** — три метрики из `/stats`: доля этапов, закрытых с первой же попытки;
+  распределение ожидания до первой попытки (`created_at` → `started_at` первой попытки)
+  — `p50`/`p90`/`p99`, `count` и `max`, а не одно число; таксономия исходов попыток.
+  Плюс строки по репозиториям и отдельная строка «без репозитория».
 
 ## Форма ответа `/stats`
 
 ```jsonc
 {
   "now": 1793693881,
-  "boards": [{
-    "slug": "hermes-duty", "path": "…/kanban.db", "read": true,
-    "truncated": false, "warnings": [],
-    "tasks_total": 12, "tasks_by_status": { "done": 11, "running": 1 },
-    "runs_total": 14, "runs_by_outcome": { "completed": 12, "crashed": 2 },
-    "first_try": { "ok": 10, "with_runs": 11, "share": 0.909 },
+  "window": { "since": 1793600000, "sec": 93881 },   // null, если окна не задавали
+  "repos": [{
+    "repo": "hermes-duty",
+    "deals": 12, "deals_by_status": { "done": 11, "running": 1 },
+    "attempts_total": 14, "attempts_by_outcome": { "done": 12, "crashed": 2 },
+    "first_try": { "ok": 10, "closed": 11, "share": 0.909 },
     "waiting_sec": { "p50": 227, "p90": 1440, "p99": 3600, "count": 11, "max": 7200 }
   }],
-  "totals": { /* те же поля, сведённые по прочитанным доскам */ },
-  "errors": [],                        // недоступная доска: в итог не входит
-  "warnings": [],                      // обрезанный срез: распределение неполное
-  "success_outcomes": ["completed", …], "crash_outcomes": ["crashed", …]
+  "without_repo": { /* те же поля для дел без репозитория */ },
+  "totals": { /* те же поля, сведённые по всем делам */ },
+  "errors": [],                        // нечитаемый store/журнал: в итог не входит
+  "warnings": [],
+  "success_outcomes": ["done", …], "crash_outcomes": ["crashed", …]
 }
 ```
 
 Правила, которые нельзя перепутать местами:
 
 - перцентили считаются по **объединённой выборке** всех дел, а не как среднее
-  перцентилей досок: перцентиль перцентилей не равен перцентилю объединённой выборки;
+  перцентилей групп: перцентиль перцентилей не равен перцентилю объединённой выборки;
 - метод — ближайший ранг (nearest rank) без интерполяции: `p` — значение на позиции
   `ceil(p / 100 * n)` в возрастающем ряду, поэтому на наборе 1..10 `p50 = 5`, а не 5.5;
 - пустая выборка — `null` во всех перцентилях и `count: 0`: «нет данных» и «ждали
   0 секунд» — разные вещи, нули здесь были бы выдумкой;
-- `first_try.with_runs = 0` — это «считать не по чему» (`share: null`), а не «сто
+- `first_try.closed = 0` — это «считать не по чему» (`share: null`), а не «сто
   процентов»;
-- срез доски ограничен `STATS_TASK_LIMIT` (5000) и сработавший лимит помечен
-  `truncated`, а также назван в `warnings[]` верхнего уровня — иначе доля и
-  распределение выглядели бы полными при урезанной выборке;
-- `?board=` и `?since=` считает `collect_stats()`, а не CLI: перцентиль подмножества не
+- `?repo=` и `?since=` считает `collect_stats()`, а не CLI: перцентиль подмножества не
   выводится из перцентилей целого, поэтому терминал и роут получают одни и те же числа;
 - успех и падение — наборы исходов бэкенда (`success_outcomes`, `crash_outcomes`), а не
   решение UI.
@@ -537,48 +532,53 @@ store и `note` «только свои дела: kanban-доски с таки�
 ## Страница `/duty` (desktop)
 
 Страница читает только два эндпоинта бэкенда — `GET /now` (раз в 10 с,
-`REFRESH_MS`) и `GET /duty/{board}/{task_id}/attempts` (по клику на дело); прямого
+`REFRESH_MS`) и `GET /duty/{deal_id}/attempts` (по клику на дело); прямого
 `fetch`, шелла и чтения файлов из UI нет. Ядро не импортируется, состояния не
 пересчитываются: UI рисует `waiting.state` и `waiting.evidence` как есть, а группы
-строит в порядке первого появления состояния в ответе (`/now` уже отсортирован по
-`WAITING_PRIORITY`). Незнакомое состояние показывается последней группой серым,
-без попытки его «доразобрать» (`desktop/model.js:29-38`, `:158-171`).
+строит по `repo` (`shapeGroups`) и внутри группы — в порядке первого появления
+состояния в ответе (`/now` уже отсортирован по `WAITING_PRIORITY`). Незнакомое
+состояние показывается последней группой серым, без попытки его «доразобрать»
+(`desktop/model.js`).
 
 - экраны переключаются табами в шапке в порядке спеки — «Сейчас», «Дело», «Почему
   стоит», «Здоровье»; таб «Дело» без выбранного дела показывает выбор из активных, а
   выбранное запоминается (`lastDeal`), поэтому таб и «← к списку дел» ведут в одно и
   то же место;
+- адрес дела — `#/deal/<deal_id>`. Прежний адрес с доской (`#/deal/<board>/<id>`)
+  даёт экран отказа с объяснением и ссылкой на извлечённый из него id: старый адрес
+  не становится алиасом, иначе доски вернулись бы через чужую закладку;
 - «Здоровье» запрашивает `/stats` только когда открыто (`STATS_REFRESH_MS` = 30 с);
-- строка таблицы: доска · `id` · title (многоточие) · assignee · возраст попытки ·
-  состояние лизинга · возраст последнего действия · бейдж состояния с цветом
-  (жёлтый `wait_human`, фиолетовый `capability`, красный `dead_lease`/`crashed`,
-  зелёный `working`, серый `no_signal`/`wait_slot`/`wait_gate`);
-- фильтры локальные (доска, чипы состояний, поиск по `id`/title с debounce 240 мс):
-  `/now` на ввод не перезапрашивается (`desktop/plugin.js:22`, `desktop/model.js:239-253`);
-- экран «Дело» — таймлайн попыток: полоса на попытку относительно самой долгой,
-  длительность, исход цветом (набор «падений» — из `crash_outcomes` ответа),
-  `error` текстом, события рана списком; пока грузится — скелетон; рядом
-  спецификация карточки (`body`, `body_truncated`);
+- строка таблицы: репозиторий (или «репозиторий не назван») · `id` · title
+  (многоточие) · assignee · возраст попытки · состояние лизинга · возраст последнего
+  действия · бейдж состояния с цветом (жёлтый `wait_human`, фиолетовый `capability`,
+  красный `dead_lease`/`crashed`, зелёный `working`, серый
+  `no_signal`/`wait_slot`/`wait_gate`);
+- фильтры локальные (репозиторий, чипы состояний, поиск по `id`/`title`/`repo` с
+  debounce 240 мс): `/now` на ввод не перезапрашивается (`desktop/plugin.js`,
+  `desktop/model.js`);
+- экран «Дело» — общая шкала времени на всё дело: ось от первого события журнала до
+  `now` (у закрытого дела — до закрытия), дорожка на этап графа, полосы попыток и
+  маркеры событий на той же оси. Второй геометрии («доля от самой долгой попытки»)
+  нет: две шкалы на одном экране были бы несравнимы — `shapeDealTime()` в
+  `desktop/model.js`, полоса на попытку при `min-width` 2 % и подписью «<1с» для
+  коротких, незакрытые попытки — пунктиром до `now`. Исход подписан цветом (набор
+  «падений» — из `crash_outcomes` ответа), `error` текстом, события попытки
+  списком; пока грузится — скелетон; рядом спецификация дела (`body`,
+  `body_truncated`);
 - ошибка запроса — красная плашка с текстом и кнопкой «повторить», данные на
-  экране не затираются; недоступные доски и упавшие источники (`errors`) — жёлтой
-  полосой, а в пустом состоянии — списком «доска X недоступна: причина» рядом со
-  счётчиком реально прочитанных досок (`desktop/plugin.js:673-680`, `:682-699`, `:775-785`);
+  экране не затираются; упавшие источники (`errors`) — жёлтой полосой, а в пустом
+  состоянии — тем же списком рядом со списком дел (`desktop/plugin.js`);
 - **устаревший снимок не выдаёт себя за свежий.** Показ прошлых данных — это
   осознанное поведение (экран не мигает пустотой при обрыве), но замечания к
   прошлому ответу к настоящему отношения не имеют: при `snap.error` список
   неполноты гасится (`noticeLines(model, stale)`), а плашка говорит
   `снимок от HH:MM:SS — обновление не удалось: …`, где время берётся из поля
-  `now` снимка, то есть из бэкенда. Без этого строка «доска `_archived`
-  недоступна» переживает починку кода и висит, пока страницу не перезагрузят
+  `now` снимка, то есть из бэкенда. Без этого строка «источник duty/duty.db
+  недоступен» переживает починку кода и висит, пока страницу не перезагрузят
   (`desktop/model.js`, `desktop/plugin.js`);
 - ответы бэкенда не кэшируются: `Cache-Control: no-store, no-cache,
   must-revalidate` ставится на все маршруты плагина, включая `4xx` — у ошибок
-  тоже нет права переживать свой запрос в кэше промежуточного слоя;
-- `boards[].truncated` и `boards[].warnings` шейпер разбирает в `truncatedNotices`
-  и `warningNotices` (`desktop/model.js:205-210`), а страница рисует их жёлтой
-  полосой над списком, когда дела есть, и тем же списком в пустом состоянии
-  (`desktop/plugin.js:673-680`, `:775-785`, `:682-699`); порядок строк в полосе:
-  недоступные доски, упавшие источники, обрезанный срез, деградировавшие таблицы.
+  тоже нет права переживать свой запрос в кэше промежуточного слоя.
 
 Шейпер ответов — `desktop/model.js` (чистые функции, без React/DOM). Загрузчик
 десктопных плагинов исполняет `plugin.js` как blob-модуль и отвергает любой
@@ -601,22 +601,37 @@ CommonJS-скрипт и пропускает то, что валит парсе
 ответ роута дословно, поэтому терминал и экран не могут разойтись по построению.
 
 ```
-duty now [--board B] [--state S]        таблица дел: доска, id, ожидание, возраст, доказательство
-duty deal <board> <id>                 карточка дела: факты плюс таймлайн попыток
-duty attempts <board> <id>             только таймлайн попыток
-duty stats [--board B] [--since D]     p50/p90/p99, исходы, «с первой попытки»
-duty why <board> <id>                  доказательство словами бэкенда
-duty why <board> <id> <этап>           плюс приговор последней попытки этапа
-duty watch [--interval 10]             тот же now, перерисовка в терминале
+duty now [--repo R] [--state S]        таблица дел: репозиторий, id, ожидание, возраст, доказательство
+duty deal <deal_id>                    карточка дела: факты плюс таймлайн попыток
+duty attempts <deal_id>                только таймлайн попыток
+duty stats [--repo R] [--since D]      p50/p90/p99, исходы, «с первой попытки»
+duty why <deal_id>                     доказательство словами бэкенда
+duty why <deal_id> <этап>              плюс приговор последней попытки этапа
+duty watch [--interval 10] [--repo R]  тот же now, перерисовка в терминале
+duty run <deal_id> [--spec P] [--max-steps N] [--once]
+                                       довести дело по спеке: решение → шаг → перечитать журнал
+duty reap [--dry-run]                  закрыть осиротевшие попытки (лизинг истёк, конца нет)
+duty decide <deal_id> continue|stop    решение человека: продолжить или закрыть
+duty close <deal_id> [--reason R]      закрыть дело решением человека
 duty demo [--home DIR] [--keep]        прогон дела по спеке на песочном корне
+duty spec check <путь>                 проверить duty.yaml до запуска
 duty create|comment|block|unblock|claim|complete|review|changes|attach|archive …
                                        мутации своего дела (docs/OWNERSHIP.md)
 ```
 
-Коды возврата — контракт: `0` — ответ получен и `errors[]` пуст; `1` — доска или дело не
-найдены (404 роута); `2` — ошибка источников (503/400 роута или непустой `errors[]`) либо
-неверный вход мутации. `duty watch` деградацию источников не превращает в падение:
-печатает `errors[]` строками и продолжает, отсутствующая доска — выход с кодом 1.
+Ни одной команды с доской нет: дело адресуется своим `id`, а группировка задаётся
+`--repo` (пустая строка — дела без репозитория). Старое `--board` не оставлено даже
+как синоним: адрес и фильтр — разные вещи, и синоним сделал бы доску снова адресом.
+
+Коды возврата — контракт: `0` — ответ получен и `errors[]` пуст; `1` — дело не найдено
+(404 роута); `2` — ошибка источников (503/400 роута или непустой `errors[]`) либо
+неверный вход мутации; `3` — драйвер ждёт (ответа человека, приговора, паузы,
+чужого лизинга); `4` — упёрся в предел шагов; `130` — прервано с клавиатуры
+(`dashboard/driver.py`). Неизвестный `--repo` — не ошибка: пустой срез и код `0`,
+потому что репозиторий — свойство дела, а не адрес (`duty now --repo nope` печатает
+«дел нет»).
+`duty watch` деградацию источников не превращает в падение: печатает `errors[]`
+строками и продолжает, отсутствующее дело — выход с кодом 1.
 `duty claim` без `--owner` подставляет `HERMES_PROFILE`, иначе пользователя ОС.
 
 Интерпретатор: `plugin_api.py` импортирует `fastapi` на уровне модуля, а в системном
@@ -632,21 +647,23 @@ duty create|comment|block|unblock|claim|complete|review|changes|attach|archive �
 `~/.hermes` берётся только DDL схем, данные не читаются) и печатает отчёт: шаги, журнал
 дела, пул вопросов, проверки и блок «чего ещё нет».
 
-Шаги прогона: create → claim → ask → answer → gate (родитель → ребёнок) → comment/attach
-→ ingest (чужие факты) → повторный ingest → `/now` → второй вопрос → complete → поздний
-ответ. Каждый шаг помечен тем, **кто его сделал**: `script` — сегодня это делает прогон,
-`engine` — то, что появится с движком; иначе демонстрация выдавала бы скрипт за движок.
+Шаги прогона: create → claim → ask → answer → gate (родитель → ребёнок) → comment →
+наблюдение `/cards` → повторное наблюдение → `/now` → второй вопрос → complete →
+поздний ответ. Каждый шаг помечен тем, **кто его сделал**: `script` — сегодня это
+делает прогон, `engine` — то, что делает движок; иначе демонстрация выдавала бы
+скрипт за движок.
 
 Прогон падает, если не сходится хотя бы один из семи инвариантов учёта: вопрос уводит
 дело в `wait_human`; ответ возвращает его в работу; гейт ребёнка открывается завершением
 родителя; закрытое дело уходит из `/now`; поздний ответ не воскрешает закрытое;
-повторный `ingest` не плодит событий; `kanban.db` после прогона побайтово тот же.
+повторное наблюдение карточек не плодит событий; `kanban.db` после прогона побайтово
+тот же.
 
 Спека-образец — `examples/demo.yaml`: этапы, роли, evidence-команды и объявленные
-вопросы. Код 0.0.3 этот файл не читает и не валидирует — движка, который исполняет
-этапы, нет; файл нужен, чтобы спека и учёт не разъехались. Отчёт печатает ту же спеку и
-блок «чего ещё нет до 0.1.0» (этапы и их граф, лизинг и спавн `hermes chat -p <role>`,
-попытка как процесс с кодом выхода, проверка evidence, ретраи и `reap`).
+вопросы. Прогон не исполняет спеку движком: он проверяет, что спека и учёт не
+разъехались. Отчёт печатает ту же спеку и блок «чего ещё нет до 0.1.0» (этапы и их
+граф, лизинг и спавн `hermes chat -p <role>`, попытка как процесс с кодом выхода,
+проверка evidence, ретраи и `reap`).
 `--json` печатает отчёт целиком (`steps`, `checks`, `ledger`, `pool`, `engine_todo`),
 `--keep` оставляет песочный корень для разбора.
 
@@ -661,7 +678,11 @@ duty create|comment|block|unblock|claim|complete|review|changes|attach|archive �
   драйвер `bin/duty run` и уборка осиротевших попыток `reaper.sweep` (`bin/duty reap`:
   попытка без `attempt_ended` с истёкшим лизингом закрывается `failed(infra)` с
   `reaped: true`, поэтому срез и переход сходятся сами). Осталось из фазы:
-  декомпозиция дела на подзадачи — она же названа в блоке «чего ещё нет» `duty demo`.
-  Наблюдение за kanban-делами продолжает работать, пока движок не заменит ядро целиком;
+  декомпозиция дела на подзадачи — она же названа в блоке «чего ещё нет» `duty demo`;
+- `0.0.6` (сделано) — досок нет: дело адресуется своим `d_<hex>`, группируется по
+  `repo`, журнал и store — единственный источник дел и состояния, а карточки kanban
+  живут отдельным наблюдением `/cards`. Схема журнала и store пересобрана (колонки
+  `board` больше нет, её значение у старых событий переехало в `payload.board`),
+  маршруты и CLI адресуют дело по id, `?board=` отвечает 400 с подсказкой про `?repo=`;
 - `0.1.0+` — P1: duty заменяет kanban для оркестрации — дела живут только в своём store,
   ядро kanban для наблюдаемости больше не нужно.

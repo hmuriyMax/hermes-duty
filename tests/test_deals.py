@@ -293,6 +293,23 @@ def test_create_with_board_field_is_error(home: Path, client: TestClient) -> Non
     assert deal_rows(home) == []
 
 
+def test_patch_repo_is_refused_in_words(home: Path, client: TestClient) -> None:
+    """`repo` правкой не меняется: `PATCH {repo}` отказывает словами, а не молчит.
+
+    Молчаливое игнорирование читалось бы как «репозиторий сменён»: `repo` — свойство
+    дела, оно вычисляется при создании (из спеки либо явного значения).
+    """
+    deal = create(client, repo=BOARD)
+
+    response = client.patch(f"/deals/{deal['id']}", json={"repo": "other/repo"})
+
+    assert response.status_code == 400
+    reason = response.json()["errors"][0]["reason"]
+    assert "repo" in reason
+    assert "создании" in reason
+    assert deal_rows(home)[0]["repo"] == BOARD
+
+
 def test_create_requires_title_but_not_repo(client: TestClient) -> None:
     """Пустой title — ошибка входа; пустой `repo` — законное «репозиторий не назван»."""
     response = client.post("/deals", json={"title": "  "})

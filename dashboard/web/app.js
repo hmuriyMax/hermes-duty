@@ -704,7 +704,9 @@ function viewDealPicker() {
  * называет, что доски больше нет, и даёт ссылку на id из прежнего адреса.
  */
 function viewDealBadAddress(board, dealId) {
-  const id = dealId && /^d_[0-9a-f]+$/i.test(dealId) ? dealId : ''
+  // Форма id — та же, что у бэкенда (`deals.is_own`: `^d_[0-9a-f]{6,}$`): адрес,
+  // который бэкенд заведомо не примет, не должен превращаться в ссылку.
+  const id = dealId && /^d_[0-9a-f]{6,}$/.test(dealId) ? dealId : ''
   return h(
     'div',
     { class: 'empty' },

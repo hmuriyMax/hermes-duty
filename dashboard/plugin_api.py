@@ -676,14 +676,8 @@ DECISION_KIND = "decision"
 # принимается по ответу, но таблица `duty now` не переносит строк.
 DECISION_ANSWER_LIMIT = 80
 
-# Сколько задач берёт экран «Здоровье» с доски. Это не срез «сейчас»: тут важна
-# доля, а не мгновенная картина, поэтому лимит больше. Сработавший лимит виден
-# как `truncated` доски и назван в `warnings[]` итога — молча урезать выборку
-# нельзя, иначе и доля, и распределение ожидания врут.
-STATS_TASK_LIMIT = 5000
-
-# Исходы рана, которые считаются успехом попытки. Отдельно от статуса: у рана
-# бывает `status='awaiting_merge'` с `outcome='completed'` — этап пройден.
+# Исходы попытки, которые считаются успехом. Отдельно от статуса попытки: этап
+# считается пройденным по исходу, а не по тому, закрылась ли попытка.
 SUCCESS_OUTCOMES = ("completed", "done", "succeeded")
 
 # Сколько тела дела отдаём на экран «Дело» (тело карточки — спецификация, в
@@ -1668,17 +1662,14 @@ def collect_stats(
     empty = _repo_metrics("", [], journal_events, now, leases)
     without_group = _repo_metrics("", without, journal_events, now, leases)
     if repo is not None:
-        if repo == "":
-            groups = []
-        else:
-            groups = [group for group in groups if group["repo"] == repo]
+        # Неизвестный `repo` — это фильтр, а не ресурс: пустой результат, а не 404.
+        # Опечатка в фильтре видна пустым ответом; отказом она выглядела бы как
+        # «такого репозитория нет», хотя репозиторий — свойство дела, а не адрес.
+        groups = [group for group in groups if group["repo"] == repo]
+        # `repo=""` — ровно дела без репозитория: их группа остаётся, а группы
+        # названных репозиториев — пусты.
+        if repo:
             without_group = empty
-            if not groups:
-                raise HTTPException(
-                    status_code=404,
-                    headers=NO_STORE_HEADERS,
-                    detail=f"repo '{repo}' не назван ни одним делом",
-                )
     waits: list[int] = []
     for group in groups + [without_group]:
         waits.extend(group.pop("_waits", []))
@@ -1706,12 +1697,13 @@ def stats(
 ) -> dict[str, Any]:
     """Здоровье дел по репозиториям: доля этапов с первой попытки, ожидание, исходы.
 
-    `?repo=<путь>` — только один репозиторий (404, если его не назвало ни одно
-    дело); `?repo=` (пустая строка) — только дела **без** репозитория;
-    `?since=<unix>` — только дела, созданные не раньше этой секунды. Фильтры
-    считает `collect_stats`, поэтому CLI и роут отдают одну и ту же форму и одни
-    и те же числа. `?board=` — отказ (400) с подсказкой: доск нет, фильтр
-    называется `repo`.
+    `?repo=<путь>` — только один репозиторий; `?repo=` (пустая строка) — только
+    дела **без** репозитория; `?since=<unix>` — только дела, созданные не раньше
+    этой секунды. Фильтры считает `collect_stats`, поэтому CLI и роут отдают одну
+    и ту же форму и одни и те же числа. Неизвестный `repo` — это фильтр, а не
+    ресурс: ответ 200 с пустым результатом, как у `/now` (одно поведение на обеих
+    ручках — `docs/SPEC.md`). `?board=` — отказ (400) с подсказкой: доск нет,
+    фильтр называется `repo`.
     """
     _refuse_board_filter(board)
     return collect_stats(_hermes_home(), _now_sec(), repo=repo, since=since)
@@ -2027,7 +2019,16 @@ def _repo_of(spec: Optional[str], repo: Optional[str]) -> Optional[str]:
 def deals_patch(
     home: Path, deal_id: str, payload: dict[str, Any], *, source: str = "api"
 ) -> dict[str, Any]:
-    """`PATCH /deals/{id}`: title/body/assignee и `status='archived'`."""
+    """`PATCH /deals/{id}`: title/body/assignee и `status='archived'`.
+
+    `repo` правкой не принимается (0.0.6): он задаётся при создании из спеки дела
+    или явного значения, и отказ назван словами — молча проигнорированное поле
+    читалось бы как «репозиторий сменён».
+    """
+    if payload.get("repo") is not None:
+        raise deals.DealError(
+            "patch: 'repo' — свойство дела, задаётся при создании; правкой не меняется"
+        )
     conn = _store_for_write(home)
     try:
         return _mutation(
@@ -2417,21 +2418,6 @@ def attach_deal_route(deal_id: str, file: UploadFile = File(...)) -> Any:
         return _deal_error(exc, deal_id)
 
 
-def _repo_entry(home: Path, repo: str) -> None:
-    """Репозиторий назван хотя бы одним делом — иначе 404 словами.
-
-    Опечатка в `?repo=` не должна давать «пусто»: пустая страница выглядела бы
-    как «в репозитории нет дел», хотя такого репозитория не называло ни одно дело.
-    """
-    if any(group["repo"] == repo for group in _repos_of(home)["list"]):
-        return
-    raise HTTPException(
-        status_code=404,
-        headers=NO_STORE_HEADERS,
-        detail=f"repo '{repo}' не назван ни одним делом",
-    )
-
-
 BOARD_FILTER_HINT = (
     "фильтра 'board' больше нет (0.0.6): доск нет, дело адресуется своим id d_<hex>, "
     "а группировка задаётся 'repo' — передай ?repo=<путь>, ?repo= для дел без "
@@ -2464,9 +2450,10 @@ def now(
 ) -> dict[str, Any]:
     """Активные дела: лизинг, попытка, последнее действие, ожидание.
 
-    `?repo=<путь>` — только один репозиторий (404, если его не назвало ни одно
-    дело); `?repo=` (пустая строка) — только дела **без** репозитория;
-    `?state=<waiting.state>` — только дела в этом состоянии ожидания.
+    `?repo=<путь>` — только один репозиторий; `?repo=` (пустая строка) — только
+    дела **без** репозитория; `?state=<waiting.state>` — только дела в этом
+    состоянии ожидания. Неизвестный `repo` — это фильтр, а не ресурс: ответ 200 с
+    пустым списком, ровно как у `/stats` (`docs/SPEC.md`).
     `?board=` — отказ (400) с подсказкой: доск нет, фильтр называется `repo`.
 
     Прохода ingest больше нет (`?ingest=1` удалён вместе с досками): срез только
@@ -2480,8 +2467,6 @@ def now(
             detail=f"unknown state '{state}', expected one of {list(WAITING_PRIORITY)}",
         )
     home = _hermes_home()
-    if repo:
-        _repo_entry(home, repo)
     return collect_now(home, _now_sec(), repo=repo, state=state)
 
 

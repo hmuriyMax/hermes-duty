@@ -67,6 +67,35 @@ CREATE TABLE questions (
 
 # ------------------------------------------------------------------ фикстуры
 
+# Схема kanban-БД карточек — ровно те колонки, которые читает наблюдение `/cards`
+# (`plugin_api._cards_of`), плюс лизинг рана: наблюдение показывает статус, ран и
+# срок лизинга, а не дела.
+CARD_SCHEMA = """
+CREATE TABLE tasks (
+    id                   TEXT PRIMARY KEY,
+    title                TEXT NOT NULL,
+    body                 TEXT,
+    assignee             TEXT,
+    status               TEXT NOT NULL,
+    created_at           INTEGER NOT NULL,
+    started_at           INTEGER,
+    completed_at         INTEGER,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    current_run_id       INTEGER,
+    block_kind           TEXT
+);
+CREATE TABLE task_runs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id       TEXT NOT NULL,
+    profile       TEXT,
+    status        TEXT NOT NULL,
+    started_at    INTEGER NOT NULL,
+    ended_at      INTEGER,
+    outcome       TEXT,
+    lease_expires INTEGER
+);
+"""
+
 
 def make_pool(home: Path) -> Path:
     """Пул вопросов по реальной схеме; повторный вызов не пересоздаёт таблицу."""
@@ -523,10 +552,38 @@ def test_state_and_repo_filters(home: Path, client: TestClient) -> None:
     assert [deal["id"] for deal in one_state["deals"]] == [stack]
     assert one_state["by_state"]["wait_human"] == 1
 
-    assert client.get("/now", params={"repo": "nope"}).status_code == 404
+    # Неизвестный repo — фильтр, а не ресурс: пустой результат, тот же код, что у
+    # `/stats` (одно поведение на обеих ручках, `docs/SPEC.md`).
+    unknown = client.get("/now", params={"repo": "nope"})
+    assert unknown.status_code == 200
+    assert unknown.json()["deals"] == []
+    assert unknown.json()["count"] == 0
     assert client.get("/now", params={"state": "nonsense"}).status_code == 400
     assert client.get("/duty/d_00000000/attempts").status_code == 404
     assert client.get("/duty/nonsense/attempts").status_code == 400
+
+
+def test_unknown_repo_is_a_filter_on_both_handles(home: Path, client: TestClient) -> None:
+    """`/now?repo=` и `/stats?repo=` отвечают одинаково: 200 с пустым результатом.
+
+    Репозиторий — свойство дела, а не адрес: опечатка в фильтре даёт пустую
+    страницу, а не 404. Расхождение было настоящим: `/stats?repo=<живой>&since=`
+    отдавал 404, потому что repo искался уже внутри окна `since`.
+    """
+    deal = make_deal(home, status="todo", repo="stack", created_at=NOW - 100)
+
+    for path in ("/now", "/stats"):
+        response = client.get(path, params={"repo": "nope"})
+        assert response.status_code == 200, path
+        assert response.json()["errors"] == [], path
+    assert client.get("/stats", params={"repo": "nope"}).json()["repos"] == []
+    assert client.get("/now", params={"repo": "nope"}).json()["deals"] == []
+
+    # Живой repo вне окна `since` — тот же ответ, а не 404: дело есть, окно пустое.
+    windowed = client.get("/stats", params={"repo": "stack", "since": NOW + 1000})
+    assert windowed.status_code == 200
+    assert windowed.json()["repos"] == []
+    assert client.get("/now", params={"repo": "stack"}).json()["deals"][0]["id"] == deal
 
 
 def test_sorting_is_deterministic_between_polls(home: Path) -> None:
@@ -764,3 +821,81 @@ def test_kanban_cards_are_not_deals(home: Path, client: TestClient) -> None:
     assert body["deals"] == []
     assert body["count"] == 0
     assert client.get("/deal/t_0000aa").status_code == 400
+
+
+# ------------------------------------------------- доски выбыли: наблюдение /cards
+#
+# Карточки kanban живут только в `/cards` (`plugin_api._card_databases`), и выбывшая
+# доска источником не считается: ядро kanban убирает закрытые доски в
+# `kanban/boards/_archived/` и ставит камень `board.json: archived`. Пробы ниже —
+# про `_retired`, а не про адресацию: адрес дела от доски не зависит вовсе.
+
+
+def make_cards_board(home: Path, name: str, card: str) -> Path:
+    """Kanban-БД доски `name` с одной карточкой — так её раскладывает ядро Hermes."""
+    database = home / "kanban" / "boards" / name / "kanban.db"
+    database.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(database)
+    conn.executescript(CARD_SCHEMA)
+    conn.execute(
+        "INSERT INTO tasks (id, title, assignee, status, block_kind, consecutive_failures, "
+        "created_at) VALUES (?, 'карточка', 'implementer', 'blocked', 'needs_input', 0, 1)",
+        (card,),
+    )
+    conn.commit()
+    conn.close()
+    return database
+
+
+def cards_names(client: TestClient) -> list[str]:
+    """Имена kanban-БД, которые наблюдение `/cards` реально прочитало."""
+    body = client.get("/cards").json()
+    return [entry["name"] for entry in body["cards"]]
+
+
+def test_archived_namespace_is_not_a_live_source(home: Path, client: TestClient) -> None:
+    """`boards/_archived/` — namespace, а не доска: в `/cards` он не читается.
+
+    Раньше `_archived/kanban.db` попадал в обнаружение как ещё одна доска и висел
+    в ответе пустым наблюдением, хотя это каталог выбывших досок.
+    """
+    make_cards_board(home, "stack", "t_3e0c0001")
+    make_cards_board(home, "_archived/old-board", "t_3e0c0002")
+    (home / "kanban" / "boards" / "_archived" / "kanban.db").write_bytes(b"")
+
+    assert cards_names(client) == ["stack"]
+    body = client.get("/cards").json()
+    assert body["databases"] == 1
+    assert body["count"] == 1
+    assert {card["id"] for entry in body["cards"] for card in entry["cards"]} == {"t_3e0c0001"}
+
+
+def test_archived_tombstone_board_is_skipped(home: Path, client: TestClient) -> None:
+    """Доска с камнем `board.json: archived` не читается в `/cards`."""
+    make_cards_board(home, "stack", "t_3e0d0001")
+    legacy = make_cards_board(home, "legacy", "t_3e0d0002")
+    (legacy.parent / "board.json").write_text('{"slug": "legacy", "archived": true}')
+
+    assert cards_names(client) == ["stack"]
+
+
+def test_retired_filter_is_about_retirement_not_readability(
+    home: Path, client: TestClient
+) -> None:
+    """Выбывшая доска скрыта, живая пустая — видна: фильтр про retired, не про чтение."""
+    make_cards_board(home, "stack", "t_3e0e0001")
+    retired = make_cards_board(home, "_archived/old-board", "t_3e0e0002")
+    assert retired.is_file()
+    empty = home / "kanban" / "boards" / "empty-board" / "kanban.db"
+    empty.parent.mkdir(parents=True)
+    empty.write_bytes(b"")
+
+    body = client.get("/cards").json()
+    shown = {entry["name"]: entry for entry in body["cards"]}
+
+    # выбывшая доска со своей карточкой не показана вовсе, хотя её БД читается
+    assert "old-board" not in shown
+    assert {card["id"] for entry in body["cards"] for card in entry["cards"]} == {"t_3e0e0001"}
+    # пустая живая доска остаётся в наблюдении с причиной «empty db», а не исчезает
+    assert shown["empty-board"]["read"] is False
+    assert shown["empty-board"]["note"] == "empty db"

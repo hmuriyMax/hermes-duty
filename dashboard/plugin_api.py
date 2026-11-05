@@ -1505,6 +1505,20 @@ def collect_now(
 
 PERCENTILES = (50, 90, 99)
 
+# Окно здоровья по умолчанию — сутки: спека (экран 4 «здоровье») меряет «за
+# сутки», и число без окна («за всё время») с ней не сравнимо. `?since=`/`--since`
+# называет границу явно и переопределяет эту.
+HEALTH_WINDOW_SEC = 24 * 60 * 60
+
+# Класс отказа «контракт» (`dashboard/failures.py`): движок кладёт его в `kind`
+# события `attempt_ended`, старые записи — в `details.class`. Одно слово на плагин:
+# переписанное строкой, оно разошлось бы с политикой ретраев.
+CONTRACT_CLASS = "contract"
+
+# Код правила в тексте причины отказа: `artifact.missing`, `commit.foreign`,
+# `result.json`. Правило — последний точечный код причины, а не путь перед ним.
+RULE_CODE_RE = re.compile(r"\b[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]+)+\b")
+
 
 def _waiting_distribution(values: list[int]) -> dict[str, Any]:
     """Распределение ожидания до первой попытки: p50, p90, p99, `count`, `max`.
@@ -1532,36 +1546,158 @@ def _waiting_distribution(values: list[int]) -> dict[str, Any]:
     return shaped
 
 
+def _payload_dict(event: dict[str, Any]) -> dict[str, Any]:
+    """`payload` события объектом: у факта без payload полей нет, а не «пусто-мусор»."""
+    payload = journal.payload_of(event)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _int(value: Any) -> int:
+    """Целое из payload: `True` числом не считается, мусор — нулём."""
+    if value is None or isinstance(value, bool):
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _maybe_int(value: Any) -> Optional[int]:
+    """Целое или `None`: токены отсутствуют честно, а не нулём."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _details_of(payload: dict[str, Any]) -> dict[str, Any]:
+    """`details` попытки объектом: детали пишет движок, а не вызывающий."""
+    details = payload.get("details")
+    return details if isinstance(details, dict) else {}
+
+
+def _window_events(events: list[dict[str, Any]], since: int) -> list[dict[str, Any]]:
+    """Факты окна: `ts` не раньше границы. Окно — про факты, а не про дела."""
+    return [event for event in events if _int(event.get("ts")) >= int(since)]
+
+
+def _refusal_rule(payload: dict[str, Any]) -> str:
+    """Правило отказа контракта: `details.rule`, иначе код причины, иначе первая фраза.
+
+    Класс отказа (`contract`) говорит «чем кончилось», а экран «Здоровье» считает
+    ещё и **чем** — разбивкой по правилу. Движок пишет правило текстом причины
+    (`result.json:artifacts[0].path: artifact.missing: …`), и правилом там служит
+    последний точечный код, а не путь перед ним; у причины без кода (`код 1,
+    ждали 0`) правило — её первая фраза.
+    """
+    rule = str(_details_of(payload).get("rule") or "").strip()
+    if rule:
+        return rule
+    reason = str(payload.get("reason") or "").strip()
+    codes = RULE_CODE_RE.findall(reason)
+    if codes:
+        return codes[-1]
+    return re.split(r"[:,]", reason, maxsplit=1)[0].strip() or "без правила"
+
+
+def _refusal_class(payload: dict[str, Any]) -> str:
+    """Класс отказа попытки: `kind` события (так пишет движок), иначе `details.class`."""
+    return str(payload.get("kind") or _details_of(payload).get("class") or "").strip()
+
+
+def _human_waits(events: list[dict[str, Any]]) -> list[int]:
+    """Ожидание человека: `question_answered.ts − question_asked.ts` по `question_id`.
+
+    Это **другая** величина, чем ожидание до первой попытки этапа: там ждёт
+    очередь движка, здесь — человек. Пара ищется по id вопроса, а не по порядку
+    событий (ответ приходит отдельным фактом и может лечь позже любого другого).
+    Вопрос без ответа в выборку не идёт: он либо ещё ждёт, либо закрыт таймаутом,
+    и приписывать ему срок нельзя.
+    """
+    asked: dict[str, int] = {}
+    answered: dict[str, int] = {}
+    for event in sorted(events, key=lambda item: _int(item.get("id"))):
+        kind = str(event.get("kind") or "")
+        if kind not in ("question_asked", "question_answered"):
+            continue
+        payload = _payload_dict(event)
+        question_id = payload.get("question_id")
+        if question_id is None:
+            continue
+        key = str(question_id)
+        if kind == "question_asked":
+            asked.setdefault(key, _int(event.get("ts")))
+        else:
+            answered.setdefault(key, _int(event.get("ts")))
+    return [max(0, answered[key] - asked[key]) for key in asked if key in answered]
+
+
 def _repo_metrics(
     name: str,
     rows: list[dict[str, Any]],
     journal_events: dict[str, list[dict[str, Any]]],
     now: int,
     leases: dict[str, dict[tuple[str, int], int]],
+    since: int,
 ) -> dict[str, Any]:
     """Здоровье одной группы-репозитория: по журналу её дел, не по карточкам.
 
     Метрики — про **дела движка**, и считаются ровно по тем фактам, которые он
-    пишет сам: этап (`deal_id` + `stage`) с первой попытки, исходы попыток и
-    ожидание до первой попытки этапа. Ни одно число здесь не выводится из
-    `kanban.db`: карточки — наблюдение (`/cards`), и их «раны» не дела.
+    пишет сам: этап (`deal_id` + `stage`), закрытый с первой попытки; исходы и
+    классы попыток; ожидание человека (`question_asked` → `question_answered`);
+    ожидание до первой попытки этапа; отказы контракта с разбивкой по правилу;
+    токены за окно. Ни одно число здесь не выводится из `kanban.db`: карточки —
+    наблюдение (`/cards`, отдельный блок ответа `cards`), и их «раны» не дела.
+
+    `since` — граница окна по `ts` фактов: `attempt_*`, `question_*` и близкие
+    метрики считаются только по фактам окна, иначе «за сутки» и «за всё время»
+    смешались бы в одно число.
 
     `first_try.share` — `null` при нулевом знаменателе, а не «100%» и не «0%»:
-    доля без случаев не считается. `waiting_sec` — распределение по делам, у
-    которых первая попытка этапа началась: «ждали 0 секунд» и «ждать было нечему»
-    разные факты, поэтому пустая выборка даёт `null`, а не нули.
+    доля без случаев не считается. `waiting_sec` и `waiting_human_sec` —
+    распределения: «ждали 0 секунд» и «ждать было нечему» разные факты, поэтому
+    пустая выборка даёт `null`, а не нули. `tokens.total` — `null`, если ни одна
+    закрытая попытка окна не записала `usage_tokens`: ноль был бы выдумкой.
     """
     by_status: dict[str, int] = {}
     by_outcome: dict[str, int] = {}
+    by_class: dict[str, int] = {}
+    by_rule: dict[str, int] = {}
     waits: list[int] = []
+    human_waits: list[int] = []
     attempts_total = 0
     first_ok = 0
     closed = 0
+    stages_total = 0
+    deals_active = 0
+    ended_total = 0
+    tokens_total = 0
+    tokens_count = 0
     for row in rows:
         status = str(row.get("status") or "—")
         by_status[status] = by_status.get(status, 0) + 1
         deal_id = str(row["id"])
-        events = journal_events.get(deal_id, [])
+        events = _window_events(journal_events.get(deal_id, []), since)
+        if events:
+            deals_active += 1
+        human_waits.extend(_human_waits(events))
+        for event in events:
+            if str(event.get("kind") or "") != "attempt_ended":
+                continue
+            payload = _payload_dict(event)
+            ended_total += 1
+            refusal = _refusal_class(payload)
+            if refusal:
+                by_class[refusal] = by_class.get(refusal, 0) + 1
+                if refusal == CONTRACT_CLASS:
+                    rule = _refusal_rule(payload)
+                    by_rule[rule] = by_rule.get(rule, 0) + 1
+            tokens = _maybe_int(_details_of(payload).get("usage_tokens"))
+            if tokens is not None:
+                tokens_total += tokens
+                tokens_count += 1
         attempts = stagefeed.attempts(events, now, leases=leases.get(deal_id, {}))
         attempts_total += len(attempts)
         stages: dict[str, list[dict[str, Any]]] = {}
@@ -1570,6 +1706,7 @@ def _repo_metrics(
             outcome = attempt.get("outcome")
             key = str(outcome) if outcome else f"без исхода ({attempt.get('status') or '—'})"
             by_outcome[key] = by_outcome.get(key, 0) + 1
+        stages_total += len(stages)
         for stage_attempts in stages.values():
             finished = [item for item in stage_attempts if item.get("finished_at") is not None]
             if not finished:
@@ -1592,17 +1729,86 @@ def _repo_metrics(
     return {
         "repo": name,
         "deals": len(rows),
+        "deals_active": deals_active,
         "deals_by_status": by_status,
         "attempts_total": attempts_total,
         "attempts_by_outcome": by_outcome,
+        "attempts_by_class": by_class,
+        # Доля этапов с первой попытки — та самая метрика спеки; имя `first_try`
+        # оставлено как было: его читают поверхности (`dashboard/web/app.js`,
+        # `desktop/plugin.js`) и оно не врёт. `stages` называет знаменатель.
         "first_try": {
             "ok": first_ok,
             "closed": closed,
             "share": (first_ok / closed) if closed else None,
         },
+        "stages": {"total": stages_total, "closed": closed},
         "waiting_sec": _waiting_distribution(waits),
+        "waiting_human_sec": _waiting_distribution(human_waits),
+        "contract_refusals": {"count": sum(by_rule.values()), "by_rule": by_rule},
+        "tokens": {
+            "total": tokens_total if tokens_count else None,
+            "count": tokens_count,
+            "without": ended_total - tokens_count,
+        },
         "_waits": waits,
+        "_human_waits": human_waits,
     }
+
+
+def _cards_summary(home: Path) -> dict[str, Any]:
+    """Карточки kanban счётом: `tasks_total`/`runs_total`, статусы и исходы ранов.
+
+    Это **наблюдение, не дела**: у карточки нет этапов, отказов контракта и
+    токенов, поэтому её числа живут отдельным блоком ответа (`cards`) и ни одним
+    полем не попадают в `totals`. Источник — те же живые `kanban.db`, что у
+    `/cards`; отсутствие канбана — не ошибка, а ноль карточек.
+    """
+    found = _card_databases(home)
+    by_status: dict[str, int] = {}
+    runs_by_outcome: dict[str, int] = {}
+    tasks_total = 0
+    runs_total = 0
+    warnings: list[str] = []
+    for name, database in found:
+        rows, error = _query_checked(
+            database, "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
+        )
+        if error:
+            warnings.append(f"{name}: tasks: {error}")
+        for row in rows:
+            count = int(row.get("n") or 0)
+            status = str(row.get("status") or "—")
+            by_status[status] = by_status.get(status, 0) + count
+            tasks_total += count
+        rows, error = _query_checked(
+            database, "SELECT outcome, COUNT(*) AS n FROM task_runs GROUP BY outcome"
+        )
+        if error:
+            warnings.append(f"{name}: task_runs: {error}")
+        for row in rows:
+            count = int(row.get("n") or 0)
+            key = str(row.get("outcome") or "running")
+            runs_by_outcome[key] = runs_by_outcome.get(key, 0) + count
+            runs_total += count
+    return {
+        "kind": "observation",
+        "label": CARDS_LABEL,
+        "databases": len(found),
+        "tasks_total": tasks_total,
+        "runs_total": runs_total,
+        "by_status": by_status,
+        "runs_by_outcome": runs_by_outcome,
+        "warnings": warnings,
+    }
+
+
+def _pooled(metric: str, groups: list[dict[str, Any]]) -> dict[str, Any]:
+    """Распределение по объединённой выборке групп: перцентиль групп — не перцентиль целого."""
+    values: list[int] = []
+    for group in groups:
+        values.extend(group.pop(metric, []))
+    return _waiting_distribution(values)
 
 
 def collect_stats(
@@ -1611,7 +1817,7 @@ def collect_stats(
     repo: Optional[str] = None,
     since: Optional[int] = None,
 ) -> dict[str, Any]:
-    """Здоровье дел по репозиториям: этапы с первой попытки, исходы, ожидание.
+    """Здоровье дел по репозиториям: этапы, ожидание человека, отказы, токены.
 
     Источник один — store дел и его журнал (`duty/duty.db`). Доски были тем,
     чем считалась статистика до 0.0.6, — и вместе с ними ушёл чужой объект:
@@ -1619,12 +1825,20 @@ def collect_stats(
     теперь одна — `repo` строки дела; дела без репозитория идут отдельной группой
     (`without_repo`), и это не «ошибка данных», а законное состояние.
 
-    Распределение ожидания считается по объединённой выборке группы, а не как
-    среднее: перцентиль перцентилей не равен перцентилю объединённой выборки.
-    `since` — нижняя граница окна по `deals.created_at`; нечитаемый store или
-    журнал попадает в `errors`, и ответ остаётся 200.
+    Окно по умолчанию — сутки (`HEALTH_WINDOW_SEC`), как в спеке экрана 4:
+    «за сутки» и «за всё время» — разные числа, и молча отдавать второе под
+    первым нельзя. `since` называет границу явно; тогда же по `created_at`
+    сужается и список дел (так было и до окна по умолчанию), а без явной границы
+    сужаются только факты: дело живёт дольше окна, и его `deals` — объект, а не
+    факт.
+
+    Распределения считаются по объединённой выборке группы, а не как среднее:
+    перцентиль перцентилей не равен перцентилю объединённой выборки. Нечитаемый
+    store или журнал попадает в `errors`, нечитаемые карточки — в
+    `cards.warnings`, и ответ остаётся 200.
     """
     errors: list[dict[str, str]] = []
+    since_value = int(since) if since is not None else int(now) - HEALTH_WINDOW_SEC
     journal_events, _, journal_errors = _journal_context(home)
     errors.extend(journal_errors)
     try:
@@ -1656,11 +1870,11 @@ def collect_stats(
             without.append(row)
 
     groups = [
-        _repo_metrics(name, grouped[name], journal_events, now, leases)
+        _repo_metrics(name, grouped[name], journal_events, now, leases, since_value)
         for name in sorted(grouped)
     ]
-    empty = _repo_metrics("", [], journal_events, now, leases)
-    without_group = _repo_metrics("", without, journal_events, now, leases)
+    empty = _repo_metrics("", [], journal_events, now, leases, since_value)
+    without_group = _repo_metrics("", without, journal_events, now, leases, since_value)
     if repo is not None:
         # Неизвестный `repo` — это фильтр, а не ресурс: пустой результат, а не 404.
         # Опечатка в фильтре видна пустым ответом; отказом она выглядела бы как
@@ -1670,20 +1884,34 @@ def collect_stats(
         # названных репозиториев — пусты.
         if repo:
             without_group = empty
-    waits: list[int] = []
-    for group in groups + [without_group]:
-        waits.extend(group.pop("_waits", []))
-    totals = _repo_metrics("", rows, journal_events, now, leases)
-    totals["waiting_sec"] = _waiting_distribution(waits)
+    scoped = groups + [without_group]
+    totals = _repo_metrics("", rows, journal_events, now, leases, since_value)
+    totals["waiting_sec"] = _pooled("_waits", scoped)
+    totals["waiting_human_sec"] = _pooled("_human_waits", scoped)
     totals.pop("_waits", None)
+    totals.pop("_human_waits", None)
+    warnings: list[str] = []
+    if totals["tokens"]["count"] == 0 and totals["tokens"]["without"]:
+        warnings.append(
+            "токены: ни одна закрытая попытка окна не записала details.usage_tokens — "
+            "сумма не считается (null, а не 0)"
+        )
+    cards = _cards_summary(home)
     return {
         "now": now,
-        "window": {"since": since, "sec": None if since is None else max(0, int(now) - int(since))},
+        "window": {
+            "since": since_value,
+            "sec": max(0, int(now) - since_value),
+            "source": "explicit" if since is not None else "default",
+        },
         "repos": groups,
         "without_repo": without_group,
         "totals": totals,
+        # Карточки kanban — наблюдение с своим именем: два объекта, две таблицы,
+        # ни одного общего числа (см. тест `test_health_cards_and_deals_do_not_mix`).
+        "cards": cards,
         "errors": errors,
-        "warnings": [],
+        "warnings": warnings + cards["warnings"],
         "success_outcomes": list(SUCCESS_OUTCOMES),
         "crash_outcomes": list(CRASH_OUTCOMES),
     }
@@ -1695,15 +1923,20 @@ def stats(
     since: Optional[int] = None,
     board: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Здоровье дел по репозиториям: доля этапов с первой попытки, ожидание, исходы.
+    """Здоровье дел по репозиториям: этапы, ожидание человека, отказы, токены.
 
     `?repo=<путь>` — только один репозиторий; `?repo=` (пустая строка) — только
-    дела **без** репозитория; `?since=<unix>` — только дела, созданные не раньше
-    этой секунды. Фильтры считает `collect_stats`, поэтому CLI и роут отдают одну
-    и ту же форму и одни и те же числа. Неизвестный `repo` — это фильтр, а не
-    ресурс: ответ 200 с пустым результатом, как у `/now` (одно поведение на обеих
-    ручках — `docs/SPEC.md`). `?board=` — отказ (400) с подсказкой: доск нет,
-    фильтр называется `repo`.
+    дела **без** репозитория; `?since=<unix>` — граница окна (по умолчанию
+    сутки): факты считаются с неё, а список дел при явной границе сужается по
+    `created_at`, как и раньше. Фильтры считает `collect_stats`, поэтому CLI и
+    роут отдают одну и ту же форму и одни и те же числа. Неизвестный `repo` — это
+    фильтр, а не ресурс: ответ 200 с пустым результатом, как у `/now` (одно
+    поведение на обеих ручках — `docs/SPEC.md`). `?board=` — отказ (400) с
+    подсказкой: доск нет, фильтр называется `repo`.
+
+    Карточки kanban приходят отдельным блоком `cards` (наблюдение, не дела): у
+    карточки нет этапов, отказов контракта и токенов, и ни одно её число не
+    попадает в `totals`.
     """
     _refuse_board_filter(board)
     return collect_stats(_hermes_home(), _now_sec(), repo=repo, since=since)

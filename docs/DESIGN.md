@@ -102,7 +102,7 @@ desktop-страница `/duty` (внутренний роут приложен
 | `GET /now?repo=<path>&state=<waiting.state>` | срез «сейчас» (форма ниже); у дела — `stage {id, role, attempt, state, live, since}` из журнала (`null`, если попыток не было) | 400 — состояние не из таксономии или `?board=`; неизвестный `repo` — 200 с пустым срезом |
 | `GET /duty/{deal_id}/attempts` | таймлайн попыток дела | 400 — id не `d_<hex>`; 404 — дела нет; 503 — store не читается |
 | `GET /deal/{deal_id}?spec=<путь>` | одно дело: спецификация + факты `/now`, `comments[]`, `attachments[]`, `timeline[]`, лента этапов `stages[]` + `stages_note` + `spec` | 400 — `t_<hex>` или битый id; 404 — дела нет; 503 — store не читается |
-| `GET /stats?repo=<path>&since=<unix>` | здоровье по репозиториям и итогом: `deals_by_status`, `attempts_by_outcome`, `first_try`, `waiting_sec` (p50/p90/p99, `count`, `max`); `?repo=` — один репозиторий, `?since=` — окно по `created_at` | 400 — `?board=`; неизвестный `repo` — 200 с пустым результатом; деградация — в `errors[]` |
+| `GET /stats?repo=<path>&since=<unix>` | здоровье дел: `first_try` (доля этапов с первой попытки), `stages` (знаменатель), `waiting_human_sec` и `waiting_sec` (p50/p90/p99, `count`, `max`), `contract_refusals` (число и по правилу), `tokens`, `attempts_by_outcome`/`attempts_by_class`, `deals_by_status`; окно по умолчанию сутки, `?repo=` — один репозиторий, `?since=` — граница окна. Отдельным блоком `cards` — карточки kanban (наблюдение, не дела) | 400 — `?board=`; неизвестный `repo` — 200 с пустым результатом; деградация — в `errors[]`/`warnings[]` |
 | `POST /ask/{deal_id}` | вопрос по делу в пул: `{question_id, created, deduped, adopted, errors[]}` | 400 — битый id, пустой `text`/кривые `options`; 404 — дела нет; 503 — пул или журнал недоступны |
 | `POST /deals` | завести своё дело (`status=todo`): `{repo?, title, body?, assignee?, parents?[], spec?, external_ref?, dedup_window?}` | 400 — вход не тот (в том числе `board`); 503 — store не открылся |
 | `PATCH /deals/{id}` | спецификация (`title`/`body`/`assignee`) либо `{status: archived}` | 404 — дела нет; 400 — смена статуса мимо команды или попытка поправить `repo` |
@@ -468,28 +468,43 @@ failures.classify → policy → decide_park
   `attempt_ended`) с таймингом — из своего журнала, а не `task_events` ядрового kanban;
 - **Почему стоит** — карточки дел с `waiting.evidence` целиком: причину можно
   проверить, а не поверить. Группы — по состояниям, в порядке `WAITING_PRIORITY`;
-- **Здоровье** — три метрики из `/stats`: доля этапов, закрытых с первой же попытки;
-  распределение ожидания до первой попытки (`created_at` → `started_at` первой попытки)
-  — `p50`/`p90`/`p99`, `count` и `max`, а не одно число; таксономия исходов попыток.
-  Плюс строки по репозиториям и отдельная строка «без репозитория».
+- **Здоровье** — метрики спеки (экран 4), все по журналу дел: доля **этапов**, закрытых с
+  первой же попытки (`first_try`, знаменатель — `stages`); медиана **ожидания человека**
+  (`question_asked` → `question_answered`); ожидание до первой попытки этапа (`created_at` →
+  `started_at` первой попытки) — `p50`/`p90`/`p99`, `count` и `max`, а не одно число; **отказы
+  контракта** числом и по правилу; **токены** за окно (сутки по умолчанию); таксономия исходов
+  и классов попыток. Плюс строки по репозиториям и отдельная строка «без репозитория».
+  Карточки kanban — вторым блоком под честным именем «наблюдение, не дела»: их числа не
+  смешиваются с делами.
 
 ## Форма ответа `/stats`
 
 ```jsonc
 {
   "now": 1793693881,
-  "window": { "since": 1793600000, "sec": 93881 },   // null, если окна не задавали
+  "window": { "since": 1793607481, "sec": 86400, "source": "default" }, // source: default | explicit
   "repos": [{
     "repo": "hermes-duty",
-    "deals": 12, "deals_by_status": { "done": 11, "running": 1 },
-    "attempts_total": 14, "attempts_by_outcome": { "done": 12, "crashed": 2 },
+    "deals": 12, "deals_active": 9, "deals_by_status": { "done": 11, "running": 1 },
+    "attempts_total": 14, "attempts_by_outcome": { "done": 12, "failed": 2 },
+    "attempts_by_class": { "contract": 2 },
     "first_try": { "ok": 10, "closed": 11, "share": 0.909 },
-    "waiting_sec": { "p50": 227, "p90": 1440, "p99": 3600, "count": 11, "max": 7200 }
+    "stages": { "total": 11, "closed": 11 },
+    "waiting_sec": { "p50": 227, "p90": 1440, "p99": 3600, "count": 11, "max": 7200 },
+    "waiting_human_sec": { "p50": 420, "p90": 1800, "p99": 3600, "count": 4, "max": 3600 },
+    "contract_refusals": { "count": 2, "by_rule": { "artifact.missing": 2 } },
+    "tokens": { "total": 1200000, "count": 12, "without": 2 }
   }],
   "without_repo": { /* те же поля для дел без репозитория */ },
   "totals": { /* те же поля, сведённые по всем делам */ },
+  "cards": {                            // наблюдение, НЕ дела: другой объект и другая таблица
+    "kind": "observation", "label": "карточки kanban (наблюдение, не дела)",
+    "databases": 17, "tasks_total": 818, "runs_total": 1174,
+    "by_status": { "archived": 732, "done": 85 }, "runs_by_outcome": { "completed": 744 },
+    "warnings": []
+  },
   "errors": [],                        // нечитаемый store/журнал: в итог не входит
-  "warnings": [],
+  "warnings": [],                      // в том числе «ни одна попытка не записала usage_tokens»
   "success_outcomes": ["done", …], "crash_outcomes": ["crashed", …]
 }
 ```
@@ -504,6 +519,16 @@ failures.classify → policy → decide_park
   0 секунд» — разные вещи, нули здесь были бы выдумкой;
 - `first_try.closed = 0` — это «считать не по чему» (`share: null`), а не «сто
   процентов»;
+- `waiting_human_sec` и `waiting_sec` — **разные величины**: первая меряет
+  `question_asked` → `question_answered` (сколько ждал человек), вторая — `created` →
+  первая попытка этапа (сколько ждал движок). Подменять одну другой нельзя;
+- `contract_refusals` считается по классу `contract` (`attempt_ended.kind`, старые
+  записи — `details.class`) и разбивается по правилу: `details.rule`, иначе код
+  причины (`artifact.missing`), иначе первая фраза `reason`;
+- `tokens.total = null` и предупреждение, если ни одна попытка окна не записала
+  `details.usage_tokens`: ноль написал бы «истратили ничего», чего никто не утверждал;
+- числа карточек (`cards`) и числа дел (`totals`) не пересекаются ни одним полем: два
+  объекта — два блока, проценты не складываются;
 - `?repo=` и `?since=` считает `collect_stats()`, а не CLI: перцентиль подмножества не
   выводится из перцентилей целого, поэтому терминал и роут получают одни и те же числа;
 - успех и падение — наборы исходов бэкенда (`success_outcomes`, `crash_outcomes`), а не

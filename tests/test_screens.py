@@ -391,6 +391,9 @@ def test_stats_has_no_board_shaped_leftovers(client: TestClient, home: Path) -> 
     верхнего уровня про обрезанный срез доски. В 0.0.6 источник один — store
     дел, — поэтому ни ключа, ни предупреждения быть не должно: они вернули бы доску
     чёрным ходом.
+
+    `cards` — не доска: это отдельный блок наблюдения за карточками kanban
+    (`tasks_total`/`runs_total`/`by_status`), и доск он не возвращает.
     """
     make_deal(home)
 
@@ -406,8 +409,11 @@ def test_stats_has_no_board_shaped_leftovers(client: TestClient, home: Path) -> 
         "repos",
         "without_repo",
         "totals",
+        "cards",
         "errors",
         "warnings",
         "success_outcomes",
         "crash_outcomes",
     }
+    assert stats["cards"]["kind"] == "observation"
+    assert "tasks_total" in stats["cards"] and "deals" not in stats["cards"]

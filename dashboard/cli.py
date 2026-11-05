@@ -3,7 +3,7 @@
     duty now [--repo R] [--state S]        дела группами по репозиториям: id, ожидание, возраст
     duty deal <deal_id>                    карточка дела: факты плюс таймлайн попыток
     duty attempts <deal_id>                только таймлайн попыток
-    duty stats [--repo R] [--since D]      p50/p90/p99, исходы, «с первой попытки»
+    duty stats [--repo R] [--since D]      здоровье дел: этапы, ожидание человека, отказы, токены
     duty why <deal_id>                     доказательство словами бэкенда
     duty why <deal_id> <этап>              то же плюс приговор последней попытки этапа
     duty watch [--interval 10]            тот же `now`, перерисовка в терминале
@@ -380,9 +380,16 @@ def build_parser() -> argparse.ArgumentParser:
     attempts = command("attempts", "только таймлайн попыток")
     attempts.add_argument("deal_id", help="id дела (d_<hex>)")
 
-    stats = command("stats", "p50/p90/p99, исходы, доля с первой попытки")
+    stats = command(
+        "stats",
+        "здоровье дел: этапы с первой попытки, ожидание человека, отказы контракта, токены",
+    )
     stats.add_argument("--repo", help="только один репозиторий; пустая строка — дела без репозитория")
-    stats.add_argument("--since", type=since_arg, help="окно по created_at: unix, YYYY-MM-DD или YYYY-MM-DDTHH:MM")
+    stats.add_argument(
+        "--since",
+        type=since_arg,
+        help="граница окна (по умолчанию — сутки): unix, YYYY-MM-DD или YYYY-MM-DDTHH:MM",
+    )
 
     why = command("why", "доказательство словами бэкенда; с этапом — приговор его последней попытки")
     why.add_argument("deal_id", help="id дела (d_<hex>)")
@@ -636,15 +643,70 @@ def _counts(mapping: Any) -> str:
     return " · ".join(f"{key} {value}" for key, value in items)
 
 
-def _distribution(dist: Any) -> str:
-    """Распределение ожидания: перцентили бэкенда как есть, без пересчёта."""
+def _distribution(dist: Any, empty: str) -> str:
+    """Распределение ожидания: перцентили бэкенда как есть, без пересчёта.
+
+    `empty` — чем именно «нет данных» у этой величины: у ожидания человека и у
+    ожидания до первой попытки этапа причины разные, и общая фраза склеила бы их.
+    """
     data = dist or {}
     if not data.get("count"):
-        return "нет данных (ни у одного дела не было первой попытки)"
+        return f"нет данных ({empty})"
     parts = [
         f"p{pct} {_fmt_age(data.get(f'p{pct}'))}" for pct in (50, 90, 99) if data.get(f"p{pct}") is not None
     ]
     return f"{' · '.join(parts)} (n={data.get('count')}, максимум {_fmt_age(data.get('max'))})"
+
+
+def _refusals(block: Any) -> str:
+    """Отказы контракта: числом и разбивкой по правилу, а не одним счётчиком.
+
+    Класс `contract` говорит «чем кончилось», а разбивка — «на каком правиле»:
+    без неё «16 отказов» не отвечает на вопрос «что чинить».
+    """
+    data = block or {}
+    count = int(data.get("count") or 0)
+    if not count:
+        return "не было"
+    rules = _counts(data.get("by_rule"))
+    return f"{count} · {rules}" if rules != "—" else str(count)
+
+
+def _tokens(block: Any) -> str:
+    """Токены за окно: сумма из `attempt_ended`, а не оценка по числу попыток.
+
+    Пустая сумма — `null` бэкенда и словами здесь: «ни одна попытка не записала
+    `usage_tokens`» и «истратили 0 токенов» — разные факты.
+    """
+    data = block or {}
+    total = data.get("total")
+    if total is None:
+        closed = int(data.get("count") or 0) + int(data.get("without") or 0)
+        if not closed:
+            return "нет данных (закрытых попыток в окне не было)"
+        return f"нет данных (ни одна из {closed} закрытых попыток не записала usage_tokens)"
+    value = int(total)
+    if value >= 1_000_000:
+        shown = f"{value / 1_000_000:.1f}M"
+    elif value >= 1_000:
+        shown = f"{value / 1_000:.0f}k"
+    else:
+        shown = str(value)
+    without = int(data.get("without") or 0)
+    tail = f", {without} без токенов" if without else ""
+    return f"{shown} (по {int(data.get('count') or 0)} попыткам{tail})"
+
+
+def _window(window: Any) -> str:
+    """Окно здоровья словами: «за сутки с …», иначе «с …» — граница видна всегда."""
+    data = window or {}
+    since = data.get("since")
+    if since is None:
+        return "без окна (за всё время)"
+    sec = int(data.get("sec") or 0)
+    span = "сутки" if sec == 86400 else _fmt_age(sec)
+    source = "по умолчанию" if data.get("source") == "default" else "задано"
+    return f"{span} {source}, с {_fmt_stamp(since)}"
 
 
 def _share(first: Any) -> str:
@@ -711,6 +773,7 @@ STATS_COLUMNS = (
     ("P90", 8),
     ("P99", 8),
     ("ОЖИДАНИЙ", 9),
+    ("ЖДЁТ ЧЕЛОВЕК", 14),
 )
 
 # Подпись группы «репозиторий не назван»: NULL в `repo` — законное состояние, и в
@@ -798,9 +861,15 @@ def render_now(payload: dict[str, Any]) -> str:
 
 
 def _repo_row(group: dict[str, Any]) -> list[Any]:
-    """Строка таблицы «по репозиториям»: дела, попытки, доля с первой попытки, ожидание."""
+    """Строка таблицы «по репозиториям»: дела, попытки, доля с первой попытки, ожидание.
+
+    Последняя колонка — ожидание **человека** (p50 и размер выборки): оно меряется
+    другой парой фактов (`question_asked` → `question_answered`), и путать его с
+    ожиданием до первой попытки этапа нельзя даже в таблице.
+    """
     first = group.get("first_try") or {}
     dist = group.get("waiting_sec") or {}
+    human = group.get("waiting_human_sec") or {}
     return [
         group.get("repo") or WITHOUT_REPO_LABEL,
         group.get("deals"),
@@ -810,28 +879,57 @@ def _repo_row(group: dict[str, Any]) -> list[Any]:
         _fmt_age(dist.get("p90")),
         _fmt_age(dist.get("p99")),
         dist.get("count", 0),
+        "—" if not human.get("count") else f"{_fmt_age(human.get('p50'))} (n={human.get('count')})",
     ]
 
 
 def render_stats(payload: dict[str, Any]) -> str:
-    """Здоровье: перцентили ожидания, исходы и доля с первой попытки."""
+    """Здоровье двумя секциями: дела движка и карточки kanban — разными таблицами.
+
+    Первая секция отвечает на вопросы спеки (экран 4): сколько **этапов** с первой
+    попытки, сколько **человек** ждал ответа, сколько было **отказов контракта** и
+    сколько **токенов** истрачено за окно. Вторая — наблюдение за карточками
+    kanban: у карточки нет ни этапов, ни отказов контракта, ни токенов, поэтому
+    её числа идут отдельной подписью и в первую секцию не подмешиваются.
+    """
     totals = payload.get("totals") or {}
     repos = payload.get("repos") or []
     without = payload.get("without_repo") or {}
     groups = list(repos) + ([without] if without.get("deals") else [])
     lines = [
-        "ЗДОРОВЬЕ · {} · репозиториев: {} · дел: {} · попыток: {}".format(
+        "ЗДОРОВЬЕ ДЕЛ · {} · окно: {} · дел: {} · дел с фактами в окне: {} · попыток: {}".format(
             _fmt_stamp(payload.get("now")),
-            len(repos),
+            _window(payload.get("window")),
             totals.get("deals", 0),
+            totals.get("deals_active", 0),
             totals.get("attempts_total", 0),
         )
     ]
     lines.extend(_notice_lines(payload))
     lines.append("")
-    lines.append(f"с первой попытки: {_share(totals.get('first_try'))}")
-    lines.append(f"ожидание до первой попытки: {_distribution(totals.get('waiting_sec'))}")
+    lines.append(
+        "этапов с первой попытки: {} · этапов в окне: {}".format(
+            _share(totals.get("first_try")), (totals.get("stages") or {}).get("total", 0)
+        )
+    )
+    lines.append(
+        "ожидание человека: "
+        + _distribution(
+            totals.get("waiting_human_sec"),
+            "человек не ответил ни на один вопрос в окне",
+        )
+    )
+    lines.append(
+        "ожидание до первой попытки этапа: "
+        + _distribution(
+            totals.get("waiting_sec"),
+            "ни у одного дела в окне не было первой попытки",
+        )
+    )
+    lines.append(f"отказы контракта: {_refusals(totals.get('contract_refusals'))}")
+    lines.append(f"токены за окно: {_tokens(totals.get('tokens'))}")
     lines.append(f"исходы попыток: {_counts(totals.get('attempts_by_outcome'))}")
+    lines.append(f"классы отказов: {_counts(totals.get('attempts_by_class'))}")
     lines.append(f"статусы дел: {_counts(totals.get('deals_by_status'))}")
     if groups:
         lines.append("")
@@ -839,7 +937,29 @@ def render_stats(payload: dict[str, Any]) -> str:
     if without.get("deals"):
         lines.append("")
         lines.append(f"{WITHOUT_REPO_LABEL}: дел {without.get('deals')} — группировка не названа")
+    lines.extend(_cards_section(payload.get("cards")))
     return "\n".join(lines)
+
+
+def _cards_section(cards: Any) -> list[str]:
+    """Вторая секция: карточки kanban отдельной таблицей и честной подписью.
+
+    Пустой блок (канбана нет) печатается словами, а не нулями: «карточек нет» и
+    «канбан не прочитан» — разные факты, и второй виден в предупреждениях.
+    """
+    data = cards or {}
+    if not data:
+        return []
+    lines = [
+        "",
+        "КАРТОЧКИ КАНБАНА (наблюдение, не дела) · баз: {} · карточек: {} · ранов: {}".format(
+            data.get("databases", 0), data.get("tasks_total", 0), data.get("runs_total", 0)
+        ),
+        f"статусы карточек: {_counts(data.get('by_status'))}",
+        f"исходы ранов: {_counts(data.get('runs_by_outcome'))}",
+        "у карточки нет этапов, отказов контракта и токенов: эти числа только в секции дел",
+    ]
+    return lines
 
 
 def _fmt_duration(sec: Any) -> str:

@@ -827,7 +827,9 @@ def test_why_json_with_stage_adds_verdict_without_touching_the_route_form(home, 
 
 
 def attempt_of(home: Path, deal_id: str, *, stage: str, number: int, started_at: int,
-               ended_at: Optional[int], outcome: str = "done") -> None:
+               ended_at: Optional[int], outcome: str = "done",
+               kind: Optional[str] = None, reason: str = "",
+               details: Optional[dict] = None) -> None:
     """Попытка этапа в журнале — той же формой, что пишет движок."""
     journal_module = cli._load_journal()
     conn = cli.api().deals.open_store(home)
@@ -866,10 +868,11 @@ def attempt_of(home: Path, deal_id: str, *, stage: str, number: int, started_at:
                     "stage": stage,
                     "attempt": number,
                     "outcome": outcome,
-                    "kind": None,
-                    "reason": "",
+                    "kind": kind,
+                    "reason": reason,
                     "base": None,
                     "commit": None,
+                    **({"details": details} if details is not None else {}),
                 },
                 "idempotency_key": f"test:{deal_id}:{stage}:{number}:ended",
             }
@@ -916,6 +919,74 @@ def test_stats_since_counts_only_deals_created_after_it(home, frozen_now, capsys
     assert full["totals"]["waiting_sec"]["p90"] == 1000
     assert windowed["totals"]["waiting_sec"]["p90"] == 10
     assert windowed["totals"]["waiting_sec"]["count"] == 1
+
+
+def test_stats_prints_deals_and_cards_as_two_sections(home, frozen_now, capsys):
+    """Терминал печатает две секции с разными заголовками и не смешивает числа.
+
+    Секция дел отвечает спека-вопросами (этапы, ожидание человека, отказы
+    контракта, токены), секция карточек kanban — своя, подписанная «наблюдение,
+    не дела». Карточка фикстуры (`make_card`) в счёт дел не входит, и наоборот.
+    """
+    deal_id = make_deal(home, title="с вопросами", created_at=NOW - 500)
+    attempt_of(
+        home,
+        deal_id,
+        stage="impl",
+        number=1,
+        started_at=NOW - 400,
+        ended_at=NOW - 300,
+        details={"usage_tokens": 1500},
+    )
+    journal_module = cli._load_journal()
+    conn = cli.api().deals.open_store(home)
+    assert conn is not None
+    try:
+        journal_module.append(
+            conn,
+            [
+                {
+                    "deal_id": deal_id,
+                    "repo": REPO,
+                    "kind": "question_asked",
+                    "ts": NOW - 350,
+                    "recorded_at": NOW - 350,
+                    "source": "engine",
+                    "payload": {"question_id": 7, "critical": 0},
+                    "idempotency_key": f"test:{deal_id}:asked",
+                },
+                {
+                    "deal_id": deal_id,
+                    "repo": REPO,
+                    "kind": "question_answered",
+                    "ts": NOW - 50,
+                    "recorded_at": NOW - 50,
+                    "source": "engine",
+                    "payload": {"question_id": 7, "answer_len": 2},
+                    "idempotency_key": f"test:{deal_id}:answered",
+                },
+            ],
+        )
+    finally:
+        conn.close()
+    code, out, _ = run(["stats"], capsys)
+
+    assert code == 0
+    deals_section, cards_section = out.split("КАРТОЧКИ КАНБАНА (наблюдение, не дела)")
+    assert "ЗДОРОВЬЕ ДЕЛ" in deals_section
+    assert "этапов с первой попытки: 1/1 (100%)" in deals_section
+    # Ожидание человека — 300 с (question_asked → question_answered), а не 100 с
+    # (created → первая попытка): это две разные величины спеки.
+    assert "ожидание человека: p50 5 мин" in deals_section
+    assert "ожидание до первой попытки этапа: p50 1 мин" in deals_section
+    assert "токены за окно: 2k (по 1 попыткам)" in deals_section
+    assert "отказы контракта: не было" in deals_section
+    # Секция карточек: своё имя, свои числа, ни одного числа дел.
+    assert "статусы карточек: blocked 1" in cards_section
+    assert "ранов: 0" in cards_section
+    assert "карточек:" not in deals_section
+    assert "дел с фактами в окне" not in cards_section
+    assert "первой попытки" not in cards_section
 
 
 # ----------------------------------------------------------------------- watch

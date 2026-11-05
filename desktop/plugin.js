@@ -2206,6 +2206,12 @@ function HealthScreen({ stats }) {
     data.warnings.length
       ? h('div', { className: 'duty-note', style: { margin: '0 0 10px' } }, ...data.warnings.map((text, i) => h('div', { key: `hw-${i}` }, text)))
       : null,
+    // Окно — часть числа: «за сутки» и «за всё время» — разные метрики.
+    h(
+      'div',
+      { className: 'duty-muted', style: { margin: '0 0 10px' } },
+      `окно: ${(data.window || {}).source === 'default' ? 'сутки по умолчанию' : 'задано вручную'} (${fmtAge((data.window || {}).sec)}) · числа считаются по журналу дел; карточки kanban — отдельное наблюдение`,
+    ),
     h(
       'div',
       { className: 'duty-kpis' },

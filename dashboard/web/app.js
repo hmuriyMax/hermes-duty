@@ -565,6 +565,16 @@ function viewHealth() {
   }
   if (stats.warnings && stats.warnings.length) parts.push(noticesBlock(stats.warnings))
 
+  // Окно — часть числа, а не украшение: «за сутки» и «за всё время» — разные метрики.
+  const win = stats.window || {}
+  parts.push(
+    h(
+      'div',
+      { class: 'muted' },
+      `окно: ${win.source === 'default' ? 'сутки по умолчанию' : 'задано вручную'} (${fmtAge(win.sec)}) · числа считаются по журналу дел; карточки kanban — отдельное наблюдение`,
+    ),
+  )
+
   parts.push(
     h(
       'div',

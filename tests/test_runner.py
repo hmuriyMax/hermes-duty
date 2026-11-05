@@ -1788,7 +1788,12 @@ def test_review_changes_returns_to_the_named_stage(tmp_path: Path) -> None:
 
 
 def test_review_without_verdict_is_contract(tmp_path: Path) -> None:
-    """`done` без приговора — отказ, а не тишина: иначе дефект вернётся молчанием."""
+    """`done` без приговора — отказ, а не тишина: иначе дефект вернётся молчанием.
+
+    Отказ выдаёт гейт пакета (`evidence.witness`, 0.0.5): у этапа с приговором
+    свидетель один — `verdict`, и `commit|artifacts` его не заменяют, даже если
+    ревьюер приложил файл-свидетельство.
+    """
     home = make_home(tmp_path)
     conn = open_store(home)
     deal = make_deal(conn)
@@ -1798,10 +1803,61 @@ def test_review_without_verdict_is_contract(tmp_path: Path) -> None:
     report = run_review(conn, spec, deal, home, None)
 
     assert (report["outcome"], report["kind"]) == (runner.OUTCOME_FAILED, runner.FAIL_CONTRACT)
-    assert "этап ревью обязан вернуть verdict: {action, target, reason}" in report["reason"]
-    assert f"{spec.path}:{verdict_line()}" in report["reason"]
+    assert "нужен verdict {action, target, reason}" in report["reason"]
+    assert "commit/artifacts не требуются" in report["reason"]
     assert "collected" not in kinds(conn, deal)
     assert review_ended(conn, deal)["payload"]["kind"] == runner.FAIL_CONTRACT
+
+
+def test_empty_verdict_is_refused_with_the_spec_line(tmp_path: Path) -> None:
+    """Пустой приговор проходит форму и отказывает смыслом: `file:line` спеки в причине.
+
+    Гейт пакета видит только «`verdict` — словарь», а какой именно приговор от
+    этапа ждут, знает движок (`runner.report_verdict`): отказ обязан назвать
+    строку спеки, иначе человек ищет требование по коду.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = review_chain(tmp_path)
+    seed_passed(conn, deal)
+
+    report = run_review(conn, spec, deal, home, {})
+
+    assert (report["outcome"], report["kind"]) == (runner.OUTCOME_FAILED, runner.FAIL_CONTRACT)
+    assert f"{spec.path}:{verdict_line()}" in report["reason"]
+    assert "verdict.action=None" in report["reason"]
+    assert "collected" not in kinds(conn, deal)
+
+
+def test_review_verdict_without_work_package_is_accepted(tmp_path: Path) -> None:
+    """Приговор и есть свидетель этапа ревью: без commit и artifacts пакет принят.
+
+    Дефект FIX-W: гейт требовал `commit|artifacts` безусловно, и `review` с
+    честным приговором получал `failed(contract)` на каждом повторе. Дерево
+    ревьюер не меняет — называть работу ему нечем.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = review_chain(tmp_path)
+    seed_passed(conn, deal)
+    fake = Fake(
+        result={
+            "status": "done",
+            "summary": "ревью прошло",
+            "evidence": [],
+            "verdict": {"action": "approve", "target": "", "reason": "дифф чистый"},
+        }
+    )
+
+    report = runner.run_stage(conn, spec, deal, "review", 1, home=home, spawn=fake, clock=lambda: NOW)
+
+    assert (report["outcome"], report["kind"]) == (runner.OUTCOME_DONE, None)
+    ended = review_ended(conn, deal)["payload"]
+    assert ended["details"]["witness"] == "verdict"
+    assert ended["details"]["verdict"]["witness"] == "verdict"
+    assert only(conn, deal, "collected")["payload"]["stage"] == "review"
 
 
 def test_review_verdict_with_unknown_target_is_contract(tmp_path: Path) -> None:
@@ -2383,6 +2439,38 @@ def test_run_stage_dispatches_gate_kind(tmp_path: Path) -> None:
     assert report["question_id"] > 0
 
 
+def test_gate_stage_does_not_go_through_the_package_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Гейт не проходит проверку пакета: его факты пишет движок, а не отчёт агента.
+
+    Приёмка FIX-W: свидетель (`commit|artifacts`/`verdict`/`published`) относится к
+    отчёту исполнителя. У гейта отчёта нет вовсе, и если бы он попадал в
+    `evidence.verify`, любой ответ человека закрывался бы отказом «работа не
+    названа» — вопрос стал бы неотвечаемым.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = gate_spec(tmp_path)
+    asked = run_gate(conn, spec, deal, home)
+    answer_gate(home, asked["question_id"], "да")
+    assert sync(conn, home)["appended"] == 1
+
+    def boom(*args: Any, **kwargs: Any) -> Any:  # pragma: no cover - не должен зваться
+        raise AssertionError("гейт пакета к этапу-гейту не применяется")
+
+    monkeypatch.setattr(runner.evidence_module, "verify", boom)
+
+    report = run_gate(conn, spec, deal, home, attempt=2)
+
+    assert (report["outcome"], report["kind"]) == (runner.OUTCOME_DONE, None)
+    ended = ended_of(conn, deal, "gate")["payload"]
+    assert ended["details"]["stage_kind"] == runner.STAGE_KIND_GATE
+    assert "result" not in ended
+    assert "witness" not in ended["details"]
+
+
 # ---------------------------------------------------------------- публикация
 
 
@@ -2615,6 +2703,39 @@ def test_publish_after_the_tree_moved_is_contract(tmp_path: Path) -> None:
     # Отказ — факт журнала: попытку не поднимали, и лизинга у этапа нет.
     assert [event for event in events(conn, deal) if event["kind"] == "blocked"][-1]["payload"]["block_kind"] == "needs_input"
     assert runner.lease_of(conn, deal, "publish") is None
+
+
+def test_publish_report_without_a_work_package_is_accepted(tmp_path: Path) -> None:
+    """Публикующий этап называет `published`, а не дерево: пакет принят без commit/artifacts.
+
+    Красная проба FIX-W: живой прогон TF3-c отказывал каждой публикации
+    (`result.json:artifacts: required: status: done без commit и без artifacts`),
+    потому что гейт требовал работу от этапа, который дерево не меняет. Свидетель
+    публикации — `published`, и его движок сверяет с origin строже дерева.
+    """
+    repo, _origin = git_origin(tmp_path)
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = publish_spec(tmp_path, repo)
+    approve(conn, spec, deal, home)
+    pushed = head_of(repo, "HEAD")
+    fake = Fake(
+        result={
+            "status": "done",
+            "summary": "запушил",
+            "evidence": [],
+            "published": {"sha": pushed, "branch": "main"},
+        }
+    )
+
+    report = run_publish(conn, spec, deal, home, fake)
+
+    assert (report["outcome"], report["kind"]) == (runner.OUTCOME_DONE, None)
+    ended = ended_of(conn, deal, "publish")["payload"]
+    assert ended["details"]["witness"] == "published"
+    fact = only(conn, deal, "published")["payload"]
+    assert (fact["sha"], fact["ref"], fact["verified_by"]) == (pushed, "refs/heads/main", runner.PUBLISH_VERIFY)
 
 
 def test_publish_of_the_approved_commit_is_confirmed_by_origin(tmp_path: Path) -> None:

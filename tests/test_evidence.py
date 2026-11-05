@@ -53,14 +53,19 @@ def make_stage(
     evidence_items: tuple[tuple[str, int], ...] = (),
     tokens: Optional[int] = None,
     workspace: str = "none",
+    role: str = "implementer",
+    verdict: Any = None,
+    kind: str = "agent",
 ) -> Any:
-    """Этап спеки: объявленные команды и бюджет — только через него гейт их узнаёт."""
+    """Этап спеки: объявленные команды, бюджет и вид — только через него гейт их узнаёт."""
     return spec_module.Stage(
         id="impl",
-        role="implementer",
+        role=role,
+        kind=kind,
         workspace=workspace,
         evidence=tuple(spec_module.Evidence(cmd=cmd, must=must) for cmd, must in evidence_items),
         budget=spec_module.Budget(tokens=tokens) if tokens is not None else None,
+        verdict=verdict,
     )
 
 
@@ -167,6 +172,86 @@ def test_done_without_commit_and_artifacts_is_refused(tmp_path: Path) -> None:
     assert (verdict.ok, verdict.kind) == (False, "contract")
     assert rules(verdict) == [evidence.RULE_REQUIRED]
     assert verdict.errors[0].where == "result.json:artifacts"
+    # Текст отказа прежний: обычный этап по-прежнему обязан назвать работу.
+    assert "работа не названа ни коммитом, ни файлами" in str(verdict.errors[0])
+
+
+def test_publishing_stage_witnesses_published(tmp_path: Path) -> None:
+    """Публикующий этап называет публикацию, а не дерево: `published` — его свидетель.
+
+    Дефект FIX-W (живой прогон TF3-c): `publish` не меняет дерево, его свидетель —
+    `published: {sha, branch}`, который движок сверяет с origin (`git ls-remote`),
+    а гейт пакета требовал `commit|artifacts` и отказывал каждой честной попытке.
+    """
+    stage = make_stage(role="publisher")
+    built = {
+        "status": "done",
+        "evidence": [],
+        "summary": "запушил в origin",
+        "published": {"sha": "a" * 40, "branch": "main"},
+    }
+
+    verdict = verify(built, stage, tmp_path)
+
+    assert (verdict.ok, verdict.kind) == (True, None), verdict.details
+    assert verdict.witness == evidence.WITNESS_PUBLISHED
+    assert evidence.witness(stage) == evidence.WITNESS_PUBLISHED
+
+
+def test_publishing_stage_without_published_is_refused_by_its_own_witness(tmp_path: Path) -> None:
+    """Публикующий без `published` — отказ, и он называет свидетель этого этапа."""
+    stage = make_stage(role="publisher")
+    path, digest = write(tmp_path, "notes.txt")
+    built = {
+        "status": "done",
+        "artifacts": [{"path": path, "sha256": digest}],
+        "evidence": [],
+        "summary": "готово",
+    }
+
+    verdict = verify(built, stage, tmp_path)
+
+    assert (verdict.ok, verdict.kind) == (False, "contract")
+    assert rules(verdict) == [evidence.RULE_REQUIRED]
+    assert verdict.errors[0].where == "result.json:published"
+    assert "этап публикации: нужен published {sha, branch}" in str(verdict.errors[0])
+    assert "commit/artifacts не требуются" in str(verdict.errors[0])
+
+
+def test_verdict_stage_witnesses_verdict(tmp_path: Path) -> None:
+    """Этап с приговором называет приговор: `verdict` вместо коммита и файлов."""
+    stage = make_stage(role="reviewer", verdict=spec_module.Verdict(approve="next", changes="impl"))
+    built = {
+        "status": "done",
+        "evidence": [],
+        "summary": "ревью прошло",
+        "verdict": {"action": "approve", "target": "next", "reason": "дифф чистый"},
+    }
+
+    verdict = verify(built, stage, tmp_path)
+
+    assert (verdict.ok, verdict.kind) == (True, None), verdict.details
+    assert verdict.witness == evidence.WITNESS_VERDICT
+    assert evidence.witness(stage) == evidence.WITNESS_VERDICT
+
+
+def test_verdict_stage_without_verdict_is_refused_by_its_own_witness(tmp_path: Path) -> None:
+    """Этап с приговором без приговора: отказ называет `verdict`, а не «нет работы»."""
+    stage = make_stage(role="reviewer", verdict=spec_module.Verdict(approve="next", changes="impl"))
+
+    verdict = verify({"status": "done", "evidence": [], "summary": "ревью прошло"}, stage, tmp_path)
+
+    assert (verdict.ok, verdict.kind) == (False, "contract")
+    assert verdict.errors[0].where == "result.json:verdict"
+    assert "нужен verdict {action, target, reason}" in str(verdict.errors[0])
+
+
+def test_witness_is_chosen_by_the_stage_not_one_for_all(tmp_path: Path) -> None:
+    """Свидетель выбирается по этапу: обычный `agent` без `verdict` — `commit|artifacts`."""
+    assert evidence.witness(make_stage()) == evidence.WITNESS_WORK
+    assert evidence.witness(make_stage(kind="shell")) == evidence.WITNESS_WORK
+    # Публикующая роль — не «обычный этап», даже если это команда.
+    assert evidence.witness(make_stage(role="deployer")) == evidence.WITNESS_PUBLISHED
 
 
 def test_done_without_summary_is_refused(tmp_path: Path) -> None:
@@ -502,6 +587,20 @@ def test_report_schema_speaks_the_declared_commands(tmp_path: Path) -> None:
     assert schema["status"] == ["done", "blocked", "refused"]
     assert schema["required_for_done"] == ["commit|artifacts", "evidence", "summary"]
     assert schema["evidence"] == [{"cmd": "go test ./...", "exit": 0, "started_at": "unix-секунды"}]
+    assert "published" not in schema and "verdict" not in schema
+
+
+def test_report_schema_requires_the_witness_of_the_stage(tmp_path: Path) -> None:
+    """Контракт и гейт требуют одного свидетеля: иначе настоящее правило — в отказе."""
+    publishing = evidence.report_schema(make_stage(role="publisher"))
+    assert publishing["required_for_done"] == ["published", "evidence", "summary"]
+    assert publishing["published"]["sha"].startswith("полный или сокращённый sha")
+
+    reviewing = evidence.report_schema(
+        make_stage(role="reviewer", verdict=spec_module.Verdict(approve="next", changes="impl"))
+    )
+    assert reviewing["required_for_done"] == ["verdict", "evidence", "summary"]
+    assert set(reviewing["verdict"]) == {"action", "target", "reason"}
 
 
 def test_non_object_report_is_refused(tmp_path: Path) -> None:

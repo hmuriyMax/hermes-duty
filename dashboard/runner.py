@@ -1825,6 +1825,9 @@ def run_shell_stage(
             "cleaned": cleaned,
             "cleanup": cleanup or None,
             "verdict": verdict.as_payload() if verdict is not None else None,
+            # У команды свидетель один — `commit|artifacts`; поле заполняется,
+            # когда пакет действительно проверялся (объявлены `artifacts`).
+            "witness": verdict.witness if verdict is not None else None,
         },
     }
     if result is not None:
@@ -2967,6 +2970,11 @@ def run_stage(
             "cleanup": cleanup or None,
             "stderr_path": str(stderr_file) if stderr_file is not None else None,
             "verdict": verdict.as_payload() if verdict is not None else None,
+            # Чем этап назвал работу, когда пакет принят (`evidence.witness`):
+            # `commit|artifacts`, `verdict` или `published`. Без этого поля в
+            # журнале видно только «принято», а не «принято потому, что этап
+            # предъявил вот это» — и разбор отказа идёт по коду, а не по факту.
+            "witness": verdict.witness if verdict is not None else None,
         },
     }
     if result is not None:

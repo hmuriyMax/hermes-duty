@@ -92,6 +92,38 @@
   Документация: `docs/SPEC.md` (правило и две проверки), `docs/JOURNAL.md`
   (вид `published`), `docs/OWNERSHIP.md` (кто пишет `published`).
 
+### FIX-W: свидетель пакета — по возможностям этапа, а не один на всех
+
+- Публикация в 0.0.5 не проходила ни разу: `evidence._check_schema` требовал
+  `commit|artifacts` у **каждого** этапа со `status: done`, поэтому `publish`
+  (`published` — его свидетель) и `review` (`verdict`) получали `failed(contract)`
+  на каждом повторе, и дело зацикливалось на пересоздании (живой прогон TF3-c:
+  `d_88ba1e8a publish · failed(contract)`, `result.json:artifacts: required`).
+- Одна функция выбирает свидетеля — `evidence.witness(stage)`: `verdict` у этапа с
+  `verdict` в спеке, `published` у публикующего (`role` из `spec.PUBLISHING_ROLES`),
+  иначе `commit|artifacts`. Новых флагов нет: признаки берутся у самой спеки.
+- Отказ называет, что принимается **у этого** этапа: «этап публикации: нужен
+  published {sha, branch}; commit/artifacts не требуются». Гейт остальным не ослаблен:
+  обычный этап без `commit|artifacts` — прежний текст, `done` без `summary`/`evidence`
+  — отказ, `blocked`/`refused` свидетеля не требуют.
+- `report_schema.required_for_done` строится той же функцией (у публикующего —
+  `published`, у ревьюера — `verdict`), а `attempt_ended.details.witness` называет
+  принятый свидетель: контракт, проверка и журнал говорят одно и то же.
+- `kind: gate` через проверку пакета не проходит вовсе (факты пишет движок) —
+  зафиксировано тестом с подменённым `evidence.verify`.
+- Тесты: `tests/test_evidence.py::test_publishing_stage_witnesses_published` (красная
+  проба — безусловное `commit|artifacts` даёт `AssertionError: (False, 'contract') ==
+  (True, None)`), `test_verdict_stage_witnesses_verdict`,
+  `test_publishing_stage_without_published_is_refused_by_its_own_witness`,
+  `test_verdict_stage_without_verdict_is_refused_by_its_own_witness`,
+  `test_witness_is_chosen_by_the_stage_not_one_for_all`,
+  `test_report_schema_requires_the_witness_of_the_stage`;
+  `tests/test_runner.py::test_publish_report_without_a_work_package_is_accepted`,
+  `test_review_verdict_without_work_package_is_accepted`,
+  `test_gate_stage_does_not_go_through_the_package_gate`,
+  `test_empty_verdict_is_refused_with_the_spec_line`. Регрессия: 782 passed, 1 skipped
+  (+10 тестов).
+
 ### FIX-V: приговор ревью — факт журнала, а не слово в отчёте
 
 - Гейт `review{verdict} → gate` в 0.0.5 стоял навсегда: правило 2

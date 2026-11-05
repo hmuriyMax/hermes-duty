@@ -14,8 +14,9 @@
 Порядок проверок — от «что вообще заявлено» к «чем это подтверждено»:
 
 1. **Схема отчёта**: `status` из закрытого набора; для `done` обязательны
-   `commit`|`artifacts`, `evidence`, `summary`. Лишнее поле — предупреждение, а не
-   отказ: исполнитель вправе добавить контекст.
+   `evidence`, `summary` и **свидетель этапа** (`witness`): `commit`|`artifacts`
+   у обычного этапа, `verdict` у этапа с приговором, `published` у публикующего.
+   Лишнее поле — предупреждение, а не отказ: исполнитель вправе добавить контекст.
 2. **Артефакты**: путь относительный и не выводит из дерева попытки, файл есть,
    `sha256` заявлен целиком и совпадает с содержимым. У отсутствующего файла
    отказ называет мерку («искали относительно дерево/каталог попытки») и, если
@@ -40,11 +41,36 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import importlib.util
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+# Спека грузится тем же модулем, что у остального плагина: «этап публикует»
+# решает одна константа `spec.PUBLISHING_ROLES`, и второй её копии здесь быть не
+# должно — иначе гейт пакета и валидатор спеки разойдутся на первом `deployer`.
+SPEC_MODULE_NAME = "hermes_duty_spec"
+
+
+def _load(name: str, filename: str) -> Any:
+    """`dashboard/<filename>` — тот же модуль, что грузит остальной плагин."""
+    loaded = sys.modules.get(name)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / filename
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise ImportError(f"module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+spec_module = _load(SPEC_MODULE_NAME, "spec.py")
 
 # Классы отказа, которые выдаёт слой. `infra` здесь нет намеренно: он ставится
 # по фактам движка (код выхода, отсутствие отчёта, таймаут), а не по пакету.
@@ -103,6 +129,14 @@ RULE_EVIDENCE_FUTURE = "evidence.future"
 RULE_EVIDENCE_SUBSTITUTED = "evidence.substituted"
 RULE_BUDGET = "budget.tokens"
 
+# Свидетели этапа (0.0.5): «готово» доказывается тем, что этап по своей природе
+# может предъявить, а не одним списком на всех. Обычный этап называет работу
+# (`commit` или `artifacts`), этап с приговором — приговор (`verdict`), публикующий
+# — то, что ушло в origin (`published`). Выбор делает `witness(stage)`.
+WITNESS_WORK = "commit|artifacts"
+WITNESS_VERDICT = "verdict"
+WITNESS_PUBLISHED = "published"
+
 # Имя отчёта в тексте отказа: `result.json:evidence[0].exit` читается как
 # `file:line` спеки, только «строка» здесь — путь внутри отчёта.
 REPORT_NAME = "result.json"
@@ -160,6 +194,10 @@ class Verdict:
     ok: bool
     kind: Optional[str] = None
     details: list[Issue] = field(default_factory=list)
+    # Принятый свидетель пакета (`witness(stage)`): он же уходит в
+    # `attempt_ended.details`, чтобы в журнале было видно, чем этап назвал работу,
+    # а не только «принято». У непринятого пакета его нет: свидетель не принят.
+    witness: Optional[str] = None
 
     @property
     def errors(self) -> list[Issue]:
@@ -174,10 +212,11 @@ class Verdict:
         return " · ".join(str(issue) for issue in self.errors[:limit])
 
     def as_payload(self) -> dict[str, Any]:
-        """Вердикт для события `attempt_ended`: класс, флаг и все details строками."""
+        """Вердикт для события `attempt_ended`: класс, флаг, свидетель и все details."""
         return {
             "ok": bool(self.ok),
             "kind": self.kind,
+            "witness": self.witness,
             "details": [str(issue) for issue in self.details],
         }
 
@@ -282,6 +321,65 @@ def _is_ancestor(root: Path, commit: str, base: str) -> Optional[bool]:
     return None
 
 
+def witness(stage: Any) -> str:
+    """Какой свидетель принимается от этапа: по его возможностям, а не один на всех.
+
+    Этап, который по своей природе не меняет дерево, не может назвать работу
+    коммитом или файлами — и требовать от него `commit|artifacts` значит требовать
+    ложь. Поэтому свидетель выбирается по признакам самой спеки, без новых флагов:
+
+    - у этапа есть `verdict` — он выносит приговор, и приговора достаточно
+      (`runner.report_verdict` пишет по нему факт графа);
+    - `role` из `spec.PUBLISHING_ROLES` — этап действует вовне, и его свидетель
+      `published: {sha, branch}`, который сверяется с origin строже дерева
+      (`runner.published_claim`, `git ls-remote`);
+    - всё остальное называет работу: `commit` или `artifacts`.
+    """
+    if getattr(stage, "verdict", None) is not None:
+        return WITNESS_VERDICT
+    if str(getattr(stage, "role", "") or "") in spec_module.PUBLISHING_ROLES:
+        return WITNESS_PUBLISHED
+    return WITNESS_WORK
+
+
+def _witness_problem(kind: str, result: dict[str, Any]) -> Optional[Issue]:
+    """Чем свидетель этапа не предъявлен; `None` — предъявлен в своей форме.
+
+    Отказ называет, что принимается **у этого** этапа: «нет коммита» на
+    публикующем этапе отправляло исполнителя искать работу, которую тот и не
+    делал (живой прогон TF3-c: `publish` и `review` отказывали всегда).
+    """
+    if kind == WITNESS_VERDICT:
+        if isinstance(result.get("verdict"), dict):
+            return None
+        return Issue(
+            _where(WITNESS_VERDICT),
+            RULE_REQUIRED,
+            "этап с приговором: нужен verdict {action, target, reason}; "
+            "commit/artifacts не требуются",
+        )
+    if kind == WITNESS_PUBLISHED:
+        published = result.get(WITNESS_PUBLISHED)
+        if isinstance(published, dict) and str(published.get("sha") or "").strip():
+            return None
+        return Issue(
+            _where(WITNESS_PUBLISHED),
+            RULE_REQUIRED,
+            "этап публикации: нужен published {sha, branch}; commit/artifacts не требуются",
+        )
+    commit = result.get("commit")
+    claimed_commit = commit.strip() if isinstance(commit, str) else ""
+    artifacts = result.get("artifacts")
+    claimed_artifacts = artifacts if isinstance(artifacts, list) else []
+    if claimed_commit or claimed_artifacts:
+        return None
+    return Issue(
+        _where("artifacts"),
+        RULE_REQUIRED,
+        "status: done без commit и без artifacts: работа не названа ни коммитом, ни файлами",
+    )
+
+
 # ----------------------------------------------------------------------- проверки
 
 
@@ -318,16 +416,9 @@ def _check_schema(result: dict[str, Any], stage: Any, issues: list[Issue]) -> Op
     artifacts = result.get("artifacts")
     if artifacts is not None and not isinstance(artifacts, list):
         issues.append(Issue(_where("artifacts"), RULE_REQUIRED, "artifacts — список {path, sha256}"))
-    claimed_commit = commit.strip() if isinstance(commit, str) else ""
-    claimed_artifacts = artifacts if isinstance(artifacts, list) else []
-    if not claimed_commit and not claimed_artifacts:
-        issues.append(
-            Issue(
-                _where("artifacts"),
-                RULE_REQUIRED,
-                "status: done без commit и без artifacts: работа не названа ни коммитом, ни файлами",
-            )
-        )
+    problem = _witness_problem(witness(stage), result)
+    if problem is not None:
+        issues.append(problem)
     if "evidence" not in result:
         issues.append(
             Issue(
@@ -667,9 +758,12 @@ def verify(
         # предъявляют, и перерасход там — не отказ пакета, а факт движка.
         _check_budget(result, stage, issues)
 
+    # Свидетель, которым этап называет работу (`witness`): у `blocked`/`refused`
+    # пакета нет вовсе, и называть там нечего.
+    accepted = witness(stage) if status == STATUS_DONE else None
     errors = [issue for issue in issues if issue.severity == ERROR]
     if not errors:
-        return Verdict(ok=True, kind=None, details=issues)
+        return Verdict(ok=True, kind=None, details=issues, witness=accepted)
     kind = KIND_CONTRACT if any(issue.kind == KIND_CONTRACT for issue in errors) else KIND_CAPABILITY
     return Verdict(ok=False, kind=kind, details=issues)
 
@@ -684,19 +778,29 @@ def report_schema(stage: Any) -> dict[str, Any]:
     это единственный способ, которым ревьюер говорит «одобрено» структурно, а не
     словом в `summary`, — иначе следующему этапу нечего прочитать и гейт графа
     (`dashboard/transit.py`, правило 2) ждёт приговор, которого никто не писал.
+    Требуемый свидетель (`required_for_done`) называет `witness(stage)`: контракт
+    и гейт обязаны требовать от этапа одно и то же, иначе исполнитель узнаёт
+    настоящее требование из отказа.
     """
     evidence = [
         {"cmd": getattr(item, "cmd", ""), "exit": getattr(item, "must", 0), "started_at": "unix-секунды"}
         for item in getattr(stage, "evidence", ())
     ]
-    required = ["commit|artifacts", "evidence", "summary"]
+    wanted = witness(stage)
+    required = [wanted, "evidence", "summary"]
     verdict: dict[str, str] = {}
-    if getattr(stage, "verdict", None) is not None:
-        required.append("verdict")
+    if wanted == WITNESS_VERDICT:
         verdict = {
             "action": "approve (одобрено) | changes (на доработку) — приговор этапа",
             "target": "next | id этапа | \"\" — по умолчанию: approve → next, changes → verdict.changes спеки",
             "reason": "одна строка: на чём основан приговор",
+        }
+    published: dict[str, str] = {}
+    if wanted == WITNESS_PUBLISHED:
+        published = {
+            "sha": "полный или сокращённый sha того, что ушло в origin (сверяется с git ls-remote)",
+            "branch": "ветка, в которую опубликовано, или пустая строка",
+            "mr_url": "ссылка на MR — заявка, не проверяется движком",
         }
     schema: dict[str, Any] = {
         "status": list(STATUSES),
@@ -707,4 +811,6 @@ def report_schema(stage: Any) -> dict[str, Any]:
     }
     if verdict:
         schema["verdict"] = verdict
+    if published:
+        schema["published"] = published
     return schema

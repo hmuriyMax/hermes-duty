@@ -53,7 +53,7 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 | `lease_lost` | лизинг исчез без завершения | `previous_expires` |
 | `attempt_started` | открылся ран в `task_runs` (движок: попытка заспавнена) | `run_id`, `pid`, `stage`, `attempt`, `cmd`, `stage_kind` (только у `kind: shell` — `shell`; отсутствие ключа читается как `agent`), `shell_cmd` (у `shell` — строка `cmd` из спеки), `cwd`, `workdir`, `tree`, `base` (фактическая база дерева — коммит, от которого этап отведён), `lease_expires`, `contract` — фактическая команда и вход целиком |
 | `attempt_progress` | шаг попытки движка: вызов инструмента или его результат (телеметрия, состояние дела не меняет) | `stage`, `attempt`, `seq`, `phase` (`tool_use`/`tool_result`), `name`, `duration_ms` (только у результата), `ts` |
-| `attempt_ended` | ран закрыт (движок: попытка отчиталась, не отчиталась или упала; `done` — только при принятом evidence-пакете; `reaped: true` — попытку закрыл `reaper.sweep`, отчёта от неё не было; `refused: true` в `details` — попытку не поднимали вовсе: потолок дела исчерпан (`details.budget`: `{kind, used, limit}`) или нет «ок» человека на это дерево (`details.publish`); у `shell`-попытки в `details` — `exit_code`, `duration_sec`, `must`, `timed_out`, хвосты `stdout_tail`/`stderr_tail`; у гейта — `stage_kind: gate`, `question_id`, `answer`, `allow`) | `run_id`, `stage`, `attempt`, `outcome` (`done`/`failed`), `kind` (`infra`/`contract`/`capability`/`null`), `reason`, `base` (база дерева попытки), `commit` (что произвела принятая попытка — коммит движка в её дереве или коммит исполнителя; от него отводится дерево следующего этапа; `null` — произвести было нечего), `details` (в том числе `verdict`: вердикт гейта с `details`), `result` (если отчёт разобран), `reaped` (только у убранных), `pid` (у убранных — из `attempt_started`) |
+| `attempt_ended` | ран закрыт (движок: попытка отчиталась, не отчиталась или упала; `done` — только при принятом evidence-пакете; `reaped: true` — попытку закрыл `reaper.sweep`, отчёта от неё не было; `refused: true` в `details` — попытку не поднимали вовсе: потолок дела исчерпан (`details.budget`: `{kind, used, limit}`) или нет «ок» человека на это дерево (`details.publish`); у `shell`-попытки в `details` — `exit_code`, `duration_sec`, `must`, `timed_out`, хвосты `stdout_tail`/`stderr_tail`; у гейта — `stage_kind: gate`, `question_id`, `answer`, `allow`) | `run_id`, `stage`, `attempt`, `outcome` (`done`/`failed`), `kind` (`infra`/`contract`/`capability`/`null`), `reason`, `base` (база дерева попытки), `commit` (что произвела принятая попытка — коммит движка в её дереве или коммит исполнителя; от него отводится дерево следующего этапа; `null` — произвести было нечего), `details` (в том числе `witness` — принятый свидетель пакета: `commit\|artifacts` / `verdict` / `published`; `verdict`: вердикт гейта с `details`), `result` (если отчёт разобран), `reaped` (только у убранных), `pid` (у убранных — из `attempt_started`) |
 | `blocked` | `status=blocked` | `block_kind`, `reason` |
 | `unblocked` | был `blocked`, стал иной статус | `previous_kind` |
 | `completed` | `status=done` (или `archived` как отдельный факт: переносится тем же `completed` со `status="archived"`) | `status` |
@@ -409,7 +409,7 @@ approved_commit}`.
 
 | шаг | что сверяется | правило отказа | класс |
 |---|---|---|---|
-| 1 | `status` ∈ {`done`, `blocked`, `refused`}; для `done` есть `commit`\|`artifacts`, `evidence`, `summary`; лишнее поле — предупреждение | `status`, `required`, `extra` | `contract` |
+| 1 | `status` ∈ {`done`, `blocked`, `refused`}; для `done` есть свидетель этапа (`commit`\|`artifacts`, `verdict` или `published` — по `evidence.witness`), `evidence`, `summary`; лишнее поле — предупреждение | `status`, `required`, `extra` | `contract` |
 | 2 | артефакт: относительный путь внутри дерева попытки, файл есть, `sha256` полный и совпадает; отказ называет мерку («искали относительно дерево/каталог попытки») и подсказывает `workspace: worktree`, если файл нашёлся в дереве попытки | `artifact.path`, `artifact.missing`, `artifact.sha256` | `contract` |
 | 3 | `git rev-parse --verify <commit>^{commit}` в дереве; коммит не предок базы (предок = «принёс чужое готовое») | `commit.resolve`, `commit.foreign`; `commit.base` — предупреждение, если база не резолвится | `contract` |
 | 4 | по каждой `{cmd, must}` из `stage.evidence` есть запись с тем же `cmd`, `exit == must` и `started_at` ≥ начала попытки (и не позже «сейчас») | `evidence.missing`, `evidence.exit`, `evidence.stale`, `evidence.future` | `contract` |
@@ -423,7 +423,15 @@ approved_commit}`.
 
 Схема отчёта уходит исполнителю в файл контракта (`report_schema` в
 `attempt_started.contract`): гейт, о правилах которого узнают только из отказа, —
-не контракт, а ловушка.
+не контракт, а ловушка. Требуемый свидетель (`required_for_done`) берётся из той же
+функции, что и проверка, — `evidence.witness(stage)`: `commit|artifacts` у обычного
+этапа, `verdict` у этапа с приговором, `published` у публикующего
+(`docs/SPEC.md`, «Свидетель этапа»).
+
+Принятый свидетель называется в самом факте: `attempt_ended.details.witness`
+(`commit|artifacts` / `verdict` / `published`, `null` — пакет не принимался) и рядом
+`details.verdict.witness`. По журналу видно не только «принято», но и чем этап
+назвал работу — без этого разбор отказа идёт по коду плагина.
 
 Что гейт **не** делает: не запускает объявленные команды повторно, не считает
 дело закрытым (`fold` читает факт), не ставит ретраи — это `transit`/`failures`

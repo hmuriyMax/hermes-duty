@@ -571,9 +571,13 @@ def _repos_of(home: Path) -> dict[str, Any]:
         conn = deals.open_store(home, create=False, readonly=True)
     except Exception:  # noqa: BLE001 - store не читается: скажет `/now` в errors
         return {"list": [], "without_repo": 0, "read": False}
-    if conn is None or not deals.has_store(conn):
+    if conn is None:
         return {"list": [], "without_repo": 0, "read": True}
     try:
+        # `has_store` и выборка — часть чтения: битый файл падает и здесь, а не
+        # только на открытии, и группировка не имеет права ронять весь срез.
+        if not deals.has_store(conn):
+            return {"list": [], "without_repo": 0, "read": True}
         rows = deals.deal_rows(conn, open_only=False)
     except Exception:  # noqa: BLE001 - битый store
         return {"list": [], "without_repo": 0, "read": False}

@@ -34,6 +34,7 @@ sys.modules[_SPEC.name] = plugin_api
 _SPEC.loader.exec_module(plugin_api)
 
 journal = plugin_api.journal
+deals = plugin_api.deals
 
 NOW = 1_800_000_000
 
@@ -284,12 +285,12 @@ def test_schema_matches_contract(home: Path) -> None:
     conn = journal.open_journal(home)
     assert conn is not None
     columns = {row["name"]: row for row in conn.execute("PRAGMA table_info(events)")}
+    # Колонки `board` в журнале больше нет (0.0.6): дело адресуется своим `deal_id`.
     assert list(columns) == [
         "id",
         "ts",
         "recorded_at",
         "deal_id",
-        "board",
         "kind",
         "payload",
         "source",
@@ -297,7 +298,7 @@ def test_schema_matches_contract(home: Path) -> None:
     ]
     assert columns["id"]["pk"] == 1
     assert columns["payload"]["dflt_value"] == "'{}'"
-    for name in ("ts", "recorded_at", "deal_id", "board", "kind", "source", "idempotency_key"):
+    for name in ("ts", "recorded_at", "deal_id", "kind", "source", "idempotency_key"):
         assert columns[name]["notnull"] == 1, name
 
     indexes = {row["name"]: row for row in conn.execute("PRAGMA index_list(events)")}
@@ -807,50 +808,62 @@ def test_fold_priority_wait_human_beats_crashed() -> None:
     assert "ещё: crashed:" in folded["evidence"]
 
 
-def test_ingest_expired_kanban_lease_still_folds_to_dead_lease(home: Path) -> None:
-    """Правило 4 для чужого факта: истёкший срок kanban-лизинга — по-прежнему `dead_lease`.
+def test_expired_lease_term_still_folds_to_dead_lease() -> None:
+    """Правило 4: `claimed` со сроком из payload, срок прошёл, попытки не было — `dead_lease`.
 
-    `claimed` от ingest несёт срок из payload источника, срок прошёл, попытки за
-    лизингом не было — факт называется. Изменение правила касается только
-    `claimed` без срока, а не проверки срока у чужих фактов.
+    Изменение правила касается только `claimed` без срока, а не проверки срока:
+    факт лизинга с истёкшим сроком назван независимо от того, кто его записал.
     """
-    board = make_board(home)
-    conn = sqlite3.connect(board)
-    try:
-        add_task(conn, "t_expired", status="running", claim_lock="L", claim_expires=NOW - 100)
-        add_kanban_event(
-            conn,
-            "claimed",
-            task_id="t_expired",
-            payload={"lock": "L", "expires": NOW - 100},
-            created_at=NOW - 200,
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    ingest(board, home)
-
-    conn = journal.open_journal(home, create=False)
-    assert conn is not None
-    try:
-        folded = journal.fold(journal.read_events(conn, "t_expired"), now=NOW)
-    finally:
-        conn.close()
+    folded = journal.fold(
+        events(("claimed", {"claim_lock": "L", "claim_expires": NOW - 100, "source": "engine"})),
+        now=NOW,
+    )
 
     assert folded["state"] == "dead_lease"
     assert "L" in folded["evidence"]
 
 
-# -------------------------------------------------------------------- ingest
+# ------------------------------------------------- своё дело в store (0.0.6)
+#
+# Доск больше нет: `/now` показывает только дела своего store (`dashboard/deals.py`),
+# а состояние берётся fold'ом журнала. Карточки kanban — наблюдение (`/cards`), в
+# срез дел они не входят. Поэтому фикстура «дело в срезе» — строка store плюс его
+# события, а не карточка доски.
 
 
-def ingest(board: Path, home: Path) -> dict[str, Any]:
-    """Прогнать ingest по одной фикстурной доске."""
+def store(home: Path) -> sqlite3.Connection:
+    """Соединение своего store: схему (и журнал рядом) доводит открытие на запись."""
+    conn = deals.open_store(home)
+    assert conn is not None
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def make_deal(
+    home: Path, *, title: str = "дело", status: str = "ready", repo: str | None = "stack"
+) -> str:
+    """Своё дело в store: строка плюс `created` — как их пишет мутация."""
+    conn = store(home)
+    try:
+        result = deals.create_deal(conn, repo=repo, title=title, now=NOW - 900)
+        deal_id = str(result["deal"]["id"])
+        if status != str(result["deal"]["status"]):
+            # Статус жизни ставится командой, а не созданием: в тесте — прямо в строку.
+            with conn:
+                conn.execute("UPDATE deals SET status = ? WHERE id = ?", (status, deal_id))
+    finally:
+        conn.close()
+    return deal_id
+
+
+def append_facts(
+    home: Path, deal_id: str, *pairs: tuple[str, dict | None], ts: int = NOW - 100
+) -> None:
+    """Дописать факты журнала дела так, как их пишет движок."""
     conn = journal.open_journal(home)
     assert conn is not None
     try:
-        return journal.ingest(conn, home, plugin_api._discover_boards(home))
+        journal.append(conn, events(*pairs, deal_id=deal_id, ts=ts))
     finally:
         conn.close()
 
@@ -864,433 +877,66 @@ def journal_kinds(home: Path) -> list[str]:
         conn.close()
 
 
-def test_ingest_writes_facts_of_every_ingested_kind(home: Path) -> None:
-    """Каждый вид из таблицы контракта, у которого есть строка источника, — в журнале."""
-    board = make_board(home)
-    conn = sqlite3.connect(board)
-    add_task(conn, "t_full", status="running", claim_lock="L1", claim_expires=NOW + 600)
-    run_id = add_run(conn, "t_full", worker_pid=os.getpid(), claim_lock="L1")
-    add_kanban_event(conn, "created", task_id="t_full", payload={"assignee": "implementer", "status": "todo", "parents": []}, created_at=NOW - 900)
-    add_kanban_event(conn, "claimed", task_id="t_full", payload={"lock": "L1", "expires": NOW + 600, "run_id": run_id}, run_id=run_id, created_at=NOW - 800)
-    add_kanban_event(conn, "blocked", task_id="t_full", payload={"kind": "needs_input", "reason": "нужно решение"}, created_at=NOW - 700)
-    add_kanban_event(conn, "unblocked", task_id="t_full", created_at=NOW - 650)
-    add_kanban_event(conn, "completed", task_id="t_full", payload={"status": "awaiting_merge"}, run_id=run_id, created_at=NOW - 600)
-    conn.commit()
-    conn.close()
-
-    report = ingest(board, home)
-
-    assert report["errors"] == []
-    assert report["appended"] > 0
-    kinds = journal_kinds(home)
-    # `completed` со статусом awaiting_merge — не завершение дела: fold закрыл бы живое.
-    assert set(kinds) == {"created", "claimed", "blocked", "unblocked", "attempt_started"}
-    assert "completed" not in kinds
-
-
-def test_ingest_payload_holds_source_facts_only(home: Path) -> None:
-    """payload — сырые факты источника, без вычисленных состояний."""
-    board = make_board(home)
-    conn = sqlite3.connect(board)
-    add_task(conn, "t_pay", status="ready", title="дело про факты")
-    add_kanban_event(conn, "created", task_id="t_pay", payload={"assignee": "implementer", "status": "ready", "parents": ["t_parent"]}, created_at=NOW - 900)
-    conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES ('t_parent', 't_pay')")
-    conn.commit()
-    conn.close()
-
-    ingest(board, home)
-
-    conn = journal.open_journal(home)
-    created = journal.read_events(conn, deal_id="t_pay")[0]
-    conn.close()
-    assert created["kind"] == "created"
-    assert created["payload"] == {
-        "title": "дело про факты",
-        "assignee": "implementer",
-        "status": "ready",
-        "parents": ["t_parent"],
-    }
-    assert created["source"] == "ingest"
-    assert created["idempotency_key"].startswith("ingest:stack:t_pay:created:")
-
-
-def test_second_ingest_is_a_noop_and_fold_is_the_same(home: Path) -> None:
-    """Повторный проход: 0 новых строк, и `fold` даёт тот же результат (инвариант 3)."""
-    board = make_board(home)
-    conn = sqlite3.connect(board)
-    add_task(conn, "t_twice", status="blocked", block_kind="needs_input")
-    add_kanban_event(conn, "created", task_id="t_twice", payload={"status": "blocked"}, created_at=NOW - 900)
-    add_kanban_event(conn, "blocked", task_id="t_twice", payload={"kind": "needs_input", "reason": "нужно решение"}, created_at=NOW - 800)
-    conn.commit()
-    conn.close()
-
-    first = ingest(board, home)
-    conn = journal.open_journal(home, create=False)
-    assert conn is not None
-    before = journal.read_events(conn)
-    conn.close()
-    second = ingest(board, home)
-    conn = journal.open_journal(home, create=False)
-    assert conn is not None
-    after = journal.read_events(conn)
-    conn.close()
-
-    assert first["appended"] == len(before) > 0
-    assert second["appended"] == 0
-    assert after == before
-    assert journal.fold(before) == journal.fold(after)
-    assert journal.fold(after)["state"] == "wait_human"
-
-
-def test_ingest_does_not_touch_foreign_databases(home: Path) -> None:
-    """mtime `kanban.db`/`state.db` не меняется за весь сценарий (инвариант 1)."""
-    board = make_board(home)
-    conn = sqlite3.connect(board)
-    add_task(conn, "t_ro", status="running", worker_pid=os.getpid())
-    run_id = add_run(conn, "t_ro", worker_pid=os.getpid())
-    add_kanban_event(conn, "created", task_id="t_ro", payload={"status": "running"}, created_at=NOW - 900)
-    add_kanban_event(conn, "claimed", task_id="t_ro", payload={"lock": "L", "expires": NOW + 600, "run_id": run_id}, run_id=run_id, created_at=NOW - 800)
-    conn.commit()
-    conn.close()
-    state_db = home / "profiles" / "implementer" / "state.db"
-    state_db.parent.mkdir(parents=True)
-    sqlite3.connect(state_db).close()
-
-    before = {path: path.stat().st_mtime_ns for path in (board, state_db)}
-    ingest(board, home)
-    ingest(board, home)
-    after = {path: path.stat().st_mtime_ns for path in (board, state_db)}
-
-    assert after == before
-
-
-def test_ingest_skips_history_of_untouched_terminal_deals(home: Path) -> None:
-    """Историю задним числом не мигрируем: закрытое дело, которого журнал не знает, не пишется."""
-    board = make_board(home)
-    conn = sqlite3.connect(board)
-    add_task(conn, "t_old", status="done")
-    add_kanban_event(conn, "created", task_id="t_old", payload={"status": "ready"}, created_at=NOW - 9000)
-    add_kanban_event(conn, "completed", task_id="t_old", payload={"status": "done"}, created_at=NOW - 8000)
-    add_task(conn, "t_live", status="ready")
-    conn.commit()
-    conn.close()
-
-    ingest(board, home)
-
-    conn = journal.open_journal(home, create=False)
-    assert conn is not None
-    deals = journal.deal_ids(conn)
-    conn.close()
-    assert deals == {"t_live"}
-
-
-def test_ingest_writes_lease_lost_for_claim_without_attempt(home: Path) -> None:
-    """Лизинг исчез без попытки: в kanban события для этого нет, факт выводится сравнением."""
-    board = make_board(home)
-    conn = sqlite3.connect(board)
-    add_task(conn, "t_lost", status="ready", claim_lock=None, claim_expires=None)
-    add_kanban_event(conn, "created", task_id="t_lost", payload={"status": "ready"}, created_at=NOW - 900)
-    add_kanban_event(conn, "claimed", task_id="t_lost", payload={"lock": "L-lost", "expires": NOW - 500, "run_id": 1}, run_id=1, created_at=NOW - 800)
-    conn.commit()
-    conn.close()
-
-    ingest(board, home)
-
-    conn = journal.open_journal(home)
-    rows = [event for event in journal.read_events(conn, deal_id="t_lost") if event["kind"] == "lease_lost"]
-    conn.close()
-    assert len(rows) == 1
-    assert rows[0]["payload"] == {"previous_expires": NOW - 500}
-
-
-def test_ingest_does_not_write_lease_lost_for_closed_deal_with_tail(home: Path) -> None:
-    """Хвост после `completed` не делает закрытое дело кандидатом на `lease_lost`.
-
-    `lease_lost` в kanban события не имеет: он выводится сравнением журнала с
-    источником (лизинг был, попытки за ним не было, лизинга больше нет). Признак
-    «дело закрыто» читался по последней строке журнала (`events[-1]`), и у дела с
-    хвостом (`commented`, `question_answered`) он был ложен — в закрытое дело
-    дописывался `lease_lost`, а он state-changing, то есть снова воскрешал дело.
-    Теперь закрытость считается общим предикатом fold (правило 2).
-    """
-    board = make_board(home)
-    conn = sqlite3.connect(board)
-    add_task(conn, "t_tail", status="running", claim_lock="L-tail", claim_expires=NOW + 600)
-    add_kanban_event(conn, "created", task_id="t_tail", payload={"status": "running"}, created_at=NOW - 900)
-    add_kanban_event(
-        conn,
-        "claimed",
-        task_id="t_tail",
-        payload={"lock": "L-tail", "expires": NOW + 600, "run_id": 1},
-        run_id=1,
-        created_at=NOW - 800,
-    )
-    conn.commit()
-    conn.close()
-
-    ingest(board, home)  # журнал знает дело, пока оно ещё активно
-
-    conn = sqlite3.connect(board)
-    conn.execute("UPDATE tasks SET status='done', claim_lock=NULL, claim_expires=NULL WHERE id='t_tail'")
-    add_kanban_event(conn, "completed", task_id="t_tail", payload={"status": "done"}, created_at=NOW - 100)
-    conn.commit()
-    conn.close()
-
-    ingest(board, home)  # закрытие легло в журнал; хвоста ещё нет
-    jconn = journal.open_journal(home)
-    journal.append(
-        jconn, events(("commented", {"author": "max", "len": 6}), deal_id="t_tail", ts=NOW - 50)
-    )
-    jconn.close()
-
-    first = ingest(board, home)
-    second = ingest(board, home)
-
-    kinds = journal_kinds(home)
-    assert "completed" in kinds
-    # Хвост — последняя строка журнала, и решение о закрытости от него не зависит.
-    assert kinds[-1] == "commented"
-    assert "lease_lost" not in kinds
-    # Идемпотентность сохранена: дописывать нечего ни на первом проходе с хвостом,
-    # ни на повторном.
-    assert first["appended"] == 0
-    assert second["appended"] == 0
-
-
-def test_ingest_keeps_live_lease_untouched(home: Path) -> None:
-    """Лизинг на месте — он не потерян, `lease_lost` не пишется."""
-    board = make_board(home)
-    conn = sqlite3.connect(board)
-    add_task(conn, "t_held", status="ready", claim_lock="L-hold", claim_expires=NOW + 600)
-    add_kanban_event(conn, "created", task_id="t_held", payload={"status": "ready"}, created_at=NOW - 900)
-    add_kanban_event(conn, "claimed", task_id="t_held", payload={"lock": "L-hold", "expires": NOW + 600, "run_id": 1}, run_id=1, created_at=NOW - 800)
-    conn.commit()
-    conn.close()
-
-    ingest(board, home)
-
-    assert "lease_lost" not in journal_kinds(home)
-
-
-def test_ingest_completed_without_status_uses_task_status(home: Path) -> None:
-    """Старые kanban-события не писали `status`: терминальность берём у карточки."""
-    board = make_board(home)
-    conn = sqlite3.connect(board)
-    add_task(conn, "t_old_done", status="awaiting_merge")
-    add_kanban_event(conn, "created", task_id="t_old_done", payload={"status": "ready"}, created_at=NOW - 900)
-    add_kanban_event(conn, "completed", task_id="t_old_done", payload={}, created_at=NOW - 800)
-    conn.commit()
-    conn.close()
-
-    ingest(board, home)
-
-    # дело активно, а `completed` без статуса завершением не считается
-    assert "completed" not in journal_kinds(home)
-
-
-def test_ingest_completed_of_done_card_closes_deal(home: Path, client: TestClient) -> None:
-    """B1, ветка «статус из карточки»: дело сдали → в журнале `completed`.
-
-    Дело закрывается ровно в одном месте — ingest через `_completed_status()`.
-    До этого теста про `completed` были только отрицательные проверки («событие
-    НЕ появилось»), поэтому `_completed_status()`, всегда возвращающий `None`,
-    оставлял весь набор зелёным, а журнал перестал бы закрывать дела вовсе.
-
-    Дело сначала живёт на доске (иначе это история, которую ingest намеренно не
-    мигрирует), потом карточка уходит в `done`, а kanban-событие `completed`
-    приходит без `status` — статус берётся из карточки.
-    """
-    board = make_board(home)
-    conn = sqlite3.connect(board)
-    add_task(conn, "t_done", status="running")
-    add_kanban_event(conn, "created", task_id="t_done", payload={"status": "running"}, created_at=NOW - 900)
-    conn.commit()
-    ingest(board, home)
-    assert "completed" not in journal_kinds(home)
-
-    conn.execute("UPDATE tasks SET status = 'done' WHERE id = 't_done'")
-    add_kanban_event(conn, "completed", task_id="t_done", payload={}, created_at=NOW - 800)
-    conn.commit()
-    conn.close()
-
-    client.post("/ingest")
-
-    kinds = journal_kinds(home)
-    assert "completed" in kinds
-    conn = journal.open_journal(home, create=False)
-    assert conn is not None
-    rows = journal.read_events(conn, deal_id="t_done")
-    conn.close()
-    completed = [event for event in rows if event["kind"] == "completed"]
-    assert len(completed) == 1
-    assert completed[0]["payload"] == {"status": "done"}
-    assert journal.fold(rows, now=NOW)["active"] is False
-    assert client.get("/now").json()["count"] == 0
-
-
-def test_ingest_completed_by_payload_status_takes_deal_out_of_now(home: Path, client: TestClient) -> None:
-    """B1, ветка «статус из payload»: `completed` события закрывает дело и уводит его из `/now`.
-
-    Карточка при этом ещё активна (`awaiting_merge`), поэтому срез обязан не
-    просто выкинуть дело, а назвать расхождение в `boards[].warnings`: «дело
-    ушло» и «дело пропало» — разные вещи.
-    """
-    board = make_board(home)
-    conn = sqlite3.connect(board)
-    add_task(conn, "t_stage", status="awaiting_merge")
-    add_kanban_event(conn, "created", task_id="t_stage", payload={"status": "ready"}, created_at=NOW - 900)
-    add_kanban_event(conn, "completed", task_id="t_stage", payload={"status": "done"}, created_at=NOW - 800)
-    conn.commit()
-    conn.close()
-
-    before = client.get("/now").json()
-    client.post("/ingest")
-    after = client.get("/now").json()
-
-    assert [deal["id"] for deal in before["deals"]] == ["t_stage"]
-    assert before["boards"][0]["warnings"] == []
-    assert after["count"] == 0
-    assert any(
-        "t_stage" in warning and "правило 2" in warning for warning in after["boards"][0]["warnings"]
-    )
-
-
-def test_ingest_writes_attempt_ended_for_closed_run(home: Path) -> None:
-    """B2: у закрытого рана (`ended_at`) появляется `attempt_ended`, и попытка не живёт.
-
-    До этого теста ни один `add_run(...)` не задавал `ended_at`, поэтому потеря
-    записи `attempt_ended` в ingest не роняла ничего: дело с закрытым раном
-    навсегда осталось бы в `working`/`no_signal` — тихая ложь в `/now`.
-    """
-    board = make_board(home)
-    pid = os.getpid()
-    conn = sqlite3.connect(board)
-    add_task(conn, "t_ran", status="running", worker_pid=pid)
-    run_id = add_run(conn, "t_ran", started_at=NOW - 600, ended_at=NOW - 100, outcome="completed", worker_pid=pid)
-    add_kanban_event(conn, "created", task_id="t_ran", payload={"status": "running"}, created_at=NOW - 900)
-    conn.commit()
-    conn.close()
-
-    ingest(board, home)
-
-    conn = journal.open_journal(home, create=False)
-    assert conn is not None
-    rows = journal.read_events(conn, deal_id="t_ran")
-    conn.close()
-    ended = [event for event in rows if event["kind"] == "attempt_ended"]
-    assert len(ended) == 1
-    assert ended[0]["payload"] == {"run_id": run_id, "outcome": "completed", "error": None}
-    assert ended[0]["ts"] == NOW - 100
-    # Тот же набор без `attempt_ended` даёт живой факт — на этом различии тест и стоит.
-    still_open = journal.fold([event for event in rows if event["kind"] != "attempt_ended"], now=NOW)
-    assert still_open["state"] == "working"
-    folded = journal.fold(rows, now=NOW)
-    assert folded["state"] is None
-    assert folded["reason"] == "no_live_fact"
-    assert folded["last_kind"] == "attempt_ended"
-
-
-def test_ingest_reports_unreadable_board(home: Path) -> None:
-    """Ошибка источника — факт отчёта, а не падение прохода."""
-    broken = board_db(home, "broken")
-    broken.parent.mkdir(parents=True)
-    broken.write_bytes(b"")
-    board = make_board(home)
-    conn = sqlite3.connect(board)
-    add_task(conn, "t_ok", status="ready")
-    conn.commit()
-    conn.close()
-
-    report = ingest(board, home)
-
-    assert report["appended"] > 0
-    assert any(error["board"] == "broken" for error in report["errors"])
-    assert {item["slug"]: item["read"] for item in report["boards"]}["broken"] is False
-
-
 # -------------------------------------------------------------------- роуты
 
 
-def test_now_falls_back_to_kanban_and_says_so(home: Path, client: TestClient) -> None:
-    """Пустой журнал: состояние из kanban, и evidence это называет (правило 7)."""
+def test_now_reads_deals_from_store_not_from_kanban(home: Path, client: TestClient) -> None:
+    """`/now` показывает дела store, а карточка kanban делом не считается (0.0.6)."""
     board = make_board(home)
     conn = sqlite3.connect(board)
     add_task(conn, "t_blocked", status="blocked", block_kind="needs_input")
     conn.commit()
     conn.close()
 
+    assert client.get("/now").json()["deals"] == []
+
+    deal_id = make_deal(home)
+
+    listed = client.get("/now").json()["deals"]
+    assert [deal["id"] for deal in listed] == [deal_id]
+    assert listed[0]["repo"] == "stack"
+
+
+def test_now_counts_state_by_journal(home: Path, client: TestClient) -> None:
+    """Состояние дела считается по журналу: `attempt_started` даёт `working`."""
+    deal_id = make_deal(home, status="running")
+    append_facts(
+        home,
+        deal_id,
+        ("attempt_started", {"run_id": f"{deal_id}:impl#1", "stage": "impl", "attempt": 1, "pid": os.getpid(), "lease_expires": NOW + 600}),
+    )
+
+    assert journal_kinds(home) == ["created", "attempt_started"]
     deal = client.get("/now").json()["deals"][0]
 
-    assert deal["waiting"]["state"] == "wait_human"
-    assert deal["waiting"]["evidence"].startswith("journal: empty — состояние из kanban")
-    assert "status=blocked" in deal["waiting"]["evidence"]
-    assert deal["waiting"]["human_kind"] == "status"
+    assert deal["waiting"]["state"] == "working"
+    assert "journal:" not in deal["waiting"]["evidence"]
+    assert deal["attempt"]["pid"] == os.getpid()
+    assert deal["attempt"]["source"] == "journal"
 
 
-def test_now_counts_state_by_journal_after_ingest(home: Path, client: TestClient) -> None:
-    """После ingest состояние считается по журналу, и пометки «из kanban» больше нет."""
-    board = make_board(home)
-    conn = sqlite3.connect(board)
-    pid = os.getpid()
-    add_task(conn, "t_run", status="running", worker_pid=pid, claim_lock="L", claim_expires=NOW + 600)
-    run_id = add_run(conn, "t_run", worker_pid=pid, claim_lock="L")
-    add_kanban_event(conn, "created", task_id="t_run", payload={"status": "running"}, created_at=NOW - 900)
-    add_kanban_event(conn, "claimed", task_id="t_run", payload={"lock": "L", "expires": NOW + 600, "run_id": run_id}, run_id=run_id, created_at=NOW - 800)
-    conn.commit()
-    conn.close()
+def test_health_counts_journal_only_and_is_idempotent(home: Path, client: TestClient) -> None:
+    """`/health.journal` — числа журнала: два чтения подряд дают одно и то же."""
+    deal_id = make_deal(home)
 
-    before = client.get("/now").json()
-    client.post("/ingest")
-    after = client.get("/now").json()
+    first = client.get("/health").json()["journal"]
+    second = client.get("/health").json()["journal"]
 
-    assert before["deals"][0]["waiting"]["evidence"].startswith("journal: empty")
-    assert after["deals"][0]["waiting"]["state"] == "working"
-    assert "journal:" not in after["deals"][0]["waiting"]["evidence"]
-    assert "attempt_started" in journal_kinds(home)
+    assert first == {"events": 1, "deals": 1}
+    assert second == first
+    assert deal_id in journal.deal_ids(journal.open_journal(home, create=False))
 
 
-def test_health_drift_falls_after_ingest_and_repeat_is_noop(home: Path, client: TestClient) -> None:
-    """`drift.empty_journal` — число: было N, после ingest 0, повторный проход count не меняет."""
-    board = make_board(home)
-    conn = sqlite3.connect(board)
-    add_task(conn, "t_a", status="ready")
-    add_task(conn, "t_b", status="todo")
-    add_kanban_event(conn, "created", task_id="t_a", payload={"status": "ready"}, created_at=NOW - 900)
-    conn.commit()
-    conn.close()
-
-    before = client.get("/health").json()["journal"]
-    first = client.post("/ingest").json()
-    after = client.get("/health").json()["journal"]
-    second = client.post("/ingest").json()
-    again = client.get("/health").json()["journal"]
-
-    assert before == {"events": 0, "deals": 0, "drift": {"empty_journal": 2}}
-    assert first["appended"] > 0
-    assert after["drift"]["empty_journal"] == 0
-    assert after["events"] == first["events"] > 0
-    assert second["appended"] == 0
-    assert again == after
-
-
-def test_now_with_ingest_flag_writes_only_then(home: Path, client: TestClient) -> None:
-    """`?ingest=1` — единственный способ, которым срез пишет; без флага журнал не меняется."""
-    board = make_board(home)
-    conn = sqlite3.connect(board)
-    add_task(conn, "t_flag", status="ready")
-    add_kanban_event(conn, "created", task_id="t_flag", payload={"status": "ready"}, created_at=NOW - 900)
-    conn.commit()
-    conn.close()
-
-    client.get("/now")
-    assert journal_count(home) == 0
-    first = client.get("/now", params={"ingest": 1}).json()
+def test_now_does_not_write_the_journal(home: Path, client: TestClient) -> None:
+    """Срез только читает: ни одного события и ни байта новых файлов."""
+    deal_id = make_deal(home)
     written = journal_count(home)
+
     client.get("/now")
-    assert journal_count(home) == written > 0
-    client.get("/now", params={"ingest": 1})
+    client.get(f"/deal/{deal_id}")
+    client.get(f"/duty/{deal_id}/attempts")
+
     assert journal_count(home) == written
-    assert first["count"] == 1
 
 
 def test_now_waiting_shape_is_pinned(home: Path, client: TestClient) -> None:
@@ -1299,11 +945,7 @@ def test_now_waiting_shape_is_pinned(home: Path, client: TestClient) -> None:
     Пропажа `human_kind` вернула бы 0.0.2, где «ждёт ответа» и «ждёт решения по
     статусу» были одним словом; пропажа любого ключа ломает шейпер экрана.
     """
-    board = make_board(home)
-    conn = sqlite3.connect(board)
-    add_task(conn, "t_shape", status="blocked", block_kind="needs_input")
-    conn.commit()
-    conn.close()
+    make_deal(home, status="blocked")
 
     waiting = client.get("/now").json()["deals"][0]["waiting"]
 
@@ -1317,21 +959,12 @@ def test_question_in_journal_reports_answer_expected(home: Path, client: TestCli
     Пара к предыдущему тесту: два разных «нужен человек» различимы по ответу
     `/now`, а не только внутри fold.
     """
-    board = make_board(home)
-    conn = sqlite3.connect(board)
-    add_task(conn, "t_ask", status="blocked")
-    conn.commit()
-    conn.close()
-    jconn = journal.open_journal(home)
-    journal.append(
-        jconn,
-        events(
-            ("created", {"status": "blocked"}),
-            ("question_asked", {"question_id": 7, "session_key": "t_ask", "critical": 1}),
-            deal_id="t_ask",
-        ),
+    deal_id = make_deal(home, status="blocked")
+    append_facts(
+        home,
+        deal_id,
+        ("question_asked", {"question_id": 7, "session_key": f"t_{deal_id}", "critical": 1}),
     )
-    jconn.close()
 
     waiting = client.get("/now").json()["deals"][0]["waiting"]
 
@@ -1340,58 +973,31 @@ def test_question_in_journal_reports_answer_expected(home: Path, client: TestCli
     assert "#7" in waiting["evidence"]
 
 
-def test_repeat_pass_counts_no_rows_for_lease_lost(home: Path) -> None:
-    """Счётчик доски считает вставленные строки, а не кандидатов `lease_lost`.
-
-    Кандидат на `lease_lost` на повторном проходе тот же (условие вывода от записи
-    не меняется), `INSERT OR IGNORE` его отбрасывает. До правки `appended` доски
-    прибавлял единицу за кандидата, а итог оставался нулём: сумма по доскам
-    расходилась с `appended` ответа — число врало тихо.
-    """
-    board = make_board(home)
-    conn = sqlite3.connect(board)
-    add_task(conn, "t_lost2", status="ready")
-    add_kanban_event(conn, "created", task_id="t_lost2", payload={"status": "ready"}, created_at=NOW - 900)
-    add_kanban_event(conn, "claimed", task_id="t_lost2", payload={"lock": "L2", "expires": NOW - 500}, run_id=1, created_at=NOW - 800)
-    conn.commit()
-    conn.close()
-
-    first = ingest(board, home)
-    second = ingest(board, home)
-
-    assert "lease_lost" in journal_kinds(home)
-    # created + claimed + lease_lost — и ровно столько же насчитала доска
-    assert first["appended"] == 3
-    assert first["appended"] == sum(item["appended"] for item in first["boards"])
-    assert second["appended"] == 0
-    assert [item["appended"] for item in second["boards"]] == [0]
-
-
 def test_now_deal_shape_is_pinned(home: Path, client: TestClient) -> None:
     """Форма `/now` и `/now.deals[]` запинена тестом: правка поля роняет тест.
 
     Пункт 6 ревью: пин был только на `waiting`, а сама форма дела проверялась
     чтением кода — при следующей правке поле уехало бы молча. `_age_sec` здесь
     намеренно отсутствует: это служебный ключ сортировки, наружу он не идёт.
+    Доски (`boards[]`) в ответе больше нет (0.0.6): группировка — `repos`.
     """
-    board = make_board(home)
-    pid = os.getpid()
-    conn = sqlite3.connect(board)
-    add_task(conn, "t_shape", status="running", worker_pid=pid, claim_lock="L", claim_expires=NOW + 600)
-    add_run(conn, "t_shape", worker_pid=pid, claim_lock="L")
-    add_kanban_event(conn, "created", task_id="t_shape", payload={"status": "running"}, created_at=NOW - 900)
-    conn.commit()
-    conn.close()
+    deal_id = make_deal(home, status="running")
+    append_facts(
+        home,
+        deal_id,
+        ("attempt_started", {"run_id": f"{deal_id}:impl#1", "stage": "impl", "attempt": 1, "pid": os.getpid(), "lease_expires": NOW + 600}),
+    )
 
     body = client.get("/now").json()
 
-    assert list(body) == ["now", "count", "deals", "by_state", "crash_outcomes", "boards", "errors"]
+    assert list(body) == ["now", "count", "deals", "repos", "by_state", "crash_outcomes", "errors"]
     assert list(body["by_state"]) == list(journal.WAITING_PRIORITY)
     assert body["crash_outcomes"] == list(plugin_api.CRASH_OUTCOMES)
-    assert list(body["boards"][0]) == ["slug", "path", "read", "deals", "truncated", "warnings"]
+    assert list(body["repos"]) == ["list", "without_repo", "read"]
+    assert body["repos"]["list"] == [{"repo": "stack", "deals": 1}]
     deal = body["deals"][0]
     assert list(deal) == [
-        "board",
+        "repo",
         "id",
         "title",
         "assignee",
@@ -1405,8 +1011,8 @@ def test_now_deal_shape_is_pinned(home: Path, client: TestClient) -> None:
         "last_action",
         "last_run",
         # W6: этап графа и номер попытки из журнала — «что сейчас» без открытия
-        # дела. Вложенный объект, потому что имя `attempt` в этой форме уже
-        # занято фактом рана kanban.
+        # дела. Вложенный объект, потому что имя `attempt` в этой форме занято
+        # фактом попытки.
         "stage",
         # 0.0.5: расход против верхнего `budget` спеки (`dashboard/budget.py`);
         # `null` — потолка на дело нет.
@@ -1428,64 +1034,43 @@ def test_now_deal_shape_is_pinned(home: Path, client: TestClient) -> None:
     ]
     assert list(deal["lease"]) == ["claim_lock", "expires_at", "expires_in_sec", "state"]
     assert list(deal["last_action"]) == ["kind", "at", "age_sec", "summary"]
-    assert list(deal["last_run"]) == ["run_id", "status", "outcome", "started_at", "ended_at"]
+    assert deal["last_run"] is None
     assert list(deal["waiting"]) == ["state", "evidence", "human_kind"]
 
 
-def test_health_names_boards_it_could_not_read(home: Path, client: TestClient) -> None:
-    """Нечитаемая доска не «выпадает из drift молча»: она названа в `journal.note`.
-
-    Пункт 9 ревью: причина сбоя `_query_checked` выбрасывалась, доска не попадала в
-    `active`, и `drift.empty_journal` показывал 0 — «тихое всё хорошо». Теперь у
-    ответа появляется `note` с именем доски и причиной, а не только число.
-    """
-    board = make_board(home)
-    conn = sqlite3.connect(board)
-    add_task(conn, "t_ok", status="ready")
-    conn.commit()
-    conn.close()
-    empty = board_db(home, "broken")
-    empty.parent.mkdir(parents=True)
-    empty.write_bytes(b"")
-
+def test_health_without_journal_does_not_create_it(home: Path, client: TestClient) -> None:
+    """`/health` файлов не создаёт: пустой журнал — это 0 событий, а не новый файл."""
     journal_health = client.get("/health").json()["journal"]
 
-    assert journal_health["drift"]["empty_journal"] == 1
-    assert "broken" in journal_health["note"]
+    assert journal_health == {"events": 0, "deals": 0}
+    assert not (home / "duty" / "duty.db").exists()
 
 
-def test_health_has_no_note_when_every_board_reads(home: Path, client: TestClient) -> None:
-    """Читаемые источники — ровно три ключа контракта: `note` не появляется зря."""
-    board = make_board(home)
-    conn = sqlite3.connect(board)
-    add_task(conn, "t_ok", status="ready")
-    conn.commit()
-    conn.close()
+def test_health_note_names_unreadable_journal(home: Path, client: TestClient) -> None:
+    """Нечитаемый журнал назван в `note` с причиной, а не выдан за пустой."""
+    path = home / "duty" / "duty.db"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"not a database")
 
-    journal_health = client.get("/health").json()["journal"]
+    health = client.get("/health").json()
 
-    assert list(journal_health) == ["events", "deals", "drift"]
-    assert journal_health["drift"]["empty_journal"] == 1
+    assert health["journal"] == {"events": 0, "deals": 0}
+    assert "journal unreadable" in health["note"]
 
 
 def test_unreadable_journal_names_itself_as_a_path(home: Path, client: TestClient) -> None:
-    """Недоступный журнал назван путём `duty/duty.db`, как остальные источники.
+    """Недоступный журнал назван в `errors[]` именем источника, а не падением роута.
 
     Не слагом доски: «доска duty» читалась бы как ещё одна доска kanban, а дело
     тут — свой файл. Имя берётся из одной константы `journal.JOURNAL_SOURCE`.
     """
     journal_path = home / "duty" / "duty.db"
     journal_path.parent.mkdir(parents=True)
-    journal_path.write_bytes(b"not a database")  # журнал есть, но не читается
-    board = make_board(home)
-    conn = sqlite3.connect(board)
-    add_task(conn, "t_ok", status="ready")
-    conn.commit()
-    conn.close()
+    journal_path.write_bytes(b"not a database")
 
     body = client.get("/now").json()
 
-    sources = [error["board"] for error in body["errors"]]
+    sources = [error["source"] for error in body["errors"]]
     assert journal.JOURNAL_SOURCE in sources
     assert "duty" not in sources
 
@@ -1502,44 +1087,28 @@ def journal_count(home: Path) -> int:
 
 
 def test_now_excludes_deal_that_journal_closed(home: Path, client: TestClient) -> None:
-    """Правило 2: журнал говорит completed, kanban ещё активна — дело не в срезе, но назван."""
-    board = make_board(home)
-    conn = sqlite3.connect(board)
-    add_task(conn, "t_drift", status="awaiting_merge")
-    conn.commit()
-    conn.close()
-    jconn = journal.open_journal(home)
-    journal.append(
-        jconn,
-        events(("created", {"status": "todo"}), ("completed", {"status": "done"}), deal_id="t_drift"),
-    )
-    jconn.close()
+    """Правило 2: журнал говорит `completed` — дело не в срезе, хотя строка активна."""
+    deal_id = make_deal(home, status="awaiting_merge")
+    append_facts(home, deal_id, ("completed", {"status": "done"}))
 
     body = client.get("/now").json()
 
     assert body["count"] == 0
-    assert any("t_drift" in warning and "правило 2" in warning for warning in body["boards"][0]["warnings"])
+    assert deal_id not in {deal["id"] for deal in body["deals"]}
 
 
 def test_pool_question_wins_over_journal_state_and_is_named(home: Path, client: TestClient) -> None:
     """Живой вопрос пула — факт: он важнее состояния журнала и назван в evidence."""
-    board = make_board(home)
-    conn = sqlite3.connect(board)
-    pid = os.getpid()
-    add_task(conn, "t_0000aa", status="running", worker_pid=pid)
-    run_id = add_run(conn, "t_0000aa", worker_pid=pid)
-    add_kanban_event(conn, "created", task_id="t_0000aa", payload={"status": "running"}, created_at=NOW - 900)
-    conn.commit()
-    conn.close()
-    jconn = journal.open_journal(home)
-    journal.append(
-        jconn,
-        events(("attempt_started", {"run_id": run_id, "pid": pid}), deal_id="t_0000aa"),
+    deal_id = make_deal(home, status="running")
+    append_facts(
+        home,
+        deal_id,
+        ("attempt_started", {"run_id": f"{deal_id}:impl#1", "stage": "impl", "attempt": 1, "pid": os.getpid()}),
     )
-    jconn.close()
     pool = sqlite3.connect(home / "messaging" / "pool.db")
     pool.execute(
-        "INSERT INTO questions (session_key, text, origin, status) VALUES ('t_0000aa', 'вопрос по делу', 'card', 'sent')"
+        "INSERT INTO questions (session_key, text, origin, status) VALUES (?, 'вопрос по делу', 'duty', 'sent')",
+        (f"t_{deal_id}",),
     )
     pool.commit()
     pool.close()
@@ -1553,16 +1122,22 @@ def test_pool_question_wins_over_journal_state_and_is_named(home: Path, client: 
 
 def test_deal_screen_uses_the_same_journal_state(home: Path, client: TestClient) -> None:
     """Экран дела показывает тот же факт-набор, что `/now`: второй правды нет."""
-    board = make_board(home)
-    conn = sqlite3.connect(board)
-    add_task(conn, "t_one", status="blocked", block_kind="needs_input")
-    conn.commit()
-    conn.close()
+    deal_id = make_deal(home, status="blocked")
 
-    body = client.get("/deal/stack/t_one").json()
+    body = client.get(f"/deal/{deal_id}").json()
 
+    assert body["deal"]["waiting"] == client.get("/now").json()["deals"][0]["waiting"]
     assert body["deal"]["waiting"]["state"] == "wait_human"
-    assert body["deal"]["waiting"]["evidence"].startswith("journal: empty — состояние из kanban")
+
+
+def test_kanban_card_is_not_a_deal_for_the_routes(home: Path, client: TestClient) -> None:
+    """`t_…` в маршрутах дел — отказ словами: карточки смотри в `/cards`."""
+    make_board(home)
+
+    for path in ("/deal/t_0000aa", "/duty/t_0000aa/attempts"):
+        response = client.get(path)
+        assert response.status_code == 400, (path, response.text)
+        assert "карточка kanban" in response.json()["detail"]
 
 
 # ------------------------------------------------------- парковка гейта

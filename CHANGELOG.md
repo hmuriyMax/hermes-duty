@@ -5,7 +5,44 @@
 
 ## [0.0.5] — в разработке
 
-- _заполняется по ходу работы_
+### Вид этапа: команда (`shell`) и вопрос (`gate`)
+
+У этапа появилось поле `kind` — три вида (`agent` по умолчанию, `shell`, `gate`); спеки
+0.0.4 без него читаются как прежде. Чужие поля вида — отказ, а не тихий игнор
+(`docs/SPEC.md`, «`kind`: `agent`, `shell` и `gate`»).
+
+- `kind: shell` — этап-команда: движок запускает `cmd` одной строкой в оболочке
+  (`runner.shell_command`: `SHELL_BIN`, флаг `-c`, строка спеки) в дереве этапа, без роли
+  и её токенов (окружение попытки минус `HERMES_PROFILE`/`HERMES_ROLE` и любые
+  `*TOKEN*`). Договор — код возврата `must` (умолчание `0`) и объявленные `artifacts`,
+  проверенные тем же `dashboard/evidence.py`, что и пакет агента; `result.json` не
+  читается вовсе. Другой код — `contract` «код N, ждали M» с хвостом stderr, таймаут и
+  сигнал — `infra`. `role`, `ask`, `verdict`, `retry` у `shell` отказывают
+  (`kind.role`, `kind.ask`, `kind.verdict`, `kind.retry`), а поля команды у `agent` —
+  `kind.cmd`/`kind.must`/`kind.artifacts`.
+- Публикующие команды в `cmd` запрещены (`cmd.forbidden`, тот же
+  `FORBIDDEN_CMD_PREFIXES`, что у `evidence.cmd`): второго пути публикации мимо роли
+  `publisher` не заводится.
+- Журнал: те же `attempt_started`/`attempt_ended` с `source: shell` и
+  `stage_kind: shell`; в `details` — `exit_code`, `duration_sec`, `must`, `timed_out`,
+  хвосты `stdout`/`stderr` (последние 20 строк) и пути полных логов
+  (`.duty/stdout.log`, `.duty/stderr.log`).
+- `kind: gate` — этап-вопрос: движок ничего не спавнит, лизинг не берёт и
+  `attempt_started` не пишет; он задаёт человеку вопрос `ask.q` с вариантами
+  `ask.options` через `ask()` (срок — `budget.minutes`, умолчание `ASK_TIMEOUT_HOURS` =
+  24 ч) и уходит в `wait_human`. `allow` сужает продолжение (по умолчанию — все
+  `options`): ответ вне списка — отказ `contract` с цитатой ответа, истечение срока —
+  парковка «гейт: человек не ответил за N» без класса отказа и счётчика попыток. `ask.q`
+  и `ask.options` обязательны; `role`, `workspace`, `verdict`, `retry`, `cmd`, `must`,
+  `artifacts` и маршрут вопроса (`ask.allowed`/`to_human`/`max_hops`/`risky`) у гейта
+  отказывают, как и `allow` у `agent`/`shell`.
+- Видимость: вопрос гейта называет номер, варианты и срок в `/now` (`wait_human`),
+  `bin/duty deal` и `bin/duty why`; факт суда — `attempt_ended` с `details.stage_kind:
+  gate`, `question_id`, `answer`, `allow`.
+- Тесты: `tests/test_spec.py` (правила вида), `tests/test_runner.py`
+  (`test_shell_nonzero_exit_is_contract`, `test_gate_answer_outside_allow_is_contract`),
+  `tests/test_stagefeed.py` (вид этапа в ленте). Регрессия после S1 и S2:
+  656 → 696 passed, 1 skipped.
 
 ### Бюджет дела целиком, а не только на этап
 
@@ -54,6 +91,33 @@
   `ПУБЛИКАЦИЯ`, `/duty/{board}/{id}/attempts` — факт публикации в строке попытки.
   Документация: `docs/SPEC.md` (правило и две проверки), `docs/JOURNAL.md`
   (вид `published`), `docs/OWNERSHIP.md` (кто пишет `published`).
+
+### «Продолжить» заводит дело, а не карточку (`hermes-tickets` 0.2.7)
+
+- Кнопка «Продолжить» в плагине тикетов работает в режиме `deal` по умолчанию: заводит
+  дело по `duty.yaml` из корня рабочей ветки тикета. Нет спеки или она не прошла
+  `bin/duty spec check` — отказ с подсказкой (путь к шаблону, путь к спеке), дело не
+  заводится.
+- Прежнее поведение 0.0.4 (lead-карточка канбана) осталось **явным откатом**:
+  `continue_mode: card` в `settings.json`. Старый ключ `duty.enabled` читается как тот же
+  флаг, пока `continue_mode` не задан, — настройки 0.0.4 продолжают работать.
+- UI показывает включённый режим строкой (`mode_note`), чтобы разное поведение одной
+  кнопки не было сюрпризом. Регрессия: 55 passed, 3 skipped (`hermes-tickets`).
+
+### FIX-S4a: сверка коммитов по префиксу, а не по полному равенству
+
+- Одна функция сравнения — `publish.same_commit` — и для гейта («одобрен commit X, в
+  дереве Y»), и для сверки опубликованного с одобренным. Сокращённый sha законен, пока
+  однозначен; не-hex имена (`HEAD`, `origin/master`) сверяются только целиком: у них нет
+  семантики префикса.
+- `publish.origin_hits` дедуплицирует по коммиту, а не по ссылке: один коммит под веткой
+  и тегом — тот же факт, два разных коммита с общим началом — отказ `contract`
+  «подходит к нескольким ссылкам».
+- `publish.sha_shape`: мусор в `sha` и короче четырёх hex-знаков — отказ «не sha» **до**
+  сети, а не «git ls-remote отказал».
+- Событие `published` несёт полный `sha` из `ls-remote`, заявку исполнителя рядом
+  (`claimed_sha`), `ref` и `verified_by: git ls-remote`; лента попыток показывает оба.
+- Регрессия: 767 passed, 1 skipped (+12 тестов).
 
 ## [0.0.4] — в разработке
 

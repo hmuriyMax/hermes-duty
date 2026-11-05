@@ -1218,7 +1218,62 @@ bin/duty decide d_f8389a4b stop           # или закрыть: completed cau
 3. вернуть код (`git checkout -- <файл>`), прогнать тест и полный `pytest`: числа в столбце
    «полный прогон» должны вернуться к `626 passed, 1 skipped`.
 
-## 14. Что делать не нужно
+## 14. Проверки: красные пробы 0.0.5
+
+Тот же вопрос, что у §13, но про решения 0.0.5: **какой тест докажет, что правило не
+откатилось**. Вид этапа (`shell`, `gate`), потолок дела и сверка публикации — четыре
+правила, у каждого один тест, который падает первым и по делу.
+
+Проба берётся одной командой (имя теста — из правого столбца):
+
+```bash
+~/.hermes/hermes-agent/venv/bin/python -m pytest "tests/test_runner.py::test_shell_nonzero_exit_is_contract" -q
+```
+
+| Проба | Что ломаем (откат) | Какой тест падает — имя |
+|---|---|---|
+| **S1 «договор команды»** | `dashboard/runner.py:1407` (`classify_shell`): убрать сверку `exit_code` с `must` и всегда отдавать `OUTCOME_DONE` — этап-команда «проходит» на `exit 1`, и провал проверки становится успехом | `tests/test_runner.py::test_shell_nonzero_exit_is_contract` — краснеет на первом же утверждении: `('failed', 'contract') != ('done', '')`, причина «код 1, ждали 0» пропала |
+| **S2 «ответ вне allow»** | `dashboard/runner.py:2136` (`gate_answer_allowed`): убрать сверку ответа с `allow` — гейт объявляет `done` на «нет» при `allow: [да]`, и отказ человека становится продолжением | `tests/test_runner.py::test_gate_answer_outside_allow_is_contract` — падает на исходе попытки (ждали `failed(contract)` с цитатой ответа, получили `done`) |
+| **S3 «потолок дела»** | `dashboard/runner.py:1558` (вызов `refuse_budget` в `run_stage`) или сам `refuse_budget` (`:1441`) — сделать «потолок не исчерпан» навсегда: исчерпанное дело поднимает ещё одну попытку и жжёт бюджет, которого нет | `tests/test_driver.py::test_second_attempt_does_not_start_when_deal_budget_is_spent` — падает на `assert fake.calls == []`: вторая попытка стартует |
+| **S4/FIX-S4a «один коммит в двух формах»** | `dashboard/publish.py:157` (`same_commit`): вернуть точное равенство строк вместо сверки по префиксу — «одобрен a1b2c3d, в дереве a1b2c3d4e5f6» снова читается как подмена дерева, и честная публикация получает отказ `contract` | `tests/test_publish.py::test_same_commit_takes_the_short_form` — падает на `same_commit("a1b2c3d", "a1b2c3d4e5f6") is True` |
+
+### Что проба ловит сверх одного теста
+
+Один тест назван потому, что падает первым и по делу; столько тестов держат то же
+правило (по отчётам карточек S1–S4/FIX-S4a):
+
+| Проба | Кто ещё краснеет при том же откате |
+|---|---|
+| S1 | сверка с `must` держит всю классификацию исхода shell-попытки: соседний кейс — `test_shell_must_accepts_its_own_code` (команда с кодом `must` обязана проходить) |
+| S2 | `test_gate_allow_defaults_to_every_option`, `test_gate_answer_outside_allow_stops_the_deal` |
+| S3 | `test_refused_shell_attempt_names_deal_minutes` — та же сверка в `run_shell_stage`: отказ обязан называть числа и у этапа-команды |
+| S4/FIX-S4a | `test_publish_claim_by_a_short_sha_is_confirmed_by_origin`, `test_approval_of_a_short_gate_commit_is_ok` (обе — `same_commit` на уровне прогона), `test_publish_claim_of_an_ambiguous_sha_is_contract`: без сверки по префиксу неоднозначность тоже перестаёт ловиться |
+
+### Чем эта таблица отличается от §13
+
+В §13 каждая строка — транскрипт прогона `0.0.4` (`8a329d5`): откат → красный тест →
+возврат → зелёный. Откаты `0.0.5` делались там, где правило писалось, — в карточках S1,
+S2, S3 и FIX-S4a; их отчёты называют имена упавших тестов и числа полного прогона
+(656 → 696 → 722 → 755 → 767 passed). **Здесь откат не повторялся:** карточка DOC-4
+правит только документацию, код в ней не трогается. На `def83ee` проверено:
+
+```bash
+# имена существуют, тесты зелёные — по каждой строке таблицы
+~/.hermes/hermes-agent/venv/bin/python -m pytest --collect-only -q | grep test_same_commit_takes_the_short_form
+~/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q     # 767 passed, 1 skipped
+```
+
+Рабочее дерево после прогона чистое (пустой `git diff --stat`), HEAD — `def83ee`.
+
+### Как добавить свою строку
+
+1. сломать ровно одно правило (одна строка кода, один смысл) и убедиться, что тест краснеет;
+2. записать имя теста, `file:line` отката и чем именно упал тест — не «тест про гейт»,
+   а утверждение и полученное значение;
+3. вернуть код (откат правки в редакторе или из `git show HEAD:<файл>`), прогнать тест
+   и полный `pytest`: числа должны вернуться к `767 passed, 1 skipped`.
+
+## 15. Что делать не нужно
 
 - не перезапускать gateway ради страницы;
 - не править номер версии руками — только `bin/duty-version`;

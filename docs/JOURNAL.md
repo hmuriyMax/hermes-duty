@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS events (
   board           TEXT    NOT NULL,          -- слаг доски на момент факта
   kind            TEXT    NOT NULL,          -- см. набор ниже
   payload         TEXT    NOT NULL DEFAULT '{}',  -- JSON, только факты источника
-  source          TEXT    NOT NULL,          -- ingest | ask | cli
+  source          TEXT    NOT NULL,          -- ingest | ask | cli | api | engine | shell
   idempotency_key TEXT    NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS events_idem ON events(idempotency_key);
@@ -51,9 +51,9 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 | `created` | дело впервые увидено на доске | `title`, `assignee`, `status`, `parents` |
 | `claimed` | появился лизинг (`claim_lock`/`claim_expires`) | `claim_lock`, `claim_expires` |
 | `lease_lost` | лизинг исчез без завершения | `previous_expires` |
-| `attempt_started` | открылся ран в `task_runs` (движок: попытка заспавнена) | `run_id`, `pid`, `stage`, `attempt`, `cmd`, `cwd`, `workdir`, `tree`, `base` (фактическая база дерева — коммит, от которого этап отведён), `lease_expires`, `contract` — фактическая команда и вход целиком |
+| `attempt_started` | открылся ран в `task_runs` (движок: попытка заспавнена) | `run_id`, `pid`, `stage`, `attempt`, `cmd`, `stage_kind` (только у `kind: shell` — `shell`; отсутствие ключа читается как `agent`), `shell_cmd` (у `shell` — строка `cmd` из спеки), `cwd`, `workdir`, `tree`, `base` (фактическая база дерева — коммит, от которого этап отведён), `lease_expires`, `contract` — фактическая команда и вход целиком |
 | `attempt_progress` | шаг попытки движка: вызов инструмента или его результат (телеметрия, состояние дела не меняет) | `stage`, `attempt`, `seq`, `phase` (`tool_use`/`tool_result`), `name`, `duration_ms` (только у результата), `ts` |
-| `attempt_ended` | ран закрыт (движок: попытка отчиталась, не отчиталась или упала; `done` — только при принятом evidence-пакете; `reaped: true` — попытку закрыл `reaper.sweep`, отчёта от неё не было; `refused: true` в `details` — попытку не поднимали вовсе: потолок дела исчерпан, `details.budget` называет числа) | `run_id`, `stage`, `attempt`, `outcome` (`done`/`failed`), `kind` (`infra`/`contract`/`capability`/`null`), `reason`, `base` (база дерева попытки), `commit` (что произвела принятая попытка — коммит движка в её дереве или коммит исполнителя; от него отводится дерево следующего этапа; `null` — произвести было нечего), `details` (в том числе `verdict`: вердикт гейта с `details`), `result` (если отчёт разобран), `reaped` (только у убранных), `pid` (у убранных — из `attempt_started`) |
+| `attempt_ended` | ран закрыт (движок: попытка отчиталась, не отчиталась или упала; `done` — только при принятом evidence-пакете; `reaped: true` — попытку закрыл `reaper.sweep`, отчёта от неё не было; `refused: true` в `details` — попытку не поднимали вовсе: потолок дела исчерпан (`details.budget`: `{kind, used, limit}`) или нет «ок» человека на это дерево (`details.publish`); у `shell`-попытки в `details` — `exit_code`, `duration_sec`, `must`, `timed_out`, хвосты `stdout_tail`/`stderr_tail`; у гейта — `stage_kind: gate`, `question_id`, `answer`, `allow`) | `run_id`, `stage`, `attempt`, `outcome` (`done`/`failed`), `kind` (`infra`/`contract`/`capability`/`null`), `reason`, `base` (база дерева попытки), `commit` (что произвела принятая попытка — коммит движка в её дереве или коммит исполнителя; от него отводится дерево следующего этапа; `null` — произвести было нечего), `details` (в том числе `verdict`: вердикт гейта с `details`), `result` (если отчёт разобран), `reaped` (только у убранных), `pid` (у убранных — из `attempt_started`) |
 | `blocked` | `status=blocked` | `block_kind`, `reason` |
 | `unblocked` | был `blocked`, стал иной статус | `previous_kind` |
 | `completed` | `status=done` (или `archived` как отдельный факт: переносится тем же `completed` со `status="archived"`) | `status` |
@@ -90,6 +90,59 @@ fold (14), а не второй вид на каждое событие попы
 публикация это факт о дереве. Пишет его только движок и только после сверки с origin:
 исполнитель заявляет `published` в `result.json`, но заявка без подтверждения даёт
 отказ класса `contract` («публикация заявлена, но не найдена»), а не факт журнала.
+
+### Вид этапа и расход попытки: поля 0.0.5
+
+Вид этапа **не заводит новых событий**: `kind: shell` и `kind: gate` пишут те же
+`attempt_started`/`attempt_ended`, а вид у них читается из `stage_kind`. Где ключ
+действительно есть (`dashboard/runner.py`, `dashboard/stagefeed.py`):
+
+| факт | `stage_kind` | `source` | почему так |
+|---|---|---|---|
+| `attempt_started` этапа `kind: shell` | `shell` | `shell` | попытку исполнила команда, а не профиль: по `source` видно писателя, по `stage_kind` — вид |
+| `attempt_started` этапа `kind: agent` | **ключа нет** | `engine` | отсутствие `stage_kind` читается как `agent` (`stagefeed.py:223`): старые записи 0.0.4 остаются верными без миграции |
+| `attempt_ended` этапа `kind: shell` | `details.stage_kind` нет; вид виден по `source: shell` | `shell` | у попытки-команды свой набор `details` (ниже) |
+| `attempt_ended` этапа `kind: gate` | `details.stage_kind: gate` | `engine` | `attempt_started` у гейта нет вовсе: он не работает, а ждёт |
+| `attempt_ended` отказа движка (`refused: true`) | `details.stage_kind` — вид этапа | `engine` | отказ бюджета или публикации пишется без начала |
+
+`details` попытки-команды (`kind: shell`, `attempt_ended`) — измеренное, а не
+сказанное:
+
+| поле | что это |
+|---|---|
+| `cmd` | строка `cmd` из спеки — та же, что в `shell_cmd` у `attempt_started` |
+| `exit_code` | код возврата процесса (`null` — код неизвестен) |
+| `duration_sec` | сколько шла команда, секунды с одним знаком (`round(..., 1)`); по нему считаются минуты бюджета дела |
+| `must` | обязательный код из спеки: с ним сверяется `exit_code` |
+| `timed_out` | остановила ли команду наша собственная рука по сроку этапа |
+| `stdout_tail` / `stderr_tail` | последние 20 строк вывода: журнал отвечает «чем кончилось» |
+| `stdout_path` / `stderr_path` | полные логи файлами (`.duty/stdout.log`, `.duty/stderr.log` в каталоге попытки): файл отвечает «что было написано» |
+
+`details` гейта (`kind: gate`, `attempt_ended`) — **вопрос, ответ и правило**:
+`stage_kind: gate`, `question_id`, `answer` (цитата ответа человека, до 80 знаков —
+целиком ответ живёт в пуле и в `question_answered`), `allow` (список, с которым
+сверяли). В `payload.result` гейт ничего не пишет — отчёта у него нет. Вид и
+закрытие называет **строка шага** (то, что вернул `runner`: `stage_kind: gate`,
+`closed`), и драйвер кладёт их в `steps[i]` отчёта прогона — `--json` тоже
+(см. «Закрытие — факт журнала»).
+
+`usage_tokens` — расход попытки в токенах, пишет движок по потоку процесса
+(`attempt_ended.details.usage_tokens` у `agent`). У `shell`-попытки ключа нет:
+команда токенов не тратит, её расход — минуты по `duration_sec`. Если у
+`agent`-попытки телеметрии нет, бюджет дела берёт `result.usage.total_tokens` —
+слово исполнителя в том же событии (`dashboard/budget.py:_tokens_of`), а нет ни
+того, ни другого — ноль, и это тоже факт, а не догадка.
+
+Отказ по бюджету дела — `attempt_ended` **без** `attempt_started`:
+`kind: capability`, `details.refused: true`, `details.stage_kind` (вид этапа) и
+`details.budget: {kind, used, limit}` — единица (`tokens`/`minutes`), расход и
+потолок числами; причина «бюджет дела исчерпан: N/M токенов». Рядом — `blocked`
+с `block_kind: capability` и теми же числами, чтобы поверхность показывала
+`capability`, а не «running без живого факта».
+
+Отказ публикации без «ок» — та же форма: `attempt_ended` без начала,
+`kind: contract`, `details.refused: true`, `details.publish: {gate, question_id,
+approved_commit}`.
 
 Набор закрыт: новый `kind` добавляется вместе с правилом fold и тестом, а не «по пути».
 Закрытость держится кодом, а не дисциплиной: `append()` отвергает `kind` вне набора

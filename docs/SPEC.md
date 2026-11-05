@@ -175,6 +175,26 @@ stages:
 `ask.q` с вариантами `ask.options` и ждёт ответа. Спеки 0.0.4 без `kind`
 читаются как прежде: умолчание не изменилось.
 
+Что каждый вид принимает и что запрещает — одна матрица (правила печатаются из
+`dashboard/spec.py`: `_check_kind`, `_check_shell_kind`, `_check_gate_kind`).
+Отказ, а не тихий игнор: объявленное и не прочитанное — ложь спеки.
+
+| поле этапа | `agent` (умолчание) | `shell` | `gate` |
+|---|---|---|---|
+| `id`, `needs`, `parallel_with` | да | да | да |
+| `budget` | потолок попытки | потолок попытки | `budget.minutes` — **срок ответа человека**, в сумму бюджета дела не входит |
+| `role` | **обязательно**: без него отказ `role` («профиля нет в Hermes») | отказ `kind.role` | отказ `kind.role` |
+| `workspace` | `worktree`/`dir`/`none` | `worktree`/`dir`/`none` | всегда `none`; объявленный `workspace` — отказ `kind.workspace` |
+| `cmd` | отказ `kind.cmd` | **обязателен**, иначе `kind.cmd` | отказ `kind.cmd` |
+| `must` | отказ `kind.must` | `0` по умолчанию, не целое — `kind.must` | отказ `kind.must` |
+| `artifacts` | отказ `kind.artifacts` | `[]` по умолчанию, не пути — `kind.artifacts` | отказ `kind.artifacts` |
+| `ask` | `{allowed, to_human, max_hops}` или `{q, options, risky}` | отказ `kind.ask` | **обязателен** `{q, options}`; `ask.allowed`/`ask.to_human`/`ask.max_hops`/`ask.risky` — отказ `kind.ask` |
+| `allow` | отказ `kind.allow` | отказ `kind.allow` | `[]` = все `ask.options`; ответ вне `ask.options` — отказ `allow` |
+| `verdict` | да (роль ревьюера) | отказ `kind.verdict` | отказ `kind.verdict` |
+| `retry` | да, повтор по классу отказа | отказ `kind.retry`: у команды политика повтора — `must` | отказ `kind.retry` |
+| `evidence` | да, гейт проверяет пакет | **не проверяется**: предупреждение `kind.evidence`, договор — `must` + `artifacts` | предупреждение `kind.evidence`, договор — вопрос и ответ |
+| публикующая команда в `cmd` | — (`cmd` не поле вида) | отказ `cmd.forbidden` (`git push`, `git commit`, `rm -rf`, `sudo`) | — (`cmd` не поле вида) |
+
 ```yaml
 stages:
   - id: impl
@@ -272,7 +292,10 @@ stages:
 - **Чужие поля отказывают**: `role`, `workspace`, `verdict`, `retry`, `cmd`,
   `must` и поля команды у гейта — ошибки валидации (`kind.role`, `kind.workspace`,
   `kind.verdict`, `kind.retry`, `kind.cmd`, `kind.must`), как и `allow` у
-  `agent`/`shell` (`kind.allow`). Объявленное и не прочитанное — ложь спеки.
+  `agent`/`shell` (`kind.allow`). У `ask` гейт берёт **только** `q` и `options`:
+  `ask.allowed`, `ask.to_human`, `ask.max_hops` и `ask.risky` отказывают
+  (`kind.ask`) — маршрут вопроса и его риск гейт не объявляет, он спрашивает
+  человека напрямую. Объявленное и не прочитанное — ложь спеки.
 - **Видимость**: ожидание называется `wait_human` с номером вопроса и вариантами
   ответа (`/now`, `bin/duty deal`, `bin/duty why`); парковка гейта не показывает
   «0/0» — класса отказа и счётчика попыток у неё нет.
@@ -487,6 +510,13 @@ approved_commit`), а не ответа: ответ приходит позже,
 | `verdict.max_rounds` | меньше 1 |
 | `review-gate` | публикующий (`publisher`/`deployer`) или рискованный (`ask.risky: true`) этап без `role: reviewer` в транзитивных `needs` |
 | `publish-gate` | публикующий этап без `kind: gate` в транзитивных `needs`; гейт-предок не объявляет `allow` (продолжением стал бы любой вариант, включая «не публиковать») |
+| `kind` | значение не из `agent`/`shell`/`gate` |
+| `kind.role`, `kind.workspace`, `kind.verdict`, `kind.retry`, `kind.ask` | поле чужого вида: `role` у `shell`/`gate`; `workspace`/`verdict`/`retry` у `gate`; `ask` у `shell`; `ask.allowed`/`ask.to_human`/`ask.max_hops`/`ask.risky` у `gate` |
+| `kind.cmd`, `kind.must`, `kind.artifacts` | `cmd` не строка/пустой или `cmd` у `agent`/`gate`; `must` не целое или у `agent`/`gate`; `artifacts` не список путей или у `agent`/`gate` |
+| `cmd.forbidden` | `cmd` этапа `kind: shell` начинается с `git push`, `git commit`, `rm -rf`, `sudo`: публикация идёт ролью, а не командой этапа |
+| `kind.allow`, `allow` | `allow` не список строк; `allow` у `agent`/`shell`; `allow` называет вариант, которого нет в `ask.options` |
+| `ask.q`, `ask.options` | у `kind: gate` нет `ask`; пустой `ask.q`; пустой список `ask.options`; пустой вариант ответа |
+| `kind.evidence` (**warning**) | `evidence` у `shell`/`gate` не проверяется: у команды договор — `must` и `artifacts`, у гейта — вопрос и ответ |
 | `evidence` | `evidence` не список; элемент не словарь |
 | `evidence.cmd` | `cmd` пустой или не строка |
 | `evidence.must` | `must` не целое (в том числе `true`/`false`) |

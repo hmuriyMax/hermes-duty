@@ -179,6 +179,69 @@ review попытка 1 ── дерево от коммита verify ──▶
   стало `worktree`, `c3a5d77`). Не проверено живьём: этап публикации (в прогоне его в
   спеке не было) — публикация требует «ок» Max, и такого прогона в 0.0.4 ещё не делали.
 
+## Цепочка 0.0.5: команда, вопрос и публикация как этапы дела
+
+0.0.5 (в разработке) добавляет к делу три вещи, которых не было в 0.0.4: **этап-команду**
+(`kind: shell`), **этап-вопрос** (`kind: gate`) и **потолок на дело целиком** (`budget` в
+корне спеки). Цепочка из примера `examples/duty.yaml` читается сверху вниз — она же
+фикстура: `bin/duty spec check examples/duty.yaml` проверяет ровно этот файл (в нём есть
+и шестой этап `docs` с `parallel_with`, и комментарии к полям — здесь оставлены пять
+шагов цепочки).
+
+```yaml
+duty: sx-widgets-tristate
+repo: ~/GolandProjects/sx-widgets-api
+base: origin/master
+
+stages:
+  - id: impl                              # agent: процесс профиля (умолчание вида)
+    role: implementer
+    workspace: worktree                   # отдельное дерево, чужое не трогаем
+    evidence:
+      - {cmd: "go build ./...", must: 0}
+      - {cmd: "go test ./widget/...", must: 0, timeout_sec: 600}
+    retry: {max: 2, on: [infra, contract]}
+    budget: {tokens: 200000, minutes: 30}
+
+  - id: verify                            # agent: проверяющий видит дерево impl
+    role: tester
+    needs: [impl]
+
+  - id: review                            # agent: приговор, возврат на доработку
+    role: reviewer
+    needs: [verify]
+    verdict: {approve: next, changes: impl, max_rounds: 2}
+
+  - id: gate                              # gate: спрашивает человека, ничего не исполняет
+    kind: gate
+    needs: [review]
+    ask: {q: "Публикуем этот коммит?", options: ["публиковать", "не публиковать"]}
+    allow: ["публиковать"]                # ответ вне allow — отказ contract
+    budget: {minutes: 120}                # срок ответа человека, а не расход дела
+
+  - id: publish                           # agent: публикует профиль, движок проверяет
+    role: publisher
+    needs: [gate]
+    workspace: worktree
+```
+
+| вид этапа | одним предложением |
+|---|---|
+| `agent` (умолчание) | движок поднимает процесс профиля `role`, попытка отчитывается `result.json`, гейт проверяет пакет — вся прежняя модель, спеки 0.0.4 без правок |
+| `kind: shell` | этап-команда: движок запускает `cmd` в дереве этапа без роли и её токенов, судит по коду возврата `must` (иной код — отказ `contract` «код N, ждали M») и проверяет объявленные `artifacts`; публикующие команды (`git push`) запрещены |
+| `kind: gate` | этап-вопрос: движок ничего не спавнит и лизинг не берёт, задаёт человеку вопрос `ask.q` с вариантами `ask.options` и ждёт ответа (срок — `budget.minutes`); ответ вне `allow` — отказ `contract`, истечение срока — парковка «гейт: человек не ответил за N» |
+| `budget` в корне | потолок дела рядом с `repo`/`base`: расход считается по журналу (токены всех попыток и их минуты), исчерпан — попытка не поднимается, класс `capability` с числами «N/M токенов»; спека без него работает как в 0.0.4 |
+| `publish-gate` | публикующий этап требует `kind: gate` с **объявленным** `allow` в предках: публикует профиль `publisher`, движок сверяет «одобрен commit X, в дереве Y» и подтверждает `published.sha` через `git ls-remote` |
+
+Правила целиком — `docs/SPEC.md` («`kind`: `agent`, `shell` и `gate`», «`budget` в корне»,
+«Гейт „публикация спрашивает человека“»), факты журнала — `docs/JOURNAL.md`.
+
+**«Продолжить» в `hermes-tickets`.** Кнопка работает в режиме `deal` по умолчанию: заводит
+дело по `duty.yaml` из корня рабочей ветки тикета (нет спеки или она не прошла
+`spec check` — отказ с подсказкой, дело не заводится). Прежнее поведение 0.0.4
+(lead-карточка канбана) осталось явным откатом — `continue_mode: card` в `settings.json`
+плагина тикетов.
+
 ## Что уже работает (роуты и экраны)
 
 Роуты (монтируются под `/api/plugins/hermes-duty`; чужие источники открываются только
@@ -402,7 +465,7 @@ hermes plugins enable hermes-duty     # или Capabilities → Plugins в де�
 Из каталога плагина (`cd ~/.hermes/plugins/hermes-duty`):
 
 ```bash
-~/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q  # 755 passed, 1 skipped
+~/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q  # 767 passed, 1 skipped
 node --test tests/model.test.mjs tests/web.test.mjs        # 49 pass (37 + 12)
 bin/duty-model-sync --check                                # OK
 bin/duty-version check                                     # OK
@@ -436,7 +499,7 @@ evidence-гейт `evidence.verify`, адресация вопросов `routin
 `runner.base_of_stage` (дерево от коммита предшественника, автокоммит принятой работы),
 решение человека по делу (`bin/duty decide continue|stop`, `bin/duty close`) и закрытие
 дела фактом журнала (`deals.close_stages_done`, `cause='all_stages_done'`). Регрессия
-**755 pytest + 1 skipped**, **49 node** (37 + 12), `bin/duty demo` — 7/7.
+**767 pytest + 1 skipped**, **49 node** (37 + 12), `bin/duty demo` — 7/7.
 
 `v0.0.3` — свой журнал событий (`state = fold(events)`, `POST /ingest`, `journal` в
 `/health`), единственный канал вопросов `ask()`, CLI `bin/duty` (чтение и мутации),

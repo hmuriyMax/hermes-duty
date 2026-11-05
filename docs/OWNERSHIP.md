@@ -157,6 +157,27 @@ CREATE TABLE IF NOT EXISTS attachments (
 (`dashboard/runner.published_claim`). Вид входит в `NON_STATE_KINDS`: он не двигает ни
 этап, ни закрытость дела — этап закрыт своим `attempt_ended`.
 
+Граница публикации — в обе стороны:
+
+- **`bin/duty` не публикует и не пушит.** Ни одна команда CLI не запускает `git push`
+  и не пишет `published`: он только читает факт из журнала и печатает его
+  («опубликовано: sha · ветка · MR», колонка `ПУБЛИКАЦИЯ` в `/now`). Публикующие
+  префиксы команд (`git push`, `git commit`) запрещены и как `evidence.cmd`, и как
+  `kind: shell cmd` — одна и та же константа `FORBIDDEN_CMD_PREFIXES`
+  (`dashboard/spec.py`).
+- **Движок тоже не публикует.** Публикацию делает попытка профиля с ролью из
+  `PUBLISHING_ROLES` (`publisher`, `deployer`); движок перед спавном сверяет «одобрен
+  commit X, в дереве Y» (`dashboard/publish.py`), а после отчёта подтверждает
+  заявленный sha через `git ls-remote`.
+- **Заявка исполнителя — его слово, а не факт.** Она живёт в его `result.json`
+  (`published: {sha, branch, mr_url}`) и рядом в `claimed_sha` события `published`;
+  фактом (`sha` — полный из `ls-remote`, `ref`, `verified_by`) её делает движок.
+- **`question_asked` тоже пишет движок, а не исполнитель.** Попытка задаёт вопрос
+  отчётом (`result.json`), а факт журнала появляется, когда вопрос действительно
+  создан в пуле — единственным каналом `ask()`; у гейта (`kind: gate`) его зовёт
+  движок, у остальных путей — CLI/API мутация. Ответ находит `ask.sync_answers`
+  и пишет `question_answered`.
+
 `idempotency_key` для мутаций: `cli:<deal_id>:<kind>:<sha1(аргументы)>`, для API —
 `api:<deal_id>:<kind>:<sha1(тело запроса)>`; повторный тот же вызов не плодит событий.
 У `gate_closed` ключ считается от причины перехода, а не от аргументов:

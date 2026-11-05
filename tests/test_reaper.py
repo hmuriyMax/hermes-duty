@@ -165,10 +165,9 @@ def make_deal(
     """Своё дело в store; спека — в `created.payload.spec`, как у `duty create --spec`."""
     created = deals.create_deal(
         conn,
-        board=board,
+        repo=board,
         title="Дело с осиротевшей попыткой",
         body="",
-        known_boards=[board],
         spec_path=str(spec_path) if spec_path is not None else None,
         now=NOW,
     )
@@ -192,7 +191,6 @@ def seed(
                 "ts": ts,
                 "recorded_at": NOW,
                 "deal_id": str(deal["id"]),
-                "board": str(deal["board"]),
                 "kind": kind,
                 "payload": payload,
                 "source": "test",
@@ -665,7 +663,7 @@ def test_kanban_observed_run_is_not_reaped(tmp_path: Path) -> None:
     """
     home = make_home(tmp_path)
     conn = open_store(home)
-    foreign = {"id": "tabc123456", "board": "hermes-tickets"}
+    foreign = {"id": "tabc123456", "repo": "hermes-tickets"}
     seed(
         conn,
         foreign,

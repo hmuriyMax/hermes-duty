@@ -260,7 +260,7 @@ def client(home: Path) -> TestClient:
 
 def deal_facts(home: Path) -> dict[str, Any]:
     """Факты дела для прямого вызова `ask()` (без HTTP)."""
-    return {"id": DEAL, "board": "stack", "home": home}
+    return {"id": DEAL, "repo": "stack", "home": home}
 
 
 def ask_once(home: Path, **kwargs: Any) -> ask.AskResult:
@@ -399,7 +399,7 @@ def test_ask_marks_long_waiting_deal_critical(home: Path) -> None:
                     "ts": now - ask.ASK_CRITICAL_SEC - 600,
                     "recorded_at": now - ask.ASK_CRITICAL_SEC - 600,
                     "deal_id": DEAL,
-                    "board": "stack",
+                    "repo": "stack",
                     "kind": "blocked",
                     "payload": {"block_kind": "needs_input", "reason": "нужно решение"},
                     "source": "ingest",

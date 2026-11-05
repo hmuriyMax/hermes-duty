@@ -1,4 +1,4 @@
-"""Свой журнал дел: события, fold по ним и ingest (контракт `docs/JOURNAL.md`).
+"""Свой журнал дел: события и fold по ним (контракт `docs/JOURNAL.md`).
 
 До 0.0.3 состояние дела выводилось из изменяемых колонок kanban (`status`,
 `claim_lock`, `claim_expires`, `task_runs`) — то есть из того же места, которое
@@ -8,26 +8,25 @@
 Границы модуля по контракту:
 
 - журнал — собственность плагина: `$HERMES_HOME/duty/duty.db`, режим WAL;
-- чужие БД (`kanban.db`, `state.db`) открываются только на чтение
-  (`connect_ro` — единственное место, где этот модуль их касается); пул вопросов
-  (`pool.db`) пишет только `ask()`, этот модуль его не открывает вовсе — пишем мы
-  исключительно в свой журнал;
+- чужие БД (`kanban.db`, `state.db`) этот модуль не открывает вовсе: с 0.0.6 у
+  журнала нет моста к канбану (прохода ingest больше нет — карточки читает только
+  наблюдение `/cards` в `plugin_api.py`); пул вопросов (`pool.db`) пишет только
+  `ask()`, пишем мы исключительно в свой журнал;
 - `fold` — чистая функция: на вход список событий, на выход состояние ожидания.
   Ни БД, ни файлов она не открывает. Внешние факты, без которых правила 4–5
   контракта не сформулировать, — часы и живость pid: это не чтение источников;
-- ingest ничего не «додумывает»: нет строки в источнике — нет события.
+- событие адресуется парой `deal_id` + `id`: доски в схеме журнала нет (0.0.6), а
+  поле `board` в payload старых событий остаётся историческим фактом.
 """
 
 from __future__ import annotations
 
-import hashlib
 import importlib.util
 import json
 import os
 import sqlite3
 import sys
 import time
-from contextlib import closing
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
@@ -240,7 +239,6 @@ CREATE TABLE IF NOT EXISTS events (
   ts              INTEGER NOT NULL,
   recorded_at     INTEGER NOT NULL,
   deal_id         TEXT    NOT NULL,
-  board           TEXT    NOT NULL,
   kind            TEXT    NOT NULL,
   payload         TEXT    NOT NULL DEFAULT '{}',
   source          TEXT    NOT NULL,
@@ -250,9 +248,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS events_idem ON events(idempotency_key);
 CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 """
 
-# Сколько строк источника берём в один запрос `IN (...)`: предел переменных
-# SQLite (999) не должен превращать проход ingest в ошибку на большой доске.
-IN_CHUNK = 400
+# Колонка `board` была в схеме до 0.0.6 (`NOT NULL`, дело принадлежало доске).
+# Удаляется пересборкой таблицы: `DROP COLUMN` не годится, пока на базе остался
+# хоть один индекс или ограничение с этим именем, а строки обязаны сохраниться
+# вместе с `id` — порядок `id` и есть порядок применения фактов в `fold`.
+LEGACY_BOARD_FIELD = "board"
+EVENTS_COLUMNS = (
+    "id",
+    "ts",
+    "recorded_at",
+    "deal_id",
+    "kind",
+    "payload",
+    "source",
+    "idempotency_key",
+)
 
 # Длина текста причины блока в evidence.
 REASON_LIMIT = 200
@@ -314,7 +324,48 @@ def open_journal(home: Path, *, create: bool = True) -> Optional[sqlite3.Connect
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _event_columns(conn: sqlite3.Connection) -> set[str]:
+    """Колонки таблицы `events` по факту схемы — то, чем проверяется миграция."""
+    return {str(row["name"]) for row in conn.execute("PRAGMA table_info(events)")}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Довести уже существующий журнал до схемы 0.0.6: без колонки `board`.
+
+    `CREATE TABLE IF NOT EXISTS` колонку не убирает, а `ALTER TABLE ... DROP COLUMN`
+    на `board` не проходит: колонка была `NOT NULL` и лежала в индексах базы.
+    Поэтому таблица **пересобирается** (create new → copy → drop → rename) в одной
+    транзакции: строки сохраняются как есть, вместе с `id` (порядок `id` — это
+    порядок применения фактов в `fold`) и `idempotency_key` (по нему дедуплицируются
+    мутации). Payload не трогается: `board` внутри старых событий остаётся
+    историческим фактом, а новые события его не пишут.
+
+    Идемпотентность — по проверке схемы: на мигрированной базе функция ничего не
+    делает, повторный запуск стоит одного `PRAGMA table_info`.
+    """
+    columns = _event_columns(conn)
+    if not columns or LEGACY_BOARD_FIELD not in columns:
+        return
+    with conn:  # одна транзакция: пересборка + оба индекса
+        conn.execute("DROP INDEX IF EXISTS events_idem")
+        conn.execute("DROP INDEX IF EXISTS events_deal")
+        conn.execute(
+            "CREATE TABLE events_v6 ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, "
+            "recorded_at INTEGER NOT NULL, deal_id TEXT NOT NULL, kind TEXT NOT NULL, "
+            "payload TEXT NOT NULL DEFAULT '{}', source TEXT NOT NULL, "
+            "idempotency_key TEXT NOT NULL)"
+        )
+        copied = ", ".join(name for name in EVENTS_COLUMNS if name in columns)
+        conn.execute(f"INSERT INTO events_v6 ({copied}) SELECT {copied} FROM events")
+        conn.execute("DROP TABLE events")
+        conn.execute("ALTER TABLE events_v6 RENAME TO events")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS events_idem ON events(idempotency_key)")
+        conn.execute("CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id)")
 
 
 def append(conn: sqlite3.Connection, events: Iterable[dict[str, Any]]) -> int:
@@ -360,8 +411,8 @@ def append_in_tx(conn: sqlite3.Connection, events: Iterable[dict[str, Any]]) -> 
 
 _INSERT_SQL = (
     "INSERT OR IGNORE INTO events "
-    "(ts, recorded_at, deal_id, board, kind, payload, source, idempotency_key) "
-    "VALUES (?,?,?,?,?,?,?,?)"
+    "(ts, recorded_at, deal_id, kind, payload, source, idempotency_key) "
+    "VALUES (?,?,?,?,?,?,?)"
 )
 
 
@@ -369,7 +420,9 @@ def _event_rows(events: Iterable[dict[str, Any]]) -> list[tuple[Any, ...]]:
     """События → строки для `INSERT` в порядке `(ts, KIND_ORDER)`; пустой вход — пусто.
 
     Порядок и проверка набора одни на оба пути записи (`append` и
-    `append_in_tx`): второй копии этих правил быть не должно.
+    `append_in_tx`): второй копии этих правил быть не должно. Колонки `board` в
+    журнале нет с 0.0.6: дело адресуется своим `deal_id`, а `board` в payload
+    старых событий остаётся историческим фактом и не переписывается.
     """
     ordered = sorted(events, key=lambda ev: (int(ev["ts"]), _kind_rank(str(ev["kind"]))))
     if not ordered:
@@ -382,10 +435,9 @@ def _event_rows(events: Iterable[dict[str, Any]]) -> list[tuple[Any, ...]]:
             int(ev["ts"]),
             int(ev["recorded_at"]),
             str(ev["deal_id"]),
-            str(ev["board"]),
             str(ev["kind"]),
             json.dumps(ev.get("payload") or {}, ensure_ascii=False),
-            str(ev.get("source") or "ingest"),
+            str(ev.get("source") or "engine"),
             str(ev["idempotency_key"]),
         )
         for ev in ordered
@@ -401,7 +453,7 @@ def read_events(
     не повод молчать, поэтому неразобранное поле отдаётся как есть в `payload_raw`.
     """
     sql = (
-        "SELECT id, ts, recorded_at, deal_id, board, kind, payload, source, idempotency_key "
+        "SELECT id, ts, recorded_at, deal_id, kind, payload, source, idempotency_key "
         "FROM events WHERE id > ?"
     )
     params: list[Any] = [int(since_id)]
@@ -574,8 +626,7 @@ def fold(
     #    возраста строки. У своего дела срока нет вовсе (`claim` пишет `NULL`,
     #    аренды в 0.0.3 не существует), и время по такому факту ничего не
     #    доказывает — иначе ответ противоречил бы `lease.state = "none"` того же
-    #    дела. Срок — данные, а не происхождение записи: проверяется он, а не
-    #    `source = "ingest"`.
+    #    дела. Срок — данные, а не происхождение записи: проверяется он.
     claim = _last_of_kind(ordered, "claimed")
     if claim is not None:
         claim_index, claim_event = claim
@@ -1010,372 +1061,6 @@ def _short(text: str) -> str:
     """Причина блока одной строкой: пробелы схлопнуты, хвост обрезан."""
     collapsed = " ".join(str(text).split())
     return collapsed[:REASON_LIMIT] + ("…" if len(collapsed) > REASON_LIMIT else "")
-
-
-# ---------------------------------------------------------------- ingest
-
-
-def ingest(conn: sqlite3.Connection, home: Path, boards: Iterable[dict[str, Any]]) -> dict[str, Any]:
-    """Дописать в журнал недостающие события по фактам источников.
-
-    `boards` — живой список `({"slug", "path"}, ...)` от поверхности
-    (`plugin_api._discover_boards`): правило «какая БД источник, а какая архив»
-    живёт в одном месте, дублировать его здесь нельзя. Источники открываются
-    только `connect_ro`, пишем исключительно в свой журнал.
-
-    Один факт — одна строка источника:
-
-    - `task_events` → `created`/`claimed`/`blocked`/`unblocked`/`completed`;
-      `archived` переносится тем же `completed` со `status="archived"`;
-    - `task_runs` → `attempt_started`/`attempt_ended` (ран открылся/закрылся;
-      `attempt_ended` возможен только при непустом `ended_at`);
-    - строка `tasks` → `created`, если kanban-события `created` у дела не было;
-    - `lease_lost` события в kanban не имеет и выводится сравнением журнала с
-      текущим лизингом: лизинг был, попытки за ним не было, а лизинга больше нет.
-
-    Историю задним числом не мигрируем (`docs/JOURNAL.md`: журнал начинается с
-    момента включения), поэтому в проход попадают активные дела и дела, которые
-    в журнале уже есть. Повторный проход — no-op: ключи те же.
-    """
-    now = _now_sec()
-    known = _known_deals_by_board(conn)
-    report: dict[str, Any] = {
-        "appended": 0,
-        "boards": [],
-        "errors": [],
-        "warnings": [],
-    }
-    leases: list[dict[str, Any]] = []
-    for entry in boards:
-        slug = str(entry["slug"])
-        try:
-            events, board_leases, warnings = _board_pass(entry, known.get(slug, set()), now)
-        except Exception as exc:  # noqa: BLE001 - недоступная доска не валит проход
-            reason = str(exc) if isinstance(exc, RuntimeError) else f"{type(exc).__name__}: {exc}"
-            report["errors"].append({"board": slug, "reason": reason})
-            report["boards"].append({"slug": slug, "path": entry.get("path"), "read": False, "deals": 0, "appended": 0})
-            continue
-        written = append(conn, events)
-        report["warnings"].extend(warnings)
-        report["boards"].append(
-            {
-                "slug": slug,
-                "path": entry.get("path"),
-                "read": True,
-                "deals": len(board_leases),
-                "appended": written,
-            }
-        )
-        report["appended"] += written
-        leases.extend(board_leases)
-
-    lost, error = _lease_lost_events(conn, leases, now)
-    if error:
-        report["errors"].append({"board": JOURNAL_SOURCE, "reason": error})
-    # `lease_lost` пишется по доске отдельной пачкой: счётчик `appended` доски
-    # обязан считать строки, которые легли в журнал, а не кандидатов. На повторном
-    # проходе кандидат тот же (условие в `_lease_lost_events` от записи не
-    # меняется), `INSERT OR IGNORE` его отбрасывает — и доска не должна врать
-    # единицей.
-    lost_by_board: dict[str, list[dict[str, Any]]] = {}
-    for lost_event in lost:
-        lost_by_board.setdefault(str(lost_event["board"]), []).append(lost_event)
-    for slug, board_lost in lost_by_board.items():
-        written = append(conn, board_lost)
-        report["appended"] += written
-        for board in report["boards"]:
-            if board["slug"] == slug:
-                board["appended"] += written
-    report.update(counts(conn))
-    return report
-
-
-def _known_deals_by_board(conn: sqlite3.Connection) -> dict[str, set[str]]:
-    """Дела, о которых журнал уже знает, по доскам: их тоже держим в проходе."""
-    known: dict[str, set[str]] = {}
-    for row in conn.execute("SELECT DISTINCT board, deal_id FROM events"):
-        known.setdefault(str(row["board"]), set()).add(str(row["deal_id"]))
-    return known
-
-
-def _board_pass(
-    entry: dict[str, Any], known: set[str], now: int
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
-    """Один проход по доске: (новые события, факты для lease_lost, предупреждения).
-
-    Чтение — одним read-only снимком доски. Провал вспомогательной таблицы
-    (`task_events`, `task_runs`, `task_links`) не валит проход: факты этой
-    таблицы просто не переносятся, а причина уходит в `warnings`.
-    """
-    slug = str(entry["slug"])
-    path = Path(entry["path"])
-    warnings: list[str] = []
-    if entry.get("note") == "empty db":
-        raise RuntimeError(f"empty db ({path}): 0 bytes")
-    with closing(connect_ro(path)) as src:
-        if not _table_exists(src, "tasks"):
-            raise RuntimeError(f"{path}: no tasks table")
-        active = _rows(
-            src,
-            "SELECT id FROM tasks WHERE status NOT IN (?, ?) ORDER BY created_at, id",
-            TERMINAL_STATUSES,
-        )
-        wanted = {str(row["id"]) for row in active} | set(known)
-        if not wanted:
-            return [], [], warnings
-        tasks = _by_id(
-            _rows_in(src, "SELECT id, title, assignee, status, created_at, claim_lock, claim_expires FROM tasks", "id", wanted)
-        )
-        events = _rows_in(
-            src,
-            "SELECT id, task_id, run_id, kind, payload, created_at FROM task_events",
-            "task_id",
-            wanted,
-            extra_sql="AND kind IN ({})".format(", ".join("?" * len(INGEST_EVENT_KINDS))),
-            extra_params=INGEST_EVENT_KINDS,
-            order_by="ORDER BY id",
-            warning=("task_events", warnings),
-        )
-        runs = _rows_in(
-            src,
-            "SELECT id, task_id, status, outcome, error, started_at, ended_at, worker_pid FROM task_runs",
-            "task_id",
-            wanted,
-            order_by="ORDER BY id",
-            warning=("task_runs", warnings),
-        )
-        links = _rows_in(
-            src,
-            "SELECT child_id, parent_id FROM task_links",
-            "child_id",
-            wanted,
-            order_by="ORDER BY child_id, parent_id",
-            warning=("task_links", warnings),
-        )
-
-    parents: dict[str, list[str]] = {}
-    for row in links:
-        parents.setdefault(str(row["child_id"]), []).append(str(row["parent_id"]))
-
-    out: list[dict[str, Any]] = []
-    block_kind_by_deal: dict[str, Any] = {}
-    created_deals: set[str] = set()
-    for row in events:
-        deal_id = str(row["task_id"])
-        task = tasks.get(deal_id, {})
-        kind = str(row["kind"])
-        payload = _payload(row)
-        ts = int(row["created_at"] or now)
-        if kind == "created":
-            created_deals.add(deal_id)
-            event_payload = {
-                "title": task.get("title"),
-                "assignee": payload.get("assignee", task.get("assignee")),
-                "status": payload.get("status", task.get("status")),
-                "parents": payload.get("parents") or parents.get(deal_id, []),
-            }
-            # Ключ один на оба источника факта (`task_events` и строка `tasks`):
-            # «дело впервые увидено» — один факт, и второй его копии быть не должно.
-            out.append(_event(slug, deal_id, "created", ts, event_payload, "task", now))
-        elif kind == "claimed":
-            out.append(
-                _event(
-                    slug,
-                    deal_id,
-                    "claimed",
-                    ts,
-                    {"claim_lock": payload.get("lock"), "claim_expires": payload.get("expires"), "run_id": payload.get("run_id")},
-                    row["id"],
-                    now,
-                )
-            )
-        elif kind == "blocked":
-            block_kind_by_deal[deal_id] = payload.get("kind")
-            out.append(
-                _event(slug, deal_id, "blocked", ts, {"block_kind": payload.get("kind"), "reason": payload.get("reason")}, row["id"], now)
-            )
-        elif kind == "unblocked":
-            out.append(_event(slug, deal_id, "unblocked", ts, {"previous_kind": block_kind_by_deal.get(deal_id)}, row["id"], now))
-        elif kind == "archived":
-            out.append(_event(slug, deal_id, "completed", ts, {"status": "archived"}, row["id"], now))
-        elif (completed_status := _completed_status(payload, task)) is not None:
-            # `completed` в kanban — это «этап сдан»: карточка могла уйти в
-            # `review`/`awaiting_merge`. Завершением дела событие считается
-            # только по терминальному статусу, иначе fold закрыл бы живое дело.
-            # Статус берётся из payload события, а если его там нет — из карточки:
-            # выбор ветки делает `_completed_status`, здесь только запись факта.
-            out.append(
-                _event(slug, deal_id, "completed", ts, {"status": completed_status}, row["id"], now)
-            )
-
-    for row in runs:
-        deal_id = str(row["task_id"])
-        run_id = row["id"]
-        started_at = int(row["started_at"] or now)
-        out.append(_event(slug, deal_id, "attempt_started", started_at, {"run_id": run_id, "pid": row["worker_pid"]}, f"run:{run_id}", now))
-        if row["ended_at"] is not None:
-            out.append(
-                _event(
-                    slug,
-                    deal_id,
-                    "attempt_ended",
-                    int(row["ended_at"]),
-                    {"run_id": run_id, "outcome": row["outcome"], "error": row["error"]},
-                    f"run:{run_id}",
-                    now,
-                )
-            )
-
-    # `created` без kanban-события: строка `tasks` — тоже строка источника, и без
-    # неё журнал не знал бы о деле вовсе. Ключ общий на доску и дело: у факта
-    # «дела ещё не было» один источник — сама карточка.
-    for deal_id, task in tasks.items():
-        if deal_id in created_deals:
-            continue
-        out.append(
-            _event(
-                slug,
-                deal_id,
-                "created",
-                int(task.get("created_at") or now),
-                {
-                    "title": task.get("title"),
-                    "assignee": task.get("assignee"),
-                    "status": task.get("status"),
-                    "parents": parents.get(deal_id, []),
-                },
-                "task",
-                now,
-            )
-        )
-
-    leases = [
-        {"board": slug, "deal_id": deal_id, "claim_lock": task.get("claim_lock")}
-        for deal_id, task in tasks.items()
-    ]
-    return out, leases, warnings
-
-
-def _completed_status(payload: dict[str, Any], task: dict[str, Any]) -> Optional[str]:
-    """Терминальный статус факта `completed`, или None если факт не про завершение.
-
-    Старые kanban-события не писали `status` в payload: тогда источником статуса
-    остаётся сама карточка (`tasks.status`) — это факт источника, а не догадка.
-    """
-    status = payload.get("status")
-    if status is not None:
-        return str(status) if str(status) in TERMINAL_STATUSES else None
-    current = task.get("status")
-    return str(current) if str(current) in TERMINAL_STATUSES else None
-
-
-def _lease_lost_events(
-    conn: sqlite3.Connection, leases: list[dict[str, Any]], now: int
-) -> tuple[list[dict[str, Any]], Optional[str]]:
-    """Лизинги, которые исчезли без попытки: (события, причина сбоя чтения журнала).
-
-    События для этого факта в kanban нет — он выводится сравнением: журнал
-    последним помнит `claimed`, за ним не было `attempt_started`, а лизинга в
-    источнике уже нет. Ключ идемпотентности — хеш кортежа `lock|expires`, как в
-    контракте для фактов из колонок.
-    """
-    if not leases:
-        return [], None
-    try:
-        by_deal: dict[str, list[dict[str, Any]]] = {}
-        for event in read_events(conn):
-            by_deal.setdefault(str(event["deal_id"]), []).append(event)
-    except Exception as exc:  # noqa: BLE001 - свой журнал не прочитался
-        return [], f"journal unreadable: {type(exc).__name__}: {exc}"
-    out: list[dict[str, Any]] = []
-    for lease in leases:
-        events = by_deal.get(lease["deal_id"]) or []
-        claim = _last_of_kind(events, "claimed")
-        if claim is None:
-            continue
-        claim_index, claim_event = claim
-        payload = _payload(claim_event)
-        if str(payload.get("claim_lock") or "") == str(lease["claim_lock"] or ""):
-            continue  # лизинг на месте
-        if any(str(event.get("kind")) == "attempt_started" for event in events[claim_index + 1 :]):
-            continue  # за лизингом была попытка: лизинг кончился работой, а не потерей
-        # Закрытость — тем же общим предикатом, что у fold (правило 2): у дела с
-        # хвостом (`commented`, `question_answered` и т.п.) последняя строка уже не
-        # `completed`, и по ней `lease_lost` дописался бы в закрытое дело, снова
-        # сделав его живым на ingest.
-        if _closed_kind(str(_last_state_event(events).get("kind") or "")):
-            continue  # дело закрыто: лизинг снят завершением
-        stable = hashlib.sha1(
-            f"{payload.get('claim_lock')}|{payload.get('claim_expires')}".encode()
-        ).hexdigest()
-        out.append(
-            _event(
-                str(lease["board"]),
-                str(lease["deal_id"]),
-                "lease_lost",
-                now,
-                {"previous_expires": payload.get("claim_expires")},
-                stable,
-                now,
-            )
-        )
-    return out, None
-
-
-def _event(
-    board: str, deal_id: str, kind: str, ts: int, payload: dict[str, Any], stable: Any, now: int
-) -> dict[str, Any]:
-    """Событие журнала по контракту: ключ идемпотентности — факт источника, не время."""
-    return {
-        "ts": int(ts),
-        "recorded_at": int(now),
-        "deal_id": str(deal_id),
-        "board": str(board),
-        "kind": str(kind),
-        "payload": payload,
-        "source": "ingest",
-        "idempotency_key": f"ingest:{board}:{deal_id}:{kind}:{stable}",
-    }
-
-
-def _rows(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> list[dict[str, Any]]:
-    """Строки запроса как словари."""
-    return [dict(row) for row in conn.execute(sql, params)]
-
-
-def _rows_in(
-    conn: sqlite3.Connection,
-    select_sql: str,
-    key: str,
-    values: set[str],
-    *,
-    extra_sql: str = "",
-    extra_params: tuple = (),
-    order_by: str = "",
-    warning: tuple[str, list[str]] | None = None,
-) -> list[dict[str, Any]]:
-    """`SELECT ... WHERE key IN (...)` пачками: предел переменных SQLite не должен валить проход.
-
-    Провал такого запроса не «нет фактов», поэтому причина уходит в `warnings`
-    доски (`warning` = (имя таблицы, список предупреждений)), а проход едет дальше.
-    """
-    gathered: list[dict[str, Any]] = []
-    ordered = sorted(values)
-    for start in range(0, len(ordered), IN_CHUNK):
-        chunk = ordered[start : start + IN_CHUNK]
-        sql = f"{select_sql} WHERE {key} IN ({', '.join('?' * len(chunk))}) {extra_sql} {order_by}"
-        try:
-            gathered.extend(dict(row) for row in conn.execute(sql, tuple(chunk) + extra_params))
-        except Exception as exc:  # noqa: BLE001 - таблицы нет/схема чужая
-            if warning is not None:
-                warning[1].append(f"{warning[0]}: {type(exc).__name__}: {exc}")
-            return gathered
-    return gathered
-
-
-def _by_id(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Строки `tasks` по id дела."""
-    return {str(row.get("id")): row for row in rows}
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:

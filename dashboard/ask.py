@@ -28,7 +28,7 @@
 
 Кто и когда зовёт `ask()`:
 
-- явный путь — `POST /ask/{board}/{task_id}` (`dashboard/plugin_api.py`): вопрос задаёт
+- явный путь — `POST /ask/{deal_id}` (`dashboard/plugin_api.py`): вопрос задаёт
   человек или координатор, когда дело в `blocked`/`needs_input` стоит без вопроса.
   Это и есть решение п.5 заметки 0.0.2: дело без вопроса больше не выдаёт себя за
   «ждёт ответа» (`waiting.human_kind = "status"`), а получает вопрос осознанным
@@ -256,7 +256,8 @@ def ask(
     """Задать вопрос по делу; вернуть id вопроса и что именно произошло.
 
     `conn` — соединение с журналом (`journal.open_journal`), `deal` — факты дела:
-    обязательны `id`, `board` и `home` (корень Hermes, где лежит пул).
+    обязательны `id` и `home` (корень Hermes, где лежит пул); `repo` необязателен
+    и попадает в пул как `project` — группировка вопроса (0.0.6).
 
     `routing` — адрес вопроса и причина решения (`dashboard/routing.py`): движок
     знает этап и попытку, которые спросили, и кладёт их в факт `question_asked`.
@@ -288,10 +289,7 @@ def ask(
       нечем — дело залипло бы в «ждёт ответа» навсегда.
     """
     deal_id = str(deal.get("id") or "")
-    board = str(deal.get("board") or "")
     home = deal.get("home")
-    if not board:
-        raise ValueError("ask: у дела нет доски")
     if home is None:
         raise ValueError("ask: в фактах дела нет home")
     key = session_key(deal_id)
@@ -307,7 +305,6 @@ def ask(
         _record_asked(
             conn,
             deal_id=deal_id,
-            board=board,
             question_id=question_id,
             key=key,
             critical=int(live.get("critical") or 0),
@@ -322,7 +319,7 @@ def ask(
     question_id = _insert(
         pool_path(Path(home)),
         key=key,
-        board=board,
+        project=str(deal.get("repo") or ""),
         text=short,
         text_full=(str(text_full).strip() or None) if text_full else None,
         options=list(options) if options else None,
@@ -336,7 +333,6 @@ def ask(
     _record_asked(
         conn,
         deal_id=deal_id,
-        board=board,
         question_id=question_id,
         key=key,
         critical=flag,
@@ -372,12 +368,12 @@ def sync_answers(conn: sqlite3.Connection, home: Path) -> dict[str, Any]:
     db = pool_path(Path(home))
     report: dict[str, Any] = {"appended": 0, "errors": []}
     if not db.is_file():
-        report["errors"].append({"board": QUESTION_SOURCE, "reason": f"pool.db not found: {db}"})
+        report["errors"].append({"source": QUESTION_SOURCE, "reason": f"pool.db not found: {db}"})
         return report
     try:
         rows = _closed_rows(db)
     except sqlite3.Error as exc:
-        report["errors"].append({"board": QUESTION_SOURCE, "reason": f"pool.db unreadable: {db} ({exc})"})
+        report["errors"].append({"source": QUESTION_SOURCE, "reason": f"pool.db unreadable: {db} ({exc})"})
         return report
 
     journal = _journal()
@@ -390,7 +386,7 @@ def sync_answers(conn: sqlite3.Connection, home: Path) -> dict[str, Any]:
             # закрыл, и без строки в `errors[]` это исчезло бы молча.
             report["errors"].append(
                 {
-                    "board": QUESTION_SOURCE,
+                    "source": QUESTION_SOURCE,
                     "reason": (
                         f"вопрос #{row.get('id')} закрыт, но session_key "
                         f"{row.get('session_key')!r} не разобран в id дела — question_answered не записан"
@@ -407,7 +403,6 @@ def sync_answers(conn: sqlite3.Connection, home: Path) -> dict[str, Any]:
                 "ts": _iso_sec(row.get("answered_at")) or now,
                 "recorded_at": now,
                 "deal_id": deal_id,
-                "board": _board_of(conn, deal_id),
                 "kind": "question_answered",
                 "payload": {
                     "question_id": int(row["id"]),
@@ -452,7 +447,7 @@ def _insert(
     db: Path,
     *,
     key: str,
-    board: str,
+    project: str,
     text: str,
     text_full: Optional[str],
     options: Optional[list[str]],
@@ -462,8 +457,9 @@ def _insert(
     """Вставка вопроса в пул: единственная запись duty в чужую БД.
 
     Схема — пула imessage-gateway (`questions`), поэтому колонки названы его
-    словами: `session_key`, `origin`, `kind`, `options_json`. `project` — слаг
-    доски: пул группирует вопросы по нему так же, как для карточных.
+    словами: `session_key`, `origin`, `kind`, `options_json`. `project` пул
+    группирует по проекту; в duty группы теперь задаёт `repo` дела (0.0.6), и
+    именно он сюда пишется — пустая строка, если репозиторий не назван.
     """
     if not db.is_file():
         raise AskError(f"pool.db not found: {db}")
@@ -481,7 +477,7 @@ def _insert(
                 "(session_key, project, text, text_full, origin, options_json, status,"
                 " timeout, critical, kind) "
                 "VALUES (?,?,?,?,?,?,'pending',?,?,?)",
-                (key, board, text, text_full, ASK_ORIGIN, options_json, timeout, critical, ASK_KIND),
+                (key, project, text, text_full, ASK_ORIGIN, options_json, timeout, critical, ASK_KIND),
             )
             conn.commit()
             return int(cur.lastrowid or 0)
@@ -495,7 +491,6 @@ def _record_asked(
     conn: sqlite3.Connection,
     *,
     deal_id: str,
-    board: str,
     question_id: int,
     key: str,
     critical: int,
@@ -532,7 +527,6 @@ def _record_asked(
                     "ts": ts,
                     "recorded_at": now,
                     "deal_id": deal_id,
-                    "board": board,
                     "kind": "question_asked",
                     "payload": payload,
                     "source": ASK_SOURCE,
@@ -573,12 +567,6 @@ def _waiting_since(conn: sqlite3.Connection, deal_id: str) -> Optional[int]:
         elif kind in ("unblocked", "completed"):
             since = None
     return since
-
-
-def _board_of(conn: sqlite3.Connection, deal_id: str) -> str:
-    """Доска дела — по последнему событию журнала; пустая строка, если её нет."""
-    row = conn.execute("SELECT board FROM events WHERE deal_id = ? ORDER BY id DESC LIMIT 1", (deal_id,)).fetchone()
-    return "" if row is None else str(row[0])
 
 
 def _iso_sec(value: Any) -> Optional[int]:

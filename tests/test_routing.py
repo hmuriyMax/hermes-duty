@@ -392,7 +392,6 @@ def start_attempt(conn: sqlite3.Connection, stage_id: str = "impl", attempt: int
                 "ts": NOW - 60,
                 "recorded_at": NOW - 60,
                 "deal_id": DEAL,
-                "board": BOARD,
                 "kind": "attempt_started",
                 "payload": {
                     "stage": stage_id,
@@ -420,7 +419,6 @@ def end_attempt(conn: sqlite3.Connection, stage_id: str = "impl", attempt: int =
                 "ts": NOW - 50,
                 "recorded_at": NOW - 50,
                 "deal_id": DEAL,
-                "board": BOARD,
                 "kind": "attempt_ended",
                 "payload": {
                     "stage": stage_id,
@@ -451,7 +449,7 @@ def ask_with_address(conn: sqlite3.Connection, home: Path, spec: Any, stage_id: 
     target = routing.route(spec.stage(stage_id), fact(), 0)
     return ask.ask(
         conn,
-        {"id": DEAL, "board": BOARD, "home": home},
+        {"id": DEAL, "repo": BOARD, "home": home},
         "в каком каталоге миграции?",
         "полная версия вопроса",
         routing={**target.as_payload(), "stage": stage_id, "attempt": 1},
@@ -495,7 +493,7 @@ def test_routing_failed_reaches_the_journal_event(
         lost = routing.route(stage(allowed=()), fact(), 0)
         asked = ask.ask(
             conn,
-            {"id": DEAL, "board": BOARD, "home": home},
+            {"id": DEAL, "repo": BOARD, "home": home},
             "в каком каталоге миграции?",
             None,
             routing={**lost.as_payload(), "stage": "impl", "attempt": 1},

@@ -7,7 +7,7 @@ Duty до 0.0.3 только наблюдал kanban. Здесь он **влад
 
 Границы модуля:
 
-- таблицы `boards`/`deals`/`deal_links`/`comments`/`attachments` живут в **той же**
+- таблицы `deals`/`deal_links`/`comments`/`attachments` живут в **той же**
   `duty/duty.db`, что и журнал (`dashboard/journal.py`), отдельными таблицами;
   схема `events` не меняется. Там же `leases` — лизинг этапа движка
   (`dashboard/runner.py`): store у дела один, и взаимное исключение двух
@@ -21,8 +21,10 @@ Duty до 0.0.3 только наблюдал kanban. Здесь он **влад
 - `deals.status` — намерение жизненного цикла; «почему стоит» по-прежнему считает
   `fold` журнала. `ready` не ставится руками: он вычисляется по родителям, и
   каждый переход гейта пишется событием (`gate_opened`/`gate_closed`);
-- чужие БД (`kanban.db`, `state.db`, `pool.db`) этот модуль не открывает: о
-  досках он знает только по слагам, которые ему передали (`known_boards`).
+- доски как сущности нет (0.0.6): дело адресуется своим `d_<hex>`, а группируется
+  по `repo` (`deals.repo`) — репозиторию из спеки дела. `repo` вычисляется при
+  создании и руками после этого не правится; `NULL` — «репозиторий не назван»,
+  законное состояние, а не ошибка.
 
 Повторный вызов с теми же аргументами — no-op: `idempotency_key` события
 (`<source>:<deal_id>:<kind>:<sha1(аргументы)>`), поэтому повтор даёт `events: 0` и
@@ -92,15 +94,12 @@ ATTACH_LIMIT_BYTES = 25 * 1024 * 1024
 # Схема — дословно из `docs/OWNERSHIP.md`. `REFERENCES deals(id)` держится
 # `PRAGMA foreign_keys = ON` на соединении (`open_store`).
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS boards (
-  slug       TEXT PRIMARY KEY,
-  name       TEXT NOT NULL,
-  created_at INTEGER NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS deals (
   id         TEXT PRIMARY KEY,
-  board      TEXT NOT NULL REFERENCES boards(slug),
+  -- Репозиторий дела (0.0.6): из `spec.repo` при создании, иначе из явного
+  -- `--repo`, иначе NULL — «репозиторий не назван». Это группировка, а не адрес:
+  -- дело адресуется своим `d_<hex>`, и по repo его не найти.
+  repo       TEXT,
   title      TEXT NOT NULL,
   body       TEXT NOT NULL DEFAULT '',
   assignee   TEXT,
@@ -153,10 +152,19 @@ CREATE TABLE IF NOT EXISTS leases (
   expires_at INTEGER NOT NULL,
   PRIMARY KEY (deal_id, stage)
 );
-CREATE INDEX IF NOT EXISTS deals_board ON deals(board, status);
 CREATE INDEX IF NOT EXISTS comments_deal ON comments(deal_id, id);
 CREATE INDEX IF NOT EXISTS attachments_deal ON attachments(deal_id, id);
 """
+
+# Индексы `deals` создаются не в `SCHEMA`, а в `_migrate`: на старой базе колонки
+# `repo` ещё нет, и `CREATE INDEX ... (repo, status)` упал бы до пересборки таблицы.
+DEALS_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS deals_repo ON deals(repo, status)",
+    # До 0.0.6 строка дела принадлежала доске, и поиск живого дела по внешнему
+    # имени шёл с `board = ?`. Индекс на доску больше не нужен: пересборка таблицы
+    # его и так снимает, а `DROP INDEX IF EXISTS` доводит базу, где он остался.
+    "DROP INDEX IF EXISTS deals_board",
+)
 
 # Каталог вложений рядом с БД: `<home>/duty/attachments/<deal_id>/`.
 ATTACH_SUBDIR = "attachments"
@@ -169,16 +177,20 @@ ATTACH_SUBDIR = "attachments"
 # «колонки ещё нет» читается как «внешнего имени нет», а не как ошибка.
 DEAL_FIELDS = (
     "id",
-    "board",
+    "repo",
     "title",
     "body",
     "assignee",
     "status",
     "origin",
+    "external_ref",
     "created_at",
     "updated_at",
 )
 EXTERNAL_REF_FIELD = "external_ref"
+REPO_FIELD = "repo"
+# Колонка, которой больше нет (0.0.6): строку дела она привязывала к доске.
+BOARD_FIELD = "board"
 
 
 class DealError(RuntimeError):
@@ -242,30 +254,77 @@ def _deal_columns(conn: sqlite3.Connection) -> set[str]:
 
 
 def _deal_fields(conn: sqlite3.Connection) -> str:
-    """Список колонок строки дела для `SELECT`: `external_ref` — если она есть.
+    """Список колонок строки дела для `SELECT`: отсутствующие читаются как `NULL`.
 
     Читающая ручка не имеет права доводить схему (смотр экрана не меняет файл),
-    поэтому `external_ref` попадает в выборку только когда колонка уже заведена
-    миграцией. Отсутствие колонки — это «внешнего имени нет», а не ошибка чтения.
+    поэтому колонка, которую миграция ещё не завела, подставляется как
+    `NULL AS <имя>`. Иначе чтение старой `duty.db` падало бы на `no such column`,
+    хотя «внешнего имени нет» и «репозиторий не назван» — законные состояния, а
+    не ошибки чтения.
     """
-    fields: list[str] = list(DEAL_FIELDS)
-    if EXTERNAL_REF_FIELD in _deal_columns(conn):
-        fields.insert(fields.index("origin") + 1, EXTERNAL_REF_FIELD)
-    return ", ".join(fields)
+    columns = _deal_columns(conn)
+    return ", ".join(
+        name if name in columns else f"NULL AS {name}" for name in DEAL_FIELDS
+    )
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """Довести уже существующую `duty.db` до схемы 0.0.4: колонка `external_ref`.
+    """Довести уже существующую `duty.db` до схемы 0.0.6: `repo` вместо `board`.
 
     Отдельного файла миграций у плагина нет (`CREATE TABLE IF NOT EXISTS` при
-    каждом открытии и есть миграция), но колонку в заведённую таблицу так не
-    добавить. Поэтому при открытии **на запись** схема доводится здесь: ALTER
-    идемпотентен по проверке и коммитится сразу, чтобы не оказаться частью
-    чужой транзакции мутации.
+    каждом открытии и есть миграция), но убрать колонку так нельзя. Поэтому при
+    открытии **на запись** схема доводится здесь, и каждый шаг идемпотентен по
+    проверке: повторный запуск на мигрированной базе не делает ничего.
+
+    Колонка `board` была `NOT NULL` и лежала в индексе `deals_board`, а SQLite
+    отказывается удалять индексированную колонку — поэтому `deals` **пересобирается**
+    (create new → copy → drop → rename), а не правится `DROP COLUMN`. Пересборка
+    идёт в одной транзакции и с выключенными внешними ключами: у `deal_links`,
+    `comments`, `attachments` и `leases` есть `REFERENCES deals(id)`, и `DROP TABLE`
+    при включённых FK упал бы на их строках. `id` копируются как есть — порядок
+    `deals.id` не меняется, а `repo` у старых дел остаётся `NULL`: доски, из
+    которой его можно вывести, больше нет.
     """
-    if EXTERNAL_REF_FIELD not in _deal_columns(conn):
-        conn.execute(f"ALTER TABLE deals ADD COLUMN {EXTERNAL_REF_FIELD} TEXT")
-        conn.commit()
+    columns = _deal_columns(conn)
+    if not columns:  # таблицы ещё нет: её заведёт `SCHEMA`
+        return
+    rebuild = BOARD_FIELD in columns
+    if rebuild or REPO_FIELD not in columns:
+        # `PRAGMA foreign_keys` не действует внутри транзакции — выключаем до неё.
+        conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            with conn:  # одна транзакция на всю пересборку
+                if rebuild:
+                    conn.execute(
+                        "CREATE TABLE deals_v6 ("
+                        "id TEXT PRIMARY KEY, repo TEXT, title TEXT NOT NULL, "
+                        "body TEXT NOT NULL DEFAULT '', assignee TEXT, status TEXT NOT NULL, "
+                        "origin TEXT NOT NULL DEFAULT 'duty', external_ref TEXT, "
+                        "created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)"
+                    )
+                    # Копируются колонки, которые в старой таблице реально есть:
+                    # база 0.0.3 не знает `external_ref`, и жёсткий список на ней
+                    # упал бы. `repo` не переносится — его не из чего вывести.
+                    copied = [
+                        name for name in DEAL_FIELDS if name in columns and name != REPO_FIELD
+                    ]
+                    conn.execute(
+                        f"INSERT INTO deals_v6 ({REPO_FIELD}, {', '.join(copied)}) "
+                        f"SELECT NULL, {', '.join(copied)} FROM deals"
+                    )
+                    conn.execute("DROP TABLE deals")
+                    conn.execute("ALTER TABLE deals_v6 RENAME TO deals")
+                else:
+                    conn.execute(f"ALTER TABLE deals ADD COLUMN {REPO_FIELD} TEXT")
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
+    with conn:
+        for statement in DEALS_INDEXES:
+            conn.execute(statement)
+        # Таблица досок больше не нужна: дело адресуется своим id, а группировка —
+        # по `repo`. Строки досок не переносятся никуда: вывести из них репозиторий
+        # нечем, и придумывать его нельзя.
+        conn.execute("DROP TABLE IF EXISTS boards")
 
 
 def has_store(conn: Optional[sqlite3.Connection]) -> bool:
@@ -314,16 +373,44 @@ def is_own(deal_id: Any) -> bool:
     """Своё ли это дело по префиксу id (`d_<hex>`) — без исключения на чужой.
 
     Отдельно от `own_id`, потому что здесь решается ветка «кто владеет», а не
-    проверка входа: роут `/deal` спрашивает про оба пространства и не должен
-    ловить исключение, чтобы понять, куда идти.
+    проверка входа: роут `/deal` спрашивает про префикс, чтобы ответить отказом
+    словами, а не поймать исключение ради ветки.
     """
     return re.fullmatch(r"d_[0-9a-f]{6,}", str(deal_id or "").strip()) is not None
+
+
+def is_card(deal_id: Any) -> bool:
+    """Карточка kanban ли это по префиксу id (`t_<hex>`).
+
+    Карточка — наблюдение, а не дело (0.0.6): доски, через которую она попадала
+    в адресацию, больше нет. Отдельная проверка нужна, чтобы отказ на `t_…` был
+    назван причиной, а не выглядел как «дела нет».
+    """
+    return re.fullmatch(r"t_[0-9a-f]{6,}", str(deal_id or "").strip()) is not None
 
 
 def new_id() -> str:
     """Новый id своего дела: `d_` + 8 hex-символов (случайные, не время)."""
     seed = f"{time.time_ns()}|{id(object())}".encode()
     return OWN_PREFIX + hashlib.sha1(seed).hexdigest()[:8]
+
+
+def repo_of(value: Any) -> Optional[str]:
+    """Репозиторий дела: путь как есть (с `~` развёрнутым), `None` — не назван.
+
+    Источник один на оба входа (`create` API и `cli`): `spec.repo`, иначе явный
+    `--repo`. Значение не проверяется на существование: группировка не обязана
+    быть живым каталогом, а «репозиторий объявлен, но его нет на диске» — дело
+    спеки (`duty spec check`), а не отказ создания. Нормализация ровно одна —
+    `~` разворачивается, иначе один и тот же репозиторий, записанный двумя
+    способами, дал бы две группы.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return str(Path(text).expanduser())
 
 
 def external_ref_of(value: Any) -> Optional[str]:
@@ -361,18 +448,24 @@ def deal_row(conn: sqlite3.Connection, deal_id: str) -> Optional[dict[str, Any]]
 
 
 def deal_rows(
-    conn: sqlite3.Connection, *, board: Optional[str] = None, open_only: bool = True
+    conn: sqlite3.Connection, *, repo: Optional[str] = None, open_only: bool = True
 ) -> list[dict[str, Any]]:
-    """Свои дела (по умолчанию — активные), по возрастанию `created_at`."""
+    """Свои дела (по умолчанию — активные), по возрастанию `created_at`.
+
+    `repo` — фильтр группировки, а не адрес: `repo=None` — все дела, в том числе
+    без репозитория. Отфильтровать «без репозитория» отдельно этим параметром
+    нельзя (`NULL` значил бы «не фильтровать»), и это честно: такой фильтр ставит
+    вызывающий по полю строки.
+    """
     sql = f"SELECT {_deal_fields(conn)} FROM deals"
     params: list[Any] = []
     where: list[str] = []
     if open_only:
         where.append("status NOT IN ({})".format(", ".join("?" * len(CLOSED_STATUSES))))
         params.extend(CLOSED_STATUSES)
-    if board is not None:
-        where.append("board = ?")
-        params.append(str(board))
+    if repo is not None:
+        where.append("repo = ?")
+        params.append(str(repo))
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY created_at, id"
@@ -390,9 +483,9 @@ def parents_of(conn: sqlite3.Connection, deal_id: str) -> list[dict[str, Any]]:
 
 
 def children_of(conn: sqlite3.Connection, deal_id: str) -> list[dict[str, Any]]:
-    """Дети дела: `id`, `board`, `status` — те, чей гейт двигает эта мутация."""
+    """Дети дела: `id`, `status` — те, чей гейт двигает эта мутация."""
     rows = conn.execute(
-        "SELECT d.id AS id, d.board AS board, d.status AS status FROM deal_links l "
+        "SELECT d.id AS id, d.status AS status FROM deal_links l "
         "JOIN deals d ON d.id = l.child_id WHERE l.parent_id = ? ORDER BY d.id",
         (own_id(deal_id),),
     )
@@ -420,13 +513,13 @@ def attachments_of(conn: sqlite3.Connection, deal_id: str) -> list[dict[str, Any
 
 def live_deal_by_ref(
     conn: sqlite3.Connection,
-    board: str,
+    repo: Optional[str],
     external_ref: str,
     *,
     now: Optional[int] = None,
     window: Optional[int] = None,
 ) -> Optional[dict[str, Any]]:
-    """Живое дело с этим внешним именем на этой доске — то, что не дублируется.
+    """Живое дело с этим внешним именем в этом репозитории — то, что не дублируется.
 
     Закрытое (`done`/`archived`) не возвращается никогда: продолжение после паузы
     — это новое дело, и оно должно быть видно отдельно, а не как воскрешение
@@ -434,16 +527,21 @@ def live_deal_by_ref(
     есть (заведены руками), берётся самое свежее — «продолжить» возвращает то, чем
     дело кончилось в последний раз, а не первое из истории.
 
+    Область поиска — `repo` (0.0.6; до этого была доска): один тикет может идти
+    в двух репозиториях, и это два разных дела. `repo IS NULL` — своя область
+    «репозиторий не назван», а не «любая»: иначе дело без repo перехватывало бы
+    повтор из названного репозитория.
+
     `window` — окно дедупликации в секундах: если задано, живое дело, созданное
     раньше окна, не переиспользуется (заводится новое — старое продолжение видно
     отдельно). По умолчанию окна нет: любое живое дело с этим именем — то же дело.
     """
     where = [
-        "board = ?",
+        "repo IS ?",
         "external_ref = ?",
         "status NOT IN ({})".format(", ".join("?" * len(CLOSED_STATUSES))),
     ]
-    params: list[Any] = [str(board), external_ref, *CLOSED_STATUSES]
+    params: list[Any] = [repo, external_ref, *CLOSED_STATUSES]
     if window is not None:
         base = _now_sec() if now is None else int(now)
         where.append("created_at > ?")
@@ -464,20 +562,6 @@ def gate_open(conn: sqlite3.Connection, deal_id: str) -> bool:
     в `todo` значило бы ждать того, чего уже не будет.
     """
     return all(str(parent["status"]) in CLOSED_STATUSES for parent in parents_of(conn, deal_id))
-
-
-def board_known(conn: sqlite3.Connection, slug: str, known_boards: Iterable[str]) -> bool:
-    """Есть ли доска: своя (строка `boards`) или kanban-доска с этим слагом."""
-    if slug in {str(item) for item in known_boards}:
-        return True
-    return conn.execute("SELECT 1 FROM boards WHERE slug = ?", (slug,)).fetchone() is not None
-
-
-def _ensure_board(conn: sqlite3.Connection, slug: str, now: int) -> None:
-    """Завести строку доски при первом своём деле: имя по умолчанию — слаг."""
-    conn.execute(
-        "INSERT OR IGNORE INTO boards (slug, name, created_at) VALUES (?, ?, ?)", (slug, slug, now)
-    )
 
 
 # ------------------------------------------------------------------- события
@@ -504,12 +588,16 @@ def _event(
     args: dict[str, Any],
     now: int,
 ) -> dict[str, Any]:
-    """Событие журнала по факту мутации своего дела."""
+    """Событие журнала по факту мутации своего дела.
+
+    Доски в событии нет (0.0.6): дело адресуется своим `id`, а группировка —
+    по `repo` строки дела. Старые события при миграции не переписываются, и
+    поле `board` в их payload остаётся историческим фактом.
+    """
     return {
         "ts": now,
         "recorded_at": now,
         "deal_id": str(deal["id"]),
-        "board": str(deal["board"]),
         "kind": kind,
         "payload": payload,
         "source": source,
@@ -560,7 +648,6 @@ def _gate_events(
                 "ts": now,
                 "recorded_at": now,
                 "deal_id": str(child["id"]),
-                "board": str(child["board"]),
                 "kind": kind,
                 "payload": {"from": str(child["status"]), "to": target, "parent": str(parent["id"])},
                 "source": source,
@@ -638,12 +725,11 @@ def _apply(
 def create_deal(
     conn: sqlite3.Connection,
     *,
-    board: str,
+    repo: Optional[str] = None,
     title: str,
     body: str = "",
     assignee: Optional[str] = None,
     parents: Iterable[str] = (),
-    known_boards: Iterable[str] = (),
     source: str = "cli",
     spec_path: Optional[str] = None,
     external_ref: Optional[str] = None,
@@ -657,6 +743,10 @@ def create_deal(
     родители `done`»). Родитель, которого нет, или родитель из пространства
     `t_…` — ошибка входа, а не 500: гейт обязан считаться по своим делам.
 
+    `repo` — репозиторий дела (группировка, не адрес): вызывающий вычисляет его
+    из `spec.repo`, иначе из явного `--repo`, иначе оставляет `NULL` — «репозиторий
+    не назван». Обязательным он не бывает: дело без репозитория законно.
+
     `spec_path` — спека дела (`duty.yaml`), по которой строится лента этапов
     (`docs/SPEC.md`). Путь записывается в `created.payload.spec`, потому что
     консоль читает журнал: «по какому графу завели дело» — факт дела, а не
@@ -666,7 +756,7 @@ def create_deal(
 
     `external_ref` — внешнее имя дела (`jira:RP-14080`), по которому его находят
     повторно (`docs/OWNERSHIP.md`, «Внешнее имя дела»). Если живое дело с этим
-    именем на этой доске уже есть, новое не заводится: возвращается оно с
+    именем в этом репозитории уже есть, новое не заводится: возвращается оно с
     `created: false` и причиной в `reason` — повторный клик «продолжить» не
     плодит второе дело. Закрытое дело не воскрешается: это продолжение, и оно
     заводится новым (`created: true`). `dedup_window` ограничивает поиск свежими
@@ -677,16 +767,10 @@ def create_deal(
     повтор.
     """
     now = _now_sec() if now is None else int(now)
-    slug = " ".join(str(board or "").split())
-    if not slug:
-        raise DealError("create: поле 'board' обязательно")
     clean_title = " ".join(str(title or "").split())
     if not clean_title:
         raise DealError("create: поле 'title' обязательно")
-    if not board_known(conn, slug, known_boards):
-        raise DealError(
-            f"create: доски {slug!r} нет — ни своей в store, ни kanban-доски с таким слагом"
-        )
+    repo_name = repo_of(repo)
     spec_file = "" if spec_path is None else str(spec_path).strip()
     if spec_file:
         path = Path(spec_file).expanduser()
@@ -712,7 +796,7 @@ def create_deal(
                 f"create: 'dedup_window' — неотрицательное число секунд, получено {window}"
             )
     if ref is not None:
-        existing = live_deal_by_ref(conn, slug, ref, now=now, window=window)
+        existing = live_deal_by_ref(conn, repo_name, ref, now=now, window=window)
         if existing is not None:
             # Живое дело с этим внешним именем уже есть — повтор («продолжить»
             # нажали дважды) не заводит второе. События не пишутся: создавать
@@ -723,14 +807,14 @@ def create_deal(
                 "idempotent": True,
                 "created": False,
                 "reason": (
-                    f"живое дело {existing['id']} с external_ref={ref!r} на доске {slug!r} "
-                    "уже есть — вернули его (закрытое дело с этим именем не воскрешается: "
-                    "продолжение заводится новым)"
+                    f"живое дело {existing['id']} с external_ref={ref!r} "
+                    f"(repo={repo_name or '—'}) уже есть — вернули его (закрытое дело "
+                    "с этим именем не воскрешается: продолжение заводится новым)"
                 ),
             }
 
     deal_id = new_id()
-    deal = {"id": deal_id, "board": slug}
+    deal = {"id": deal_id, "repo": repo_name}
     created = _event(
         deal,
         "created",
@@ -744,7 +828,7 @@ def create_deal(
         },
         source,
         {
-            "board": slug,
+            "repo": repo_name,
             "title": clean_title,
             "body": str(body or ""),
             "assignee": assignee,
@@ -754,12 +838,11 @@ def create_deal(
         },
         now,
     )
-    with conn:  # одна транзакция: доска, строка дела, связи, событие
-        _ensure_board(conn, slug, now)
+    with conn:  # одна транзакция: строка дела, связи, событие
         conn.execute(
-            "INSERT INTO deals (id, board, title, body, assignee, status, origin, external_ref, "
+            "INSERT INTO deals (id, repo, title, body, assignee, status, origin, external_ref, "
             "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (deal_id, slug, clean_title, str(body or ""), assignee, "todo", "duty", ref, now, now),
+            (deal_id, repo_name, clean_title, str(body or ""), assignee, "todo", "duty", ref, now, now),
         )
         for parent_id in parent_ids:
             conn.execute(

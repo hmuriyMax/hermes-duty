@@ -103,10 +103,9 @@ def make_deal(conn: sqlite3.Connection, *, spec_path: Path | None = None) -> dic
     """Своё дело в store; спека — в `created.payload.spec`, как у `duty create --spec`."""
     created = deals.create_deal(
         conn,
-        board="duty",
+        repo="duty",
         title="Довести дело по спеке",
         body="",
-        known_boards=["duty"],
         spec_path=str(spec_path) if spec_path is not None else None,
         now=NOW,
     )
@@ -120,7 +119,6 @@ def append(conn: sqlite3.Connection, deal: dict[str, Any], facts: list[tuple[str
             "ts": ts,
             "recorded_at": ts,
             "deal_id": str(deal["id"]),
-            "board": str(deal["board"]),
             "kind": kind,
             "payload": payload,
             "source": "test",

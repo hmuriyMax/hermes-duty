@@ -148,7 +148,6 @@ def ev(
         "id": number,
         "ts": 1793800000 + number if ts is None else ts,
         "deal_id": DEAL,
-        "board": "duty",
         "kind": kind_name,
         "payload": body,
         "source": "test",

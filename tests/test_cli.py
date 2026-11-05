@@ -238,9 +238,9 @@ def test_now_json_is_exactly_the_route_payload(home, client, frozen_now, capsys)
 
 
 def test_now_json_honours_board_and_state_filters(home, client, frozen_now, capsys):
-    code, out, _ = run(["now", "--board", "b1", "--state", "wait_human", "--json"], capsys)
+    code, out, _ = run(["now", "--repo", "b1", "--state", "wait_human", "--json"], capsys)
     assert code == 0
-    assert json.loads(out) == client.get("/now", params={"board": "b1", "state": "wait_human"}).json()
+    assert json.loads(out) == client.get("/now", params={"repo": "b1", "state": "wait_human"}).json()
 
 
 def test_stats_json_is_exactly_the_route_payload(home, client, frozen_now, capsys):
@@ -251,9 +251,9 @@ def test_stats_json_is_exactly_the_route_payload(home, client, frozen_now, capsy
 
 def test_stats_json_passes_board_and_since_to_the_same_function(home, client, frozen_now, capsys):
     since = NOW - 60
-    code, out, _ = run(["stats", "--board", "b1", "--since", str(since), "--json"], capsys)
+    code, out, _ = run(["stats", "--repo", "b1", "--since", str(since), "--json"], capsys)
     assert code == 0
-    assert json.loads(out) == client.get("/stats", params={"board": "b1", "since": since}).json()
+    assert json.loads(out) == client.get("/stats", params={"repo": "b1", "since": since}).json()
 
 
 def test_deal_json_is_exactly_the_route_payload(home, client, frozen_now, capsys):
@@ -299,7 +299,7 @@ def test_json_flag_works_before_the_command_too(home, client, frozen_now, capsys
 
 
 def test_missing_board_is_code_1(home, capsys):
-    code, out, err = run(["now", "--board", "nope"], capsys)
+    code, out, err = run(["now", "--repo", "nope"], capsys)
     assert code == cli.EXIT_NOT_FOUND
     assert out == ""
     assert "not found" in err
@@ -436,7 +436,7 @@ def write_three_attempts(home: Path, deal_id: str) -> None:
             [
                 {
                     "deal_id": deal_id,
-                    "board": "b1",
+                    "repo": "b1",
                     "kind": kind,
                     "ts": ts,
                     "recorded_at": ts,
@@ -538,7 +538,7 @@ def test_published_fact_is_shown_by_deal_now_and_attempts(home, frozen_now, caps
             [
                 {
                     "deal_id": deal_id,
-                    "board": "b1",
+                    "repo": "b1",
                     "kind": "published",
                     "ts": NOW - 100,
                     "recorded_at": NOW - 100,
@@ -612,7 +612,7 @@ def start_live_attempt(
             [
                 {
                     "deal_id": deal_id,
-                    "board": "b1",
+                    "repo": "b1",
                     "kind": "attempt_started",
                     "ts": started_at,
                     "recorded_at": started_at,
@@ -693,7 +693,7 @@ def seed_attempt(home: Path, *, deal_id: str = "t_aaa001", stage: str = "impl", 
     assert conn is not None
     base = {
         "deal_id": deal_id,
-        "board": "b1",
+        "repo": "b1",
         "source": "engine",
     }
     event = {
@@ -858,7 +858,7 @@ def test_watch_survives_source_degradation(home, frozen_now):
 def test_watch_of_missing_board_exits_1_instead_of_looping(home, capsys):
     # `ticks` — страховка теста: если сопоставление 404 сломается, прогон кончится
     # тремя тиками с кодом 0, а не зависанием.
-    code = cli.run_watch(interval=0, board="nope", ticks=3, stream=io.StringIO())
+    code = cli.run_watch(interval=0, repo="nope", ticks=3, stream=io.StringIO())
     assert code == cli.EXIT_NOT_FOUND
 
 
@@ -974,7 +974,7 @@ ANSWER = "stop: прогон закрыт координатором — это 
 
 def own_deal(home: Path, *, title: str = "своё дело") -> str:
     """Своё дело в store (`d_<hex>`): у него есть журнал и переходы."""
-    payload = cli.api().deals_create(home, {"board": "b1", "title": title}, source="cli")
+    payload = cli.api().deals_create(home, {"repo": "b1", "title": title}, source="cli")
     return str(payload["id"])
 
 
@@ -995,7 +995,7 @@ def park_deal(home: Path, deal_id: str, *, question_id: int = 293, answer: str =
             [
                 {
                     "deal_id": deal_id,
-                    "board": "b1",
+                    "repo": "b1",
                     "kind": "question_asked",
                     "ts": NOW - 30,
                     "recorded_at": NOW - 30,
@@ -1030,7 +1030,7 @@ def park_deal(home: Path, deal_id: str, *, question_id: int = 293, answer: str =
             [
                 {
                     "deal_id": deal_id,
-                    "board": "b1",
+                    "repo": "b1",
                     "kind": "question_answered",
                     "ts": NOW - 10,
                     "recorded_at": NOW - 10,
@@ -1249,7 +1249,7 @@ def running_deal(home: Path, *, lease_expires: Optional[int] = None) -> str:
             [
                 {
                     "deal_id": deal_id,
-                    "board": "b1",
+                    "repo": "b1",
                     "kind": "attempt_started",
                     "ts": NOW - 60,
                     "recorded_at": NOW - 60,

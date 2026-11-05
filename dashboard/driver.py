@@ -371,7 +371,6 @@ def _report(
     """
     return {
         "deal": str(deal.get("id") or ""),
-        "board": str(deal.get("board") or ""),
         "spec": str(getattr(spec, "path", "") or ""),
         "steps": list(steps),
         "reaped": list(reaped or ()),
@@ -559,7 +558,7 @@ def run(
         synced = ask.sync_answers(conn, home)
         answers["appended"] = int(answers.get("appended") or 0) + int(synced.get("appended") or 0)
         for error in synced.get("errors") or ():
-            row = dict(error) if isinstance(error, dict) else {"board": "", "reason": str(error)}
+            row = dict(error) if isinstance(error, dict) else {"source": "", "reason": str(error)}
             if row in answers_errors:
                 continue  # один и тот же сбой пула не повторяется на каждом шаге
             answers_errors.append(row)

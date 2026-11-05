@@ -110,7 +110,7 @@ def open_store(home: Path) -> sqlite3.Connection:
 
 def make_deal(conn: sqlite3.Connection) -> dict[str, Any]:
     created = deals.create_deal(
-        conn, board="duty", title="Починить шапку", body="", known_boards=["duty"], now=NOW
+        conn, repo="duty", title="Починить шапку", body="", now=NOW
     )
     return deals.deal_row(conn, str(created["deal"]["id"]))
 
@@ -146,7 +146,6 @@ def seed(conn: sqlite3.Connection, deal: dict[str, Any], kind: str, payload: dic
                 "ts": ts,
                 "recorded_at": ts,
                 "deal_id": str(deal["id"]),
-                "board": str(deal["board"]),
                 "kind": kind,
                 "payload": payload,
                 "source": "test",

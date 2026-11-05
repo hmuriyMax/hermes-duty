@@ -3,16 +3,20 @@
 С 0.0.3 состояние дела считается не по колонкам kanban, а по **своему журналу
 событий** (`dashboard/journal.py`, контракт `docs/JOURNAL.md`):
 `waiting = fold(events)`. Журнал живёт в `$HERMES_HOME/duty/duty.db` и принадлежит
-плагину; чужие БД (`kanban.db`, `state.db`, `pool.db`) по-прежнему открываются
-только `?mode=ro`, и срез в них ничего не пишет.
+плагину; чужие БД (`kanban.db`, `state.db`, `pool.db`) открываются только
+`?mode=ro`, и ни один роут в них не пишет.
 
-Единственное место, где плагин пишет в свой журнал, — проход ingest, и только по
-явному требованию: `POST /ingest` или `GET /now?ingest=1`. Проход ingest читает
-kanban на чтение, сравнивает с журналом и дописывает недостающие события;
-повторный проход — no-op. Без этого флага ни один читающий роут не создаёт и не
-меняет файлов.
+С 0.0.6 **доск нет**: дело адресуется своим `d_<hex>`, а группируется по `repo`
+строки дела (репозиторий из спеки). Маршруты поэтому односегментные —
+`/deal/{deal_id}`, `/duty/{deal_id}/attempts`, — а фильтр группировки называется
+`?repo=`. Подбора событий из kanban (`ingest`) больше нет: это был последний мост
+к канбану, и вместе с досками он стал не нужен.
 
-Вопросы человеку идут одним каналом — `dashboard/ask.py`: `POST /ask/{board}/{task_id}`
+Карточки kanban остались **только наблюдением** — `GET /cards`: их статусы и
+лизинг, своим ответом и своим маршрутом. На список дел, статистику и id они не
+влияют: дела живут в store (`dashboard/deals.py`), и другого источника у них нет.
+
+Вопросы человеку идут одним каналом — `dashboard/ask.py`: `POST /ask/{deal_id}`
 пишет вопрос в пул `messaging/pool.db` (`origin='duty'`, `kind='decision'`) и факт
 `question_asked` в журнал. Остальной код пул только читает (`mode=ro`).
 
@@ -20,20 +24,17 @@ kanban на чтение, сравнивает с журналом и допис
 
 Источники (поиск от корня Hermes, без хардкода путей):
 
-- `kanban.db` в корне — живая БД доски `default` (остальные доски лежат в
-  `kanban/boards/<slug>/kanban.db`);
-- `messaging/pool.db` — пул вопросов (для таксономии ожиданий, тоже только чтение);
+- `duty/duty.db` — свой store дел и журнал (единственный источник дел и `/stats`);
+- `messaging/pool.db` — пул вопросов (для таксономии ожиданий, только чтение);
 - `profiles/<role>/state.db` — сессии, из которых берётся «последнее действие»;
-- `duty/duty.db` — свой журнал (читается всеми, пишется только ingest).
+- `kanban.db` (+ `kanban/boards/<slug>/kanban.db`) — только для `/cards`.
 
 Ядро kanban и его диспетчер не импортируются: P0 не должен зависеть от кода,
 который мы собираемся заменить.
 
-Экран «сейчас» (`/now`) и таймлайн попыток (`/duty/{board}/{task_id}/attempts`)
-считаются здесь же: состояние ожидания дела выводится fold'ом по событиям
-журнала, а дело, которого в журнале ещё нет, — по набору фактов kanban (лизинг,
-pid, heartbeat, граф зависимостей, пул вопросов, исход последнего рана) с честной
-пометкой в `waiting.evidence`, откуда состояние взято.
+Экран «сейчас» (`/now`) и таймлайн попыток (`/duty/{deal_id}/attempts`) считаются
+здесь же: состояние ожидания дела выводится fold'ом по событиям журнала, а факты
+попытки и лизинга — из журнала и таблицы `leases` своего store.
 """
 
 from __future__ import annotations
@@ -62,6 +63,8 @@ JOURNAL_MODULE_NAME = "hermes_duty_journal"
 ASK_MODULE_NAME = "hermes_duty_ask"
 # `dashboard/deals.py` — свой store дел и мутации (`docs/OWNERSHIP.md`).
 DEALS_MODULE_NAME = "hermes_duty_deals"
+# `dashboard/spec.py` — чтение спеки дела (`load_spec`): из неё берётся `repo`.
+SPEC_MODULE_NAME = "hermes_duty_spec"
 # `dashboard/stagefeed.py` — лента этапов и попыток дела (`GET /deal`, `GET /now`).
 STAGEFEED_MODULE_NAME = "hermes_duty_stagefeed"
 # `dashboard/budget.py` — расход дела по журналу против верхнего `budget` спеки.
@@ -122,6 +125,30 @@ def _load_deals() -> Any:
 
 
 deals = _load_deals()
+
+
+def _load_spec() -> Any:
+    """Загрузить `dashboard/spec.py` — чтение спеки дела (граф этапов и `repo`).
+
+    Отдельной загрузкой по пути, как и остальные модули рядом: плагин грузит
+    `plugin_api.py` как файл, и обычный `import spec` попал бы не в тот пакет.
+    Нужен здесь ради одного факта — `repo` из спеки при создании дела; граф
+    этапов читает `stagefeed.py` сам.
+    """
+    loaded = sys.modules.get(SPEC_MODULE_NAME)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / "spec.py"
+    spec = importlib.util.spec_from_file_location(SPEC_MODULE_NAME, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise ImportError(f"spec module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[SPEC_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+spec_mod = _load_spec()
 
 
 def _load_stagefeed() -> Any:
@@ -216,22 +243,6 @@ SQL_BUSY_TIMEOUT_SEC = 2.0
 # Префикс — не украшение: он и отличает владение от наблюдения.
 DEAL_ID_RE = re.compile(r"[td]_[0-9a-f]{6,}")
 
-# Корневая БД: доска `default` лежит не в `kanban/boards/`, а прямо в корне Hermes.
-DEFAULT_BOARD = "default"
-
-# Каталог выбывших досок: ядро убирает туда закрытые доски (`_archived/<slug>/`)
-# и ставит рядом камень `board.json` с `"archived": true`. Это не источник среза.
-ARCHIVED_DIR = "_archived"
-
-
-def hermes_home() -> Path:
-    """Корень Hermes — та же точка, что у роутов.
-
-    CLI зовёт её отсюда, а не ищет `HERMES_HOME` сам: иначе «где живёт store» и
-    «где живут источники» разъехались бы между терминалом и экраном.
-    """
-    return _hermes_home()
-
 
 def _plugin_version() -> str:
     """Номер версии — один источник (plugin.yaml), а не четвёртая копия в коде."""
@@ -239,7 +250,7 @@ def _plugin_version() -> str:
     try:
         for line in meta.read_text().splitlines():
             if line.startswith("version:"):
-                return line.split(":", 1)[1].strip().strip('"\'')
+                return line.split(":", 1)[1].strip().strip("\"'")
     except OSError:
         pass
     return "0.0.0"
@@ -249,10 +260,20 @@ VERSION = _plugin_version()
 
 
 def _hermes_home() -> Path:
+    """Корень Hermes: `$HERMES_HOME`, иначе `~/.hermes`.
+
+    Одна точка на все роуты и на CLI (`hermes_home` ниже): иначе «где живёт
+    store» и «где живут источники» разъехались бы между терминалом и экраном.
+    """
     env = os.environ.get("HERMES_HOME")
     if env:
         return Path(env).expanduser()
     return Path.home() / ".hermes"
+
+
+def hermes_home() -> Path:
+    """Корень Hermes — та же точка, что у роутов (её зовёт CLI)."""
+    return _hermes_home()
 
 
 def _ro(path: Path) -> str:
@@ -287,7 +308,7 @@ def _fetch(
 ) -> tuple[list[dict[str, Any]], Optional[str]]:
     """Один запрос на уже открытом соединении: `(строки, причина сбоя)` без исключений.
 
-    Отдельно от `_query_checked`, потому что срез доски делает несколько запросов
+    Отдельно от `_query_checked`, потому что наблюдение делает несколько запросов
     по одному соединению, а не открывает новое на каждый.
     """
     try:
@@ -299,11 +320,7 @@ def _fetch(
 def _query_checked(
     path: Path, sql: str, params: tuple = ()
 ) -> tuple[list[dict[str, Any]], Optional[str]]:
-    """Один read-only запрос: `(строки, причина сбоя)`, без исключений наружу.
-
-    Причина нужна экрану «сейчас»: доска, которая не читается, попадает в
-    `errors` ответа, а не роняет роут.
-    """
+    """Один read-only запрос: `(строки, причина сбоя)`, без исключений наружу."""
     try:
         with closing(_connect_ro(path)) as conn:
             return _fetch(conn, sql, params)
@@ -316,129 +333,24 @@ def _query(path: Path, sql: str) -> list[dict[str, Any]]:
     return _query_checked(path, sql)[0]
 
 
-def _table_exists(path: Path, table: str) -> bool:
-    rows = _query(path, "SELECT name FROM sqlite_master WHERE type='table'")
-    return any(str(r.get("name")) == table for r in rows)
-
-
-def _archived_reason(board_dir: Path) -> Optional[str]:
-    """Почему доска выбыла, или None, если она живая.
-
-    Ядро kanban убирает закрытые доски в `kanban/boards/_archived/` и ставит в
-    каталог доски могильный камень `board.json` с `"archived": true`; открывать
-    такую доску ядро отказывается (`_refuse_dead_board_resurrection`). Для среза
-    это не источник, а история: читать её значит показывать архив как живое дело,
-    а не читать — значит держать вечный `errors[]` на каждом ответе.
-    """
-    if board_dir.name == ARCHIVED_DIR or board_dir.parent.name == ARCHIVED_DIR:
-        return f"{ARCHIVED_DIR}: выбывшие доски, не живой источник"
-    tombstone = board_dir / "board.json"
-    if not tombstone.is_file():
-        return None
-    try:
-        raw = json.loads(tombstone.read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError):
-        return None
-    if isinstance(raw, dict) and raw.get("archived"):
-        return "board.json: archived"
-    return None
-
-
-def _board_paths(home: Path) -> list[tuple[str, Path]]:
-    """Все каталоги-кандидаты в доски: корень Hermes + `kanban/boards/<slug>`."""
-    candidates: list[tuple[str, Path]] = []
-    root = home / "kanban.db"
-    if root.is_file():
-        candidates.append((DEFAULT_BOARD, root))
-    boards_dir = home / "kanban" / "boards"
-    if boards_dir.is_dir():
-        for child in sorted(boards_dir.iterdir()):
-            db = child / "kanban.db"
-            if child.is_dir() and db.is_file():
-                candidates.append((child.name, db))
-            # Сам каталог `_archived/` — это namespace, а не доска: настоящие
-            # выбывшие доски лежат на уровень глубже (`_archived/<slug>/`).
-            # Без этого спуска архив был бы невидим целиком.
-            if child.is_dir() and child.name == ARCHIVED_DIR:
-                for retired in sorted(child.iterdir()):
-                    retired_db = retired / "kanban.db"
-                    if retired.is_dir() and retired_db.is_file():
-                        candidates.append((retired.name, retired_db))
-    return candidates
-
-
-def _discover_archived(home: Path) -> list[dict[str, Any]]:
-    """Выбывшие доски: видны в `/sources`, но не читаются в срез.
-
-    Молча выкинуть архив нельзя — тогда «доски не видно» станет неотличимо от
-    «доски нет». Поэтому он перечислен отдельным списком с причиной.
-    """
-    found: list[dict[str, Any]] = []
-    for slug, path in _board_paths(home):
-        if slug == DEFAULT_BOARD:
-            continue
-        reason = _archived_reason(path.parent)
-        if reason is None:
-            continue
-        found.append({"slug": slug, "path": str(path), "reason": reason})
-    return found
-
-
-def _discover_boards(home: Path) -> list[dict[str, Any]]:
-    """Все живые kanban-БД: корневая (доска default) + boards/<slug>/kanban.db.
-
-    0-байтная БД не выпадает из перечня: она помечается `note = "empty db"` и
-    видна как доска, которую не прочитали. Иначе такой файл молча исчезает и из
-    `boards[]`, и из `errors[]`, и срез выглядит полным, хотя доска потеряна.
-
-    Выбывшие доски (`_archived/`, камень `board.json: archived`) сюда не входят:
-    они не источник среза, их место — `/sources.archived`.
-    """
-    found: list[dict[str, Any]] = []
-    for slug, path in _board_paths(home):
-        if slug != DEFAULT_BOARD and _archived_reason(path.parent) is not None:
-            continue
-        entry: dict[str, Any] = {"slug": slug, "path": str(path)}
-        if path.stat().st_size == 0:
-            entry["note"] = "empty db"
-        found.append(entry)
-    return found
-
-
-def _board_summary(entry: dict[str, Any]) -> dict[str, Any]:
-    path = Path(entry["path"])
-    out: dict[str, Any] = {
-        "slug": entry["slug"],
-        "path": str(path),
-        "size_bytes": path.stat().st_size,
-        "mtime": int(path.stat().st_mtime),
-        "readable": False,
-        "tasks": 0,
-        "blocked": 0,
-        "running": 0,
-    }
-    if entry.get("note"):
-        out["note"] = entry["note"]
-        return out
-    if not _table_exists(path, "tasks"):
-        # Пустая/служебная БД — не ошибка, честно помечаем.
-        out["note"] = "no tasks table"
-        return out
-    rows = _query(
-        path,
-        "SELECT COUNT(*) AS n, "
-        "SUM(CASE WHEN status='blocked' THEN 1 ELSE 0 END) AS blocked, "
-        "SUM(CASE WHEN status='running' THEN 1 ELSE 0 END) AS running FROM tasks",
-    )
-    if rows:
-        out["readable"] = True
-        out["tasks"] = int(rows[0].get("n") or 0)
-        out["blocked"] = int(rows[0].get("blocked") or 0)
-        out["running"] = int(rows[0].get("running") or 0)
-    return out
+# Карточки kanban (наблюдение, не дела). Корневая БД лежит не в `kanban/boards/<slug>/`,
+# а прямо в корне Hermes; остальные — по каталогам-слагам. Список источников
+# нужен только наблюдению `/cards`: ни список дел, ни статистика, ни id из него
+# больше не собираются (0.0.6: доск в duty нет).
+CARD_DB_NAME = "kanban.db"
+CARDS_DIR = ("kanban", "boards")
+CARDS_ARCHIVED = "_archived"
+# Имя корневой kanban-БД в наблюдении: «доска default» — раскладка Hermes, а не
+# наша сущность, и в ответе она подписана файлом, а не слагом.
+CARDS_ROOT_NAME = "default"
+# Подпись наблюдения — одна на все поверхности: карточки не дела.
+CARDS_LABEL = "карточки kanban (наблюдение, не дела)"
+# Сколько карточек отдаёт наблюдение: предел назван числом, а не «как получится».
+CARD_LIMIT = 200
 
 
 def _pool_summary(home: Path) -> Optional[dict[str, Any]]:
+    """Пул вопросов: что в нём лежит, по происхождению и статусу (только чтение)."""
     db = home / "messaging" / "pool.db"
     if not db.is_file():
         return None
@@ -450,76 +362,147 @@ def _pool_summary(home: Path) -> Optional[dict[str, Any]]:
     }
 
 
-@router.get("/health")
-def health() -> dict[str, Any]:
-    """Живая проверка: плагин смонтирован и источники читаются на чтение.
+def _retired(board_dir: Path) -> bool:
+    """Выбывший каталог доски: архив или камень `board.json: archived`.
 
-    `journal` — состояние своего журнала: `events` (строк), `deals` (дел с
-    событиями) и `drift.empty_journal` — сколько активных дел kanban журнал ещё
-    не подобрал. Это число, а не «всё хорошо»: пока оно больше нуля, состояние
-    этих дел считается по kanban, и расхождение видно счётчиком. `/health`
-    журнал не создаёт и не пишет: нет файла — значит событий 0, а в расхождении
-    все активные дела, и это правда.
+    Ядро kanban убирает закрытые доски в `kanban/boards/_archived/` и ставит в
+    каталог могильный камень `board.json` с `"archived": true`. Наблюдение архив
+    не показывает: его карточки — история, а не «что сейчас».
     """
-    home = _hermes_home()
-    boards = _discover_boards(home)
-    readable = [b for b in boards if _table_exists(Path(b["path"]), "tasks")]
-    # Доски, которые не попали в `readable`, не считают свой drift ни в одну
-    # сторону: без имени это выглядело бы как «расхождений нет». Причина (включая
-    # `note` источника) идёт в `journal.note`, а не в тишину.
-    skipped = [
-        f"{b['slug']}: {b.get('note') or 'no tasks table'}" for b in boards if b not in readable
-    ]
-    pool = _pool_summary(home)
+    if board_dir.name == CARDS_ARCHIVED or board_dir.parent.name == CARDS_ARCHIVED:
+        return True
+    tombstone = board_dir / "board.json"
+    if not tombstone.is_file():
+        return False
+    try:
+        raw = json.loads(tombstone.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(raw, dict) and bool(raw.get("archived"))
+
+
+def _card_databases(home: Path) -> list[tuple[str, Path]]:
+    """Живые kanban-БД для наблюдения: `(имя, путь)`; выбывшие не читаются."""
+    found: list[tuple[str, Path]] = []
+    root = home / CARD_DB_NAME
+    if root.is_file():
+        found.append((CARDS_ROOT_NAME, root))
+    boards_dir = home.joinpath(*CARDS_DIR)
+    if not boards_dir.is_dir():
+        return found
+    for child in sorted(boards_dir.iterdir()):
+        database = child / CARD_DB_NAME
+        if not child.is_dir() or not database.is_file() or _retired(child):
+            continue
+        found.append((child.name, database))
+    return found
+
+
+def _card_row(task: dict[str, Any], run: Optional[dict[str, Any]], now: int) -> dict[str, Any]:
+    """Карточка наблюдения: статус, лизинг и последний ран — без состояний дел.
+
+    Наблюдение не выводит `waiting` и не считает таксономию: состояние ожидания —
+    свойство дела (`fold` журнала), а у карточки его нет. Поэтому здесь только
+    факты строки kanban, названные своими именами.
+    """
+    expires = run.get("lease_expires") if run is not None else None
+    lease: Optional[dict[str, Any]] = None
+    if expires is not None:
+        lease = {
+            "holder": run.get("profile") or task.get("assignee"),
+            "expires_at": int(expires),
+            "expired": int(expires) <= int(now),
+            "sec_left": int(expires) - int(now),
+        }
     return {
-        "ok": True,
-        "version": VERSION,
-        "hermes_home": str(home),
-        "kanban": {
-            "databases": len(boards),
-            "readable": len(readable),
-            "task_rows": sum(
-                int((_query(Path(b["path"]), "SELECT COUNT(*) AS n FROM tasks") or [{"n": 0}])[0].get("n") or 0)
-                for b in readable
-            ),
-        },
-        "pool": {"present": pool is not None, "total": (pool or {}).get("total", 0)},
-        "journal": _journal_health(home, readable, skipped),
-        "mode": "read-only",
+        "id": str(task.get("id")),
+        "title": task.get("title"),
+        "status": task.get("status"),
+        "assignee": task.get("assignee"),
+        "block_kind": task.get("block_kind"),
+        "consecutive_failures": int(task.get("consecutive_failures") or 0),
+        "run_id": None if run is None else run.get("id"),
+        "run_status": None if run is None else run.get("status"),
+        "lease": lease,
+        "created_at": task.get("created_at"),
+        "started_at": task.get("started_at"),
+        "completed_at": task.get("completed_at"),
     }
 
 
-def _journal_health(
-    home: Path, boards: list[dict[str, Any]], skipped: Optional[list[str]] = None
-) -> dict[str, Any]:
-    """`{events, deals, drift: {empty_journal}}` — сколько журнал знает и чего не догнал.
-
-    `drift.empty_journal` — активные дела kanban без единого события в журнале:
-    именно им состояние считается по kanban (правило 7 контракта), и пока ingest
-    их не подобрал, число больше нуля.
-
-    Непрочитанное не выдаётся за «расхождений нет»: доска, которую не удалось
-    прочитать (или у которой нет `tasks`), в `active` не попадает, поэтому её
-    дела не считаются ни в одну сторону — и это названо в `note`. Поле `note`
-    появляется только тогда, когда сказать есть что; при полностью читаемых
-    источниках ответ — ровно три ключа контракта.
-    """
-    active: set[str] = set()
-    unread: list[str] = list(skipped or [])
-    for entry in boards:
-        rows, err = _query_checked(
-            Path(entry["path"]),
-            "SELECT id FROM tasks WHERE status NOT IN (?, ?)",
-            TERMINAL_STATUSES,
+def _cards_of(name: str, database: Path, now: int) -> dict[str, Any]:
+    """Карточки одной kanban-БД: активные плюс лизинг их ранов."""
+    out: dict[str, Any] = {"name": name, "path": str(database), "read": True, "cards": []}
+    if database.stat().st_size == 0:
+        out.update({"read": False, "note": "empty db"})
+        return out
+    with closing(_connect_ro(database)) as conn:
+        tasks, err = _fetch(
+            conn,
+            "SELECT id, title, assignee, status, block_kind, consecutive_failures, "
+            "current_run_id, created_at, started_at, completed_at FROM tasks "
+            "WHERE status NOT IN (?, ?) ORDER BY created_at, id LIMIT ?",
+            (TERMINAL_STATUSES[0], TERMINAL_STATUSES[1], CARD_LIMIT),
         )
         if err:
-            unread.append(f"{entry.get('slug')}: {err}")
-            continue
-        active.update(str(row.get("id")) for row in rows)
+            out.update({"read": False, "note": err})
+            return out
+        cards = [str(task.get("id")) for task in tasks]
+        runs: dict[str, dict[str, Any]] = {}
+        if cards:
+            marks = ", ".join("?" * len(cards))
+            rows, err = _fetch(
+                conn,
+                f"SELECT * FROM task_runs WHERE task_id IN ({marks}) ORDER BY started_at, id",
+                tuple(cards),
+            )
+            if err:
+                out["warnings"] = [f"task_runs: {err}"]
+            for row in rows:
+                task_id = str(row.get("task_id"))
+                # Лизинг — у идущего рана; иначе самый свежий, чтобы наблюдение
+                # показало, чем карточка кончилась в последний раз.
+                if row.get("status") == "running" or task_id not in runs:
+                    runs[task_id] = row
+    out["cards"] = [_card_row(task, runs.get(str(task.get("id"))), now) for task in tasks]
+    out["truncated"] = len(tasks) >= CARD_LIMIT
+    return out
 
-    notes = [f"boards unreadable: {'; '.join(unread)}"] if unread else []
-    totals = {"events": 0, "deals": 0}
-    known: set[str] = set()
+
+@router.get("/cards")
+def cards() -> dict[str, Any]:
+    """Наблюдение за карточками kanban: статусы, лизинг, последний ран.
+
+    Отдельный ответ и отдельный маршрут — потому что это **не дела**. Ни `/now`,
+    ни `/stats`, ни адресация по id сюда не ходят: с 0.0.6 доск в duty нет, а
+    карточка kanban не может быть адресом дела (`d_<hex>`).
+    """
+    home = _hermes_home()
+    now = _now_sec()
+    found = [_cards_of(name, database, now) for name, database in _card_databases(home)]
+    return {
+        "now": now,
+        "kind": "observation",
+        "label": CARDS_LABEL,
+        "databases": len(found),
+        "count": sum(len(entry.get("cards") or []) for entry in found),
+        "cards": found,
+    }
+
+
+@router.get("/health")
+def health() -> dict[str, Any]:
+    """Живая проверка: плагин смонтирован, store и пул читаются на чтение.
+
+    `journal` — состояние своего журнала: `events` (строк) и `deals` (дел с
+    событиями). Расхождения «канбан против журнала» здесь больше нет (0.0.6):
+    карточки kanban — отдельное наблюдение (`/cards`), и считать их делами
+    значило бы вернуть доски через чёрный ход. `/health` файлов не создаёт и не
+    пишет: нет журнала — значит событий 0, и это правда.
+    """
+    home = _hermes_home()
+    journal_block: dict[str, Any] = {"events": 0, "deals": 0}
+    notes: list[str] = []
     try:
         conn = _open_journal_ro(home)
     except Exception as exc:  # noqa: BLE001 - свой журнал не открылся
@@ -527,17 +510,19 @@ def _journal_health(
         notes.append(f"journal unreadable: {type(exc).__name__}: {exc}")
     if conn is not None:
         try:
-            totals = journal.counts(conn)
-            known = journal.deal_ids(conn)
+            journal_block.update(journal.counts(conn))
         except Exception as exc:  # noqa: BLE001 - битый журнал
             notes.append(f"journal unreadable: {type(exc).__name__}: {exc}")
         finally:
             conn.close()
-
     answer: dict[str, Any] = {
-        "events": totals["events"],
-        "deals": totals["deals"],
-        "drift": {"empty_journal": len(active - known)},
+        "ok": True,
+        "version": VERSION,
+        "hermes_home": str(home),
+        "store": journal.journal_path(home).is_file(),
+        "pool": {"present": (home / "messaging" / "pool.db").is_file()},
+        "journal": journal_block,
+        "mode": "read-only",
     }
     if notes:
         answer["note"] = "; ".join(notes)
@@ -546,37 +531,68 @@ def _journal_health(
 
 @router.get("/sources")
 def sources() -> dict[str, Any]:
-    """Что плагин видит: доски, пул, профили. Ничего не меняет."""
+    """Что плагин видит: store дел, репозитории дел, пул, профили. Ничего не меняет."""
     home = _hermes_home()
     profiles_dir = home / "profiles"
-    profiles = sorted(
-        p.name for p in profiles_dir.iterdir() if p.is_dir() and (p / "state.db").is_file()
-    ) if profiles_dir.is_dir() else []
+    profiles = (
+        sorted(
+            p.name for p in profiles_dir.iterdir() if p.is_dir() and (p / "state.db").is_file()
+        )
+        if profiles_dir.is_dir()
+        else []
+    )
     return {
         "version": VERSION,
         "hermes_home": str(home),
-        "boards": [_board_summary(b) for b in _discover_boards(home)],
-        "archived": _discover_archived(home),
+        "store": {
+            "path": str(journal.journal_path(home)),
+            "present": journal.journal_path(home).is_file(),
+        },
+        "repos": _repos_of(home),
         "pool": _pool_summary(home),
         "profiles": profiles,
+        # Наблюдение за карточками kanban — отдельный источник, и он назван здесь
+        # так, чтобы его нельзя было спутать с делами.
+        "cards": {
+            "label": CARDS_LABEL,
+            "databases": len(_card_databases(home)),
+        },
     }
 
 
-@router.get("/board/{slug}/tasks")
-def board_tasks(slug: str) -> dict[str, Any]:
-    """Сырой срез карточек доски для будущего экрана «сейчас» (read-only)."""
-    home = _hermes_home()
-    match = [b for b in _discover_boards(home) if b["slug"] == slug]
-    if not match:
-        raise HTTPException(status_code=404, headers=NO_STORE_HEADERS, detail=f"board '{slug}' not found")
-    path = Path(match[0]["path"])
-    rows = _query(
-        path,
-        "SELECT id, title, assignee, status, block_kind, consecutive_failures, "
-        "worker_pid, current_run_id, created_at, started_at, completed_at "
-        "FROM tasks WHERE status NOT IN ('done','archived') ORDER BY created_at DESC LIMIT 200",
-    )
-    return {"slug": slug, "path": str(path), "count": len(rows), "tasks": rows}
+def _repos_of(home: Path) -> dict[str, Any]:
+    """Репозитории дел: уникальные непустые `repo` строк store плюс дела без repo.
+
+    Один источник на `/now`, `/stats` и `bin/duty` (через ответ роута): второй
+    копии этой группировки быть не должно, иначе терминал и экран показывали бы
+    разные числа.
+    """
+    try:
+        conn = deals.open_store(home, create=False, readonly=True)
+    except Exception:  # noqa: BLE001 - store не читается: скажет `/now` в errors
+        return {"list": [], "without_repo": 0, "read": False}
+    if conn is None or not deals.has_store(conn):
+        return {"list": [], "without_repo": 0, "read": True}
+    try:
+        rows = deals.deal_rows(conn, open_only=False)
+    except Exception:  # noqa: BLE001 - битый store
+        return {"list": [], "without_repo": 0, "read": False}
+    finally:
+        conn.close()
+    counts: dict[str, int] = {}
+    without = 0
+    for row in rows:
+        repo = row.get("repo")
+        if not repo:
+            without += 1
+            continue
+        counts[str(repo)] = counts.get(str(repo), 0) + 1
+    return {
+        "list": [{"repo": repo, "deals": counts[repo]} for repo in sorted(counts)],
+        "without_repo": without,
+        "read": True,
+    }
+
 
 
 # ------------------------------------------------------------- «сейчас» (P0b)
@@ -788,181 +804,13 @@ def _pool_context(
     errors: list[dict[str, str]] = []
     if pool_err:
         notes.append(f"пул вопросов недоступен ({pool_err})")
-        errors.append({"board": "messaging/pool.db", "reason": pool_err})
+        errors.append({"source": POOL_SOURCE, "reason": pool_err})
     if pool_truncated:
         reason = f"questions truncated: more than {QUESTION_LIMIT} live questions"
         notes.append(f"живых вопросов в пуле больше {QUESTION_LIMIT} (старые не вошли)")
-        errors.append({"board": "messaging/pool.db", "reason": reason})
+        errors.append({"source": POOL_SOURCE, "reason": reason})
     pool_note = f"{'; '.join(notes)} — факт wait_human не проверен" if notes else None
     return questions, pool_note, errors
-
-
-def _lease(task: dict[str, Any], run: Optional[dict[str, Any]], now: int) -> dict[str, Any]:
-    """Лизинг дела: `claim_lock`/`claim_expires` карточки, а если их нет — текущего рана."""
-    lock = task.get("claim_lock")
-    expires = task.get("claim_expires")
-    if expires is None and run is not None:
-        lock = lock or run.get("claim_lock")
-        expires = run.get("claim_expires")
-    if expires is None:
-        state = "none" if not lock else "unknown"
-        return {"claim_lock": lock, "expires_at": None, "expires_in_sec": None, "state": state}
-    state = "expired" if int(expires) <= now else "live"
-    return {
-        "claim_lock": lock,
-        "expires_at": int(expires),
-        "expires_in_sec": int(expires) - now,
-        "state": state,
-    }
-
-
-def _attempt(task: dict[str, Any], run: Optional[dict[str, Any]], now: int) -> Optional[dict[str, Any]]:
-    """Текущая попытка дела: живой ран (или ран, на который указывает `current_run_id`).
-
-    Пид, старт и heartbeat берутся из записи рана, а карточка — только запасной
-    источник для старых БД, где `task_runs` скудный. Добор из карточки виден в
-    поле `source`: `run`, если все три факта из рана, иначе `task` — тогда часть
-    фактов попытки на самом деле карточные, и это не скрыто.
-    """
-    if run is None:
-        return None
-    pid = run.get("worker_pid")
-    start = run.get("started_at")
-    heartbeat = run.get("last_heartbeat_at")
-    source = "run"
-    if pid is None:
-        pid = task.get("worker_pid")
-        source = "task"
-    if start is None:
-        start = task.get("started_at")
-        source = "task"
-    if heartbeat is None:
-        heartbeat = task.get("last_heartbeat_at")
-        source = "task"
-    return {
-        "run_id": run.get("id"),
-        "source": source,
-        "start": None if start is None else int(start),
-        "age_sec": _age_sec(start, now),
-        "pid": None if not pid else int(pid),
-        "pid_alive": _pid_alive(pid),
-        "heartbeat_age_sec": _age_sec(heartbeat, now),
-        "run_status": run.get("status"),
-    }
-
-
-def _waiting(
-    task: dict[str, Any],
-    attempt: Optional[dict[str, Any]],
-    lease: dict[str, Any],
-    last_run: Optional[dict[str, Any]],
-    parents: list[tuple[str, str]],
-    slot_holder: Optional[str],
-    question: Optional[dict[str, Any]],
-    block_reason: str,
-    pool_note: Optional[str],
-) -> dict[str, str]:
-    """Состояние ожидания дела по набору фактов: `{"state", "evidence"}`.
-
-    Каждое правило, которое сработало, кладёт свой факт в `facts`; состояние —
-    первое по `WAITING_PRIORITY`, а все сработавшие факты уходят в `evidence`.
-    """
-    status = str(task.get("status") or "")
-    facts: dict[str, str] = {}
-    # Факты одного рана: статус, pid и heartbeat берутся из одной попытки
-    # (`attempt`), иначе старый `running` склеивается со стартовавшим новым раном
-    # и `dead_lease` не срабатывает. `last_run` нужен только для исхода последнего
-    # рана — и в тексте факта он назван явно.
-    attempt = attempt or {}
-    run_status = attempt.get("run_status")
-    run_id = attempt.get("run_id")
-    pid_alive = attempt.get("pid_alive")
-    heartbeat_age = attempt.get("heartbeat_age_sec")
-    pid = attempt.get("pid")
-    last_status = (last_run or {}).get("status")
-
-    # 1. Живой вопрос человеку в пуле.
-    if question is not None:
-        facts["wait_human"] = (
-            f"в пуле вопрос #{question.get('id')} status='{question.get('status')}' "
-            f"origin='{question.get('origin')}'"
-        )
-
-    # 2. Блок, который просит доступ или права.
-    block_kind = str(task.get("block_kind") or "")
-    if status == "blocked" and (
-        block_kind == "capability" or any(word in block_reason.lower() for word in CAPABILITY_WORDS)
-    ):
-        facts["capability"] = (
-            f"status=blocked, block_kind={block_kind or '—'}: {(block_reason or 'причина не записана')[:160]}"
-        )
-
-    # 3. Протухший лизинг. Мёртвый pid при уже завершённом ране — не dead_lease:
-    #    это либо crashed, либо нормальное завершение (проверяется ниже).
-    hung_run = run_status == "running" and pid_alive is False
-    last_running = last_run is None or last_status == "running"
-    expired_claim = lease["state"] == "expired" and last_running
-    if hung_run:
-        facts["dead_lease"] = (
-            f"ран {run_id} в статусе running, а pid {pid} мёртв "
-            f"(лизинг {lease['state']})"
-        )
-    elif expired_claim:
-        facts["dead_lease"] = (
-            f"лизинг истёк {-lease['expires_in_sec']}с назад ({lease['claim_lock'] or '—'}), "
-            f"ран {last_status or '—'}"
-        )
-
-    # 4. Падение: счётчик отказов, кривой исход последнего рана или зависший ран
-    #    (pid жив, а heartbeat молчит дольше порога — диспетчер такое снимает).
-    crash_bits: list[str] = []
-    failures = int(task.get("consecutive_failures") or 0)
-    if failures > 0:
-        crash_bits.append(f"consecutive_failures={failures}")
-    last_outcome = (last_run or {}).get("outcome")
-    if last_outcome in CRASH_OUTCOMES:
-        crash_bits.append(f"последний ран {(last_run or {}).get('id')}: outcome={last_outcome}")
-    stale_heartbeat = (heartbeat_age or 0) > HEARTBEAT_FRESH_SEC
-    if run_status == "running" and pid_alive is not False and stale_heartbeat:
-        crash_bits.append(
-            f"ран {run_id} running, {_pid_text(pid, pid_alive)}, heartbeat {heartbeat_age}с назад"
-        )
-    if crash_bits:
-        facts["crashed"] = "; ".join(crash_bits)
-
-    # 5. Живая работа: ран идёт, pid не мёртв, heartbeat свежий. Факт про pid
-    #    называет ровно то, что известно: жив / состояние неизвестно (`os.kill`
-    #    вернул прочий OSError) / не записан — формулировка одна на обе ветки.
-    fresh_heartbeat = heartbeat_age is not None and heartbeat_age <= HEARTBEAT_FRESH_SEC
-    if run_status == "running" and pid_alive is not False and fresh_heartbeat:
-        facts["working"] = (
-            f"ран {run_id} running, {_pid_text(pid, pid_alive)}, heartbeat {heartbeat_age}с назад"
-        )
-
-    # 6. Очередь на занятый профиль.
-    if status == "ready" and slot_holder:
-        facts["wait_slot"] = (
-            f"status=ready, профиль {task.get('assignee') or '—'} занят делом {slot_holder} (running)"
-        )
-
-    # 7. Гейт по незавершённому родителю.
-    if status in GATE_STATUSES and parents:
-        gate_list = ", ".join(f"{pid_} ({st})" for pid_, st in parents)
-        facts["wait_gate"] = f"незавершённые родители: {gate_list}"
-
-    state = next((name for name in WAITING_PRIORITY if name in facts), None)
-    if state is None:
-        state, reason = WAITING_FALLBACK.get(status, ("wait_slot", f"status={status or '—'}: нет живых фактов"))
-        facts[state] = reason
-
-    winner = facts[state]
-    others = [f"{name}: {text}" for name, text in facts.items() if name != state]
-    order = {name: i for i, name in enumerate(WAITING_PRIORITY)}
-    others.sort(key=lambda line: order.get(line.split(":", 1)[0], len(order)))
-    evidence = winner if not others else f"{winner}; ещё: " + "; ".join(others)
-    if pool_note and state == "wait_human" and question is None:
-        evidence = f"{evidence}; {pool_note}"
-    return {"state": state, "evidence": evidence}
 
 
 # --------------------------------------------------- журнал событий (0.0.3)
@@ -980,86 +828,40 @@ JOURNAL_SOURCE = journal.JOURNAL_SOURCE
 
 
 def _journal_context(
-    home: Path, boards: list[dict[str, Any]], *, ingest: bool = False
+    home: Path,
 ) -> tuple[dict[str, list[dict[str, Any]]], Optional[str], list[dict[str, str]]]:
-    """События журнала по делам; при `ingest` — сначала проход ingest.
+    """События журнала по делам: `(по делам, пометка, ошибки)`.
 
     Читающие роуты журнал не пишут и файла не создают (`create=False`): иначе
     «открыл экран» и «включил журнал» стали бы одним действием, а срез отвечал бы
     за запись. Недоступный журнал не валит ответ: причина уходит в `errors`, а
-    состояние дел считается по kanban с пометкой в `evidence`.
+    состояния дел тогда нет — и это сказано в пометке, а не выдано за «дел нет».
 
-    Без `ingest` соединение открывается строго на чтение (`?mode=ro`): журнал
-    живёт в WAL, и обычное соединение при закрытии вправе сделать checkpoint —
-    тогда «посмотрел срез» меняло бы файл, хотя ни одного события не записано.
+    Соединение открывается строго на чтение (`?mode=ro`): журнал живёт в WAL, и
+    обычное соединение при закрытии вправе сделать checkpoint — тогда «посмотрел
+    срез» меняло бы файл, хотя ни одного события не записано.
     """
     try:
-        conn = journal.open_journal(home, create=ingest) if ingest else _open_journal_ro(home)
+        conn = _open_journal_ro(home)
     except Exception as exc:  # noqa: BLE001 - свой журнал не открылся
         reason = f"{type(exc).__name__}: {exc}"
-        return {}, f"journal: недоступен ({reason}) — состояние из kanban", [
-            {"board": JOURNAL_SOURCE, "reason": reason}
+        return {}, f"journal: недоступен ({reason})", [
+            {"source": JOURNAL_SOURCE, "reason": reason}
         ]
     if conn is None:  # журнала ещё нет — это пустой журнал, а не ошибка
         return {}, None, []
-    errors: list[dict[str, str]] = []
     try:
-        if ingest:
-            report = journal.ingest(conn, home, boards)
-            errors.extend(report.get("errors") or [])
-            # В том же проходе журнал узнаёт ответы пула: вопрос, на который уже
-            # ответили, обязан перестать быть живым фактом ожидания.
-            answers = ask.sync_answers(conn, home)
-            for error in answers.get("errors") or []:
-                if error not in errors:
-                    errors.append(error)
         by_deal: dict[str, list[dict[str, Any]]] = {}
         for event in journal.read_events(conn):
             by_deal.setdefault(str(event["deal_id"]), []).append(event)
-        return by_deal, None, errors
+        return by_deal, None, []
     except Exception as exc:  # noqa: BLE001 - битый/занятый журнал
         reason = f"{type(exc).__name__}: {exc}"
-        return {}, f"journal: недоступен ({reason}) — состояние из kanban", [
-            {"board": JOURNAL_SOURCE, "reason": reason}
+        return {}, f"journal: недоступен ({reason})", [
+            {"source": JOURNAL_SOURCE, "reason": reason}
         ]
     finally:
         conn.close()
-
-
-def _deal_waiting(
-    folded: dict[str, Any],
-    kanban_waiting: dict[str, str],
-    question: Optional[dict[str, Any]],
-    journal_note: Optional[str],
-    *,
-    home: Optional[Path] = None,
-    deal_id: str = "",
-) -> dict[str, Any]:
-    """`waiting` дела: журнал первым, kanban — только с честной пометкой, откуда факт.
-
-    `human_kind` отделяет два разных «нужен человек»: `question` — ждёт ответа на
-    вопрос, `status` — ждёт решения по статусу (блок, разбор, ревью, мердж), а
-    `decision` — ответ по запаркованному делу уже получен, и человеку осталось
-    выбрать `continue|stop` (`duty decide`). Это закрывает п.5 заметки 0.0.2, где
-    оба первых случая назывались «ждёт ответа».
-    """
-    if folded["state"] is not None:
-        return _journal_waiting(folded, question, home=home, deal_id=deal_id)
-    if journal_note:
-        head = journal_note
-    elif folded["reason"] == "empty":
-        head = "journal: empty — состояние из kanban"
-    else:
-        head = (
-            f"journal: нет живых фактов (последнее событие: {folded['last_kind'] or '—'}) "
-            f"— состояние из kanban"
-        )
-    state = kanban_waiting["state"]
-    return {
-        "state": state,
-        "evidence": f"{head}; {kanban_waiting['evidence']}",
-        "human_kind": "question" if question is not None else ("status" if state == "wait_human" else None),
-    }
 
 
 def _journal_waiting(
@@ -1165,212 +967,6 @@ def _decision_line(deal_id: str, question_id: Any, answer: Optional[str]) -> str
     return f"{said}; нужно решение: bin/duty decide {deal_id or '<id>'} continue|stop"
 
 
-def _board_deals(
-    entry: dict[str, Any],
-    now: int,
-    questions: dict[str, dict[str, Any]],
-    pool_note: Optional[str],
-    journal_events: dict[str, list[dict[str, Any]]],
-    journal_note: Optional[str] = None,
-    home: Optional[Path] = None,
-) -> dict[str, Any]:
-    """Активные дела одной доски с лизингом, попыткой, последним действием и ожиданием.
-
-    Провал чтения самой `tasks` роняет этот вызов: доска тогда попадает в
-    `errors` ответа (исключение не перехватывается здесь — его тип и текст важны
-    для причины). Провал вспомогательных таблиц (`task_runs`, `task_events`,
-    `task_links`) деградирует факты и уходит в `warnings` доски, а не в ошибку.
-
-    Дело, у которого последнее state-changing событие журнала — `completed`
-    (правило 2 контракта), в срез не попадает: журнал говорит, что дело закрыто.
-    Расхождение с kanban при этом не молчит — дело называется в `warnings` доски.
-    """
-    slug = str(entry["slug"])
-    path = Path(entry["path"])
-    if entry.get("note") == "empty db":
-        # 0-байтный файл sqlite откроет как пустую БД и скажет «no such table»;
-        # настоящую причину называем сами, чтобы она была видна в `errors`.
-        raise RuntimeError(f"empty db ({path}): 0 bytes")
-    warnings: list[str] = []
-    # Одно соединение на доску: все запросы среза идут по одному снимку (`BEGIN`),
-    # а не открывают новое соединение на каждый запрос.
-    with closing(_connect_ro(path)) as conn:
-        tasks, err = _fetch(
-            conn,
-            "SELECT * FROM tasks WHERE status NOT IN (?, ?) ORDER BY created_at, id LIMIT ?",
-            (TERMINAL_STATUSES[0], TERMINAL_STATUSES[1], DEAL_LIMIT),
-        )
-        if err:
-            raise RuntimeError(err)
-        deal_ids = [str(row.get("id")) for row in tasks]
-        marks = ", ".join("?" * len(deal_ids))
-
-        runs_by_task: dict[str, list[dict[str, Any]]] = {}
-        parents_of: dict[str, list[tuple[str, str]]] = {}
-        suspenders: dict[str, dict[str, Any]] = {}
-        block_reasons: dict[str, str] = {}
-        if deal_ids:
-            rows, err = _fetch(
-                conn,
-                f"SELECT * FROM task_runs WHERE task_id IN ({marks}) ORDER BY started_at, id",
-                tuple(deal_ids),
-            )
-            if err:
-                warnings.append(f"task_runs: {err}")
-            for row in rows:
-                runs_by_task.setdefault(str(row.get("task_id")), []).append(row)
-
-            # Незавершённый родитель — ровно то, чем гейтит ядро: родитель не в
-            # терминальном статусе (Edge-таблица `task_links`, колонки parent/child).
-            # Связи ограничены делами среза: без `child_id IN (...)` join тянет всю доску.
-            rows, err = _fetch(
-                conn,
-                f"SELECT l.child_id, p.id AS parent_id, p.status AS parent_status "
-                f"FROM task_links l JOIN tasks p ON p.id = l.parent_id "
-                f"WHERE l.child_id IN ({marks}) AND p.status NOT IN (?, ?) "
-                f"ORDER BY l.child_id, p.id",
-                tuple(deal_ids) + TERMINAL_STATUSES,
-            )
-            if err:
-                warnings.append(f"task_links: {err}")
-            for row in rows:
-                parents_of.setdefault(str(row.get("child_id")), []).append(
-                    (str(row.get("parent_id")), str(row.get("parent_status")))
-                )
-
-            # Последнее действие: самое свежее событие, а heartbeat — только если
-            # других событий у дела нет (иначе экран показывает шум).
-            latest_action_sql = (
-                f"SELECT * FROM task_events WHERE id IN (SELECT MAX(id) FROM task_events "
-                f"WHERE task_id IN ({marks}) AND kind != 'heartbeat' GROUP BY task_id)"
-            )
-            latest_any_sql = (
-                f"SELECT * FROM task_events WHERE id IN (SELECT MAX(id) FROM task_events "
-                f"WHERE task_id IN ({marks}) GROUP BY task_id)"
-            )
-            for sql in (latest_action_sql, latest_any_sql):
-                rows, err = _fetch(conn, sql, tuple(deal_ids))
-                if err:
-                    warnings.append(f"task_events: {err}")
-                    break
-                for row in rows:
-                    suspenders.setdefault(str(row.get("task_id")), row)
-
-            rows, err = _fetch(
-                conn,
-                f"SELECT * FROM task_events WHERE id IN (SELECT MAX(id) FROM task_events "
-                f"WHERE task_id IN ({marks}) AND kind = 'blocked' GROUP BY task_id)",
-                tuple(deal_ids),
-            )
-            if err:
-                warnings.append(f"task_events(blocked): {err}")
-            for row in rows:
-                reason = _payload_summary(row.get("payload")) or ""
-                block_reasons[str(row.get("task_id"))] = reason
-
-    slots: dict[str, str] = {}
-    for row in tasks:
-        if str(row.get("status")) == "running":
-            slots.setdefault(str(row.get("assignee") or ""), str(row.get("id")))
-
-    deals: list[dict[str, Any]] = []
-    closed: list[str] = []
-    for task in tasks:
-        task_id = str(task.get("id"))
-        runs = runs_by_task.get(task_id, [])
-        current_run_id = task.get("current_run_id")
-        run = next((r for r in reversed(runs) if r.get("status") == "running"), None)
-        if run is None and current_run_id is not None:
-            run = next((r for r in runs if r.get("id") == current_run_id), None)
-        last_run = runs[-1] if runs else None
-        attempt = _attempt(task, run, now)
-        lease = _lease(task, run, now)
-        event = suspenders.get(task_id)
-        assignee = task.get("assignee")
-        slot_holder = slots.get(str(assignee or ""))
-        question = questions.get(task_id)
-        folded = journal.fold(journal_events.get(task_id, []), now=now)
-        if not folded["active"]:
-            # Правило 2: журнал говорит, что дело закрыто. В срез оно не идёт, но и
-            # не исчезает молча — расхождение с kanban названо в warnings доски.
-            closed.append(
-                f"дело {task_id}: в журнале completed, а kanban status={task.get('status')} — "
-                f"в срез не попало (правило 2 fold)"
-            )
-            continue
-        waiting = _deal_waiting(
-            folded,
-            _waiting(
-                task,
-                attempt,
-                lease,
-                last_run,
-                parents_of.get(task_id, []),
-                None if slot_holder == task_id else slot_holder,
-                question,
-                block_reasons.get(task_id, ""),
-                pool_note,
-            ),
-            question,
-            journal_note,
-            home=home,
-            deal_id=task_id,
-        )
-        deals.append(
-            {
-                "board": slug,
-                "id": task_id,
-                "title": task.get("title"),
-                "assignee": assignee,
-                "status": task.get("status"),
-                "priority": task.get("priority"),
-                "consecutive_failures": int(task.get("consecutive_failures") or 0),
-                "created_at": task.get("created_at"),
-                "workspace_kind": task.get("workspace_kind"),
-                "attempt": attempt,
-                "lease": lease,
-                "last_action": {
-                    "kind": None if event is None else event.get("kind"),
-                    "at": None if event is None else event.get("created_at"),
-                    "age_sec": None if event is None else _age_sec(event.get("created_at"), now),
-                    "summary": None if event is None else _payload_summary(event.get("payload")),
-                },
-                "last_run": None
-                if last_run is None
-                else {
-                    "run_id": last_run.get("id"),
-                    "status": last_run.get("status"),
-                    "outcome": last_run.get("outcome"),
-                    "started_at": last_run.get("started_at"),
-                    "ended_at": last_run.get("ended_at"),
-                },
-                # Этап и номер попытки — из журнала (`dashboard/stagefeed.py`):
-                # «что сейчас» видно без открытия дела. Вложенный объект, потому
-                # что поле `attempt` в этой же форме уже занято фактом рана
-                # kanban — одно имя не может значить две вещи.
-                "stage": stagefeed.current(journal_events.get(task_id, []), now),
-                # Расход против верхнего `budget` спеки, если она записана в
-                # журнале: у наблюдаемого дела спеки обычно нет — `null`.
-                "budget": budget.describe_events(journal_events.get(task_id, [])),
-                # Публикация по журналу (`dashboard/publish.py`): `null` — не
-                # публиковали, блок — факт, подтверждённый `git ls-remote`.
-                "published": publish.published_of(journal_events.get(task_id, [])),
-                "waiting": waiting,
-                "_age_sec": (attempt or {}).get("age_sec")
-                if attempt is not None
-                else _age_sec(task.get("created_at"), now),
-            }
-        )
-
-    return {
-        "slug": slug,
-        "path": str(path),
-        "deals": deals,
-        "warnings": warnings + closed,
-        "truncated": len(tasks) >= DEAL_LIMIT,
-    }
-
-
 # ------------------------------------------------------- свои дела (0.0.3, W5)
 #
 # Владение делом (`docs/OWNERSHIP.md`): свой store (`dashboard/deals.py`) живёт
@@ -1383,6 +979,9 @@ def _board_deals(
 # Имя источника в `errors[]` для своих дел — путь журнала: store живёт в том же
 # файле, и вторая строка «duty.db (дела)» только путала бы.
 DEALS_SOURCE = journal.JOURNAL_SOURCE
+# Пул вопросов — отдельный источник: его сбой не делает дела нечитаемыми, и
+# `errors[]` называет именно тот файл, который не открылся.
+POOL_SOURCE = "messaging/pool.db"
 
 # Остаточная ветка для своего дела: живого факта в журнале нет, а kanban тут ни
 # при чём — своего дела в kanban нет, и «состояние из kanban» было бы выдумкой.
@@ -1566,10 +1165,10 @@ def _own_shaped(
     home: Optional[Path] = None,
     leases: Optional[dict[tuple[str, int], int]] = None,
 ) -> dict[str, Any]:
-    """Дело своего store в той же форме, что дело kanban в `/now`.
+    """Дело store в той же форме, в какой его читают поверхности.
 
     Пустые факты названы пустыми, а не выброшены: `last_run`/`priority`/
-    `workspace_kind` у своего дела нет вовсе, и это видно полем, а не отсутствием
+    `workspace_kind` у дела нет вовсе, и это видно полем, а не отсутствием
     ключа — иначе экран не отличил бы «нечего показывать» от «не посчитали».
     Попытка и лизинг — наоборот, читаются из журнала и store (`_own_attempt_facts`):
     движок спавнит попытки и держит лизинг, и постоянные `null`/`none` на этом
@@ -1579,7 +1178,7 @@ def _own_shaped(
     folded = journal.fold(events, now=now)
     attempt, lease, attempts = _own_attempt_facts(events, leases or {}, now)
     return {
-        "board": str(row["board"]),
+        "repo": row.get("repo"),
         "id": str(row["id"]),
         "title": row.get("title"),
         "assignee": row.get("assignee"),
@@ -1638,25 +1237,24 @@ def _own_deals(
     pool_note: Optional[str],
     journal_events: dict[str, list[dict[str, Any]]],
     journal_note: Optional[str],
-    board: Optional[str] = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    """Активные свои дела для среза «сейчас»: `(дела, ошибки)`.
+    """Активные дела для среза «сейчас»: `(дела, ошибки)`.
 
-    Отсутствие store — не ошибка, а «своих дел ещё нет» (`create=False` файла не
+    Отсутствие store — не ошибка, а «дел ещё нет» (`create=False` файла не
     создаёт). Нечитаемый store или журнал — строка в `errors[]`: пустой список без
-    причины выглядел бы как «своих дел нет», а это разные факты.
+    причины выглядел бы как «дел нет», а это разные факты.
     """
     try:
         conn = deals.open_store(home, create=False, readonly=True)
     except Exception as exc:  # noqa: BLE001 - свой store не открылся
-        return [], [{"board": DEALS_SOURCE, "reason": f"{type(exc).__name__}: {exc}"}]
+        return [], [{"source": DEALS_SOURCE, "reason": f"{type(exc).__name__}: {exc}"}]
     if conn is None:
         return [], []
     try:
         if not deals.has_store(conn):
             return [], []
         out: list[dict[str, Any]] = []
-        for row in deals.deal_rows(conn, board=board, open_only=True):
+        for row in deals.deal_rows(conn, open_only=True):
             events = journal_events.get(str(row["id"]), [])
             folded = journal.fold(events, now=now)
             if not folded["active"]:
@@ -1675,7 +1273,7 @@ def _own_deals(
             )
         return out, []
     except Exception as exc:  # noqa: BLE001 - битый store/журнал
-        return [], [{"board": DEALS_SOURCE, "reason": f"store: {type(exc).__name__}: {exc}"}]
+        return [], [{"source": DEALS_SOURCE, "reason": f"store: {type(exc).__name__}: {exc}"}]
     finally:
         conn.close()
 
@@ -1702,7 +1300,6 @@ def _closed_block(fact: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
 def _deal_response(
     *,
     now: int,
-    board: str,
     deal_id: str,
     row: dict[str, Any],
     shaped: Optional[dict[str, Any]],
@@ -1717,20 +1314,21 @@ def _deal_response(
     budget_block: Optional[dict[str, Any]] = None,
     published_block: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    """Ответ «одно дело» — одна форма и для kanban-дела, и для своего.
+    """Ответ «одно дело»: одна форма для всех поверхностей.
 
-    Экран не должен знать, откуда дело: ключи одинаковые, различаются только
-    значения. У наблюдаемого дела нет наших комментариев и вложений — там пустые
-    списки, а не отсутствие полей, иначе клиент держал бы две ветки разбора.
+    Экран не должен собирать дело из разных ответов: ключи одинаковые у
+    `GET /deal/{deal_id}`, у мутации и у `bin/duty deal` — различаются значения.
+    Дела бывают только свои (0.0.6): наблюдаемых kanban-дел в этой форме нет,
+    карточки живут своим ответом `/cards` и сюда не подмешиваются.
+
+    `repo` — группировка дела (репозиторий из спеки), а не адрес: адрес дела —
+    его `id`. `null` здесь значит «репозиторий не назван», и это законное
+    состояние, а не «не посчитали».
 
     `stages` — лента этапов (`dashboard/stagefeed.py`): состояние графа и попытки
     из журнала. Пустой список без причины выглядел бы как «этапов нет», поэтому
     `stages_note` называет, почему лента пуста (нет спеки, спека не читается),
     а `spec` — какой граф прочитан.
-
-    `external_ref` — внешнее имя дела (`jira:RP-14080`), по которому его находят
-    повторно. У наблюдаемого kanban-дела его нет: имя ставит тот, кто заводит
-    дело в store (`docs/OWNERSHIP.md`, «Внешнее имя дела»).
 
     `closed` — факт закрытия (`journal.closed_fact`): причина и время, `null` —
     дело не закрывалось фактом журнала. Один ответ на вопрос «почему закрыто» для
@@ -1746,7 +1344,7 @@ def _deal_response(
     status = str(row.get("status") or "")
     return {
         "now": now,
-        "board": board,
+        "repo": row.get("repo"),
         "id": deal_id,
         "title": row.get("title"),
         "status": status,
@@ -1821,7 +1419,6 @@ def _own_response(
     feed = _stages_block(events, now, spec)
     return _deal_response(
         now=now,
-        board=str(row["board"]),
         deal_id=deal_id,
         row=row,
         shaped=shaped,
@@ -1840,96 +1437,37 @@ def _own_response(
 def collect_now(
     home: Path,
     now: int,
-    board: Optional[str] = None,
+    repo: Optional[str] = None,
     state: Optional[str] = None,
-    ingest: bool = False,
 ) -> dict[str, Any]:
-    """Срез «сейчас» по всем доскам: активные дела, отсортированные по таксономии.
+    """Срез «сейчас»: активные свои дела, отсортированные по таксономии.
+
+    Источник один — store дел (`duty/duty.db`). Карточек kanban в срезе нет
+    (0.0.6): доска была тем, чем карточка попадала в дела, и без неё это были бы
+    дела без адреса. Наблюдение за карточками живёт отдельно — `GET /cards`.
 
     Сортировка детерминирована: `waiting.state` по `WAITING_PRIORITY`, затем
     возраст текущей попытки по убыванию, затем `id` — иначе UI дёргается между
-    опросами. Доска, у которой не читается `tasks`, пропускается и попадает в
-    `errors`; ответ при этом остаётся 200.
+    опросами.
 
-    `waiting` считается fold'ом по журналу (правило 7 контракта — исключение:
-    дело без событий считается по kanban, и это сказано в `evidence`). `ingest`
-    запускает проход в свой журнал до сбора среза; без него срез ничего не пишет.
+    `repo` — фильтр группировки (`None` — все дела, включая дела без репозитория);
+    `repo=""` — ровно дела **без** репозитория. Пустая строка как значение фильтра
+    не выдумка: «без репозитория» — законная группа, и отличить её от «фильтра нет»
+    иначе нечем.
+
+    `waiting` считается fold'ом по журналу. Ошибка store не валит ответ — она в
+    `errors[]`: «дел нет» и «store не прочитался» — разные факты.
     """
-    boards = _discover_boards(home)
-    scope = [entry for entry in boards if board is None or entry["slug"] == board]
     questions, pool_note, pool_errors = _pool_context(home)
     errors: list[dict[str, str]] = list(pool_errors)
-    journal_events, journal_note, journal_errors = _journal_context(home, boards, ingest=ingest)
+    journal_events, journal_note, journal_errors = _journal_context(home)
     errors.extend(journal_errors)
-    # Свои дела (`docs/OWNERSHIP.md`) идут в тот же срез: экран отличает их только
-    # префиксом `d_`. Ошибка своего store не валит ответ — она в `errors[]`, как и
-    # ошибка доски: «своих дел нет» и «store не прочитался» — разные факты.
-    own_deals, own_errors = _own_deals(
-        home, now, questions, pool_note, journal_events, journal_note, board
+    items, own_errors = _own_deals(
+        home, now, questions, pool_note, journal_events, journal_note
     )
     errors.extend(own_errors)
-
-    boards_out: list[dict[str, Any]] = []
-    # Имя `deals` занято модулем своего store (`deals.store_path`), поэтому список
-    # дел среза называется `items`: иначе внутри функции модуль был бы затенён и
-    # `deals.store_path(...)` означал бы «метод списка».
-    items: list[dict[str, Any]] = []
-    for entry in scope:
-        try:
-            collected = _board_deals(entry, now, questions, pool_note, journal_events, journal_note, home)
-        except Exception as exc:  # noqa: BLE001 - любая ошибка доски не валит срез
-            # Тип исключения важен: `ValueError` из чужой схемы (`int('soon')` по
-            # `claim_expires`) иначе не отличить от сбоя БД. RuntimeError несёт
-            # готовую причину, у остальных префиксуем тип.
-            reason = str(exc) if isinstance(exc, RuntimeError) else f"{type(exc).__name__}: {exc}"
-            errors.append({"board": str(entry["slug"]), "reason": reason})
-            unread: dict[str, Any] = {
-                "slug": entry["slug"],
-                "path": str(entry["path"]),
-                "read": False,
-                "deals": 0,
-            }
-            if entry.get("note"):
-                unread["note"] = entry["note"]
-            boards_out.append(unread)
-            continue
-        boards_out.append(
-            {
-                "slug": collected["slug"],
-                "path": collected["path"],
-                "read": True,
-                "deals": len(collected["deals"]),
-                "truncated": collected["truncated"],
-                "warnings": collected["warnings"],
-            }
-        )
-        items.extend(collected["deals"])
-
-    # Свои дела вливаются в тот же список и в те же счётчики досок: иначе `/now`
-    # показывал бы два разных «сколько дел» — по срезу и по доскам.
-    items.extend(own_deals)
-    own_by_board: dict[str, int] = {}
-    for own in own_deals:
-        own_by_board[str(own["board"])] = own_by_board.get(str(own["board"]), 0) + 1
-    for slug, count in sorted(own_by_board.items()):
-        for entry in boards_out:
-            if entry["slug"] == slug:
-                entry["deals"] = int(entry.get("deals") or 0) + count
-                entry["own_deals"] = count
-                break
-        else:
-            # Доска есть только в своём store: kanban-доски с таким слагом нет.
-            # Это не «непрочитанная доска», поэтому `read: true` и путь store.
-            boards_out.append(
-                {
-                    "slug": slug,
-                    "path": str(deals.store_path(home)),
-                    "read": True,
-                    "deals": count,
-                    "own_deals": count,
-                    "note": "только свои дела: kanban-доски с таким слагом нет",
-                }
-            )
+    if repo is not None:
+        items = [deal for deal in items if (deal.get("repo") or "") == repo]
 
     order = {name: i for i, name in enumerate(WAITING_PRIORITY)}
     items.sort(
@@ -1950,9 +1488,12 @@ def collect_now(
         "now": now,
         "count": len(items),
         "deals": items,
+        # Группировка вместо списка досок: уникальные непустые `repo` дел плюс
+        # число дел без репозитория. Считается по всему store, а не по срезу, —
+        # это состав списка, а не его текущая страница.
+        "repos": _repos_of(home),
         "by_state": by_state,
         "crash_outcomes": list(CRASH_OUTCOMES),
-        "boards": boards_out,
         "errors": errors,
     }
 
@@ -1994,101 +1535,73 @@ def _waiting_distribution(values: list[int]) -> dict[str, Any]:
     return shaped
 
 
-def _stats_board(entry: dict[str, Any], *, since: Optional[int] = None) -> dict[str, Any]:
-    """Метрики одной доски: первая попытка, ожидание до неё, исходы ранов.
+def _repo_metrics(
+    name: str,
+    rows: list[dict[str, Any]],
+    journal_events: dict[str, list[dict[str, Any]]],
+    now: int,
+    leases: dict[str, dict[tuple[str, int], int]],
+) -> dict[str, Any]:
+    """Здоровье одной группы-репозитория: по журналу её дел, не по карточкам.
 
-    Провал чтения `tasks` роняет вызов (доска уходит в `errors`), провал
-    `task_runs` — только в `warnings`: доля попыток тогда не считается, и это
-    видно как `first_try.with_runs = 0`, а не как «всё с первой попытки».
+    Метрики — про **дела движка**, и считаются ровно по тем фактам, которые он
+    пишет сам: этап (`deal_id` + `stage`) с первой попытки, исходы попыток и
+    ожидание до первой попытки этапа. Ни одно число здесь не выводится из
+    `kanban.db`: карточки — наблюдение (`/cards`), и их «раны» не дела.
 
-    `since` — нижняя граница окна по `tasks.created_at` (unix-секунды). Фильтр
-    живёт здесь, а не в CLI: распределение и доля считаются по тому же проходу,
-    иначе терминал показывал бы числа, которых не считает ни один роут. Задачи
-    без `created_at` в окно не попадают — их нечем датировать, — и это названо
-    в `warnings`, а не спрятано.
+    `first_try.share` — `null` при нулевом знаменателе, а не «100%» и не «0%»:
+    доля без случаев не считается. `waiting_sec` — распределение по делам, у
+    которых первая попытка этапа началась: «ждали 0 секунд» и «ждать было нечему»
+    разные факты, поэтому пустая выборка даёт `null`, а не нули.
     """
-    slug = str(entry["slug"])
-    path = Path(entry["path"])
-    if entry.get("note") == "empty db":
-        raise RuntimeError(f"empty db ({path}): 0 bytes")
-    warnings: list[str] = []
-    with closing(_connect_ro(path)) as conn:
-        # Лимит проверяется лишней строкой: ровно `STATS_TASK_LIMIT` задач не
-        # должны помечаться обрезанными.
-        tasks, err = _fetch(
-            conn,
-            "SELECT id, status, created_at FROM tasks "
-            "WHERE (? IS NULL OR (created_at IS NOT NULL AND created_at >= ?)) "
-            "ORDER BY created_at, id LIMIT ?",
-            (since, since, STATS_TASK_LIMIT + 1),
-        )
-        if err:
-            raise RuntimeError(err)
-        if since is not None:
-            rows, err = _fetch(conn, "SELECT COUNT(*) AS n FROM tasks WHERE created_at IS NULL")
-            if err:
-                warnings.append(f"tasks(created_at): {err}")
-            elif rows and int(rows[0].get("n") or 0):
-                warnings.append(
-                    f"задач без created_at: {int(rows[0]['n'])} — в окно since не вошли, датировать нечем"
-                )
-        truncated = len(tasks) > STATS_TASK_LIMIT
-        tasks = tasks[:STATS_TASK_LIMIT]
-        task_ids = [str(task.get("id")) for task in tasks]
-        runs_by_task: dict[str, list[dict[str, Any]]] = {}
-        if task_ids:
-            marks = ", ".join("?" * len(task_ids))
-            rows, err = _fetch(
-                conn,
-                f"SELECT task_id, status, outcome, started_at FROM task_runs "
-                f"WHERE task_id IN ({marks}) ORDER BY started_at, id",
-                tuple(task_ids),
-            )
-            if err:
-                warnings.append(f"task_runs: {err}")
-            for row in rows:
-                runs_by_task.setdefault(str(row.get("task_id")), []).append(row)
-
     by_status: dict[str, int] = {}
     by_outcome: dict[str, int] = {}
     waits: list[int] = []
-    first_try_ok = 0
-    with_runs = 0
-    runs_total = 0
-    for task in tasks:
-        status = str(task.get("status") or "—")
+    attempts_total = 0
+    first_ok = 0
+    closed = 0
+    for row in rows:
+        status = str(row.get("status") or "—")
         by_status[status] = by_status.get(status, 0) + 1
-        runs = runs_by_task.get(str(task.get("id")), [])
-        if not runs:
-            continue
-        with_runs += 1
-        runs_total += len(runs)
-        for run in runs:
-            outcome = run.get("outcome")
-            key = str(outcome) if outcome else f"без исхода ({run.get('status') or '—'})"
+        deal_id = str(row["id"])
+        events = journal_events.get(deal_id, [])
+        attempts = stagefeed.attempts(events, now, leases=leases.get(deal_id, {}))
+        attempts_total += len(attempts)
+        stages: dict[str, list[dict[str, Any]]] = {}
+        for attempt in attempts:
+            stages.setdefault(str(attempt.get("stage") or ""), []).append(attempt)
+            outcome = attempt.get("outcome")
+            key = str(outcome) if outcome else f"без исхода ({attempt.get('status') or '—'})"
             by_outcome[key] = by_outcome.get(key, 0) + 1
-        first = runs[0]
-        if str(first.get("outcome") or "") in SUCCESS_OUTCOMES:
-            first_try_ok += 1
-        created = task.get("created_at")
-        started = first.get("started_at")
+        for stage_attempts in stages.values():
+            finished = [item for item in stage_attempts if item.get("finished_at") is not None]
+            if not finished:
+                continue
+            closed += 1
+            # «С первой попытки» — этап закрыт с первой же попытки и успешно.
+            if len(stage_attempts) == 1 and str(finished[0].get("outcome") or "") in SUCCESS_OUTCOMES:
+                first_ok += 1
+        created = row.get("created_at")
+        started = next(
+            (
+                int(attempt["started_at"])
+                for attempt in attempts
+                if attempt.get("started_at") is not None
+            ),
+            None,
+        )
         if created is not None and started is not None:
-            waits.append(max(0, int(started) - int(created)))
-
+            waits.append(max(0, started - int(created)))
     return {
-        "slug": slug,
-        "path": str(path),
-        "read": True,
-        "truncated": truncated,
-        "warnings": warnings,
-        "tasks_total": len(tasks),
-        "tasks_by_status": by_status,
-        "runs_total": runs_total,
-        "runs_by_outcome": by_outcome,
+        "repo": name,
+        "deals": len(rows),
+        "deals_by_status": by_status,
+        "attempts_total": attempts_total,
+        "attempts_by_outcome": by_outcome,
         "first_try": {
-            "ok": first_try_ok,
-            "with_runs": with_runs,
-            "share": (first_try_ok / with_runs) if with_runs else None,
+            "ok": first_ok,
+            "closed": closed,
+            "share": (first_ok / closed) if closed else None,
         },
         "waiting_sec": _waiting_distribution(waits),
         "_waits": waits,
@@ -2098,232 +1611,156 @@ def _stats_board(entry: dict[str, Any], *, since: Optional[int] = None) -> dict[
 def collect_stats(
     home: Path,
     now: int,
-    board: Optional[str] = None,
+    repo: Optional[str] = None,
     since: Optional[int] = None,
 ) -> dict[str, Any]:
-    """Здоровье живых досок: агрегат по ранам плюс итог по прочитанным.
+    """Здоровье дел по репозиториям: этапы с первой попытки, исходы, ожидание.
 
-    Распределение ожидания считается по объединённой выборке, а не как среднее
-    перцентилей досок: перцентиль перцентилей не равен перцентилю объединённой
-    выборки. Доска, у которой не читается `tasks`, попадает в `errors` и в итог
-    не входит — ответ остаётся 200.
+    Источник один — store дел и его журнал (`duty/duty.db`). Доски были тем,
+    чем считалась статистика до 0.0.6, — и вместе с ними ушёл чужой объект:
+    `runs_by_outcome` по `task_runs` kanban описывал карточки, а не дела. Группа
+    теперь одна — `repo` строки дела; дела без репозитория идут отдельной группой
+    (`without_repo`), и это не «ошибка данных», а законное состояние.
 
-    `board` и `since` — те же фильтры, что у `collect_now`: CLI не фильтрует
-    готовый агрегат (перцентиль подмножества не считается из перцентилей целого),
-    а просит ту же функцию посчитать по нужному окну. `boards[]` и `totals`
-    поэтому всегда согласованы между собой.
-
-    Обрезанный срез доски (`truncated`) остаётся флагом этой доски, но дополнительно
-    называется в `warnings[]` верхнего уровня: распределение по неполной выборке
-    нельзя выдавать за полное, а `totals.waiting_sec` читают в отрыве от `boards[]`.
+    Распределение ожидания считается по объединённой выборке группы, а не как
+    среднее: перцентиль перцентилей не равен перцентилю объединённой выборки.
+    `since` — нижняя граница окна по `deals.created_at`; нечитаемый store или
+    журнал попадает в `errors`, и ответ остаётся 200.
     """
-    boards: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
-    warnings: list[str] = []
-    waits: list[int] = []
-    by_status: dict[str, int] = {}
-    by_outcome: dict[str, int] = {}
-    tasks_total = 0
-    runs_total = 0
-    first_try_ok = 0
-    with_runs = 0
-    scope = [entry for entry in _discover_boards(home) if board is None or entry["slug"] == board]
-    for entry in scope:
+    journal_events, _, journal_errors = _journal_context(home)
+    errors.extend(journal_errors)
+    try:
+        conn = deals.open_store(home, create=False, readonly=True)
+    except Exception as exc:  # noqa: BLE001 - store не открылся
+        conn = None
+        errors.append({"source": DEALS_SOURCE, "reason": f"{type(exc).__name__}: {exc}"})
+    rows: list[dict[str, Any]] = []
+    leases: dict[str, dict[tuple[str, int], int]] = {}
+    if conn is not None:
         try:
-            collected = _stats_board(entry, since=since)
-        except Exception as exc:  # noqa: BLE001 - ошибка доски не валит ответ
-            reason = str(exc) if isinstance(exc, RuntimeError) else f"{type(exc).__name__}: {exc}"
-            errors.append({"board": str(entry["slug"]), "reason": reason})
-            unread: dict[str, Any] = {
-                "slug": entry["slug"],
-                "path": str(entry["path"]),
-                "read": False,
-                "tasks_total": 0,
-            }
-            if entry.get("note"):
-                unread["note"] = entry["note"]
-            boards.append(unread)
-            continue
-        waits.extend(collected.pop("_waits"))
-        tasks_total += collected["tasks_total"]
-        runs_total += collected["runs_total"]
-        first_try_ok += collected["first_try"]["ok"]
-        with_runs += collected["first_try"]["with_runs"]
-        for key, count in collected["tasks_by_status"].items():
-            by_status[key] = by_status.get(key, 0) + count
-        for key, count in collected["runs_by_outcome"].items():
-            by_outcome[key] = by_outcome.get(key, 0) + count
-        if collected["truncated"]:
-            warnings.append(
-                f"доска {collected['slug']}: срез обрезан лимитом {STATS_TASK_LIMIT} задач — "
-                f"распределение ожидания и доля первой попытки считаются по неполной выборке"
-            )
-        boards.append(collected)
+            if deals.has_store(conn):
+                rows = deals.deal_rows(conn, open_only=False)
+                if since is not None:
+                    rows = [row for row in rows if int(row.get("created_at") or 0) >= int(since)]
+                leases = {str(row["id"]): _own_leases(conn, str(row["id"])) for row in rows}
+        except Exception as exc:  # noqa: BLE001 - битый store/журнал
+            errors.append({"source": DEALS_SOURCE, "reason": f"store: {type(exc).__name__}: {exc}"})
+        finally:
+            conn.close()
 
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    without: list[dict[str, Any]] = []
+    for row in rows:
+        name = row.get("repo")
+        if name:
+            grouped.setdefault(str(name), []).append(row)
+        else:
+            without.append(row)
+
+    groups = [
+        _repo_metrics(name, grouped[name], journal_events, now, leases)
+        for name in sorted(grouped)
+    ]
+    empty = _repo_metrics("", [], journal_events, now, leases)
+    without_group = _repo_metrics("", without, journal_events, now, leases)
+    if repo is not None:
+        if repo == "":
+            groups = []
+        else:
+            groups = [group for group in groups if group["repo"] == repo]
+            without_group = empty
+            if not groups:
+                raise HTTPException(
+                    status_code=404,
+                    headers=NO_STORE_HEADERS,
+                    detail=f"repo '{repo}' не назван ни одним делом",
+                )
+    waits: list[int] = []
+    for group in groups + ([without_group] if without_group["deals"] else []):
+        waits.extend(group.pop("_waits"))
+    totals = _repo_metrics("", rows, journal_events, now, leases)
+    totals["waiting_sec"] = _waiting_distribution(waits)
+    totals.pop("_waits", None)
     return {
         "now": now,
-        "boards": boards,
+        "window": {"since": since, "sec": None if since is None else max(0, int(now) - int(since))},
+        "repos": groups,
+        "without_repo": without_group,
+        "totals": totals,
         "errors": errors,
-        "warnings": warnings,
-        "totals": {
-            "tasks_total": tasks_total,
-            "tasks_by_status": by_status,
-            "runs_total": runs_total,
-            "runs_by_outcome": by_outcome,
-            "first_try": {
-                "ok": first_try_ok,
-                "with_runs": with_runs,
-                "share": (first_try_ok / with_runs) if with_runs else None,
-            },
-            "waiting_sec": _waiting_distribution(waits),
-        },
+        "warnings": [],
         "success_outcomes": list(SUCCESS_OUTCOMES),
         "crash_outcomes": list(CRASH_OUTCOMES),
     }
 
 
 @router.get("/stats")
-def stats(board: Optional[str] = None, since: Optional[int] = None) -> dict[str, Any]:
-    """Здоровье: доля с первой попытки, распределение ожидания (p50/p90/p99), исходы.
+def stats(repo: Optional[str] = None, since: Optional[int] = None) -> dict[str, Any]:
+    """Здоровье дел по репозиториям: доля этапов с первой попытки, ожидание, исходы.
 
-    `?board=<slug>` — только одна доска (404, если её нет);
-    `?since=<unix>` — только дела, созданные не раньше этой секунды. Оба фильтра
+    `?repo=<путь>` — только один репозиторий (404, если его не назвало ни одно
+    дело); `?repo=` (пустая строка) — только дела **без** репозитория;
+    `?since=<unix>` — только дела, созданные не раньше этой секунды. Фильтры
     считает `collect_stats`, поэтому CLI и роут отдают одну и ту же форму и одни
-    и те же числа; без параметров ответ прежний.
+    и те же числа.
     """
-    home = _hermes_home()
-    if board is not None:
-        _board_entry(home, board)
-    return collect_stats(home, _now_sec(), board=board, since=since)
+    return collect_stats(_hermes_home(), _now_sec(), repo=repo, since=since)
 
 
-@router.get("/deal/{board}/{task_id}")
-def deal(board: str, task_id: str, spec: Optional[str] = None) -> dict[str, Any]:
+@router.get("/deal/{deal_id}")
+def deal(deal_id: str, spec: Optional[str] = None) -> dict[str, Any]:
     """Одно дело: спецификация плюс тот же факт-набор, что в `/now`.
 
-    Дело ищется по префиксу id: `d_<hex>` — своё (store), `t_<hex>` — наблюдаемое
-    (kanban). Форма ответа одна на оба: экран не должен знать, откуда дело, иначе
-    пришлось бы держать две ветки разбора одного и того же экрана.
+    Адрес дела — только его id `d_<hex>` (0.0.6). Карточка kanban (`t_<hex>`)
+    делом не бывает: доски, которая связывала их, больше нет, и попытка открыть
+    дело по карте — отказ словами, а не пустой экран.
 
     `deal` — `null` для закрытого дела (`done`/`archived`): состояний ожидания у
     него нет, и придумывать их нельзя. Таймлайн попыток живёт отдельно —
-    `GET /duty/{board}/{task_id}/attempts`. Лента этапов (`stages`) есть и у
-    закрытого дела: что было — факт, он не перестаёт быть им после закрытия.
+    `GET /duty/{deal_id}/attempts`. Лента этапов (`stages`) есть и у закрытого
+    дела: что было — факт, он не перестаёт быть им после закрытия.
 
     `?spec=<абсолютный путь>` — граф для ленты этапов, если в журнале спека не
     записана. Файл читается `load_spec()` (`yaml.safe_load`), не исполняется;
     процессов роут не открывает ни одного.
     """
     home = _hermes_home()
-    if deals.is_own(task_id):
-        return _own_deal(home, board, task_id, spec=spec)
-    entry = _board_entry(home, board)
-    rows, err = _query_checked(Path(entry["path"]), "SELECT * FROM tasks WHERE id = ?", (task_id,))
-    if err:
+    if not deals.is_own(deal_id) and deals.is_card(deal_id):
         raise HTTPException(
-            status_code=503, headers=NO_STORE_HEADERS, detail=f"board '{board}' unreadable: {err}"
-        )
-    if not rows:
-        raise HTTPException(
-            status_code=404,
+            status_code=400,
             headers=NO_STORE_HEADERS,
-            detail=f"task '{task_id}' not found on board '{board}'",
+            detail=(
+                f"'{deal_id}' — карточка kanban, а не дело: доск больше нет, дело "
+                "адресуется своим id d_<hex>; карточки смотри в /cards"
+            ),
         )
-    task = rows[0]
-    now = _now_sec()
-    journal_events, journal_note, _ = _journal_context(home, [])
-    events = journal_events.get(task_id, [])
-    shaped: Optional[dict[str, Any]] = None
-    if str(task.get("status") or "") not in TERMINAL_STATUSES:
-        questions, pool_note, _ = _pool_context(home)
-        collected = _board_deals(entry, now, questions, pool_note, journal_events, journal_note, home)
-        shaped = next((item for item in collected["deals"] if item["id"] == task_id), None)
-    feed = _stages_block(events, now, spec)
-    return _deal_response(
-        now=now,
-        board=board,
-        deal_id=task_id,
-        row=task,
-        shaped=shaped,
-        # Комментарии и вложения у наблюдаемого дела — не наши: store их не ведёт,
-        # и пустой список здесь означает «duty их не держит», а не «их нет».
-        comments=[],
-        attachments=[],
-        timeline=_timeline(events, now),
-        stages=feed["stages"],
-        stages_note=feed["note"],
-        spec=feed["spec"],
-        closed=journal.closed_fact(events),
-        budget_block=budget.describe_events(events),
-        published_block=publish.published_of(events),
-    )
+    return _own_deal(home, deal_id, spec=spec)
 
 
-def _resolve_deal(home: Path, board: str, deal_id: str) -> dict[str, Any]:
-    """Дело по id для роутов: своё (store) или kanban — по префиксу.
+def _resolve_deal(home: Path, deal_id: str) -> dict[str, Any]:
+    """Дело по id для роутов: строка store или 404 словами.
 
-    Одно место, где решается «где искать дело»: `d_` живёт в store, `t_` — на
-    доске kanban, и один id не ищется в двух правдах. Возвращает ровно те факты,
-    которых хватает вопросу и таймлайну (`id`, `board`, `status`, `title`, `own`);
-    404/503 бросаются здесь же, чтобы у всех роутов была одна формулировка отказа.
+    Одно место, где решается «это дело?»: `d_<hex>` живёт в store, а `t_<hex>`
+    делом не является вовсе (0.0.6). Возвращает ровно те факты, которых хватает
+    вопросу и таймлайну (`id`, `repo`, `status`, `title`); 404/503 бросаются
+    здесь же, чтобы у всех роутов была одна формулировка отказа.
     """
-    if deals.is_own(deal_id):
-        try:
-            conn = deals.open_store(home, create=False, readonly=True)
-        except Exception as exc:  # noqa: BLE001 - свой store не открылся
-            raise HTTPException(
-                status_code=503,
-                headers=NO_STORE_HEADERS,
-                detail=f"store unreadable: {type(exc).__name__}: {exc}",
-            ) from exc
-        if conn is None:
-            raise HTTPException(
-                status_code=404,
-                headers=NO_STORE_HEADERS,
-                detail=f"deal '{deal_id}' not found: своего store ещё нет",
-            )
-        try:
-            row = deals.deal_row(conn, deal_id) if deals.has_store(conn) else None
-        finally:
-            conn.close()
-        if row is None or str(row["board"]) != board:
-            raise HTTPException(
-                status_code=404,
-                headers=NO_STORE_HEADERS,
-                detail=f"deal '{deal_id}' not found on board '{board}'",
-            )
-        return {
-            "id": deal_id,
-            "board": board,
-            "status": str(row["status"]),
-            "title": row.get("title"),
-            "own": True,
-        }
-    entry = _board_entry(home, board)
-    rows, err = _query_checked(
-        Path(entry["path"]), "SELECT id, title, status FROM tasks WHERE id = ?", (deal_id,)
-    )
-    if err:
+    if deals.is_card(deal_id):
         raise HTTPException(
-            status_code=503, headers=NO_STORE_HEADERS, detail=f"board '{board}' unreadable: {err}"
-        )
-    if not rows:
-        raise HTTPException(
-            status_code=404,
+            status_code=400,
             headers=NO_STORE_HEADERS,
-            detail=f"task '{deal_id}' not found on board '{board}'",
+            detail=(
+                f"'{deal_id}' — карточка kanban, а не дело: дело адресуется своим id "
+                "d_<hex>; карточки смотри в /cards"
+            ),
         )
-    return {
-        "id": deal_id,
-        "board": board,
-        "status": str(rows[0].get("status") or ""),
-        "title": rows[0].get("title"),
-        "own": False,
-    }
-
-
-def _own_deal(home: Path, board: str, deal_id: str, *, spec: Optional[str] = None) -> dict[str, Any]:
-    """Своё дело по id: строка store плюс журнал; 404, если его нет или не та доска."""
+    if not deals.is_own(deal_id):
+        raise HTTPException(
+            status_code=400,
+            headers=NO_STORE_HEADERS,
+            detail=f"id {deal_id!r} не дело: свои дела адресуются как d_<hex>",
+        )
     try:
         conn = deals.open_store(home, create=False, readonly=True)
     except Exception as exc:  # noqa: BLE001 - свой store не открылся
@@ -2340,14 +1777,48 @@ def _own_deal(home: Path, board: str, deal_id: str, *, spec: Optional[str] = Non
         )
     try:
         row = deals.deal_row(conn, deal_id) if deals.has_store(conn) else None
-        if row is None or str(row["board"]) != board:
+    finally:
+        conn.close()
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            headers=NO_STORE_HEADERS,
+            detail=f"deal '{deal_id}' not found",
+        )
+    return {
+        "id": deal_id,
+        "repo": row.get("repo"),
+        "status": str(row["status"]),
+        "title": row.get("title"),
+    }
+
+
+def _own_deal(home: Path, deal_id: str, *, spec: Optional[str] = None) -> dict[str, Any]:
+    """Своё дело по id: строка store плюс журнал; 404, если его нет."""
+    try:
+        conn = deals.open_store(home, create=False, readonly=True)
+    except Exception as exc:  # noqa: BLE001 - свой store не открылся
+        raise HTTPException(
+            status_code=503,
+            headers=NO_STORE_HEADERS,
+            detail=f"store unreadable: {type(exc).__name__}: {exc}",
+        ) from exc
+    if conn is None:
+        raise HTTPException(
+            status_code=404,
+            headers=NO_STORE_HEADERS,
+            detail=f"deal '{deal_id}' not found: своего store ещё нет",
+        )
+    try:
+        row = deals.deal_row(conn, deal_id) if deals.has_store(conn) else None
+        if row is None:
             raise HTTPException(
                 status_code=404,
                 headers=NO_STORE_HEADERS,
-                detail=f"deal '{deal_id}' not found on board '{board}'",
+                detail=f"deal '{deal_id}' not found",
             )
         questions, pool_note, _ = _pool_context(home)
-        _, journal_note, _ = _journal_context(home, [])
+        _, journal_note, _ = _journal_context(home)
         return _own_response(
             conn,
             row,
@@ -2370,15 +1841,6 @@ def _own_deal(home: Path, board: str, deal_id: str, *, spec: Optional[str] = Non
 # и 400/404, а не 500: битый вход это ответ, а не падение.
 
 
-def _known_boards(home: Path) -> list[str]:
-    """Слаги kanban-досок: своя доска должна быть здесь или уже в store.
-
-    Так опечатка в слаге не заводит тихую доску-призрак: `POST /deals` с чужим
-    слагом отвечает ошибкой, а не создаёт новое пространство имён.
-    """
-    return [str(entry["slug"]) for entry in _discover_boards(home)]
-
-
 def _store_for_write(home: Path) -> sqlite3.Connection:
     """Соединение store для мутации: 503, если файл не открывается."""
     try:
@@ -2396,15 +1858,17 @@ def _store_for_write(home: Path) -> sqlite3.Connection:
     return conn
 
 
-def _error_body(board: Optional[str], deal_id: Optional[str], reason: str) -> dict[str, Any]:
+def _error_body(deal_id: Optional[str], reason: str) -> dict[str, Any]:
     """Тело ошибки мутации — та же форма, что у успеха, но `deal: null`.
 
     Клиент не должен разбирать второй тип тела ради отказа: ключи те же, причина
-    в `errors[]` (как у остальных ошибок 0.0.2), дело не притворяется живым.
+    в `errors[]` (как у остальных ошибок), дело не притворяется живым. `repo`
+    здесь `null`: отказанная мутация не назвала репозиторий — объявлять его в
+    ответе значило бы утверждать то, чего в store не появилось.
     """
     return {
         "now": _now_sec(),
-        "board": board,
+        "repo": None,
         "id": deal_id,
         "title": None,
         "status": None,
@@ -2419,11 +1883,11 @@ def _error_body(board: Optional[str], deal_id: Optional[str], reason: str) -> di
         "attachments": [],
         "timeline": [],
         "budget": None,
-        "errors": [{"board": board or DEALS_SOURCE, "reason": reason}],
+        "errors": [{"source": DEALS_SOURCE, "reason": reason}],
     }
 
 
-def _deal_error(exc: RuntimeError, board: Optional[str], deal_id: Optional[str]) -> JSONResponse:
+def _deal_error(exc: RuntimeError, deal_id: Optional[str]) -> JSONResponse:
     """Отвергнутая мутация: 404 для «дела нет», 400 для «вход не тот», не 500.
 
     Тип в подписи — `RuntimeError` (`deals.DealError` — его наследник): модуль
@@ -2434,7 +1898,7 @@ def _deal_error(exc: RuntimeError, board: Optional[str], deal_id: Optional[str])
     return JSONResponse(
         status_code=status,
         headers=NO_STORE_HEADERS,
-        content=_error_body(board, deal_id, str(exc)),
+        content=_error_body(deal_id, str(exc)),
     )
 
 
@@ -2451,7 +1915,7 @@ def _mutation(conn: sqlite3.Connection, home: Path, result: dict[str, Any]) -> d
     это ответ, а не ошибка, и скрипт обязан отличить его от создания.
     """
     questions, pool_note, _ = _pool_context(home)
-    _, journal_note, _ = _journal_context(home, [])
+    _, journal_note, _ = _journal_context(home)
     body = _own_response(
         conn,
         result["deal"],
@@ -2473,7 +1937,23 @@ def _mutation(conn: sqlite3.Connection, home: Path, result: dict[str, Any]) -> d
 
 
 def deals_create(home: Path, payload: dict[str, Any], *, source: str = "api") -> dict[str, Any]:
-    """`POST /deals` и `duty create`: одно правило на оба входа."""
+    """`POST /deals` и `duty create`: одно правило на оба входа.
+
+    `board` в теле больше не принимается (0.0.6): доск нет, дело адресуется своим
+    `d_<hex>`, а группировка — `repo`. Отказ по `board` назван словами, а не
+    проигнорирован: иначе старый скрипт молча завёл бы дело без группировки и
+    решил, что доска «сработала».
+
+    `repo` вычисляется здесь, в одном месте на API и CLI: из `spec.repo`, если
+    спека дана и в ней есть `repo`; иначе из явного `repo`; иначе `NULL` —
+    «репозиторий не назван». Спека сильнее явного значения, потому что она —
+    записанный граф дела: если `worktree`-этап строит дерево из `spec.repo`,
+    группировка обязана совпадать с ним, иначе дело попадёт не в ту группу.
+    """
+    if payload.get("board") is not None:
+        raise deals.DealError(
+            "create: доск больше нет — дело адресуется своим id, группировка задаётся 'repo'"
+        )
     parents = payload.get("parents") or []
     if not isinstance(parents, list) or not all(isinstance(item, str) for item in parents):
         raise deals.DealError("create: 'parents' — список id своих дел (d_<hex>)")
@@ -2486,6 +1966,9 @@ def deals_create(home: Path, payload: dict[str, Any], *, source: str = "api") ->
     spec = payload.get("spec")
     if spec is not None and not isinstance(spec, str):
         raise deals.DealError("create: 'spec' — абсолютный путь к спеке (duty.yaml) или null")
+    repo = payload.get("repo")
+    if repo is not None and not isinstance(repo, str):
+        raise deals.DealError("create: 'repo' — путь репозитория (строка) или null")
     external_ref = payload.get("external_ref")
     if external_ref is not None and not isinstance(external_ref, str):
         raise deals.DealError("create: 'external_ref' — строка (например jira:RP-14080) или null")
@@ -2499,12 +1982,11 @@ def deals_create(home: Path, payload: dict[str, Any], *, source: str = "api") ->
             home,
             deals.create_deal(
                 conn,
-                board=str(payload.get("board") or ""),
+                repo=_repo_of(spec, repo),
                 title=str(payload.get("title") or ""),
                 body=str(body or ""),
                 assignee=assignee,
                 parents=parents,
-                known_boards=_known_boards(home),
                 source=source,
                 spec_path=spec,
                 external_ref=external_ref,
@@ -2513,6 +1995,24 @@ def deals_create(home: Path, payload: dict[str, Any], *, source: str = "api") ->
         )
     finally:
         conn.close()
+
+
+def _repo_of(spec: Optional[str], repo: Optional[str]) -> Optional[str]:
+    """Репозиторий нового дела: `spec.repo`, иначе явный `repo`, иначе `None`.
+
+    Нечитаемая спека не отменяет создание дела по `repo`: отказ здесь запретил бы
+    заводить дело по графу, который «пока не читается», хотя `repo` назвал сам
+    вызывающий. Но и молчать нельзя — поэтому пустая строка от `spec.repo`
+    трактуется как «в спеке репозитория нет», а не как репозиторий `""`.
+    """
+    from_spec: Optional[str] = None
+    if spec:
+        try:
+            from_spec = spec_mod.load_spec(spec).repo
+        except Exception:  # noqa: BLE001 - спека не разобралась: остаётся явный repo
+            from_spec = None
+    chosen = (from_spec or "").strip() or (repo or "").strip()
+    return chosen or None
 
 
 def deals_patch(
@@ -2908,23 +2408,31 @@ def attach_deal_route(deal_id: str, file: UploadFile = File(...)) -> Any:
         return _deal_error(exc, None, deal_id)
 
 
-def _board_entry(home: Path, slug: str) -> dict[str, Any]:
-    """Запись доски по слагу или HTTP 404."""
-    match = [b for b in _discover_boards(home) if b["slug"] == slug]
-    if not match:
-        raise HTTPException(status_code=404, headers=NO_STORE_HEADERS, detail=f"board '{slug}' not found")
-    return match[0]
+def _repo_entry(home: Path, repo: str) -> None:
+    """Репозиторий назван хотя бы одним делом — иначе 404 словами.
+
+    Опечатка в `?repo=` не должна давать «пусто»: пустая страница выглядела бы
+    как «в репозитории нет дел», хотя такого репозитория не называло ни одно дело.
+    """
+    if any(group["repo"] == repo for group in _repos_of(home)["list"]):
+        return
+    raise HTTPException(
+        status_code=404,
+        headers=NO_STORE_HEADERS,
+        detail=f"repo '{repo}' не назван ни одним делом",
+    )
 
 
 @router.get("/now")
-def now(board: Optional[str] = None, state: Optional[str] = None, ingest: bool = False) -> dict[str, Any]:
-    """Активные дела всех досок: лизинг, попытка, последнее действие, ожидание.
+def now(repo: Optional[str] = None, state: Optional[str] = None) -> dict[str, Any]:
+    """Активные дела: лизинг, попытка, последнее действие, ожидание.
 
-    `?board=<slug>` — только одна доска (404, если её нет);
-    `?state=<waiting.state>` — только дела в этом состоянии ожидания;
-    `?ingest=1` — сначала прогнать ingest в свой журнал (тот же проход, что
-    `POST /ingest`, только без отчёта). Без флага срез ничего не пишет: журнал
-    открывается на чтение и файла не создаёт.
+    `?repo=<путь>` — только один репозиторий (404, если его не назвало ни одно
+    дело); `?repo=` (пустая строка) — только дела **без** репозитория;
+    `?state=<waiting.state>` — только дела в этом состоянии ожидания.
+
+    Прохода ingest больше нет (`?ingest=1` удалён вместе с досками): срез только
+    читает, журнал открывается `?mode=ro` и файла не создаёт.
     """
     if state is not None and state not in WAITING_PRIORITY:
         raise HTTPException(
@@ -2933,53 +2441,24 @@ def now(board: Optional[str] = None, state: Optional[str] = None, ingest: bool =
             detail=f"unknown state '{state}', expected one of {list(WAITING_PRIORITY)}",
         )
     home = _hermes_home()
-    if board is not None:
-        _board_entry(home, board)
-    return collect_now(home, _now_sec(), board=board, state=state, ingest=ingest)
+    if repo:
+        _repo_entry(home, repo)
+    return collect_now(home, _now_sec(), repo=repo, state=state)
 
 
-@router.post("/ingest")
-def ingest_now() -> dict[str, Any]:
-    """Проход ingest по требованию: дописать в свой журнал недостающие события.
-
-    Единственный роут (вместе с `POST /ask`), который пишет, и пишет он только в
-    `duty/duty.db`. Источники (`kanban.db`, `state.db`, `pool.db`) открываются
-    `mode=ro` — инвариант «в kanban не пишем» проверяется тестом по `mtime`.
-
-    Повторный вызов — no-op: `appended: 0` (`INSERT OR IGNORE` по
-    `idempotency_key`). Ответ — отчёт прохода: сколько строк добавлено, по каким
-    доскам, что не прочиталось (`errors[]`). Тот же проход доступен как
-    `GET /now?ingest=1`.
-
-    Там же дочитываются ответы пула (`ask.sync_answers`, блок `answers`):
-    вопрос, на который уже ответили, перестаёт быть живым фактом ожидания.
-    """
-    home = _hermes_home()
-    try:
-        conn = journal.open_journal(home)
-    except Exception as exc:  # noqa: BLE001 - свой журнал не открылся
-        raise HTTPException(
-            status_code=503,
-            headers=NO_STORE_HEADERS,
-            detail=f"journal unreadable: {type(exc).__name__}: {exc}",
-        ) from exc
-    try:
-        report = journal.ingest(conn, home, _discover_boards(home))
-        report["answers"] = ask.sync_answers(conn, home)
-        return report
-    finally:
-        conn.close()
-
-
-@router.post("/ask/{board}/{task_id}")
-def ask_deal(board: str, task_id: str, payload: dict[str, Any] = Body(...)) -> Any:
+@router.post("/ask/{deal_id}")
+def ask_deal(deal_id: str, payload: dict[str, Any] = Body(...)) -> Any:
     """Явный канал вопроса по делу: пул `messaging/pool.db` плюс событие журнала.
 
     Кто и когда зовёт: человек или координатор (из UI/CLI), когда дело стоит в
     `blocked`/`needs_input` **без** живого вопроса — тогда `/now` честно говорит
     `waiting.human_kind="status"`, а этот роут превращает «нужен человек» в
-    конкретный вопрос со вариантами ответа. Автоматически ingest вопросов не
-    создаёт: пул решений не должен наполняться проходами по доске.
+    конкретный вопрос со вариантами ответа. Автоматически вопросы не создаются:
+    пул решений не должен наполняться проходами по срезу.
+
+    Адрес — только `d_<hex>` (0.0.6): доски, которая связывала дело с карточкой,
+    больше нет, и `POST /ask/{board}/{task_id}` не алиасится — два способа
+    адресовать одно дело дали бы две правды.
 
     Тело: `{"text": "...", "text_full": "...", "options": ["..."], "critical": true}`
     (`text_full`, `options` и `critical` необязательны; `critical` по умолчанию
@@ -2994,7 +2473,7 @@ def ask_deal(board: str, task_id: str, payload: dict[str, Any] = Body(...)) -> A
     этом не пишется (`question_asked` только после успешной вставки).
     """
     home = _hermes_home()
-    _resolve_deal(home, board, task_id)
+    resolved = _resolve_deal(home, deal_id)
 
     text = " ".join(str(payload.get("text") or "").split())
     if not text:
@@ -3016,7 +2495,7 @@ def ask_deal(board: str, task_id: str, payload: dict[str, Any] = Body(...)) -> A
             status_code=400, headers=NO_STORE_HEADERS, detail="ask: 'critical' — true/false"
         )
 
-    deal = {"id": task_id, "board": board, "home": home}
+    deal = {"id": deal_id, "repo": resolved.get("repo"), "home": home}
     try:
         conn = journal.open_journal(home)
     except Exception as exc:  # noqa: BLE001 - свой журнал не открылся
@@ -3043,7 +2522,7 @@ def ask_deal(board: str, task_id: str, payload: dict[str, Any] = Body(...)) -> A
                 "created": False,
                 "deduped": False,
                 "adopted": False,
-                "errors": [{"board": ask.QUESTION_SOURCE, "reason": f"ask {task_id}: {exc}"}],
+                "errors": [{"source": ask.QUESTION_SOURCE, "reason": f"ask {deal_id}: {exc}"}],
             },
         )
     finally:
@@ -3057,93 +2536,25 @@ def ask_deal(board: str, task_id: str, payload: dict[str, Any] = Body(...)) -> A
     }
 
 
-@router.get("/duty/{board}/{task_id}/attempts")
-def duty_attempts(board: str, task_id: str) -> dict[str, Any]:
+@router.get("/duty/{deal_id}/attempts")
+def duty_attempts(deal_id: str) -> dict[str, Any]:
     """Таймлайн попыток дела: все попытки по возрастанию старта плюс их события.
 
-    У своего дела (`d_…`) попытки строятся по журналу: в 0.0.4 движок спавнит
-    процесс и пишет `attempt_started`/`attempt_progress`/`attempt_ended`, а
-    живость незакрытой попытки берётся из лизинга — без `ps` и `/proc`
-    (`docs/PROBES.md`). Форма у обоих пространств одна: этап, номер, начало,
-    конец, длительность, исход, класс отказа, причина, `base`, `commit`, `pid`,
-    `reaped`, число событий прогресса — чтобы консоль и страница рисовали одну
-    форму, а не две.
+    Попытки строятся по журналу: движок спавнит процесс и пишет
+    `attempt_started`/`attempt_progress`/`attempt_ended`, а живость незакрытой
+    попытки берётся из лизинга — без `ps` и `/proc` (`docs/PROBES.md`). Форма:
+    этап, номер, начало, конец, длительность, исход, класс отказа, причина,
+    `base`, `commit`, `pid`, `reaped`, число событий прогресса — чтобы консоль и
+    страница рисовали одну форму, а не две.
+
+    Адрес — только `d_<hex>` (0.0.6). Попыток карточек kanban здесь нет: карточка
+    не дело, и её `task_runs` — наблюдение (`/cards`), а не таймлайн дела.
 
     Пустой список — законный ответ: дело существует, и «попыток не было» — это
     факт о нём, а не отсутствие дела. `note` в этом случае называет настоящую
-    причину; у наблюдаемого kanban-дела `note` пуст, потому что его попытки
-    читаются из `task_runs` доски.
+    причину.
     """
-    home = _hermes_home()
-    if deals.is_own(task_id):
-        return _own_attempts(home, board, task_id)
-    path = Path(_board_entry(home, board)["path"])
-    tasks, err = _query_checked(path, "SELECT id, title FROM tasks WHERE id = ?", (task_id,))
-    if err:
-        raise HTTPException(status_code=503, headers=NO_STORE_HEADERS, detail=f"board '{board}' unreadable: {err}")
-    if not tasks:
-        raise HTTPException(status_code=404, headers=NO_STORE_HEADERS, detail=f"task '{task_id}' not found on board '{board}'")
-
-    now = _now_sec()
-    runs, err = _query_checked(
-        path, "SELECT * FROM task_runs WHERE task_id = ? ORDER BY started_at, id", (task_id,)
-    )
-    if err:
-        raise HTTPException(status_code=503, headers=NO_STORE_HEADERS, detail=f"task_runs unreadable: {err}")
-    events_by_run: dict[int, list[dict[str, Any]]] = {}
-    rows, err = _query_checked(
-        path,
-        "SELECT run_id, kind, payload, created_at FROM task_events "
-        "WHERE task_id = ? AND run_id IS NOT NULL ORDER BY created_at, id",
-        (task_id,),
-    )
-    if err:
-        rows = []
-    for row in rows:
-        events_by_run.setdefault(int(row.get("run_id") or 0), []).append(
-            {
-                "kind": row.get("kind"),
-                "at": row.get("created_at"),
-                "summary": _payload_summary(row.get("payload")),
-            }
-        )
-
-    attempts: list[dict[str, Any]] = []
-    for run in runs:
-        start = run.get("started_at")
-        end = run.get("ended_at")
-        duration = None
-        if start is not None:
-            duration = int(end if end is not None else now) - int(start)
-        attempts.append(
-            {
-                "run_id": run.get("id"),
-                "profile": run.get("profile"),
-                "status": run.get("status"),
-                "start": start,
-                "end": end,
-                "duration_sec": duration,
-                "outcome": run.get("outcome"),
-                "error": run.get("error"),
-                "summary": run.get("summary"),
-                "events": events_by_run.get(int(run.get("id") or 0), []),
-            }
-        )
-    return {
-        "board": board,
-        "task_id": task_id,
-        "title": tasks[0].get("title"),
-        "count": len(attempts),
-        "crash_outcomes": list(CRASH_OUTCOMES),
-        "attempts": attempts,
-        # Пометка о пустом ответе — в одной форме у обоих пространств: у
-        # kanban-дела попытки читаются из `task_runs`, и объяснять нечего.
-        "note": "",
-        # Строка итога по журналу дела; у наблюдаемого дела спеки обычно нет.
-        "budget": budget.describe_events(
-            _journal_context(home, [])[0].get(task_id, [])
-        ),
-    }
+    return _own_attempts(_hermes_home(), deal_id)
 
 
 # Причина пустого таймлайна своего дела: попыток правда не было. Прежняя
@@ -3216,9 +2627,9 @@ def _own_attempt(row: dict[str, Any], now: int) -> dict[str, Any]:
     }
 
 
-def _own_attempts(home: Path, board: str, task_id: str) -> dict[str, Any]:
-    """Таймлайн попыток своего дела: журнал плюс таблица лизингов, без `ps`."""
-    resolved = _resolve_deal(home, board, task_id)
+def _own_attempts(home: Path, deal_id: str) -> dict[str, Any]:
+    """Таймлайн попыток дела: журнал плюс таблица лизингов, без `ps`."""
+    resolved = _resolve_deal(home, deal_id)
     try:
         conn = deals.open_store(home, create=False, readonly=True)
     except Exception as exc:  # noqa: BLE001 - свой store не открылся
@@ -3228,17 +2639,17 @@ def _own_attempts(home: Path, board: str, task_id: str) -> dict[str, Any]:
             detail=f"store unreadable: {type(exc).__name__}: {exc}",
         ) from exc
     try:
-        events = journal.read_events(conn, task_id)
+        events = journal.read_events(conn, deal_id)
         # Срок из store важнее срока из `attempt_started`: лизинг продлевается
         # heartbeat'ом (`_own_leases`).
-        leases = _own_leases(conn, task_id)
+        leases = _own_leases(conn, deal_id)
     finally:
         conn.close()
     now = _now_sec()
     attempts = [_own_attempt(row, now) for row in stagefeed.attempts(events, now, leases=leases)]
     return {
-        "board": board,
-        "task_id": task_id,
+        "deal_id": deal_id,
+        "repo": resolved.get("repo"),
         "title": resolved.get("title"),
         "count": len(attempts),
         "crash_outcomes": list(CRASH_OUTCOMES),

@@ -266,7 +266,7 @@ def events(*pairs: tuple[str, dict | None], **kwargs: Any) -> list[dict[str, Any
                 "ts": ts + index,
                 "recorded_at": ts + index,
                 "deal_id": kwargs.get("deal_id", "t_0001"),
-                "board": "stack",
+                "repo": "stack",
                 "kind": kind,
                 "payload": payload or {},
                 "source": "cli",

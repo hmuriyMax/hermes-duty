@@ -1,7 +1,7 @@
-"""Контракт формы P0-роутов: `/health`, `/sources`, `/board/{slug}/tasks`.
+"""Контракт формы P0-роутов: `/health`, `/sources`, `/board/`.
 
 Baseline — `fd6d102` (каркас + read-only `/health`): у `/health` 11 ключей,
-у `/sources` было 19, у `/board/{slug}/tasks` 15 (см. `evidence.json` карточки
+у `/sources` было 19, у `/board/` 15 (см. `evidence.json` карточки
 `t_ed22e46e`). Здесь форма зафиксирована тестом, а не ручной сверкой: удаление
 или добавление любого ключа в этих ответах роняет тест.
 
@@ -252,7 +252,7 @@ def test_sources_shape_matches_baseline(client: TestClient) -> None:
 
 
 def test_board_tasks_shape_matches_baseline(client: TestClient) -> None:
-    """`/board/{slug}/tasks` — 15 ключей, как в baseline `fd6d102`."""
+    """`/board/` — 15 ключей, как в baseline `fd6d102`."""
     response = client.get("/board/stack/tasks")
 
     assert response.status_code == 200

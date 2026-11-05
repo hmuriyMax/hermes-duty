@@ -244,7 +244,6 @@ def sweep(
             out.append(
                 {
                     "deal": deal_id,
-                    "board": str(attempt["event"].get("board") or ""),
                     **payload,
                     "dry_run": bool(dry_run),
                     "written": written,
@@ -335,7 +334,6 @@ def _write(conn: Any, attempt: dict[str, Any], payload: dict[str, Any], now: int
         "ts": int(now),
         "recorded_at": int(now),
         "deal_id": str(attempt["event"].get("deal_id") or ""),
-        "board": str(attempt["event"].get("board") or ""),
         "kind": "attempt_ended",
         "payload": payload,
         "source": SOURCE,

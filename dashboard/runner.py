@@ -19,7 +19,7 @@
    это `spec.base`, у следующего — то, что произвёл предшественник
    (`base_of_stage`). Иначе второй этап получал бы чистое дерево и не видел
    работу первого. Каталог попытки лежит под
-   `<home>/kanban/boards/<board>/workspaces/<deal>-<stage>-<attempt>` — это
+   `<home>/kanban/boards/duty/workspaces/<deal>-<stage>-<attempt>` — это
    разрешённый корень `role-access` (`docs/PROBES.md`, проба 3): иначе read-only
    роль не прочитает ни дерево, ни отчёт. Успешная попытка дерево оставляет,
    упавшая — удаляет (`git worktree remove --force`), путь и причина уходят в
@@ -201,7 +201,12 @@ DECISION_RUN = "run"
 # Каталог попытки внутри дерева Hermes: разрешённый корень `role-access`
 # (`docs/PROBES.md`, проба 3). Менять его на `mktemp`/`~` нельзя — read-only роль
 # тогда не прочитает ни дерево, ни отчёт.
-WORKSPACES_SUBDIR = ("kanban", "boards")
+#
+# С 0.0.6 доск нет, поэтому каталог попытки больше не делится по слагу: он лежит
+# прямо в `duty/workspaces/`. Каталог `duty` — не доска и никакого отношения к
+# kanban не имеет: это единственное место под разрешённым корнем ролей, где duty
+# вправе держать деревья попыток, и имя говорит, чьи они.
+WORKSPACES_SUBDIR = ("kanban", "boards", "duty")
 
 # Служебный каталог попытки рядом с деревом: контракт и отчёт.
 DUTY_SUBDIR = ".duty"
@@ -379,17 +384,17 @@ def lease_of(conn: sqlite3.Connection, deal: Any, stage: str) -> Optional[dict[s
 
 
 def attempt_dir(home: Path, deal: Any, stage: str, attempt: int) -> Path:
-    """Каталог попытки: `<home>/kanban/boards/<board>/workspaces/<deal>-<stage>-<n>`.
+    """Каталог попытки: `<home>/kanban/boards/duty/workspaces/<deal>-<stage>-<n>`.
 
     Под `kanban/boards/**` — потому что это разрешённый корень чтения read-only
     роли: каталог в `mktemp` или профильном `cache/scratch` роль не увидит, и
     ревью окажется пустым не из-за отсутствия находок, а из-за отсутствия
-    доступа.
+    доступа. Слага доски в пути больше нет (0.0.6): дело адресуется своим id.
     """
     base = Path(home)
     for part in WORKSPACES_SUBDIR:
         base = base / part
-    return base / str(deal["board"]) / "workspaces" / f"{deal['id']}-{stage}-{int(attempt)}"
+    return base / "workspaces" / f"{deal['id']}-{stage}-{int(attempt)}"
 
 
 def contract_path(workdir: Path, stage: str, attempt: int) -> Path:
@@ -1171,7 +1176,6 @@ def _event(
         "ts": now,
         "recorded_at": now,
         "deal_id": str(deal["id"]),
-        "board": str(deal["board"]),
         "kind": kind,
         "payload": payload,
         "source": source,

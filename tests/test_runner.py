@@ -104,7 +104,7 @@ def open_store(home: Path) -> sqlite3.Connection:
 def make_deal(conn: sqlite3.Connection, *, title: str = "Починить шапку", body: str = "") -> dict[str, Any]:
     """Своё дело в store: id, доска, статус — то, что движок видит на входе."""
     created = deals.create_deal(
-        conn, board="duty", title=title, body=body, known_boards=["duty"], now=NOW
+        conn, repo="duty", title=title, body=body, now=NOW
     )
     return deals.deal_row(conn, str(created["deal"]["id"]))
 
@@ -315,7 +315,6 @@ def seed(conn, deal, kind: str, payload: dict[str, Any], *, key: str, ts: int = 
                 "ts": ts,
                 "recorded_at": ts,
                 "deal_id": str(deal["id"]),
-                "board": str(deal["board"]),
                 "kind": kind,
                 "payload": payload,
                 "source": "test",
@@ -1087,7 +1086,6 @@ def test_closed_kind_set_still_rejects_unknown(tmp_path: Path) -> None:
         "ts": NOW,
         "recorded_at": NOW,
         "deal_id": str(deal["id"]),
-        "board": str(deal["board"]),
         "kind": "attempt_progress",
         "payload": {"phase": "tool_use", "name": "read_file"},
         "source": "test",
@@ -1244,7 +1242,6 @@ def fact(kind: str, payload: dict[str, Any], *, ts: int = NOW, key: str = "test:
         "ts": ts,
         "recorded_at": ts,
         "deal_id": "d_probe",
-        "board": "duty",
         "kind": kind,
         "payload": payload,
         "source": "test",

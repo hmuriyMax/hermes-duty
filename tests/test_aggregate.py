@@ -664,7 +664,7 @@ def test_ended_run_with_dead_pid_is_not_dead_lease(home: Path) -> None:
 
 
 def test_state_and_board_filters(home: Path, client: TestClient) -> None:
-    """`?board=` и `?state=` фильтруют один и тот же детерминированный срез."""
+    """`?repo=` и `?state=` фильтруют один и тот же детерминированный срез."""
     for slug, task_id, status in (("stack", "t_a", "todo"), ("other", "t_b", "blocked")):
         conn = sqlite3.connect(make_board(home, slug))
         add_task(conn, task_id, status=status, created_at=NOW - 100)
@@ -675,14 +675,14 @@ def test_state_and_board_filters(home: Path, client: TestClient) -> None:
     assert everything["count"] == 2
     assert [deal["id"] for deal in everything["deals"]] == ["t_b", "t_a"]  # сортировка по таксономии
 
-    one_board = client.get("/now", params={"board": "other"}).json()
+    one_board = client.get("/now", params={"repo": "other"}).json()
     assert [deal["id"] for deal in one_board["deals"]] == ["t_b"]
 
     one_state = client.get("/now", params={"state": "wait_slot"}).json()
     assert [deal["id"] for deal in one_state["deals"]] == ["t_a"]
     assert one_state["by_state"]["wait_human"] == 1
 
-    assert client.get("/now", params={"board": "nope"}).status_code == 404
+    assert client.get("/now", params={"repo": "nope"}).status_code == 404
     assert client.get("/now", params={"state": "nonsense"}).status_code == 400
     assert client.get("/duty/nope/t_a/attempts").status_code == 404
     assert client.get("/duty/stack/missing/attempts").status_code == 404

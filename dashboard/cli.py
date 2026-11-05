@@ -1,11 +1,11 @@
 """CLI hermes-duty: тот же бэкенд, что у роутов, но из терминала.
 
-    duty now [--board B] [--state S]      таблица дел: доска, id, ожидание, возраст, доказательство
-    duty deal <board> <id>                карточка дела: факты плюс таймлайн попыток
-    duty attempts <board> <id>            только таймлайн попыток
-    duty stats [--board B] [--since D]    p50/p90/p99, исходы, «с первой попытки»
-    duty why <board> <id>                 доказательство словами бэкенда
-    duty why <board> <id> <этап>          то же плюс приговор последней попытки этапа
+    duty now [--repo R] [--state S]        таблица дел: репозиторий, id, ожидание, возраст
+    duty deal <deal_id>                    карточка дела: факты плюс таймлайн попыток
+    duty attempts <deal_id>                только таймлайн попыток
+    duty stats [--repo R] [--since D]      p50/p90/p99, исходы, «с первой попытки»
+    duty why <deal_id>                     доказательство словами бэкенда
+    duty why <deal_id> <этап>              то же плюс приговор последней попытки этапа
     duty watch [--interval 10]            тот же `now`, перерисовка в терминале
     duty run <deal_id> [--spec F]         довести своё дело по спеке: решение → шаг → журнал
     duty spec check <file>                спека дела до запуска: OK или file:line: правило: текст
@@ -20,14 +20,14 @@
 Коды возврата (контракт карточки W3):
 
 - `0` — успех: ответ получен целиком, `errors[]` пуст;
-- `1` — доска или дело не найдены (роут ответил 404);
+- `1` — дело или репозиторий не найдены (роут ответил 404);
 - `2` — ошибка источников: роут ответил ошибкой (503 «не прочиталось», 400
   «неизвестное состояние») либо в ответе есть `errors[]` — часть источников не
   прочитана, и выдавать такой ответ за полный нельзя.
 
 `duty watch` деградацию источников не превращает в падение: печатает `errors[]`
-строками и продолжает. Отсутствующая доска — исключение: она не появится сама,
-поэтому выход сразу с кодом 1.
+строками и продолжает. Отсутствующее дело или неназванный репозиторий — исключение:
+сами они не появятся, поэтому выход сразу с кодом 1.
 
 `duty run` (движок доводит дело до конца) добавляет к этому свои три кода —
 `3` ждёт (`wait`: ответа человека, приговора, паузы, чужого лизинга), `4` упёрлось
@@ -71,7 +71,7 @@ PLUGIN_API_MODULE_NAME = "hermes_duty_plugin_api"
 
 
 class NotFound(RuntimeError):
-    """Дело или доска не найдены (роут ответил 404) — код возврата 1."""
+    """Дело или репозиторий не найдены (роут ответил 404) — код возврата 1."""
 
 
 class SourceFailure(RuntimeError):
@@ -369,25 +369,22 @@ def build_parser() -> argparse.ArgumentParser:
         )
         return sub
 
-    now = command("now", "таблица дел: доска, id, ожидание, возраст, доказательство")
-    now.add_argument("--board", help="только одна доска (slug)")
+    now = command("now", "таблица дел: репозиторий, id, ожидание, возраст, доказательство")
+    now.add_argument("--repo", help="только один репозиторий; пустая строка — дела без репозитория")
     now.add_argument("--state", help="только дела в этом waiting.state")
 
     deal = command("deal", "карточка дела: факты плюс таймлайн попыток")
-    deal.add_argument("board")
-    deal.add_argument("task_id")
+    deal.add_argument("deal_id", help="id дела (d_<hex>)")
 
     attempts = command("attempts", "только таймлайн попыток")
-    attempts.add_argument("board")
-    attempts.add_argument("task_id")
+    attempts.add_argument("deal_id", help="id дела (d_<hex>)")
 
     stats = command("stats", "p50/p90/p99, исходы, доля с первой попытки")
-    stats.add_argument("--board", help="только одна доска (slug)")
+    stats.add_argument("--repo", help="только один репозиторий; пустая строка — дела без репозитория")
     stats.add_argument("--since", type=since_arg, help="окно по created_at: unix, YYYY-MM-DD или YYYY-MM-DDTHH:MM")
 
     why = command("why", "доказательство словами бэкенда; с этапом — приговор его последней попытки")
-    why.add_argument("board")
-    why.add_argument("task_id")
+    why.add_argument("deal_id", help="id дела (d_<hex>)")
     why.add_argument(
         "stage",
         nargs="?",
@@ -396,7 +393,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     watch = command("watch", "тот же now, перерисовка в терминале")
     watch.add_argument("--interval", type=float, default=10.0, help="секунд между тиками (по умолчанию 10)")
-    watch.add_argument("--board", help="только одна доска (slug)")
+    watch.add_argument("--repo", help="только один репозиторий; пустая строка — дела без репозитория")
     watch.add_argument("--state", help="только дела в этом waiting.state")
 
     # Драйвер дела (`docs/RUNBOOK.md`): цикл «решение → шаг → перечитать журнал».
@@ -432,7 +429,10 @@ def build_parser() -> argparse.ArgumentParser:
     # Мутации своего дела (`docs/OWNERSHIP.md`): те же функции, что у роутов
     # `/deals…`, — CLI не заводит второго набора правил.
     create = command("create", "завести своё дело (id d_<hex>)")
-    create.add_argument("--board", required=True, help="слаг доски (kanban-доска или своя в store)")
+    create.add_argument(
+        "--repo",
+        help="репозиторий дела (группировка): по умолчанию — repo из спеки, иначе не назван",
+    )
     create.add_argument("--title", required=True, help="заголовок дела")
     create.add_argument("--body-file", help="файл с телом дела (спецификацией)")
     create.add_argument("--assignee", help="профиль-роль исполнителя")
@@ -647,25 +647,29 @@ def _distribution(dist: Any) -> str:
 
 
 def _share(first: Any) -> str:
-    """«С первой попытки»: доля и её основание, а не одно число без знаменателя."""
+    """«С первой попытки»: доля и её основание, а не одно число без знаменателя.
+
+    Знаменатель — закрытые **этапы** дел (`first_try.closed`), а не раны карточек:
+    с 0.0.6 статистика считается по журналу своих дел, и ран карточки в ней нет.
+    """
     data = first or {}
-    with_runs = int(data.get("with_runs") or 0)
-    if not with_runs:
-        return "нет ранов — доля не считается"
+    closed = int(data.get("closed") or 0)
+    if not closed:
+        return "нет закрытых этапов — доля не считается"
     ok = int(data.get("ok") or 0)
     share = data.get("share")
     percent = "—" if share is None else f"{round(float(share) * 100)}%"
-    return f"{ok}/{with_runs} ({percent})"
+    return f"{ok}/{closed} ({percent})"
 
 
 def _share_cell(first: Any) -> str:
-    """Та же доля компактно для таблицы: у доски без ранов — прочерк, «нет ранов» один раз в итоге."""
+    """Та же доля компактно для таблицы: у группы без закрытых этапов — прочерк."""
     data = first or {}
-    if not int(data.get("with_runs") or 0):
+    if not int(data.get("closed") or 0):
         return "—"
     share = data.get("share")
     percent = "—" if share is None else f"{round(float(share) * 100)}%"
-    return f"{int(data.get('ok') or 0)}/{int(data['with_runs'])} ({percent})"
+    return f"{int(data.get('ok') or 0)}/{int(data['closed'])} ({percent})"
 
 
 def _notice_lines(payload: dict[str, Any]) -> list[str]:
@@ -676,14 +680,9 @@ def _notice_lines(payload: dict[str, Any]) -> list[str]:
     """
     lines: list[str] = []
     for error in payload.get("errors") or []:
-        lines.append(f"! источник {error.get('board')}: {error.get('reason')}")
+        lines.append(f"! источник {error.get('source')}: {error.get('reason')}")
     for warning in payload.get("warnings") or []:
         lines.append(f"! {warning}")
-    for board in payload.get("boards") or []:
-        for warning in board.get("warnings") or []:
-            lines.append(f"! доска {board.get('slug')}: {warning}")
-        if board.get("truncated"):
-            lines.append(f"! доска {board.get('slug')}: срез обрезан лимитом — картина неполная")
     return lines
 
 
@@ -691,7 +690,7 @@ def _notice_lines(payload: dict[str, Any]) -> list[str]:
 
 
 NOW_COLUMNS = (
-    ("ДОСКА", 16),
+    ("РЕПОЗИТОРИЙ", 40),
     ("ID", 14),
     ("СОСТОЯНИЕ", 20),
     ("ОЖИДАНИЕ", 9),
@@ -703,15 +702,19 @@ NOW_COLUMNS = (
 )
 
 STATS_COLUMNS = (
-    ("ДОСКА", 16),
-    ("ЗАДАЧ", 7),
-    ("РАНОВ", 7),
+    ("РЕПОЗИТОРИЙ", 40),
+    ("ДЕЛ", 6),
+    ("ПОПЫТОК", 8),
     ("С ПЕРВОЙ", 15),
     ("P50", 8),
     ("P90", 8),
     ("P99", 8),
     ("ОЖИДАНИЙ", 9),
 )
+
+# Подпись группы «репозиторий не назван»: NULL в `repo` — законное состояние, и в
+# таблице оно выглядит словами, а не пустой клеткой.
+WITHOUT_REPO_LABEL = "без репозитория"
 
 
 def _now_row(deal: dict[str, Any], now: Any) -> list[Any]:
@@ -737,7 +740,7 @@ def _now_row(deal: dict[str, Any], now: Any) -> list[Any]:
     caption = str(block.get("text") or "") if isinstance(block, dict) else ""
     spent = caption.replace("израсходовано ", "")
     return [
-        deal.get("board"),
+        deal.get("repo") or WITHOUT_REPO_LABEL,
         deal.get("id"),
         state,
         _fmt_age(wait_age),
@@ -766,20 +769,18 @@ def render_now(payload: dict[str, Any]) -> str:
     lines.append("")
     lines.append(_table(NOW_COLUMNS, [_now_row(deal, payload.get("now")) for deal in deals]))
     lines.append("")
-    lines.append("доказательство целиком: duty why <доска> <id> · таймлайн: duty attempts <доска> <id>")
+    lines.append("доказательство целиком: duty why <id> · таймлайн: duty attempts <id>")
     return "\n".join(lines)
 
 
-def _board_row(board: dict[str, Any]) -> list[Any]:
-    """Строка таблицы «по доскам»: непрочитанная доска — прочерки, а не нули."""
-    if not board.get("read"):
-        return [board.get("slug"), "—", "—", "не прочитана", "—", "—", "—", "—"]
-    first = board.get("first_try") or {}
-    dist = board.get("waiting_sec") or {}
+def _repo_row(group: dict[str, Any]) -> list[Any]:
+    """Строка таблицы «по репозиториям»: дела, попытки, доля с первой попытки, ожидание."""
+    first = group.get("first_try") or {}
+    dist = group.get("waiting_sec") or {}
     return [
-        board.get("slug"),
-        board.get("tasks_total"),
-        board.get("runs_total"),
+        group.get("repo") or WITHOUT_REPO_LABEL,
+        group.get("deals"),
+        group.get("attempts_total"),
         _share_cell(first),
         _fmt_age(dist.get("p50")),
         _fmt_age(dist.get("p90")),
@@ -791,24 +792,29 @@ def _board_row(board: dict[str, Any]) -> list[Any]:
 def render_stats(payload: dict[str, Any]) -> str:
     """Здоровье: перцентили ожидания, исходы и доля с первой попытки."""
     totals = payload.get("totals") or {}
-    boards = payload.get("boards") or []
+    repos = payload.get("repos") or []
+    without = payload.get("without_repo") or {}
+    groups = list(repos) + ([without] if without.get("deals") else [])
     lines = [
-        "ЗДОРОВЬЕ · {} · досок: {} · задач: {} · ранов: {}".format(
+        "ЗДОРОВЬЕ · {} · репозиториев: {} · дел: {} · попыток: {}".format(
             _fmt_stamp(payload.get("now")),
-            len(boards),
-            totals.get("tasks_total", 0),
-            totals.get("runs_total", 0),
+            len(repos),
+            totals.get("deals", 0),
+            totals.get("attempts_total", 0),
         )
     ]
     lines.extend(_notice_lines(payload))
     lines.append("")
     lines.append(f"с первой попытки: {_share(totals.get('first_try'))}")
     lines.append(f"ожидание до первой попытки: {_distribution(totals.get('waiting_sec'))}")
-    lines.append(f"исходы ранов: {_counts(totals.get('runs_by_outcome'))}")
-    lines.append(f"статусы дел: {_counts(totals.get('tasks_by_status'))}")
-    if boards:
+    lines.append(f"исходы попыток: {_counts(totals.get('attempts_by_outcome'))}")
+    lines.append(f"статусы дел: {_counts(totals.get('deals_by_status'))}")
+    if groups:
         lines.append("")
-        lines.append(_table(STATS_COLUMNS, [_board_row(board) for board in boards]))
+        lines.append(_table(STATS_COLUMNS, [_repo_row(group) for group in groups]))
+    if without.get("deals"):
+        lines.append("")
+        lines.append(f"{WITHOUT_REPO_LABEL}: дел {without.get('deals')} — группировка не названа")
     return "\n".join(lines)
 
 
@@ -869,9 +875,8 @@ def _sha(value: Any) -> str:
 def render_attempts(payload: dict[str, Any]) -> str:
     """Таймлайн попыток: попытки по возрастанию старта плюс их события."""
     lines = [
-        "ПОПЫТКИ · {}/{} · {} · {}".format(
-            payload.get("board"),
-            payload.get("task_id"),
+        "ПОПЫТКИ · {} · {} · {}".format(
+            payload.get("deal_id"),
             _clip(payload.get("title"), 80),
             payload.get("count", 0),
         )
@@ -1004,8 +1009,7 @@ def _waiting_head(payload: dict[str, Any]) -> str:
 def render_deal(payload: dict[str, Any], timeline: Optional[dict[str, Any]], timeline_error: Optional[str]) -> str:
     """Карточка дела: спецификация, факты ожидания и таймлайн попыток."""
     lines = [
-        "ДЕЛО {}/{} · {} · {} · создано {}".format(
-            payload.get("board"),
+        "ДЕЛО {} · {} · {} · создано {}".format(
             payload.get("id"),
             payload.get("status") or "—",
             payload.get("assignee") or "—",
@@ -1088,12 +1092,11 @@ def _fact_lines(shaped: dict[str, Any], now: Any) -> list[str]:
 def render_why(payload: dict[str, Any]) -> str:
     """Доказательство словами бэкенда: тот же `waiting.evidence`, что на экране «Почему стоит».
 
-    Если этап назван (`duty why <доска> <id> <этап>`), ниже печатается приговор
+    Если этап назван (`duty why <id> <этап>`), ниже печатается приговор
     его последней попытки — из журнала, тем же вердиктом, что записал движок.
     """
     lines = [
-        "ПОЧЕМУ СТОИТ {}/{} · {} · {}".format(
-            payload.get("board"),
+        "ПОЧЕМУ СТОИТ {} · {} · {}".format(
             payload.get("id"),
             payload.get("status") or "—",
             payload.get("assignee") or "—",
@@ -1140,7 +1143,7 @@ def render_mutation(payload: dict[str, Any], action: str) -> str:
     """
     mutation = payload.get("mutation") or {}
     lines = [
-        f"{action} {payload.get('board')}/{payload.get('id')} · {payload.get('status') or '—'}",
+        f"{action} {payload.get('id')} · {payload.get('status') or '—'}",
         f"заголовок: {payload.get('title') or '—'}",
     ]
     if payload.get("external_ref"):
@@ -1210,7 +1213,7 @@ def _claim_owner(explicit: Optional[str]) -> str:
 def run_watch(
     interval: float,
     *,
-    board: Optional[str] = None,
+    repo: Optional[str] = None,
     state: Optional[str] = None,
     as_json: bool = False,
     ticks: Optional[int] = None,
@@ -1228,7 +1231,7 @@ def run_watch(
         tick += 1
         first_tick = tick == 1
         try:
-            payload = _route(api().now, board=board, state=state)
+            payload = _route(api().now, repo=repo, state=state)
         except NotFound as exc:
             # Доска не появится сама: это не деградация, а неверный аргумент.
             print(f"! {exc}", file=sys.stderr)
@@ -1676,9 +1679,8 @@ def render_reap_row(row: dict[str, Any]) -> str:
     строки: набор кандидатов считается тем же кодом, что и настоящий проход.
     """
     head = "было бы закрыто" if row.get("dry_run") else "закрыто движком"
-    return "{}: {}/{} · {} · попытка {} · {}: {}".format(
+    return "{}: {} · {} · попытка {} · {}: {}".format(
         head,
-        row.get("board") or "—",
         row.get("deal") or "—",
         row.get("stage") or "—",
         row.get("attempt") or 0,
@@ -1741,7 +1743,7 @@ def render_answer_error(row: dict[str, Any]) -> str:
     дело выглядело бы просто ждущим ответа, которого уже нет.
     """
     return "! ответы пула: {} — {}".format(
-        row.get("board") or "—", row.get("reason") or "причина не записана"
+        row.get("source") or "—", row.get("reason") or "причина не записана"
     )
 
 
@@ -1827,7 +1829,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         if args.command == "watch":
             return run_watch(
-                args.interval, board=args.board, state=args.state, as_json=args.json, stream=out
+                args.interval, repo=args.repo, state=args.state, as_json=args.json, stream=out
             )
         if args.command == "run":
             # Прогон дела: цикл живёт в `dashboard/driver.py`, здесь — argv,
@@ -1874,11 +1876,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             _emit_json(report, out) if args.json else print(_load_demo().render_demo(report), file=out)
             return EXIT_OK
         if args.command == "now":
-            payload = _route(api().now, board=args.board, state=args.state)
+            payload = _route(api().now, repo=args.repo, state=args.state)
             _emit_json(payload, out) if args.json else print(render_now(payload), file=out)
             return _payload_code(payload)
         if args.command == "stats":
-            payload = _route(api().stats, board=args.board, since=args.since)
+            payload = _route(api().stats, repo=args.repo, since=args.since)
             _emit_json(payload, out) if args.json else print(render_stats(payload), file=out)
             return _payload_code(payload)
         if args.command == "spec":
@@ -1889,11 +1891,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             _emit_json(payload, out) if args.json else print(render_spec_check(payload), file=out)
             return spec_exit_code(payload)
         if args.command == "attempts":
-            payload = _route(api().duty_attempts, args.board, args.task_id)
+            payload = _route(api().duty_attempts, args.deal_id)
             _emit_json(payload, out) if args.json else print(render_attempts(payload), file=out)
             return _payload_code(payload)
         if args.command == "why":
-            payload = _route(api().deal, args.board, args.task_id)
+            payload = _route(api().deal, args.deal_id)
             # Факты отказов и приговор последней попытки берутся из журнала плагина:
             # то же, что видит движок, плюс к форме роута — отдельными ключами
             # (`failures`, `verdict`), чтобы `--json` оставался дословным ответом
@@ -1904,7 +1906,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             _emit_json(payload, out) if args.json else print(render_why(payload), file=out)
             return _payload_code(payload)
         if args.command == "deal":
-            payload = _route(api().deal, args.board, args.task_id)
+            payload = _route(api().deal, args.deal_id)
             if args.json:
                 # Форма роута `/deal` дословно: таймлайн — отдельный роут
                 # `/duty/.../attempts` и своя форма (`duty attempts --json`).
@@ -1913,7 +1915,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             timeline: Optional[dict[str, Any]] = None
             timeline_error: Optional[str] = None
             try:
-                timeline = _route(api().duty_attempts, args.board, args.task_id)
+                timeline = _route(api().duty_attempts, args.deal_id)
             except SourceFailure as exc:
                 timeline_error = str(exc)
             print(render_deal(payload, timeline, timeline_error), file=out)
@@ -1927,11 +1929,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                     print(f"! не читается {args.body_file}: {exc}", file=sys.stderr)
                     return EXIT_SOURCE
             request: dict[str, Any] = {
-                "board": args.board,
                 "title": args.title,
                 "body": body,
                 "parents": list(args.parent),
             }
+            if args.repo is not None:
+                # Пустая строка — осознанное «без репозитория»: роут отличает её
+                # от «не задано» так же, как фильтр `--repo` в `now`/`stats`.
+                request["repo"] = args.repo
             if args.assignee:
                 request["assignee"] = args.assignee
             if args.external_ref:

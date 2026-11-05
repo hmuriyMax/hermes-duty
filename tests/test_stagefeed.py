@@ -2,7 +2,7 @@
 
 Карточка W6 требует три вещи, которые нельзя проверить глазами при ревью:
 
-1. `/deal/{board}/{id}` отдаёт блок `stages`, где у каждой попытки есть факты
+1. `/deal/{id}` отдаёт блок `stages`, где у каждой попытки есть факты
    процесса (pid, начало, конец, код выхода, исход, класс, токены, инструменты,
    причина), а не строка статуса;
 2. `/now` показывает, на каком этапе дело сейчас, без открытия дела;
@@ -92,7 +92,7 @@ def spec_file(home: Path) -> Path:
 
 
 def new_deal(client: TestClient, home: Path, *, spec: bool = True) -> str:
-    payload = {"board": BOARD, "title": "дело с лентой"}
+    payload = {"repo": BOARD, "title": "дело с лентой"}
     if spec:
         payload["spec"] = str(spec_file(home))
     response = client.post("/deals", json=payload)
@@ -112,7 +112,6 @@ def append(client: TestClient, home: Path, deal_id: str, events: list[dict]) -> 
                         "ts": event["ts"],
                         "recorded_at": event["ts"],
                         "deal_id": deal_id,
-                        "board": BOARD,
                         "kind": event["kind"],
                         "payload": event["payload"],
                         "source": event.get("source", "engine"),
@@ -662,7 +661,7 @@ def test_now_gate_question_shows_options_from_the_pool(home):
     app = FastAPI()
     app.include_router(plugin_api.router)
     client = TestClient(app)
-    created = client.post("/deals", json={"board": BOARD, "title": "гейт", "spec": str(path)})
+    created = client.post("/deals", json={"repo": BOARD, "title": "гейт", "spec": str(path)})
     assert created.status_code == 200, created.text
     deal_id = created.json()["id"]
     (home / "messaging").mkdir(parents=True, exist_ok=True)
@@ -700,7 +699,6 @@ def test_now_gate_question_shows_options_from_the_pool(home):
                     "ts": NOW - 30,
                     "recorded_at": NOW - 30,
                     "deal_id": deal_id,
-                    "board": BOARD,
                     "kind": "question_asked",
                     "payload": {
                         "question_id": 284,

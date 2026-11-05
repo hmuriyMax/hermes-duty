@@ -40,6 +40,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+# Репозиторий демо-дела: группировка (не адрес). Дело адресуется своим id.
+DEMO_REPO = "/tmp/duty-demo-repo"
+# Каталог чужой kanban-БД в песочнице: демо читает её только наблюдением.
 DEMO_BOARD = "duty-demo"
 DEMO_TITLE = "тристейт в виджете: разобрать, починить, проверить"
 
@@ -253,9 +256,8 @@ def run_demo(
             say(f"{n:>2}. {what:<26} {detail}  [{by}]")
 
         # 1. Дело заводится явно: карточки нет, статуса нет, есть событие created.
-        created = deals.create_deal(conn, board=DEMO_BOARD, title=DEMO_TITLE,
-                                    body="по спеке: impl → verify → review", assignee=None,
-                                    known_boards=[DEMO_BOARD])
+        created = deals.create_deal(conn, repo=DEMO_REPO, title=DEMO_TITLE,
+                                    body="по спеке: impl → verify → review", assignee=None)
         deal_id = str(created["deal"]["id"])
         step(1, "create  (дело)", f"{deal_id} · status={created['deal']['status']}")
 
@@ -265,7 +267,7 @@ def run_demo(
 
         # 3. Вопрос человеку — единственным каналом ask(): объект в пуле плюс
         #    событие в журнале, а не «block_kind в чужой таблице».
-        asked = ask.ask(conn, {"id": deal_id, "board": DEMO_BOARD, "title": DEMO_TITLE,
+        asked = ask.ask(conn, {"id": deal_id, "repo": DEMO_REPO, "title": DEMO_TITLE,
                                "home": sandbox},
                         "Режем скоуп до одного виджета или чиним тристейт целиком?",
                         "Полная формулировка: в спеке три этапа; если режем — review не нужен.",
@@ -287,11 +289,11 @@ def run_demo(
         step(4, "answer  (ответ получен)", f"+{synced['appended']} событие · дело снова в работе: {fold.get('state') or 'нет ожидания'}")
 
         # 5. Гейт: ребёнок ждёт родителя и открывается его завершением, не вручную.
-        parent = deals.create_deal(conn, board=DEMO_BOARD, title="проверить контракт виджета",
-                                   assignee="researcher", known_boards=[DEMO_BOARD])
+        parent = deals.create_deal(conn, repo=DEMO_REPO, title="проверить контракт виджета",
+                                   assignee="researcher")
         parent_id = str(parent["deal"]["id"])
-        child = deals.create_deal(conn, board=DEMO_BOARD, title="прогнать тесты после фикса",
-                                  parents=[parent_id], known_boards=[DEMO_BOARD])
+        child = deals.create_deal(conn, repo=DEMO_REPO, title="прогнать тесты после фикса",
+                                  parents=[parent_id])
         child_id = str(child["deal"]["id"])
         gate = journal.fold(journal.read_events(conn, child_id))
         step(5, "gate    (ждёт родителя)", f"{child_id} · {gate.get('state')} · родитель {parent_id}")
@@ -305,13 +307,13 @@ def run_demo(
                           content=b"# plan\nimpl -> verify -> review\n", content_type="text/markdown")
         step(7, "comment (факт таймлайна)", "состояние ожидания не появилось")
 
-        # 7. Попытки наблюдаемого kanban-дела: единственный источник — ingest.
+        # 7. Карточки kanban — только наблюдение: своим ответом, без дел и без
+        #    попыток в журнале. Своего журнала они не касаются вовсе.
         before = journal.counts(conn)
-        report = journal.ingest(conn, sandbox, api._discover_boards(sandbox))
+        cards = api.cards()
         after = journal.counts(conn)
-        step(8, "ingest  (чужие факты)", f"+{report['appended']} событий · дел {before['deals']}→{after['deals']}")
-        again = journal.ingest(conn, sandbox, api._discover_boards(sandbox))
-        step(9, "ingest  (повтор)", f"+{again['appended']} событий (идемпотентно)")
+        step(8, "cards   (наблюдение)", f"карточек: {cards['count']} · дел в журнале {before['deals']}→{after['deals']}")
+        step(9, "cards   (повтор)", f"карточек: {api.cards()['count']} · событий не прибавилось")
 
         # 8. Поверхности читают журнал, а не колонки.
         now_payload = api.now()
@@ -320,14 +322,14 @@ def run_demo(
 
         # 9. Второй вопрос задаётся ДО закрытия: так и бывает на практике —
         #    спросили, а решение пришло позже. Ответ пока не пришёл.
-        late = ask.ask(conn, {"id": deal_id, "board": DEMO_BOARD, "title": DEMO_TITLE, "home": sandbox},
+        late = ask.ask(conn, {"id": deal_id, "repo": DEMO_REPO, "title": DEMO_TITLE, "home": sandbox},
                        "Оставить ли фича-флаг?", "дело закрывают, вопрос задан раньше",
                        critical=False)
         step(11, "ask     (второй вопрос)", f"question #{late.question_id} · дело снова wait_human")
 
         # 10. Закрытие. После него дело обязано уйти из среза.
         deals.complete_deal(conn, deal_id, summary="фикс влит, evidence-команды зелёные")
-        card = api.deal(DEMO_BOARD, deal_id)
+        card = api.deal(deal_id)
         now_after = [d["id"] for d in api.now()["deals"]]
         step(12, "complete", f"terminal={card.get('terminal')} · в /now: {'да' if deal_id in now_after else 'нет'}")
 
@@ -342,7 +344,7 @@ def run_demo(
             pool.close()
         ask.sync_answers(conn, sandbox)
         folded = journal.fold(journal.read_events(conn, deal_id))
-        card = api.deal(DEMO_BOARD, deal_id)
+        card = api.deal(deal_id)
         step(13, "late answer", f"active={folded.get('active')} · waiting={'есть' if card.get('waiting') else 'нет'}")
 
         ledger = [
@@ -367,9 +369,10 @@ def run_demo(
         check("закрытое дело ушло из /now", deal_id not in now_after, "срез без закрытого дела")
         check("поздний ответ не воскресил дело", folded.get("active") is False and not card.get("waiting"),
               "fold.active=False и waiting отсутствует")
-        check("повторный ingest не плодит событий", again["appended"] == 0, f"+{again['appended']}")
+        check("наблюдение карточек не пишет в журнал", after == before,
+              "счётчики журнала до и после /cards совпадают")
         check("kanban.db не изменён", _sha(sand["board"]) == board_before,
-              "sha256 доски совпадает с исходным")
+              "sha256 чужой БД совпадает с исходным")
 
         failed = [c["name"] for c in checks if not c["ok"]]
         if failed:
@@ -378,7 +381,7 @@ def run_demo(
         return {
             "ok": True,
             "home": str(sandbox),
-            "board": DEMO_BOARD,
+            "repo": DEMO_REPO,
             "deal": deal_id,
             "parent": parent_id,
             "child": child_id,

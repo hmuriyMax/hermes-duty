@@ -210,7 +210,7 @@ def kinds(home: Path, deal_id: str) -> list[str]:
 
 def create(client: TestClient, **payload: Any) -> dict[str, Any]:
     """`POST /deals` со значениями по умолчанию: доска, заголовок, тело."""
-    request = {"board": BOARD, "title": "своё дело", "body": "спецификация"}
+    request = {"repo": BOARD, "title": "своё дело", "body": "спецификация"}
     request.update(payload)
     response = client.post("/deals", json=request)
     assert response.status_code == 200, response.text
@@ -268,7 +268,7 @@ def test_create_writes_deal_row_and_created_event(home: Path, client: TestClient
 
 def test_create_with_unknown_parent_is_error_not_500(home: Path, client: TestClient) -> None:
     """Несуществующий родитель — `errors[]` и 400, а не падение роута."""
-    response = client.post("/deals", json={"board": BOARD, "title": "ребёнок", "parents": ["d_deadbeef"]})
+    response = client.post("/deals", json={"repo": BOARD, "title": "ребёнок", "parents": ["d_deadbeef"]})
 
     assert response.status_code == 400
     body = response.json()
@@ -280,7 +280,7 @@ def test_create_with_unknown_parent_is_error_not_500(home: Path, client: TestCli
 
 def test_create_on_unknown_board_is_error(home: Path, client: TestClient) -> None:
     """Доска, которой нет ни в kanban, ни в store, не заводится молча."""
-    response = client.post("/deals", json={"board": "no-such-board", "title": "дело"})
+    response = client.post("/deals", json={"repo": "no-such-board", "title": "дело"})
 
     assert response.status_code == 400
     assert "no-such-board" in response.json()["errors"][0]["reason"]
@@ -289,7 +289,7 @@ def test_create_on_unknown_board_is_error(home: Path, client: TestClient) -> Non
 
 def test_create_requires_title_and_board(client: TestClient) -> None:
     """Пустой title или board — ошибка входа, а не дело без имени."""
-    for payload in ({"board": BOARD, "title": "  "}, {"board": "", "title": "дело"}):
+    for payload in ({"repo": BOARD, "title": "  "}, {"repo": "", "title": "дело"}):
         response = client.post("/deals", json=payload)
         assert response.status_code == 400
         assert response.json()["errors"], payload
@@ -334,7 +334,7 @@ def test_event_write_failure_rolls_back_deal_row(
 
     monkeypatch.setattr(journal, "append_in_tx", boom)
     with pytest.raises(RuntimeError, match="журнал недоступен"):
-        TestClient(app).post("/deals", json={"board": BOARD, "title": "не должно остаться"})
+        TestClient(app).post("/deals", json={"repo": BOARD, "title": "не должно остаться"})
     # store мог быть создан (файл и схема), но строки дела в нём нет
     assert deal_rows(home) == []
 
@@ -1042,7 +1042,6 @@ def append_journal(home: Path, deal_id: str, items: list[tuple[str, int, dict[st
             [
                 {
                     "deal_id": deal_id,
-                    "board": BOARD,
                     "kind": kind,
                     "ts": ts,
                     "recorded_at": ts,
@@ -1308,7 +1307,7 @@ def test_cli_create_comment_complete(home: Path, client: TestClient, capsys: pyt
     sys.modules[spec.name] = cli
     spec.loader.exec_module(cli)
 
-    assert cli.main(["create", "--board", BOARD, "--title", "из терминала", "--json"]) == 0
+    assert cli.main(["create", "--repo", BOARD, "--title", "из терминала", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     deal_id = payload["id"]
     assert deal_id.startswith("d_")
@@ -1411,7 +1410,7 @@ def test_external_ref_dedups_only_on_its_own_board(home: Path, client: TestClien
     conn.close()
 
     first = create(client, external_ref="jira:RP-14080")
-    second = create(client, board=other, external_ref="jira:RP-14080")
+    second = create(client, repo=other, external_ref="jira:RP-14080")
 
     assert second["created"] is True
     assert second["id"] != first["id"]
@@ -1423,16 +1422,16 @@ def test_dedup_window_lets_a_stale_live_deal_go(home: Path) -> None:
     conn = store(home)
     try:
         first = deals.create_deal(
-            conn, board=BOARD, title="первое", external_ref="jira:RP-7",
-            known_boards=[BOARD], now=NOW,
+            conn, repo=BOARD, title="первое", external_ref="jira:RP-7",
+            now=NOW,
         )
         same = deals.create_deal(
-            conn, board=BOARD, title="повтор", external_ref="jira:RP-7",
-            known_boards=[BOARD], now=NOW + 10, dedup_window=60,
+            conn, repo=BOARD, title="повтор", external_ref="jira:RP-7",
+            now=NOW + 10, dedup_window=60,
         )
         stale = deals.create_deal(
-            conn, board=BOARD, title="продолжение", external_ref="jira:RP-7",
-            known_boards=[BOARD], now=NOW + 600, dedup_window=60,
+            conn, repo=BOARD, title="продолжение", external_ref="jira:RP-7",
+            now=NOW + 600, dedup_window=60,
         )
     finally:
         conn.close()
@@ -1445,7 +1444,7 @@ def test_dedup_window_lets_a_stale_live_deal_go(home: Path) -> None:
 
 def test_empty_external_ref_is_input_error(home: Path, client: TestClient) -> None:
     """Пустое имя — ошибка входа, а не второй способ сказать «без имени»."""
-    response = client.post("/deals", json={"board": BOARD, "title": "дело", "external_ref": "   "})
+    response = client.post("/deals", json={"repo": BOARD, "title": "дело", "external_ref": "   "})
 
     assert response.status_code == 400
     assert "external_ref" in response.json()["errors"][0]["reason"]
@@ -1497,7 +1496,7 @@ def test_cli_create_with_external_ref_is_idempotent(
     """CLI: флаг `--external-ref` и `--json` с `deal_id`, `created`, `status`."""
     cli = cli_module()
     argv = [
-        "create", "--board", BOARD, "--title", "из терминала",
+        "create", "--repo", BOARD, "--title", "из терминала",
         "--external-ref", "jira:RP-14080", "--json",
     ]
 
@@ -1547,7 +1546,6 @@ def append_attempt(
             [
                 {
                     "deal_id": deal_id,
-                    "board": BOARD,
                     "kind": "attempt_started",
                     "ts": started_at,
                     "recorded_at": started_at,
@@ -1665,7 +1663,6 @@ def test_own_deal_with_closed_attempt_has_no_current_one(home: Path, client: Tes
             [
                 {
                     "deal_id": deal["id"],
-                    "board": BOARD,
                     "kind": "attempt_ended",
                     "ts": moment - 200,
                     "recorded_at": moment - 200,
@@ -1718,7 +1715,6 @@ def end_attempt(
             [
                 {
                     "deal_id": deal_id,
-                    "board": BOARD,
                     "kind": "attempt_ended",
                     "ts": started_at + 120,
                     "recorded_at": started_at + 120,

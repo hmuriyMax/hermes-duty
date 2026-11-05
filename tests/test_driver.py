@@ -144,10 +144,9 @@ def make_deal(conn: sqlite3.Connection, *, spec_path: Optional[Path] = None) -> 
     """Своё дело в store; спека — в `created.payload.spec`, как у `duty create --spec`."""
     created = deals.create_deal(
         conn,
-        board="duty",
+        repo="duty",
         title="Довести дело по спеке",
         body="",
-        known_boards=["duty"],
         spec_path=str(spec_path) if spec_path is not None else None,
         now=NOW,
     )
@@ -176,7 +175,6 @@ def seed(conn: sqlite3.Connection, deal: dict[str, Any], kind: str, payload: dic
                 "ts": ts,
                 "recorded_at": ts,
                 "deal_id": str(deal["id"]),
-                "board": str(deal["board"]),
                 "kind": kind,
                 "payload": payload,
                 "source": "test",
@@ -1489,7 +1487,7 @@ def test_deal_why_and_run_name_the_same_closure(
     report = run(conn, spec, deal, home, Fake())
     monkeypatch.setenv("HERMES_HOME", str(home))
 
-    payload = cli.api().deal(str(deal["board"]), str(deal["id"]))
+    payload = cli.api().deal(str(deal.get("repo")), str(deal["id"]))
     deal_out = cli.render_deal(payload, None, None)
     why_out = cli.render_why(payload)
     run_out = cli.render_run_final(report)

@@ -1,10 +1,15 @@
-/* Hermes Duty — веб-версия (0.0.2).
+/* Hermes Duty — веб-версия (0.0.6).
  *
  * Четыре экрана поверх двух API-ответов плагина:
- *   #/now                    «Сейчас»            — GET /now
- *   #/why                    «Почему стоит»      — GET /now (группировка + evidence)
- *   #/health                 «Здоровье»          — GET /stats
- *   #/deal/<board>/<task_id> «Дело»              — GET /deal/{board}/{id} + /duty/.../attempts
+ *   #/now             «Сейчас»            — GET /now
+ *   #/why             «Почему стоит»      — GET /now (группировка + evidence)
+ *   #/health          «Здоровье»          — GET /stats
+ *   #/deal/<deal_id>  «Дело»              — GET /deal/{deal_id} + /duty/{deal_id}/attempts
+ *
+ * Дело адресуется ТОЛЬКО своим id `d_<hex>` (0.0.6: доски нет). Прежний адрес
+ * `#/deal/<board>/<id>` — отказ: страница называет, что доски больше нет, вместо
+ * того чтобы открыть полусломанную карточку. Список дел группируется по `repo`,
+ * дела без репозитория — отдельной группой и последней.
  *
  * Шейпер ответов не дублируется: он импортируется из `./model.js`, а бэкенд
  * отдаёт тот же файл, что вшит в десктопный плагин. Таксономия состояний и
@@ -15,16 +20,21 @@
  * заголовком `X-Hermes-Session-Token` ко всем `/api/plugins/hermes-duty/*`.
  */
 import {
+  ALL_REPOS,
+  WITHOUT_REPO_LABEL,
   filterNow,
   fmtAge,
   fmtClock,
+  groupStatesText,
   humanLine,
   noticeLines,
+  repoLabel,
   shapeAttempts,
   shapeDeal,
   shapeDealTime,
   shapeNow,
   shapeStages,
+  stateLabel,
   stateMeta,
 } from './model.js'
 
@@ -104,7 +114,7 @@ let stampAt = null
 let ticker = null
 
 const snap = { data: null, error: null, loading: false }
-const filter = { board: '', states: new Set(), query: '', effQuery: '' }
+const filter = { repo: ALL_REPOS, states: new Set(), query: '', effQuery: '' }
 const health = { data: null, error: null, loading: false }
 const dealSnap = { key: '', data: null, attempts: null, error: null, loading: false }
 
@@ -155,13 +165,19 @@ function dealRow(deal) {
     deal.leaseExpiresIn === null
       ? `лизинг: ${deal.leaseState}`
       : `лизинг: ${deal.leaseState}, ${deal.leaseExpiresIn > 0 ? 'ещё' : 'истёк'} ${fmtAge(Math.abs(deal.leaseExpiresIn))}`
+  // Адрес дела — только его id (0.0.6): доски в маршруте больше нет.
   const open = () => {
-    location.hash = `#/deal/${encodeURIComponent(deal.board)}/${encodeURIComponent(deal.id)}`
+    location.hash = `#/deal/${encodeURIComponent(deal.id)}`
   }
   return h(
     'tr',
-    { class: 'row', tabindex: '0', title: deal.evidence || '', onclick: open, onkeydown: (e) => (e.key === 'Enter' ? open() : null) },
-    h('td', { class: 'mono' }, deal.board),
+    {
+      class: 'row',
+      tabindex: '0',
+      title: [deal.repoLabel, deal.evidence].filter(Boolean).join(' · '),
+      onclick: open,
+      onkeydown: (e) => (e.key === 'Enter' ? open() : null),
+    },
     h('td', { class: 'mono' }, deal.id),
     h('td', { class: 'ttl', title: deal.titleFull }, deal.title),
     h('td', null, deal.assignee),
@@ -175,11 +191,23 @@ function dealRow(deal) {
   )
 }
 
+/**
+ * Группа списка — репозиторий (0.0.6). Заголовок называет репозиторий и число
+ * дел в нём; состояния группы подписаны одной строкой, чтобы «ждёт ответа» не
+ * терялось при смене группировки. Столбца «репозиторий» в строках нет — он был бы
+ * повтором заголовка группы.
+ */
 function groupBlock(group) {
   return h(
     'section',
     { class: 'grp' },
-    h('div', { class: 'grp-h' }, Badge(group.state, null, group.label), h('span', { class: 'n' }, `${group.count}`)),
+    h(
+      'div',
+      { class: 'grp-h' },
+      h('span', { class: group.repo ? 'grp-k mono' : 'grp-k mono muted', title: group.repo || 'репозиторий не назван' }, group.label),
+      h('span', { class: 'n' }, `${group.count}`),
+      h('span', { class: 'grp-s muted' }, groupStatesText(group)),
+    ),
     h(
       'table',
       null,
@@ -189,7 +217,6 @@ function groupBlock(group) {
         h(
           'tr',
           null,
-          h('th', null, 'доска'),
           h('th', null, 'дело'),
           h('th', null, 'заголовок'),
           h('th', null, 'исполнитель'),
@@ -205,11 +232,28 @@ function groupBlock(group) {
   )
 }
 
+/**
+ * Фильтр по репозиторию вместо доски: `ALL_REPOS` — все дела, пустое значение —
+ * ровно дела без репозитория (так же их отличает роут: `?repo=`). Список
+ * репозиториев — состав store из `/now.repos`, а не только видимый срез: иначе
+ * фильтр по репозиторию с одними закрытыми делами было бы не выбрать.
+ */
 function filtersBlock(model) {
   const toggle = (state) => {
     if (filter.states.has(state)) filter.states.delete(state)
     else filter.states.add(state)
     render()
+  }
+  const options = [h('option', { value: ALL_REPOS, selected: filter.repo === ALL_REPOS }, 'все репозитории')]
+  if (model.withoutRepo > 0) {
+    options.push(
+      h('option', { value: '', selected: filter.repo === '' }, `${WITHOUT_REPO_LABEL} (${model.withoutRepo})`),
+    )
+  }
+  for (const item of model.repos.list) {
+    options.push(
+      h('option', { value: item.repo, selected: filter.repo === item.repo }, `${item.repo} (${item.deals})`),
+    )
   }
   return h(
     'div',
@@ -217,16 +261,13 @@ function filtersBlock(model) {
     h(
       'select',
       {
-        title: 'Фильтр по доске',
+        title: 'Фильтр по репозиторию',
         onchange: (e) => {
-          filter.board = e.target.value
+          filter.repo = e.target.value
           render()
         },
       },
-      h('option', { value: '' }, 'все доски'),
-      ...model.boards.map((board) =>
-        h('option', { value: board.slug, selected: filter.board === board.slug }, board.read ? board.slug : `${board.slug} (недоступна)`),
-      ),
+      ...options,
     ),
     h(
       'div',
@@ -245,9 +286,8 @@ function filtersBlock(model) {
       ),
       ...model.stateOrder.map((state) => {
         const meta = stateMeta(state)
-        // Подпись чипа — та же, что у группы: «ждёт ответа» стоит только там,
-        // где в этом состоянии действительно есть вопрос.
-        const group = model.groups.find((item) => item.state === state)
+        // Подпись чипа — та же, что у бейджа: «ждёт ответа» стоит только там,
+        // где в этом состоянии действительно есть вопрос (видимые дела).
         return h(
           'button',
           {
@@ -255,7 +295,7 @@ function filtersBlock(model) {
             title: state,
             onclick: () => toggle(state),
           },
-          group ? group.label : meta.label,
+          stateLabel(state, model.deals),
           h('span', { class: 'n' }, `${model.byState[state] || 0}`),
         )
       }),
@@ -323,7 +363,11 @@ function viewNow() {
         'div',
         { class: 'empty' },
         h('b', null, model.count > 0 ? 'под фильтры ничего не подошло' : 'нет активных дел'),
-        h('span', { class: 'muted' }, `прочитано досок: ${model.boardsRead} из ${model.boardsTotal}`),
+        h(
+          'span',
+          { class: 'muted' },
+          `репозиториев в store: ${model.repoCount} · дел без репозитория: ${model.withoutRepo}`,
+        ),
         lines.length ? h('ul', null, ...lines.map((line) => h('li', null, line))) : null,
       ),
     )
@@ -337,7 +381,7 @@ function viewNow() {
 
 function whyCard(deal) {
   const open = () => {
-    location.hash = `#/deal/${encodeURIComponent(deal.board)}/${encodeURIComponent(deal.id)}`
+    location.hash = `#/deal/${encodeURIComponent(deal.id)}`
   }
   return h(
     'article',
@@ -347,7 +391,7 @@ function whyCard(deal) {
       'div',
       { class: 'why-meta' },
       Badge(deal.state, deal.humanKind),
-      h('span', { class: 'mono' }, `${deal.board} · ${deal.id}`),
+      h('span', { class: 'mono' }, `${deal.repoLabel} · ${deal.id}`),
       h('span', { class: 'muted' }, deal.assignee),
     ),
     h('div', { class: 'why-evidence', text: deal.evidence || 'доказательство не записано' }),
@@ -356,7 +400,7 @@ function whyCard(deal) {
       { class: 'why-foot' },
       h('span', null, `попытка: ${deal.attemptAgeText} (${deal.attemptNote})`),
       h('span', null, `действие: ${deal.lastActionAgeText} назад`),
-      h('a', { href: `#/deal/${encodeURIComponent(deal.board)}/${encodeURIComponent(deal.id)}`, onclick: open }, 'открыть дело →'),
+      h('a', { href: `#/deal/${encodeURIComponent(deal.id)}`, onclick: open }, 'открыть дело →'),
     ),
   )
 }
@@ -389,7 +433,7 @@ function viewWhy() {
     return h('div', null, ...parts)
   }
 
-  for (const group of model.groups) {
+  for (const group of model.stateGroups) {
     parts.push(
       h('div', { class: 'sec-h' }, h('h2', null, group.label), h('span', { class: 'num' }, `${group.count} · ${group.state}`)),
     )
@@ -427,8 +471,8 @@ function kpi(title, value, sub, barPct) {
 
 function taxonomy(stats) {
   const totals = stats.totals
-  const entries = Object.entries(totals.runs_by_outcome || {}).sort((a, b) => b[1] - a[1])
-  if (!entries.length) return h('div', { class: 'empty' }, h('b', null, 'ранов нет'), h('span', { class: 'muted' }, 'таксономия исходов считается по task_runs'))
+  const entries = Object.entries(totals.attempts_by_outcome || {}).sort((a, b) => b[1] - a[1])
+  if (!entries.length) return h('div', { class: 'empty' }, h('b', null, 'попыток нет'), h('span', { class: 'muted' }, 'таксономия считается по журналу дел'))
   const max = entries[0][1] || 1
   const crashes = new Set(stats.crash_outcomes || [])
   const success = new Set(stats.success_outcomes || [])
@@ -448,55 +492,54 @@ function taxonomy(stats) {
   )
 }
 
-function boardTable(stats) {
-  const rows = stats.boards.map((board) => {
-    if (!board.read) {
-      return h(
-        'tr',
-        null,
-        h('td', { class: 'mono' }, board.slug),
-        h('td', { colspan: '5', class: 'muted' }, board.note || 'доска недоступна'),
-      )
-    }
-    const share = board.first_try.share
+/**
+ * Таблица «по репозиториям»: те же группы и числа, что печатает `bin/duty stats`.
+ *
+ * Источник — `repos[]` и `without_repo` ответа `/stats`: доски в статистике не
+ * участвуют (0.0.6), «без репозитория» — законная строка, а не пропуск.
+ */
+function repoTable(stats) {
+  const groups = [...(stats.repos || []), ...(stats.without_repo && stats.without_repo.deals ? [stats.without_repo] : [])]
+  const rows = groups.map((group) => {
+    const share = group.first_try.share
     return h(
       'tr',
       null,
-      h('td', { class: 'mono' }, board.slug),
-      h('td', { class: 'n' }, `${board.tasks_total}`),
-      h('td', { class: 'n' }, `${board.runs_total}`),
-      h('td', { class: 'n' }, `${board.first_try.ok}/${board.first_try.with_runs} · ${pct(share)}`),
-      h('td', { class: 'n' }, board.waiting_sec.p50 === null ? '—' : `${fmtAge(board.waiting_sec.p50)} / ${fmtAge(board.waiting_sec.p90)}`),
-      h(
-        'td',
-        { class: 'muted' },
-        [board.truncated ? 'срез обрезан лимитом' : '', ...(board.warnings || [])].filter(Boolean).join('; ') || '—',
-      ),
+      h('td', { class: 'mono' }, group.repo || WITHOUT_REPO_LABEL),
+      h('td', { class: 'n' }, `${group.deals}`),
+      h('td', { class: 'n' }, `${group.attempts_total}`),
+      h('td', { class: 'n' }, `${group.first_try.ok}/${group.first_try.closed} · ${pct(share)}`),
+      h('td', { class: 'n' }, group.waiting_sec.p50 === null ? '—' : `${fmtAge(group.waiting_sec.p50)} / ${fmtAge(group.waiting_sec.p90)}`),
+      h('td', { class: 'n' }, group.waiting_sec.count ? `${group.waiting_sec.count}` : '—'),
+      h('td', { class: 'muted' }, '—'),
     )
   })
   return h(
     'div',
     { class: 'panel' },
-    h('div', { class: 'panel-h' }, 'по доскам'),
-    h(
-      'table',
-      null,
-      h(
-        'thead',
-        null,
-        h(
-          'tr',
+    h('div', { class: 'panel-h' }, 'по репозиториям'),
+    groups.length
+      ? h(
+          'table',
           null,
-          h('th', null, 'доска'),
-          h('th', null, 'задач'),
-          h('th', null, 'ранов'),
-          h('th', null, 'с первой попытки'),
-          h('th', null, 'ожидание p50 / p90'),
-          h('th', null, 'неполнота'),
-        ),
-      ),
-      h('tbody', null, ...rows),
-    ),
+          h(
+            'thead',
+            null,
+            h(
+              'tr',
+              null,
+              h('th', null, 'репозиторий'),
+              h('th', null, 'дел'),
+              h('th', null, 'попыток'),
+              h('th', null, 'с первой попытки'),
+              h('th', null, 'ожидание p50 / p90'),
+              h('th', null, 'ожиданий'),
+              h('th', null, 'неполнота'),
+            ),
+          ),
+          h('tbody', null, ...rows),
+        )
+      : h('div', { class: 'panel-b muted' }, 'дел в store нет: считать нечего'),
   )
 }
 
@@ -506,17 +549,19 @@ function viewHealth() {
 
   const stats = health.data
   const totals = stats.totals
+  const repos = stats.repos || []
+  const without = stats.without_repo || null
+  // Падения — по наборам исходов бэкенда, а не по своему списку.
   const crashes = new Set(stats.crash_outcomes || [])
-  const crashRuns = Object.entries(totals.runs_by_outcome || {})
+  const outcomeEntries = Object.entries(totals.attempts_by_outcome || {})
+  const crashRuns = outcomeEntries
     .filter(([key]) => crashes.has(key))
     .reduce((acc, [, count]) => acc + count, 0)
-  const crashShare = totals.runs_total ? crashRuns / totals.runs_total : null
-  const readBoards = stats.boards.filter((board) => board.read).length
 
   const parts = []
   if (health.error) parts.push(errorBanner(`обновление не удалось: ${health.error}`, loadHealth))
   if (stats.errors.length) {
-    parts.push(noticesBlock(stats.errors.map((err) => `источник ${err.board} недоступен: ${err.reason}`)))
+    parts.push(noticesBlock(stats.errors.map((err) => `источник ${err.source} недоступен: ${err.reason}`)))
   }
   if (stats.warnings && stats.warnings.length) parts.push(noticesBlock(stats.warnings))
 
@@ -527,7 +572,7 @@ function viewHealth() {
       kpi(
         'дела с первой попытки',
         pct(totals.first_try.share),
-        `${totals.first_try.ok} из ${totals.first_try.with_runs} дел, у которых были раны`,
+        `${totals.first_try.ok} из ${totals.first_try.closed} этапов, закрытых попытками`,
         totals.first_try.share === null ? null : Math.round(totals.first_try.share * 100),
       ),
       kpi(
@@ -537,16 +582,20 @@ function viewHealth() {
           ? `p99: ${fmtAge(totals.waiting_sec.p99)} · максимум: ${fmtAge(totals.waiting_sec.max)} · выборка: ${totals.waiting_sec.count} дел (created_at → started_at)`
           : 'выборки нет: у дел среза нет ни одного рана (created_at → started_at)',
       ),
-      kpi('ранов всего', `${totals.runs_total}`, `падений: ${crashRuns} · ${pct(crashShare)}`),
-      kpi('прочитано досок', `${readBoards} / ${stats.boards.length}`, `задач в срезе: ${totals.tasks_total}`),
+      kpi('попыток всего', `${totals.attempts_total}`, `падений: ${crashRuns}${totals.attempts_total ? ` · ${pct(crashRuns / totals.attempts_total)}` : ''}`),
+      kpi(
+        'репозиториев',
+        `${repos.length}`,
+        `дел в store: ${totals.deals} · без репозитория: ${without ? without.deals : 0}`,
+      ),
     ),
   )
 
-  parts.push(h('div', { class: 'sec-h' }, h('h2', null, 'таксономия исходов'), h('span', { class: 'num' }, 'по всем ранам')))
+  parts.push(h('div', { class: 'sec-h' }, h('h2', null, 'таксономия исходов попыток'), h('span', { class: 'num' }, 'по журналу дел')))
   parts.push(h('div', { class: 'panel' }, h('div', { class: 'panel-b' }, taxonomy(stats))))
 
-  parts.push(h('div', { class: 'sec-h' }, h('h2', null, 'доски')))
-  parts.push(boardTable(stats))
+  parts.push(h('div', { class: 'sec-h' }, h('h2', null, 'репозитории')))
+  parts.push(repoTable(stats))
 
   parts.push(
     h(
@@ -555,7 +604,7 @@ function viewHealth() {
       h(
         'div',
         null,
-        'Как это считается: успех попытки — исход рана из набора успеха (передаётся бэкендом), падение — из набора crash. «С первой попытки» — у дела первый по времени ран уже успешен. p50/p90/p99 ожидания — метод ближайшего ранга (позиция ceil(p/100 · n) в возрастающем ряду, без интерполяции) по объединённой выборке; обрезанный срез доски помечен в колонке «неполнота» и в предупреждениях выше, чтобы доля и распределение не выглядели полными.',
+        'Как это считается: успех попытки — исход из набора успеха (передаётся бэкендом), падение — из набора crash. «С первой попытки» — этап журнала закрыт первой же попыткой и успешно. p50/p90/p99 ожидания — метод ближайшего ранга (позиция ceil(p/100 · n) в возрастающем ряду, без интерполяции) по объединённой выборке дел репозитория. Группа — `repo` строки дела; доски в статистике не участвуют.',
       ),
     ),
   )
@@ -566,12 +615,14 @@ function viewHealth() {
 
 // «Дело» — полноценный экран: таб открывает последнее открытое дело, а если
 // такого нет — список активных дел, из которого видно, куда идти. Запоминаем в
-// localStorage: переключение табов не должно терять контекст.
+// localStorage: переключение табов не должно терять контекст. Адрес дела — его id
+// (0.0.6): доски в ключе больше нет, и старый ключ `board/id` при чтении просто не
+// совпадёт с форматом — покажется «последнего нет», а не битая ссылка.
 const LAST_DEAL = 'duty:last-deal'
 
-function rememberDeal(board, id) {
+function rememberDeal(dealId) {
   try {
-    localStorage.setItem(LAST_DEAL, `${board}/${id}`)
+    localStorage.setItem(LAST_DEAL, String(dealId))
   } catch {
     /* приватный режим / выключенное хранилище — не повод ломать экран */
   }
@@ -584,13 +635,14 @@ function lastDeal() {
   } catch {
     return null
   }
-  const [board, id] = raw.split('/')
-  return board && id ? { board, id } : null
+  // Прежний ключ был `board/id` — два сегмента; такой адрес больше не открыть.
+  if (!raw || raw.includes('/')) return null
+  return { id: raw }
 }
 
-async function loadDeal(board, taskId) {
-  rememberDeal(board, taskId)
-  const key = `${board}/${taskId}`
+async function loadDeal(dealId) {
+  rememberDeal(dealId)
+  const key = String(dealId)
   if (dealSnap.key !== key) {
     dealSnap.key = key
     dealSnap.data = null
@@ -600,8 +652,8 @@ async function loadDeal(board, taskId) {
   dealSnap.loading = true
   try {
     const [detail, attempts] = await Promise.all([
-      api(`/deal/${encodeURIComponent(board)}/${encodeURIComponent(taskId)}`),
-      api(`/duty/${encodeURIComponent(board)}/${encodeURIComponent(taskId)}/attempts`),
+      api(`/deal/${encodeURIComponent(dealId)}`),
+      api(`/duty/${encodeURIComponent(dealId)}/attempts`),
     ])
     if (dealSnap.key === key) {
       dealSnap.data = detail
@@ -632,7 +684,7 @@ function viewDealPicker() {
         'div',
         { class: 'note' },
         h('div', null, 'последнее открытое: '),
-        h('a', { href: `#/deal/${encodeURIComponent(last.board)}/${encodeURIComponent(last.id)}` }, `${last.board}/${last.id}`),
+        h('a', { href: `#/deal/${encodeURIComponent(last.id)}` }, last.id),
       ),
     )
   }
@@ -642,6 +694,32 @@ function viewDealPicker() {
   }
   parts.push(...(model.groups.length ? model.groups.map(groupBlock) : [h('div', { class: 'empty' }, 'активных дел нет')]))
   return h('div', null, ...parts)
+}
+
+/**
+ * Отказ по старому адресу дела: `#/deal/<board>/<id>`.
+ *
+ * Молча открыть дело по второму сегменту значило бы оставить в закладках адрес,
+ * которого нет; показать половину карточки — выдать отказ за успех. Поэтому экран
+ * называет, что доски больше нет, и даёт ссылку на id из прежнего адреса.
+ */
+function viewDealBadAddress(board, dealId) {
+  const id = dealId && /^d_[0-9a-f]+$/i.test(dealId) ? dealId : ''
+  return h(
+    'div',
+    { class: 'empty' },
+    h('b', null, 'так дело больше не адресуется'),
+    h(
+      'span',
+      { class: 'muted' },
+      `в адресе ${board}/${dealId} первая часть — доска, а досок с 0.0.6 нет: дело называется своим id d_<hex>.`,
+    ),
+    id
+      ? h('a', { href: `#/deal/${encodeURIComponent(id)}` }, `открыть ${id} →`)
+      : h('span', { class: 'muted' }, 'id дела выглядит как d_<hex> — возьмите его из списка.'),
+    h('a', { href: '#/deal' }, '← к списку дел'),
+    h('a', { href: '#/now' }, '← к срезу «сейчас»'),
+  )
 }
 
 /* ------------------------------------------------- лента этапов и попыток */
@@ -973,12 +1051,12 @@ function attemptCard(attempt) {
   )
 }
 
-function viewDeal(board, taskId) {
+function viewDeal(dealId) {
   if (dealSnap.error && !dealSnap.data) {
     return h(
       'div',
       null,
-      errorBanner(dealSnap.error, () => loadDeal(board, taskId)),
+      errorBanner(dealSnap.error, () => loadDeal(dealId)),
       h('a', { href: '#/deal' }, '← к списку дел'),
     )
   }
@@ -999,7 +1077,7 @@ function viewDeal(board, taskId) {
   const head = h(
     'div',
     { class: 'deal-head' },
-    h('div', { class: 'mono muted' }, `${data.board} · ${data.id}`),
+    h('div', { class: 'mono muted' }, `${repoLabel(data.repo)} · ${data.id}`),
     h('h1', null, data.title || '—'),
     h(
       'div',
@@ -1052,9 +1130,11 @@ function parseRoute() {
   const raw = (location.hash || '#/now').replace(/^#/, '')
   const parts = raw.split('/').filter(Boolean)
   if (parts[0] === 'deal') {
-    return parts[1] && parts[2]
-      ? { name: 'deal', board: decodeURIComponent(parts[1]), id: decodeURIComponent(parts[2]) }
-      : { name: 'deal' }
+    // Адрес дела — один сегмент: `#/deal/<d_hex>`. Два сегмента — прежний адрес
+    // `#/deal/<board>/<id>`; он получает отказ, а не открытую наполовину карточку.
+    if (parts.length > 2) return { name: 'deal', bad: true, board: decodeURIComponent(parts[1]), id: decodeURIComponent(parts[2]) }
+    if (parts[1]) return { name: 'deal', id: decodeURIComponent(parts[1]) }
+    return { name: 'deal' }
   }
   if (parts[0] === 'why') return { name: 'why' }
   if (parts[0] === 'health') return { name: 'health' }
@@ -1066,7 +1146,8 @@ function render() {
   if (route.name === 'now') body.append(viewNow())
   else if (route.name === 'why') body.append(viewWhy())
   else if (route.name === 'health') body.append(viewHealth())
-  else body.append(route.board ? viewDeal(route.board, route.id) : viewDealPicker())
+  else if (route.bad) body.append(viewDealBadAddress(route.board, route.id))
+  else body.append(route.id ? viewDeal(route.id) : viewDealPicker())
 
   for (const link of document.querySelectorAll('#tabs a')) {
     link.classList.toggle('on', link.dataset.tab === route.name)
@@ -1086,7 +1167,8 @@ function run() {
   if (route.name === 'now') void loadNow()
   else if (route.name === 'why') void loadNow()
   else if (route.name === 'health') void loadHealth()
-  else if (route.board) void loadDeal(route.board, route.id)
+  else if (route.bad) void loadNow()
+  else if (route.id) void loadDeal(route.id)
   else void loadNow()
 }
 

@@ -3,8 +3,8 @@
   "count": 8,
   "deals": [
     {
-      "board": "hermes-tickets",
-      "id": "t_a1b2c3d4",
+      "repo": "~/go/src/gitlab.ozon.ru/sx/sx-widgets-api",
+      "id": "d_a1b2c3d4",
       "title": "IMPL: страница /duty — экран «сейчас» и таймлайн попыток с длинным заголовком, который обязан обрезаться многоточием в строке таблицы",
       "assignee": "implementer",
       "status": "blocked",
@@ -48,8 +48,8 @@
       }
     },
     {
-      "board": "ozon",
-      "id": "t_ca900001",
+      "repo": "~/go/src/gitlab.ozon.ru/sx/sx-widgets-api",
+      "id": "d_ca900001",
       "title": "DEPS: поднять realtime-config-go до v1.18 в qaravai",
       "assignee": "implementer",
       "status": "blocked",
@@ -77,8 +77,8 @@
       }
     },
     {
-      "board": "hermes-duty",
-      "id": "t_dead0001",
+      "repo": "~/.hermes/plugins/hermes-duty",
+      "id": "d_dead0001",
       "title": "PUBLISH: выкатить release/v0.0.1 в main",
       "assignee": "publisher",
       "status": "running",
@@ -121,8 +121,8 @@
       }
     },
     {
-      "board": "ozon",
-      "id": "t_cra5h001",
+      "repo": "~/go/src/gitlab.ozon.ru/review/pinned-review-service",
+      "id": "d_cra5h001",
       "title": "FIX: flaky-тест TestAggregateNow в pinned-review-service",
       "assignee": "tester",
       "status": "running",
@@ -165,8 +165,8 @@
       }
     },
     {
-      "board": "hermes-tickets",
-      "id": "t_w0rk0001",
+      "repo": "~/.hermes/plugins/hermes-duty",
+      "id": "d_w0rk0001",
       "title": "IMPL: правая панель тикета — контекст Jira",
       "assignee": "implementer",
       "status": "running",
@@ -209,8 +209,8 @@
       }
     },
     {
-      "board": "ozon",
-      "id": "t_0519a001",
+      "repo": null,
+      "id": "d_0519a001",
       "title": "FIX: разобрать дело, оставленное в running после падения воркера",
       "assignee": "implementer",
       "status": "running",
@@ -238,8 +238,8 @@
       }
     },
     {
-      "board": "default",
-      "id": "t_51070001",
+      "repo": null,
+      "id": "d_51070001",
       "title": "RESEARCH: сравнить два подхода к хранению журнала дел",
       "assignee": "researcher",
       "status": "ready",
@@ -267,8 +267,8 @@
       }
     },
     {
-      "board": "hermes-duty",
-      "id": "t_6a7e0001",
+      "repo": "~/go/src/gitlab.ozon.ru/review/pinned-review-service",
+      "id": "d_6a7e0001",
       "title": "IMPL: экран «почему стоит» — группировка по состояниям",
       "assignee": "implementer",
       "status": "todo",
@@ -292,7 +292,7 @@
       "last_run": null,
       "waiting": {
         "state": "wait_gate",
-        "evidence": "незавершённые родители: t_d0d7e8bc (running)"
+        "evidence": "незавершённые родители: d_d0d7e8bc (running)"
       }
     }
   ],
@@ -306,54 +306,37 @@
     "wait_slot": 1,
     "wait_gate": 1
   },
-  "crash_outcomes": ["crashed", "gave_up", "spawn_failed", "timed_out"],
-  "boards": [
-    {
-      "slug": "hermes-tickets",
-      "path": "/Users/example/.hermes/kanban/boards/hermes-tickets/kanban.db",
-      "read": true,
-      "deals": 2,
-      "truncated": false,
-      "warnings": []
-    },
-    {
-      "slug": "ozon",
-      "path": "/Users/example/.hermes/kanban/boards/ozon/kanban.db",
-      "read": true,
-      "deals": 3,
-      "truncated": false,
-      "warnings": ["task_events: no such column: run_id"]
-    },
-    {
-      "slug": "hermes-duty",
-      "path": "/Users/example/.hermes/kanban/boards/hermes-duty/kanban.db",
-      "read": true,
-      "deals": 2,
-      "truncated": false,
-      "warnings": []
-    },
-    {
-      "slug": "default",
-      "path": "/Users/example/.hermes/kanban.db",
-      "read": true,
-      "deals": 1,
-      "truncated": false,
-      "warnings": []
-    },
-    {
-      "slug": "ozon-legacy",
-      "path": "/Users/example/.hermes/kanban/boards/ozon-legacy/kanban.db",
-      "read": false,
-      "deals": 0
-    }
+  "crash_outcomes": [
+    "crashed",
+    "gave_up",
+    "spawn_failed",
+    "timed_out"
   ],
+  "repos": {
+    "list": [
+      {
+        "repo": "~/.hermes/plugins/hermes-duty",
+        "deals": 2
+      },
+      {
+        "repo": "~/go/src/gitlab.ozon.ru/review/pinned-review-service",
+        "deals": 2
+      },
+      {
+        "repo": "~/go/src/gitlab.ozon.ru/sx/sx-widgets-api",
+        "deals": 2
+      }
+    ],
+    "without_repo": 2,
+    "read": true
+  },
   "errors": [
     {
-      "board": "ozon-legacy",
-      "reason": "unable to open database file"
+      "source": "duty/duty.db",
+      "reason": "store: unreadable: unable to open database file"
     },
     {
-      "board": "messaging/pool.db",
+      "source": "messaging/pool.db",
       "reason": "questions truncated: more than 200 live questions"
     }
   ]

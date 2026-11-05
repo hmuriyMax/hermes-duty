@@ -62,9 +62,21 @@ test('четыре экрана маршрутизируются', () => {
 })
 
 test('«Дело» без выбранного дела показывает выбор, а не пустоту', () => {
-  assert.match(app, /route\.board \? viewDeal\(route\.board, route\.id\) : viewDealPicker\(\)/)
+  assert.match(app, /route\.id \? viewDeal\(route\.id\) : viewDealPicker\(\)/)
   assert.match(app, /function viewDealPicker\(\)/)
-  assert.match(app, /localStorage\.setItem\(LAST_DEAL/)
+  assert.match(app, /localStorage\.setItem\(LAST_DEAL, String\(dealId\)\)/)
+})
+
+test('адрес дела — только `#/deal/<deal_id>`; старый `<board>/<id>` получает отказ', () => {
+  // разбор: один сегмент — дело, два — прежний адрес (доски больше нет)
+  assert.match(app, /if \(parts\.length > 2\) return \{ name: 'deal', bad: true, board: /)
+  assert.match(app, /if \(parts\[1\]\) return \{ name: 'deal', id: decodeURIComponent\(parts\[1\]\) \}/)
+  // отказ — своим экраном, а не полусобранной карточкой
+  assert.match(app, /route\.bad\) body\.append\(viewDealBadAddress\(route\.board, route\.id\)\)/)
+  assert.match(app, /function viewDealBadAddress\(board, dealId\)/)
+  assert.match(app, /доски больше нет/)
+  // старый ключ localStorage (два сегмента) не открывается как дело
+  assert.match(app, /raw\.includes\('\/'\)\) return null/)
 })
 
 test('бэкенд монтирует страницу и отдаёт общий шейпер', () => {

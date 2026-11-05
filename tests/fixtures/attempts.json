@@ -1,6 +1,6 @@
 {
-  "board": "hermes-tickets",
-  "task_id": "t_a1b2c3d4",
+  "deal_id": "d_a1b2c3d4",
+  "repo": "~/go/src/gitlab.ozon.ru/sx/sx-widgets-api",
   "title": "IMPL: страница /duty — экран «сейчас» и таймлайн попыток",
   "count": 3,
   "crash_outcomes": ["crashed", "gave_up", "spawn_failed", "timed_out"],
@@ -13,7 +13,7 @@
       "end": 1793630412,
       "duration_sec": 12,
       "outcome": "spawn_failed",
-      "error": "spawn: worker profile 'implementer' is already running a task (t_w0rk0001)",
+      "error": "spawn: worker profile 'implementer' is already running a task (d_w0rk0001)",
       "summary": null,
       "events": [
         { "kind": "claimed", "at": 1793630401, "summary": null },

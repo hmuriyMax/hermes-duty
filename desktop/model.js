@@ -9,6 +9,12 @@
  * ниже — только подписи и цвета бейджей для известных состояний; незнакомое
  * состояние рисуется своим именем серым.
  *
+ * Группировка списка — по `repo` (0.0.6: доски нет): дело адресуется своим
+ * `d_<hex>`, а «чей это рой» показывает репозиторий. Дела без репозитория идут
+ * последней группой `без репозитория`; порядок внутри группы — ответ бэкенда.
+ * Тот же блок `repos` считает CLI, поэтому числа дел и групп совпадают на вебе,
+ * десктопе и в терминале.
+ *
  * Два набора берутся из ответа, а не дублируются тут: порядок состояний — по
  * ключам `by_state` (чипы фильтра), набор «падений» — по `crash_outcomes`
  * (красный тон исхода). Так расширение набора на бэкенде не разъезжается с UI.
@@ -127,6 +133,22 @@ function humanLine(counts) {
   )}`
 }
 
+// Подпись группы «репозиторий не назван»: NULL в `repo` — законное состояние
+// (`dashboard/plugin_api.py`, `_repos_of`), и в списке оно называется словами, а не
+// пустой строкой. Слово то же, что у CLI (`dashboard/cli.py`, WITHOUT_REPO_LABEL):
+// терминал и экран обязаны называть одну группу одинаково.
+const WITHOUT_REPO_LABEL = 'без репозитория'
+
+// Значение фильтра «все репозитории»: путь репозитория не бывает `*`, а пустая
+// строка занята группой «без репозитория» — ровно так же её называет роут
+// (`?repo=` — только дела без репозитория, docs/RUNBOOK.md).
+const ALL_REPOS = '*'
+
+/** Подпись репозитория: путь как есть, дела без него — «без репозитория». */
+function repoLabel(repo) {
+  return String(repo || '') || WITHOUT_REPO_LABEL
+}
+
 /** Возраст/длительность в человекочитаемом виде: `45 с`, `12 мин`, `3 ч`, `2 д`. */
 function fmtAge(sec) {
   if (sec === null || sec === undefined || sec === '') return '—'
@@ -171,6 +193,7 @@ function shapeDeal(deal) {
   const leaseState = String(lease.state || 'none')
   const attemptAge = attempt && attempt.age_sec !== undefined ? attempt.age_sec : null
   const lastAge = action.age_sec !== undefined ? action.age_sec : null
+  const repo = String(d.repo || '')
   // «pid не записан» и «состояние pid неизвестно» (`os.kill` вернул OSError) — разные факты.
   let attemptNote = 'нет попытки'
   if (attempt) {
@@ -182,7 +205,10 @@ function shapeDeal(deal) {
     if (attempt.source === 'task') attemptNote = `${attemptNote}, факты карточки`
   }
   return {
-    board: String(d.board || ''),
+    // Репозиторий дела (0.0.6): доски нет, «чей это рой» показывает группировка.
+    // Пусто — законное состояние «без репозитория», подпись даёт `repoLabel`.
+    repo,
+    repoLabel: repoLabel(repo),
     id: String(d.id || ''),
     title: fmtTitle(d.title),
     titleFull: String(d.title || ''),
@@ -218,77 +244,170 @@ function shapeDeal(deal) {
     stageText: stage
       ? `${String(stage.id || '—')} · попытка ${Number(stage.attempt) || 0}${stage.live === true ? ' · идёт' : ''}`
       : '',
-    search: `${d.board || ''} ${d.id || ''} ${d.title || ''} ${d.assignee || ''} ${waiting.state || ''}`.toLowerCase(),
+    search: `${d.repo || ''} ${d.id || ''} ${d.title || ''} ${d.assignee || ''} ${waiting.state || ''}`.toLowerCase(),
   }
+}
+
+/** Сколько дел в каждом состоянии — по строкам, а не по ответу бэкенда. */
+function stateCounts(deals) {
+  const counts = {}
+  for (const deal of deals || []) {
+    const state = (deal && deal.state) || '—'
+    counts[state] = (counts[state] || 0) + 1
+  }
+  return counts
+}
+
+/**
+ * Подпись состояния для набора строк: `wait_human` с вопросом — «ждёт ответа»,
+ * без вопроса — «ждёт решения» (та же развилка, что у бейджа, см. `stateMeta`).
+ *
+ * Нужна чипам фильтра и подписи группы: подпись считается по видимым делам, а не
+ * берётся из одной группы, которой после 0.0.6 (группировка — репозиторий) уже
+ * нет.
+ */
+function stateLabel(state, deals) {
+  const kinds = new Set(
+    (deals || []).filter((deal) => deal && deal.state === state).map((deal) => deal.humanKind || ''),
+  )
+  return kinds.size === 1 ? stateMeta(state, [...kinds][0]).label : stateMeta(state).label
+}
+
+/**
+ * Группы строк по `repo`: сначала названные репозитории, «без репозитория» —
+ * отдельной группой и последней.
+ *
+ * Порядок названных — по имени: репозиторий это подпись группы, а не приоритет
+ * (приоритет задаёт бэкенд и он виден по строкам — `/now` сортирует дела
+ * `WAITING_PRIORITY`). Внутри группы порядок ответа не пересортировывается, иначе
+ * два опроса одного снимка давали бы разный список. То же самое делает CLI
+ * (`dashboard/cli.py`, `_repo_groups`): числа дел и групп обязаны совпадать.
+ */
+function groupDeals(deals) {
+  const named = new Map()
+  const without = []
+  for (const deal of deals || []) {
+    const repo = String((deal && deal.repo) || '')
+    if (!repo) {
+      without.push(deal)
+      continue
+    }
+    if (!named.has(repo)) named.set(repo, [])
+    named.get(repo).push(deal)
+  }
+  const groups = [...named.keys()].sort().map((repo) => ({
+    key: repo,
+    repo,
+    label: repo,
+    // Выдуманного тона у группы нет: она про репозиторий, а не про ожидание.
+    // Состояния видны в шапке группы и бейджами в строках.
+    tone: '',
+    state: '',
+    count: named.get(repo).length,
+    deals: named.get(repo),
+    byState: stateCounts(named.get(repo)),
+  }))
+  if (without.length) {
+    groups.push({
+      key: '',
+      repo: '',
+      label: WITHOUT_REPO_LABEL,
+      tone: '',
+      state: '',
+      count: without.length,
+      deals: without,
+      byState: stateCounts(without),
+    })
+  }
+  return groups
+}
+
+/**
+ * Состояния группы одной строкой: `ждёт ответа 2 · работает 1`.
+ *
+ * Порядок — по первому появлению в группе (то есть по приоритету ответа), а не
+ * по таблице подписей: второго списка приоритетов в UI нет.
+ */
+function groupStatesText(group) {
+  const rows = []
+  for (const deal of (group && group.deals) || []) {
+    const state = deal.state || '—'
+    const found = rows.find((row) => row.state === state)
+    if (found) {
+      found.count += 1
+      continue
+    }
+    rows.push({ state, count: 1 })
+  }
+  return rows.map((row) => `${stateLabel(row.state, group.deals)} ${row.count}`).join(' · ')
 }
 
 /**
  * Группы строк по `waiting.state` — в порядке первого появления в ответе.
  *
- * `/now` сортирует дела по `WAITING_PRIORITY` бэкенда, поэтому порядок групп
- * получается приоритетным без второго списка приоритетов в UI; строки внутри
- * группы сохраняют порядок ответа.
+ * Нужны экрану «Почему стоит»: там группировка по ожиданию и есть объяснение
+ * («почему стоит» — это состояние), а список дел с 0.0.6 группируется по `repo`.
+ * Порядок групп приоритетный без второго списка приоритетов: `/now` сортирует
+ * дела `WAITING_PRIORITY`, а строки внутри группы сохраняют порядок ответа.
  */
-function groupDeals(deals) {
+function groupByState(deals) {
   const buckets = new Map()
-  for (const deal of deals) {
-    const state = deal.state || '—'
+  for (const deal of deals || []) {
+    const state = (deal && deal.state) || '—'
     if (!buckets.has(state)) buckets.set(state, [])
     buckets.get(state).push(deal)
   }
   const groups = []
   for (const [state, rows] of buckets) {
     const meta = stateMeta(state)
-    // Внутри группы `wait_human` встречаются оба вида: подпись группы говорит
-    // «ждёт ответа», только если вопрос есть у каждого дела в ней; иначе остаётся
-    // базовая — группа с блокировками без вопросов не обещает ответа.
-    const kinds = new Set(rows.map((deal) => deal.humanKind || ''))
-    const label = kinds.size === 1 ? stateMeta(state, [...kinds][0]).label : meta.label
-    groups.push({ state, label, tone: meta.tone, count: rows.length, deals: rows })
+    groups.push({
+      key: state,
+      state,
+      // «ждёт ответа» — только если вопрос есть у каждого дела в группе; иначе
+      // базовая подпись: блокировка без вопроса не обещает ответа.
+      label: stateLabel(state, rows),
+      tone: meta.tone,
+      count: rows.length,
+      deals: rows,
+      byState: stateCounts(rows),
+    })
   }
   return groups
 }
 
+/** Группировка-состав репозиториев из ответа (`/now.repos`, `/stats.repos`). */
+function shapeRepos(raw) {
+  const data = raw && typeof raw === 'object' ? raw : {}
+  const list = (Array.isArray(data.list) ? data.list : [])
+    .map((item) => ({ repo: String((item && item.repo) || ''), deals: Number(item && item.deals) || 0 }))
+    .filter((item) => item.repo)
+  return {
+    list,
+    withoutRepo: Number(data.without_repo) || 0,
+    // `read: false` — store дел не прочитался: «репозиториев нет» и «группировка не
+    // посчитана» разные факты, и экран не имеет права показывать первое вместо второго.
+    read: data.read !== false,
+  }
+}
+
 /**
- * Модель экрана из ответа `/now`: строки, группы, доски и честный счётчик ошибок.
+ * Модель экрана из ответа `/now`: строки, группы по репозиториям и честные ошибки
+ * источников.
  *
- * `boards` отвечает на вопрос «сколько досок реально прочиталось»: запись с
- * `read !== true` — недоступная доска, её причина берётся из `errors`. Ошибки, не
- * относящиеся к доске (например, недоступный пул вопросов), уходят отдельно в
- * `otherErrors` — их нельзя выдавать за «доска недоступна».
+ * Досок в ответе больше нет (0.0.6): `repos` отвечает, какие репозитории названы
+ * делами store и сколько дел без репозитория — тот же блок считает CLI. Ошибки
+ * источников приходят парой `{source, reason}`: источник назван, а не выдан за
+ * «доску».
  */
 function shapeNow(payload) {
   const data = payload && typeof payload === 'object' ? payload : {}
   const deals = (Array.isArray(data.deals) ? data.deals : []).map(shapeDeal)
-  const boards = (Array.isArray(data.boards) ? data.boards : []).map((board) => ({
-    slug: String(board.slug || ''),
-    read: board.read === true,
-    deals: Number(board.deals) || 0,
-    truncated: board.truncated === true,
-    warnings: Array.isArray(board.warnings) ? board.warnings.map(String) : [],
-  }))
+  const repos = shapeRepos(data.repos)
   const errors = (Array.isArray(data.errors) ? data.errors : []).map((error) => ({
-    board: String(error.board || ''),
-    reason: String(error.reason || 'причина не записана'),
+    source: String((error && error.source) || 'источник'),
+    reason: String((error && error.reason) || 'причина не записана'),
   }))
-  const unreachable = boards
-    .filter((board) => !board.read)
-    .map((board) => ({
-      board: board.slug,
-      reason: (errors.find((error) => error.board === board.slug) || {}).reason || 'причина не записана',
-    }))
-  const boardSlugs = new Set(boards.map((board) => board.slug))
-  // Прочитанная доска тоже бывает неполной: срез упёрся в лимит дел
-  // (`truncated`) или вспомогательная таблица не прочиталась (`warnings`).
-  // Молчать про это нельзя — доска тогда выглядит полной.
-  const truncatedNotices = boards
-    .filter((board) => board.truncated)
-    .map((board) => `доска ${board.slug}: срез обрезан лимитом, показано ${board.deals} дел`)
-  const warningNotices = boards.flatMap((board) =>
-    board.warnings.map((warning) => `доска ${board.slug}: ${warning}`),
-  )
-  const byState = {}
-  for (const deal of deals) byState[deal.state] = (byState[deal.state] || 0) + 1
+  const byState = stateCounts(deals)
   // Порядок состояний — из ответа бэкенда (`by_state` идёт в порядке
   // WAITING_PRIORITY), а не из порядка ключей таблицы подписей.
   const backendStates =
@@ -300,36 +419,45 @@ function shapeNow(payload) {
     now: Number.isFinite(Number(data.now)) ? Number(data.now) : null,
     deals,
     groups: groupDeals(deals),
-    boards,
+    repos,
     errors,
-    otherErrors: errors.filter((error) => !boardSlugs.has(error.board)),
-    unreachable,
-    truncatedNotices,
-    warningNotices,
-    boardsTotal: boards.length,
-    boardsRead: boards.filter((board) => board.read).length,
+    repoCount: repos.list.length,
+    withoutRepo: repos.withoutRepo,
     count: deals.length,
     byState,
+    stateGroups: groupByState(deals),
     humanCounts: humanCounts(deals),
     stateOrder,
   }
 }
 
-/** Локальные фильтры страницы: доска, набор состояний, поиск по id/title/assignee. */
+/**
+ * Локальные фильтры страницы: репозиторий, набор состояний, поиск.
+ *
+ * `repo` — `ALL_REPOS` (или не задан) — все дела, `''` — ровно дела без
+ * репозитория, иначе путь репозитория. Пустая строка как значение — не выдумка:
+ * ровно так отличает «без репозитория» от «фильтра нет» бэкенд (`?repo=`).
+ */
 function filterNow(model, filter) {
   const f = filter && typeof filter === 'object' ? filter : {}
-  const board = String(f.board || '')
+  const repo = f.repo === undefined || f.repo === null ? ALL_REPOS : String(f.repo)
   const states = f.states instanceof Set ? f.states : new Set(Array.isArray(f.states) ? f.states : [])
   const query = String(f.query || '').trim().toLowerCase()
   const deals = (model && model.deals ? model.deals : []).filter(
     (deal) =>
-      (!board || deal.board === board) &&
+      (repo === ALL_REPOS || (repo === '' ? !deal.repo : deal.repo === repo)) &&
       (!states.size || states.has(deal.state)) &&
       (!query || deal.search.includes(query)),
   )
-  const byState = {}
-  for (const deal of deals) byState[deal.state] = (byState[deal.state] || 0) + 1
-  return { ...model, deals, groups: groupDeals(deals), count: deals.length, byState, humanCounts: humanCounts(deals) }
+  return {
+    ...model,
+    deals,
+    groups: groupDeals(deals),
+    stateGroups: groupByState(deals),
+    count: deals.length,
+    byState: stateCounts(deals),
+    humanCounts: humanCounts(deals),
+  }
 }
 
 /** Тон исхода попытки: «падение» — по набору бэкенда, дальше успех/отложено. */
@@ -342,7 +470,7 @@ function outcomeTone(outcome, status, crashOutcomes) {
 }
 
 /**
- * Таймлайн попыток из ответа `/duty/{board}/{id}/attempts`.
+ * Таймлайн попыток из ответа `/duty/{deal_id}/attempts`.
  *
  * Геометрии здесь нет: полосы на общей оси дела считает `shapeDealTime`
  * (минимум и максимум по `timeline` и `attempts`), и второй расчёт ширины —
@@ -387,8 +515,8 @@ function shapeAttempts(payload) {
     }
   })
   return {
-    board: String(data.board || ''),
-    taskId: String(data.task_id || ''),
+    repo: String(data.repo || ''),
+    dealId: String(data.deal_id || ''),
     title: String(data.title || ''),
     count: attempts.length,
     attempts,
@@ -396,21 +524,21 @@ function shapeAttempts(payload) {
 }
 
 /**
- * Строки неполноты ответа `/now`: недоступная доска, упавший источник,
- * обрезанная или деградировавшая доска.
+ * Строки неполноты ответа `/now`: упавший источник и непосчитанная группировка.
  *
  * `stale` — последний запрос не прошёл, на экране прошлый снимок: его замечания
- * уже не факт о настоящем, поэтому отдаём пусто. Иначе «доска X недоступна»
+ * уже не факт о настоящем, поэтому отдаём пусто. Иначе «источник X недоступен»
  * переживает починку кода и висит, пока страницу не перезагрузят.
  */
 function noticeLines(model, stale = false) {
   if (stale || !model) return []
-  return [
-    ...model.unreachable.map((bad) => `доска ${bad.board} недоступна: ${bad.reason}`),
-    ...model.otherErrors.map((bad) => `источник ${bad.board} недоступен: ${bad.reason}`),
-    ...model.truncatedNotices,
-    ...model.warningNotices,
-  ]
+  const lines = (model.errors || []).map((bad) => `источник ${bad.source} недоступен: ${bad.reason}`)
+  // Store дел не прочитан — группировки по репозиториям нет: пустой список групп
+  // тут означал бы «репозиториев не названо», а это другой факт.
+  if (model.repos && model.repos.read === false) {
+    lines.push('store дел не прочитан: группировка по репозиториям не посчитана')
+  }
+  return lines
 }
 
 /* ------------------------------------------- лента этапов и попыток (W6) */
@@ -1136,6 +1264,9 @@ export {
   WAIT_HUMAN_LABEL,
   TONE_COLOR,
   STAGE_META,
+  WITHOUT_REPO_LABEL,
+  ALL_REPOS,
+  repoLabel,
   stateMeta,
   stageMeta,
   humanCounts,
@@ -1144,7 +1275,12 @@ export {
   fmtTitle,
   fmtClock,
   shapeDeal,
+  stateCounts,
+  stateLabel,
   groupDeals,
+  groupByState,
+  groupStatesText,
+  shapeRepos,
   shapeNow,
   filterNow,
   outcomeTone,

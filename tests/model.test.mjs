@@ -14,22 +14,29 @@ import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 
 import {
+  ALL_REPOS,
   STATE_META,
   WAIT_HUMAN_LABEL,
+  WITHOUT_REPO_LABEL,
   filterNow,
   fmtAge,
   fmtTitle,
+  groupByState,
   groupDeals,
+  groupStatesText,
   humanCounts,
   humanLine,
   noticeLines,
   outcomeTone,
+  repoLabel,
   shapeAttempts,
   shapeDeal,
   shapeDealTime,
   shapeNow,
+  shapeRepos,
   shapeStages,
   stageMeta,
+  stateLabel,
   stateMeta,
 } from '../desktop/model.js'
 
@@ -54,15 +61,25 @@ const pluginSource = readFileSync(new URL('../desktop/plugin.js', import.meta.ur
 
 const model = shapeNow(nowPayload)
 
-test('порядок групп — приоритет ответа бэкенда, по одной группе на состояние', () => {
+test('группы — по репозиторию: названные по имени, «без репозитория» последней', () => {
+  // Доска ушла (0.0.6): группировка списка — `repo`, а дело адресуется своим id.
   assert.deepEqual(
-    model.groups.map((group) => group.state),
-    PRIORITY,
+    model.groups.map((group) => group.label),
+    [
+      '~/.hermes/plugins/hermes-duty',
+      '~/go/src/gitlab.ozon.ru/review/pinned-review-service',
+      '~/go/src/gitlab.ozon.ru/sx/sx-widgets-api',
+      WITHOUT_REPO_LABEL,
+    ],
   )
   assert.deepEqual(
     model.groups.map((group) => group.count),
-    [1, 1, 1, 1, 1, 1, 1, 1],
+    [2, 2, 2, 2],
   )
+  // «без репозитория» — последняя группа, и это законное состояние, а не пропуск
+  assert.equal(model.groups[3].repo, '')
+  assert.equal(model.groups.slice(0, 3).reduce((sum, group) => sum + group.count, 0), 6)
+  // состояния при этом не потеряны: они в строках и в подписи группы
   assert.deepEqual(Object.keys(model.byState).sort(), [...PRIORITY].sort())
   assert.equal(model.count, 8)
   // чипы фильтра идут в порядке `by_state` бэкенда — второго списка приоритета нет
@@ -73,27 +90,41 @@ test('порядок групп — приоритет ответа бэкенд
 
 test('у каждой группы порядок строк не пересортировывается', () => {
   const deals = [
-    shapeDeal({ board: 'b', id: 't_1', waiting: { state: 'working' } }),
-    shapeDeal({ board: 'b', id: 't_2', waiting: { state: 'working' } }),
+    shapeDeal({ repo: 'r', id: 'd_1', waiting: { state: 'working' } }),
+    shapeDeal({ repo: 'r', id: 'd_2', waiting: { state: 'working' } }),
   ]
   const groups = groupDeals(deals)
   assert.equal(groups.length, 1)
   assert.deepEqual(
     groups[0].deals.map((deal) => deal.id),
-    ['t_1', 't_2'],
+    ['d_1', 'd_2'],
   )
 })
 
-test('страница не навязывает свой порядок: группы идут за ответом', () => {
-  // обратный порядок состояний — единственный источник приоритета это бэкенд
+test('внутри группы порядок — ответа бэкенда, подписи группы — по её состояниям', () => {
+  // Приоритет задаёт `/now` (WAITING_PRIORITY); экран не переставляет строки.
   const groups = groupDeals([
-    shapeDeal({ board: 'b', id: 't_1', waiting: { state: 'wait_gate' } }),
-    shapeDeal({ board: 'b', id: 't_2', waiting: { state: 'wait_human' } }),
+    shapeDeal({ repo: 'r', id: 'd_1', waiting: { state: 'wait_gate' } }),
+    shapeDeal({ repo: 'r', id: 'd_2', waiting: { state: 'wait_human' } }),
   ])
   assert.deepEqual(
-    groups.map((group) => group.state),
+    groups[0].deals.map((deal) => deal.state),
     ['wait_gate', 'wait_human'],
   )
+  // Состояния группы названы одной строкой в порядке появления
+  assert.equal(groupStatesText(groups[0]), 'ждёт гейт 1 · ждёт ответа 1')
+})
+
+test('«Почему стоит» группирует по ожиданию: группы идут за ответом бэкенда', () => {
+  const stateGroups = groupByState([
+    shapeDeal({ repo: 'r', id: 'd_1', waiting: { state: 'wait_gate' } }),
+    shapeDeal({ repo: 'r', id: 'd_2', waiting: { state: 'wait_human' } }),
+  ])
+  assert.deepEqual(
+    stateGroups.map((group) => group.state),
+    ['wait_gate', 'wait_human'],
+  )
+  assert.equal(stateGroups[0].label, 'ждёт гейт')
 })
 
 test('чипы фильтра идут в порядке by_state из ответа, а не таблицы подписей', () => {
@@ -129,7 +160,7 @@ test('набор «падений» приходит с бэкенда: лока
 test('бейдж wait_human не обещает «человека»: вопрос может быть агенту', () => {
   assert.equal(stateMeta('wait_human', 'question').label, 'ждёт ответа')
   assert.ok(!STATE_META.wait_human.label.includes('человек'))
-  const deal = model.deals.find((item) => item.id === 't_a1b2c3d4')
+  const deal = model.deals.find((item) => item.id === 'd_a1b2c3d4')
   assert.equal(deal.stateLabel, 'ждёт ответа')
   // чей это вопрос — видно в evidence (origin в ответе бэкенда)
   assert.match(deal.evidence, /origin='card'/)
@@ -155,8 +186,8 @@ test('подпись wait_human — по human_kind: «ждёт ответа» /
   assert.deepEqual(Object.keys(WAIT_HUMAN_LABEL).sort(), ['question', 'status'])
 })
 
-test('подпись группы wait_human не обещает ответа, если вопросов в ней нет', () => {
-  const onlyStatus = groupDeals([
+test('подпись группы ожидания не обещает ответа, если вопросов в ней нет', () => {
+  const onlyStatus = groupByState([
     shapeDeal({ waiting: { state: 'wait_human', human_kind: 'status' } }),
     shapeDeal({ waiting: { state: 'wait_human', human_kind: 'status' } }),
   ])
@@ -165,7 +196,7 @@ test('подпись группы wait_human не обещает ответа, �
 
   // Смешанная группа идёт под базовой подписью: «ждёт ответа» было бы неправдой
   // про половину строк, а «ждёт решения» — про другую.
-  const mixed = groupDeals([
+  const mixed = groupByState([
     shapeDeal({ waiting: { state: 'wait_human', human_kind: 'question' } }),
     shapeDeal({ waiting: { state: 'wait_human', human_kind: 'status' } }),
   ])
@@ -201,15 +232,15 @@ test('human_kind: «вопрос» и «блокировка» считаютс�
 test('фильтр пересчитывает счётчики человека по видимым делам', () => {
   const payload = {
     deals: [
-      { board: 'one', id: 't_1', waiting: { state: 'wait_human', human_kind: 'question' } },
-      { board: 'two', id: 't_2', waiting: { state: 'wait_human', human_kind: 'status' } },
+      { repo: 'one', id: 'd_1', waiting: { state: 'wait_human', human_kind: 'question' } },
+      { repo: 'two', id: 'd_2', waiting: { state: 'wait_human', human_kind: 'status' } },
     ],
     by_state: { wait_human: 2 },
   }
   const shaped = shapeNow(payload)
   assert.deepEqual(shaped.humanCounts, { question: 1, status: 1 })
 
-  const onlyTwo = filterNow(shaped, { board: 'two' })
+  const onlyTwo = filterNow(shaped, { repo: 'two' })
   assert.deepEqual(onlyTwo.humanCounts, { question: 0, status: 1 })
   assert.equal(humanLine(onlyTwo.humanCounts), '0 вопросов + 1 блокировка')
 })
@@ -225,9 +256,9 @@ test('pid: «не записан» и «состояние неизвестно�
 })
 
 test('незнакомое состояние — своей группой, без переклассификации', () => {
-  const groups = groupDeals([
-    shapeDeal({ board: 'b', id: 't_1', waiting: { state: 'working' } }),
-    shapeDeal({ board: 'b', id: 't_2', waiting: { state: 'quantum' } }),
+  const groups = groupByState([
+    shapeDeal({ repo: 'r', id: 'd_1', waiting: { state: 'working' } }),
+    shapeDeal({ repo: 'r', id: 'd_2', waiting: { state: 'quantum' } }),
   ])
   assert.deepEqual(
     groups.map((group) => group.state),
@@ -262,14 +293,14 @@ test('заголовок обрезается многоточием ровно 
   assert.equal(fmtTitle(null), '—')
   assert.equal(fmtTitle('x'.repeat(10), 6), 'xxxxx…')
   assert.equal(fmtTitle('x'.repeat(10), 6).length, 6)
-  const long = model.deals.find((deal) => deal.id === 't_a1b2c3d4')
+  const long = model.deals.find((deal) => deal.id === 'd_a1b2c3d4')
   assert.ok(long.title.endsWith('…'))
   assert.ok(long.title.length <= 64)
 })
 
 test('пустой attempt: возраст и лизинг показываются прочерком, а не нулём', () => {
-  const deal = model.deals.find((item) => item.id === 't_6a7e0001')
-  assert.equal(nowPayload.deals.find((item) => item.id === 't_6a7e0001').attempt, null)
+  const deal = model.deals.find((item) => item.id === 'd_6a7e0001')
+  assert.equal(nowPayload.deals.find((item) => item.id === 'd_6a7e0001').attempt, null)
   assert.equal(deal.attemptAge, null)
   assert.equal(deal.attemptAgeText, '—')
   assert.equal(deal.attemptNote, 'нет попытки')
@@ -280,17 +311,18 @@ test('пустой attempt: возраст и лизинг показывают�
   assert.equal(deal.state, 'wait_gate')
   // дело без attempt: пид-фактов нет, но бейдж и доказательство на месте
   assert.equal(deal.stateLabel, 'ждёт гейт')
-  assert.match(deal.evidence, /t_d0d7e8bc/)
+  assert.match(deal.evidence, /d_d0d7e8bc/)
 
-  const withRun = model.deals.find((item) => item.id === 't_w0rk0001')
+  const withRun = model.deals.find((item) => item.id === 'd_w0rk0001')
   assert.equal(withRun.attemptAgeText, '3 мин')
   assert.equal(withRun.attemptNote, 'pid жив')
   assert.equal(withRun.leaseText, 'жив')
 })
 
-test('строка таблицы — все поля запроса: доска, id, title, assignee, попытка, лизинг, действие, состояние', () => {
-  const deal = model.deals.find((item) => item.id === 't_dead0001')
-  assert.equal(deal.board, 'hermes-duty')
+test('строка таблицы — все поля запроса: репозиторий, id, title, assignee, попытка, лизинг, действие, состояние', () => {
+  const deal = model.deals.find((item) => item.id === 'd_dead0001')
+  assert.equal(deal.repo, '~/.hermes/plugins/hermes-duty')
+  assert.equal(deal.repoLabel, '~/.hermes/plugins/hermes-duty')
   assert.equal(deal.assignee, 'publisher')
   assert.equal(deal.attemptAgeText, '1 ч')
   assert.equal(deal.attemptNote, 'pid мёртв')
@@ -316,7 +348,7 @@ test('тон бейджа по состоянию: жёлтый/фиолетов
 })
 
 test('дело без живого сигнала не выдаётся за работающее', () => {
-  const deal = model.deals.find((item) => item.id === 't_0519a001')
+  const deal = model.deals.find((item) => item.id === 'd_0519a001')
   assert.equal(deal.state, 'no_signal')
   assert.equal(deal.tone, 'gray')
   assert.equal(deal.stateLabel, 'нет сигнала')
@@ -331,34 +363,38 @@ test('факты попытки из карточки помечены, а не 
   })
   assert.equal(fromTask.attemptNote, 'pid жив, факты карточки')
   // факты из записи рана идут без оговорки
-  const fromRun = model.deals.find((item) => item.id === 't_dead0001')
+  const fromRun = model.deals.find((item) => item.id === 'd_dead0001')
   assert.equal(fromRun.attemptNote, 'pid мёртв')
-  assert.equal(model.deals.find((item) => item.id === 't_w0rk0001').attemptNote, 'pid жив')
+  assert.equal(model.deals.find((item) => item.id === 'd_w0rk0001').attemptNote, 'pid жив')
 })
 
-test('обрезанный срез и warnings доски не молчат: пометки рядом с недоступными', () => {
-  const withNotices = shapeNow({
-    ...nowPayload,
-    boards: [
-      ...nowPayload.boards,
-      { slug: 'big', read: true, deals: 500, truncated: true, warnings: ['task_runs: no such table'] },
-    ],
-  })
-  // доска прочиталась, но показано не всё — это видно текстом, а не только счётом
-  assert.deepEqual(withNotices.truncatedNotices, [
-    'доска big: срез обрезан лимитом, показано 500 дел',
+test('упавший источник назван словами, а не выдан за недоступную доску', () => {
+  // Ошибки ответа — пара `{source, reason}`: store дел и пул вопросов.
+  assert.deepEqual(
+    model.errors.map((error) => error.source),
+    ['duty/duty.db', 'messaging/pool.db'],
+  )
+  // `repos.read` в фикстуре true: группировка посчитана
+  assert.equal(model.repos.read, true)
+  assert.deepEqual(model.repos.list.map((item) => [item.repo, item.deals]), [
+    ['~/.hermes/plugins/hermes-duty', 2],
+    ['~/go/src/gitlab.ozon.ru/review/pinned-review-service', 2],
+    ['~/go/src/gitlab.ozon.ru/sx/sx-widgets-api', 2],
   ])
-  assert.ok(withNotices.warningNotices.includes('доска big: task_runs: no such table'))
-  assert.ok(withNotices.warningNotices.includes('доска ozon: task_events: no such column: run_id'))
-  // в фикстуре нет обрезанных досок, но warnings у ozon есть всегда
-  assert.deepEqual(model.truncatedNotices, [])
-  assert.deepEqual(model.warningNotices, ['доска ozon: task_events: no such column: run_id'])
+  assert.equal(model.withoutRepo, 2)
+  assert.equal(model.repoCount, 3)
+})
+
+test('непосчитанная группировка названа, а не показана пустой', () => {
+  const broken = shapeNow({ deals: [], repos: { list: [], without_repo: 0, read: false }, errors: [] })
+  assert.deepEqual(noticeLines(broken), ['store дел не прочитан: группировка по репозиториям не посчитана'])
+  assert.deepEqual(noticeLines(model).filter((line) => line.startsWith('store дел не прочитан')), [])
 })
 
 test('устаревший снимок не показывает замечаний прошлого ответа', () => {
-  // в фикстуре есть недоступная доска и ошибка источника — по свежему ответу это факт
-  assert.ok(noticeLines(model).some((line) => line.startsWith('доска ozon-legacy недоступна')))
-  assert.ok(noticeLines(model).some((line) => line.startsWith('источник messaging/pool.db')))
+  // в фикстуре есть упавшие источники — по свежему ответу это факт
+  assert.ok(noticeLines(model).some((line) => line.startsWith('источник duty/duty.db недоступен')))
+  assert.ok(noticeLines(model).some((line) => line.startsWith('источник messaging/pool.db недоступен')))
 
   // тот же снимок, но последний запрос не прошёл: на экране картина прошлого
   // ответа, и её замечания больше ничего не утверждают о настоящем
@@ -368,55 +404,67 @@ test('устаревший снимок не показывает замечан
   assert.deepEqual(noticeLines(null), [])
 })
 
-test('доски: счётчик прочитанных и причины недоступных — из ответа, без догадок', () => {
-  assert.equal(model.boardsRead, 4)
-  assert.equal(model.boardsTotal, 5)
-  assert.deepEqual(model.unreachable, [{ board: 'ozon-legacy', reason: 'unable to open database file' }])
-  // ошибка пула вопросов — не «доска недоступна»
+test('фильтры локальные: репозиторий, набор состояний, поиск по id и заголовку', () => {
+  const byRepo = filterNow(model, { repo: '~/go/src/gitlab.ozon.ru/sx/sx-widgets-api' })
+  assert.equal(byRepo.count, 2)
   assert.deepEqual(
-    model.otherErrors.map((item) => item.board),
-    ['messaging/pool.db'],
+    byRepo.deals.map((deal) => deal.state),
+    ['wait_human', 'capability'],
   )
-  assert.ok(!model.unreachable.some((item) => item.board === 'messaging/pool.db'))
-})
+  // счётчики группировки фильтр не трогает — пустое состояние остаётся честным
+  assert.equal(byRepo.repoCount, model.repoCount)
+  assert.equal(byRepo.withoutRepo, model.withoutRepo)
 
-test('фильтры локальные: доска, набор состояний, поиск по id и заголовку', () => {
-  const byBoard = filterNow(model, { board: 'ozon' })
-  assert.equal(byBoard.count, 3)
+  // пустое значение — ровно дела без репозитория (так же их отличает роут: ?repo=)
+  const withoutRepo = filterNow(model, { repo: '' })
+  assert.equal(withoutRepo.count, 2)
   assert.deepEqual(
-    byBoard.groups.map((group) => group.state),
-    ['capability', 'crashed', 'no_signal'],
+    withoutRepo.groups.map((group) => group.label),
+    [WITHOUT_REPO_LABEL],
   )
-  // счётчики досок и ошибок фильтр не трогает — пустое состояние остаётся честным
-  assert.equal(byBoard.boardsRead, model.boardsRead)
-  assert.deepEqual(byBoard.unreachable, model.unreachable)
+  // ALL_REPOS и отсутствие фильтра — одно и то же
+  assert.equal(filterNow(model, { repo: ALL_REPOS }).count, 8)
+  assert.equal(filterNow(model, {}).count, 8)
 
   const byState = filterNow(model, { states: new Set(['wait_human']) })
   assert.equal(byState.count, 1)
-  assert.equal(byState.groups[0].state, 'wait_human')
+  assert.equal(byState.deals[0].state, 'wait_human')
 
   const byTwoStates = filterNow(model, { states: ['capability', 'wait_gate'] })
   assert.deepEqual(
-    byTwoStates.groups.map((group) => group.state),
+    byTwoStates.deals.map((deal) => deal.state),
     ['capability', 'wait_gate'],
   )
 
   assert.equal(filterNow(model, { query: 'qaravai' }).count, 1)
   assert.equal(filterNow(model, { query: '  QARAVAI ' }).count, 1)
-  assert.equal(filterNow(model, { query: 't_dead0001' }).count, 1)
+  assert.equal(filterNow(model, { query: 'd_dead0001' }).count, 1)
   assert.equal(filterNow(model, { query: 'такого-нет' }).count, 0)
-  assert.equal(filterNow(model, {}).count, 8)
+  // поиск знает и репозиторий: «чей это рой» ищется тем же полем
+  assert.equal(filterNow(model, { query: 'pinned-review-service' }).count, 2)
 })
 
 test('пустой ответ /now не роняет модель', () => {
-  const empty = shapeNow({ now: 1, count: 0, deals: [], by_state: {}, boards: [], errors: [] })
+  const empty = shapeNow({ now: 1, count: 0, deals: [], by_state: {}, repos: { list: [], without_repo: 0, read: true }, errors: [] })
   assert.equal(empty.count, 0)
   assert.deepEqual(empty.groups, [])
-  assert.equal(empty.boardsRead, 0)
-  assert.equal(empty.boardsTotal, 0)
-  assert.deepEqual(empty.unreachable, [])
+  assert.deepEqual(empty.stateGroups, [])
+  assert.equal(empty.repoCount, 0)
+  assert.equal(empty.withoutRepo, 0)
+  assert.deepEqual(empty.errors, [])
   assert.deepEqual(filterNow(empty, { query: 'x' }).groups, [])
   assert.equal(shapeNow(null).count, 0)
+})
+
+test('подписи репозитория и формы его отсутствия — одни на обе поверхности', () => {
+  assert.equal(repoLabel('~/go/src/x'), '~/go/src/x')
+  assert.equal(repoLabel(''), WITHOUT_REPO_LABEL)
+  assert.equal(repoLabel(null), WITHOUT_REPO_LABEL)
+  assert.equal(shapeDeal({ repo: null }).repoLabel, WITHOUT_REPO_LABEL)
+  // состояние группы подписано по её делам: вопрос есть у всех — «ждёт ответа»
+  assert.equal(stateLabel('wait_human', model.deals.filter((deal) => deal.state === 'wait_human')), 'ждёт ответа')
+  assert.deepEqual(shapeRepos(null), { list: [], withoutRepo: 0, read: true })
+  assert.equal(shapeRepos({ read: false }).read, false)
 })
 
 test('таймлайн попыток: длительность словами, исход цветом, ошибка текстом', () => {
@@ -865,12 +913,12 @@ test('пустая лента и этап без попыток не роняю�
 })
 
 test('/now: этап и номер попытки видны в строке, без открытия дела', () => {
-  const withStage = shapeDeal({ board: 'b', id: 'd_1', stage: { id: 'impl', attempt: 2, state: 'running', live: true } })
+  const withStage = shapeDeal({ repo: 'r', id: 'd_1', stage: { id: 'impl', attempt: 2, state: 'running', live: true } })
   assert.equal(withStage.stageText, 'impl · попытка 2 · идёт')
   assert.equal(withStage.stageId, 'impl')
   assert.equal(withStage.stageAttempt, 2)
   // без попыток строки нет: «этап 0» был бы выдуманным графом
-  assert.equal(shapeDeal({ board: 'b', id: 'd_2' }).stageText, '')
+  assert.equal(shapeDeal({ repo: 'r', id: 'd_2' }).stageText, '')
 })
 
 test('вшитый в plugin.js шейпер дословно совпадает с desktop/model.js', () => {
@@ -897,7 +945,12 @@ test('plugin.js: форма плагина, маршрут, пункт сайд�
   // данные — только через ctx.rest
   assert.match(pluginSource, /rest = ctx\.rest\.bind\(ctx\)/)
   assert.match(pluginSource, /rest\('\/now'/)
-  assert.match(pluginSource, /\/duty\/\$\{encodeURIComponent\(board\)\}/)
+  assert.match(pluginSource, /\/duty\/\$\{encodeURIComponent\(dealId\)\}\/attempts/)
+  assert.match(pluginSource, /rest\(`\/deal\/\$\{encodeURIComponent\(dealId\)\}`/)
+  // старых адресов и досок в поверхностях не осталось
+  for (const [name, text] of [['model.js', modelSource], ['plugin.js', pluginSource]]) {
+    assert.equal(/\bboard\b|\bдоск/i.test(text), false, `${name}: доски больше нет`)
+  }
   // ни прямого fetch, ни шелла, ни относительных импортов (загрузчик их отвергает)
   assert.ok(!pluginSource.includes('fetch('), 'plugin.js: прямой fetch запрещён')
   assert.ok(!pluginSource.includes('child_process'), 'plugin.js: шелл из UI запрещён')

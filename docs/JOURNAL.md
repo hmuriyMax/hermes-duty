@@ -29,8 +29,7 @@ CREATE TABLE IF NOT EXISTS events (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   ts              INTEGER NOT NULL,          -- unix seconds, момент факта
   recorded_at     INTEGER NOT NULL,          -- unix seconds, момент записи
-  deal_id         TEXT    NOT NULL,          -- t_<hex>
-  board           TEXT    NOT NULL,          -- слаг доски на момент факта
+  deal_id         TEXT    NOT NULL,          -- d_<hex>: адрес дела (доски нет с 0.0.6)
   kind            TEXT    NOT NULL,          -- см. набор ниже
   payload         TEXT    NOT NULL DEFAULT '{}',  -- JSON, только факты источника
   source          TEXT    NOT NULL,          -- ingest | ask | cli | api | engine | shell
@@ -48,7 +47,7 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 
 | `kind` | когда пишется | ключевые поля payload |
 |---|---|---|
-| `created` | дело впервые увидено на доске | `title`, `assignee`, `status`, `parents` |
+| `created` | дело заведено в store плагина | `title`, `assignee`, `status`, `parents`, `repo` (репозиторий группировки; отсутствие ключа — «без репозитория») |
 | `claimed` | появился лизинг (`claim_lock`/`claim_expires`) | `claim_lock`, `claim_expires` |
 | `lease_lost` | лизинг исчез без завершения | `previous_expires` |
 | `attempt_started` | открылся ран в `task_runs` (движок: попытка заспавнена) | `run_id`, `pid`, `stage`, `attempt`, `cmd`, `stage_kind` (только у `kind: shell` — `shell`; отсутствие ключа читается как `agent`), `shell_cmd` (у `shell` — строка `cmd` из спеки), `cwd`, `workdir`, `tree`, `base` (фактическая база дерева — коммит, от которого этап отведён), `lease_expires`, `contract` — фактическая команда и вход целиком |
@@ -152,9 +151,9 @@ approved_commit}`.
 
 `idempotency_key` — строка, уникальная для факта источника:
 
-- ingest: `ingest:<board>:<deal_id>:<kind>:<stable>` где `stable` — идентификатор строки
-  источника (`task_events.id`, `task_runs.id`, либо хеш кортежа для колонок:
-  `sha1(claim_lock|claim_expires)`), а не время;
+- ingest: `ingest:<deal_id>:<kind>:<stable>` где `stable` — идентификатор факта
+  источника (например `sha1(claim_lock|claim_expires)`), а не время. Прохода ingest
+  из kanban больше нет (0.0.6): правило оставлено для журналов, заведённых до 0.0.6;
 - ask: `ask:<question_id>:<kind>`;
 - cli: `cli:<deal_id>:<kind>:<sha1(аргументы)>`;
 - api: `api:<deal_id>:<kind>:<sha1(тело запроса)>` — мутации своих дел по HTTP
@@ -181,7 +180,7 @@ approved_commit}`.
 | `all_stages_done` | движок (`deals.close_stages_done`) | `transit` ответил `done` — все этапы графа пройдены |
 | `stopped_by_human` | человек (`bin/duty decide <дело> stop`) | решение остановить: запаркованное дело или бегущее без живого драйвера |
 | `closed_by_human` | человек (`bin/duty close <дело> --reason …`); движок — когда гейт перед публикацией получил ответ «не публиковать» | дело закрыто решением человека, а не ходом движка |
-| *(нет `cause`)* | ingest, `complete`, сдача в ревью | дело закрыто на доске или сдано как `done` |
+| *(нет `cause`)* | `complete`, сдача в ревью | дело сдано как `done` (внешнего закрытия «на доске» больше нет: доск нет) |
 
 `payload.stage` у человеческого закрытия — адрес (`где стояло дело`), а не признак
 «это факт этапа»: принадлежность событию решает `kind`, а не наличие `stage`.
@@ -298,27 +297,26 @@ approved_commit}`.
     от чужой строки.
 
 
-## Ingest
+## Синк ответов пула
 
-Отдельный проход (внутри запроса `/now` при `?ingest=1`, либо фоновым вызовом CLI):
-читает kanban-источники **read-only**, сравнивает с журналом и дописывает недостающие
-события. В том же проходе дочитываются ответы пула (`ask.sync_answers` →
+Отдельного прохода ingest из kanban больше нет (0.0.6: доск нет, ingest удалён вместе
+с ними). Остался ровно один синк — ответы пула (`ask.sync_answers` →
 `question_answered`): иначе отвеченный вопрос навсегда остался бы живым фактом
-ожидания. Тот же синк зовёт драйвер перед каждым решением (`bin/duty run`): движок,
-запущенный из терминала или как процесс, не проходит через ingest, и без синка
-ответов пула он не видел бы вовсе. Одно и то же событие пишется один раз —
-идемпотентность по `ask:<question_id>:question_answered`. Инварианты:
+ожидания. Его зовёт драйвер перед каждым решением (`bin/duty run`) и роут `/now`.
+Одно и то же событие пишется один раз — идемпотентность по
+`ask:<question_id>:question_answered`. Инварианты:
 
-- ingest не меняет kanban ни в каком виде (проверяется тестом по mtime);
-- ingest не «додумывает»: нет строки в источнике — нет события;
-- ingest не создаёт вопросов: единственный канал вопросов — `ask()` по явному
-  запросу `POST /ask/{board}/{task_id}`;
-- ошибка источника не валит ответ: дело попадает в `errors[]` как в 0.0.2.
+- kanban не меняется ни в каком виде: плагин его только читает (`/cards`), и это
+  проверяется тестом по mtime;
+- синк не «додумывает»: нет строки в пуле — нет события;
+- вопросов синк не создаёт: единственный канал вопросов — `ask()` по явному
+  запросу `POST /ask/{deal_id}`;
+- ошибка пула не валит ответ: она попадает в `errors[]` как в 0.0.2.
 
 ## `ask()`
 
 Единственный канал вопросов. Пишет в `messaging/pool.db` (схема imessage-gateway):
-`session_key=t_<deal_id>`, `origin='duty'`, `kind='decision'`, `text` — краткая строка,
+`session_key=t_d_<deal_id>`, `origin='duty'`, `kind='decision'`, `text` — краткая строка,
 `text_full` — развёрнутая с фактами дела, `options_json` — варианты, если заданы.
 Код — `dashboard/ask.py`; остальной плагин пул только читает (`mode=ro`).
 
@@ -380,10 +378,10 @@ approved_commit}`.
   Нулевой `question_id` от вставки — тоже `AskError`: ключ `ask:0:*` в журнале
   заглушил бы все будущие `question_asked`.
 
-Кто и когда зовёт: явный путь `POST /ask/{board}/{task_id}` (тело
+Кто и когда зовёт: явный путь `POST /ask/{deal_id}` (тело
 `{"text", "text_full", "options", "critical"}`) — вопрос задаёт человек или
-координатор, когда дело в `blocked`/`needs_input` стоит без вопроса. Ingest вопросов
-**не** создаёт: пул решений наполняется осознанным действием, а не проходом по доске.
+координатор, когда дело в `blocked`/`needs_input` стоит без вопроса. Синк вопросов
+**не** создаёт: пул решений наполняется осознанным действием, а не проходом по срезу.
 Так закрывается п.5 заметки 0.0.2: дело без вопроса больше не выдаёт себя за «ждёт
 ответа» — у него `waiting.human_kind="status"`, а после `ask()` — `"question"`.
 

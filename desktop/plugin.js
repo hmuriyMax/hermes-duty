@@ -3,13 +3,15 @@
  *
  * Форма — как у hermes-tickets: `export default { id, name, register(ctx) }`,
  * страница в `area: 'routes'`, пункт в `area: 'sidebar.nav'`. Данные — ТОЛЬКО
- * через `ctx.rest('/now')` и `ctx.rest('/duty/{board}/{id}/attempts')`: прямого
- * fetch и шелла из UI нет, ядро не импортируется, файлы плагин не читает.
+ * через `ctx.rest('/now')`, `ctx.rest('/deal/{deal_id}')` и
+ * `ctx.rest('/duty/{deal_id}/attempts')`: прямого fetch и шелла из UI нет, ядро не
+ * импортируется, файлы плагин не читает.
  *
- * Классификация состояний — не здесь: страница рисует `waiting.state` и
- * `waiting.evidence` ровно как их отдал бэкенд (`dashboard/plugin_api.py`,
- * `WAITING_PRIORITY`). Единственная логика UI — группировка по этому полю,
- * форматирование чисел и локальные фильтры.
+ * Дело адресуется только своим id `d_<hex>` (0.0.6: доски нет). Классификация
+ * состояний — не здесь: страница рисует `waiting.state` и `waiting.evidence` ровно
+ * как их отдал бэкенд (`dashboard/plugin_api.py`, `WAITING_PRIORITY`). Логика UI —
+ * группировка по `repo`, форматирование чисел и локальные фильтры; вся геометрия и
+ * вычисления — в `desktop/model.js` (вшит ниже блоком `duty:model-start`).
  *
  * UI собран без JSX (файл грузится нескомпилированным, см. kanban-graph).
  */
@@ -53,6 +55,12 @@ let rest = null
  * ничего не пересортировывает и не выводит состояние из фактов. `STATE_META`
  * ниже — только подписи и цвета бейджей для известных состояний; незнакомое
  * состояние рисуется своим именем серым.
+ *
+ * Группировка списка — по `repo` (0.0.6: доски нет): дело адресуется своим
+ * `d_<hex>`, а «чей это рой» показывает репозиторий. Дела без репозитория идут
+ * последней группой `без репозитория`; порядок внутри группы — ответ бэкенда.
+ * Тот же блок `repos` считает CLI, поэтому числа дел и групп совпадают на вебе,
+ * десктопе и в терминале.
  *
  * Два набора берутся из ответа, а не дублируются тут: порядок состояний — по
  * ключам `by_state` (чипы фильтра), набор «падений» — по `crash_outcomes`
@@ -172,6 +180,22 @@ function humanLine(counts) {
   )}`
 }
 
+// Подпись группы «репозиторий не назван»: NULL в `repo` — законное состояние
+// (`dashboard/plugin_api.py`, `_repos_of`), и в списке оно называется словами, а не
+// пустой строкой. Слово то же, что у CLI (`dashboard/cli.py`, WITHOUT_REPO_LABEL):
+// терминал и экран обязаны называть одну группу одинаково.
+const WITHOUT_REPO_LABEL = 'без репозитория'
+
+// Значение фильтра «все репозитории»: путь репозитория не бывает `*`, а пустая
+// строка занята группой «без репозитория» — ровно так же её называет роут
+// (`?repo=` — только дела без репозитория, docs/RUNBOOK.md).
+const ALL_REPOS = '*'
+
+/** Подпись репозитория: путь как есть, дела без него — «без репозитория». */
+function repoLabel(repo) {
+  return String(repo || '') || WITHOUT_REPO_LABEL
+}
+
 /** Возраст/длительность в человекочитаемом виде: `45 с`, `12 мин`, `3 ч`, `2 д`. */
 function fmtAge(sec) {
   if (sec === null || sec === undefined || sec === '') return '—'
@@ -216,6 +240,7 @@ function shapeDeal(deal) {
   const leaseState = String(lease.state || 'none')
   const attemptAge = attempt && attempt.age_sec !== undefined ? attempt.age_sec : null
   const lastAge = action.age_sec !== undefined ? action.age_sec : null
+  const repo = String(d.repo || '')
   // «pid не записан» и «состояние pid неизвестно» (`os.kill` вернул OSError) — разные факты.
   let attemptNote = 'нет попытки'
   if (attempt) {
@@ -227,7 +252,10 @@ function shapeDeal(deal) {
     if (attempt.source === 'task') attemptNote = `${attemptNote}, факты карточки`
   }
   return {
-    board: String(d.board || ''),
+    // Репозиторий дела (0.0.6): доски нет, «чей это рой» показывает группировка.
+    // Пусто — законное состояние «без репозитория», подпись даёт `repoLabel`.
+    repo,
+    repoLabel: repoLabel(repo),
     id: String(d.id || ''),
     title: fmtTitle(d.title),
     titleFull: String(d.title || ''),
@@ -263,77 +291,170 @@ function shapeDeal(deal) {
     stageText: stage
       ? `${String(stage.id || '—')} · попытка ${Number(stage.attempt) || 0}${stage.live === true ? ' · идёт' : ''}`
       : '',
-    search: `${d.board || ''} ${d.id || ''} ${d.title || ''} ${d.assignee || ''} ${waiting.state || ''}`.toLowerCase(),
+    search: `${d.repo || ''} ${d.id || ''} ${d.title || ''} ${d.assignee || ''} ${waiting.state || ''}`.toLowerCase(),
   }
+}
+
+/** Сколько дел в каждом состоянии — по строкам, а не по ответу бэкенда. */
+function stateCounts(deals) {
+  const counts = {}
+  for (const deal of deals || []) {
+    const state = (deal && deal.state) || '—'
+    counts[state] = (counts[state] || 0) + 1
+  }
+  return counts
+}
+
+/**
+ * Подпись состояния для набора строк: `wait_human` с вопросом — «ждёт ответа»,
+ * без вопроса — «ждёт решения» (та же развилка, что у бейджа, см. `stateMeta`).
+ *
+ * Нужна чипам фильтра и подписи группы: подпись считается по видимым делам, а не
+ * берётся из одной группы, которой после 0.0.6 (группировка — репозиторий) уже
+ * нет.
+ */
+function stateLabel(state, deals) {
+  const kinds = new Set(
+    (deals || []).filter((deal) => deal && deal.state === state).map((deal) => deal.humanKind || ''),
+  )
+  return kinds.size === 1 ? stateMeta(state, [...kinds][0]).label : stateMeta(state).label
+}
+
+/**
+ * Группы строк по `repo`: сначала названные репозитории, «без репозитория» —
+ * отдельной группой и последней.
+ *
+ * Порядок названных — по имени: репозиторий это подпись группы, а не приоритет
+ * (приоритет задаёт бэкенд и он виден по строкам — `/now` сортирует дела
+ * `WAITING_PRIORITY`). Внутри группы порядок ответа не пересортировывается, иначе
+ * два опроса одного снимка давали бы разный список. То же самое делает CLI
+ * (`dashboard/cli.py`, `_repo_groups`): числа дел и групп обязаны совпадать.
+ */
+function groupDeals(deals) {
+  const named = new Map()
+  const without = []
+  for (const deal of deals || []) {
+    const repo = String((deal && deal.repo) || '')
+    if (!repo) {
+      without.push(deal)
+      continue
+    }
+    if (!named.has(repo)) named.set(repo, [])
+    named.get(repo).push(deal)
+  }
+  const groups = [...named.keys()].sort().map((repo) => ({
+    key: repo,
+    repo,
+    label: repo,
+    // Выдуманного тона у группы нет: она про репозиторий, а не про ожидание.
+    // Состояния видны в шапке группы и бейджами в строках.
+    tone: '',
+    state: '',
+    count: named.get(repo).length,
+    deals: named.get(repo),
+    byState: stateCounts(named.get(repo)),
+  }))
+  if (without.length) {
+    groups.push({
+      key: '',
+      repo: '',
+      label: WITHOUT_REPO_LABEL,
+      tone: '',
+      state: '',
+      count: without.length,
+      deals: without,
+      byState: stateCounts(without),
+    })
+  }
+  return groups
+}
+
+/**
+ * Состояния группы одной строкой: `ждёт ответа 2 · работает 1`.
+ *
+ * Порядок — по первому появлению в группе (то есть по приоритету ответа), а не
+ * по таблице подписей: второго списка приоритетов в UI нет.
+ */
+function groupStatesText(group) {
+  const rows = []
+  for (const deal of (group && group.deals) || []) {
+    const state = deal.state || '—'
+    const found = rows.find((row) => row.state === state)
+    if (found) {
+      found.count += 1
+      continue
+    }
+    rows.push({ state, count: 1 })
+  }
+  return rows.map((row) => `${stateLabel(row.state, group.deals)} ${row.count}`).join(' · ')
 }
 
 /**
  * Группы строк по `waiting.state` — в порядке первого появления в ответе.
  *
- * `/now` сортирует дела по `WAITING_PRIORITY` бэкенда, поэтому порядок групп
- * получается приоритетным без второго списка приоритетов в UI; строки внутри
- * группы сохраняют порядок ответа.
+ * Нужны экрану «Почему стоит»: там группировка по ожиданию и есть объяснение
+ * («почему стоит» — это состояние), а список дел с 0.0.6 группируется по `repo`.
+ * Порядок групп приоритетный без второго списка приоритетов: `/now` сортирует
+ * дела `WAITING_PRIORITY`, а строки внутри группы сохраняют порядок ответа.
  */
-function groupDeals(deals) {
+function groupByState(deals) {
   const buckets = new Map()
-  for (const deal of deals) {
-    const state = deal.state || '—'
+  for (const deal of deals || []) {
+    const state = (deal && deal.state) || '—'
     if (!buckets.has(state)) buckets.set(state, [])
     buckets.get(state).push(deal)
   }
   const groups = []
   for (const [state, rows] of buckets) {
     const meta = stateMeta(state)
-    // Внутри группы `wait_human` встречаются оба вида: подпись группы говорит
-    // «ждёт ответа», только если вопрос есть у каждого дела в ней; иначе остаётся
-    // базовая — группа с блокировками без вопросов не обещает ответа.
-    const kinds = new Set(rows.map((deal) => deal.humanKind || ''))
-    const label = kinds.size === 1 ? stateMeta(state, [...kinds][0]).label : meta.label
-    groups.push({ state, label, tone: meta.tone, count: rows.length, deals: rows })
+    groups.push({
+      key: state,
+      state,
+      // «ждёт ответа» — только если вопрос есть у каждого дела в группе; иначе
+      // базовая подпись: блокировка без вопроса не обещает ответа.
+      label: stateLabel(state, rows),
+      tone: meta.tone,
+      count: rows.length,
+      deals: rows,
+      byState: stateCounts(rows),
+    })
   }
   return groups
 }
 
+/** Группировка-состав репозиториев из ответа (`/now.repos`, `/stats.repos`). */
+function shapeRepos(raw) {
+  const data = raw && typeof raw === 'object' ? raw : {}
+  const list = (Array.isArray(data.list) ? data.list : [])
+    .map((item) => ({ repo: String((item && item.repo) || ''), deals: Number(item && item.deals) || 0 }))
+    .filter((item) => item.repo)
+  return {
+    list,
+    withoutRepo: Number(data.without_repo) || 0,
+    // `read: false` — store дел не прочитался: «репозиториев нет» и «группировка не
+    // посчитана» разные факты, и экран не имеет права показывать первое вместо второго.
+    read: data.read !== false,
+  }
+}
+
 /**
- * Модель экрана из ответа `/now`: строки, группы, доски и честный счётчик ошибок.
+ * Модель экрана из ответа `/now`: строки, группы по репозиториям и честные ошибки
+ * источников.
  *
- * `boards` отвечает на вопрос «сколько досок реально прочиталось»: запись с
- * `read !== true` — недоступная доска, её причина берётся из `errors`. Ошибки, не
- * относящиеся к доске (например, недоступный пул вопросов), уходят отдельно в
- * `otherErrors` — их нельзя выдавать за «доска недоступна».
+ * Досок в ответе больше нет (0.0.6): `repos` отвечает, какие репозитории названы
+ * делами store и сколько дел без репозитория — тот же блок считает CLI. Ошибки
+ * источников приходят парой `{source, reason}`: источник назван, а не выдан за
+ * «доску».
  */
 function shapeNow(payload) {
   const data = payload && typeof payload === 'object' ? payload : {}
   const deals = (Array.isArray(data.deals) ? data.deals : []).map(shapeDeal)
-  const boards = (Array.isArray(data.boards) ? data.boards : []).map((board) => ({
-    slug: String(board.slug || ''),
-    read: board.read === true,
-    deals: Number(board.deals) || 0,
-    truncated: board.truncated === true,
-    warnings: Array.isArray(board.warnings) ? board.warnings.map(String) : [],
-  }))
+  const repos = shapeRepos(data.repos)
   const errors = (Array.isArray(data.errors) ? data.errors : []).map((error) => ({
-    board: String(error.board || ''),
-    reason: String(error.reason || 'причина не записана'),
+    source: String((error && error.source) || 'источник'),
+    reason: String((error && error.reason) || 'причина не записана'),
   }))
-  const unreachable = boards
-    .filter((board) => !board.read)
-    .map((board) => ({
-      board: board.slug,
-      reason: (errors.find((error) => error.board === board.slug) || {}).reason || 'причина не записана',
-    }))
-  const boardSlugs = new Set(boards.map((board) => board.slug))
-  // Прочитанная доска тоже бывает неполной: срез упёрся в лимит дел
-  // (`truncated`) или вспомогательная таблица не прочиталась (`warnings`).
-  // Молчать про это нельзя — доска тогда выглядит полной.
-  const truncatedNotices = boards
-    .filter((board) => board.truncated)
-    .map((board) => `доска ${board.slug}: срез обрезан лимитом, показано ${board.deals} дел`)
-  const warningNotices = boards.flatMap((board) =>
-    board.warnings.map((warning) => `доска ${board.slug}: ${warning}`),
-  )
-  const byState = {}
-  for (const deal of deals) byState[deal.state] = (byState[deal.state] || 0) + 1
+  const byState = stateCounts(deals)
   // Порядок состояний — из ответа бэкенда (`by_state` идёт в порядке
   // WAITING_PRIORITY), а не из порядка ключей таблицы подписей.
   const backendStates =
@@ -345,36 +466,45 @@ function shapeNow(payload) {
     now: Number.isFinite(Number(data.now)) ? Number(data.now) : null,
     deals,
     groups: groupDeals(deals),
-    boards,
+    repos,
     errors,
-    otherErrors: errors.filter((error) => !boardSlugs.has(error.board)),
-    unreachable,
-    truncatedNotices,
-    warningNotices,
-    boardsTotal: boards.length,
-    boardsRead: boards.filter((board) => board.read).length,
+    repoCount: repos.list.length,
+    withoutRepo: repos.withoutRepo,
     count: deals.length,
     byState,
+    stateGroups: groupByState(deals),
     humanCounts: humanCounts(deals),
     stateOrder,
   }
 }
 
-/** Локальные фильтры страницы: доска, набор состояний, поиск по id/title/assignee. */
+/**
+ * Локальные фильтры страницы: репозиторий, набор состояний, поиск.
+ *
+ * `repo` — `ALL_REPOS` (или не задан) — все дела, `''` — ровно дела без
+ * репозитория, иначе путь репозитория. Пустая строка как значение — не выдумка:
+ * ровно так отличает «без репозитория» от «фильтра нет» бэкенд (`?repo=`).
+ */
 function filterNow(model, filter) {
   const f = filter && typeof filter === 'object' ? filter : {}
-  const board = String(f.board || '')
+  const repo = f.repo === undefined || f.repo === null ? ALL_REPOS : String(f.repo)
   const states = f.states instanceof Set ? f.states : new Set(Array.isArray(f.states) ? f.states : [])
   const query = String(f.query || '').trim().toLowerCase()
   const deals = (model && model.deals ? model.deals : []).filter(
     (deal) =>
-      (!board || deal.board === board) &&
+      (repo === ALL_REPOS || (repo === '' ? !deal.repo : deal.repo === repo)) &&
       (!states.size || states.has(deal.state)) &&
       (!query || deal.search.includes(query)),
   )
-  const byState = {}
-  for (const deal of deals) byState[deal.state] = (byState[deal.state] || 0) + 1
-  return { ...model, deals, groups: groupDeals(deals), count: deals.length, byState, humanCounts: humanCounts(deals) }
+  return {
+    ...model,
+    deals,
+    groups: groupDeals(deals),
+    stateGroups: groupByState(deals),
+    count: deals.length,
+    byState: stateCounts(deals),
+    humanCounts: humanCounts(deals),
+  }
 }
 
 /** Тон исхода попытки: «падение» — по набору бэкенда, дальше успех/отложено. */
@@ -387,7 +517,7 @@ function outcomeTone(outcome, status, crashOutcomes) {
 }
 
 /**
- * Таймлайн попыток из ответа `/duty/{board}/{id}/attempts`.
+ * Таймлайн попыток из ответа `/duty/{deal_id}/attempts`.
  *
  * Геометрии здесь нет: полосы на общей оси дела считает `shapeDealTime`
  * (минимум и максимум по `timeline` и `attempts`), и второй расчёт ширины —
@@ -432,8 +562,8 @@ function shapeAttempts(payload) {
     }
   })
   return {
-    board: String(data.board || ''),
-    taskId: String(data.task_id || ''),
+    repo: String(data.repo || ''),
+    dealId: String(data.deal_id || ''),
     title: String(data.title || ''),
     count: attempts.length,
     attempts,
@@ -441,21 +571,21 @@ function shapeAttempts(payload) {
 }
 
 /**
- * Строки неполноты ответа `/now`: недоступная доска, упавший источник,
- * обрезанная или деградировавшая доска.
+ * Строки неполноты ответа `/now`: упавший источник и непосчитанная группировка.
  *
  * `stale` — последний запрос не прошёл, на экране прошлый снимок: его замечания
- * уже не факт о настоящем, поэтому отдаём пусто. Иначе «доска X недоступна»
+ * уже не факт о настоящем, поэтому отдаём пусто. Иначе «источник X недоступен»
  * переживает починку кода и висит, пока страницу не перезагрузят.
  */
 function noticeLines(model, stale = false) {
   if (stale || !model) return []
-  return [
-    ...model.unreachable.map((bad) => `доска ${bad.board} недоступна: ${bad.reason}`),
-    ...model.otherErrors.map((bad) => `источник ${bad.board} недоступен: ${bad.reason}`),
-    ...model.truncatedNotices,
-    ...model.warningNotices,
-  ]
+  const lines = (model.errors || []).map((bad) => `источник ${bad.source} недоступен: ${bad.reason}`)
+  // Store дел не прочитан — группировки по репозиториям нет: пустой список групп
+  // тут означал бы «репозиториев не названо», а это другой факт.
+  if (model.repos && model.repos.read === false) {
+    lines.push('store дел не прочитан: группировка по репозиториям не посчитана')
+  }
+  return lines
 }
 
 /* ------------------------------------------- лента этапов и попыток (W6) */
@@ -1331,24 +1461,24 @@ function useNow() {
 }
 
 /** Таймлайн попыток выбранного дела. Смена выбора отменяет старый ответ (по ключу). */
-function useAttempts(board, taskId) {
+function useAttempts(dealId) {
   const [state, setState] = useState({ key: '', data: null, error: null, loading: false })
-  const key = board && taskId ? `${board}/${taskId}` : ''
+  const key = dealId ? String(dealId) : ''
 
   const load = useCallback(async () => {
-    if (!board || !taskId) return
-    const mine = `${board}/${taskId}`
+    if (!dealId) return
+    const mine = String(dealId)
     setState((prev) => ({ key: mine, data: prev.key === mine ? prev.data : null, error: null, loading: true }))
     try {
       const data = await rest(
-        `/duty/${encodeURIComponent(board)}/${encodeURIComponent(taskId)}/attempts`,
+        `/duty/${encodeURIComponent(dealId)}/attempts`,
         { timeoutMs: REQUEST_TIMEOUT_MS },
       )
       setState((prev) => (prev.key === mine ? { key: mine, data, error: null, loading: false } : prev))
     } catch (error) {
       setState((prev) => (prev.key === mine ? { ...prev, error: errText(error), loading: false } : prev))
     }
-  }, [board, taskId])
+  }, [dealId])
 
   useEffect(() => {
     void load()
@@ -1390,22 +1520,22 @@ function useStats(enabled) {
 }
 
 /** Экран «Дело»: спецификация + тот же факт-набор, что в `/now`. */
-function useDeal(board, taskId) {
+function useDeal(dealId) {
   const [state, setState] = useState({ key: '', data: null, error: null, loading: false })
-  const key = board && taskId ? `${board}/${taskId}` : ''
+  const key = dealId ? String(dealId) : ''
 
   const load = useCallback(async () => {
     if (!key) return
     setState((prev) => ({ key, data: prev.key === key ? prev.data : null, error: null, loading: true }))
     try {
-      const data = await rest(`/deal/${encodeURIComponent(board)}/${encodeURIComponent(taskId)}`, {
+      const data = await rest(`/deal/${encodeURIComponent(dealId)}`, {
         timeoutMs: REQUEST_TIMEOUT_MS,
       })
       setState((prev) => (prev.key === key ? { key, data, error: null, loading: false } : prev))
     } catch (error) {
       setState((prev) => (prev.key === key ? { ...prev, error: errText(error), loading: false } : prev))
     }
-  }, [board, taskId, key])
+  }, [dealId, key])
 
   useEffect(() => {
     void load()
@@ -1439,9 +1569,8 @@ function DealRow({ deal, selected, onPick }) {
     {
       className: selected ? 'duty-row sel' : 'duty-row',
       onClick: () => onPick(deal),
-      title: deal.evidence || undefined,
+      title: [deal.repoLabel, deal.evidence].filter(Boolean).join(' · '),
     },
-    h('td', { className: 'duty-mono', title: deal.board }, deal.board),
     h('td', { className: 'duty-mono', title: deal.id }, deal.id),
     h('td', { title: deal.titleFull }, deal.title),
     h('td', { title: deal.assignee }, deal.assignee),
@@ -1453,6 +1582,10 @@ function DealRow({ deal, selected, onPick }) {
   )
 }
 
+/**
+ * Группа списка — репозиторий (0.0.6): имя, число дел и состояния группы одной
+ * строкой. Столбца «репозиторий» в строках нет — он повторял бы заголовок.
+ */
 function DealGroup({ group, selectedKey, onPick }) {
   return h(
     'section',
@@ -1460,8 +1593,10 @@ function DealGroup({ group, selectedKey, onPick }) {
     h(
       'div',
       { className: 'duty-group-h' },
-      h(StateBadge, { label: group.label, tone: group.tone, title: group.state }),
+      h('span', { className: group.repo ? 'duty-mono' : 'duty-mono duty-muted', title: group.repo || 'репозиторий не назван' }, group.label),
       h('span', { className: 'duty-num' }, `${group.count}`),
+      h('span', { className: 'duty-spacer' }),
+      h('span', { className: 'duty-muted' }, groupStatesText(group)),
     ),
     h(
       'table',
@@ -1469,7 +1604,6 @@ function DealGroup({ group, selectedKey, onPick }) {
       h(
         'colgroup',
         null,
-        h('col', { style: { width: '96px' } }),
         h('col', { style: { width: '104px' } }),
         h('col', null),
         h('col', { style: { width: '132px' } }),
@@ -1485,7 +1619,6 @@ function DealGroup({ group, selectedKey, onPick }) {
         h(
           'tr',
           null,
-          h('th', null, 'доска'),
           h('th', null, 'дело'),
           h('th', null, 'заголовок'),
           h('th', null, 'исполнитель'),
@@ -1501,9 +1634,9 @@ function DealGroup({ group, selectedKey, onPick }) {
         null,
         ...group.deals.map((deal) =>
           h(DealRow, {
-            key: `${deal.board}/${deal.id}`,
+            key: deal.id,
             deal,
-            selected: selectedKey === `${deal.board}/${deal.id}`,
+            selected: selectedKey === deal.id,
             onPick,
           }),
         ),
@@ -1903,7 +2036,7 @@ function WhyCard({ deal, onOpen }) {
       'div',
       { className: 'duty-why-meta' },
       h(StateBadge, { label: deal.stateLabel, tone: deal.tone, title: deal.state }),
-      h('span', { className: 'duty-mono' }, `${deal.board} · ${deal.id}`),
+      h('span', { className: 'duty-mono' }, `${deal.repoLabel} · ${deal.id}`),
       h('span', { className: 'duty-muted' }, deal.assignee),
     ),
     h('div', { className: 'duty-evidence', style: { margin: '6px 0 0' } }, deal.evidence || 'доказательство не записано'),
@@ -1917,6 +2050,10 @@ function WhyCard({ deal, onOpen }) {
   )
 }
 
+/**
+ * Группа «Почему стоит»: состояния по-прежнему группируют объяснения, поэтому
+ * заголовок секции — подпись состояния; репозиторий в карточке назван рядом с id.
+ */
 function WhyScreen({ model, stale, onOpen }) {
   const lines = noticeLines(model, stale)
   return h(
@@ -1935,7 +2072,7 @@ function WhyScreen({ model, stale, onOpen }) {
       : h(
           'div',
           null,
-          ...model.groups.map((group) =>
+          ...model.stateGroups.map((group) =>
             h(
               'section',
               { key: `why-${group.state}`, style: { marginBottom: '16px' } },
@@ -1949,7 +2086,7 @@ function WhyScreen({ model, stale, onOpen }) {
               h(
                 'div',
                 { className: 'duty-why-grid' },
-                ...group.deals.map((deal) => h(WhyCard, { key: `${deal.board}/${deal.id}`, deal, onOpen })),
+                ...group.deals.map((deal) => h(WhyCard, { key: deal.id, deal, onOpen })),
               ),
             ),
           ),
@@ -1979,10 +2116,10 @@ function Kpi({ title, value, sub, barPct }) {
  * `crash_outcomes`) — страница не решает сама, что считать падением.
  */
 function Taxonomy({ stats }) {
-  const entries = Object.entries(stats.totals.runs_by_outcome || {}).sort((a, b) => b[1] - a[1])
+  const entries = Object.entries(stats.totals.attempts_by_outcome || {}).sort((a, b) => b[1] - a[1])
   const crashes = new Set(stats.crash_outcomes || [])
   const success = new Set(stats.success_outcomes || [])
-  if (!entries.length) return h('div', { className: 'duty-muted' }, 'ранов нет: таксономия считается по task_runs')
+  if (!entries.length) return h('div', { className: 'duty-muted' }, 'попыток нет: таксономия считается по журналу дел')
   const max = entries[0][1] || 1
   return h(
     'div',
@@ -2000,7 +2137,14 @@ function Taxonomy({ stats }) {
   )
 }
 
-function BoardHealthTable({ stats }) {
+/**
+ * Таблица «по репозиториям»: те же группы и числа, что печатает `bin/duty stats`.
+ * Источник — `repos[]` и `without_repo` ответа `/stats`: доски в статистике не
+ * участвуют (0.0.6), «без репозитория» — законная строка.
+ */
+function RepoHealthTable({ stats }) {
+  const groups = [...(stats.repos || []), ...(stats.without_repo && stats.without_repo.deals ? [stats.without_repo] : [])]
+  if (!groups.length) return h('div', { className: 'duty-muted' }, 'дел в store нет: считать нечего')
   return h(
     'table',
     { className: 'duty-table duty-health-table' },
@@ -2010,39 +2154,28 @@ function BoardHealthTable({ stats }) {
       h(
         'tr',
         null,
-        h('th', null, 'доска'),
-        h('th', null, 'задач'),
-        h('th', null, 'ранов'),
+        h('th', null, 'репозиторий'),
+        h('th', null, 'дел'),
+        h('th', null, 'попыток'),
         h('th', null, 'с первой попытки'),
         h('th', null, 'ожидание p50 / p90'),
-        h('th', null, 'неполнота'),
+        h('th', null, 'ожиданий'),
       ),
     ),
     h(
       'tbody',
       null,
-      ...stats.boards.map((board) => {
-        if (!board.read) {
-          return h(
-            'tr',
-            { key: `bh-${board.slug}` },
-            h('td', { className: 'duty-mono' }, board.slug),
-            h('td', { colSpan: 5, className: 'duty-muted' }, board.note || 'доска недоступна'),
-          )
-        }
-        const share = board.first_try.share
-        const incompleteness = [board.truncated ? 'срез обрезан лимитом' : '', ...(board.warnings || [])]
-          .filter(Boolean)
-          .join('; ')
+      ...groups.map((group) => {
+        const share = group.first_try.share
         return h(
           'tr',
-          { key: `bh-${board.slug}` },
-          h('td', { className: 'duty-mono' }, board.slug),
-          h('td', { className: 'duty-num' }, `${board.tasks_total}`),
-          h('td', { className: 'duty-num' }, `${board.runs_total}`),
-          h('td', { className: 'duty-num' }, `${board.first_try.ok}/${board.first_try.with_runs} · ${share === null ? '—' : `${Math.round(share * 100)}%`}`),
-          h('td', { className: 'duty-num' }, board.waiting_sec.p50 === null ? '—' : `${fmtAge(board.waiting_sec.p50)} / ${fmtAge(board.waiting_sec.p90)}`),
-          h('td', { className: 'duty-muted' }, incompleteness || '—'),
+          { key: `rh-${group.repo || 'without'}` },
+          h('td', { className: 'duty-mono' }, group.repo || WITHOUT_REPO_LABEL),
+          h('td', { className: 'duty-num' }, `${group.deals}`),
+          h('td', { className: 'duty-num' }, `${group.attempts_total}`),
+          h('td', { className: 'duty-num' }, `${group.first_try.ok}/${group.first_try.closed} · ${share === null ? '—' : `${Math.round(share * 100)}%`}`),
+          h('td', { className: 'duty-num' }, group.waiting_sec.p50 === null ? '—' : `${fmtAge(group.waiting_sec.p50)} / ${fmtAge(group.waiting_sec.p90)}`),
+          h('td', { className: 'duty-num' }, group.waiting_sec.count ? `${group.waiting_sec.count}` : '—'),
         )
       }),
     ),
@@ -2058,16 +2191,17 @@ function HealthScreen({ stats }) {
   }
   const data = stats.data
   const totals = data.totals
+  const repos = data.repos || []
+  const without = data.without_repo || null
   const crashes = new Set(data.crash_outcomes || [])
-  const crashRuns = Object.entries(totals.runs_by_outcome || {}).reduce((acc, [key, count]) => (crashes.has(key) ? acc + count : acc), 0)
+  const crashRuns = Object.entries(totals.attempts_by_outcome || {}).reduce((acc, [key, count]) => (crashes.has(key) ? acc + count : acc), 0)
   const share = totals.first_try.share
-  const readBoards = data.boards.filter((board) => board.read).length
   return h(
     'div',
     { className: 'duty-scroll' },
     stats.error ? h('div', { className: 'duty-banner', style: { margin: '0 0 10px' } }, h('span', null, `снимок не обновлён: ${stats.error}`), h(Button, { size: 'xs', variant: 'secondary', onClick: () => void stats.reload() }, 'повторить')) : null,
     data.errors.length
-      ? h('div', { className: 'duty-note', style: { margin: '0 0 10px' } }, ...data.errors.map((err, i) => h('div', { key: `he-${i}` }, `источник ${err.board} недоступен: ${err.reason}`)))
+      ? h('div', { className: 'duty-note', style: { margin: '0 0 10px' } }, ...data.errors.map((err, i) => h('div', { key: `he-${i}` }, `источник ${err.source} недоступен: ${err.reason}`)))
       : null,
     data.warnings.length
       ? h('div', { className: 'duty-note', style: { margin: '0 0 10px' } }, ...data.warnings.map((text, i) => h('div', { key: `hw-${i}` }, text)))
@@ -2075,19 +2209,19 @@ function HealthScreen({ stats }) {
     h(
       'div',
       { className: 'duty-kpis' },
-      h(Kpi, { title: 'дела с первой попытки', value: share === null ? '—' : `${Math.round(share * 100)}%`, sub: `${totals.first_try.ok} из ${totals.first_try.with_runs} дел, у которых были раны`, barPct: share === null ? null : Math.round(share * 100) }),
+      h(Kpi, { title: 'дела с первой попытки', value: share === null ? '—' : `${Math.round(share * 100)}%`, sub: `${totals.first_try.ok} из ${totals.first_try.closed} этапов, закрытых попытками`, barPct: share === null ? null : Math.round(share * 100) }),
       h(Kpi, { title: 'ожидание до первой попытки: p50 / p90', value: totals.waiting_sec.p50 === null ? '—' : `${fmtAge(totals.waiting_sec.p50)} / ${fmtAge(totals.waiting_sec.p90)}`, sub: totals.waiting_sec.count ? `p99: ${fmtAge(totals.waiting_sec.p99)} · максимум: ${fmtAge(totals.waiting_sec.max)} · выборка: ${totals.waiting_sec.count} дел (created_at → started_at)` : 'выборки нет: у дел среза нет ни одного рана (created_at → started_at)' }),
-      h(Kpi, { title: 'ранов всего', value: `${totals.runs_total}`, sub: `падений: ${crashRuns}${totals.runs_total ? ` · ${Math.round((crashRuns / totals.runs_total) * 100)}%` : ''}` }),
-      h(Kpi, { title: 'прочитано досок', value: `${readBoards} / ${data.boards.length}`, sub: `задач в срезе: ${totals.tasks_total}` }),
+      h(Kpi, { title: 'попыток всего', value: `${totals.attempts_total}`, sub: `падений: ${crashRuns}${totals.attempts_total ? ` · ${Math.round((crashRuns / totals.attempts_total) * 100)}%` : ''}` }),
+      h(Kpi, { title: 'репозиториев', value: `${repos.length}`, sub: `дел в store: ${totals.deals} · без репозитория: ${without ? without.deals : 0}` }),
     ),
-    h('div', { className: 'duty-group-h' }, h('span', null, 'таксономия исходов'), h('span', { className: 'duty-mono' }, 'по всем ранам')),
+    h('div', { className: 'duty-group-h' }, h('span', null, 'таксономия исходов попыток'), h('span', { className: 'duty-mono' }, 'по журналу дел')),
     h(Taxonomy, { stats: data }),
-    h('div', { className: 'duty-group-h', style: { marginTop: '14px' } }, h('span', null, 'доски')),
-    h(BoardHealthTable, { stats: data }),
+    h('div', { className: 'duty-group-h', style: { marginTop: '14px' } }, h('span', null, 'репозитории')),
+    h(RepoHealthTable, { stats: data }),
     h(
       'div',
       { className: 'duty-muted', style: { marginTop: '10px' } },
-      'успех и падение — наборы исходов из ответа бэкенда; «с первой попытки» — первый по времени ран дела уже успешен; p50/p90/p99 — метод ближайшего ранга по объединённой выборке дел (сортировка одна, интерполяции нет)',
+      'успех и падение — наборы исходов из ответа бэкенда; «с первой попытки» — этап журнала закрыт первой же попыткой и успешно; p50/p90/p99 — метод ближайшего ранга по объединённой выборке дел репозитория (сортировка одна, интерполяции нет); доски в статистике не участвуют',
     ),
   )
 }
@@ -2095,8 +2229,8 @@ function HealthScreen({ stats }) {
 /* ---------------- экран «дело» ---------------- */
 
 function DealScreen({ sel, onBack }) {
-  const detail = useDeal(sel.board, sel.id)
-  const query = useAttempts(sel.board, sel.id)
+  const detail = useDeal(sel.id)
+  const query = useAttempts(sel.id)
   const deal = useMemo(() => (detail.data && detail.data.deal ? shapeDeal(detail.data.deal) : null), [detail.data])
   const timeline = useMemo(() => (query.data ? shapeAttempts(query.data) : null), [query.data])
   // Шкала времени — тот же шейпер, что в вебе (`shapeDealTime`): ось, дорожки,
@@ -2115,7 +2249,7 @@ function DealScreen({ sel, onBack }) {
       h(
         'div',
         { style: { flex: '1 1 auto', minWidth: 0 } },
-        h('div', { className: 'duty-mono' }, `${sel.board} · ${sel.id}`),
+        h('div', { className: 'duty-mono' }, `${repoLabel((detail.data && detail.data.repo) || sel.repo)} · ${sel.id}`),
         h('div', { className: 'duty-deal-title' }, (detail.data && detail.data.title) || sel.titleFull || '—'),
       ),
       h(Button, { size: 'xs', variant: 'secondary', onClick: onBack }, '← к списку'),
@@ -2189,7 +2323,7 @@ function EmptyState({ view, model, onReset, stale }) {
     h(
       'span',
       { className: 'duty-muted' },
-      `прочитано досок: ${model.boardsRead} из ${model.boardsTotal}`,
+      `репозиториев в store: ${model.repoCount} · дел без репозитория: ${model.withoutRepo}`,
     ),
     filtered ? h(Button, { size: 'xs', variant: 'secondary', onClick: onReset }, 'сбросить фильтры') : null,
     lines.length
@@ -2201,7 +2335,8 @@ function EmptyState({ view, model, onReset, stale }) {
 function DutyPage() {
   const snap = useNow()
   const [screen, setScreen] = useState('now')
-  const [board, setBoard] = useState('')
+  // Фильтр по репозиторию вместо доски: ALL_REPOS — все, '' — без репозитория.
+  const [repo, setRepo] = useState(ALL_REPOS)
   const [states, setStates] = useState(() => new Set())
   const [query, setQuery] = useState('')
   const [effQuery, setEffQuery] = useState('')
@@ -2224,8 +2359,8 @@ function DutyPage() {
 
   const model = useMemo(() => (snap.data ? shapeNow(snap.data) : null), [snap.data])
   const view = useMemo(
-    () => (model ? filterNow(model, { board, states, query: effQuery }) : null),
-    [model, board, states, effQuery],
+    () => (model ? filterNow(model, { repo, states, query: effQuery }) : null),
+    [model, repo, states, effQuery],
   )
 
   if (!rest) {
@@ -2233,7 +2368,7 @@ function DutyPage() {
   }
 
   const updatedAgo = snap.updatedAt ? Math.max(0, Math.floor((tick - snap.updatedAt) / 1000)) : null
-  const selectedKey = sel ? `${sel.board}/${sel.id}` : ''
+  const selectedKey = sel ? sel.id : ''
   // Клик по делу открывает его собственным экраном: у дела есть спецификация и
   // таймлайн попыток, и в узкую панель они не помещаются.
   const pick = (deal) => {
@@ -2249,7 +2384,7 @@ function DutyPage() {
       return next
     })
   const resetFilters = () => {
-    setBoard('')
+    setRepo(ALL_REPOS)
     setStates(new Set())
     setQuery('')
     setEffQuery('')
@@ -2290,7 +2425,7 @@ function DutyPage() {
           humanLine(view.humanCounts),
         )
       : null,
-    model ? h('span', { className: 'duty-muted' }, `· досок ${model.boardsRead}/${model.boardsTotal}`) : null,
+    model ? h('span', { className: 'duty-muted' }, `· репозиториев ${model.repoCount} · без репозитория ${model.withoutRepo}`) : null,
     h('span', { className: 'duty-spacer' }),
     snap.loading && !model
       ? h('span', { className: 'duty-muted' }, 'загрузка…')
@@ -2317,12 +2452,12 @@ function DutyPage() {
       )
     : null
 
-  // Недоступные доски, упавшие источники и обрезанные/деградировавшие доски —
-  // жёлтой полосой над списком, чтобы неполнота ответа была видна и тогда, когда
-  // дела есть (в пустом состоянии те же строки перечисляет EmptyState).
-  // Показываем их только по свежему ответу: при `snap.error` экран держит прошлый
-  // снимок, и его замечания — не факт о настоящем (иначе «доска _archived
-  // недоступна» висит вечно, хотя последний ответ её уже не содержит).
+  // Упавшие источники и неполный срез — жёлтой полосой над списком, чтобы
+  // неполнота ответа была видна и тогда, когда дела есть (в пустом состоянии те же
+  // строки перечисляет EmptyState). Показываем их только по свежему ответу: при
+  // `snap.error` экран держит прошлый снимок, и его замечания — не факт о
+  // настоящем (иначе «источник X недоступен» висит вечно, хотя последний ответ его
+  // уже не содержит).
   const stale = Boolean(snap.error)
   const noticeRows = noticeLines(model, stale)
   const notices = noticeRows.length && view && view.count > 0
@@ -2341,13 +2476,18 @@ function DutyPage() {
           'select',
           {
             className: 'duty-select',
-            value: board,
-            onChange: (e) => setBoard(e.target.value),
-            title: 'Фильтр по доске',
+            value: repo,
+            onChange: (e) => setRepo(e.target.value),
+            title: 'Фильтр по репозиторию',
           },
-          h('option', { value: '' }, 'все доски'),
-          ...model.boards.map((item) =>
-            h('option', { value: item.slug, key: `board-${item.slug}` }, item.read ? item.slug : `${item.slug} (недоступна)`),
+          h('option', { value: ALL_REPOS }, 'все репозитории'),
+          // «Без репозитория» — отдельная группа, и в списке фильтра она тоже
+          // отдельная строка: пустое значение отличает её от «фильтра нет».
+          model.withoutRepo > 0
+            ? h('option', { value: '' }, `${WITHOUT_REPO_LABEL} (${model.withoutRepo})`)
+            : null,
+          ...model.repos.list.map((item) =>
+            h('option', { value: item.repo, key: `repo-${item.repo}` }, `${item.repo} (${item.deals})`),
           ),
         ),
         h(
@@ -2365,9 +2505,8 @@ function DutyPage() {
           ),
           ...model.stateOrder.map((state) => {
             const meta = stateMeta(state)
-            // Подпись чипа — та же, что у группы: «ждёт ответа» стоит только там,
+            // Подпись чипа — та же, что у бейджа: «ждёт ответа» стоит только там,
             // где в этом состоянии действительно есть вопрос.
-            const group = model.groups.find((item) => item.state === state)
             const count = model.byState[state] || 0
             return h(
               'button',
@@ -2379,7 +2518,7 @@ function DutyPage() {
                 title: state,
                 onClick: () => toggleState(state),
               },
-              group ? group.label : meta.label,
+              stateLabel(state, model.deals),
               h('span', { className: 'duty-num' }, `${count}`),
             )
           }),
@@ -2410,7 +2549,7 @@ function DutyPage() {
     list = h(
       'div',
       { className: 'duty-list' },
-      ...view.groups.map((group) => h(DealGroup, { key: `grp-${group.state}`, group, selectedKey, onPick: pick })),
+      ...view.groups.map((group) => h(DealGroup, { key: `grp-${group.repo || 'without'}`, group, selectedKey, onPick: pick })),
     )
   }
 
@@ -2419,7 +2558,7 @@ function DutyPage() {
   let content
   if (screen === 'deal' && sel) {
     content = h(DealScreen, {
-      key: `${sel.board}/${sel.id}`,
+      key: sel.id,
       sel,
       onBack: () => {
         setSel(null)
@@ -2434,7 +2573,7 @@ function DutyPage() {
           'div',
           { className: 'duty-scroll' },
           h('div', { className: 'duty-why-meta' }, 'выбери дело из активных'),
-          ...view.groups.map((group) => h(DealGroup, { key: `pick-${group.state}`, group, selectedKey, onPick: pick })),
+          ...view.groups.map((group) => h(DealGroup, { key: `pick-${group.repo || 'without'}`, group, selectedKey, onPick: pick })),
         )
       : h('div', { className: 'duty-scroll' }, h('div', { className: 'duty-skel-row' }, ...Array.from({ length: 4 }, (_, i) => h('div', { className: 'duty-skel', key: `ds-${i}`, style: { width: `${92 - i * 9}%` } }))))
   } else if (screen === 'why') {

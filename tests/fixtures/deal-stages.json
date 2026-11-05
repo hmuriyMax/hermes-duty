@@ -1,6 +1,6 @@
 {
   "now": 1799999950,
-  "board": "b1",
+  "repo": "~/.hermes/plugins/hermes-duty",
   "id": "d_abcdef12",
   "title": "дело с лентой",
   "status": "running",

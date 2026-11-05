@@ -67,7 +67,7 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 | `attached` | в деле появились метаданные вложения | `filename`, `size_bytes`, `content_type` |
 | `question_asked` | `ask()` создал вопрос в пуле | `question_id`, `session_key`, `critical`, `timeout`, `routing` (`{target, reason, stage, attempt}` — если вопрос адресовал движок) |
 | `question_answered` | ответ найден в пуле — или у вопроса вышел срок (`answered_via='expired'`): закрытие по TTL снимает факт так же, как ответ | `question_id`, `answer_len`, `answered_via` |
-| `published` | публикующий этап отчитался, и движок **подтвердил** факт: `git ls-remote origin` видит заявленный sha. Пишет движок (`dashboard/runner.published_claim`), а не исполнитель: `published` в `result.json` — заявка | `stage`, `attempt`, `sha`, `branch`, `mr_url` (заявка — GitLab движку не виден), `ref` (что нашлось в origin), `verified_by` (`git ls-remote`) |
+| `published` | публикующий этап отчитался, и движок **подтвердил** факт: `git ls-remote origin` видит заявленный sha (сверка по префиксу: сокращённый sha законен, пока однозначен). Пишет движок (`dashboard/runner.published_claim`), а не исполнитель: `published` в `result.json` — заявка | `stage`, `attempt`, `sha` (полный, из `ls-remote`), `claimed_sha` (что сказал исполнитель), `branch`, `mr_url` (заявка — GitLab движку не виден), `ref` (что нашлось в origin), `verified_by` (`git ls-remote`) |
 
 Восемь видов (`review_requested`, `changes_requested`, `collected`, `gate_opened`,
 `gate_closed`, `patched`, `commented`, `attached`) заведены вместе с W5 — владением

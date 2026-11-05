@@ -10,8 +10,10 @@
    цитатой «одобрен commit X, в дереве Y».
 2. **После отчёта** сверяет заявку с origin: `published: {sha, branch, mr_url}` в
    `result.json` — слова исполнителя, а факт даёт `git ls-remote`
-   (`runner.published_fact`). Нет заявленного sha в origin — класс `contract`,
-   «публикация заявлена, но не найдена».
+   (`runner.published_claim`). Нет заявленного sha в origin — класс `contract`,
+   «публикация заявлена, но не найдена». Сверка идёт по **префиксу**: сокращённый
+   sha (так его пишет публикатор и печатает консоль) законен, пока однозначен
+   (`same_commit`, `origin_hits`).
 
 Почему это отдельный слой. Здесь нет ни git, ни БД, ни часов: на вход — события
 журнала, ответ гейта и текущий коммит дерева, на выход — `Approval` или причина
@@ -68,6 +70,17 @@ OK_OUTCOMES = ("done",)
 # Длина sha в цитате отказа: семь знаков сверяются с `git log` глазами.
 SHORT_SHA = 12
 
+# Сколько знаков sha достаточно, чтобы заявку можно было сверять: `git` принимает
+# сокращённую форму, пока она однозначна, но три знака совпадают почти со всем, и
+# «нашлось» было бы догадкой, а не фактом.
+SHA_MIN = 4
+
+# Полный sha — 40 знаков hex; длиннее в заявке не бывает ссылки на коммит.
+SHA_MAX = 40
+
+# Знаки sha: hex в нижнем регистре — регистр заявки не значит ничего.
+SHA_CHARS = frozenset("0123456789abcdef")
+
 
 @dataclass(frozen=True)
 class Approval:
@@ -122,6 +135,64 @@ def _expired(answer: dict[str, Any]) -> bool:
         return int(raw) == 0
     except (TypeError, ValueError):
         return False
+
+
+def sha_shape(value: Any) -> str:
+    """Причина «это не sha» или пустая строка, если ссылку можно сверять.
+
+    Сверка идёт по префиксу полного sha, поэтому мусор в заявке (`abc`, `ветка`,
+    41 знак) обязан отсекаться **до** сети: `ls-remote` на такой строке либо не
+    ответит, либо «найдётся» случайно, и отказ назвал бы не ту причину.
+    """
+    text = str(value or "").strip().lower()
+    if len(text) < SHA_MIN:
+        return f"не sha: «{text}» короче {SHA_MIN} знаков"
+    if len(text) > SHA_MAX:
+        return f"не sha: «{text[:SHA_MAX]}…» длиннее {SHA_MAX} знаков"
+    if any(char not in SHA_CHARS for char in text):
+        return f"не sha: «{text}» содержит не hex-знаки"
+    return ""
+
+
+def same_commit(one: Any, other: Any) -> bool:
+    """Один и тот же коммит: полное равенство или однозначная сокращённая форма.
+
+    `git` принимает сокращённый sha, пока он однозначен, а человек видит коммит
+    двенадцатью знаками (`SHORT_SHA`) и в вопросе, и в причине отказа. Поэтому
+    «одобрен a1b2c3, в дереве a1b2c3d4…» — не подмена дерева, а одна ссылка в двух
+    формах: сверка обязана это понимать, иначе гейт отказывает честной публикации.
+
+    Не-hex имена (`HEAD`, `origin/master`) сверяются только полным равенством: у
+    них нет семантики префикса, и `head` от `head~1` ничего не отличал бы.
+    """
+    left = str(one or "").strip().lower()
+    right = str(other or "").strip().lower()
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    if sha_shape(left) or sha_shape(right):
+        return False
+    short, full = sorted((left, right), key=len)
+    return full.startswith(short)
+
+
+def origin_hits(refs: Iterable[tuple[str, str]], sha: Any) -> list[tuple[str, str]]:
+    """Ссылки origin, чей коммит начинается с заявленного sha: по одной на коммит.
+
+    `refs` — пары `(sha, ref)` из `git ls-remote`. Заявка — префикс, поэтому
+    сокращённый sha находит свой коммит; несколько **разных** коммитов с таким
+    началом — неоднозначность (её видно по длине списка), а один коммит под
+    несколькими ссылками (ветка и тег) — тот же факт, и первая ссылка называет его.
+    """
+    want = str(sha or "").strip().lower()
+    hits: dict[str, str] = {}
+    for full, ref in refs or ():
+        text = str(full or "").strip().lower()
+        if not text.startswith(want):
+            continue
+        hits.setdefault(text, str(ref or "").strip())
+    return sorted(hits.items())
 
 
 def approval(events: Iterable[Any], gates: Iterable[str], *, current: str) -> Approval:
@@ -217,7 +288,7 @@ def approval(events: Iterable[Any], gates: Iterable[str], *, current: str) -> Ap
             answer=given,
             reason=f"человек не дал ок: гейт {gate} — {str(ended.get('reason') or 'ответ вне allow')}",
         )
-    if not current or current != approved:
+    if not current or not same_commit(current, approved):
         return Approval(
             ok=False,
             gate=gate,
@@ -247,6 +318,10 @@ def claim(result: Any) -> tuple[Optional[dict[str, str]], str]:
     «опубликовано» — слово, а не факт, и сверять с origin нечего. `sha` без
     `branch` законен (публикация по тегу или в уже известную ветку), пустая
     строка вместо поля — нет: это незаполненная заявка, а не публикация.
+
+    `sha` — сокращённый или полный, но hex: `git` принимает префикс, пока он
+    однозначен, а «ветка» или три знака в этом поле — не ссылка, и сверять их с
+    origin значит ходить в сеть ради отказа (`sha_shape`).
     """
     if not isinstance(result, dict):
         return None, "публикация заявлена, но отчёта нет: сверять с origin нечего"
@@ -264,6 +339,9 @@ def claim(result: Any) -> tuple[Optional[dict[str, str]], str]:
         values[key] = raw.strip()
     if not values["sha"]:
         return None, "published без sha: что именно ушло в origin, не названо"
+    shape = sha_shape(values["sha"])
+    if shape:
+        return None, f"published.sha — {shape}: сверять с origin нечего"
     return values, ""
 
 

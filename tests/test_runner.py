@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -2222,6 +2223,73 @@ def head_of(repo: Path, rev: str = "HEAD") -> str:
     return got.stdout.strip()
 
 
+def commit_sha(tree: str, parent: str, stamp: int) -> str:
+    """sha коммита по его содержимому: `git` считает ровно это, а нам нужен перебор.
+
+    Дата в подписи меняет sha1 целиком, поэтому пара коммитов с общим началом
+    находится без единого запуска git.
+    """
+    body = (
+        f"tree {tree}\nparent {parent}\n"
+        f"author t <t@t> {stamp} +0000\ncommitter t <t@t> {stamp} +0000\n\namb\n"
+    )
+    raw = body.encode("utf-8")
+    return hashlib.sha1(b"commit %d\0" % len(raw) + raw).hexdigest()
+
+
+def ambiguous_prefix(repo: Path, origin: Path) -> str:
+    """Начало sha, под которое в origin подходят **два разных** коммита.
+
+    Неоднозначность проверяется живой: две ссылки в настоящем `origin`, а не
+    подставленный вывод `ls-remote`. Пару ищет перебор дат, а в репозиторий
+    попадают ровно те коммиты, чьи sha сравнивались (сверка `commit-tree`).
+    """
+    tree = head_of(repo, "HEAD^{tree}")
+    parent = head_of(repo, "HEAD")
+    width = 4
+    seen: dict[str, int] = {}
+    takens = {parent[:width], tree[:width]}
+    pair: Optional[tuple[int, int]] = None
+    for stamp in range(1_700_000_000, 1_700_100_000):
+        prefix = commit_sha(tree, parent, stamp)[:width]
+        if prefix in takens:
+            continue
+        if prefix in seen:
+            pair = (seen[prefix], stamp)
+            break
+        seen[prefix] = stamp
+    assert pair is not None, "пара коммитов с общим началом не нашлась"
+    made: list[str] = []
+    for stamp in pair:
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+            "GIT_AUTHOR_DATE": f"{stamp} +0000",
+            "GIT_COMMITTER_DATE": f"{stamp} +0000",
+        }
+        sha = subprocess.run(
+            ["git", "-C", str(repo), "commit-tree", tree, "-p", parent, "-m", "amb"],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=True,
+        ).stdout.strip()
+        # Коммит в репозитории — ровно тот, чей sha сравнивался: иначе перебор
+        # доказывал бы не то, что попало в origin.
+        assert sha == commit_sha(tree, parent, stamp)
+        tagged = subprocess.run(
+            ["git", "-C", str(repo), "tag", f"amb-{stamp}", sha], capture_output=True, text=True
+        )
+        assert tagged.returncode == 0, tagged.stderr
+        made.append(sha)
+    assert len(made) == 2, made
+    subprocess.run(["git", "-C", str(repo), "push", "-q", "origin", "--tags"], check=True)
+    return made[0][:width]
+
+
 def publish_spec(tmp_path: Path, repo: Path, *, allow: str = "да", edits: str = "") -> Any:
     """Спека «impl → гейт → publish»: вопрос человеку и публикующий этап за ним."""
     return write_spec(
@@ -2387,6 +2455,79 @@ def test_publish_of_the_approved_commit_is_confirmed_by_origin(tmp_path: Path) -
     assert fact["verified_by"] == runner.PUBLISH_VERIFY
     assert fact["ref"] == "refs/heads/main"
     assert ended_of(conn, deal, "publish")["payload"]["outcome"] == runner.OUTCOME_DONE
+
+
+def test_publish_claim_by_a_short_sha_is_confirmed_by_origin(tmp_path: Path) -> None:
+    """Сокращённый sha (так пишет публикатор) — факт, а не «нет в origin».
+
+    Приёмка FIX-S4a: полное равенство объявляло честную публикацию ложью, потому
+    что исполнитель пишет семь знаков, а `ls-remote` отдаёт сорок. Факт обязан
+    нести **полный** sha из origin, а заявку — рядом (`claimed_sha`).
+    """
+    repo, _origin = git_origin(tmp_path)
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = publish_spec(tmp_path, repo)
+    approve(conn, spec, deal, home)
+    pushed = head_of(repo, "HEAD")
+    fake = Fake(result=publish_report(pushed[:7], published={"branch": "main"}), pack=True)
+
+    report = run_publish(conn, spec, deal, home, fake)
+
+    assert report["outcome"] == runner.OUTCOME_DONE
+    fact = only(conn, deal, "published")["payload"]
+    assert fact["sha"] == pushed
+    assert fact["claimed_sha"] == pushed[:7]
+    assert fact["ref"] == "refs/heads/main"
+    assert fact["verified_by"] == runner.PUBLISH_VERIFY
+
+
+def test_publish_claim_of_an_ambiguous_sha_is_contract(tmp_path: Path) -> None:
+    """Начало sha, под которое подходят два коммита, — отказ, а не «нашли».
+
+    Молчаливое «нашлось» выбрало бы один из двух коммитов за исполнителя: он
+    мог опубликовать любой из них, и движок не имеет права угадывать.
+    """
+    repo, origin = git_origin(tmp_path)
+    prefix = ambiguous_prefix(repo, origin)
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = publish_spec(tmp_path, repo)
+    approve(conn, spec, deal, home)
+    fake = Fake(result=publish_report(prefix, published={"branch": ""}), pack=True)
+
+    report = run_publish(conn, spec, deal, home, fake)
+
+    assert report["outcome"] == runner.OUTCOME_FAILED
+    assert report["kind"] == runner.FAIL_CONTRACT
+    assert f"sha {prefix}… подходит к нескольким ссылкам" in report["reason"]
+    assert "refs/tags/amb-" in report["reason"]
+    assert "published" not in kinds(conn, deal)
+
+
+def test_publish_claim_that_is_not_a_sha_is_refused_before_git(tmp_path: Path) -> None:
+    """Мусор в `sha` — отказ до сети: у репозитория ниже даже нет origin.
+
+    `ls-remote` на «ветке вместо коммита» либо не ответит, либо совпадёт случайно,
+    и причина отказа назвала бы git, а не заявку.
+    """
+    repo = git_repo(tmp_path)
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = publish_spec(tmp_path, repo)
+    approve(conn, spec, deal, home)
+    fake = Fake(result=publish_report("release/v0.0.5", published={"branch": ""}), pack=True)
+
+    report = run_publish(conn, spec, deal, home, fake)
+
+    assert report["outcome"] == runner.OUTCOME_FAILED
+    assert report["kind"] == runner.FAIL_CONTRACT
+    assert "не sha" in report["reason"]
+    assert "ls-remote" not in report["reason"]
+    assert "published" not in kinds(conn, deal)
 
 
 def test_publish_claim_missing_in_origin_is_contract(tmp_path: Path) -> None:

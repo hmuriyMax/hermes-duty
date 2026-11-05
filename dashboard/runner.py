@@ -1945,6 +1945,14 @@ def published_claim(spec: Any, result: Any) -> tuple[Optional[dict[str, str]], s
     `git ls-remote origin [ветка]`: движок верит ссылке, а не отчёту. `mr_url`
     остаётся заявкой: он живёт в GitLab, а не в репозитории, и проверять его
     значило бы ходить в сеть из шага движка.
+
+    Заявленный sha сверяется **по префиксу** (`publish.origin_hits`): публикатор
+    пишет сокращённую форму, консоль печатает семь знаков, и полное равенство
+    объявляло бы честную публикацию «нет в origin». Факт несёт **полный** sha из
+    `ls-remote` (`sha` — то, что на самом деле в origin), а заявка рядом
+    (`claimed_sha`): видно и факт, и что именно сказал исполнитель. Несколько
+    разных коммитов с таким началом — неоднозначность и отказ: «нашли» здесь было
+    бы догадкой.
     """
     claim, why = publish.claim(result)
     if claim is None:
@@ -1959,15 +1967,26 @@ def published_claim(spec: Any, result: Any) -> tuple[Optional[dict[str, str]], s
     code, out = _git_stdout(args, repo)
     if code != 0:
         return None, f"публикация заявлена, но не найдена: git ls-remote отказал ({out})"
-    want = claim["sha"].lower()
+    refs: list[tuple[str, str]] = []
     for line in out.splitlines():
         sha, _, ref = line.partition("\t")
-        if sha.strip().lower() == want:
-            return {**claim, "ref": ref.strip()}, ""
-    tail = f" по ветке {claim['branch']}" if claim["branch"] else ""
-    return None, (
-        f"публикация заявлена, но не найдена: sha {claim['sha'][:PUBLISH_SHORT]}… нет в origin{tail}"
-    )
+        if sha.strip():
+            refs.append((sha.strip(), ref.strip()))
+    hits = publish.origin_hits(refs, claim["sha"])
+    if not hits:
+        tail = f" по ветке {claim['branch']}" if claim["branch"] else ""
+        return None, (
+            f"публикация заявлена, но не найдена: sha {claim['sha'][:PUBLISH_SHORT]}… "
+            f"нет в origin{tail}"
+        )
+    if len(hits) > 1:
+        named = ", ".join(f"{sha[:PUBLISH_SHORT]} ({ref or '—'})" for sha, ref in hits)
+        return None, (
+            f"публикация заявлена, но sha {claim['sha'][:PUBLISH_SHORT]}… подходит к "
+            f"нескольким ссылкам: {named} — назови коммит полнее"
+        )
+    sha, ref = hits[0]
+    return {**claim, "sha": sha, "ref": ref, "claimed_sha": claim["sha"]}, ""
 
 
 def _published_event(
@@ -1986,6 +2005,10 @@ def _published_event(
         "branch": fact["branch"],
         "mr_url": fact["mr_url"],
         "ref": fact.get("ref") or "",
+        # Заявка рядом с фактом: `sha` — то, что действительно в origin (полный
+        # sha из `ls-remote`), а `claimed_sha` — что сказал исполнитель (обычно
+        # сокращённая форма). Без этой пары не видно, сходилась ли заявка сама.
+        "claimed_sha": fact.get("claimed_sha") or fact["sha"],
         "verified_by": PUBLISH_VERIFY,
     }
     return _event(
@@ -2796,7 +2819,7 @@ def run_stage(
         fact, why = published_claim(spec, result)
         if fact is None:
             outcome, kind, reason = OUTCOME_FAILED, FAIL_CONTRACT, why
-        elif approval is not None and fact["sha"].lower() != approval.commit.lower():
+        elif approval is not None and not publish.same_commit(fact["sha"], approval.commit):
             outcome, kind, reason = (
                 OUTCOME_FAILED,
                 FAIL_CONTRACT,

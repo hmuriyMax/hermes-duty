@@ -342,6 +342,9 @@ def _publication(fact: Any) -> Optional[dict[str, Any]]:
         "branch": str(fact.get("branch") or ""),
         "mr_url": str(fact.get("mr_url") or ""),
         "ref": str(fact.get("ref") or ""),
+        # Заявка исполнителя рядом с фактом: `sha` подтверждён `ls-remote` и
+        # полный, а здесь — то, что он написал (обычно сокращённая форма).
+        "claimed_sha": str(fact.get("claimed_sha") or ""),
         "verified_by": str(fact.get("verified_by") or ""),
         "stage": str(fact.get("stage") or ""),
         "attempt": _maybe_int(fact.get("attempt")),

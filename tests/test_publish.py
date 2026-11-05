@@ -288,19 +288,104 @@ def test_claim_with_non_string_field_is_refused():
 def test_claim_names_the_three_fields_and_strips_them():
     """Заявка закрыта тремя полями; пробелы по краям — не часть ссылки."""
     claim, why = publish.claim(
-        {"published": {"sha": " aaa ", "branch": "origin/main ", "mr_url": " https://mr/1"}}
+        {"published": {"sha": " aaaa ", "branch": "origin/main ", "mr_url": " https://mr/1"}}
     )
 
     assert why == ""
-    assert claim == {"sha": "aaa", "branch": "origin/main", "mr_url": "https://mr/1"}
+    assert claim == {"sha": "aaaa", "branch": "origin/main", "mr_url": "https://mr/1"}
 
 
 def test_claim_without_branch_is_legal():
     """Публикация по тегу или в известную ветку: sha без ветки — законная заявка."""
-    claim, why = publish.claim({"published": {"sha": "aaa"}})
+    claim, why = publish.claim({"published": {"sha": "aaaa"}})
 
     assert why == ""
-    assert claim == {"sha": "aaa", "branch": "", "mr_url": ""}
+    assert claim == {"sha": "aaaa", "branch": "", "mr_url": ""}
+
+
+def test_claim_with_a_short_sha_is_refused():
+    """Три знака — не ссылка: префикс короче четырёх совпадает почти со всем."""
+    claim, why = publish.claim({"published": {"sha": "abc"}})
+
+    assert claim is None
+    assert "не sha" in why
+    assert "короче 4 знаков" in why
+
+
+def test_claim_with_a_non_hex_sha_is_refused():
+    """Ветка вместо коммита в поле `sha` — заявка не о том, сверять нечего."""
+    claim, why = publish.claim({"published": {"sha": "release/v0.0.5"}})
+
+    assert claim is None
+    assert "не sha" in why
+    assert "не hex-знаки" in why
+
+
+# ---------------------------------------------------- сверка ссылок и коммитов
+
+
+def test_same_commit_takes_the_short_form():
+    """Сокращённый и полный sha одного коммита — одна ссылка, а не подмена дерева."""
+    assert publish.same_commit("a1b2c3d", "a1b2c3d4e5f6") is True
+    assert publish.same_commit("A1B2C3D4E5F6", "a1b2c3d4e5f6") is True
+
+
+def test_same_commit_does_not_confuse_revision_names():
+    """Не-hex имена сверяются только целиком: у `HEAD` нет семантики префикса."""
+    assert publish.same_commit("HEAD", "HEAD") is True
+    assert publish.same_commit("HEAD", "HEAD~1") is False
+    assert publish.same_commit("origin/main", "origin") is False
+
+
+def test_same_commit_refuses_an_empty_or_different_commit():
+    """Пустая ссылка и чужой коммит — не совпадение."""
+    assert publish.same_commit("", APPROVED) is False
+    assert publish.same_commit(APPROVED, MOVED) is False
+    assert publish.same_commit("abcd", MOVED) is False
+
+
+def test_approval_of_a_short_gate_commit_is_ok():
+    """Гейт записал сокращённую форму, дерево — полную: это то же одобрение.
+
+    Красная проба FIX-S4a: при точном равенстве строк человек одобрил бы один
+    коммит, а публикация считалась бы чужой ровно из-за формы записи.
+    """
+    result = publish.approval(
+        events(asked(approved_commit=APPROVED[:7]), answered(), verdict()),
+        ["gate"],
+        current=APPROVED,
+    )
+
+    assert result.ok is True
+    assert result.commit == APPROVED[:7]
+
+
+def test_origin_hits_find_the_commit_by_a_short_sha():
+    """Заявка — префикс: `git`-семантика, сокращённый sha находит свой коммит."""
+    refs = [(APPROVED, "refs/heads/main"), (MOVED, "refs/tags/old")]
+
+    assert publish.origin_hits(refs, APPROVED[:7]) == [(APPROVED, "refs/heads/main")]
+    assert publish.origin_hits(refs, APPROVED[:7].upper()) == [(APPROVED, "refs/heads/main")]
+
+
+def test_origin_hits_name_every_commit_of_an_ambiguous_prefix():
+    """Два разных коммита с общим началом — два факта, и решать их не движку."""
+    refs = [
+        ("abc123" + "4" * 34, "refs/heads/main"),
+        ("abc123" + "5" * 34, "refs/tags/old"),
+    ]
+
+    hits = publish.origin_hits(refs, "abc123")
+
+    assert [sha for sha, _ref in hits] == [refs[0][0], refs[1][0]]
+    assert len(hits) == 2
+
+
+def test_origin_hits_keep_one_fact_for_one_commit():
+    """Один коммит под веткой и тегом — тот же факт, а не неоднозначность."""
+    refs = [(APPROVED, "refs/heads/main"), (APPROVED, "refs/tags/v1")]
+
+    assert publish.origin_hits(refs, APPROVED[:7]) == [(APPROVED, "refs/heads/main")]
 
 
 # ------------------------------------------------------------- факт журнала

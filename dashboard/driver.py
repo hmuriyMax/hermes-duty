@@ -310,6 +310,10 @@ def _rows(number: int, step_result: dict[str, Any], duration: float) -> list[dic
                 # Строка обязана нести этот флаг, иначе драйвер прочитал бы отказ
                 # как «этап занят соседом» и вышел бы ожиданием вместо остановки.
                 "refused": bool(run.get("refused")),
+                # Гейт закрыл дело решением человека («не публиковать»): строка
+                # несёт флаг, иначе драйвер прочитал бы отказ гейта как отказ дела
+                # и напечатал «попытки исчерпаны» поверх записанного `completed`.
+                "closed": bool(run.get("closed")),
                 # База дерева и коммит попытки: по ним видно, от чего этап работал
                 # и что оставил следующему (W14). В человеческую строку они не
                 # идут — она про исход, — но в `--json` и отчёте прогона нужны.
@@ -625,6 +629,16 @@ def run(
                     outcome = OUTCOME_FAILED
                     note = str(refused.get("reason") or "")
                     decision = decide()
+                    break
+                ended = next((row for row in rows if row.get("closed")), None)
+                if ended is not None:
+                    # Гейт закрыл дело решением человека («не публиковать»): это не
+                    # отказ прогона, и «попытки исчерпаны» здесь было бы неправдой.
+                    # Факт `completed` уже в журнале — итог берётся из него.
+                    decision = decide()
+                    closed = _closure(conn, deal, spec, tick())
+                    outcome = OUTCOME_DONE
+                    note = str(ended.get("reason") or "")
                     break
                 if not any(row["started"] for row in rows):
                     # Попытку поднял кто-то другой (лизинг занят живым процессом):

@@ -939,6 +939,17 @@ def _ancestors(spec: Spec) -> dict[str, set[str]]:
     return result
 
 
+def ancestors(spec: Spec) -> dict[str, set[str]]:
+    """Транзитивные предки каждого этапа по `needs` — один граф на весь плагин.
+
+    Наружу он нужен движку: перед спавном публикующего этапа тот ищет его
+    гейт-предков (`dashboard/publish.py`). Вторая реализация обхода разошлась бы
+    с валидатором на первом же `needs` через два этапа, и проверка «гейт в
+    предках» в спеке и в рантайме отвечала бы по-разному.
+    """
+    return _ancestors(spec)
+
+
 def _check_cycle(spec: Spec) -> list[Issue]:
     """Граф `needs` ацикличен: иначе `next(spec, events)` не имеет ответа."""
     by_id = {stage.id: stage for stage in spec.stages}
@@ -1163,6 +1174,60 @@ def _check_review_gate(spec: Spec) -> list[Issue]:
                 stage.line,
                 "review-gate",
                 f"этап {stage.id!r} публикует, но в его предках нет ревью (role: {REVIEWING_ROLE})",
+            )
+        )
+    return issues
+
+
+def _check_publish_gate(spec: Spec) -> list[Issue]:
+    """Публикация требует вопроса человеку в предках — и утвердительного `allow`.
+
+    `review-gate` требует приговора перед публикацией, но приговор — это роль, а
+    не человек: ревьюер одобряет дифф, а «публиковать этот коммит» решает
+    человек. Поэтому у публикующего этапа (`role` из `PUBLISHING_ROLES`) в
+    транзитивных `needs` обязан быть `kind: gate`, и у этого гейта обязан быть
+    объявленный `allow`.
+
+    `allow` обязателен именно объявленным: без него продолжением считается любой
+    вариант из `ask.options` (`runner.gate_allow`), то есть «не публиковать»
+    закрыло бы гейт успехом, и публикация поехала бы на отказе человека. Спека,
+    в которой это возможно, — небезопасная, и отказ случается до первого
+    процесса, а не в момент пуша.
+    """
+    if not _references_intact(spec):
+        return []  # ссылки битые — уже отказ `needs`/`parallel_with`, граф не проверить
+    by_id = {stage.id: stage for stage in spec.stages}
+    ancestors = _ancestors(spec)
+    issues: list[Issue] = []
+    for stage in spec.stages:
+        if stage.role not in PUBLISHING_ROLES:
+            continue
+        gates = [
+            by_id[need]
+            for need in sorted(ancestors.get(stage.id, set()))
+            if by_id[need].kind == GATE_KIND
+        ]
+        if not gates:
+            issues.append(
+                Issue(
+                    spec.path,
+                    stage.line,
+                    "publish-gate",
+                    f"публикация требует вопроса человеку (kind: {GATE_KIND}) в предках: "
+                    f"у публикующего этапа {stage.id!r} его нет",
+                )
+            )
+            continue
+        if any(gate.allow for gate in gates):
+            continue
+        gate = gates[0]
+        issues.append(
+            Issue(
+                spec.path,
+                gate.line_of("allow") if "allow" in gate.lines else gate.line,
+                "publish-gate",
+                f"гейт {gate.id!r} перед публикующим этапом {stage.id!r} не объявляет allow: "
+                "без него продолжением считается любой вариант, включая «не публиковать»",
             )
         )
     return issues
@@ -1672,6 +1737,7 @@ def validate_spec(spec: Spec, *, profiles: Optional[frozenset[str]] = None) -> l
     issues += _check_evidence(spec)
     issues += _check_verdicts(spec)
     issues += _check_review_gate(spec)
+    issues += _check_publish_gate(spec)
     issues += _check_workspace(spec)
     issues += _check_artifacts_without_tree(spec)
     issues += _check_ask(spec)

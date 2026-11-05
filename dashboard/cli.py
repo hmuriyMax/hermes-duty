@@ -697,6 +697,7 @@ NOW_COLUMNS = (
     ("ОЖИДАНИЕ", 9),
     ("ВОЗРАСТ", 8),
     ("РАСХОД", 34),
+    ("ПУБЛИКАЦИЯ", 24),
     ("ДЕЛО", 28),
     ("ДОКАЗАТЕЛЬСТВО", 72),
 )
@@ -742,6 +743,7 @@ def _now_row(deal: dict[str, Any], now: Any) -> list[Any]:
         _fmt_age(wait_age),
         _fmt_age(deal_age),
         spent or "—",
+        _published_cell(deal.get("published")),
         deal.get("title"),
         waiting.get("evidence"),
     ]
@@ -904,6 +906,9 @@ def render_attempts(payload: dict[str, Any]) -> str:
             lines.append(f"  итог: {attempt.get('summary')}")
         if attempt.get("reason"):
             lines.append(f"  причина: {attempt.get('reason')}")
+        published_text = _published_text(attempt.get("published"))
+        if published_text:
+            lines.append(f"  опубликовано: {published_text}")
         if attempt.get("error") and attempt.get("error") != attempt.get("reason"):
             lines.append(f"  ошибка: {attempt.get('error')}")
         if attempt.get("progress"):
@@ -918,6 +923,32 @@ def render_attempts(payload: dict[str, Any]) -> str:
         lines.append("")
         lines.append(total)
     return "\n".join(lines)
+
+
+def _published_text(block: Any) -> str:
+    """Публикация словами: «sha · ветка · MR» — одна строка, без простыни.
+
+    Текст собирается из факта журнала (`published`), а не из отчёта исполнителя:
+    mr_url в нём — заявка (GitLab движку не виден), а sha подтверждён
+    `git ls-remote` (`dashboard/runner.published_claim`).
+    """
+    if not isinstance(block, dict) or not block.get("sha"):
+        return ""
+    sha = _sha(block.get("sha"))
+    branch = str(block.get("branch") or "")
+    # Ветка — полное имя без `refs/heads/`: «release/v0.0.5» человек узнаёт,
+    # а «v0.0.5» (последний кусок) — не узнаёт, потому что таких веток много.
+    for prefix in ("refs/heads/", "refs/tags/"):
+        if branch.startswith(prefix):
+            branch = branch[len(prefix) :]
+    mr_url = str(block.get("mr_url") or "")
+    parts = [part for part in (sha, branch, mr_url) if part]
+    return " · ".join(parts)
+
+
+def _published_cell(block: Any) -> str:
+    """Колонка `ПУБЛИКАЦИЯ` в таблице «сейчас»: факт или прочерк."""
+    return _published_text(block) or "—"
 
 
 def _budget_line(block: Any) -> str:
@@ -986,6 +1017,9 @@ def render_deal(payload: dict[str, Any], timeline: Optional[dict[str, Any]], tim
     budget_line = _budget_line(payload.get("budget"))
     if budget_line:
         lines.append(budget_line)
+    published_text = _published_text(payload.get("published"))
+    if published_text:
+        lines.append(f"опубликовано: {published_text}")
     shaped = payload.get("deal")
     if shaped is not None:
         lines.append(f"доказательство: {(shaped.get('waiting') or {}).get('evidence') or 'не записано'}")

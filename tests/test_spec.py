@@ -99,7 +99,7 @@ def two_stages(extra: str = "", verdict: str = "verdict: {approve: next, changes
 def test_full_example_is_ok(tmp_path: Path):
     """Полный пример из спеки-источника: ни одного отказа, база резолвится."""
     loaded = spec_module.load_spec(EXAMPLES / "duty.yaml")
-    assert [stage.id for stage in loaded.stages] == ["impl", "verify", "review", "publish", "docs"]
+    assert [stage.id for stage in loaded.stages] == ["impl", "verify", "review", "gate", "publish", "docs"]
     assert spec_module.errors(spec_module.validate_spec(loaded, profiles=PROFILES)) == []
     # Репозиторий примера живёт не на каждой машине, поэтому проверка `base`
     # проверяется на копии спеки со здешним путём: правило то же, дерево есть.
@@ -463,13 +463,18 @@ stages:
 """,
     )
     found = spec_module.validate_spec(spec_module.load_spec(path), profiles=PROFILES)
-    assert [(issue.rule, issue.line, issue.severity) for issue in found] == [("review-gate", 5, "error")]
+    # Два отказа об одном: нет приговора и нет вопроса человеку. Оба — про этап
+    # публикации и оба с его `file:line`, поэтому проверяются вместе.
+    assert [(issue.rule, issue.line, issue.severity) for issue in found] == [
+        ("review-gate", 5, "error"),
+        ("publish-gate", 5, "error"),
+    ]
     assert "этап 'publish' публикует, но в его предках нет ревью (role: reviewer)" in found[0].message
     assert str(found[0]).startswith(f"{path}:5: review-gate:")
 
 
 def test_publish_after_review_is_ok(tmp_path: Path):
-    """Ревью в предках — гейт закрыт: публикация после приговора законна."""
+    """Приговор и вопрос человеку в предках — публикация законна."""
     found = issues(
         tmp_path,
         """
@@ -482,17 +487,81 @@ def test_publish_after_review_is_ok(tmp_path: Path):
             needs: [impl]
             workspace: none
             verdict: {approve: next, changes: impl, max_rounds: 1}
+          - id: gate
+            kind: gate
+            needs: [review]
+            ask: {q: "Публикуем?", options: [публиковать, стоп]}
+            allow: [публиковать]
           - id: publish
             role: publisher
-            needs: [review]
+            needs: [gate]
             workspace: none
         """,
     )
     assert found == []
 
 
+def test_publish_without_gate_is_error_even_after_review(tmp_path: Path):
+    """Ревью есть, человека не спросили — публикация не запускается: `publish-gate`.
+
+    Это приёмка карточки: «спека без `kind: gate` перед `publisher` → `spec check`
+    отказ». Приговор ревьюера его не заменяет — он про дифф, а «ок» публикации
+    даёт человек.
+    """
+    path = write(
+        tmp_path,
+        """duty: probe
+stages:
+  - id: impl
+    role: implementer
+  - id: review
+    role: reviewer
+    needs: [impl]
+    workspace: none
+    verdict: {approve: next, changes: impl, max_rounds: 1}
+  - id: publish
+    role: publisher
+    needs: [review]
+    workspace: none
+""",
+    )
+    found = spec_module.validate_spec(spec_module.load_spec(path), profiles=PROFILES)
+    assert [issue.rule for issue in found] == ["publish-gate"]
+    assert "публикация требует вопроса человеку (kind: gate) в предках" in found[0].message
+    assert str(found[0]).startswith(f"{path}:10: publish-gate:")
+
+
+def test_publish_gate_without_allow_is_error(tmp_path: Path):
+    """Гейт без `allow`: продолжением стал бы любой вариант, включая «не публиковать»."""
+    path = write(
+        tmp_path,
+        """duty: probe
+stages:
+  - id: impl
+    role: implementer
+  - id: review
+    role: reviewer
+    needs: [impl]
+    workspace: none
+    verdict: {approve: next, changes: impl, max_rounds: 1}
+  - id: gate
+    kind: gate
+    needs: [review]
+    ask: {q: "Публикуем?", options: [публиковать, стоп]}
+  - id: publish
+    role: publisher
+    needs: [gate]
+    workspace: none
+""",
+    )
+    found = spec_module.validate_spec(spec_module.load_spec(path), profiles=PROFILES)
+    assert [issue.rule for issue in found] == ["publish-gate"]
+    assert "не объявляет allow" in found[0].message
+    assert str(found[0]).startswith(f"{path}:10: publish-gate:")
+
+
 def test_publish_after_stage_that_itself_after_review_is_ok(tmp_path: Path):
-    """Ревью — транзитивно: `publish` после `verify`, а `verify` после `review`, законен."""
+    """Вопрос и приговор — транзитивно: `publish` после `verify`, а `verify` после гейта."""
     found = issues(
         tmp_path,
         """
@@ -505,9 +574,14 @@ def test_publish_after_stage_that_itself_after_review_is_ok(tmp_path: Path):
             needs: [impl]
             workspace: none
             verdict: {approve: next, changes: impl, max_rounds: 1}
+          - id: gate
+            kind: gate
+            needs: [review]
+            ask: {q: "Публикуем?", options: [публиковать, стоп]}
+            allow: [публиковать]
           - id: verify
             role: tester
-            needs: [review]
+            needs: [gate]
             workspace: none
           - id: publish
             role: publisher
@@ -538,8 +612,8 @@ def test_review_downstream_of_publish_does_not_count(tmp_path: Path):
             verdict: {approve: next, changes: impl, max_rounds: 1}
         """,
     )
-    assert [issue.rule for issue in found] == ["review-gate"]
-    assert "publish" in found[0].message
+    assert [issue.rule for issue in found] == ["review-gate", "publish-gate"]
+    assert all("publish" in issue.message for issue in found)
 
 
 @pytest.mark.parametrize("role", spec_module.PUBLISHING_ROLES)
@@ -561,7 +635,7 @@ def test_every_publishing_role_needs_review(tmp_path: Path, role: str):
         )
     )
     found = spec_module.validate_spec(loaded, profiles=PROFILES | {role})
-    assert [issue.rule for issue in found] == ["review-gate"]
+    assert [issue.rule for issue in found] == ["review-gate", "publish-gate"]
 
 
 def test_risky_stage_without_review_is_error(tmp_path: Path):
@@ -1300,9 +1374,13 @@ def test_shell_stage_without_role_is_ok(tmp_path: Path):
 
 
 def test_stage_without_kind_is_agent(tmp_path: Path):
-    """Спека 0.0.4 читается без правок: нет `kind` — этап-агент."""
+    """Спека 0.0.4 читается без правок: нет `kind` — этап-агент.
+
+    В примере теперь есть гейт (`kind: gate`, 0.0.5), поэтому «нет `kind`» читается
+    по этапам, где он не объявлен: единственный не-агент — сам гейт.
+    """
     loaded = spec_module.load_spec(EXAMPLES / "duty.yaml")
-    assert {stage.kind for stage in loaded.stages} == {spec_module.DEFAULT_STAGE_KIND}
+    assert {stage.id for stage in loaded.stages if stage.kind != spec_module.DEFAULT_STAGE_KIND} == {"gate"}
     assert spec_module.errors(spec_module.validate_spec(loaded, profiles=PROFILES)) == []
 
 

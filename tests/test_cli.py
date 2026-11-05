@@ -519,6 +519,79 @@ def test_attempts_of_own_deal_without_attempts_prints_the_note(home, frozen_now,
     assert "0.0.3" not in out
 
 
+def test_published_fact_is_shown_by_deal_now_and_attempts(home, frozen_now, capsys):
+    """Публикация видна там же, где вердикт: строкой в `deal`, колонкой в `now`.
+
+    Приёмка: «`bin/duty deal` показывает «опубликовано: sha, MR» строкой, `now` —
+    то же; в `attempts` публикация видна как попытка с вердиктом». Текст собирается
+    из факта журнала (`published`), поэтому тест пишет ровно то событие, которое
+    пишет движок после `git ls-remote`.
+    """
+    deal_id = own_deal(home)
+    write_three_attempts(home, deal_id)
+    journal_module = cli._load_journal()
+    conn = cli.api().deals.open_store(home)
+    assert conn is not None
+    try:
+        journal_module.append(
+            conn,
+            [
+                {
+                    "deal_id": deal_id,
+                    "board": "b1",
+                    "kind": "published",
+                    "ts": NOW - 100,
+                    "recorded_at": NOW - 100,
+                    "source": "engine",
+                    "payload": {
+                        "stage": "publish",
+                        "attempt": 1,
+                        "sha": COMMIT_ONE,
+                        "branch": "release/v0.0.5",
+                        "mr_url": "https://gitlab.example/mr/7",
+                        "ref": "refs/heads/release/v0.0.5",
+                        "verified_by": "git ls-remote",
+                    },
+                    "idempotency_key": f"test:{deal_id}:published",
+                }
+            ],
+        )
+    finally:
+        conn.close()
+
+    code, out, _ = run(["deal", "b1", deal_id], capsys)
+
+    assert code == cli.EXIT_OK
+    line = next(item for item in out.splitlines() if item.startswith("опубликовано:"))
+    assert "8a2d5cb" in line
+    assert "release/v0.0.5" in line
+    assert "https://gitlab.example/mr/7" in line
+
+    row = next(item for item in cli.api().now()["deals"] if item["id"] == deal_id)
+    assert row["published"]["sha"] == COMMIT_ONE
+    assert row["published"]["verified_by"] == "git ls-remote"
+
+    code, now_out, _ = run(["now"], capsys)
+    assert code == cli.EXIT_OK
+    # Таблица режет ячейки по ширине, поэтому здесь проверяется колонка, а не
+    # полная ссылка: полный текст — в `deal` выше и в `--json` роута.
+    assert "ПУБЛИКАЦИЯ" in now_out
+    assert "8a2d5cb" in now_out
+
+
+def test_now_prints_a_dash_when_nothing_was_published(home, frozen_now, capsys):
+    """Не публиковали — прочерк: «0» или пустая строка читались бы как факт."""
+    deal_id = own_deal(home)
+    write_three_attempts(home, deal_id)
+
+    code, out, _ = run(["deal", "b1", deal_id], capsys)
+
+    assert code == cli.EXIT_OK
+    assert "опубликовано:" not in out
+    row = next(item for item in cli.api().now()["deals"] if item["id"] == deal_id)
+    assert row["published"] is None
+
+
 # -------------------- факты попытки своего дела в консоли (FIX-4 / B2)
 #
 # `bin/duty deal` и строка «Сейчас» — одна карточка: попытка и лизинг читаются из

@@ -39,10 +39,23 @@ stages:
     needs: [verify]
     verdict: {approve: next, changes: impl, max_rounds: 2}   # approve: next|<stage-id>
 
+  # Публикация — вопрос человеку, а не этап роли: гейт сам ничего не исполняет,
+  # он показывает коммит, `--stat` и отчёт ревьюера и читает ответ по `allow`.
+  # `allow` объявлен явно: без него «стоп» тоже закрыл бы гейт успехом.
+  - id: gate
+    kind: gate
+    needs: [review]
+    ask: {q: "Публикуем этот коммит?", options: ["публиковать", "не публиковать"]}
+    allow: ["публиковать"]
+    budget: {minutes: 120}          # срок ответа человека, а не расход дела
+
   - id: publish
     role: publisher
-    needs: [review]
-    ask: {q: "Публикуем diff?", options: ["пушить", "стоп"], risky: true}
+    needs: [gate]
+    workspace: worktree
+    # Публикует профиль `publisher`: движок сам не пушит (`cmd` с `git push`
+    # отказывает), он только сверяет одобренный коммит и подтверждает
+    # `published: {sha, branch, mr_url}` из отчёта через `git ls-remote`.
 
   - id: docs
     role: documenter

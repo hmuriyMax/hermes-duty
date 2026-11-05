@@ -74,6 +74,10 @@ REPORT_KEYS = (
     "usage",
     "question",
     "session_id",
+    # Публикация (0.0.5): заявка {sha, branch, mr_url}. Проверяет её движок
+    # (`runner.published_claim`), а не этот слой: `git ls-remote` — сеть и git,
+    # а гейт пакета остаётся сверкой заявленного с деревом.
+    "published",
 )
 
 # Имена правил: ими отказ называется в `details` и в `duty why`, чтобы человек

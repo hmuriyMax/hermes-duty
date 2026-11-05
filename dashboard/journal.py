@@ -108,6 +108,7 @@ EVENT_KINDS = (
     "attached",
     "question_asked",
     "question_answered",
+    "published",
 )
 
 # Виды, которые живое ожидание не открывают (правило 12 `docs/JOURNAL.md`):
@@ -119,7 +120,14 @@ EVENT_KINDS = (
 # `completed` закрытое дело не воскрешает.
 # Набор один на весь модуль: расползаться по `if` в вызывающих это правило не
 # должно.
-NON_STATE_KINDS = ("commented", "attached", "patched", "question_answered", "attempt_progress")
+NON_STATE_KINDS = (
+    "commented",
+    "attached",
+    "patched",
+    "question_answered",
+    "attempt_progress",
+    "published",
+)
 
 # Вид `block_kind` парковки (`dashboard/failures.py`): попытки исчерпаны, дело
 # ждёт решения человека. Отдельного вида события для парковки нет — она выражена
@@ -179,6 +187,7 @@ KIND_ORDER = (
     "gate_opened",
     "gate_closed",
     "attempt_ended",
+    "published",
     "lease_lost",
     "completed",
 )

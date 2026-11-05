@@ -66,6 +66,8 @@ DEALS_MODULE_NAME = "hermes_duty_deals"
 STAGEFEED_MODULE_NAME = "hermes_duty_stagefeed"
 # `dashboard/budget.py` — расход дела по журналу против верхнего `budget` спеки.
 BUDGET_MODULE_NAME = "hermes_duty_budget"
+# `dashboard/publish.py` — факт публикации дела по журналу (`published`).
+PUBLISH_MODULE_NAME = "hermes_duty_publish"
 
 
 def _load_journal() -> Any:
@@ -156,6 +158,24 @@ def _load_budget() -> Any:
 
 
 budget = _load_budget()
+
+
+def _load_publish() -> Any:
+    """Загрузить `dashboard/publish.py` — факт публикации дела по журналу."""
+    loaded = sys.modules.get(PUBLISH_MODULE_NAME)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / "publish.py"
+    spec = importlib.util.spec_from_file_location(PUBLISH_MODULE_NAME, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise ImportError(f"publish module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[PUBLISH_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+publish = _load_publish()
 
 
 # Один набор заголовков на все ответы: и 200, и ошибки. Кэш промежуточного
@@ -1332,6 +1352,9 @@ def _board_deals(
                 # Расход против верхнего `budget` спеки, если она записана в
                 # журнале: у наблюдаемого дела спеки обычно нет — `null`.
                 "budget": budget.describe_events(journal_events.get(task_id, [])),
+                # Публикация по журналу (`dashboard/publish.py`): `null` — не
+                # публиковали, блок — факт, подтверждённый `git ls-remote`.
+                "published": publish.published_of(journal_events.get(task_id, [])),
                 "waiting": waiting,
                 "_age_sec": (attempt or {}).get("age_sec")
                 if attempt is not None
@@ -1582,6 +1605,8 @@ def _own_shaped(
         # Расход дела против верхнего `budget` спеки (`dashboard/budget.py`):
         # `null` — потолка на дело нет, и поверхность не выдумывает нули.
         "budget": budget.describe_events(events),
+        # Публикация — тот же факт журнала, что у `/deal` (`dashboard/publish.py`).
+        "published": publish.published_of(events),
         "waiting": _own_waiting(
             folded, question, str(row["status"]), journal_note, pool_note,
             home=home, deal_id=str(row["id"]), attempts=attempts,
@@ -1690,6 +1715,7 @@ def _deal_response(
     errors: Optional[list[dict[str, str]]] = None,
     closed: Optional[dict[str, Any]] = None,
     budget_block: Optional[dict[str, Any]] = None,
+    published_block: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Ответ «одно дело» — одна форма и для kanban-дела, и для своего.
 
@@ -1739,6 +1765,11 @@ def _deal_response(
         "stages": list(stages or []),
         "stages_note": stages_note,
         "budget": budget_block,
+        # Публикация (`dashboard/publish.py`): `{sha, branch, mr_url, …}` или
+        # `null`. Это факт журнала, записанный движком после `git ls-remote`, а не
+        # заявка исполнителя: «не публиковали» и «публикация не подтверждена» —
+        # разные факты, и второй живёт в причине отказа попытки.
+        "published": published_block,
         "errors": list(errors or []),
     }
 
@@ -1802,6 +1833,7 @@ def _own_response(
         spec=feed["spec"],
         closed=journal.closed_fact(events),
         budget_block=budget.describe_events(events),
+        published_block=publish.published_of(events),
     )
 
 
@@ -2223,6 +2255,7 @@ def deal(board: str, task_id: str, spec: Optional[str] = None) -> dict[str, Any]
         spec=feed["spec"],
         closed=journal.closed_fact(events),
         budget_block=budget.describe_events(events),
+        published_block=publish.published_of(events),
     )
 
 

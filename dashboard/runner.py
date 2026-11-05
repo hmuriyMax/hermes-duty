@@ -96,6 +96,7 @@ EVIDENCE_MODULE_NAME = "hermes_duty_evidence"
 ROUTING_MODULE_NAME = "hermes_duty_routing"
 FAILURES_MODULE_NAME = "hermes_duty_failures"
 BUDGET_MODULE_NAME = "hermes_duty_budget"
+PUBLISH_MODULE_NAME = "hermes_duty_publish"
 
 
 def _load(name: str, filename: str) -> Any:
@@ -126,6 +127,10 @@ failures = _load(FAILURES_MODULE_NAME, "failures.py")
 # потолком спеки до спавна, а числа для причины берёт оттуда же — второй счётчик
 # в памяти процесса не пережил бы рестарт.
 budget = _load(BUDGET_MODULE_NAME, "budget.py")
+# Публикация (0.0.5): одобрение человеком до спавна и сверка заявки с origin после
+# отчёта. Правило живёт отдельно от исполнения — движок только спрашивает его и
+# записывает факт (`dashboard/publish.py`).
+publish = _load(PUBLISH_MODULE_NAME, "publish.py")
 
 # Источник событий движка в журнале: `engine`, а не `cli`/`api`/`ingest` — по нему
 # видно, что факт записал движок, а не человек и не проход по чужой доске.
@@ -417,6 +422,28 @@ def _git(args: Iterable[str], cwd: Path) -> tuple[int, str]:
     return done.returncode, " ".join((done.stderr or done.stdout or "").split())
 
 
+def _git_stdout(args: Iterable[str], cwd: Path) -> tuple[int, str]:
+    """`git` в каталоге `cwd` с полным stdout — для команд, чей ответ и есть stdout.
+
+    `_git` собирает stderr одной строкой для причины отказа, а `ls-remote` и
+    `show --stat` отвечают **в stdout**: сверка публикации по «хвосту stderr»
+    не увидела бы ни одной ссылки.
+    """
+    try:
+        done = subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=WORKTREE_TIMEOUT_SEC,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, " ".join(str(exc).split())
+    if done.returncode != 0:
+        return done.returncode, " ".join((done.stderr or done.stdout or "").split())
+    return 0, done.stdout or ""
+
+
 # --------------------------------------------------------------------- дерево
 
 
@@ -556,10 +583,19 @@ def base_of_stage(spec: Any, stage: Any, events: Iterable[Any]) -> str:
         return str(getattr(spec, "base", "") or "")
     fallback = str(getattr(spec, "base", "") or "")
     found = _successful_of(needs, events)
+    by_id = {item.id: item for item in getattr(spec, "stages", ())}
     rows = []
     for need in needs:
         hit = found.get(need)
         commit = attempt_commit(hit[1]) if hit is not None else ""
+        if not commit:
+            need_stage = by_id.get(need)
+            if need_stage is not None and getattr(need_stage, "kind", "") == spec_module.GATE_KIND:
+                # Гейт дерева не производит: он спрашивает человека. Для дерева он
+                # прозрачен — базой следующего этапа служит то, что гейт одобрял, а
+                # не `spec.base`. Иначе `publish` после гейта получил бы чистое
+                # дерево и опубликовал бы пустоту.
+                commit = base_of_stage(spec, need_stage, events)
         rows.append((hit[0] if hit is not None else 0, need, commit or fallback))
     # Поздний предшественник первый: при равном родстве выбранным остаётся он.
     rows.sort(key=lambda row: row[0], reverse=True)
@@ -756,6 +792,7 @@ def build_contract(
     deadline_sec: int,
     answer: Optional[str] = None,
     session_id: str = "",
+    approved: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Входной контракт попытки: файл, а не проза в командной строке.
 
@@ -811,6 +848,10 @@ def build_contract(
     }
     if answer is not None:
         contract["answer_this_attempt"] = answer
+    if approved is not None:
+        # Что именно человек одобрил (`dashboard/publish.py`): публикующему этапу
+        # нужно публиковать этот коммит, а не то, что он найдёт в дереве.
+        contract["approved"] = approved
     if session_id:
         contract["session_id"] = session_id
     contract["report_to"] = str(report_to)
@@ -1743,6 +1784,293 @@ def run_shell_stage(
     }
 
 
+# ----------------------------------------------------------------- публикация
+#
+# Движок не публикует (`FORBIDDEN_CMD_PREFIXES`, `spec.PUBLISHING_ROLES`): этап с
+# ролью `publisher` — обычная попытка с правами, а движок делает две проверки —
+# «человек одобрил именно это дерево» до спавна и «заявленный sha есть в origin»
+# после отчёта. Правило первого живёт в `dashboard/publish.py`, здесь — git и
+# факты журнала.
+
+# Сколько строк `--stat` попадает в вопрос человеку: вопрос — одна строка, а
+# подробности — «файлы и числа», а не дифф целиком.
+PUBLISH_STAT_LINES = 20
+
+# Сколько знаков коммита в вопросе и в причине: семь сверяются глазами с `git log`.
+PUBLISH_SHORT = 12
+
+# Факт «опубликовано» в журнале называет, чем он подтверждён: `git ls-remote` —
+# единственный источник, который видит origin, а не слово исполнителя.
+PUBLISH_VERIFY = "git ls-remote"
+
+# Причина закрытия публикационного гейта: человек сказал «не публиковать».
+NO_APPROVAL = "человек не дал ок"
+
+
+def publishes(stage: Any) -> bool:
+    """Этап действует вовне: его роль из `PUBLISHING_ROLES`.
+
+    Одна константа на валидатор и движок: спека и рантайм обязаны считать
+    публикующим одну и ту же роль, иначе проверка в спеке и проверка перед
+    спавном разойдутся на первом же `deployer`.
+    """
+    return str(getattr(stage, "role", "") or "") in spec_module.PUBLISHING_ROLES
+
+
+def publish_gates(spec: Any, stage: Any) -> list[str]:
+    """Гейты в предках этапа — по тому же графу, что проверяет валидатор спеки."""
+    ancestors = spec_module.ancestors(spec).get(stage.id, set())
+    gates = {
+        item.id
+        for item in getattr(spec, "stages", ())
+        if getattr(item, "kind", "") == spec_module.GATE_KIND
+    }
+    return sorted(ancestors & gates)
+
+
+def guarded_stage(spec: Any, gate: Any) -> Optional[Any]:
+    """Публикующий этап, которому служит гейт; `None` — гейт спрашивает о другом.
+
+    По этому признаку решается, чем закончится ответ «не публиковать» (дело
+    закрывается, а не падает) и что попадёт в вопрос: коммит, `--stat` и отчёт
+    ревьюера нужны только тому гейту, за которым стоит публикация.
+    """
+    for stage in getattr(spec, "stages", ()):
+        if publishes(stage) and gate.id in publish_gates(spec, stage):
+            return stage
+    return None
+
+
+def resolved_base(spec: Any, stage: Any, events: Iterable[Any]) -> str:
+    """База этапа полным sha, если репозиторий на месте; иначе — как её назвала спека.
+
+    Сверка «одобрен X, в дереве Y» сравнивает коммиты, а не ревизии: `origin/master`
+    вместо sha означал бы «сравнили две строки». Нерезолвящаяся база возвращается
+    как есть — отказ назовёт её словами, а не выдумает совпадение.
+    """
+    rev = base_of_stage(spec, stage, events)
+    repo_text = str(getattr(spec, "repo", "") or "").strip()
+    if not rev or not repo_text:
+        return rev
+    repo = Path(repo_text).expanduser()
+    if not repo.is_dir():
+        return rev
+    return _sha(repo, rev) or rev
+
+
+def publish_facts(spec: Any, stage: Any, events: Iterable[Any]) -> dict[str, Any]:
+    """Что человек видит перед «ок»: коммит, `--stat`, отчёт ревьюера, вердикт.
+
+    Все четыре — из журнала и git, а не из пересказа: коммит — база публикующего
+    этапа (то, что уйдёт в origin), `--stat` — его же дифф, отчёт и вердикт — из
+    последней попытки ревьюера-предка. Чего нет, то названо словами: пустой
+    `--stat` человек прочитал бы как «изменений нет», хотя git просто не ответил.
+    """
+    facts: dict[str, Any] = {"commit": "", "stat": "—", "review": "не записан", "verdict": "не записан"}
+    try:
+        commit = resolved_base(spec, stage, events)
+    except BaseError as exc:
+        facts["commit_error"] = str(exc)
+        return facts
+    facts["commit"] = commit
+    if not commit:
+        facts["commit_error"] = "база публикующего этапа пуста: дерево не от чего отвести"
+        return facts
+    repo_text = str(getattr(spec, "repo", "") or "").strip()
+    repo = Path(repo_text).expanduser() if repo_text else None
+    if repo is not None and repo.is_dir():
+        code, out = _git_stdout(["show", "--stat", "--format=", commit], repo)
+        if code == 0 and out.strip():
+            lines = [line.rstrip() for line in out.strip().splitlines() if line.strip()]
+            if len(lines) > PUBLISH_STAT_LINES:
+                lines = lines[:PUBLISH_STAT_LINES] + [f"… ещё {len(lines) - PUBLISH_STAT_LINES} строк"]
+            facts["stat"] = "\n".join(lines)
+        else:
+            facts["stat"] = f"git show --stat {commit[:PUBLISH_SHORT]} не ответил: {out or code}"
+    facts.update(_review_facts(spec, stage, events))
+    return facts
+
+
+def _event_seq(event: dict[str, Any]) -> int:
+    """Номер события журнала: по нему и только по нему определяется порядок."""
+    raw = event.get("id")
+    return raw if isinstance(raw, int) else 0
+
+
+def _review_facts(spec: Any, stage: Any, events: Iterable[Any]) -> dict[str, str]:
+    """Отчёт и вердикт ревьюера-предка: ссылка на файл плюс сказанное им словами.
+
+    Путь отчёта — по контракту попытки (`<workdir>/.duty/result.json`), а не
+    `<workdir>/result.json`: контракт кладёт отчёт туда, и ссылка на несуществующий
+    файл была бы для человека хуже отсутствия ссылки. Вердикт — из исхода попытки
+    и резюме отчёта: `reason` у успешной попытки движок не пишет.
+    """
+    ancestors = spec_module.ancestors(spec).get(stage.id, set())
+    reviewers = {
+        item.id: item
+        for item in getattr(spec, "stages", ())
+        if item.id in ancestors and getattr(item, "role", "") == spec_module.REVIEWING_ROLE
+    }
+    last: Optional[dict[str, Any]] = None
+    # Порядок — по номеру события, а не по `ts`: внутри секунды он одинаков.
+    ordered = sorted((item for item in events or () if isinstance(item, dict)), key=_event_seq)
+    for event in ordered:
+        if str(event.get("kind") or "") != "attempt_ended":
+            continue
+        payload = journal.payload_of(event)
+        if str(payload.get("stage") or "") not in reviewers:
+            continue
+        last = payload
+    if last is None:
+        return {}
+    details = last.get("details")
+    details = details if isinstance(details, dict) else {}
+    workdir = str(details.get("workdir") or "")
+    report = str(Path(workdir) / ".duty" / "result.json") if workdir else ""
+    result = last.get("result")
+    result = result if isinstance(result, dict) else {}
+    said = str(result.get("summary") or last.get("reason") or "").strip()
+    outcome = str(last.get("outcome") or "").strip().lower()
+    if outcome in failures.OK_STATUSES and not str(last.get("kind") or "").strip():
+        verdict = "одобрено" + (f": {said}" if said else "")
+    else:
+        verdict = f"не одобрено: {said or 'причина не записана'}"
+    return {"review": report or "не записан", "verdict": verdict}
+
+
+def published_claim(spec: Any, result: Any) -> tuple[Optional[dict[str, str]], str]:
+    """Заявка публикации, сверенная с origin: (факт, причина отказа).
+
+    Заявка (`published: {sha, branch, mr_url}`) — слова исполнителя; факт даёт
+    `git ls-remote origin [ветка]`: движок верит ссылке, а не отчёту. `mr_url`
+    остаётся заявкой: он живёт в GitLab, а не в репозитории, и проверять его
+    значило бы ходить в сеть из шага движка.
+    """
+    claim, why = publish.claim(result)
+    if claim is None:
+        return None, why
+    repo_text = str(getattr(spec, "repo", "") or "").strip()
+    if not repo_text:
+        return None, "публикация заявлена, но не найдена: repo в спеке не задан"
+    repo = Path(repo_text).expanduser()
+    if not repo.is_dir():
+        return None, f"публикация заявлена, но не найдена: репозитория {repo} нет"
+    args = ["ls-remote", "origin"] + ([claim["branch"]] if claim["branch"] else [])
+    code, out = _git_stdout(args, repo)
+    if code != 0:
+        return None, f"публикация заявлена, но не найдена: git ls-remote отказал ({out})"
+    want = claim["sha"].lower()
+    for line in out.splitlines():
+        sha, _, ref = line.partition("\t")
+        if sha.strip().lower() == want:
+            return {**claim, "ref": ref.strip()}, ""
+    tail = f" по ветке {claim['branch']}" if claim["branch"] else ""
+    return None, (
+        f"публикация заявлена, но не найдена: sha {claim['sha'][:PUBLISH_SHORT]}… нет в origin{tail}"
+    )
+
+
+def _published_event(
+    deal: Any, stage: Any, attempt: int, fact: dict[str, str], now: int
+) -> dict[str, Any]:
+    """Факт `published`: что ушло в origin и чем это подтверждено.
+
+    Пишется движком, а не исполнителем: `published` в отчёте — заявка, и фактом
+    журнала она становится только после `git ls-remote`. Поэтому в payload есть
+    `verified_by`, а `mr_url` помечен как заявленный.
+    """
+    payload: dict[str, Any] = {
+        "stage": stage.id,
+        "attempt": int(attempt),
+        "sha": fact["sha"],
+        "branch": fact["branch"],
+        "mr_url": fact["mr_url"],
+        "ref": fact.get("ref") or "",
+        "verified_by": PUBLISH_VERIFY,
+    }
+    return _event(
+        deal,
+        "published",
+        payload,
+        {"stage": stage.id, "attempt": int(attempt), "sha": fact["sha"]},
+        now,
+    )
+
+
+def refuse_publish(
+    conn: sqlite3.Connection,
+    deal: Any,
+    stage: Any,
+    attempt: int,
+    approval: Any,
+    *,
+    clock: Callable[[], float],
+) -> Optional[dict[str, Any]]:
+    """Публикация без «ок» на это дерево: попытка не поднимается, факт в журнале.
+
+    Проверка стоит **до** лизинга и спавна — как отказ потолка
+    (`refuse_budget`): лизинг означал бы этап за процессом, которого нет, а
+    `attempt_started` — попытку, которую никто не начинал. Поэтому отказ
+    пишется `attempt_ended` без начала.
+
+    Класс — `contract`: это не сбой исполнителя, а невыполненное условие
+    движка («одобрен один коммит, а публикуется другой»). Парковки нет: спрашивать
+    «продолжать?» бессмысленно — продолжать можно только повторным вопросом
+    человеку, и он задаётся гейтом, а не парковкой.
+    """
+    if approval is None or approval.ok:
+        return None
+    now = _now_sec(int(clock()))
+    run_id = f"{stage.id}#{int(attempt)}"
+    ended = _event(
+        deal,
+        "attempt_ended",
+        {
+            "run_id": run_id,
+            "stage": stage.id,
+            "attempt": int(attempt),
+            "outcome": OUTCOME_FAILED,
+            "kind": FAIL_CONTRACT,
+            "reason": approval.reason,
+            "details": {
+                "refused": True,
+                "stage_kind": getattr(stage, "kind", STAGE_KIND_AGENT),
+                "publish": {
+                    "gate": approval.gate,
+                    "question_id": approval.question_id,
+                    "approved_commit": approval.commit,
+                },
+            },
+        },
+        {"stage": stage.id, "attempt": int(attempt), "refused": True},
+        now,
+    )
+    journal.append(conn, [ended])
+    deals.set_blocked(
+        conn,
+        str(deal["id"]),
+        kind="needs_input",
+        reason=f"этап {stage.id}: {approval.reason}",
+        author=ENGINE_SOURCE,
+        source=ENGINE_SOURCE,
+        details={
+            "stage": stage.id,
+            "attempt": int(attempt),
+            "publish": {"gate": approval.gate, "question_id": approval.question_id},
+        },
+        now=now,
+    )
+    return {
+        "started": False,
+        "refused": True,
+        "stage": stage.id,
+        "attempt": int(attempt),
+        "outcome": OUTCOME_FAILED,
+        "kind": FAIL_CONTRACT,
+        "reason": approval.reason,
+    }
+
+
 # ---------------------------------------------------------------------- гейт
 
 
@@ -1886,6 +2214,9 @@ def run_gate_stage(
         raise RunnerError(f"этап {stage_id!r} с kind: gate без ask.q: гейту нечего спрашивать")
 
     events = journal.read_events(conn, str(deal["id"]))
+    # Гейт перед публикацией называется отдельно: его вопрос несёт коммит и
+    # `--stat`, а ответ «не публиковать» закрывает дело, а не роняет его.
+    guarded = guarded_stage(spec, stage)
     asked, answer, answered_at = _gate_exchange(events, stage_id)
     if asked is not None and answer is None:
         # Вопрос уже задан и ответа ещё нет: второй вопрос не создаётся (его
@@ -1898,20 +2229,33 @@ def run_gate_stage(
             "reason": f"гейт: вопрос #{asked} уже задан — ответа ещё нет",
         }
     if asked is None:
-        return _gate_ask(conn, deal, stage, attempt, home=home, clock=clock)
+        return _gate_ask(
+            conn, spec, deal, stage, attempt, home=home, clock=clock, guarded=guarded
+        )
     return _gate_judge(
-        conn, deal, stage, attempt, asked, answer or {}, home=home, clock=clock, answered_at=answered_at
+        conn,
+        deal,
+        stage,
+        attempt,
+        asked,
+        answer or {},
+        home=home,
+        clock=clock,
+        answered_at=answered_at,
+        guarded=guarded,
     )
 
 
 def _gate_ask(
     conn: sqlite3.Connection,
+    spec: Any,
     deal: Any,
     stage: Any,
     attempt: int,
     *,
     home: Path,
     clock: Callable[[], float],
+    guarded: Optional[Any] = None,
 ) -> dict[str, Any]:
     """Задать вопрос гейта: пул, факт `question_asked`, дело в `blocked`.
 
@@ -1919,15 +2263,26 @@ def _gate_ask(
     не держит, и «идёт попытка» здесь было бы ложью. Вопрос адресуется человеку
     (`routing.route` с властной разметкой: гейт — решение, а не справка), а срок
     ответа — `budget.minutes` этапа.
+
+    У гейта перед публикацией в вопрос едет то, что человек иначе искал бы руками:
+    коммит, его `--stat`, отчёт и вердикт ревьюера (`publish_facts`). Коммит
+    попадает и в `routing.approved_commit` — по нему потом сверяется дерево.
     """
-    question_id = _ask_gate(conn, deal, stage, attempt, home=home)
+    facts: dict[str, Any] = {}
+    if guarded is not None:
+        facts = publish_facts(spec, guarded, journal.read_events(conn, str(deal["id"])))
+    question_id = _ask_gate(conn, deal, stage, attempt, home=home, facts=facts)
     now = _now_sec(int(clock()))
+    approved = str(facts.get("commit") or "")
+    headline = f"гейт {stage.id}: вопрос #{question_id} человеку"
+    if approved:
+        headline += f", одобряется commit {approved[:PUBLISH_SHORT]}"
     deals.set_blocked(
         conn,
         str(deal["id"]),
         kind="needs_input",
         reason=(
-            f"гейт {stage.id}: вопрос #{question_id} человеку — без ответа "
+            f"{headline} — без ответа "
             f"(варианты: {', '.join(gate_allow(stage)) or '—'}; пул /imsg)"
         ),
         author=ENGINE_SOURCE,
@@ -1944,26 +2299,58 @@ def _gate_ask(
     }
 
 
-def _ask_gate(conn: sqlite3.Connection, deal: Any, stage: Any, attempt: int, *, home: Path) -> int:
+def _ask_gate(
+    conn: sqlite3.Connection,
+    deal: Any,
+    stage: Any,
+    attempt: int,
+    *,
+    home: Path,
+    facts: Optional[dict[str, Any]] = None,
+) -> int:
     """Вопрос гейта в пул через `ask()` — единственный канал вопросов.
 
     Возвращает номер вопроса. Ответ на живом вопросе этого дела (`ask()` его
     подхватывает) — тот же номер: второй вопрос человеку не задаётся.
+
+    `facts` (только у гейта перед публикацией) разворачивается в теле вопроса:
+    короткая строка остаётся `ask.q` из спеки, а коммит, `--stat`, отчёт и вердикт
+    идут ниже — человеку не нужно открывать репозиторий, чтобы понять, что он
+    одобряет.
     """
     ask_decl = stage.ask
     question = str(ask_decl.q).strip()
     options = [str(option) for option in ask_decl.options]
     address = routing.route(stage, {"kind": "authority"}, 0)
+    lines = [question]
+    if facts:
+        commit = str(facts.get("commit") or "")
+        if commit:
+            lines += ["", f"одобряется commit {commit[:PUBLISH_SHORT]}"]
+        else:
+            lines += ["", f"коммит не назван: {facts.get('commit_error') or 'причина не записана'}"]
+        lines += ["", str(facts.get("stat") or "—")]
+        lines += ["", f"отчёт ревьюера: {facts.get('review') or 'не записан'}"]
+        lines += [f"вердикт: {facts.get('verdict') or 'не записан'}"]
+    lines += [
+        "",
+        f"Варианты ответа: {', '.join(options)}. Продолжение — только ответ "
+        f"из списка: {', '.join(gate_allow(stage))}.",
+    ]
     asked = ask.ask(
         conn,
         {**deal, "home": Path(home)},
         question,
-        f"{question}\n\nВарианты ответа: {', '.join(options)}. Продолжение — только ответ "
-        f"из списка: {', '.join(gate_allow(stage))}.",
+        "\n".join(lines),
         options,
         critical=False,
         timeout=gate_wait_sec(stage),
-        routing={**address.as_payload(), "stage": stage.id, "attempt": int(attempt)},
+        routing={
+            **address.as_payload(),
+            "stage": stage.id,
+            "attempt": int(attempt),
+            "approved_commit": str((facts or {}).get("commit") or ""),
+        },
     )
     return int(asked.question_id)
 
@@ -1979,6 +2366,7 @@ def _gate_judge(
     home: Path,
     clock: Callable[[], float],
     answered_at: int = 0,
+    guarded: Optional[Any] = None,
 ) -> dict[str, Any]:
     """Судить ответ человека: `allow` — продолжение, всё остальное — отказ контракта.
 
@@ -1989,6 +2377,11 @@ def _gate_judge(
 
     Время факта — не раньше ответа (`answered_at`): суд, записанный раньше того,
     что он судит, fold применил бы до ответа и вернул гейт в ожидание.
+
+    `guarded` — публикующий этап за этим гейтом: «не публиковать» тогда не сбой, а
+    решение, и дело закрывается фактом `completed` с причиной «человек не дал ок»
+    (`close_deal`). Иначе публикация не случилась бы, а дело висело бы отказом,
+    хотя человек сказал ровно то, что хотел.
     """
     if _gate_expired(answer):
         return {
@@ -2007,6 +2400,11 @@ def _gate_judge(
     else:
         outcome, kind = OUTCOME_FAILED, GATE_REFUSED_KIND
         reason = f"гейт: ответ «{_gate_quote(text)}» вне allow [{allowed}] — отказ контракта"
+        if guarded is not None:
+            reason = (
+                f"гейт: {NO_APPROVAL} — ответ «{_gate_quote(text)}» вне allow [{allowed}], "
+                "публикации не будет"
+            )
 
     now = _now_sec(max(int(clock()), int(answered_at or 0)))
     ended = _event(
@@ -2030,21 +2428,30 @@ def _gate_judge(
         now,
     )
     journal.append(conn, [ended])
-    if outcome == OUTCOME_FAILED:
+    if outcome == OUTCOME_FAILED and guarded is not None:
+        # «Не публиковать» — решение человека, а не сбой движка: дело
+        # закрывается без публикации, и причина — ровно слова решения. Отказ
+        # контракта остаётся фактом этапа (`attempt_ended` выше), так что
+        # поверхность видит и ответ, и чем всё кончилось.
+        try:
+            deals.close_deal(
+                conn,
+                str(deal["id"]),
+                reason=f"{NO_APPROVAL}: ответ «{_gate_quote(text)}» вне allow [{allowed}]",
+                cause=deals.CLOSE_CAUSE_HUMAN,
+                source=ENGINE_SOURCE,
+                now=now,
+            )
+        except deals.DealError:
+            # Дело уже закрыто или держит человек — закрывать нечего, но и
+            # терять факт ответа нельзя: он ниже, в `blocked`.
+            _gate_refused_block(conn, deal, stage, attempt, question_id, reason, now)
+    elif outcome == OUTCOME_FAILED:
         # Отказ человека виден поверхности: дело останавливается его решением, и
         # без факта журнала экран показывал бы «status=running без живого факта».
         # Парковкой это не делается: парковка спросила бы человека второй раз о
         # том же самом, а он уже ответил.
-        deals.set_blocked(
-            conn,
-            str(deal["id"]),
-            kind="needs_input",
-            reason=f"гейт {stage.id}: {reason} — дальше дело не идёт",
-            author=ENGINE_SOURCE,
-            source=ENGINE_SOURCE,
-            details={"stage": stage.id, "attempt": int(attempt), "question_id": int(question_id)},
-            now=now,
-        )
+        _gate_refused_block(conn, deal, stage, attempt, question_id, reason, now)
     return {
         "started": True,
         "stage": stage.id,
@@ -2055,7 +2462,30 @@ def _gate_judge(
         "question_id": int(question_id),
         "answer": text,
         "stage_kind": STAGE_KIND_GATE,
+        "closed": outcome == OUTCOME_FAILED and guarded is not None,
     }
+
+
+def _gate_refused_block(
+    conn: sqlite3.Connection,
+    deal: Any,
+    stage: Any,
+    attempt: int,
+    question_id: str,
+    reason: str,
+    now: int,
+) -> None:
+    """Отказ гейта виден поверхности как открытый блок, а не «running без факта»."""
+    deals.set_blocked(
+        conn,
+        str(deal["id"]),
+        kind="needs_input",
+        reason=f"гейт {stage.id}: {reason} — дальше дело не идёт",
+        author=ENGINE_SOURCE,
+        source=ENGINE_SOURCE,
+        details={"stage": stage.id, "attempt": int(attempt), "question_id": int(question_id)},
+        now=now,
+    )
 
 
 def _gate_expired(answer: dict[str, Any]) -> bool:
@@ -2119,6 +2549,22 @@ def run_stage(
     engine_pid = os.getpid()
     workdir = attempt_dir(home, deal, stage_id, attempt)
     run_id = f"{stage_id}#{attempt}"
+
+    # Публикация без «ок» на это дерево (0.0.5) проверяется до лизинга и спавна:
+    # человек одобрил коммит, а в дереве уже другой — публиковать нечего.
+    approval: Optional[Any] = None
+    if publishes(stage):
+        events = journal.read_events(conn, str(deal["id"]))
+        gates = publish_gates(spec, stage)
+        try:
+            current = resolved_base(spec, stage, events)
+        except BaseError as exc:
+            approval = publish.Approval(ok=False, reason=str(exc))
+        else:
+            approval = publish.approval(events, gates, current=current)
+        refused = refuse_publish(conn, deal, stage, attempt, approval, clock=clock)
+        if refused is not None:
+            return refused
 
     # Потолок дела целиком (0.0.5) проверяется до лизинга и до спавна: расход
     # считается по журналу (`dashboard/budget.py`), поэтому переживает рестарт и
@@ -2213,6 +2659,14 @@ def run_stage(
         deadline_sec=deadline_sec,
         answer=answer,
         session_id=session_id,
+        approved=None
+        if approval is None
+        else {
+            "commit": approval.commit,
+            "gate": approval.gate,
+            "question_id": approval.question_id,
+            "answer": approval.answer,
+        },
     )
     contract_file = write_contract(contract_path(workdir, stage_id, attempt), contract)
     query_file = contract_file
@@ -2333,6 +2787,25 @@ def run_stage(
             # `contract` для несходящегося пакета, `capability` для бюджета.
             outcome, kind, reason = OUTCOME_FAILED, failures.verdict_kind(verdict), verdict.reason()
 
+    # Публикация (0.0.5): «опубликовано» — заявка исполнителя, факт даёт origin.
+    # Сверка идёт до коммита в дереве и до `attempt_ended`: подтверждённый sha
+    # ложится отдельным событием `published`, а несошедшаяся заявка — отказом
+    # контракта в том же факте, что и смерть попытки.
+    published_fact: Optional[dict[str, str]] = None
+    if outcome == OUTCOME_DONE and not parked and result is not None and publishes(stage):
+        fact, why = published_claim(spec, result)
+        if fact is None:
+            outcome, kind, reason = OUTCOME_FAILED, FAIL_CONTRACT, why
+        elif approval is not None and fact["sha"].lower() != approval.commit.lower():
+            outcome, kind, reason = (
+                OUTCOME_FAILED,
+                FAIL_CONTRACT,
+                f"опубликован commit {fact['sha'][:PUBLISH_SHORT]}, а одобрен "
+                f"{approval.commit[:PUBLISH_SHORT]}: ушло не то дерево",
+            )
+        else:
+            published_fact = fact
+
     # Работа принята — движок фиксирует её коммитом **в дереве попытки**: только
     # так следующему этапу есть от чего отвести дерево (W14). `dir`/`none` не
     # коммитятся: у первого дерево чужое (каталог дела), у второго его нет.
@@ -2386,8 +2859,11 @@ def run_stage(
         {"stage": stage_id, "attempt": attempt, "outcome": outcome},
         now,
     )
+    facts_out = [ended]
+    if published_fact is not None:
+        facts_out.append(_published_event(deal, stage, attempt, published_fact, now))
     with conn:
-        journal.append_in_tx(conn, [ended])
+        journal.append_in_tx(conn, facts_out)
         conn.execute(
             "DELETE FROM leases WHERE deal_id = ? AND stage = ? AND pid = ?",
             (str(deal["id"]), stage_id, pid),

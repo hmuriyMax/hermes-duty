@@ -402,7 +402,7 @@ hermes plugins enable hermes-duty     # или Capabilities → Plugins в де�
 Из каталога плагина (`cd ~/.hermes/plugins/hermes-duty`):
 
 ```bash
-~/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q  # 626 passed, 1 skipped
+~/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q  # 755 passed, 1 skipped
 node --test tests/model.test.mjs tests/web.test.mjs        # 49 pass (37 + 12)
 bin/duty-model-sync --check                                # OK
 bin/duty-version check                                     # OK
@@ -436,7 +436,7 @@ evidence-гейт `evidence.verify`, адресация вопросов `routin
 `runner.base_of_stage` (дерево от коммита предшественника, автокоммит принятой работы),
 решение человека по делу (`bin/duty decide continue|stop`, `bin/duty close`) и закрытие
 дела фактом журнала (`deals.close_stages_done`, `cause='all_stages_done'`). Регрессия
-**626 pytest + 1 skipped**, **49 node** (37 + 12), `bin/duty demo` — 7/7.
+**755 pytest + 1 skipped**, **49 node** (37 + 12), `bin/duty demo` — 7/7.
 
 `v0.0.3` — свой журнал событий (`state = fold(events)`, `POST /ingest`, `journal` в
 `/health`), единственный канал вопросов `ask()`, CLI `bin/duty` (чтение и мутации),

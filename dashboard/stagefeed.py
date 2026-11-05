@@ -74,6 +74,9 @@ spec_module = _load(SPEC_MODULE_NAME, "spec.py")
 ATTEMPT_STARTED = "attempt_started"
 ATTEMPT_ENDED = "attempt_ended"
 ATTEMPT_PROGRESS = "attempt_progress"
+# Факт публикации (0.0.5): что ушло в origin и чем это подтверждено. Ложится в
+# строку своей попытки — «опубликовано» видно там же, где вердикт этапа.
+PUBLISHED = "published"
 
 # Вид этапа по факту начала попытки (`attempt_started.stage_kind`). Старые записи
 # поля не имеют — и это `agent`: до 0.0.5 других видов у этапа не было.
@@ -173,6 +176,7 @@ def _attempts(
     started: dict[str, dict[str, Any]] = {}
     order: list[str] = []
     progress: dict[tuple[str, int], int] = {}
+    published: dict[tuple[str, int], dict[str, Any]] = {}
     for event in sorted(
         (item for item in events or () if isinstance(item, dict)),
         key=lambda item: _int(item.get("id")),
@@ -183,6 +187,11 @@ def _attempts(
         if kind == ATTEMPT_PROGRESS:
             key = (str(payload.get("stage") or ""), _int(payload.get("attempt")))
             progress[key] = progress.get(key, 0) + 1
+        elif kind == PUBLISHED:
+            # Публикация — факт попытки, а не отдельная попытка: она ложится в ту
+            # строку, чей этап её записал (`runner._published_event`).
+            key = (str(payload.get("stage") or ""), _int(payload.get("attempt")))
+            published[key] = payload
         elif kind == ATTEMPT_STARTED and run_id not in started:
             started[run_id] = {"start": event, "start_payload": payload, "end": None, "end_payload": {}}
             order.append(run_id)
@@ -231,6 +240,7 @@ def _attempts(
                 "reaped": bool(end_payload.get("reaped")),
                 "progress": progress.get((stage, number), 0),
                 "evidence": _records(end_payload.get("result")),
+                "published": published.get((stage, number)),
                 "end": end is not None,
             }
         )
@@ -313,6 +323,28 @@ def _public(row: dict[str, Any], now: int) -> dict[str, Any]:
         "dead": alive["dead"],
         "lease": alive["lease"],
         "evidence": row["evidence"],
+        # Публикация попытки: `{sha, branch, mr_url, ref, verified_by}` или `null`.
+        # Один факт на попытку — последний (`published` пишется один раз).
+        "published": _publication(row.get("published")),
+    }
+
+
+def _publication(fact: Any) -> Optional[dict[str, Any]]:
+    """Факт `published` в форме ответа: только то, что было записано.
+
+    Пустой словарь вместо отсутствия публикации читался бы как «опубликовано
+    ничего», поэтому нет факта — `None`, и поверхность печатает прочерк.
+    """
+    if not isinstance(fact, dict):
+        return None
+    return {
+        "sha": str(fact.get("sha") or ""),
+        "branch": str(fact.get("branch") or ""),
+        "mr_url": str(fact.get("mr_url") or ""),
+        "ref": str(fact.get("ref") or ""),
+        "verified_by": str(fact.get("verified_by") or ""),
+        "stage": str(fact.get("stage") or ""),
+        "attempt": _maybe_int(fact.get("attempt")),
     }
 
 

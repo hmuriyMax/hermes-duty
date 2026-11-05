@@ -2195,3 +2195,370 @@ def test_run_stage_dispatches_gate_kind(tmp_path: Path) -> None:
 
     report = runner.run_stage(conn, spec, deal, "gate", 1, home=home, spawn=no_spawn, clock=lambda: NOW)
     assert report["question_id"] > 0
+
+
+# ---------------------------------------------------------------- публикация
+
+
+def git_origin(tmp_path: Path) -> tuple[Path, Path]:
+    """Репозиторий с настоящим `origin`: `git ls-remote` проверяется живым git.
+
+    Без origin сверка публикации была бы проверена на подставленном «нашлось»:
+    тогда тест не поймал бы ни отсутствующий sha, ни чужую ветку.
+    """
+    repo = git_repo(tmp_path)
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(origin)], check=True)
+    subprocess.run(["git", "-C", str(repo), "push", "-q", "origin", "main"], check=True)
+    return repo, origin
+
+
+def head_of(repo: Path, rev: str = "HEAD") -> str:
+    """Полный sha ревизии — то, с чем движок сверяет одобренный коммит."""
+    got = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", rev], capture_output=True, text=True, check=True
+    )
+    return got.stdout.strip()
+
+
+def publish_spec(tmp_path: Path, repo: Path, *, allow: str = "да", edits: str = "") -> Any:
+    """Спека «impl → гейт → publish»: вопрос человеку и публикующий этап за ним."""
+    return write_spec(
+        tmp_path,
+        f"""
+        duty: probe
+        repo: {repo}
+        base: HEAD
+        stages:
+          - id: impl
+            role: implementer
+            workspace: none
+          - id: gate
+            kind: gate
+            needs: [impl]
+            ask: {{q: "Публикуем этот коммит?", options: [да, нет]}}
+            allow: [{allow}]
+        {textwrap.indent(textwrap.dedent(edits), "    ") if edits else ""}
+          - id: publish
+            role: publisher
+            needs: [gate]
+            workspace: worktree
+        """,
+    )
+
+
+def publish_report(sha: str, **extra: Any) -> dict[str, Any]:
+    """Отчёт публикующего этапа той формы, какую принимает гейт evidence.
+
+    Своего коммита у публикации нет — дерево не меняется, и `commit` в отчёте
+    гейт отверг бы как «чужое готовое» (он был предком базы). Работу называет
+    пакет (`pack=True` в `Fake`: файл-свидетельство), а факт публикации —
+    `published`, который движок сверит с origin.
+    """
+    published: dict[str, Any] = {"sha": sha}
+    published.update(extra.pop("published", {}) if isinstance(extra.get("published"), dict) else {})
+    report: dict[str, Any] = {"status": "done", "summary": "запушил", "published": published}
+    report.update(extra)
+    return report
+
+
+def run_publish(conn, spec, deal, home, fake, *, attempt: int = 1) -> dict[str, Any]:
+    """Один шаг публикующего этапа: часы неподвижны, спавн подменён фейком."""
+    return runner.run_stage(
+        conn, spec, deal, "publish", attempt, home=home, spawn=fake, clock=lambda: NOW
+    )
+
+
+def approve(
+    conn, spec, deal, home, *, answer: str = "да", attempt: int = 1
+) -> dict[str, Any]:
+    """Пройти гейт: вопрос, ответ человека в пуле, приговор гейта."""
+    asked = runner.run_stage(conn, spec, deal, "gate", attempt, home=home, clock=lambda: NOW)
+    answer_gate(home, asked["question_id"], answer)
+    sync(conn, home)
+    run_gate(conn, spec, deal, home, attempt=attempt + 1)
+    return asked
+
+
+def test_publish_without_gate_question_is_refused_before_spawn(tmp_path: Path) -> None:
+    """Гейт в предках есть, но человека не спрашивали — публикация не поднимается.
+
+    Отказ пишется как у исчерпанного потолка (`attempt_ended` без
+    `attempt_started`): лизинг означал бы этап за живым процессом, которого нет.
+    """
+    repo, _origin = git_origin(tmp_path)
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = publish_spec(tmp_path, repo)
+
+    def no_spawn(*args: Any, **kwargs: Any) -> Any:  # pragma: no cover - не должен зваться
+        raise AssertionError("без «ок» публикацию не спавнят")
+
+    report = runner.run_stage(
+        conn, spec, deal, "publish", 1, home=home, spawn=no_spawn, clock=lambda: NOW
+    )
+
+    assert report["started"] is False
+    assert report["refused"] is True
+    assert report["kind"] == runner.FAIL_CONTRACT
+    assert "публикация требует вопроса человеку (kind: gate) в предках" in report["reason"]
+    assert "attempt_started" not in kinds(conn, deal)
+    ended = only(conn, deal, "attempt_ended")
+    assert ended["payload"]["details"]["refused"] is True
+    assert ended["payload"]["details"]["stage_kind"] == "agent"
+    blocked = only(conn, deal, "blocked")
+    assert blocked["payload"]["block_kind"] == "needs_input"
+    assert runner.lease_of(conn, deal, "publish") is None
+
+
+def test_publish_after_the_tree_moved_is_contract(tmp_path: Path) -> None:
+    """Красная проба карточки: человек одобрил один коммит, а в дереве уже другой.
+
+    Снимаешь сверку `approval.commit` с текущей базой (в `publish.approval` или
+    вызов в `runner.run_stage`) — эта попытка уходит публиковать чужое дерево, и
+    тест падает на первой же проверке.
+    """
+    repo, _origin = git_origin(tmp_path)
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = publish_spec(tmp_path, repo)
+    approved = head_of(repo, "HEAD")
+    asked = approve(conn, spec, deal, home)
+    assert only(conn, deal, "question_asked")["payload"]["routing"]["approved_commit"] == approved
+
+    # После «ок» предшественник отработал ещё раз и произвёл другой коммит.
+    (repo / "after.txt").write_text("после ок\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "later"],
+        check=True,
+    )
+    moved = head_of(repo, "HEAD")
+    assert moved != approved
+    seed(
+        conn,
+        deal,
+        "attempt_ended",
+        {"run_id": "impl#2", "stage": "impl", "attempt": 2, "outcome": "done", "kind": None, "commit": moved},
+        key="test:impl:2",
+    )
+
+    def no_spawn(*args: Any, **kwargs: Any) -> Any:  # pragma: no cover - не должен зваться
+        raise AssertionError("подменённое дерево не публикуется")
+
+    report = runner.run_stage(
+        conn, spec, deal, "publish", 1, home=home, spawn=no_spawn, clock=lambda: NOW
+    )
+
+    assert report["refused"] is True
+    assert report["kind"] == runner.FAIL_CONTRACT
+    assert f"одобрен commit {approved[:12]}" in report["reason"]
+    assert f"в дереве {moved[:12]}" in report["reason"]
+    assert asked["question_id"] > 0
+    assert "attempt_started" not in kinds(conn, deal)
+    # Отказ — факт журнала: попытку не поднимали, и лизинга у этапа нет.
+    assert [event for event in events(conn, deal) if event["kind"] == "blocked"][-1]["payload"]["block_kind"] == "needs_input"
+    assert runner.lease_of(conn, deal, "publish") is None
+
+
+def test_publish_of_the_approved_commit_is_confirmed_by_origin(tmp_path: Path) -> None:
+    """Публикация идёт: sha из origin подтверждает заявку, в журнале факт `published`."""
+    repo, _origin = git_origin(tmp_path)
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = publish_spec(tmp_path, repo)
+    asked = approve(conn, spec, deal, home)
+    pushed = head_of(repo, "HEAD")
+    fake = Fake(result=publish_report(pushed, published={"sha": pushed, "branch": "main", "mr_url": "https://mr/1"}), pack=True)
+
+    report = run_publish(conn, spec, deal, home, fake)
+
+    assert report["outcome"] == runner.OUTCOME_DONE
+    # Контракт назвал одобренный коммит: исполнитель публикует его, а не «то, что найдёт».
+    contract = json.loads(runner.contract_path(runner.attempt_dir(home, deal, "publish", 1), "publish", 1).read_text(encoding="utf-8"))
+    assert contract["approved"]["commit"] == pushed
+    assert contract["approved"]["question_id"] == str(asked["question_id"])
+    fact = only(conn, deal, "published")["payload"]
+    assert (fact["sha"], fact["branch"], fact["mr_url"]) == (pushed, "main", "https://mr/1")
+    assert fact["verified_by"] == runner.PUBLISH_VERIFY
+    assert fact["ref"] == "refs/heads/main"
+    assert ended_of(conn, deal, "publish")["payload"]["outcome"] == runner.OUTCOME_DONE
+
+
+def test_publish_claim_missing_in_origin_is_contract(tmp_path: Path) -> None:
+    """Заявка без подтверждения — отказ `contract`, а не факт: движок верит origin."""
+    repo, _origin = git_origin(tmp_path)
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = publish_spec(tmp_path, repo)
+    approve(conn, spec, deal, home)
+    fake = Fake(
+        result=publish_report(
+            "c" * 40, published={"sha": "c" * 40, "branch": "main", "mr_url": ""}
+        ),
+        pack=True,
+    )
+
+    report = run_publish(conn, spec, deal, home, fake)
+
+    assert report["outcome"] == runner.OUTCOME_FAILED
+    assert report["kind"] == runner.FAIL_CONTRACT
+    assert "публикация заявлена, но не найдена" in report["reason"]
+    assert "ccc" in report["reason"]
+    assert "published" not in kinds(conn, deal)
+
+
+def test_publish_of_another_commit_is_contract(tmp_path: Path) -> None:
+    """В origin нашёлся коммит, но одобряли другой — отказ `contract`, а не факт.
+
+    Человек одобрил `HEAD` (он же база дерева), а исполнитель запихнул в origin
+    старый коммит по тегу: ссылка реальна, `ls-remote` его видит — и именно
+    поэтому сверка нужна не только с origin, но и с одобрением.
+    """
+    repo, _origin = git_origin(tmp_path)
+    first = head_of(repo, "HEAD")
+    (repo / "b.txt").write_text("другое\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "next"],
+        check=True,
+    )
+    second = head_of(repo, "HEAD")
+    # Метка на первый коммит делает его видимым в `ls-remote` без ветки.
+    subprocess.run(["git", "-C", str(repo), "tag", "old", first], check=True)
+    subprocess.run(["git", "-C", str(repo), "push", "-q", "origin", "main", "--tags"], check=True)
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = publish_spec(tmp_path, repo)
+    approve(conn, spec, deal, home)
+    assert only(conn, deal, "question_asked")["payload"]["routing"]["approved_commit"] == second
+    fake = Fake(result=publish_report(first), pack=True)
+
+    report = run_publish(conn, spec, deal, home, fake)
+
+    assert report["outcome"] == runner.OUTCOME_FAILED
+    assert report["kind"] == runner.FAIL_CONTRACT
+    assert f"опубликован commit {first[:12]}" in report["reason"]
+    assert f"а одобрен {second[:12]}" in report["reason"]
+    assert "published" not in kinds(conn, deal)
+
+
+def test_published_event_is_not_a_state_change(tmp_path: Path) -> None:
+    """`published` — факт о дереве, а не о деле: закрытость дела он не открывает."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    seed(conn, deal, "published", {"stage": "publish", "attempt": 1, "sha": "a" * 40}, key="test:pub")
+
+    folded = journal.fold(events(conn, deal), now=NOW)
+
+    assert folded["last_kind"] == "published"
+    assert "publish" not in [str(item) for item in folded.get("stages") or {}]
+
+
+def test_gate_no_closes_the_deal_without_publication(tmp_path: Path) -> None:
+    """«Не публиковать» — решение, а не сбой: дело закрывается причиной «человек не дал ок».
+
+    Приёмка карточки: ответ «не публиковать» → дело закрыто без публикации. Отказ
+    гейта остаётся фактом этапа, но дело не висит открытым отказом и не ждёт
+    повторного вопроса — человек сказал ровно то, что хотел.
+    """
+    repo, _origin = git_origin(tmp_path)
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = publish_spec(tmp_path, repo)
+    asked = runner.run_stage(conn, spec, deal, "gate", 1, home=home, clock=lambda: NOW)
+    answer_gate(home, asked["question_id"], "нет")
+    sync(conn, home)
+
+    report = run_gate(conn, spec, deal, home, attempt=2)
+
+    assert report["closed"] is True
+    assert "человек не дал ок" in report["reason"]
+    closed = only(conn, deal, "completed")
+    assert closed["payload"]["cause"] == deals.CLOSE_CAUSE_HUMAN
+    assert closed["payload"]["from"] == "wait_human/status"
+    assert "человек не дал ок" in closed["payload"]["reason"]
+    # Публикации не было и быть не могло: факт `published` пишет только движок
+    # после `git ls-remote`, а до неё дело не дошло.
+    assert "published" not in kinds(conn, deal)
+    assert deals.deal_row(conn, str(deal["id"]))["status"] == "done"
+
+
+def test_publish_gate_question_carries_commit_stat_and_review(tmp_path: Path) -> None:
+    """Вопрос человеку несёт то, что он иначе искал бы руками: коммит, `--stat`, ревью.
+
+    Приёмка: «вопрос гейта содержит commit (короткий sha), --stat, ссылку на отчёт
+    ревьюера и вердикт». Всё четыре — из журнала и git, поэтому проверяются на
+    тексте вопроса в пуле, а не на пересказе.
+    """
+    repo, _origin = git_origin(tmp_path)
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = write_spec(
+        tmp_path,
+        f"""
+        duty: probe
+        repo: {repo}
+        base: HEAD
+        stages:
+          - id: impl
+            role: implementer
+            workspace: none
+          - id: review
+            role: reviewer
+            needs: [impl]
+            workspace: none
+            verdict: {{approve: next, changes: impl, max_rounds: 1}}
+          - id: gate
+            kind: gate
+            needs: [review]
+            ask: {{q: "Публикуем этот коммит?", options: [публиковать, не публиковать]}}
+            allow: [публиковать]
+          - id: publish
+            role: publisher
+            needs: [gate]
+            workspace: worktree
+        """,
+    )
+    report_dir = tmp_path / "review-work"
+    report_dir.mkdir()
+    seed(
+        conn,
+        deal,
+        "attempt_ended",
+        {
+            "stage": "review",
+            "attempt": 1,
+            "outcome": "done",
+            "kind": None,
+            "reason": "дифф чистый",
+            "details": {"workdir": str(report_dir)},
+        },
+        key="test:review:1",
+    )
+    base = head_of(repo, "HEAD")
+
+    asked = run_gate(conn, spec, deal, home)
+
+    row = pool_rows(home)[0]
+    text = row["text_full"]
+    assert asked["started"] is True
+    assert f"одобряется commit {base[:12]}" in text
+    # `--stat` называет файл и число: человек видит объём, а не «что-то изменилось».
+    assert "a.txt" in text and "|" in text
+    assert f"отчёт ревьюера: {report_dir / '.duty' / 'result.json'}" in text
+    # Вердикт называется словами отчёта: `reason` у успешной попытки движок не пишет.
+    assert "вердикт: одобрено: дифф чистый" in text
+    assert "не публиковать" in text
+    # Адрес вопроса несёт одобренный коммит: по нему сверяется дерево перед спавном.
+    assert row["text"] == "Публикуем этот коммит?"
+

@@ -475,13 +475,15 @@ def test_fold_closed_deal_is_not_reopened_by_non_state_kinds() -> None:
     # решением о закрытости и есть правило 2.
     assert folded["last_kind"] == "patched"
     # Набор «не открывающих живое ожидание» видов назван в одном месте и ровно этими
-    # пятью: ответ на вопрос — закрывающий факт, телеметрия попытки — не факт о деле.
+    # шестью: ответ на вопрос — закрывающий факт, телеметрия попытки — не факт о деле,
+    # публикация — факт о дереве (этап закрыт своим `attempt_ended`).
     assert journal.NON_STATE_KINDS == (
         "commented",
         "attached",
         "patched",
         "question_answered",
         "attempt_progress",
+        "published",
     )
 
 
@@ -1409,6 +1411,9 @@ def test_now_deal_shape_is_pinned(home: Path, client: TestClient) -> None:
         # 0.0.5: расход против верхнего `budget` спеки (`dashboard/budget.py`);
         # `null` — потолка на дело нет.
         "budget",
+        # 0.0.5: публикация по журналу (`dashboard/publish.py`); `null` — не
+        # публиковали.
+        "published",
         "waiting",
     ]
     assert list(deal["attempt"]) == [

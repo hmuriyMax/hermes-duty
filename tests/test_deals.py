@@ -256,11 +256,15 @@ def test_create_writes_deal_row_and_created_event(home: Path, client: TestClient
     assert len(rows) == 1
     assert rows[0]["id"] == body["id"]
     assert rows[0]["origin"] == "duty"
+    assert rows[0]["repo"] == BOARD
     assert rows[0]["body"] == "спецификация"
 
     assert kinds(home, body["id"]) == ["created"]
     created = events(home, body["id"])[0]
-    assert created["board"] == BOARD
+    # Доски в событии больше нет (0.0.6): адрес дела — его id, а группировка
+    # живёт в строке дела (`repo`) и снимком в `created.payload.repo`.
+    assert "board" not in created
+    assert created["payload"]["repo"] == BOARD
     assert created["source"] == "api"
     assert created["payload"]["parents"] == []
     assert created["payload"]["title"] == "своё дело"
@@ -278,21 +282,26 @@ def test_create_with_unknown_parent_is_error_not_500(home: Path, client: TestCli
     assert deal_rows(home) == []
 
 
-def test_create_on_unknown_board_is_error(home: Path, client: TestClient) -> None:
-    """Доска, которой нет ни в kanban, ни в store, не заводится молча."""
-    response = client.post("/deals", json={"repo": "no-such-board", "title": "дело"})
+def test_create_with_board_field_is_error(home: Path, client: TestClient) -> None:
+    """Доск больше нет: `board` в теле — отказ словами, а не молчаливое дело."""
+    response = client.post("/deals", json={"board": "no-such-board", "title": "дело"})
 
     assert response.status_code == 400
-    assert "no-such-board" in response.json()["errors"][0]["reason"]
+    reason = response.json()["errors"][0]["reason"]
+    assert "доск" in reason
+    assert "repo" in reason
     assert deal_rows(home) == []
 
 
-def test_create_requires_title_and_board(client: TestClient) -> None:
-    """Пустой title или board — ошибка входа, а не дело без имени."""
-    for payload in ({"repo": BOARD, "title": "  "}, {"repo": "", "title": "дело"}):
-        response = client.post("/deals", json=payload)
-        assert response.status_code == 400
-        assert response.json()["errors"], payload
+def test_create_requires_title_but_not_repo(client: TestClient) -> None:
+    """Пустой title — ошибка входа; пустой `repo` — законное «репозиторий не назван»."""
+    response = client.post("/deals", json={"title": "  "})
+    assert response.status_code == 400
+    assert response.json()["errors"]
+
+    nameless = create(client, repo="")
+    assert nameless["repo"] is None
+    assert nameless["status"] == "ready"
 
 
 def test_no_kanban_origin_rows_ever(home: Path, client: TestClient) -> None:
@@ -304,7 +313,7 @@ def test_no_kanban_origin_rows_ever(home: Path, client: TestClient) -> None:
     mutate(client, "POST", f"/deals/{child['id']}/claim", json={"owner": "implementer"})
     mutate(client, "POST", f"/deals/{child['id']}/complete", json={"summary": "ok"})
     client.get("/now")
-    client.get(f"/deal/{BOARD}/{child['id']}")
+    client.get(f"/deal/{child['id']}")
 
     conn = store(home)
     try:
@@ -658,8 +667,9 @@ def test_mutations_never_touch_kanban_or_pool(home: Path, client: TestClient) ->
     mutate(client, "POST", f"/deals/{child['id']}/complete", json={"summary": "ok"})
     mutate(client, "POST", f"/deals/{parent['id']}/complete", json={"summary": "ok"})
     client.get("/now")
-    client.get(f"/deal/{BOARD}/{child['id']}")
-    client.get(f"/deal/{BOARD}/{KANBAN_DEAL}")
+    client.get(f"/deal/{child['id']}")
+    # карточка kanban — только наблюдение: свой маршрут, в срез дел не входит
+    client.get("/cards")
 
     assert source_stats(home) == before
 
@@ -668,21 +678,22 @@ def test_mutations_never_touch_kanban_or_pool(home: Path, client: TestClient) ->
 
 
 def test_own_deal_visible_in_now_and_leaves_after_complete(home: Path, client: TestClient) -> None:
-    """Своё дело в `/now` рядом с kanban, отличается префиксом и уходит после `done`."""
+    """Своё дело в `/now`, сгруппировано по repo, и уходит из среза после `done`."""
     deal = create(client)
 
     listed = now_deals(client)
-    assert set(listed) == {deal["id"], KANBAN_DEAL}
+    assert set(listed) == {deal["id"]}
     assert listed[deal["id"]]["status"] == "ready"
-    assert listed[KANBAN_DEAL]["waiting"]["state"] == "wait_human"
-    boards = {entry["slug"]: entry for entry in client.get("/now").json()["boards"]}
-    assert boards[BOARD]["own_deals"] == 1
-    assert boards[BOARD]["deals"] == 2
+    assert listed[deal["id"]]["repo"] == BOARD
+    # Доск нет (0.0.6): группировка — уникальные `repo` дел плюс дела без него.
+    repos = client.get("/now").json()["repos"]
+    assert repos["list"] == [{"repo": BOARD, "deals": 1}]
+    assert repos["without_repo"] == 0
 
     mutate(client, "POST", f"/deals/{deal['id']}/complete", json={"summary": "ok"})
 
     assert deal["id"] not in now_deals(client)
-    card = client.get(f"/deal/{BOARD}/{deal['id']}").json()
+    card = client.get(f"/deal/{deal['id']}").json()
     assert card["status"] == "done"
     assert card["terminal"] is True
     assert card["deal"] is None
@@ -717,7 +728,7 @@ def test_closed_deal_stays_closed_after_comment_attach_and_patch(
 
     assert deal["id"] not in now_deals(client)
 
-    card = client.get(f"/deal/{BOARD}/{deal['id']}").json()
+    card = client.get(f"/deal/{deal['id']}").json()
     # Закрытость и отсутствие состояния согласованы в одном ответе: дело не
     # активно (у него нет `deal.waiting`), и терминальность это подтверждает.
     assert card["terminal"] is True
@@ -744,7 +755,7 @@ def test_archived_patch_keeps_closed_deal_closed(home: Path, client: TestClient)
     assert "status=archived" in folded["evidence"]
 
     assert deal["id"] not in now_deals(client)
-    card = client.get(f"/deal/{BOARD}/{deal['id']}").json()
+    card = client.get(f"/deal/{deal['id']}").json()
     assert card["status"] == "archived"
     assert card["terminal"] is True
     assert card["deal"] is None
@@ -758,7 +769,7 @@ def test_deal_card_carries_comments_and_attachments(home: Path, client: TestClie
         client, "POST", f"/deals/{deal['id']}/attach", files={"file": ("note.txt", b"hello", "text/plain")}
     )
 
-    card = client.get(f"/deal/{BOARD}/{deal['id']}").json()
+    card = client.get(f"/deal/{deal['id']}").json()
     assert [item["body"] for item in card["comments"]] == ["первый"]
     assert [item["filename"] for item in card["attachments"]] == ["note.txt"]
     attachment = card["attachments"][0]
@@ -825,7 +836,7 @@ def test_kanban_deal_is_not_mutable_through_store_routes(client: TestClient) -> 
 def own_deal_with_question(client: TestClient, text: str = "Вопрос по делу") -> tuple[str, int]:
     """Своё дело плюс живой вопрос по нему через роут `/ask`."""
     deal = create(client)
-    response = client.post(f"/ask/{BOARD}/{deal['id']}", json={"text": text})
+    response = client.post(f"/ask/{deal['id']}", json={"text": text})
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["errors"] == []
@@ -869,7 +880,7 @@ def sync_answers(home: Path) -> dict[str, Any]:
 
 
 def waiting_of(client: TestClient, deal_id: str) -> dict[str, Any]:
-    card = client.get(f"/deal/{BOARD}/{deal_id}").json()
+    card = client.get(f"/deal/{deal_id}").json()
     assert card["deal"] is not None, card
     return card["deal"]["waiting"]
 
@@ -937,7 +948,7 @@ def test_own_deal_live_question_visible_in_now(home: Path, client: TestClient) -
 def test_own_deal_question_repeat_returns_same_question(home: Path, client: TestClient) -> None:
     """Повторный `ask` по тому же делу не заводит второй вопрос и второе событие."""
     deal_id, question_id = own_deal_with_question(client)
-    again = client.post(f"/ask/{BOARD}/{deal_id}", json={"text": "другой текст"}).json()
+    again = client.post(f"/ask/{deal_id}", json={"text": "другой текст"}).json()
 
     assert int(again["question_id"]) == question_id
     assert again["deduped"] is True
@@ -967,7 +978,7 @@ def test_late_answer_does_not_revive_closed_own_deal(home: Path, client: TestCli
     assert folded["state"] is None
     assert folded["reason"] == "closed"
 
-    response = client.get(f"/deal/{BOARD}/{deal_id}")
+    response = client.get(f"/deal/{deal_id}")
     assert response.status_code == 200, response.text
     card = response.json()
     assert card["terminal"] is True
@@ -976,23 +987,15 @@ def test_late_answer_does_not_revive_closed_own_deal(home: Path, client: TestCli
     assert deal_id not in now_deals(client)
 
 
-def test_kanban_deal_question_cycle_still_works(home: Path, client: TestClient) -> None:
-    """`t_…`-путь не сломан: тот же цикл вопроса для наблюдаемого дела."""
-    response = client.post(f"/ask/{BOARD}/{KANBAN_DEAL}", json={"text": "Вопрос по kanban-делу"})
-    assert response.status_code == 200, response.text
-    question_id = int(response.json()["question_id"])
+def test_kanban_card_question_is_refused_with_reason(home: Path, client: TestClient) -> None:
+    """Карточка kanban (`t_…`) — не дело: `/ask` отказывает словами и не пишет пул."""
+    response = client.post(f"/ask/{KANBAN_DEAL}", json={"text": "Вопрос по kanban-делу"})
 
-    row = pool_rows(home)[0]
-    assert row["session_key"] == KANBAN_DEAL
-    assert ask.deal_id_of(row["session_key"]) == KANBAN_DEAL
-
-    waiting = waiting_of(client, KANBAN_DEAL)
-    assert waiting["human_kind"] == "question"
-
-    close_pool_question(home, question_id, answer="ответ")
-    assert sync_answers(home)["appended"] == 1
-    assert [event["kind"] for event in events(home, KANBAN_DEAL)].count("question_answered") == 1
-    assert waiting_of(client, KANBAN_DEAL)["human_kind"] != "question"
+    assert response.status_code == 400, response.text
+    detail = response.json()["detail"]
+    assert "карточка kanban" in detail
+    assert "d_<hex>" in detail
+    assert pool_rows(home) == []
 
 
 def test_unparsed_session_key_is_reported_not_skipped(home: Path, client: TestClient) -> None:
@@ -1112,7 +1115,7 @@ def test_own_attempts_come_from_the_journal(client: TestClient, home: Path, froz
     deal = create(client)
     append_journal(home, deal["id"], three_attempts(deal["id"]))
 
-    body = client.get(f"/duty/{BOARD}/{deal['id']}/attempts").json()
+    body = client.get(f"/duty/{deal['id']}/attempts").json()
 
     assert body["count"] == 3
     assert body["note"] == ""
@@ -1136,10 +1139,10 @@ def test_own_attempts_are_ordered_by_start_not_by_row(client: TestClient, home: 
             # id 900 — стартовала позже, id 901 — раньше: по `id` порядок обратный.
             for ident, stage, ts in ((900, "impl", NOW - 100), (901, "verify", NOW - 500)):
                 conn.execute(
-                    "INSERT INTO events (id, ts, recorded_at, deal_id, board, kind, payload, source, "
-                    "idempotency_key) VALUES (?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO events (id, ts, recorded_at, deal_id, kind, payload, source, "
+                    "idempotency_key) VALUES (?,?,?,?,?,?,?,?)",
                     (
-                        ident, ts, ts, deal["id"], BOARD, "attempt_started",
+                        ident, ts, ts, deal["id"], "attempt_started",
                         json.dumps({"run_id": f"{deal['id']}:{stage}#1", "stage": stage, "attempt": 1}),
                         "engine", f"test:{deal['id']}:{stage}",
                     ),
@@ -1147,7 +1150,7 @@ def test_own_attempts_are_ordered_by_start_not_by_row(client: TestClient, home: 
     finally:
         conn.close()
 
-    body = client.get(f"/duty/{BOARD}/{deal['id']}/attempts").json()
+    body = client.get(f"/duty/{deal['id']}/attempts").json()
 
     assert [attempt["stage"] for attempt in body["attempts"]] == ["verify", "impl"]
 
@@ -1157,7 +1160,7 @@ def test_own_attempt_outcomes_and_failure_class(client: TestClient, home: Path, 
     deal = create(client)
     append_journal(home, deal["id"], three_attempts(deal["id"]))
 
-    impl, _, review = client.get(f"/duty/{BOARD}/{deal['id']}/attempts").json()["attempts"]
+    impl, _, review = client.get(f"/duty/{deal['id']}/attempts").json()["attempts"]
 
     assert (impl["outcome"], impl["kind"], impl["status"]) == ("done", "", "completed")
     assert (review["outcome"], review["kind"], review["status"]) == ("failed", "contract", "failed")
@@ -1171,7 +1174,7 @@ def test_own_attempt_base_commit_and_progress_arrive(client: TestClient, home: P
     deal = create(client)
     append_journal(home, deal["id"], three_attempts(deal["id"]))
 
-    impl, verify, review = client.get(f"/duty/{BOARD}/{deal['id']}/attempts").json()["attempts"]
+    impl, verify, review = client.get(f"/duty/{deal['id']}/attempts").json()["attempts"]
 
     assert (impl["base"], impl["commit"]) == (BASE_ONE, COMMIT_ONE)
     assert impl["progress"] == 2
@@ -1192,7 +1195,7 @@ def test_own_open_attempt_with_live_lease_is_running(client: TestClient, home: P
     # …но лизинг продлён heartbeat'ом: живой срок — в таблице store.
     set_lease(home, deal["id"], "impl", 1, expires_at=NOW + 600)
 
-    body = client.get(f"/duty/{BOARD}/{deal['id']}/attempts").json()
+    body = client.get(f"/duty/{deal['id']}/attempts").json()
 
     attempt = body["attempts"][0]
     assert attempt["status"] == "running"
@@ -1212,7 +1215,7 @@ def test_own_open_attempt_with_expired_lease_is_orphan(client: TestClient, home:
         }),
     ])
 
-    attempt = client.get(f"/duty/{BOARD}/{deal['id']}/attempts").json()["attempts"][0]
+    attempt = client.get(f"/duty/{deal['id']}/attempts").json()["attempts"][0]
 
     assert attempt["status"] == "orphan"
     assert attempt["ended_at"] is None
@@ -1229,7 +1232,7 @@ def test_own_open_attempt_without_lease_is_unknown(client: TestClient, home: Pat
         }),
     ])
 
-    attempt = client.get(f"/duty/{BOARD}/{deal['id']}/attempts").json()["attempts"][0]
+    attempt = client.get(f"/duty/{deal['id']}/attempts").json()["attempts"][0]
 
     assert attempt["status"] == "unknown"
     assert "неизвестно" in attempt["reason"]
@@ -1249,7 +1252,7 @@ def test_own_attempt_reaped_flag_arrives(client: TestClient, home: Path, frozen:
         }),
     ])
 
-    attempt = client.get(f"/duty/{BOARD}/{deal['id']}/attempts").json()["attempts"][0]
+    attempt = client.get(f"/duty/{deal['id']}/attempts").json()["attempts"][0]
 
     assert attempt["reaped"] is True
     assert attempt["kind"] == "infra"
@@ -1259,17 +1262,17 @@ def test_own_attempt_reaped_flag_arrives(client: TestClient, home: Path, frozen:
 def test_attempts_of_own_deal_without_attempts_name_the_real_reason(client: TestClient) -> None:
     """Своё дело без попыток: count=0 и настоящая причина, а не «спавна в 0.0.3 нет»."""
     deal = create(client)
-    body = client.get(f"/duty/{BOARD}/{deal['id']}/attempts").json()
+    body = client.get(f"/duty/{deal['id']}/attempts").json()
 
     assert body["count"] == 0
     assert body["attempts"] == []
-    assert body["task_id"] == deal["id"]
+    assert body["deal_id"] == deal["id"]
     assert "попыток не было" in body["note"]
     assert "0.0.3" not in body["note"]
 
 
-def test_kanban_attempts_still_come_from_task_runs(client: TestClient, home: Path, frozen: int) -> None:
-    """Регрессия: `t_`-дело по-прежнему читается из `task_runs` доски, а не из журнала."""
+def test_kanban_card_attempts_are_refused_with_reason(client: TestClient, home: Path) -> None:
+    """`t_…` в `/duty/{deal_id}/attempts` — отказ словами: карточка не дело."""
     board = home / "kanban" / "boards" / BOARD / "kanban.db"
     conn = sqlite3.connect(board)
     try:
@@ -1282,15 +1285,12 @@ def test_kanban_attempts_still_come_from_task_runs(client: TestClient, home: Pat
     finally:
         conn.close()
 
-    body = client.get(f"/duty/{BOARD}/{KANBAN_DEAL}/attempts").json()
+    response = client.get(f"/duty/{KANBAN_DEAL}/attempts")
 
-    assert body["count"] == 1
-    assert body["note"] == ""
-    attempt = body["attempts"][0]
-    assert attempt["profile"] == "implementer"
-    assert attempt["outcome"] == "completed"
-    assert attempt["start"] == NOW - 300
-    assert attempt["duration_sec"] == 180
+    assert response.status_code == 400, response.text
+    detail = response.json()["detail"]
+    assert "карточка kanban" in detail
+    assert "/cards" in detail
 
 
 # ------------------------------------------------------------------ CLI (5)
@@ -1351,7 +1351,7 @@ def test_create_with_external_ref_records_it_in_row_and_journal(
 
     created = events(home, body["id"])[0]
     assert created["payload"]["external_ref"] == "jira:RP-14080"
-    card = client.get(f"/deal/{BOARD}/{body['id']}").json()
+    card = client.get(f"/deal/{body['id']}").json()
     assert card["external_ref"] == "jira:RP-14080"
 
 
@@ -1399,22 +1399,16 @@ def test_archived_deal_is_not_resurrected_by_external_ref(home: Path, client: Te
     assert second["id"] != first["id"]
 
 
-def test_external_ref_dedups_only_on_its_own_board(home: Path, client: TestClient) -> None:
-    """Внешнее имя ищется в пределах доски: на другой доске это другое дело."""
+def test_external_ref_dedups_only_inside_its_own_repo(home: Path, client: TestClient) -> None:
+    """Внешнее имя ищется в пределах repo: в другом репозитории это другое дело."""
     other = "another"
-    board = home / "kanban" / "boards" / other / "kanban.db"
-    board.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(board)
-    conn.executescript(KANBAN_SCHEMA)
-    conn.commit()
-    conn.close()
 
     first = create(client, external_ref="jira:RP-14080")
     second = create(client, repo=other, external_ref="jira:RP-14080")
 
     assert second["created"] is True
     assert second["id"] != first["id"]
-    assert second["board"] == other
+    assert second["repo"] == other
 
 
 def test_dedup_window_lets_a_stale_live_deal_go(home: Path) -> None:
@@ -1475,7 +1469,7 @@ def test_old_store_without_external_ref_column_is_still_readable(
 
     names = {item["id"] for item in client.get("/now").json()["deals"]}
     assert deal["id"] in names
-    card = client.get(f"/deal/{BOARD}/{deal['id']}").json()
+    card = client.get(f"/deal/{deal['id']}").json()
     assert card["external_ref"] is None
 
     # смотр экрана схему не доводит: колонки после чтения по-прежнему нет
@@ -1768,7 +1762,7 @@ def test_own_deal_with_attempts_does_not_say_the_engine_never_started(
         end_attempt(home, deal["id"], attempt=number, started_at=started)
     park_and_unblock(client, deal["id"])
 
-    assert client.get(f"/deal/{BOARD}/{deal['id']}").json()["status"] == "ready"
+    assert client.get(f"/deal/{deal['id']}").json()["status"] == "ready"
     listed = now_deals(client)[deal["id"]]
 
     evidence = listed["waiting"]["evidence"]
@@ -1779,10 +1773,10 @@ def test_own_deal_with_attempts_does_not_say_the_engine_never_started(
     assert "bin/duty run" in evidence
     # Тот же факт виден полем: идущей попытки нет, а закрытые — есть в таймлайне.
     assert listed["attempt"] is None
-    timeline = client.get(f"/duty/{BOARD}/{deal['id']}/attempts").json()
+    timeline = client.get(f"/duty/{deal['id']}/attempts").json()
     assert [row["attempt"] for row in timeline["attempts"]] == [1, 2]
     # Одна строка на обе поверхности: `/deal` не считает доказательство заново.
-    card = client.get(f"/deal/{BOARD}/{deal['id']}").json()["deal"]
+    card = client.get(f"/deal/{deal['id']}").json()["deal"]
     assert card["waiting"] == listed["waiting"]
 
 

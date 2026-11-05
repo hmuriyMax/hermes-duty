@@ -321,6 +321,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
     with conn:
         for statement in DEALS_INDEXES:
             conn.execute(statement)
+        # `external_ref` появилась в 0.0.4, и база 0.0.3 её не знает: колонку
+        # доводит та же миграция, что и `repo` — иначе первая же запись в такую
+        # базу падала бы на `table deals has no column named external_ref`.
+        if EXTERNAL_REF_FIELD not in _deal_columns(conn):
+            conn.execute(f"ALTER TABLE deals ADD COLUMN {EXTERNAL_REF_FIELD} TEXT")
         # Таблица досок больше не нужна: дело адресуется своим id, а группировка —
         # по `repo`. Строки досок не переносятся никуда: вывести из них репозиторий
         # нечем, и придумывать его нельзя.
@@ -819,6 +824,10 @@ def create_deal(
         deal,
         "created",
         {
+            # Группировка дела — факт создания: доски в событии больше нет (0.0.6),
+            # а `repo` её заменил, и по журналу видно, к какому репозиторию дело
+            # отнесли в момент заведения.
+            "repo": repo_name,
             "title": clean_title,
             "assignee": assignee,
             "status": None,

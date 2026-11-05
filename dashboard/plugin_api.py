@@ -2291,7 +2291,7 @@ def create_deal_route(payload: dict[str, Any] = Body(...)) -> Any:
     try:
         return deals_create(_hermes_home(), payload)
     except deals.DealError as exc:
-        return _deal_error(exc, payload.get("board"), None)
+        return _deal_error(exc, None)
 
 
 @router.patch("/deals/{deal_id}")
@@ -2300,7 +2300,7 @@ def patch_deal_route(deal_id: str, payload: dict[str, Any] = Body(...)) -> Any:
     try:
         return deals_patch(_hermes_home(), deal_id, payload)
     except deals.DealError as exc:
-        return _deal_error(exc, None, deal_id)
+        return _deal_error(exc, deal_id)
 
 
 @router.post("/deals/{deal_id}/comment")
@@ -2309,7 +2309,7 @@ def comment_deal_route(deal_id: str, payload: dict[str, Any] = Body(...)) -> Any
     try:
         return deals_comment(_hermes_home(), deal_id, payload)
     except deals.DealError as exc:
-        return _deal_error(exc, None, deal_id)
+        return _deal_error(exc, deal_id)
 
 
 @router.post("/deals/{deal_id}/block")
@@ -2318,7 +2318,7 @@ def block_deal_route(deal_id: str, payload: dict[str, Any] = Body(...)) -> Any:
     try:
         return deals_block(_hermes_home(), deal_id, payload)
     except deals.DealError as exc:
-        return _deal_error(exc, None, deal_id)
+        return _deal_error(exc, deal_id)
 
 
 @router.post("/deals/{deal_id}/unblock")
@@ -2327,7 +2327,7 @@ def unblock_deal_route(deal_id: str, payload: dict[str, Any] = Body(default={}))
     try:
         return deals_unblock(_hermes_home(), deal_id, payload or {})
     except deals.DealError as exc:
-        return _deal_error(exc, None, deal_id)
+        return _deal_error(exc, deal_id)
 
 
 @router.post("/deals/{deal_id}/decide")
@@ -2340,7 +2340,7 @@ def decide_deal_route(deal_id: str, payload: dict[str, Any] = Body(...)) -> Any:
     try:
         return deals_decide(_hermes_home(), deal_id, payload)
     except deals.DealError as exc:
-        return _deal_error(exc, None, deal_id)
+        return _deal_error(exc, deal_id)
 
 
 @router.post("/deals/{deal_id}/close")
@@ -2349,7 +2349,7 @@ def close_deal_route(deal_id: str, payload: dict[str, Any] = Body(default={})) -
     try:
         return deals_close(_hermes_home(), deal_id, payload or {})
     except deals.DealError as exc:
-        return _deal_error(exc, None, deal_id)
+        return _deal_error(exc, deal_id)
 
 
 @router.post("/deals/{deal_id}/claim")
@@ -2358,7 +2358,7 @@ def claim_deal_route(deal_id: str, payload: dict[str, Any] = Body(...)) -> Any:
     try:
         return deals_claim(_hermes_home(), deal_id, payload)
     except deals.DealError as exc:
-        return _deal_error(exc, None, deal_id)
+        return _deal_error(exc, deal_id)
 
 
 @router.post("/deals/{deal_id}/complete")
@@ -2367,7 +2367,7 @@ def complete_deal_route(deal_id: str, payload: dict[str, Any] = Body(...)) -> An
     try:
         return deals_complete(_hermes_home(), deal_id, payload)
     except deals.DealError as exc:
-        return _deal_error(exc, None, deal_id)
+        return _deal_error(exc, deal_id)
 
 
 @router.post("/deals/{deal_id}/review")
@@ -2376,7 +2376,7 @@ def review_deal_route(deal_id: str, payload: dict[str, Any] = Body(...)) -> Any:
     try:
         return deals_review(_hermes_home(), deal_id, payload)
     except deals.DealError as exc:
-        return _deal_error(exc, None, deal_id)
+        return _deal_error(exc, deal_id)
 
 
 @router.post("/deals/{deal_id}/changes")
@@ -2385,7 +2385,7 @@ def changes_deal_route(deal_id: str, payload: dict[str, Any] = Body(...)) -> Any
     try:
         return deals_changes(_hermes_home(), deal_id, payload)
     except deals.DealError as exc:
-        return _deal_error(exc, None, deal_id)
+        return _deal_error(exc, deal_id)
 
 
 @router.post("/deals/{deal_id}/attach")
@@ -2405,7 +2405,7 @@ def attach_deal_route(deal_id: str, file: UploadFile = File(...)) -> Any:
             content_type=file.content_type,
         )
     except deals.DealError as exc:
-        return _deal_error(exc, None, deal_id)
+        return _deal_error(exc, deal_id)
 
 
 def _repo_entry(home: Path, repo: str) -> None:

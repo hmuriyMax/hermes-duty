@@ -22,6 +22,7 @@ import {
   noticeLines,
   shapeAttempts,
   shapeDeal,
+  shapeDealTime,
   shapeNow,
   shapeStages,
   stateMeta,
@@ -748,7 +749,201 @@ function stageFeedPanel(data) {
   )
 }
 
+/* -------------------------------------------- шкала времени дела (E2) */
+
+// Глиф маркера — только значок; слово и время приходят из шейпера (`label`,
+// `title`), чтобы подпись не разъезжалась между вебом и десктопом.
+const MARKER_GLYPH = {
+  question: '?',
+  answer: '+',
+  verdict: 'v',
+  budget: '!',
+  published: '↑',
+  closed: '■',
+  started: '',
+  ended: '',
+}
+
+/**
+ * Строка фактов шапки дела. Числа целиком из `shapeDealTime`: попытки по этапам,
+ * длительность (у живого дела — до «сейчас», с пометкой), вопросы человеку,
+ * бюджет дела и факт публикации.
+ */
+function dealFactSpans(scale) {
+  const facts = scale.facts
+  const parts = [
+    h(
+      'span',
+      { title: 'попыток всего и по этапам' },
+      'попыток: ',
+      h('b', null, `${facts.attempts.total}${facts.attempts.text ? ` (${facts.attempts.text})` : ''}`),
+    ),
+    h(
+      'span',
+      { title: scale.axis.text },
+      'длительность: ',
+      h('b', null, facts.duration.text),
+      facts.duration.live ? ' · идёт' : '',
+    ),
+    h('span', { title: 'вопросы человеку по таймлайну' }, 'вопросы: ', h('b', null, facts.questions.text)),
+  ]
+  if (facts.budget) {
+    parts.push(
+      h(
+        'span',
+        { title: facts.budget.exhausted ? `потолок исчерпан: ${facts.budget.exhausted}` : 'потолок дела целиком' },
+        'бюджет: ',
+        h('b', null, facts.budget.text || '—'),
+      ),
+    )
+  }
+  if (facts.published) {
+    parts.push(
+      h(
+        'span',
+        { title: facts.published.mrUrl || facts.published.ref || 'факт журнала' },
+        'публикация: ',
+        h('b', { class: 'mono' }, facts.published.text || '—'),
+      ),
+    )
+  }
+  if (facts.closed) {
+    parts.push(h('span', { title: facts.closed.cause || '' }, 'закрытие: ', h('b', null, facts.closed.text)))
+  }
+  return parts
+}
+
+/** Маркер события: засечка старта/закрытия попытки или заметная точка события. */
+function markerNode(marker, index) {
+  return h(
+    'span',
+    {
+      class: `scale-marker t-${marker.tone}${marker.tick ? ' tick' : ''}`,
+      style: `left:${marker.pct}%;top:${(index % 2) * 13}px`,
+      title: marker.title,
+      'aria-label': marker.ariaLabel,
+      role: 'img',
+      tabindex: '0',
+    },
+    h('span', { class: 'scale-marker-dot' }, MARKER_GLYPH[marker.type] || ''),
+  )
+}
+
+/** Легенда маркеров: только те виды, что реально есть в журнале этого дела. */
+function markerLegend(scale) {
+  const seen = []
+  for (const marker of scale.markers) {
+    if (marker.tick || seen.some((item) => item.type === marker.type)) continue
+    seen.push(marker)
+  }
+  if (!seen.length) return null
+  return h(
+    'div',
+    { class: 'scale-legend' },
+    ...seen.map((marker) =>
+      h('span', { class: `t-${marker.tone}` }, `${MARKER_GLYPH[marker.type] || '•'} ${marker.label}`),
+    ),
+    h('span', { class: 'muted' }, '· засечки — старт и конец попыток'),
+  )
+}
+
+/**
+ * Панель шкалы времени: подписанная ось, дорожка на этап, полосы попыток и лента
+ * маркеров. Геометрия приходит посчитанной (`shapeDealTime`); здесь только DOM.
+ */
+function scalePanel(scale) {
+  if (scale.empty) {
+    return h(
+      'div',
+      { class: 'panel', style: 'margin-bottom:14px' },
+      h('div', { class: 'panel-h' }, 'шкала времени'),
+      h('div', { class: 'panel-b muted' }, 'событий и попыток нет: рисовать нечего'),
+    )
+  }
+  return h(
+    'div',
+    { class: 'panel', style: 'margin-bottom:14px' },
+    h('div', { class: 'panel-h' }, `шкала времени · ${scale.axis.text}`),
+    h(
+      'div',
+      { class: 'panel-b' },
+      h(
+        'div',
+        { class: 'scale-axis' },
+        ...scale.axis.ticks.map((tick) =>
+          h(
+            'span',
+            { class: `scale-tick align-${tick.align}`, style: `left:${tick.pct}%`, title: tick.clock },
+            `${tick.edge} ${tick.clock}`,
+          ),
+        ),
+      ),
+      h(
+        'div',
+        { class: 'scale-lanes' },
+        ...scale.lanes.map((lane, index) =>
+          h(
+            'div',
+            { class: 'scale-lane' },
+            h(
+              'span',
+              { class: 'scale-lane-k', title: lane.count ? lane.label : `${lane.label}: попыток не было` },
+              lane.label,
+              lane.count ? null : h('i', { class: 'scale-lane-none' }, ' ·'),
+            ),
+            h(
+              'div',
+              { class: 'scale-track' },
+              ...scale.bars
+                .filter((bar) => bar.lane === index)
+                .map((bar) =>
+                  h(
+                    'div',
+                    {
+                      class: `scale-bar t-${bar.tone}${bar.open ? ' open' : ''}`,
+                      style: `left:${bar.leftPct}%;width:${bar.widthPct}%`,
+                      title: bar.title,
+                      'aria-label': bar.ariaLabel,
+                      role: 'img',
+                      tabindex: '0',
+                    },
+                    h('span', { class: 'scale-bar-k' }, bar.label),
+                  ),
+                ),
+            ),
+          ),
+        ),
+      ),
+      scale.markers.length
+        ? h(
+            'div',
+            { class: 'scale-markers' },
+            ...scale.markers.map((marker, index) =>
+              marker.waitPct > 0
+                ? h(
+                    'span',
+                    {
+                      class: 'scale-wait t-yellow',
+                      style: `left:${marker.pct}%;width:${marker.waitPct}%`,
+                      title: `${marker.clock} → сейчас: ${marker.waitText}`,
+                    },
+                    h('span', { class: 'scale-wait-k' }, marker.waitText),
+                  )
+                : null,
+            ),
+            ...scale.markers.map(markerNode),
+          )
+        : null,
+      markerLegend(scale),
+      scale.facts.attempts.journal ? h('div', { class: 'muted' }, 'полосы собраны из журнала: ответ попыток пуст') : null,
+    ),
+  )
+}
+
 function attemptCard(attempt) {
+  const facts = [attempt.stage ? `этап ${attempt.stage}` : '', attempt.progressText, attempt.toolsText]
+    .filter(Boolean)
+    .join(' · ')
   return h(
     'div',
     { class: 'att' },
@@ -761,7 +956,9 @@ function attemptCard(attempt) {
       h('span', { class: 'sp' }),
       h('span', { class: `badge t-${attempt.outcomeTone}`, title: `status=${attempt.status}${attempt.outcome ? `, outcome=${attempt.outcome}` : ''}` }, attempt.outcome || attempt.status),
     ),
-    h('div', { class: `track t-${attempt.outcomeTone}` }, h('div', { class: 'bar', style: `width:${attempt.barPct}%` })),
+    // Сегментов вызовов внутри полосы нет: их нет и в данных — только числа
+    // `progress`/`tools`, если бэкенд их прислал.
+    facts ? h('div', { class: 'att-facts muted' }, facts) : null,
     attempt.summary ? h('div', { class: 'att-summary' }, attempt.summary) : null,
     attempt.error ? h('div', { class: 'att-error' }, attempt.error) : null,
     attempt.events.length
@@ -795,6 +992,9 @@ function viewDeal(board, taskId) {
   // говорили об одном и том же одними словами.
   const deal = data.deal ? shapeDeal(data.deal) : null
   const timeline = dealSnap.attempts ? shapeAttempts(dealSnap.attempts) : null
+  // Шкала времени: ось, дорожки этапов, полосы и маркеры — из одного шейпера
+  // (`shapeDealTime`), того же, что вшит в десктопный плагин.
+  const scale = shapeDealTime(data, dealSnap.attempts)
 
   const head = h(
     'div',
@@ -816,6 +1016,8 @@ function viewDeal(board, taskId) {
       h('span', null, 'создано: ', h('b', null, fmtClock(data.created_at))),
       deal ? h('span', null, 'последнее действие: ', h('b', null, `${deal.lastActionAgeText} назад`)) : null,
     ),
+    // Факты шкалы: попытки по этапам, длительность, вопросы, бюджет, публикация.
+    h('div', { class: 'deal-facts' }, ...dealFactSpans(scale)),
     deal && deal.evidence ? h('div', { class: 'why-evidence', style: 'margin-top:10px', text: deal.evidence }) : null,
   )
 
@@ -838,6 +1040,7 @@ function viewDeal(board, taskId) {
     null,
     h('div', { style: 'margin-bottom:10px' }, h('a', { href: '#/deal' }, '← к списку дел')),
     head,
+    scalePanel(scale),
     stageFeedPanel(data),
     h('div', { class: 'two-col' }, left, right),
   )

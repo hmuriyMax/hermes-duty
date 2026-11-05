@@ -344,15 +344,15 @@ function outcomeTone(outcome, status, crashOutcomes) {
 /**
  * Таймлайн попыток из ответа `/duty/{board}/{id}/attempts`.
  *
- * `barPct` — ширина полосы попытки относительно самой долгой в этом таймлайне
- * (минимум 2%, чтобы мгновенная попытка не исчезала), так короче/длиннее видно
- * глазом, без абсолютной шкалы.
+ * Геометрии здесь нет: полосы на общей оси дела считает `shapeDealTime`
+ * (минимум и максимум по `timeline` и `attempts`), и второй расчёт ширины —
+ * «доля от самой долгой попытки» — дал бы на экране две несравнимые шкалы.
+ * Здесь только факты одной попытки для карточки под шкалой.
  */
 function shapeAttempts(payload) {
   const data = payload && typeof payload === 'object' ? payload : {}
   const list = Array.isArray(data.attempts) ? data.attempts : []
   const crashes = Array.isArray(data.crash_outcomes) ? data.crash_outcomes.map(String) : []
-  const longest = list.reduce((acc, attempt) => Math.max(acc, Number(attempt.duration_sec) || 0), 0) || 1
   const attempts = list.map((attempt) => {
     const duration = attempt.duration_sec === undefined ? null : attempt.duration_sec
     const events = (Array.isArray(attempt.events) ? attempt.events : []).map((event) => ({
@@ -364,12 +364,21 @@ function shapeAttempts(payload) {
     return {
       runId: attempt.run_id ?? null,
       profile: String(attempt.profile || '—'),
+      stage: String(attempt.stage || ''),
       status: String(attempt.status || '—'),
       start: attempt.start ?? null,
       end: attempt.end ?? null,
       duration,
       durationText: fmtAge(duration),
-      barPct: Math.max(2, Math.round(((Number(duration) || 0) / longest) * 100)),
+      open: attempt.start !== undefined && attempt.start !== null && (attempt.end === undefined || attempt.end === null),
+      lease: String(attempt.lease || ''),
+      progress: attempt.progress ?? null,
+      tools: attempt.tools ?? null,
+      // Числа процесса подписываются словами здесь, а не в рендере: у обеих
+      // поверхностей одна форма (`шагов N`, `инструментов M`), и разъехаться
+      // этой подписи негде.
+      progressText: attempt.progress === null || attempt.progress === undefined ? '' : `шагов ${fmtCount(attempt.progress)}`,
+      toolsText: attempt.tools === null || attempt.tools === undefined ? '' : `инструментов ${fmtCount(attempt.tools)}`,
       outcome: String(attempt.outcome || ''),
       outcomeTone: outcomeTone(attempt.outcome, attempt.status, crashes),
       error: String(attempt.error || ''),
@@ -628,6 +637,500 @@ function shapeStages(payload) {
   }
 }
 
+/* ---------------------------------------- шкала времени дела (E2, 0.0.5) */
+
+// Минимальная ширина полосы на общей оси: мгновенная попытка не должна исчезать
+// из шкалы (те же 2%, что были у относительной полосы), но подпись при этом
+// честная — `<1с`, иначе две ширины в процентах читались бы как две секунды.
+const BAR_MIN_PCT = 2
+
+// Подпись и тон маркера: журнал назвал событие — экран назвал его тем же словом.
+// `tick` — тонкая засечка старта/закрытия попытки (их на оси много); остальные
+// виды — то, что случилось с делом, и они рисуются заметно.
+const MARKER_META = {
+  question: { label: 'вопрос человеку', tone: 'yellow', tick: false },
+  answer: { label: 'ответ человека', tone: 'green', tick: false },
+  verdict: { label: 'вердикт', tone: 'blue', tick: false },
+  budget: { label: 'отказ по бюджету', tone: 'red', tick: false },
+  published: { label: 'публикация', tone: 'green', tick: false },
+  closed: { label: 'закрыто', tone: 'gray', tick: false },
+  started: { label: 'старт попытки', tone: 'gray', tick: true },
+  ended: { label: 'конец попытки', tone: 'gray', tick: true },
+}
+
+/**
+ * Вид маркера по событию журнала; пусто — маркера нет.
+ *
+ * Гейт и отказ по бюджету узнаются по причине из `attempt_ended`
+ * (`_payload_summary` берёт `reason`): своего `kind` у отказа нет, он назван
+ * словами движка — «гейт: …» и «бюджет дела исчерпан: N/M токенов». Незнакомое
+ * событие маркера не получает: «нет события — нет маркера» — правило экрана.
+ */
+function markerType(kind, summary) {
+  const text = String(summary || '')
+  if (kind === 'question_asked') return 'question'
+  if (kind === 'question_answered') return 'answer'
+  if (kind === 'attempt_started') return 'started'
+  if (kind === 'attempt_ended') {
+    if (/^гейт/.test(text)) return 'verdict'
+    if (/бюджет/i.test(text)) return 'budget'
+    return 'ended'
+  }
+  // Приговор ревью — два факта журнала (`journal.VERDICT_FACTS`), а не текст.
+  if (kind === 'collected' || kind === 'changes_requested') return 'verdict'
+  if (kind === 'published') return 'published'
+  if (kind === 'completed') return 'closed'
+  return ''
+}
+
+/** Время как ЧЧ:ММ — для подписи оси: секунды на шкале дела не читаются. */
+function fmtClockShort(at) {
+  const full = fmtClock(at)
+  return full === '—' ? '—' : full.slice(0, 5)
+}
+
+/** Длительность с нижней границей: ноль — `<1с`, а не `0 с`. */
+function fmtDuration(sec) {
+  const value = Number(sec)
+  if (!Number.isFinite(value) || value <= 0) return '<1с'
+  return fmtAge(value)
+}
+
+/** Лизинг незакрытой попытки словом: `жив`/`лизинг истёк`/`неизвестно`. */
+function leaseWord(lease, status) {
+  const key = String(lease || '')
+  if (key === 'live') return 'жив'
+  if (key === 'expired') return 'лизинг истёк'
+  if (key === 'dead' || status === 'orphan') return 'лизинг истёк'
+  return 'неизвестно'
+}
+
+/** Сколько дел в секундах — только конечные числа, иначе `null`. */
+function numOrNull(value) {
+  if (value === null || value === undefined || value === '') return null
+  const n = Number(value)
+  return Number.isFinite(n) ? n : null
+}
+
+/** Попытка из ответа `/attempts` в полосу шкалы: время, дорожка, подписи. */
+function attemptBar(attempt, crashes) {
+  const a = attempt && typeof attempt === 'object' ? attempt : {}
+  const start = numOrNull(a.start)
+  const end = numOrNull(a.end)
+  const duration = numOrNull(a.duration_sec)
+  const lease = String(a.lease || '')
+  const open = start !== null && end === null
+  const dead = open && (lease === 'expired' || a.dead === true || a.status === 'orphan')
+  const stage = String(a.stage || a.profile || '—')
+  return {
+    key: String(a.run_id === null || a.run_id === undefined ? '' : a.run_id),
+    number: a.attempt ? `#${a.attempt}` : '',
+    stage,
+    laneKey: stage,
+    laneLabel: stage,
+    lane: 0,
+    start,
+    end,
+    endAt: null,
+    duration,
+    durationSec: null,
+    durationText: '',
+    open,
+    lease,
+    leaseText: open ? leaseWord(lease, a.status) : '',
+    progress: numOrNull(a.progress),
+    tools: numOrNull(a.tools),
+    outcome: String(a.outcome || ''),
+    status: String(a.status || ''),
+    tone: open ? (dead ? 'red' : 'blue') : outcomeTone(a.outcome, a.status, crashes),
+    leftPct: 0,
+    endPct: 0,
+    widthPct: 0,
+    clockStart: fmtClock(start),
+    clockEnd: '',
+    label: '',
+    title: '',
+    ariaLabel: '',
+    progressText: '',
+    toolsText: '',
+    // Откуда полоса: `attempts` — ответ ручки попыток, `journal` — пара
+    // `attempt_started`/`attempt_ended`, когда ручка попыток пуста (старый бэкенд
+    // или дело без рана kanban). Экран показывает разницу, а не прячет.
+    source: 'attempts',
+  }
+}
+
+/**
+ * Стадия из выжимки `attempt_started`: там лежит JSON (`{"run_id": "review#1",
+ * "stage": "review", …}`), обрезанный по `SUMMARY_LIMIT`. Разбор JSON ломался бы
+ * на обрезке, поэтому берём два поля по образцу — их видно в начале строки.
+ */
+function stageOfSummary(summary) {
+  const text = String(summary || '')
+  const stage = /"stage":\s*"([^"]+)"/.exec(text)
+  if (stage) return stage[1]
+  const run = /"run_id":\s*"([^"#]+)#(\d+)"/.exec(text)
+  return run ? run[1] : ''
+}
+
+/** Номер попытки из той же выжимки: `attempt` первым делом, иначе из `run_id`. */
+function attemptOfSummary(summary) {
+  const text = String(summary || '')
+  const attempt = /"attempt":\s*(\d+)/.exec(text)
+  if (attempt) return Number(attempt[1])
+  const run = /"run_id":\s*"([^"#]+)#(\d+)"/.exec(text)
+  return run ? Number(run[2]) : 0
+}
+
+/**
+ * Строковые поля выжимки события по образцу `"key": "value"`.
+ *
+ * `JSON.parse` здесь не годится: бэкенд обрезает `summary` по `SUMMARY_LIMIT`
+ * и строка часто недописана. Берём только нужные ключи, которые стоят в начале
+ * выжимки; чего нет — того нет, и маркер это честно покажет.
+ */
+function summaryFields(summary, keys) {
+  const text = String(summary || '')
+  const out = {}
+  for (const key of keys) {
+    const found = new RegExp(`"${key}":\\s*"([^"]*)"`).exec(text)
+    if (found) out[key] = found[1]
+  }
+  return out
+}
+
+/**
+ * Полосы из журнала: пары `attempt_started` ↔ `attempt_ended`, когда ответ
+ * попыток пуст.
+ *
+ * Второй копии расчёта здесь нет — это тот же шейпер, просто другой источник
+ * факта: `attempt_ended` гейта и отказа по бюджету пишется без начала
+ * (`docs/JOURNAL.md`), и такие события полосой не становятся — они уходят на
+ * ленту маркеров.
+ *
+ * Исход берётся из выжимки `attempt_ended` по образцу `"outcome": "…"`: она
+ * обрезана по `SUMMARY_LIMIT`, но ключ стоит в начале строки, и цвет полосы не
+ * приходится выдумывать по её длительности.
+ */
+function journalBars(events, crashes) {
+  const bars = []
+  const open = []
+  for (const event of events) {
+    if (!(event.at > 0)) continue
+    if (event.kind === 'attempt_started') {
+      const stage = stageOfSummary(event.summary)
+      const bar = {
+        key: `journal:${event.at}:${bars.length}`,
+        number: attemptOfSummary(event.summary) ? `#${attemptOfSummary(event.summary)}` : '',
+        stage: stage || 'попытка',
+        laneKey: stage || 'попытка',
+        laneLabel: stage || 'попытка',
+        lane: 0,
+        start: event.at,
+        end: null,
+        endAt: null,
+        duration: null,
+        durationSec: null,
+        durationText: '',
+        open: false,
+        lease: '',
+        leaseText: '',
+        progress: null,
+        tools: null,
+        outcome: '',
+        status: '',
+        tone: 'gray',
+        leftPct: 0,
+        endPct: 0,
+        widthPct: 0,
+        clockStart: fmtClock(event.at),
+        clockEnd: '',
+        label: '',
+        title: '',
+        ariaLabel: '',
+        progressText: '',
+        toolsText: '',
+        source: 'journal',
+      }
+      bars.push(bar)
+      open.push(bar)
+    } else if (event.kind === 'attempt_ended' && markerType(event.kind, event.summary) === 'ended') {
+      const bar = open.shift()
+      if (!bar) continue
+      bar.end = event.at
+      bar.duration = event.at - bar.start
+      bar.outcome = String((/"outcome":\s*"([^"]*)"/.exec(event.summary) || [])[1] || '')
+      bar.tone = outcomeTone(bar.outcome, '', crashes)
+    }
+  }
+  // Незакрытая пара — та же незакрытая попытка: тянется до `now` пунктиром.
+  for (const bar of open) bar.open = true
+  return bars
+}
+
+/**
+ * Шкала времени дела: одна ось, дорожки этапов, полосы попыток, маркеры событий
+ * и строка фактов шапки. Единственный расчёт геометрии на обе поверхности.
+ *
+ * Ось: начало — минимум из `timeline[].at` и `attempts[].start`, конец — максимум
+ * из `at`/`end`, у живого дела — `now`. Полоса ставится по `start` и тянется на
+ * `duration_sec`; параллельные этапы живут на своих дорожках, поэтому перекрытие
+ * видно глазом, а не по легенде.
+ *
+ * Свой расчёт чисел шапки не заводится: бюджет берётся блоком `budget` ответа,
+ * публикация — блоком `published`, закрытие — блоком `closed`; здесь только
+ * раскладка по словам и процентам.
+ */
+function shapeDealTime(detail, attemptsPayload) {
+  const d = detail && typeof detail === 'object' ? detail : {}
+  const a = attemptsPayload && typeof attemptsPayload === 'object' ? attemptsPayload : {}
+  const now = numOrNull(d.now) ?? numOrNull(a.now)
+  // «Живое» — по `terminal` ответа: закрытое дело ось не тянет вперёд, и его
+  // длительность перестаёт расти в ту же секунду, когда записан `completed`.
+  // Событие закрытия в журнале — тот же признак, если сервер не отдал `terminal`.
+  const events = (Array.isArray(d.timeline) ? d.timeline : []).map((event) => {
+    const e = event && typeof event === 'object' ? event : {}
+    return { kind: String(e.kind || ''), at: numOrNull(e.at) || 0, summary: String(e.summary || '') }
+  })
+  const closedInJournal = events.some((event) => markerType(event.kind, event.summary) === 'closed')
+  const live = d.terminal !== true && !closedInJournal
+  const rows = Array.isArray(a.attempts) ? a.attempts : []
+  const crashes = Array.isArray(a.crash_outcomes) ? a.crash_outcomes.map(String) : []
+  const bars = rows.length ? rows.map((row) => attemptBar(row, crashes)) : journalBars(events, crashes)
+
+  // Ось: только записанные времена. Пусто — шкалы нет, и рисовать «нулевую ось»
+  // значило бы выдумать интервал, которого в журнале не было.
+  const stamps = []
+  for (const event of events) if (event.at > 0) stamps.push(event.at)
+  for (const bar of bars) if (bar.start > 0) stamps.push(bar.start)
+  const known = stamps.length > 0
+  const axisStart = known ? Math.min(...stamps) : null
+  let axisEnd = known ? Math.max(...stamps) : null
+  if (live && now !== null) axisEnd = axisEnd === null ? now : Math.max(axisEnd, now)
+  // Закрытая попытка без `end`, но с длительностью: конец считаем по ней, иначе
+  // полоса оборвалась бы на `start` и шкала «съела» самый длинный этап.
+  for (const bar of bars) {
+    if (bar.start === null) continue
+    const stop = bar.end !== null ? bar.end : bar.start + (bar.duration || 0)
+    if (stop > (axisEnd === null ? 0 : axisEnd) && !live) axisEnd = stop
+  }
+  const span = axisStart === null || axisEnd === null ? 0 : Math.max(1, axisEnd - axisStart)
+  const pctOf = (at) => {
+    if (axisStart === null || !(at > 0) || span === 0) return 0
+    const value = ((at - axisStart) / span) * 100
+    return Math.round(Math.max(0, Math.min(100, value)) * 10) / 10
+  }
+
+  // Дорожки: сначала этапы графа в его порядке (`stages[]` ответа `/deal`) —
+  // тогда дорожек столько же, сколько этапов, и видно, какой этап ещё не
+  // начинался; потом этапы, которых в графе нет (попытка без спеки, дело
+  // kanban), в порядке появления на оси.
+  const lanes = []
+  const laneIndex = new Map()
+  const addLane = (key) => {
+    if (!key || laneIndex.has(key)) return
+    laneIndex.set(key, lanes.length)
+    lanes.push({ key, label: key, count: 0 })
+  }
+  for (const stage of Array.isArray(d.stages) ? d.stages : []) addLane(String((stage && stage.id) || ''))
+  for (const bar of [...bars].sort((left, right) => (left.start || 0) - (right.start || 0))) {
+    addLane(bar.laneKey)
+    bar.lane = laneIndex.get(bar.laneKey)
+    lanes[bar.lane].count += 1
+  }
+  if (!lanes.length) bars.forEach((bar) => { bar.lane = 0 })
+
+  for (const bar of bars) {
+    const stop = bar.open
+      ? (now !== null ? now : bar.start)
+      : bar.end !== null
+        ? bar.end
+        : bar.start === null
+          ? null
+          : bar.start + (bar.duration || 0)
+    bar.endAt = stop
+    bar.leftPct = pctOf(bar.start)
+    bar.endPct = pctOf(stop)
+    bar.widthPct = bar.start === null ? 0 : Math.max(BAR_MIN_PCT, Math.round((bar.endPct - bar.leftPct) * 10) / 10)
+    bar.durationSec = bar.open
+      ? (bar.start !== null && now !== null ? Math.max(0, now - bar.start) : null)
+      : bar.duration !== null
+        ? bar.duration
+        : bar.start !== null && bar.end !== null
+          ? bar.end - bar.start
+          : null
+    bar.durationText = bar.open ? 'идёт' : fmtDuration(bar.durationSec)
+    bar.clockEnd = bar.open ? (now !== null ? fmtClock(now) : '—') : fmtClock(stop)
+    bar.progressText = bar.progress === null ? '' : `шагов ${fmtCount(bar.progress)}`
+    bar.toolsText = bar.tools === null ? '' : `инструментов ${fmtCount(bar.tools)}`
+    // Подпись внутри полосы — исход, а не догадка: у незакрытой это слово о
+    // лизинге, у закрытой без исхода — её длительность.
+    bar.label = bar.open ? bar.leaseText : bar.outcome || bar.status || bar.durationText
+    const details = [bar.progressText, bar.toolsText].filter(Boolean).join(', ')
+    const head = `${bar.laneLabel} · попытка ${bar.number || '—'}`
+    const interval = `${bar.clockStart}–${bar.clockEnd} (${bar.durationText})`
+    const tail = bar.open ? `лизинг: ${bar.leaseText}` : `исход: ${bar.outcome || bar.status || 'не записан'}`
+    bar.title = `${head} · ${interval} · ${tail}${details ? ` · ${details}` : ''}`
+    bar.ariaLabel = bar.title
+  }
+
+  // Маркеры: только факты журнала. Вопрос без ответа получает интервал до `now` —
+  // это и есть «сколько человек думает», а не догадка о его решении.
+  const markers = []
+  const pending = []
+  for (const event of events) {
+    const type = markerType(event.kind, event.summary)
+    if (!type) continue
+    const meta = MARKER_META[type]
+    const clock = fmtClock(event.at)
+    const title = `${clock} · ${meta.label}${event.summary ? ` — ${event.summary}` : ''}`
+    const marker = {
+      type,
+      kind: event.kind,
+      at: event.at,
+      pct: pctOf(event.at),
+      clock,
+      label: meta.label,
+      tone: meta.tone,
+      tick: meta.tick,
+      summary: event.summary,
+      title,
+      ariaLabel: title,
+      answered: false,
+      waitPct: 0,
+      waitText: '',
+    }
+    if (type === 'question') pending.push(marker)
+    // Ответ закрывает первый неотвеченный вопрос: порядок событий и есть порядок
+    // ответов, а `question_id` в выжимке бывает обрезан.
+    else if (type === 'answer' && pending.length) pending.shift().answered = true
+    markers.push(marker)
+  }
+  for (const marker of pending) {
+    marker.waitText = 'ждёт ответа'
+    if (now !== null && marker.at > 0) {
+      marker.waitPct = Math.max(0, Math.round((pctOf(now) - marker.pct) * 10) / 10)
+      marker.title = `${marker.title} · ждёт ответа ${fmtAge(now - marker.at)}`
+      marker.ariaLabel = marker.title
+    }
+  }
+
+  // Шапка дела: числа из ответа, ни одного нового расчёта на бэкенде.
+  const answered = markers.filter((marker) => marker.type === 'answer').length
+  const waiting = pending.length
+  const asked = markers.filter((marker) => marker.type === 'question').length
+  const budgetRaw = d.budget && typeof d.budget === 'object' ? d.budget : a.budget && typeof a.budget === 'object' ? a.budget : null
+  let budget = null
+  if (budgetRaw) {
+    const units = []
+    for (const [unit, label] of [['tokens', 'токенов'], ['minutes', 'минут']]) {
+      const part = budgetRaw[unit]
+      if (!part || typeof part !== 'object') continue
+      const spent = Number(part.spent) || 0
+      const limit = Number(part.limit) || 0
+      const share = limit > 0 ? Math.min(100, Math.round((spent / limit) * 100)) : 0
+      units.push({ unit, label, spent, limit, pct: share, text: `${label} ${fmtCount(spent)} / ${fmtCount(limit)} (${share}%)` })
+    }
+    const rawText = String(budgetRaw.text || '')
+    budget = {
+      units,
+      exhausted: budgetRaw.exhausted ? String(budgetRaw.exhausted) : '',
+      attempts: Number(budgetRaw.attempts) || 0,
+      text: units.length ? units.map((item) => item.text).join(' · ') : rawText,
+    }
+  }
+  // Публикация: поле ответа, а если его нет (сервер старше 0.0.5) — событие
+  // `published` журнала: те же sha/branch/verified_by, второй расчёт не нужен.
+  const pubEvent = [...events].reverse().find((event) => event.kind === 'published')
+  const pubRaw = d.published && typeof d.published === 'object'
+    ? d.published
+    : summaryFields(pubEvent && pubEvent.summary, ['sha', 'branch', 'ref', 'verified_by', 'mr_url'])
+  const pub = Object.keys(pubRaw).length ? pubRaw : null
+  const published = pub
+    ? {
+        sha: String(pub.sha || ''),
+        shaShort: String(pub.sha || '').slice(0, 8),
+        branch: String(pub.branch || ''),
+        ref: String(pub.ref || ''),
+        mrUrl: String(pub.mr_url || ''),
+        verifiedBy: String(pub.verified_by || ''),
+        text: [String(pub.sha || '').slice(0, 8), String(pub.branch || pub.ref || ''), String(pub.verified_by || '')]
+          .filter(Boolean)
+          .join(' · '),
+      }
+    : null
+  // Закрытие: поле ответа, иначе событие журнала (`completed`/`blocked`/`failed`
+  // с `cause`) — тот же факт, что рисует маркер `closed`.
+  const closedEvent = [...events].reverse().find((event) => markerType(event.kind, event.summary) === 'closed')
+  const closedRaw = d.closed && typeof d.closed === 'object'
+    ? d.closed
+    : closedEvent
+      ? { at: closedEvent.at, cause: summaryFields(closedEvent.summary, ['cause']).cause || '' }
+      : null
+  const closed = closedRaw
+    ? {
+        at: numOrNull(closedRaw.at),
+        clock: fmtClock(closedRaw.at),
+        cause: String(closedRaw.cause || ''),
+        text: `закрыто ${fmtClock(closedRaw.at)}${closedRaw.cause ? `: ${closedRaw.cause}` : ''}`,
+      }
+    : null
+  const durationSec = axisStart === null || axisEnd === null ? null : Math.max(0, axisEnd - axisStart)
+
+  const midAt = axisStart === null || axisEnd === null ? null : axisStart + Math.round((axisEnd - axisStart) / 2)
+  return {
+    now,
+    live,
+    empty: bars.length === 0 && markers.length === 0,
+    axis: {
+      start: axisStart,
+      end: axisEnd,
+      spanSec: durationSec,
+      live,
+      text: axisStart === null || axisEnd === null ? 'времени в журнале нет' : `${fmtClockShort(axisStart)}–${fmtClockShort(axisEnd)}`,
+      ticks:
+        axisStart === null || axisEnd === null
+          ? []
+          : [
+              { pct: 0, edge: 'нач.', align: 'start', clock: fmtClock(axisStart) },
+              { pct: 50, edge: 'сер.', align: 'center', clock: fmtClock(midAt) },
+              { pct: 100, edge: 'кон.', align: 'end', clock: fmtClock(axisEnd) },
+            ],
+    },
+    lanes,
+    bars,
+    markers,
+    facts: {
+      attempts: {
+        total: bars.length,
+        // «по этапам» — только этапы, где попытки были: `gate 0` в шапке читалось
+        // бы как сломанный этап, а не как «ещё не начинался».
+        byStage: lanes
+          .filter((lane) => lane.count > 0)
+          .map((lane) => ({ key: lane.key, label: lane.label, count: lane.count })),
+        text: lanes
+          .filter((lane) => lane.count > 0)
+          .map((lane) => `${lane.label} ${lane.count}`)
+          .join(' · '),
+        journal: bars.length > 0 && bars.every((bar) => bar.source === 'journal'),
+      },
+      duration: { sec: durationSec, text: durationSec === null ? '—' : fmtDuration(durationSec), live },
+      questions: {
+        asked,
+        answered,
+        waiting,
+        text: `${asked} ${plural(asked, 'вопрос', 'вопроса', 'вопросов')}${
+          waiting ? ` · ${waiting} ${plural(waiting, 'ждёт', 'ждут', 'ждут')} ответа` : ''
+        }`,
+      },
+      budget,
+      published,
+      closed,
+    },
+    counts: { bars: bars.length, lanes: lanes.length, markers: markers.length },
+  }
+}
+
 export {
   STATE_META,
   WAIT_HUMAN_LABEL,
@@ -646,6 +1149,7 @@ export {
   filterNow,
   outcomeTone,
   shapeAttempts,
+  shapeDealTime,
   shapeStages,
   noticeLines,
 }

@@ -26,6 +26,7 @@ import {
   outcomeTone,
   shapeAttempts,
   shapeDeal,
+  shapeDealTime,
   shapeNow,
   shapeStages,
   stageMeta,
@@ -418,7 +419,7 @@ test('пустой ответ /now не роняет модель', () => {
   assert.equal(shapeNow(null).count, 0)
 })
 
-test('таймлайн попыток: полоса относительно самой долгой, исход цветом, ошибка текстом', () => {
+test('таймлайн попыток: длительность словами, исход цветом, ошибка текстом', () => {
   const timeline = shapeAttempts(attemptsPayload)
   assert.equal(timeline.count, 3)
   assert.equal(timeline.title, 'IMPL: страница /duty — экран «сейчас» и таймлайн попыток')
@@ -426,15 +427,13 @@ test('таймлайн попыток: полоса относительно с�
     timeline.attempts.map((attempt) => attempt.durationText),
     ['12 с', '10 мин', '2 мин'],
   )
-  // самая долгая попытка — 100%, мгновенная не исчезает (минимум 2%)
-  assert.deepEqual(
-    timeline.attempts.map((attempt) => attempt.barPct),
-    [2, 100, 20],
-  )
   assert.deepEqual(
     timeline.attempts.map((attempt) => attempt.outcomeTone),
     ['red', 'red', 'green'],
   )
+  // Относительной полосы в шейпере нет: ширину полосы считает общая ось дела
+  // (`shapeDealTime`), а `barPct` давал бы на том же экране вторую шкалу.
+  assert.ok(!('barPct' in timeline.attempts[0]), 'в попытке остался относительный процент')
   assert.match(timeline.attempts[1].error, /nil pointer dereference/)
   assert.equal(timeline.attempts[0].outcome, 'spawn_failed')
   assert.deepEqual(
@@ -442,6 +441,9 @@ test('таймлайн попыток: полоса относительно с�
     ['claimed', 'tool_call', 'crashed'],
   )
   assert.equal(timeline.attempts[2].status, 'running')
+  // Попытка без `end` — незакрытая: шкала тянет её до «сейчас» пунктиром.
+  assert.equal(timeline.attempts[2].open, true)
+  assert.equal(timeline.attempts[1].open, false)
   assert.equal(timeline.attempts[2].error, '')
 })
 
@@ -450,8 +452,265 @@ test('таймлайн попыток: пустой ответ и попытка
   assert.equal(shapeAttempts(null).count, 0)
   const one = shapeAttempts({ attempts: [{ run_id: 1, status: 'running', duration_sec: null, events: [] }] })
   assert.equal(one.attempts[0].durationText, '—')
-  assert.equal(one.attempts[0].barPct, 2)
   assert.equal(one.attempts[0].outcomeTone, 'green')
+  // Номеров процесса нет — подписи пустые, а не «шагов 0»: ноль шагов никто не мерил.
+  assert.equal(one.attempts[0].progressText, '')
+  assert.equal(one.attempts[0].toolsText, '')
+})
+
+/* ------------------------------- шкала времени дела (E2) ----------------- */
+
+// Ось в 500 с: `created` в 1000, два перекрывающихся этапа (impl 1060–1180,
+// verify 1120–1240), живая попытка impl с 1250, нулевая попытка verify в 1240,
+// вопрос человеку с ответом и вопрос без ответа. `now` = 1500 — дело не закрыто,
+// поэтому ось тянется до него, а не до последнего события.
+const TIME_DETAIL = {
+  now: 1500,
+  status: 'running',
+  terminal: false,
+  timeline: [
+    { kind: 'created', at: 1000, summary: 'ready' },
+    { kind: 'attempt_started', at: 1060, summary: '{"run_id": "impl#1", "stage": "impl", "attempt": 1}' },
+    { kind: 'attempt_started', at: 1120, summary: '{"run_id": "verify#1", "stage": "verify", "attempt": 1}' },
+    { kind: 'attempt_ended', at: 1180, summary: 'impl: готово' },
+    { kind: 'question_asked', at: 1200, summary: '{"question_id": 7}' },
+    { kind: 'attempt_ended', at: 1240, summary: 'verify: упало' },
+    { kind: 'question_answered', at: 1300, summary: '{"question_id": 7, "answer_len": 4}' },
+    { kind: 'published', at: 1320, summary: '{"sha": "f750c7850a706b089ff3ea783c86cc9f8d0a791a"}' },
+    { kind: 'question_asked', at: 1340, summary: '{"question_id": 8}' },
+  ],
+  budget: { tokens: { spent: 1500, limit: 6000 }, minutes: null, text: 'токенов 1 500 / 6 000', attempts: 3, exhausted: null },
+  published: { sha: 'f750c7850a706b089ff3ea783c86cc9f8d0a791a', branch: 'release/pub', verified_by: 'git ls-remote' },
+  closed: null,
+}
+
+const TIME_ATTEMPTS = {
+  crash_outcomes: ['crashed', 'gave_up'],
+  attempts: [
+    { run_id: 'impl#1', stage: 'impl', attempt: 1, status: 'completed', start: 1060, end: 1180, duration_sec: 120, outcome: 'done', progress: 12, tools: 7 },
+    { run_id: 'verify#1', stage: 'verify', attempt: 1, status: 'failed', start: 1120, end: 1240, duration_sec: 120, outcome: 'crashed' },
+    { run_id: 'impl#2', stage: 'impl', attempt: 2, status: 'running', start: 1250, end: null, duration_sec: null, outcome: null, lease: 'live' },
+    { run_id: 'verify#2', stage: 'verify', attempt: 2, status: 'completed', start: 1240, end: 1240, duration_sec: 0, outcome: 'done' },
+  ],
+}
+
+test('шкала времени: смещение полосы — от начала оси, а не от нуля', () => {
+  const scale = shapeDealTime(TIME_DETAIL, TIME_ATTEMPTS)
+  // ось: начало — первое событие, конец — `now` живого дела
+  assert.equal(scale.axis.start, 1000)
+  assert.equal(scale.axis.end, 1500)
+  assert.equal(scale.axis.spanSec, 500)
+  assert.deepEqual(
+    scale.axis.ticks.map((tick) => tick.pct),
+    [0, 50, 100],
+  )
+  // offsets — проценты от общей оси дела, а не от собственной длительности
+  assert.deepEqual(
+    scale.bars.map((bar) => [bar.leftPct, bar.widthPct]),
+    [
+      [12, 24],
+      [24, 24],
+      [50, 50],
+      [48, 2],
+    ],
+  )
+  // нулевая длительность не исчезает: минимальная ширина и подпись `<1с`
+  assert.equal(scale.bars[3].durationSec, 0)
+  assert.equal(scale.bars[3].durationText, '<1с')
+  // живая попытка тянется до `now` и называется по лизингу
+  assert.equal(scale.bars[2].open, true)
+  assert.equal(scale.bars[2].endAt, 1500)
+  assert.equal(scale.bars[2].leaseText, 'жив')
+  assert.equal(scale.bars[2].durationText, 'идёт')
+  assert.equal(scale.bars[2].tone, 'blue')
+  // подписи с абсолютным временем — у каждой полосы
+  assert.match(scale.bars[0].title, /impl · попытка #1 · \d\d:\d\d:\d\d–\d\d:\d\d:\d\d \(2 мин\)/)
+  assert.equal(scale.bars[0].ariaLabel, scale.bars[0].title)
+})
+
+test('шкала времени: перекрывающиеся этапы — на разных дорожках, дорожек по числу этапов', () => {
+  const scale = shapeDealTime(TIME_DETAIL, TIME_ATTEMPTS)
+  assert.deepEqual(
+    scale.lanes.map((lane) => [lane.key, lane.count]),
+    [
+      ['impl', 2],
+      ['verify', 2],
+    ],
+  )
+  assert.deepEqual(
+    scale.bars.map((bar) => bar.lane),
+    [0, 1, 0, 1],
+  )
+  // перекрытие видно глазом: impl идёт 1060–1180, verify — 1120–1240 на своей дорожке
+  assert.ok(scale.bars[1].leftPct < scale.bars[0].endPct, 'второй этап должен начинаться до конца первого')
+  assert.equal(scale.facts.attempts.total, 4)
+  assert.equal(scale.facts.attempts.text, 'impl 2 · verify 2')
+  assert.equal(scale.facts.attempts.journal, false)
+})
+
+test('шкала времени: маркеры — только факты журнала, вопрос без ответа ждёт «сейчас»', () => {
+  const scale = shapeDealTime(TIME_DETAIL, TIME_ATTEMPTS)
+  assert.equal(scale.markers.length, 8)
+  assert.deepEqual(
+    scale.markers.filter((marker) => !marker.tick).map((marker) => marker.type),
+    ['question', 'answer', 'published', 'question'],
+  )
+  assert.deepEqual(
+    scale.markers.filter((marker) => marker.tick).map((marker) => marker.type),
+    ['started', 'started', 'ended', 'ended'],
+  )
+  const waiting = scale.markers.filter((marker) => marker.waitText)
+  assert.equal(waiting.length, 1)
+  assert.equal(waiting[0].type, 'question')
+  assert.equal(waiting[0].waitText, 'ждёт ответа')
+  assert.equal(waiting[0].pct, 68)
+  assert.equal(waiting[0].waitPct, 32)
+  // тултип — `summary` события, а не придуманная фраза
+  assert.match(scale.markers[3].title, /вопрос человеку — \{"question_id": 7\}/)
+  assert.equal(scale.counts.markers, 8)
+  assert.equal(scale.counts.lanes, 2)
+})
+
+test('шкала времени: событие без маркера — не маркер (телеметрия попытки не считается)', () => {
+  const quiet = shapeDealTime(
+    { now: 2000, terminal: true, timeline: [{ kind: 'attempt_progress', at: 1500, summary: 'tool_use' }] },
+    { attempts: [] },
+  )
+  assert.equal(quiet.markers.length, 0)
+  // ось есть — по ней видно, что дело закрыто и событие одно
+  assert.equal(quiet.axis.start, 1500)
+})
+
+test('шкала времени: пустой timeline и пустые попытки не роняют модель', () => {
+  const none = shapeDealTime({ now: 1000, terminal: true, timeline: [], budget: null, published: null }, null)
+  assert.equal(none.empty, true)
+  assert.equal(none.axis.start, null)
+  assert.deepEqual(none.axis.ticks, [])
+  assert.equal(none.facts.duration.text, '—')
+  assert.equal(none.facts.questions.text, '0 вопросов')
+  assert.equal(none.facts.attempts.total, 0)
+  assert.equal(none.facts.budget, null)
+  assert.equal(none.facts.published, null)
+  assert.deepEqual(none.counts, { bars: 0, lanes: 0, markers: 0 })
+  assert.equal(shapeDealTime(null, null).empty, true)
+})
+
+test('шкала времени: закрытие и публикация — из журнала, если сервер не отдал поля', () => {
+  // Сервер старше 0.0.5 не отдаёт `published`/`closed`/`terminal` — те же факты
+  // лежат событиями журнала, и экран не имеет права показывать «—» там, где
+  // движок уже всё записал.
+  const scale = shapeDealTime(
+    {
+      now: 9999,
+      timeline: [
+        ...TIME_DETAIL.timeline,
+        { kind: 'completed', at: 1400, summary: '{"cause": "all_stages_done", "stages": ["impl", "verify"]}' },
+      ],
+    },
+    { attempts: [] },
+  )
+  assert.equal(scale.live, false)
+  assert.equal(scale.axis.end, 1400)
+  assert.equal(scale.facts.closed.text, `закрыто ${scale.facts.closed.clock}: all_stages_done`)
+  assert.equal(scale.facts.published.shaShort, 'f750c785')
+  assert.equal(scale.facts.published.text, 'f750c785')
+  assert.deepEqual(
+    scale.markers.map((marker) => marker.type).slice(-1),
+    ['closed'],
+  )
+})
+
+test('шкала времени: закрытое дело не тянет ось до «сейчас»', () => {
+  const closed = shapeDealTime(
+    { ...TIME_DETAIL, now: 9999, terminal: true, closed: { at: 1330, cause: 'all_stages_done' } },
+    { ...TIME_ATTEMPTS, attempts: TIME_ATTEMPTS.attempts.slice(0, 2) },
+  )
+  assert.equal(closed.live, false)
+  assert.equal(closed.axis.end, 1340)
+  assert.equal(closed.facts.duration.live, false)
+  assert.equal(closed.facts.closed.text, `закрыто ${closed.facts.closed.clock}: all_stages_done`)
+  // бюджет и публикация — блоками ответа, без своего пересчёта
+  assert.equal(closed.facts.budget.text, 'токенов 1 500 / 6 000 (25%)')
+  assert.equal(closed.facts.published.text, 'f750c785 · release/pub · git ls-remote')
+})
+
+test('шкала времени: дорожка на каждый этап графа — в том числе неначатый', () => {
+  const scale = shapeDealTime(
+    { ...TIME_DETAIL, stages: [{ id: 'impl' }, { id: 'verify' }, { id: 'gate' }] },
+    TIME_ATTEMPTS,
+  )
+  // дорожек столько же, сколько этапов: `gate` не начинался — дорожка пустая
+  assert.deepEqual(
+    scale.lanes.map((lane) => [lane.key, lane.count]),
+    [
+      ['impl', 2],
+      ['verify', 2],
+      ['gate', 0],
+    ],
+  )
+  // в шапке — только этапы с попытками: «gate 0» читалось бы как сломанный этап
+  assert.equal(scale.facts.attempts.text, 'impl 2 · verify 2')
+  assert.deepEqual(
+    scale.bars.map((bar) => bar.lane),
+    [0, 1, 0, 1],
+  )
+})
+
+test('шкала времени: числа шапки — из timeline (попытки, вопросы, длительность)', () => {
+  const scale = shapeDealTime(TIME_DETAIL, TIME_ATTEMPTS)
+  assert.equal(scale.facts.duration.sec, 500)
+  assert.equal(scale.facts.duration.text, '8 мин')
+  assert.equal(scale.facts.duration.live, true)
+  assert.deepEqual(scale.facts.questions, {
+    asked: 2,
+    answered: 1,
+    waiting: 1,
+    text: '2 вопроса · 1 ждёт ответа',
+  })
+})
+
+test('шкала времени: пустой ответ попыток — полосы из пар журнала, без выдумки', () => {
+  const scale = shapeDealTime(TIME_DETAIL, { attempts: [], crash_outcomes: [] })
+  assert.equal(scale.facts.attempts.journal, true)
+  assert.deepEqual(
+    scale.bars.map((bar) => [bar.stage, bar.leftPct, bar.widthPct]),
+    [
+      ['impl', 12, 24],
+      ['verify', 24, 24],
+    ],
+  )
+  // гейт и отказ по бюджету пишутся без `attempt_started` — полосой они не становятся
+  const gate = shapeDealTime(
+    {
+      now: 1200,
+      terminal: true,
+      timeline: [
+        { kind: 'attempt_started', at: 1000, summary: '{"run_id": "review#1", "stage": "review"}' },
+        { kind: 'attempt_ended', at: 1100, summary: 'гейт: ответ «публиковать» входит в allow [публиковать]' },
+        { kind: 'attempt_ended', at: 1150, summary: 'бюджет дела исчерпан: 1000/1000 токенов' },
+      ],
+    },
+    { attempts: [] },
+  )
+  assert.equal(gate.bars.length, 1)
+  assert.deepEqual(
+    gate.markers.map((marker) => marker.type),
+    ['started', 'verdict', 'budget'],
+  )
+  // Исход пары берётся из выжимки `attempt_ended`, а не выдумывается по цвету
+  const ended = shapeDealTime(
+    {
+      now: 1200,
+      terminal: true,
+      timeline: [
+        { kind: 'attempt_started', at: 1000, summary: '{"run_id": "impl#1", "stage": "impl", "attempt": 1}' },
+        { kind: 'attempt_ended', at: 1100, summary: '{"run_id": "impl#1", "outcome": "done", "kind": null}' },
+      ],
+    },
+    { attempts: [], crash_outcomes: ['crashed'] },
+  )
+  assert.equal(ended.bars[0].outcome, 'done')
+  assert.equal(ended.bars[0].tone, 'green')
 })
 
 /* ------------------------------------- лента этапов дела (W6) ------------- */

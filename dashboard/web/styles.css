@@ -452,8 +452,89 @@ pre.body {
 .att-h { display: flex; align-items: center; gap: 8px; font-size: 12.5px; flex-wrap: wrap; }
 .att-h .sp { margin-left: auto; }
 
-.track { height: 6px; border-radius: 999px; background: var(--bg-hover); overflow: hidden; margin: 7px 0; }
-.bar { height: 100%; border-radius: 999px; background: currentColor; }
+.att-facts { margin-top: 4px; font-size: 11.5px; }
+
+/* ---------- шкала времени дела (E2) ----------
+   Одна ось на всё дело: полосы попыток ставятся по `start` и тянутся на
+   длительность, каждый этап — своей дорожкой, поэтому перекрытие видно глазом.
+   Цвета — только переменные палитры (`--ok/--warn/--danger/--accent/...`), чтобы
+   шкала читалась и в тёмной, и в светлой теме. */
+.scale-axis { position: relative; height: 15px; margin: 0 0 6px; }
+.scale-tick { position: absolute; font-size: 11px; color: var(--text-3); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.scale-tick.align-start { transform: translateX(0); }
+.scale-tick.align-center { transform: translateX(-50%); }
+.scale-tick.align-end { transform: translateX(-100%); }
+
+.scale-lanes { display: flex; flex-direction: column; gap: 5px; }
+.scale-lane { display: grid; grid-template-columns: 92px 1fr; gap: 8px; align-items: center; }
+.scale-lane-k {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Дорожка этапа без попыток — пустая: точка-многоточие отличает её от этапа, где попытка просто шла вне окна. */
+.scale-lane-none { color: var(--text-3); font-style: normal; }
+
+.scale-track { position: relative; height: 20px; border-radius: 5px; background: var(--bg-soft); overflow: hidden; }
+.scale-bar {
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  border-radius: 4px;
+  border: 1px solid currentColor;
+  background: color-mix(in srgb, currentColor 22%, transparent);
+  color: var(--text-3);
+}
+.scale-bar:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* Незакрытая попытка: полоса тянется до «сейчас» пунктиром — конца нет. */
+.scale-bar.open { background: transparent; border-style: dashed; }
+.scale-bar-k { font-size: 10.5px; color: var(--text); padding: 0 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.scale-markers { position: relative; height: 42px; margin-top: 10px; border-top: 1px solid var(--border); }
+.scale-marker { position: absolute; display: flex; flex-direction: column; align-items: center; transform: translateX(-50%); }
+.scale-marker-dot {
+  display: grid;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1px solid currentColor;
+  background: var(--card);
+  font-size: 9.5px;
+  line-height: 1;
+  color: inherit;
+}
+.scale-marker.tick .scale-marker-dot { width: 1px; height: 12px; border: 0; border-radius: 0; background: currentColor; background-clip: padding-box; }
+.scale-marker:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Вопрос без ответа: интервал до «сейчас» подписью, а не догадкой о решении. */
+.scale-wait {
+  position: absolute;
+  bottom: 0;
+  height: 0;
+  border-top: 2px dashed currentColor;
+  transform: translateY(-4px);
+}
+.scale-wait-k {
+  position: absolute;
+  left: 4px;
+  top: -14px;
+  font-size: 10.5px;
+  white-space: nowrap;
+  color: inherit;
+}
+
+.scale-legend { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; font-size: 11.5px; }
+.scale-legend .muted { color: var(--text-3); }
+
+/* Относительной полосы попытки больше нет: длительность видна на общей оси дела
+   (`.scale-*`), и второй шкалы «доля от самой долгой» на экране не осталось. */
 
 .att-summary { font-size: 12.5px; color: var(--text-2); }
 .att-error {

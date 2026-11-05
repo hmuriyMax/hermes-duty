@@ -1661,6 +1661,242 @@ def test_base_of_stage_reports_an_unresolvable_predecessor_commit(tmp_path: Path
     assert "не резолвится" in str(caught.value)
 
 
+# ------------------------------------------------------------- shell-этап
+
+
+def shell_spec(tmp_path: Path, cmd: str, *, extra: str = "", needs: str = "") -> Any:
+    """Спека с этапом-командой: `cmd` в `check`, дерева нет (workspace: none)."""
+    return write_spec(
+        tmp_path,
+        f"""
+        duty: probe
+        stages:
+          - id: check
+            kind: shell
+            cmd: {json.dumps(cmd)}
+        {textwrap.indent(textwrap.dedent(needs), "    ") if needs else ""}
+        {textwrap.indent(textwrap.dedent(extra), "    ") if extra else ""}
+        """,
+    )
+
+
+def run_shell(conn, spec, deal, home, **kwargs):
+    """Один шаг shell-этапа: настоящий процесс, неподвижные часы."""
+    kwargs.setdefault("clock", lambda: NOW)
+    return runner.run_stage(conn, spec, deal, "check", 1, home=home, **kwargs)
+
+
+def test_shell_stage_runs_command_and_ends_done(tmp_path: Path) -> None:
+    """Команда дошла до конца с кодом `must` — попытка `done`, и это видно в журнале.
+
+    Проверяется ровно то, что записалось: исход, `source: shell` у обоих событий,
+    `exit_code`, `duration_sec`, команда и хвосты вывода. Файл полного лога —
+    тоже факт: журнал хранит хвост, а разбирать отказ человек будет по файлу.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = shell_spec(tmp_path, "echo hello; echo oops >&2")
+    report = run_shell(conn, spec, deal, home)
+
+    assert report["started"] is True
+    assert (report["outcome"], report["kind"]) == (runner.OUTCOME_DONE, None)
+    started = only(conn, deal, "attempt_started")
+    ended = only(conn, deal, "attempt_ended")
+    assert (started["source"], ended["source"]) == (runner.SHELL_SOURCE, runner.SHELL_SOURCE)
+    assert started["payload"]["stage_kind"] == "shell"
+    assert started["payload"]["cmd"] == ["/bin/sh", "-c", "echo hello; echo oops >&2"]
+    assert started["payload"]["shell_cmd"] == "echo hello; echo oops >&2"
+    details = ended["payload"]["details"]
+    assert details["cmd"] == "echo hello; echo oops >&2"
+    assert details["exit_code"] == 0
+    assert details["duration_sec"] >= 0
+    assert details["stdout_tail"] == ["hello"]
+    assert details["stderr_tail"] == ["oops"]
+    assert Path(details["stdout_path"]).read_text(encoding="utf-8") == "hello\n"
+    assert Path(details["stderr_path"]).read_text(encoding="utf-8") == "oops\n"
+    assert ended["payload"]["result"]["summary"].startswith("shell: echo hello")
+
+
+def test_shell_nonzero_exit_is_contract(tmp_path: Path) -> None:
+    """Код 1 при `must: 0` — класс `contract` с причиной «код 1, ждали 0» и хвостом stderr.
+
+    Это договор shell-этапа: процесс дошёл до конца и сказал «нет», поэтому вина
+    на контракте команды, а не на инфраструктуре. Тот же тест — красная проба:
+    если убрать сверку с `must`, он падает («код 1 при must 0 даёт contract»).
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = shell_spec(tmp_path, "echo boom >&2; exit 1")
+    report = run_shell(conn, spec, deal, home)
+
+    assert (report["outcome"], report["kind"]) == (runner.OUTCOME_FAILED, runner.FAIL_CONTRACT)
+    assert report["reason"] == "код 1, ждали 0"
+    ended = only(conn, deal, "attempt_ended")
+    payload = ended["payload"]
+    assert payload["reason"] == "код 1, ждали 0"
+    assert payload["details"]["exit_code"] == 1
+    assert payload["details"]["stderr_tail"] == ["boom"]
+    assert "result" not in payload
+
+
+def test_shell_result_json_does_not_decide_the_outcome(tmp_path: Path) -> None:
+    """Договор — код выхода, а не `result.json`: даже «done» в файле не спасает `exit 1`."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = shell_spec(tmp_path, 'mkdir -p .duty && echo \'{"status": "done"}\' > .duty/result.json; exit 2')
+    report = run_shell(conn, spec, deal, home)
+    assert (report["outcome"], report["kind"]) == (runner.OUTCOME_FAILED, runner.FAIL_CONTRACT)
+    assert report["reason"] == "код 2, ждали 0"
+
+
+def test_shell_must_accepts_its_own_code(tmp_path: Path) -> None:
+    """`must: 1` — команда, для которой «нашлось расхождение» и есть успех."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = shell_spec(tmp_path, "exit 1", extra="    must: 1\n")
+    report = run_shell(conn, spec, deal, home)
+    assert (report["outcome"], report["kind"]) == (runner.OUTCOME_DONE, None)
+    assert only(conn, deal, "attempt_ended")["payload"]["details"]["exit_code"] == 1
+
+
+def test_shell_artifacts_are_checked_by_evidence_gate(tmp_path: Path) -> None:
+    """Объявленные артефакты проверяет тот же гейт: файл есть, sha256 — по содержимому."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = shell_spec(
+        tmp_path, "printf 'ok' > report.txt", extra="    artifacts: [report.txt]\n"
+    )
+    report = run_shell(conn, spec, deal, home)
+
+    assert (report["outcome"], report["kind"]) == (runner.OUTCOME_DONE, None)
+    payload = only(conn, deal, "attempt_ended")["payload"]
+    assert payload["details"]["verdict"]["ok"] is True
+    artifacts = payload["result"]["artifacts"]
+    assert [item["path"] for item in artifacts] == ["report.txt"]
+    assert artifacts[0]["sha256"] == hashlib.sha256(b"ok").hexdigest()
+
+
+def test_shell_missing_artifact_is_contract(tmp_path: Path) -> None:
+    """Объявленного файла нет — отказ гейта `artifact.missing`, а не `done`."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = shell_spec(tmp_path, "true", extra="    artifacts: [report.txt]\n")
+    report = run_shell(conn, spec, deal, home)
+
+    assert (report["outcome"], report["kind"]) == (runner.OUTCOME_FAILED, runner.FAIL_CONTRACT)
+    assert "artifact.missing" in report["reason"]
+    payload = only(conn, deal, "attempt_ended")["payload"]
+    assert payload["details"]["verdict"]["ok"] is False
+
+
+def test_shell_absolute_artifact_path_is_refused(tmp_path: Path) -> None:
+    """Абсолютный путь — вне дерева этапа: отказ `artifact.path`, даже если файл есть."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("чужое\n", encoding="utf-8")
+    spec = shell_spec(tmp_path, "true", extra=f"    artifacts: [{outside}]\n")
+    report = run_shell(conn, spec, deal, home)
+    assert (report["outcome"], report["kind"]) == (runner.OUTCOME_FAILED, runner.FAIL_CONTRACT)
+    assert "artifact.path" in report["reason"]
+
+
+def test_classify_shell_timeout_and_signal_are_infra() -> None:
+    """«Команда не дожила» — `infra`, как у агента: таймаут и смерть по сигналу."""
+    assert runner.classify_shell(exit_code=None, timed_out=True, must=0, timeout_sec=30) == (
+        runner.OUTCOME_FAILED,
+        runner.FAIL_INFRA,
+        "команда не дожила: таймаут этапа 30 с",
+    )
+    assert runner.classify_shell(exit_code=-15, timed_out=False, must=0, timeout_sec=30) == (
+        runner.OUTCOME_FAILED,
+        runner.FAIL_INFRA,
+        "команда не дожила: сигнал 15",
+    )
+    assert runner.classify_shell(exit_code=None, timed_out=False, must=0, timeout_sec=30)[1] == runner.FAIL_INFRA
+
+
+def test_follow_shell_stops_the_command_at_the_deadline(tmp_path: Path) -> None:
+    """Таймаут этапа — наш факт: команда, которая не уложилась, гасится, а не ждётся."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    stage = write_spec(
+        tmp_path,
+        """
+        duty: probe
+        stages:
+          - id: check
+            kind: shell
+            cmd: "sleep 30"
+            budget: {minutes: 1}
+        """,
+    ).stage("check")
+    workdir = tmp_path / "attempt"
+    workdir.mkdir()
+    process = runner.spawn_process(["/bin/sh", "-c", "sleep 30"], workdir, None, logs=workdir)
+    began = time.monotonic()
+    followed = runner.follow_shell(
+        conn,
+        process,
+        deal=deal,
+        stage=stage,
+        attempt=1,
+        ttl=60,
+        deadline=began + 0.3,
+        monotonic=time.monotonic,
+        clock=lambda: NOW,
+    )
+    process.close_logs()
+    assert followed.timed_out is True
+    assert time.monotonic() - began < 10
+    assert process.exit_code is not None
+
+
+def test_shell_env_drops_role_and_tokens(tmp_path: Path) -> None:
+    """Окружение команды — как у попытки, но без роли и токенов: права этап не просил."""
+    env = runner.shell_env(
+        {"PATH": "/bin", "HERMES_HOME": "/h", "HERMES_PROFILE": "publisher", "GITLAB_TOKEN": "t", "LANG": "ru"}
+    )
+    assert env == {"PATH": "/bin", "HERMES_HOME": "/h", "LANG": "ru"}
+
+
+def test_shell_stage_in_worktree_keeps_tree_and_commit(tmp_path: Path) -> None:
+    """Дерево этапа работает как раньше: команда бежит в нём, работа фиксируется коммитом."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    repo = git_repo(tmp_path)
+    spec = write_spec(
+        tmp_path,
+        f"""
+        duty: probe
+        repo: {repo}
+        base: HEAD
+        stages:
+          - id: check
+            kind: shell
+            workspace: worktree
+            cmd: "printf 'report' > report.txt"
+        """,
+    )
+    report = run_shell(conn, spec, deal, home)
+
+    assert (report["outcome"], report["kind"]) == (runner.OUTCOME_DONE, None)
+    tree = Path(str(report["tree"]))
+    assert (tree / "report.txt").read_text(encoding="utf-8") == "report"
+    payload = only(conn, deal, "attempt_ended")["payload"]
+    assert payload["commit"], "принятая работа зафиксирована коммитом в дереве попытки"
+    assert tree.exists(), "успешная попытка дерево оставляет"
+
+
 # ---------------------------------------------------------------- живой прогон
 
 

@@ -837,7 +837,12 @@ def _attempt_head(attempt: dict[str, Any]) -> str:
     run_ref = str(attempt.get("run_id") or "")
     if run_ref and run_ref != stage_ref:
         bits.append(f"#{run_ref}")
-    bits.append(str(attempt.get("profile") or "—"))
+    # Кто исполнил попытку: профиль роли или команда этапа (`kind: shell`). Пустой
+    # профиль у попытки — не «неизвестно», а «этап исполняла команда».
+    performer = str(attempt.get("profile") or "")
+    if not performer and str(attempt.get("stage_kind") or "") == "shell":
+        performer = "shell"
+    bits.append(performer or "—")
     verdict = str(attempt.get("outcome") or attempt.get("status") or "—")
     if attempt.get("kind"):
         verdict = f"{verdict}({attempt.get('kind')})"
@@ -881,6 +886,10 @@ def render_attempts(payload: dict[str, Any]) -> str:
             lines.append(f"  {' · '.join(refs)}")
         if attempt.get("pid"):
             lines.append(f"  pid {attempt.get('pid')}")
+        if attempt.get("exit") is not None:
+            # Код возврата — договор shell-этапа: без него «failed(contract)»
+            # читается как «что-то не так», а не «код 1, ждали 0».
+            lines.append(f"  код {attempt.get('exit')}")
         if attempt.get("summary"):
             lines.append(f"  итог: {attempt.get('summary')}")
         if attempt.get("reason"):
@@ -1239,6 +1248,11 @@ def spec_report(path: str) -> dict[str, Any]:
         {"id": stage.id, "workspace": stage.workspace, "default": stage.workspace_default}
         for stage in spec.stages
     ]
+    # Вид этапа печатается только там, где он не умолчание (`kind: shell`):
+    # иначе строка повторяла бы «agent» столько раз, сколько этапов.
+    payload["kinds"] = [
+        {"id": stage.id, "kind": stage.kind} for stage in spec.stages if stage.kind != module.DEFAULT_STAGE_KIND
+    ]
     payload["issues"] = [_issue_dict(issue) for issue in issues]
     payload["errors"] = len(module.errors(issues))
     payload["warnings"] = len(issues) - payload["errors"]
@@ -1262,14 +1276,19 @@ def render_spec_check(payload: dict[str, Any]) -> str:
         f"{item['id']}={item['workspace']}" + (" (по умолчанию)" if item.get("default") else "")
         for item in payload.get("workspaces") or []
     )
+    # Вид этапа называется, только если он не умолчание: `kind: shell` — это
+    # этап-команда, и человек должен видеть, что команда запустится движком.
+    kinds = " · ".join(f"{item['id']}={item['kind']}" for item in payload.get("kinds") or [])
     if payload.get("ok"):
         head = f"OK {payload['path']} · дело {payload['duty']} · этапов {payload['stages']}"
-        return "\n".join([head] + lines + ([f"workspace: {trees}"] if trees else []))
+        extra = ([f"workspace: {trees}"] if trees else []) + ([f"kind: {kinds}"] if kinds else [])
+        return "\n".join([head] + lines + extra)
     if payload.get("unreadable"):
         return "\n".join(lines + [f"ОТКАЗ · спека не читается: {payload['path']}"])
     return "\n".join(
         lines
         + ([f"workspace: {trees}"] if trees else [])
+        + ([f"kind: {kinds}"] if kinds else [])
         + [f"ОТКАЗ · ошибок {payload['errors']}, предупреждений {payload['warnings']}"]
     )
 

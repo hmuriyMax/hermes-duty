@@ -44,6 +44,7 @@ import yaml
 TOP_KEYS = ("duty", "repo", "base", "stages")
 STAGE_KEYS = (
     "id",
+    "kind",
     "role",
     "workspace",
     "needs",
@@ -53,6 +54,9 @@ STAGE_KEYS = (
     "budget",
     "ask",
     "verdict",
+    "cmd",
+    "must",
+    "artifacts",
 )
 EVIDENCE_KEYS = ("cmd", "must", "timeout_sec")
 RETRY_KEYS = ("max", "on")
@@ -62,6 +66,15 @@ VERDICT_KEYS = ("approve", "changes", "max_rounds")
 
 WORKSPACES = ("worktree", "dir", "none")
 TO_HUMAN = ("decisions_only", "never")
+
+# Виды этапа (спека P2, `docs/SPEC.md`): `agent` — процесс профиля роли,
+# `shell` — команда с кодом возврата вместо отчёта. Умолчание — `agent`:
+# спеки 0.0.4 объявляют этапы без `kind` и обязаны читаться без правок.
+STAGE_KINDS = ("agent", "shell")
+DEFAULT_STAGE_KIND = "agent"
+
+# Код возврата shell-этапа по умолчанию: «команда сходилась» — это 0.
+DEFAULT_SHELL_MUST = 0
 
 # Роли, которые действуют вовне: публикуют, мержат, деплоят. Набор — имена
 # профилей Hermes, которые заводят под эти права (`publisher`; `deployer`, если
@@ -192,10 +205,17 @@ class Verdict:
 
 @dataclass(frozen=True)
 class Stage:
-    """Этап дела. `workspace: none` — этап только читает и выносит приговор."""
+    """Этап дела. `workspace: none` — этап только читает и выносит приговор.
+
+    `kind` решает, кто исполняет этап: `agent` — процесс профиля `role`,
+    `shell` — команда `cmd` с обязательным кодом возврата `must` и, если
+    объявлены, артефактами `artifacts`. Поля команды у `agent` не значат ничего
+    и потому отказывают (`_check_kind`), а не игнорируются.
+    """
 
     id: str
     role: str
+    kind: str = DEFAULT_STAGE_KIND
     # Умолчание зависит от `needs` (см. `_parse_stage`): этап с предшественником
     # получает дерево, вход — нет. `workspace_default` помнит, что значения в
     # спеке не было: отказ и `spec check` обязаны называть умолчание умолчанием.
@@ -208,6 +228,10 @@ class Stage:
     budget: Optional[Budget] = None
     ask: Optional[Ask] = None
     verdict: Optional[Verdict] = None
+    # shell-этап: команда, её обязательный код возврата и то, что она предъявляет.
+    cmd: str = ""
+    must: int = DEFAULT_SHELL_MUST
+    artifacts: tuple[str, ...] = ()
     line: int = 0
     lines: dict[str, int] = field(default_factory=dict)
 
@@ -549,6 +573,43 @@ def _parse_stage(
     if not isinstance(stage_id, str) or not stage_id.strip():
         raise SpecError(path, line, "stage.id", f"у этапа №{index + 1} нет id — на него ссылаются needs")
     role = mapping.get("role")
+    kind = mapping.get("kind", DEFAULT_STAGE_KIND)
+    if not isinstance(kind, str) or kind not in STAGE_KINDS:
+        issues.append(
+            Issue(
+                path,
+                lines.get(prefix + ("kind",), line),
+                "kind",
+                f"kind={kind!r}: допустимо {', '.join(STAGE_KINDS)}",
+            )
+        )
+        kind = DEFAULT_STAGE_KIND
+    cmd = mapping.get("cmd", "")
+    if not isinstance(cmd, str):
+        issues.append(Issue(path, lines.get(prefix + ("cmd",), line), "kind.cmd", "cmd — строка команды"))
+        cmd = ""
+    must = _int_or_none(mapping.get("must", DEFAULT_SHELL_MUST))
+    if must is None:
+        issues.append(
+            Issue(
+                path,
+                lines.get(prefix + ("must",), line),
+                "kind.must",
+                f"must={mapping.get('must')!r}: обязательный код возврата — целое число",
+            )
+        )
+        must = DEFAULT_SHELL_MUST
+    artifacts = _str_tuple(mapping.get("artifacts", []))
+    if artifacts is None:
+        issues.append(
+            Issue(
+                path,
+                lines.get(prefix + ("artifacts",), line),
+                "kind.artifacts",
+                "artifacts — список путей (строк), проверяемых после команды",
+            )
+        )
+        artifacts = ()
     needs = _str_tuple(mapping.get("needs", []))
     parallel = _str_tuple(mapping.get("parallel_with", []))
     if needs is None:
@@ -579,6 +640,7 @@ def _parse_stage(
     return Stage(
         id=stage_id,
         role=role if isinstance(role, str) else "",
+        kind=kind,
         workspace=workspace,
         workspace_default=workspace_default,
         needs=needs,
@@ -588,6 +650,9 @@ def _parse_stage(
         budget=_parse_budget(mapping, path, lines, prefix, issues),
         ask=_parse_ask(mapping, path, lines, prefix, issues),
         verdict=_parse_verdict(mapping, path, lines, prefix, issues),
+        cmd=cmd,
+        must=must,
+        artifacts=artifacts,
         line=line,
         lines=_lines_of(lines, prefix),
     )
@@ -732,6 +797,10 @@ def known_profiles(root: Optional[Path] = None) -> frozenset[str]:
 def _check_roles(spec: Spec, profiles: frozenset[str]) -> list[Issue]:
     issues: list[Issue] = []
     for stage in spec.stages:
+        if stage.kind != DEFAULT_STAGE_KIND:
+            # У этапа-команды роли нет: кто её исполняет — это `cmd`, и роль
+            # здесь отказывает (`_check_kind`), а не ищется среди профилей.
+            continue
         if stage.role not in profiles:
             issues.append(
                 Issue(
@@ -903,6 +972,16 @@ def _check_reachable(spec: Spec) -> list[Issue]:
     ]
 
 
+def _forbidden_hit(cmd: str) -> Optional[str]:
+    """Публикующий или разрушающий префикс команды; `None` — команда допустима.
+
+    Одно место на `evidence.cmd`, `kind: shell cmd` и валидатор: «действие, а не
+    доказательство» — одно правило, и второе его написание разошлось бы с первым.
+    """
+    lowered = " ".join(str(cmd or "").lower().split())
+    return next((prefix for prefix in FORBIDDEN_CMD_PREFIXES if lowered.startswith(prefix)), None)
+
+
 def _check_evidence(spec: Spec) -> list[Issue]:
     """Доказательство — команда с кодом возврата, а не действие и не пустая строка."""
     issues: list[Issue] = []
@@ -913,8 +992,7 @@ def _check_evidence(spec: Spec) -> list[Issue]:
             if not cmd:
                 issues.append(Issue(spec.path, line, "evidence.cmd", f"у доказательства №{index + 1} пустой cmd"))
                 continue
-            lowered = " ".join(cmd.lower().split())
-            hit = next((prefix for prefix in FORBIDDEN_CMD_PREFIXES if lowered.startswith(prefix)), None)
+            hit = _forbidden_hit(cmd)
             if hit is not None:
                 issues.append(
                     Issue(
@@ -1235,6 +1313,111 @@ def _check_retry(spec: Spec) -> list[Issue]:
     return issues
 
 
+def _check_kind(spec: Spec) -> list[Issue]:
+    """Вид этапа: `agent` исполняет профиль, `shell` — команда, и вместе они не живут.
+
+    Отказ, а не тихий игнор. `role` у команды означал бы процесс профиля, которого
+    никто не поднимает; `ask` — что этап задаст вопрос человеку, а он не умеет
+    (вопрос — это отчёт агента); `verdict` — приговор, которого некому вынести;
+    `retry` обещал бы повтор класса отказа, а у команды повтор выражается кодом
+    возврата `must`, а не классом. Поля команды у `agent` отказывают по той же
+    причине: объявленное и не прочитанное — это ложь спеки, а не запас на будущее.
+    """
+    issues: list[Issue] = []
+    for stage in spec.stages:
+        if stage.kind == "shell":
+            issues += _check_shell_kind(spec, stage)
+            continue
+        for key in ("cmd", "must", "artifacts"):
+            if key not in stage.lines:
+                continue
+            issues.append(
+                Issue(
+                    spec.path,
+                    stage.line_of(key),
+                    f"kind.{key}",
+                    f"{key} у этапа {stage.id!r} с kind: {DEFAULT_STAGE_KIND}: "
+                    f"команду исполняет этап kind: shell, а профиль роли её не читает",
+                )
+            )
+    return issues
+
+
+def _check_shell_kind(spec: Spec, stage: Stage) -> list[Issue]:
+    """Правила одного `kind: shell`: нужна команда, не нужны роль, вопрос, приговор, ретрай."""
+    issues: list[Issue] = []
+    if not stage.cmd.strip():
+        issues.append(
+            Issue(
+                spec.path,
+                stage.line_of("kind"),
+                "kind.cmd",
+                f"этап {stage.id!r} с kind: shell без cmd: команде этапа нечего запускать",
+            )
+        )
+    if stage.role:
+        issues.append(
+            Issue(
+                spec.path,
+                stage.line_of("role"),
+                "kind.role",
+                f"этап {stage.id!r} с kind: shell не принимает role: этап исполняет команда, а не профиль",
+            )
+        )
+    if stage.ask is not None:
+        issues.append(
+            Issue(
+                spec.path,
+                stage.line_of("ask"),
+                "kind.ask",
+                f"этап {stage.id!r} с kind: shell не задаёт вопросов человеку: ask — поле агента, "
+                "команда вопросов не задаёт",
+            )
+        )
+    if stage.verdict is not None:
+        issues.append(
+            Issue(
+                spec.path,
+                stage.line_of("verdict"),
+                "kind.verdict",
+                f"этап {stage.id!r} с kind: shell не выносит приговора: verdict — поле агента-ревьюера",
+            )
+        )
+    if stage.retry is not None:
+        issues.append(
+            Issue(
+                spec.path,
+                stage.line_of("retry"),
+                "kind.retry",
+                f"этап {stage.id!r} с kind: shell не принимает retry: политика повтора у команды — "
+                "это must, а не класс отказа",
+            )
+        )
+    hit = _forbidden_hit(stage.cmd)
+    if hit is not None:
+        issues.append(
+            Issue(
+                spec.path,
+                stage.line_of("cmd"),
+                "cmd.forbidden",
+                f"cmd {stage.cmd!r} начинается с {hit!r}: публикация — дело роли {PUBLISHING_ROLES[0]}, "
+                "а не этапа-команды; иначе у публикации появится второй путь мимо неё",
+            )
+        )
+    if stage.evidence:
+        issues.append(
+            Issue(
+                spec.path,
+                stage.line_of("evidence"),
+                "kind.evidence",
+                f"у этапа {stage.id!r} с kind: shell evidence не проверяется: договор команды — "
+                "код возврата must и список artifacts",
+                WARNING,
+            )
+        )
+    return issues
+
+
 def validate_spec(spec: Spec, *, profiles: Optional[frozenset[str]] = None) -> list[Issue]:
     """Все отказы спеки до запуска: структура, граф, доказательства, адрес вопросов.
 
@@ -1257,6 +1440,7 @@ def validate_spec(spec: Spec, *, profiles: Optional[frozenset[str]] = None) -> l
     issues += _check_ask(spec)
     issues += _check_budget(spec)
     issues += _check_retry(spec)
+    issues += _check_kind(spec)
     return issues
 
 

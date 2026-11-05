@@ -202,9 +202,14 @@ class _Children:
         self._spawn = spawn
         self._live: list[Any] = []
 
-    def spawn(self, cmd: list[str], cwd: Path) -> Any:
-        """Запустить попытку и запомнить процесс — тот же вызов, что у `runner`."""
-        process = self._spawn(cmd, cwd)
+    def spawn(self, cmd: list[str], cwd: Path, *args: Any, **kwargs: Any) -> Any:
+        """Запустить попытку и запомнить процесс — тот же вызов, что у `runner`.
+
+        Доводы передаются как есть: агенту их два, а shell-этап называет ещё
+        окружение и каталог полных логов. Обёртка не решает, чем запускать, —
+        иначе она стала бы вторым движком.
+        """
+        process = self._spawn(cmd, cwd, *args, **kwargs)
         if not any(process is known for known in self._live):
             self._live.append(process)
         return process

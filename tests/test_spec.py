@@ -1265,3 +1265,154 @@ def test_cli_check_unreadable_spec_exit_2(capsys, tmp_path: Path):
 def test_cli_spec_without_subcommand(capsys):
     code, _ = run_cli(["spec"], capsys)
     assert code == 2
+
+
+# --------------------------------------------------------------- вид этапа (kind)
+
+
+def shell_spec(extra: str = "", stage: str = "") -> str:
+    """Спека с этапом-командой: вход `check`, за ним `review` профилем.
+
+    `check` — этап-команда (`kind: shell`): у неё нет роли, зато есть `cmd`.
+    `stage` заменяет объявление `check` — на нём проверяются запреты.
+    """
+    body = stage or "    kind: shell\n    cmd: \"pytest tests/ -q\"\n"
+    return (
+        "duty: probe\n"
+        "stages:\n"
+        "  - id: check\n"
+        + body
+        + "  - id: review\n"
+        "    role: reviewer\n"
+        "    needs: [check]\n"
+        "    workspace: none\n"
+        + extra
+    )
+
+
+def test_shell_stage_without_role_is_ok(tmp_path: Path):
+    """`kind: shell` + `cmd` — годная спека: роль команде не нужна, и это не отказ."""
+    found = issues(tmp_path, shell_spec())
+    assert found == []
+    loaded = spec_module.load_spec(write(tmp_path, shell_spec()))
+    stage = loaded.stage("check")
+    assert (stage.kind, stage.cmd, stage.must, stage.artifacts) == ("shell", "pytest tests/ -q", 0, ())
+
+
+def test_stage_without_kind_is_agent(tmp_path: Path):
+    """Спека 0.0.4 читается без правок: нет `kind` — этап-агент."""
+    loaded = spec_module.load_spec(EXAMPLES / "duty.yaml")
+    assert {stage.kind for stage in loaded.stages} == {spec_module.DEFAULT_STAGE_KIND}
+    assert spec_module.errors(spec_module.validate_spec(loaded, profiles=PROFILES)) == []
+
+
+def test_shell_with_role_is_refused(tmp_path: Path):
+    """`kind: shell` + `role` — отказ с `file:line` и правилом, а не тихий игнор."""
+    path = write(
+        tmp_path,
+        """duty: probe
+stages:
+  - id: check
+    kind: shell
+    cmd: "true"
+    role: implementer
+""",
+    )
+    found = spec_module.validate_spec(spec_module.load_spec(path), profiles=PROFILES)
+    assert [(issue.rule, issue.line) for issue in found] == [("kind.role", 6)]
+    assert "исполняет команда, а не профиль" in found[0].message
+    assert str(found[0]).startswith(f"{path}:6: kind.role:")
+
+
+def test_shell_without_cmd_is_refused(tmp_path: Path):
+    found = issues(tmp_path, shell_spec(stage="    kind: shell\n"))
+    assert "kind.cmd" in rules(found)
+    assert any("нечего запускать" in issue.message for issue in found)
+
+
+def test_shell_refuses_ask(tmp_path: Path):
+    """Вопрос человеку — поле агента: у команды `ask` отказывает, а не игнорируется."""
+    found = issues(
+        tmp_path,
+        shell_spec(stage="    kind: shell\n    cmd: \"true\"\n    ask: {allowed: [tester]}\n"),
+    )
+    assert "kind.ask" in rules(found)
+    assert any("не задаёт вопросов" in issue.message for issue in found)
+
+
+def test_shell_refuses_verdict(tmp_path: Path):
+    found = issues(
+        tmp_path,
+        shell_spec(
+            stage="    kind: shell\n    cmd: \"true\"\n    verdict: {approve: next, changes: check, max_rounds: 1}\n"
+        ),
+    )
+    assert "kind.verdict" in rules(found)
+
+
+def test_shell_refuses_retry(tmp_path: Path):
+    """Политика повтора у команды — `must`, а не класс отказа: `retry` отказывает."""
+    found = issues(tmp_path, shell_spec(stage="    kind: shell\n    cmd: \"true\"\n    retry: {max: 1, on: [infra]}\n"))
+    assert "kind.retry" in rules(found)
+    assert any("это must" in issue.message for issue in found)
+
+
+def test_shell_refuses_publishing_cmd(tmp_path: Path):
+    """Публикующая команда запрещена и этапу-команде: у публикации один путь — publisher."""
+    found = issues(tmp_path, shell_spec(stage="    kind: shell\n    cmd: \"git push origin main\"\n"))
+    assert "cmd.forbidden" in rules(found)
+    assert any("дело роли publisher" in issue.message for issue in found)
+
+
+def test_shell_evidence_is_warning_not_refusal(tmp_path: Path):
+    """`evidence` у команды не проверяется — предупреждение, а не отказ спеки."""
+    found = issues(
+        tmp_path,
+        shell_spec(stage="    kind: shell\n    cmd: \"true\"\n    evidence: [{cmd: \"go build ./...\", must: 0}]\n"),
+    )
+    assert [(issue.rule, issue.severity) for issue in found] == [("kind.evidence", "warning")]
+
+
+def test_unknown_kind_is_refused(tmp_path: Path):
+    found = issues(tmp_path, shell_spec(stage="    kind: gate\n    cmd: \"true\"\n"))
+    assert "kind" in rules(found)
+    assert any("допустимо agent, shell" in issue.message for issue in found)
+
+
+def test_agent_stage_refuses_cmd(tmp_path: Path):
+    """Поля команды у агента — отказ: объявленное и не прочитанное — ложь спеки."""
+    found = issues(tmp_path, shell_spec(stage="    role: implementer\n    cmd: \"true\"\n"))
+    assert "kind.cmd" in rules(found)
+
+
+def test_shell_must_must_be_int(tmp_path: Path):
+    found = issues(tmp_path, shell_spec(stage="    kind: shell\n    cmd: \"true\"\n    must: true\n"))
+    assert "kind.must" in rules(found)
+
+
+def test_shell_artifacts_must_be_paths(tmp_path: Path):
+    found = issues(
+        tmp_path,
+        shell_spec(stage="    kind: shell\n    cmd: \"true\"\n    artifacts: [{path: report.txt}]\n"),
+    )
+    assert "kind.artifacts" in rules(found)
+
+
+def test_cli_check_names_shell_kind(capsys, tmp_path: Path):
+    """Приёмка: `spec check` на спеке с `kind: shell` — OK и вид этапа назван."""
+    path = write(tmp_path, shell_spec())
+    code, out = run_cli(["spec", "check", str(path)], capsys)
+    assert code == 0
+    assert out.startswith("OK ")
+    assert "kind: check=shell" in out
+
+
+def test_cli_check_shell_with_role_names_line(capsys, tmp_path: Path):
+    """Приёмка: `kind: shell` + `role` — отказ с `file:line` и правилом."""
+    path = write(
+        tmp_path,
+        "duty: probe\nstages:\n  - id: check\n    kind: shell\n    cmd: \"true\"\n    role: implementer\n",
+    )
+    code, out = run_cli(["spec", "check", str(path)], capsys)
+    assert code == 1
+    assert f"{path}:6: kind.role:" in out

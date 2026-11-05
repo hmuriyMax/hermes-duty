@@ -75,6 +75,10 @@ ATTEMPT_STARTED = "attempt_started"
 ATTEMPT_ENDED = "attempt_ended"
 ATTEMPT_PROGRESS = "attempt_progress"
 
+# Вид этапа по факту начала попытки (`attempt_started.stage_kind`). Старые записи
+# поля не имеют — и это `agent`: до 0.0.5 других видов у этапа не было.
+STAGE_KIND_AGENT = "agent"
+
 # Живость попытки: три ответа, а не два. `None` — журнал не записал срок лизинга
 # (старая запись или событие без `lease_expires`), и тогда «жив» было бы догадкой.
 LIVE = "live"
@@ -207,6 +211,7 @@ def _attempts(
                 "n": number,
                 "run_id": run_id,
                 "stage": stage,
+                "stage_kind": str(start_payload.get("stage_kind") or STAGE_KIND_AGENT),
                 "role": str(contract.get("role") or start_payload.get("role") or ""),
                 "pid": _maybe_int(start_payload.get("pid")),
                 "started_at": started_at or None,
@@ -287,6 +292,7 @@ def _public(row: dict[str, Any], now: int) -> dict[str, Any]:
         "n": row["n"],
         "run_id": row["run_id"],
         "stage": row["stage"],
+        "stage_kind": row["stage_kind"],
         "role": row["role"],
         "pid": row["pid"],
         "started_at": row["started_at"],
@@ -439,6 +445,7 @@ def stages(spec: Any, events: Iterable[Any], now: Any) -> list[dict[str, Any]]:
         out.append(
             {
                 "id": stage.id,
+                "kind": getattr(stage, "kind", STAGE_KIND_AGENT),
                 "role": stage.role,
                 "state": state.state,
                 "attempt": state.attempt,

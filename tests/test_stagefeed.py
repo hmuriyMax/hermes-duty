@@ -519,6 +519,51 @@ def test_stagefeed_reads_journal_only(monkeypatch, home):
     assert rows[0]["attempts"][0]["dead"] is True
 
 
+def test_shell_attempt_is_named_by_kind_not_by_role(home):
+    """Попытка `kind: shell` видна с кодом возврата и без выдуманного профиля.
+
+    У этапа-команды роли нет: `role` пуст, а исполнителя называет
+    `stage_kind: shell` из `attempt_started`. Код возврата и длительность — те же
+    поля `exit`/`duration_sec`, что у агента, поэтому консоль печатает shell-попытку
+    не отдельной веткой, а тем же таймлайном.
+    """
+    events = [
+        {
+            "ts": NOW - 30,
+            "kind": "attempt_started",
+            "payload": {
+                "run_id": "check#1",
+                "stage": "check",
+                "attempt": 1,
+                "pid": 70100,
+                "lease_expires": NOW + 600,
+                "stage_kind": "shell",
+                "shell_cmd": "pytest tests/ -q",
+            },
+        },
+        {
+            "ts": NOW - 25,
+            "kind": "attempt_ended",
+            "payload": {
+                "run_id": "check#1",
+                "stage": "check",
+                "attempt": 1,
+                "outcome": "failed",
+                "kind": "contract",
+                "reason": "код 1, ждали 0",
+                "details": {"exit_code": 1, "duration_sec": 5.0, "stdout_tail": [], "stderr_tail": []},
+            },
+        },
+    ]
+    rows = stagefeed.attempts(events, NOW)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["stage_kind"] == "shell"
+    assert row["role"] == ""
+    assert (row["exit"], row["kind"], row["outcome"]) == (1, "contract", "failed")
+    assert row["duration_sec"] == 5
+
+
 def test_stagefeed_has_no_process_lookups():
     """Источник ленты — журнал: ни процессов, ни их проб.
 

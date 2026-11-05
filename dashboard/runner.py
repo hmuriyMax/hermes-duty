@@ -33,6 +33,9 @@
    --oneshot` с cwd дерева этапа. Профиль роли — из спеки, права не эскалируются.
    Бюджет: `minutes` → жёсткий таймаут (SIGTERM, затем SIGKILL через 10 с),
    `tokens` → превышение по `usage` из потока останавливает попытку.
+   У этапа `kind: shell` (`docs/SPEC.md`) процесса роли нет вовсе: вместо спавна
+   запускается `sh -c <cmd>` в том же дереве, а договор результата — код возврата
+   `must` и объявленные `artifacts`, а не `result.json` (`run_shell_stage`).
 5. **Телеметрия**: каждый `tool_use`/`tool_result` потока — событие
    `attempt_progress` (фаза, имя инструмента, длительность). Журнал отвечает
    «что делается прямо сейчас» без ps и хвостов логов.
@@ -69,6 +72,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -135,6 +139,29 @@ KILL_GRACE_SEC = 10
 # Сколько последних строк stderr попытки попадает в событие: хвост ошибки нужен,
 # а весь лог — нет (журнал не место для логов).
 STDERR_TAIL = 20
+
+# Виды этапа (`dashboard/spec.py`): `agent` исполняет профиль роли, `shell` —
+# команду. Здесь — только исполнение: что запускать, решила спека.
+STAGE_KIND_AGENT = "agent"
+STAGE_KIND_SHELL = "shell"
+
+# Источник событий shell-попытки в журнале: по нему видно, что этап исполнила
+# команда, а не процесс профиля. `engine` остаётся источником решений движка
+# (лизинг, парковка, закрытие) — они по-прежнему его.
+SHELL_SOURCE = "shell"
+
+# Чем запускается команда этапа: `sh -c <cmd>` — одна строка спеки как процесс.
+SHELL_BIN = "/bin/sh"
+
+# Хвост stdout/stderr shell-попытки в событии; полные логи лежат файлами рядом
+# с отчётом — журнал отвечает «чем кончилось», а не заменяет лог.
+SHELL_TAIL = 20
+SHELL_STDOUT_LOG = "stdout.log"
+SHELL_STDERR_LOG = "stderr.log"
+
+# Переменные окружения, которые shell-этап не наследует: они называют роль и её
+# доступы, а команде этапа ни роль, ни токены не нужны (она не действует вовне).
+SHELL_ENV_ROLE_KEYS = ("HERMES_PROFILE", "HERMES_ROLE", "HERMES_SESSION_TOKEN", "__HERMES_SESSION_TOKEN__")
 
 # Исходы попытки в журнале (`attempt_ended.outcome`): различаются полем, а не
 # вторым видом события (`docs/JOURNAL.md`).
@@ -829,16 +856,26 @@ def spawn_command(role: str, query_file: Path, session_id: str = "") -> list[str
 class Process:
     """Запущенный процесс попытки: строки потока, код выхода, остановка.
 
-    Поток читается отдельным потоком в очередь: иначе `for line in stdout`
+    Поток читается отдельным потоком в очередь: иначе `for line in stdout` 
     заблокировал бы heartbeat лизинга и таймаут до самого конца процесса, и
     «что делает прямо сейчас» снова стало бы невидимым.
+
+    `logs` — каталог полных логов (`stdout.log`, `stderr.log`). Агенту он не
+    нужен (его поток — телеметрия, а хвост stderr и так пишется файлом), а
+    shell-этапу нужен: от события остаётся только хвост, и разбор отказа без
+    полного вывода команды был бы догадкой.
     """
 
-    def __init__(self, cmd: list[str], cwd: Path, env: Optional[dict[str, str]] = None) -> None:
+    def __init__(
+        self, cmd: list[str], cwd: Path, env: Optional[dict[str, str]] = None, logs: Optional[Path] = None
+    ) -> None:
         self.cmd = list(cmd)
         self._queue: "queue.Queue[Optional[str]]" = queue.Queue()
         self._stderr: list[str] = []
         self._eof = False
+        self._logs = Path(logs) if logs is not None else None
+        self._stdout_log = self._open_log(SHELL_STDOUT_LOG)
+        self._stderr_log = self._open_log(SHELL_STDERR_LOG)
         self._proc = subprocess.Popen(
             self.cmd,
             cwd=str(cwd),
@@ -853,6 +890,36 @@ class Process:
         self._err = threading.Thread(target=self._read_stderr, daemon=True)
         self._out.start()
         self._err.start()
+
+    def _open_log(self, name: str) -> Optional[Any]:
+        """Файл полного лога потока; `None` — логи не просили или он не открылся."""
+        if self._logs is None:
+            return None
+        try:
+            self._logs.mkdir(parents=True, exist_ok=True)
+            return (self._logs / name).open("w", encoding="utf-8")
+        except OSError:  # pragma: no cover - каталог попытки уже создан движком
+            return None
+
+    def _write_log(self, handle: Optional[Any], line: str) -> None:
+        """Строка в полный лог: поток идёт дальше своим чередом, лог не роняет попытку."""
+        if handle is None:
+            return
+        try:
+            handle.write(line)
+            handle.flush()
+        except (OSError, ValueError):  # pragma: no cover - диск кончился или файл закрыт
+            pass
+
+    def close_logs(self) -> None:
+        """Закрыть полные логи: попытка кончилась, писать больше нечего."""
+        for handle in (self._stdout_log, self._stderr_log):
+            if handle is None:
+                continue
+            try:
+                handle.close()
+            except OSError:  # pragma: no cover - закрытие после сбоя записи
+                pass
 
     @property
     def pid(self) -> int:
@@ -869,12 +936,14 @@ class Process:
     def _read_stdout(self) -> None:
         try:
             for line in self._proc.stdout or ():
+                self._write_log(self._stdout_log, line)
                 self._queue.put(line)
         finally:
             self._queue.put(None)
 
     def _read_stderr(self) -> None:
         for line in self._proc.stderr or ():
+            self._write_log(self._stderr_log, line)
             text = line.rstrip("\n")
             if not text:
                 continue
@@ -928,13 +997,16 @@ class Process:
         return code
 
 
-def spawn_process(cmd: list[str], cwd: Path, env: Optional[dict[str, str]] = None) -> Process:
+def spawn_process(
+    cmd: list[str], cwd: Path, env: Optional[dict[str, str]] = None, logs: Optional[Path] = None
+) -> Process:
     """Запустить попытку. Единственный шов: тесты подменяют его фейком.
 
     Ни один тест движка не поднимает модель: подмена пишет заданный поток и
     `result.json`, а шаг проходит те же ветки, что и с живым процессом.
+    `logs` называет только shell-этап: его вывод целиком нужен файлом.
     """
-    return Process(cmd, cwd, env=env)
+    return Process(cmd, cwd, env=env, logs=logs)
 
 
 # ------------------------------------------------------------ поток и события
@@ -956,9 +1028,14 @@ def _int(value: Any) -> Optional[int]:
 
 
 def _event(
-    deal: Any, kind: str, payload: dict[str, Any], args: dict[str, Any], now: int
+    deal: Any, kind: str, payload: dict[str, Any], args: dict[str, Any], now: int, source: str = ENGINE_SOURCE
 ) -> dict[str, Any]:
-    """Событие движка: тот же ключ идемпотентности, что у остальных мутаций."""
+    """Событие движка: тот же ключ идемпотентности, что у остальных мутаций.
+
+    `source` отличает писателя: у решения движка — `engine`, у попытки, которую
+    исполнила команда, — `shell`. Ключ идемпотентности считается от того же
+    источника, поэтому два писателя одного факта не столкнутся ключами.
+    """
     return {
         "ts": now,
         "recorded_at": now,
@@ -966,8 +1043,8 @@ def _event(
         "board": str(deal["board"]),
         "kind": kind,
         "payload": payload,
-        "source": ENGINE_SOURCE,
-        "idempotency_key": deals.event_key(ENGINE_SOURCE, str(deal["id"]), kind, args),
+        "source": source,
+        "idempotency_key": deals.event_key(source, str(deal["id"]), kind, args),
     }
 
 
@@ -1177,6 +1254,402 @@ def classify(
     return ended.outcome, ended.kind, ended.reason
 
 
+# --------------------------------------------------------------- shell-этап
+
+
+def shell_env(base: Optional[dict[str, str]] = None) -> dict[str, str]:
+    """Окружение shell-этапа: как у попытки, но без роли и её токенов.
+
+    Команда этапа не действует от имени профиля: роль и доступы ей не нужны, а
+    лишняя переменная с токеном — это право, которого этап не просил. Остальное
+    окружение наследуется: команда этапа — обычный процесс дерева (python, go,
+    pytest), и вычищать из него всё подряд значило бы ломать ей сборку.
+    """
+    source = dict(os.environ if base is None else base)
+    return {
+        key: value
+        for key, value in source.items()
+        if key.upper() not in SHELL_ENV_ROLE_KEYS and "TOKEN" not in key.upper()
+    }
+
+
+def shell_command(cmd: str) -> list[str]:
+    """Команда этапа как процесс: `sh -c <cmd>` — одна строка спеки."""
+    return [SHELL_BIN, "-c", str(cmd)]
+
+
+class ShellRun:
+    """Что дал запуск команды: таймаут и хвосты вывода.
+
+    Форма — та же, что у `Followed`: шаг читает один объект, а не три
+    переменные, и разница «агент/команда» остаётся в способе запуска.
+    """
+
+    def __init__(self) -> None:
+        self.timed_out = False
+        self.stdout_tail: list[str] = []
+        self.stderr_tail: list[str] = []
+
+
+def follow_shell(
+    conn: sqlite3.Connection,
+    process: Any,
+    *,
+    deal: Any,
+    stage: Any,
+    attempt: int,
+    ttl: int,
+    deadline: float,
+    monotonic: Callable[[], float],
+    clock: Callable[[], float],
+) -> ShellRun:
+    """Довести команду этапа до конца: heartbeat лизинга, таймаут, хвост stdout.
+
+    Хвост собирается здесь, а полный вывод пишет сам процесс файлом (`Process`,
+    `logs`): журнал отвечает «чем кончилось», файл — «что было написано».
+    Таймаут — наш собственный факт, поэтому проверяется по часам шага, а не по
+    коду возврата: убитый по сроку процесс тоже вернёт код сигнала.
+    """
+    state = ShellRun()
+    last_renew = monotonic()
+    renew_every = max(float(ttl) / RENEW_DIVISOR, POLL_SEC)
+    pid = int(process.pid)
+    while True:
+        if monotonic() - last_renew >= renew_every:
+            renew(conn, deal=deal, stage=stage.id, pid=pid, ttl=ttl, now=_now_sec(int(clock())))
+            last_renew = monotonic()
+        line = process.next_line(POLL_SEC)
+        if line is None:
+            if process.finished():
+                break
+            if monotonic() >= deadline:
+                state.timed_out = True
+                process.stop()
+                break
+            continue
+        state.stdout_tail.append(line.rstrip("\n"))
+        del state.stdout_tail[:-SHELL_TAIL]
+    # Хвост очереди: процесс мог выйти, оставив строки в буфере.
+    while True:
+        line = process.next_line(0)
+        if line is None:
+            break
+        state.stdout_tail.append(line.rstrip("\n"))
+        del state.stdout_tail[:-SHELL_TAIL]
+    state.stderr_tail = process.stderr_tail[-SHELL_TAIL:]
+    return state
+
+
+def classify_shell(
+    *, exit_code: Optional[int], timed_out: bool, must: int, timeout_sec: int
+) -> tuple[str, str, str]:
+    """Чем кончилась shell-попытка: `(outcome, kind, reason)` — по коду возврата.
+
+    Источников три, как у агента, но отчёта среди них нет: наша собственная
+    остановка по сроку (таймаут), смерть процесса (сигнал — отрицательный код) и
+    его слово — код возврата. Ненулевой код — отказ **контракта** («код N, ждали
+    M»), а не инфраструктуры: команда дошла до конца и сказала «нет».
+    """
+    if timed_out:
+        return OUTCOME_FAILED, FAIL_INFRA, f"команда не дожила: таймаут этапа {int(timeout_sec)} с"
+    if exit_code is None:
+        return OUTCOME_FAILED, FAIL_INFRA, "команда не дожила: код выхода неизвестен"
+    if int(exit_code) < 0:
+        return OUTCOME_FAILED, FAIL_INFRA, f"команда не дожила: сигнал {-int(exit_code)}"
+    if int(exit_code) != int(must):
+        return OUTCOME_FAILED, FAIL_CONTRACT, f"код {int(exit_code)}, ждали {int(must)}"
+    return OUTCOME_DONE, "", ""
+
+
+def shell_result(stage: Any, root: Path, *, exit_code: int, duration_sec: float) -> dict[str, Any]:
+    """Отчёт shell-этапа в той же форме, что `result.json` агента.
+
+    Команда отчёта не пишет, но следующие этапы и лента читают пакет одним
+    способом (`dashboard/stagefeed.py`, `previous_reports`). Поэтому пакет
+    собирает движок — из того, что действительно произошло: код возврата,
+    длительность и хеши объявленных артефактов. Хеш считается по файлу в дереве
+    этапа: иначе «артефакт есть» доказывало бы только имя.
+    """
+    artifacts: list[dict[str, Any]] = []
+    for path in getattr(stage, "artifacts", ()) or ():
+        digest = ""
+        try:
+            handle = hashlib.sha256()
+            with (Path(root) / str(path)).open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1 << 20), b""):
+                    handle.update(chunk)
+            digest = handle.hexdigest()
+        except OSError:
+            digest = ""
+        artifacts.append({"path": str(path), "sha256": digest})
+    return {
+        "status": "done",
+        "artifacts": artifacts,
+        "evidence": [],
+        "summary": f"shell: {getattr(stage, 'cmd', '')} — код {int(exit_code)} за {float(duration_sec):.1f} с",
+    }
+
+
+def run_shell_stage(
+    conn: sqlite3.Connection,
+    spec: Any,
+    deal: Any,
+    stage_id: str,
+    attempt: int,
+    *,
+    home: Path,
+    spawn: Optional[Callable[..., Any]] = None,
+    clock: Optional[Callable[[], float]] = None,
+    monotonic: Optional[Callable[[], float]] = None,
+) -> dict[str, Any]:
+    """Одна попытка shell-этапа: лизинг, дерево, команда, факты в журнал.
+
+    Договор результата — код возврата и артефакты, а не `result.json`: команда не
+    отчитывается, она либо сходится с `must`, либо нет. Вопросов человеку этап не
+    задаёт (это отказ валидации спеки), поэтому `ask` здесь не участвует вовсе.
+    Всё остальное — как у агента: лизинг этапа, дерево по `workspace`, база этапа,
+    лизинг переезжает к процессу, отказ пишется событием и паркуется политикой.
+    """
+    spawner = spawn or spawn_process
+    clock = clock or time.time
+    monotonic = monotonic or time.monotonic
+    stage = next((item for item in spec.stages if item.id == stage_id), None)
+    if stage is None:
+        raise RunnerError(f"этапа {stage_id!r} нет в спеке {getattr(spec, 'path', '')}")
+    attempt = int(attempt)
+    if attempt < 1:
+        raise RunnerError(f"номер попытки {attempt}: попытки считаются с 1")
+    ttl = ttl_sec(stage)
+    deadline_sec = ttl
+    engine_pid = os.getpid()
+    workdir = attempt_dir(home, deal, stage_id, attempt)
+    run_id = f"{stage_id}#{attempt}"
+
+    held_at = _now_sec(int(clock()))
+    if not lease(conn, deal=deal, stage=stage_id, attempt=attempt, pid=engine_pid, ttl=ttl, now=held_at):
+        held = lease_of(conn, deal, stage_id) or {}
+        return {
+            "started": False,
+            "stage": stage_id,
+            "attempt": attempt,
+            "reason": f"этап уже за процессом pid={held.get('pid')}, срок до {held.get('expires_at')}",
+        }
+
+    stage_base = str(spec.base or "")
+    try:
+        workdir.mkdir(parents=True, exist_ok=True)
+        events = journal.read_events(conn, str(deal["id"]))
+        stage_base = base_of_stage(spec, stage, events)
+        tree, cwd = prepare_tree(spec, stage, workdir, base=stage_base)
+    except (RunnerError, OSError) as exc:
+        kind = FAIL_CONTRACT if isinstance(exc, BaseError) else FAIL_INFRA
+        release(conn, deal=deal, stage=stage_id, pid=engine_pid)
+        now = _now_sec(int(clock()))
+        event = _event(
+            deal,
+            "attempt_ended",
+            {
+                "run_id": run_id,
+                "stage": stage_id,
+                "attempt": attempt,
+                "outcome": OUTCOME_FAILED,
+                "kind": kind,
+                "reason": str(exc),
+                "details": {"cmd": stage.cmd, "workdir": str(workdir), "tree": None, "base": stage_base},
+            },
+            {"stage": stage_id, "attempt": attempt, "outcome": OUTCOME_FAILED},
+            now,
+            SHELL_SOURCE,
+        )
+        journal.append(conn, [event])
+        park = park_exhausted(conn, spec, deal, stage, attempt, kind, str(exc), home=home, clock=clock)
+        return {
+            "started": True,
+            "stage": stage_id,
+            "attempt": attempt,
+            "outcome": OUTCOME_FAILED,
+            "kind": kind,
+            "reason": str(exc),
+            "workdir": str(workdir),
+            "tree": None,
+            "base": stage_base,
+            "park": park,
+        }
+
+    actual_base = stage_base
+    if tree is not None:
+        sha = _sha(Path(tree), "HEAD")
+        if sha:
+            actual_base = sha
+
+    command = shell_command(stage.cmd)
+    now = _now_sec(int(clock()))
+    try:
+        process = spawner(command, cwd, shell_env(), logs=workdir / DUTY_SUBDIR)
+    except OSError as exc:
+        release(conn, deal=deal, stage=stage_id, pid=engine_pid)
+        if stage.workspace == "worktree":
+            remove_tree(spec, stage, workdir)
+        raise RunnerError(f"запуск команды этапа не удался: {exc}") from exc
+
+    pid = int(process.pid)
+    started = _event(
+        deal,
+        "attempt_started",
+        {
+            "run_id": run_id,
+            "stage": stage_id,
+            "attempt": attempt,
+            "pid": pid,
+            "cmd": command,
+            "shell_cmd": stage.cmd,
+            "stage_kind": STAGE_KIND_SHELL,
+            "cwd": str(cwd),
+            "workdir": str(workdir),
+            "tree": str(tree) if tree is not None else None,
+            "base": actual_base,
+            "lease_expires": now + ttl,
+        },
+        {"stage": stage_id, "attempt": attempt},
+        now,
+        SHELL_SOURCE,
+    )
+    try:
+        with conn:
+            written = journal.append_in_tx(conn, [started])
+            _hand_over(conn, str(deal["id"]), stage_id, engine_pid, pid, attempt, ttl, now)
+            if written:
+                deals._set_status(conn, deal, "running", now)
+    except sqlite3.Error:
+        process.stop()
+        if not release(conn, deal=deal, stage=stage_id, pid=pid):
+            release(conn, deal=deal, stage=stage_id, pid=engine_pid)
+        raise
+
+    began = monotonic()
+    try:
+        followed = follow_shell(
+            conn,
+            process,
+            deal=deal,
+            stage=stage,
+            attempt=attempt,
+            ttl=ttl,
+            deadline=began + deadline_sec,
+            monotonic=monotonic,
+            clock=clock,
+        )
+    except sqlite3.Error:
+        process.stop()
+        release(conn, deal=deal, stage=stage_id, pid=pid)
+        raise
+    exit_code = process.exit_code if process.exit_code is not None else process.wait(KILL_GRACE_SEC)
+    duration = max(0.0, monotonic() - began)
+    process.close_logs()
+    outcome, kind, reason = classify_shell(
+        exit_code=exit_code, timed_out=followed.timed_out, must=int(getattr(stage, "must", 0)), timeout_sec=deadline_sec
+    )
+
+    # Пакет: команда отчёта не пишет, поэтому его собирает движок — и только
+    # объявленные артефакты проверяются тем же гейтом, что у агента
+    # (`dashboard/evidence.py`: путь, наличие, sha256).
+    now = _now_sec(int(clock()))
+    result: Optional[dict[str, Any]] = None
+    verdict = None
+    if outcome == OUTCOME_DONE:
+        result = shell_result(stage, cwd, exit_code=int(exit_code or 0), duration_sec=duration)
+        if getattr(stage, "artifacts", ()):
+            verdict = evidence_module.verify(
+                result,
+                stage,
+                workdir,
+                attempt_started_at=int(started["ts"]),
+                now=now,
+                root=cwd,
+                base=spec.base,
+            )
+            if not verdict.ok:
+                outcome, kind, reason = OUTCOME_FAILED, failures.verdict_kind(verdict), verdict.reason()
+
+    committed = ""
+    if outcome == OUTCOME_DONE and tree is not None:
+        committed, commit_error = commit_tree(tree, deal, stage_id, attempt)
+        if not committed:
+            outcome = OUTCOME_FAILED
+            kind = FAIL_INFRA
+            reason = f"работа попытки не зафиксирована коммитом: {commit_error}"
+
+    cleaned = False
+    cleanup = ""
+    if outcome != OUTCOME_DONE and stage.workspace == "worktree":
+        cleaned, cleanup = remove_tree(spec, stage, workdir)
+
+    payload: dict[str, Any] = {
+        "run_id": run_id,
+        "stage": stage_id,
+        "attempt": attempt,
+        "outcome": outcome,
+        "kind": kind or None,
+        "reason": reason,
+        "base": actual_base,
+        "commit": committed or None,
+        "details": {
+            "cmd": stage.cmd,
+            "exit_code": exit_code,
+            "duration_sec": round(duration, 1),
+            "must": int(getattr(stage, "must", 0)),
+            "timed_out": followed.timed_out,
+            "stdout_tail": followed.stdout_tail,
+            "stderr_tail": followed.stderr_tail,
+            "stdout_path": str(workdir / DUTY_SUBDIR / SHELL_STDOUT_LOG),
+            "stderr_path": str(workdir / DUTY_SUBDIR / SHELL_STDERR_LOG),
+            "workdir": str(workdir),
+            "tree": str(tree) if tree is not None else None,
+            "cleaned": cleaned,
+            "cleanup": cleanup or None,
+            "verdict": verdict.as_payload() if verdict is not None else None,
+        },
+    }
+    if result is not None:
+        payload["result"] = result
+    ended = _event(
+        deal,
+        "attempt_ended",
+        payload,
+        {"stage": stage_id, "attempt": attempt, "outcome": outcome},
+        now,
+        SHELL_SOURCE,
+    )
+    with conn:
+        journal.append_in_tx(conn, [ended])
+        conn.execute(
+            "DELETE FROM leases WHERE deal_id = ? AND stage = ? AND pid = ?",
+            (str(deal["id"]), stage_id, pid),
+        )
+
+    park = None
+    if outcome == OUTCOME_FAILED:
+        park = park_exhausted(conn, spec, deal, stage, attempt, kind, reason, home=home, clock=clock)
+
+    return {
+        "started": True,
+        "stage": stage_id,
+        "attempt": attempt,
+        "outcome": outcome,
+        "kind": kind or None,
+        "reason": reason,
+        "run_id": run_id,
+        "workdir": str(workdir),
+        "tree": str(tree) if tree is not None else None,
+        "base": actual_base,
+        "commit": committed or None,
+        "exit_code": exit_code,
+        "duration_sec": round(duration, 1),
+        "verdict": verdict.as_payload() if verdict is not None else None,
+        "park": park,
+    }
+
+
 # ---------------------------------------------------------------------- шаг
 
 
@@ -1211,6 +1684,13 @@ def run_stage(
     attempt = int(attempt)
     if attempt < 1:
         raise RunnerError(f"номер попытки {attempt}: попытки считаются с 1")
+    if getattr(stage, "kind", STAGE_KIND_AGENT) == STAGE_KIND_SHELL:
+        # Вид этапа — выбор спеки, а не режим движка: попытку исполняет команда,
+        # и её шаг живёт отдельной функцией (`run_shell_stage`), чтобы ветка
+        # агента осталась ровно той же, что была до 0.0.5.
+        return run_shell_stage(
+            conn, spec, deal, stage_id, attempt, home=home, spawn=spawn, clock=clock, monotonic=monotonic
+        )
     ttl = ttl_sec(stage)
     deadline_sec = ttl
     engine_pid = os.getpid()

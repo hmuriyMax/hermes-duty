@@ -1103,7 +1103,7 @@ def _own_attempt_facts(
     Попытка — последняя незакрытая в журнале (`attempt_started` без
     `attempt_ended`): у своего дела нет записи рана kanban, и называть живую
     попытку «попытки нет» значит противоречить собственному таймлайну
-    (`GET /duty/{board}/{id}/attempts`). Все попытки закрыты — идущей нет, и это
+    (`GET /duty/{deal_id}/attempts`). Все попытки закрыты — идущей нет, и это
     тоже факт журнала, поэтому рядом едет их число: без него поверхность не
     отличила бы «движок ещё не начинал» от «попытки были и закрыты».
 
@@ -1680,8 +1680,8 @@ def collect_stats(
                     detail=f"repo '{repo}' не назван ни одним делом",
                 )
     waits: list[int] = []
-    for group in groups + ([without_group] if without_group["deals"] else []):
-        waits.extend(group.pop("_waits"))
+    for group in groups + [without_group]:
+        waits.extend(group.pop("_waits", []))
     totals = _repo_metrics("", rows, journal_events, now, leases)
     totals["waiting_sec"] = _waiting_distribution(waits)
     totals.pop("_waits", None)
@@ -1699,15 +1699,21 @@ def collect_stats(
 
 
 @router.get("/stats")
-def stats(repo: Optional[str] = None, since: Optional[int] = None) -> dict[str, Any]:
+def stats(
+    repo: Optional[str] = None,
+    since: Optional[int] = None,
+    board: Optional[str] = None,
+) -> dict[str, Any]:
     """Здоровье дел по репозиториям: доля этапов с первой попытки, ожидание, исходы.
 
     `?repo=<путь>` — только один репозиторий (404, если его не назвало ни одно
     дело); `?repo=` (пустая строка) — только дела **без** репозитория;
     `?since=<unix>` — только дела, созданные не раньше этой секунды. Фильтры
     считает `collect_stats`, поэтому CLI и роут отдают одну и ту же форму и одни
-    и те же числа.
+    и те же числа. `?board=` — отказ (400) с подсказкой: доск нет, фильтр
+    называется `repo`.
     """
+    _refuse_board_filter(board)
     return collect_stats(_hermes_home(), _now_sec(), repo=repo, since=since)
 
 
@@ -2281,15 +2287,15 @@ def deals_attach(
 
 @router.post("/deals")
 def create_deal_route(payload: dict[str, Any] = Body(...)) -> Any:
-    """`POST /deals {board, title, body?, assignee?, parents?[], spec?, external_ref?}` → дело.
+    """`POST /deals {repo?, title, body?, assignee?, parents?[], spec?, external_ref?}` → дело.
 
-    Отвечает той же формой, что `/deal/{board}/{id}`, плюс блок `mutation`. Ошибка
-    входа (нет доски, нет родителя, пустой title) — 400 с `errors[]`: контракт
+    Отвечает той же формой, что `/deal/{deal_id}`, плюс блок `mutation`. Ошибка
+    входа (нет родителя, пустой title, `board` в теле) — 400 с `errors[]`: контракт
     прямо запрещает 500 на битом входе.
 
-    `external_ref` — внешнее имя дела: если живое дело с этим именем на этой доске
-    уже есть, ответ несёт `created: false` и `existing: true` с причиной в
-    `reason`, а второе дело не заводится (`docs/OWNERSHIP.md`).
+    `external_ref` — внешнее имя дела: если живое дело с этим именем в этом
+    репозитории уже есть, ответ несёт `created: false` и `existing: true` с
+    причиной в `reason`, а второе дело не заводится (`docs/OWNERSHIP.md`).
     """
     try:
         return deals_create(_hermes_home(), payload)
@@ -2426,17 +2432,47 @@ def _repo_entry(home: Path, repo: str) -> None:
     )
 
 
+BOARD_FILTER_HINT = (
+    "фильтра 'board' больше нет (0.0.6): доск нет, дело адресуется своим id d_<hex>, "
+    "а группировка задаётся 'repo' — передай ?repo=<путь>, ?repo= для дел без "
+    "репозитория или убери параметр целиком"
+)
+
+
+def _refuse_board_filter(board: Optional[str]) -> None:
+    """Отказ на `?board=`: явная ошибка с подсказкой, а не молчаливое игнорирование.
+
+    FastAPI пропускает незнакомый query-параметр молча, и вызов со старым
+    `?board=stack` вернул бы полный срез — то есть выдал бы «фильтр по доске» за
+    применённый. Два способа адресовать одно дело (и два фильтра на одно поле)
+    дали бы две правды, поэтому старый параметр назван словами.
+    """
+    if board is None:
+        return
+    raise HTTPException(
+        status_code=400,
+        headers=NO_STORE_HEADERS,
+        detail=f"?board={board!r}: {BOARD_FILTER_HINT}",
+    )
+
+
 @router.get("/now")
-def now(repo: Optional[str] = None, state: Optional[str] = None) -> dict[str, Any]:
+def now(
+    repo: Optional[str] = None,
+    state: Optional[str] = None,
+    board: Optional[str] = None,
+) -> dict[str, Any]:
     """Активные дела: лизинг, попытка, последнее действие, ожидание.
 
     `?repo=<путь>` — только один репозиторий (404, если его не назвало ни одно
     дело); `?repo=` (пустая строка) — только дела **без** репозитория;
     `?state=<waiting.state>` — только дела в этом состоянии ожидания.
+    `?board=` — отказ (400) с подсказкой: доск нет, фильтр называется `repo`.
 
     Прохода ingest больше нет (`?ingest=1` удалён вместе с досками): срез только
     читает, журнал открывается `?mode=ro` и файла не создаёт.
     """
+    _refuse_board_filter(board)
     if state is not None and state not in WAITING_PRIORITY:
         raise HTTPException(
             status_code=400,

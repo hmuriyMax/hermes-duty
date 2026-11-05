@@ -516,7 +516,7 @@ def test_deal_route_shows_spend_and_ceiling(tmp_path: Path, home: Path, client: 
     """`/deal` показывает расход и потолок рядом с состоянием — по журналу дела."""
     made = budget_payload(tmp_path, home)
 
-    body = client.get(f"/deal/duty/{made['id']}").json()
+    body = client.get(f"/deal/{made['id']}").json()
 
     assert body["budget"] is not None
     assert body["budget"][budget.TOKENS] == {"spent": 650, "limit": 1000}
@@ -528,7 +528,7 @@ def test_attempts_route_carries_total_line(tmp_path: Path, home: Path, client: T
     """`/attempts` — расход по попыткам как раньше плюс строка итога по делу."""
     made = budget_payload(tmp_path, home)
 
-    body = client.get(f"/duty/duty/{made['id']}/attempts").json()
+    body = client.get(f"/duty/{made['id']}/attempts").json()
 
     assert body["count"] == 2, "по-попыточный расход не подменён итогом"
     assert body["budget"]["text"].startswith("израсходовано 650 из 1000 токенов")
@@ -551,7 +551,7 @@ def test_deal_render_prints_budget_line(tmp_path: Path, home: Path, client: Test
     """`bin/duty deal` печатает «бюджет дела: …» рядом с состоянием ожидания."""
     made = budget_payload(tmp_path, home)
 
-    body = client.get(f"/deal/duty/{made['id']}").json()
+    body = client.get(f"/deal/{made['id']}").json()
     printed = cli.render_deal(body, None, None)
 
     assert "бюджет дела: израсходовано 650 из 1000 токенов / 3 из 10 минут" in printed
@@ -561,7 +561,7 @@ def test_deal_render_says_nothing_without_ceiling(home: Path, client: TestClient
     """Спека без потолка — строки нет: «0 из 0» выдавало бы отсутствие за бюджет."""
     conn = open_store(home)
     deal = make_deal(conn)
-    body = client.get(f"/deal/duty/{deal['id']}").json()
+    body = client.get(f"/deal/{deal['id']}").json()
 
     assert body["budget"] is None
     assert "бюджет дела" not in cli.render_deal(body, None, None)
@@ -571,7 +571,7 @@ def test_attempts_render_prints_total_line(tmp_path: Path, home: Path, client: T
     """`bin/duty attempts` — строка итога после по-попыточного расхода."""
     made = budget_payload(tmp_path, home)
 
-    body = client.get(f"/duty/duty/{made['id']}/attempts").json()
+    body = client.get(f"/duty/{made['id']}/attempts").json()
     printed = cli.render_attempts(body)
 
     assert printed.rstrip().endswith("бюджет дела: израсходовано 650 из 1000 токенов / 3 из 10 минут")
@@ -581,7 +581,7 @@ def test_why_carries_ceiling_numbers(tmp_path: Path, home: Path, client: TestCli
     """`why --json` — та же форма, что `/deal`: числа потолка видны в разборе."""
     made = budget_payload(tmp_path, home)
 
-    body = client.get(f"/deal/duty/{made['id']}").json()
+    body = client.get(f"/deal/{made['id']}").json()
 
     assert json.loads(json.dumps(body["budget"], ensure_ascii=False)) == body["budget"]
     assert body["budget"]["attempts"] == 2

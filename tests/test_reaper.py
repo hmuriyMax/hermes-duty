@@ -283,7 +283,9 @@ def test_orphan_with_expired_lease_is_closed_as_infra(tmp_path: Path) -> None:
     assert len(rows) == 1
     row = rows[0]
     assert row["deal"] == deal["id"]
-    assert row["board"] == "duty"
+    # Доски в адресе нет (0.0.6): дело названо своим id, и «с доски duty» больше
+    # не откуда взять — группировка живёт в `repo` строки store, а не в уборке.
+    assert "board" not in row
     assert row["stage"] == "impl"
     assert row["attempt"] == 1
     assert row["outcome"] == "failed"

@@ -684,7 +684,6 @@ def test_json_report_schema(tmp_path: Path) -> None:
 
     assert set(restored) == {
         "deal",
-        "board",
         "spec",
         "steps",
         "reaped",
@@ -1122,7 +1121,7 @@ def test_cli_run_once_and_deal_show_pool_answer(
     assert "ответов пула дочитано: 1" in out
     assert "question_answered" in kinds(conn, deal)
 
-    assert _cli_run(monkeypatch, home, ["deal", "duty", deal["id"]]) == 0
+    assert _cli_run(monkeypatch, home, ["deal", deal["id"]]) == 0
     card = capsys.readouterr().out
     assert "состояние ожидания: wait_human" not in card, card
     assert "impl#2" in card, "карточка называет попытку, которую поднял ответ"
@@ -1487,7 +1486,7 @@ def test_deal_why_and_run_name_the_same_closure(
     report = run(conn, spec, deal, home, Fake())
     monkeypatch.setenv("HERMES_HOME", str(home))
 
-    payload = cli.api().deal(str(deal.get("repo")), str(deal["id"]))
+    payload = cli.api().deal(str(deal["id"]))
     deal_out = cli.render_deal(payload, None, None)
     why_out = cli.render_why(payload)
     run_out = cli.render_run_final(report)

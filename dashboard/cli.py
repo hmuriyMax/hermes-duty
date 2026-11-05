@@ -1,6 +1,6 @@
 """CLI hermes-duty: тот же бэкенд, что у роутов, но из терминала.
 
-    duty now [--repo R] [--state S]        таблица дел: репозиторий, id, ожидание, возраст
+    duty now [--repo R] [--state S]        дела группами по репозиториям: id, ожидание, возраст
     duty deal <deal_id>                    карточка дела: факты плюс таймлайн попыток
     duty attempts <deal_id>                только таймлайн попыток
     duty stats [--repo R] [--since D]      p50/p90/p99, исходы, «с первой попытки»
@@ -752,8 +752,29 @@ def _now_row(deal: dict[str, Any], now: Any) -> list[Any]:
     ]
 
 
+def _repo_groups(deals: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any]]]]:
+    """Строки среза, сгруппированные по `repo`: сначала названные, потом «без репозитория».
+
+    Группировка — то, чем доска была до 0.0.6: дело адресуется своим id, а
+    показать «чей это рой» можно только репозиторием. Дела без репозитория идут
+    последней группой: это законное состояние, а не пропущенная строка.
+    """
+    named: dict[str, list[dict[str, Any]]] = {}
+    without: list[dict[str, Any]] = []
+    for deal in deals:
+        repo = deal.get("repo")
+        if repo:
+            named.setdefault(str(repo), []).append(deal)
+        else:
+            without.append(deal)
+    groups = [(repo, named[repo]) for repo in sorted(named)]
+    if without:
+        groups.append((WITHOUT_REPO_LABEL, without))
+    return groups
+
+
 def render_now(payload: dict[str, Any]) -> str:
-    """Таблица дел: та же сортировка и те же состояния, что у `/now`."""
+    """Таблица дел по репозиториям: та же сортировка и те же состояния, что у `/now`."""
     lines = [f"ДЕЛА СЕЙЧАС · {_fmt_stamp(payload.get('now'))} · дел: {payload.get('count', 0)}"]
     counted = ", ".join(
         f"{name} {count}" for name, count in (payload.get("by_state") or {}).items() if count
@@ -766,8 +787,10 @@ def render_now(payload: dict[str, Any]) -> str:
         lines.append("")
         lines.append("активных дел нет")
         return "\n".join(lines)
-    lines.append("")
-    lines.append(_table(NOW_COLUMNS, [_now_row(deal, payload.get("now")) for deal in deals]))
+    for repo, group in _repo_groups(deals):
+        lines.append("")
+        lines.append(f"{repo} · дел: {len(group)}")
+        lines.append(_table(NOW_COLUMNS, [_now_row(deal, payload.get("now")) for deal in group]))
     lines.append("")
     lines.append("доказательство целиком: duty why <id> · таймлайн: duty attempts <id>")
     return "\n".join(lines)
@@ -1007,10 +1030,11 @@ def _waiting_head(payload: dict[str, Any]) -> str:
 
 
 def render_deal(payload: dict[str, Any], timeline: Optional[dict[str, Any]], timeline_error: Optional[str]) -> str:
-    """Карточка дела: спецификация, факты ожидания и таймлайн попыток."""
+    """Карточка дела: репозиторий, спецификация, факты ожидания и таймлайн попыток."""
     lines = [
-        "ДЕЛО {} · {} · {} · создано {}".format(
+        "ДЕЛО {} · {} · {} · {} · создано {}".format(
             payload.get("id"),
+            payload.get("repo") or WITHOUT_REPO_LABEL,
             payload.get("status") or "—",
             payload.get("assignee") or "—",
             _fmt_stamp(payload.get("created_at")),
@@ -1900,9 +1924,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             # то же, что видит движок, плюс к форме роута — отдельными ключами
             # (`failures`, `verdict`), чтобы `--json` оставался дословным ответом
             # роута с добавленными фактами, а не второй формой.
-            payload = {**payload, "failures": failure_log(api().hermes_home(), args.task_id)}
+            payload = {**payload, "failures": failure_log(api().hermes_home(), args.deal_id)}
             if args.stage:
-                payload = {**payload, "verdict": stage_verdict(api().hermes_home(), args.task_id, args.stage)}
+                payload = {**payload, "verdict": stage_verdict(api().hermes_home(), args.deal_id, args.stage)}
             _emit_json(payload, out) if args.json else print(render_why(payload), file=out)
             return _payload_code(payload)
         if args.command == "deal":

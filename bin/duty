@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """`bin/duty` — CLI hermes-duty: та же логика, что у роутов, из терминала.
 
-    bin/duty now [--board B] [--state S]
-    bin/duty deal <board> <id>
-    bin/duty attempts <board> <id>
-    bin/duty stats [--board B] [--since D]
-    bin/duty why <board> <id>
-    bin/duty why <board> <id> <этап>   (плюс приговор последней попытки этапа)
+    bin/duty now [--repo R] [--state S]
+    bin/duty deal <deal_id>
+    bin/duty attempts <deal_id>
+    bin/duty stats [--repo R] [--since D]
+    bin/duty why <deal_id>
+    bin/duty why <deal_id> <этап>   (плюс приговор последней попытки этапа)
     bin/duty watch [--interval 10]
     bin/duty run <deal_id> [--spec <duty.yaml>] [--max-steps N] [--once]
                                        (движок доводит дело: решение → шаг → журнал)
@@ -14,6 +14,10 @@
     bin/duty demo [--keep]
     bin/duty spec check <file>   (OK либо file:line: правило: текст; --json — та же форма)
     --json  (глобальный флаг: ровно форма роута)
+
+Дело адресуется своим id `d_<hex>` (0.0.6: доск нет), а группируется по `repo`:
+`now`, `deal` и `stats` печатают группы по репозиториям, «без репозитория» —
+отдельной группой. Параметра доски нет ни у одной команды.
 
 Здесь только запуск: разбор команд, вызовы бэкенда и оформление живут в
 `dashboard/cli.py`, рядом с роутами, которые он использует. Второго набора правил

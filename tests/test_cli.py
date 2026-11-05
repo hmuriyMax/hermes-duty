@@ -1,10 +1,15 @@
 """CLI `bin/duty`: те же функции, что у роутов, и те же коды возврата.
 
+Дело адресуется своим id `d_<hex>` (0.0.6: доск нет) и группируется по `repo`,
+поэтому ни одна команда не берёт сегмент доски: `deal <id>`, `attempts <id>`,
+`why <id> [этап]`, `now [--repo R]`, `stats [--repo R]`.
+
 Проверяется то, что нельзя проверить глазами при ревью и что заявлено в карточке
 W3: `--json` — ровно форма роута (сверка с ответом `/now`, `/stats`, `/deal`,
 `/duty/.../attempts` через `TestClient`), коды 0/1/2 взяты из того, что решил
-роут, `watch` переживает деградацию источников и печатает `errors[]` строкой, а
-ни одна команда ничего не пишет в чужие БД и не создаёт журнал.
+роут, `now`/`deal`/`stats` печатают группы по репозиториям («без репозитория» —
+отдельной группой), а ни одна команда ничего не пишет в чужие БД и не создаёт
+журнал.
 
 Фикстуры свои и маленькие (`tmp_path` + `HERMES_HOME`): живые БД не читаются.
 """
@@ -19,6 +24,7 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import pytest
 from fastapi import FastAPI
@@ -34,51 +40,8 @@ _SPEC.loader.exec_module(cli)
 
 NOW = 1_800_000_000
 
-# Колонки скопированы с живой `kanban.db`: те же, что читают роуты.
-SCHEMA = """
-CREATE TABLE tasks (
-    id                   TEXT PRIMARY KEY,
-    title                TEXT NOT NULL,
-    body                 TEXT,
-    assignee             TEXT,
-    status               TEXT NOT NULL,
-    priority             INTEGER DEFAULT 0,
-    created_at           INTEGER,
-    started_at           INTEGER,
-    completed_at         INTEGER,
-    worker_pid           INTEGER,
-    current_run_id       INTEGER,
-    claim_lock           TEXT,
-    claim_expires        INTEGER,
-    block_kind           TEXT,
-    consecutive_failures INTEGER DEFAULT 0,
-    workspace_kind       TEXT
-);
-CREATE TABLE task_runs (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id           TEXT NOT NULL,
-    profile           TEXT,
-    status            TEXT,
-    outcome           TEXT,
-    error             TEXT,
-    summary           TEXT,
-    started_at        INTEGER,
-    ended_at          INTEGER,
-    worker_pid        INTEGER,
-    last_heartbeat_at INTEGER,
-    claim_lock        TEXT,
-    claim_expires     INTEGER
-);
-CREATE TABLE task_events (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id    TEXT NOT NULL,
-    run_id     INTEGER,
-    kind       TEXT NOT NULL,
-    payload    TEXT,
-    created_at INTEGER
-);
-CREATE TABLE task_links (parent_id TEXT NOT NULL, child_id TEXT NOT NULL);
-"""
+# Группировка дела — `repo`; адрес — свой id `d_<hex>`. Доски в адресе нет.
+REPO = "sx-widgets-api"
 
 # Схема пула: `_pool_questions` читает `status`, `session_key`, `text`, `text_full`,
 # а `ask.answer_of` — текст ответа (`answer`) у запаркованного дела.
@@ -96,70 +59,45 @@ CREATE TABLE questions (
 """
 
 
-def make_board(path: Path, tasks=(), runs=(), events=()) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        path.unlink()
-    conn = sqlite3.connect(path)
-    conn.executescript(SCHEMA)
-    for task in tasks:
-        row = {
-            "id": "t_000001",
-            "title": "дело",
-            "body": "",
-            "assignee": "implementer",
-            "status": "ready",
-            "priority": 0,
-            "created_at": NOW - 3600,
-            "started_at": None,
-            "completed_at": None,
-            "worker_pid": None,
-            "current_run_id": None,
-            "claim_lock": None,
-            "claim_expires": None,
-            "block_kind": None,
-            "consecutive_failures": 0,
-            "workspace_kind": "scratch",
-        }
-        row.update(task)
-        conn.execute(
-            "INSERT INTO tasks (id, title, body, assignee, status, priority, created_at, started_at,"
-            " completed_at, worker_pid, current_run_id, claim_lock, claim_expires, block_kind,"
-            " consecutive_failures, workspace_kind) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            tuple(row.values()),
+def open_store(home: Path) -> sqlite3.Connection:
+    """Соединение своего store: схему и журнал доводит открытие на запись."""
+    conn = cli.api().deals.open_store(home)
+    assert conn is not None
+    return conn
+
+
+def make_deal(
+    home: Path,
+    *,
+    repo: Optional[str] = REPO,
+    title: str = "своё дело",
+    status: str = "ready",
+    created_at: int = NOW - 3600,
+) -> str:
+    """Своё дело в store (`d_<hex>`): у него есть журнал и переходы."""
+    conn = open_store(home)
+    try:
+        made = cli.api().deals.create_deal(
+            conn, repo=repo, title=title, now=created_at
         )
-    for run in runs:
-        row = {
-            "task_id": "t_000001",
-            "profile": "implementer",
-            "status": "done",
-            "outcome": "completed",
-            "error": None,
-            "summary": None,
-            "started_at": NOW - 3000,
-            "ended_at": NOW - 2900,
-            "worker_pid": None,
-            "last_heartbeat_at": None,
-            "claim_lock": None,
-            "claim_expires": None,
-        }
-        row.update(run)
-        conn.execute(
-            "INSERT INTO task_runs (task_id, profile, status, outcome, error, summary, started_at,"
-            " ended_at, worker_pid, last_heartbeat_at, claim_lock, claim_expires)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            tuple(row.values()),
+        deal_id = str(made["deal"]["id"])
+        if status != str(made["deal"]["status"]):
+            with conn:
+                conn.execute("UPDATE deals SET status = ? WHERE id = ?", (status, deal_id))
+    finally:
+        conn.close()
+    return deal_id
+
+
+def block_deal(home: Path, deal_id: str, *, kind: str = "needs_input", reason: str = "нужно решение") -> None:
+    """Заблокировать дело как движок: `blocked` — факт журнала, не поле строки."""
+    conn = open_store(home)
+    try:
+        cli.api().deals.set_blocked(
+            conn, deal_id, kind=kind, reason=reason, author="engine", source="engine", now=NOW - 60
         )
-    for event in events:
-        row = {"task_id": "t_000001", "run_id": None, "kind": "note", "payload": json.dumps({}), "created_at": NOW - 100}
-        row.update(event)
-        conn.execute(
-            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?,?,?,?,?)",
-            tuple(row.values()),
-        )
-    conn.commit()
-    conn.close()
-    return path
+    finally:
+        conn.close()
 
 
 def make_pool(home: Path, rows=()) -> Path:
@@ -188,17 +126,59 @@ def make_pool(home: Path, rows=()) -> Path:
     return path
 
 
+def make_card(home: Path, *, card_id: str = "t_aaa001") -> Path:
+    """Карточка kanban — наблюдение: в срез дел и в статистику она не входит.
+
+    Живёт в фикстуре намеренно: если карточка протечёт в `/now`, `/stats` или в
+    адресацию, тест это увидит.
+    """
+    path = home / "kanban" / "boards" / "b1" / "kanban.db"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, title TEXT, body TEXT,"
+        " assignee TEXT, status TEXT, priority INTEGER DEFAULT 0, created_at INTEGER,"
+        " started_at INTEGER, completed_at INTEGER, worker_pid INTEGER, current_run_id INTEGER,"
+        " claim_lock TEXT, claim_expires INTEGER, block_kind TEXT,"
+        " consecutive_failures INTEGER DEFAULT 0, workspace_kind TEXT);"
+        "CREATE TABLE IF NOT EXISTS task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " task_id TEXT, profile TEXT, status TEXT, outcome TEXT, error TEXT, summary TEXT,"
+        " started_at INTEGER, ended_at INTEGER, worker_pid INTEGER, last_heartbeat_at INTEGER,"
+        " claim_lock TEXT, claim_expires INTEGER);"
+        "CREATE TABLE IF NOT EXISTS task_events (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " task_id TEXT, run_id INTEGER, kind TEXT, payload TEXT, created_at INTEGER);"
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO tasks (id, title, body, assignee, status, created_at, block_kind)"
+        " VALUES (?, 'карточка', '', 'implementer', 'blocked', ?, 'needs_input')",
+        (card_id, NOW - 3600),
+    )
+    conn.commit()
+    conn.close()
+    return path
+
+
 @pytest.fixture()
 def home(tmp_path, monkeypatch):
-    """Пустой корень Hermes с одной доской `b1` и живым (пустым) пулом."""
+    """Корень Hermes: своё заблокированное дело, живой пул и карточка-наблюдение."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    make_board(
-        tmp_path / "kanban" / "boards" / "b1" / "kanban.db",
-        tasks=[{"id": "t_aaa001", "title": "первое дело", "status": "blocked", "block_kind": "needs_input"}],
-        events=[{"task_id": "t_aaa001", "kind": "blocked", "payload": json.dumps({"reason": "нужно решение"})}],
-    )
+    deal_id = make_deal(tmp_path, title="первое дело")
+    block_deal(tmp_path, deal_id)
     make_pool(tmp_path)
+    make_card(tmp_path)
     return tmp_path
+
+
+@pytest.fixture()
+def deal(home):
+    """id единственного дела фикстуры: адрес — он, а не доска."""
+    conn = open_store(home)
+    try:
+        rows = cli.api().deals.deal_rows(conn, open_only=False)
+    finally:
+        conn.close()
+    assert len(rows) == 1
+    return str(rows[0]["id"])
 
 
 @pytest.fixture()
@@ -226,7 +206,7 @@ def run(argv, capsys):
 # ------------------------------------------------------------------ одна форма
 
 
-def test_now_json_is_exactly_the_route_payload(home, client, frozen_now, capsys):
+def test_now_json_is_exactly_the_route_payload(home, deal, client, frozen_now, capsys):
     code, out, _ = run(["now", "--json"], capsys)
     from_cli = json.loads(out)
     from_route = client.get("/now").json()
@@ -234,43 +214,42 @@ def test_now_json_is_exactly_the_route_payload(home, client, frozen_now, capsys)
     assert code == 0
     assert from_cli == from_route
     assert from_cli["count"] == 1
-    assert from_cli["deals"][0]["id"] == "t_aaa001"
+    assert from_cli["deals"][0]["id"] == deal
+    # Группировка — по репозиторию; карточка kanban в срез не входит.
+    assert from_cli["repos"]["list"] == [{"repo": REPO, "deals": 1}]
 
 
-def test_now_json_honours_board_and_state_filters(home, client, frozen_now, capsys):
-    code, out, _ = run(["now", "--repo", "b1", "--state", "wait_human", "--json"], capsys)
+def test_now_json_honours_repo_and_state_filters(home, deal, client, frozen_now, capsys):
+    code, out, _ = run(["now", "--repo", REPO, "--state", "wait_human", "--json"], capsys)
     assert code == 0
-    assert json.loads(out) == client.get("/now", params={"repo": "b1", "state": "wait_human"}).json()
+    assert json.loads(out) == client.get("/now", params={"repo": REPO, "state": "wait_human"}).json()
 
 
-def test_stats_json_is_exactly_the_route_payload(home, client, frozen_now, capsys):
+def test_stats_json_is_exactly_the_route_payload(home, deal, client, frozen_now, capsys):
     code, out, _ = run(["stats", "--json"], capsys)
     assert code == 0
     assert json.loads(out) == client.get("/stats").json()
 
 
-def test_stats_json_passes_board_and_since_to_the_same_function(home, client, frozen_now, capsys):
-    since = NOW - 60
-    code, out, _ = run(["stats", "--repo", "b1", "--since", str(since), "--json"], capsys)
+def test_stats_json_passes_repo_and_since_to_the_same_function(home, deal, client, frozen_now, capsys):
+    since = NOW - 7200
+    code, out, _ = run(["stats", "--repo", REPO, "--since", str(since), "--json"], capsys)
     assert code == 0
-    assert json.loads(out) == client.get("/stats", params={"repo": "b1", "since": since}).json()
+    assert json.loads(out) == client.get("/stats", params={"repo": REPO, "since": since}).json()
 
 
-def test_deal_json_is_exactly_the_route_payload(home, client, frozen_now, capsys):
-    code, out, _ = run(["deal", "b1", "t_aaa001", "--json"], capsys)
+def test_deal_json_is_exactly_the_route_payload(home, deal, client, frozen_now, capsys):
+    code, out, _ = run(["deal", deal, "--json"], capsys)
     assert code == 0
-    assert json.loads(out) == client.get("/deal/b1/t_aaa001").json()
+    assert json.loads(out) == client.get(f"/deal/{deal}").json()
 
 
 def test_attempts_json_is_exactly_the_route_payload(home, client, frozen_now, capsys):
-    make_board(
-        home / "kanban" / "boards" / "b1" / "kanban.db",
-        tasks=[{"id": "t_aaa001", "title": "первое дело", "status": "review"}],
-        runs=[{"task_id": "t_aaa001", "status": "awaiting_merge", "outcome": "completed", "summary": "готово"}],
-    )
-    code, out, _ = run(["attempts", "b1", "t_aaa001", "--json"], capsys)
+    deal_id = make_deal(home, title="дело с попытками")
+    write_three_attempts(home, deal_id)
+    code, out, _ = run(["attempts", deal_id, "--json"], capsys)
     assert code == 0
-    assert json.loads(out) == client.get("/duty/b1/t_aaa001/attempts").json()
+    assert json.loads(out) == client.get(f"/duty/{deal_id}/attempts").json()
 
 
 # Ключи, которые `why` добавляет к форме роута: факты журнала, которых в роуте
@@ -279,34 +258,71 @@ def test_attempts_json_is_exactly_the_route_payload(home, client, frozen_now, ca
 WHY_EXTRA_KEYS = ("verdict", "failures")
 
 
-def test_why_json_is_the_deal_route_payload(home, client, frozen_now, capsys):
-    code, out, _ = run(["why", "b1", "t_aaa001", "--json"], capsys)
+def test_why_json_is_the_deal_route_payload(home, deal, client, frozen_now, capsys):
+    code, out, _ = run(["why", deal, "--json"], capsys)
     assert code == 0
     payload = json.loads(out)
-    route = client.get("/deal/b1/t_aaa001").json()
+    route = client.get(f"/deal/{deal}").json()
     assert {key: value for key, value in payload.items() if key not in WHY_EXTRA_KEYS} == route
     assert payload["failures"]["found"] is False
-    assert payload["failures"]["note"].startswith("журнала ещё нет")
+    assert payload["failures"]["note"].startswith("спеки в журнале нет")
 
 
-def test_json_flag_works_before_the_command_too(home, client, frozen_now, capsys):
+def test_json_flag_works_before_the_command_too(home, deal, client, frozen_now, capsys):
     code, out, _ = run(["--json", "now"], capsys)
     assert code == 0
     assert json.loads(out) == client.get("/now").json()
 
 
+def test_deal_is_addressed_by_id_only(home, deal, client, frozen_now, capsys):
+    """Красная проба B1b: вернуть `board` в адресацию — и этот тест падает.
+
+    Дело адресуется своим id: `/deal/{deal_id}` и `/duty/{deal_id}/attempts`
+    отвечают, а сегмента доски в адресе нет ни у одной ручки. Группировка
+    называется `repo`; старый `?board=` — отказ с подсказкой, а не синоним, и
+    CLI не принимает ни сегмент доски, ни флаг `--board`.
+    """
+    # 1) адрес — id, и только он
+    assert client.get(f"/deal/{deal}").status_code == 200
+    assert client.get(f"/duty/{deal}/attempts").status_code == 200
+
+    # 2) сегмент доски в адресе — не ручка (404), а не второй способ адресовать:
+    #    алиас вернул бы 200 и две правды об одном деле.
+    assert client.get(f"/deal/{REPO}/{deal}").status_code == 404
+    assert client.get(f"/duty/{REPO}/{deal}/attempts").status_code == 404
+
+    # 3) `?board=` — отказ с подсказкой, а не молчаливый синоним `?repo=`
+    for path in ("/now", "/stats"):
+        refused = client.get(path, params={"board": REPO})
+        assert refused.status_code == 400, path
+        assert "repo" in refused.json()["detail"], path
+        assert refused.json() != client.get(path).json(), path
+
+    # 4) CLI: лишнее слово (доска) перед id — ошибка разбора, а не второй адрес
+    with pytest.raises(SystemExit) as extra:
+        run(["deal", REPO, deal], capsys)
+    assert extra.value.code == cli.EXIT_SOURCE
+
+    # 5) `--board` не принимается ни одной командой, `--repo` — принимается
+    with pytest.raises(SystemExit) as flag:
+        run(["now", "--board", REPO], capsys)
+    assert flag.value.code == cli.EXIT_SOURCE
+    assert run(["now", "--repo", REPO, "--json"], capsys)[0] == cli.EXIT_OK
+
+
 # ------------------------------------------------------------------- коды 0/1/2
 
 
-def test_missing_board_is_code_1(home, capsys):
+def test_missing_repo_is_code_1(home, deal, capsys):
     code, out, err = run(["now", "--repo", "nope"], capsys)
     assert code == cli.EXIT_NOT_FOUND
     assert out == ""
-    assert "not found" in err
+    assert "не назван ни одним делом" in err
 
 
-def test_missing_task_is_code_1(home, capsys):
-    for argv in (["deal", "b1", "t_zzz"], ["attempts", "b1", "t_zzz"], ["why", "b1", "t_zzz"]):
+def test_missing_deal_is_code_1(home, deal, capsys):
+    # `d_ffffffff` — форма своего id, которого нет в store: 404 → код 1.
+    for argv in (["deal", "d_ffffffff"], ["attempts", "d_ffffffff"], ["why", "d_ffffffff"]):
         code, _, err = run(argv, capsys)
         assert code == cli.EXIT_NOT_FOUND
         assert "not found" in err
@@ -318,41 +334,38 @@ def test_unknown_state_is_code_2(home, capsys):
     assert "unknown state" in err
 
 
-def test_unreadable_board_is_code_2(home, capsys):
-    (home / "kanban" / "boards" / "broken").mkdir()
-    (home / "kanban" / "boards" / "broken" / "kanban.db").write_bytes(b"not a database")
+def test_unreadable_store_is_code_2(home, deal, capsys):
+    (home / "duty" / "duty.db").write_bytes(b"not a database")
     code, out, _ = run(["now", "--json"], capsys)
     payload = json.loads(out)
 
-    # Ответ приходит (роут отвечает 200), но часть источников не прочитана — код 2.
+    # Ответ приходит (роут отвечает 200), но источник не прочитан — код 2.
     assert code == cli.EXIT_SOURCE
-    assert any(error["board"] == "broken" for error in payload["errors"])
-    assert payload["count"] == 1
+    assert any(error["source"] == "duty/duty.db" for error in payload["errors"])
+    assert payload["count"] == 0
 
 
-def test_unreadable_board_on_stats_is_code_2(home, capsys):
-    (home / "kanban" / "boards" / "broken").mkdir()
-    (home / "kanban" / "boards" / "broken" / "kanban.db").write_bytes(b"not a database")
+def test_unreadable_store_on_stats_is_code_2(home, deal, capsys):
+    (home / "duty" / "duty.db").write_bytes(b"not a database")
     code, _, _ = run(["stats", "--json"], capsys)
     assert code == cli.EXIT_SOURCE
 
 
-def test_degradation_is_named_in_text_output_not_only_in_json(home, capsys):
-    (home / "kanban" / "boards" / "broken").mkdir()
-    (home / "kanban" / "boards" / "broken" / "kanban.db").write_bytes(b"not a database")
+def test_degradation_is_named_in_text_output_not_only_in_json(home, deal, capsys):
+    (home / "messaging" / "pool.db").unlink()
     code, out, _ = run(["now"], capsys)
 
     assert code == cli.EXIT_SOURCE
-    assert "! источник broken" in out
-    assert "t_aaa001" in out  # дела читаемых досок напечатаны, ответ не потерян
+    assert "! источник messaging/pool.db" in out
+    assert deal in out  # дела читаемого store напечатаны, ответ не потерян
 
 
-def test_clean_home_without_pool_reports_source_error(home, capsys):
+def test_clean_home_without_pool_reports_source_error(home, deal, capsys):
     (home / "messaging" / "pool.db").unlink()
     code, out, _ = run(["now", "--json"], capsys)
     payload = json.loads(out)
     assert code == cli.EXIT_SOURCE
-    assert any("pool.db" in error["board"] for error in payload["errors"])
+    assert any("pool.db" in error["source"] for error in payload["errors"])
 
 
 def test_since_accepts_unix_and_iso_date():
@@ -370,53 +383,69 @@ def test_bad_since_is_a_usage_error(capsys):
 # ------------------------------------------------------------------ текст команд
 
 
-def test_now_prints_the_columns_from_the_card(home, frozen_now, capsys):
+def test_now_prints_the_columns_and_the_repo_group(home, deal, frozen_now, capsys):
     code, out, _ = run(["now"], capsys)
     assert code == 0
-    for header in ("ДОСКА", "ID", "ОЖИДАНИЕ", "ВОЗРАСТ", "ДОКАЗАТЕЛЬСТВО"):
+    for header in ("РЕПОЗИТОРИЙ", "ID", "ОЖИДАНИЕ", "ВОЗРАСТ", "ДОКАЗАТЕЛЬСТВО"):
         assert header in out
-    assert "t_aaa001" in out
-    assert "wait_human/status" in out
-    assert "status=blocked" in out  # доказательство — текст бэкенда, не пересказ CLI
+    assert f"{REPO} · дел: 1" in out  # группировка по репозиторию, а не по доске
+    assert deal in out
+    assert "t_aaa001" not in out, "карточка kanban — наблюдение, в срез дел не входит"
+    assert "wait_human" in out
+    assert "block_kind=needs_input" in out  # доказательство — текст бэкенда, не пересказ CLI
+
+
+def test_now_groups_deals_without_repo_as_its_own_group(home, deal, frozen_now, capsys):
+    """«Без репозитория» — отдельная группа после названных, а не пропущенная строка."""
+    bare = make_deal(home, repo=None, title="дело без репозитория")
+
+    code, out, _ = run(["now"], capsys)
+
+    assert code == 0
+    lines = out.splitlines()
+    named_at = next(i for i, line in enumerate(lines) if line.startswith(f"{REPO} · дел:"))
+    bare_at = next(i for i, line in enumerate(lines) if line.startswith("без репозитория · дел:"))
+    assert named_at < bare_at
+    assert "без репозитория · дел: 1" in out
+    assert bare in out
+
+
+def test_now_repo_filter_shows_one_group(home, deal, frozen_now, capsys):
+    make_deal(home, repo=None, title="дело без репозитория")
+
+    code, out, _ = run(["now", "--repo", ""], capsys)
+
+    assert code == 0
+    headers = [line for line in out.splitlines() if " · дел: " in line and not line.startswith("ДЕЛА СЕЙЧАС")]
+    assert headers == ["без репозитория · дел: 1"]  # ровно одна группа — выбранная
 
 
 def test_deal_prints_facts_and_attempt_timeline(home, frozen_now, capsys):
-    make_board(
-        home / "kanban" / "boards" / "b1" / "kanban.db",
-        tasks=[{"id": "t_aaa001", "title": "первое дело", "status": "review", "assignee": "tester"}],
-        runs=[
-            {"task_id": "t_aaa001", "status": "done", "outcome": "crashed", "error": "boom"},
-            {"task_id": "t_aaa001", "status": "awaiting_merge", "outcome": "completed", "summary": "готово"},
-        ],
-        events=[{"task_id": "t_aaa001", "run_id": 2, "kind": "worker_bound", "created_at": NOW - 50}],
-    )
-    code, out, _ = run(["deal", "b1", "t_aaa001"], capsys)
+    deal_id = make_deal(home, title="дело с попытками")
+    write_three_attempts(home, deal_id)
+
+    code, out, _ = run(["deal", deal_id], capsys)
 
     assert code == 0
+    assert f"ДЕЛО {deal_id} · {REPO}" in out  # группировка дела названа в шапке
     assert "попытка:" in out
     assert "лизинг:" in out
     assert "ПОПЫТКИ" in out
-    # Исход попытки и её ошибка — из `task_runs` доски; формат строки один на оба
-    # пространства дел (`W18`): исход (длительность).
-    assert "crashed (1 мин 40 с)" in out
-    assert "ошибка: boom" in out
-    assert "итог: готово" in out
-    assert "worker_bound" in out
+    # Попытка — факт журнала: этап и номер, исход (длительность), причина.
+    assert "impl#1 · implementer · done (1 мин 40 с)" in out
+    assert "review#1 · reviewer · failed(contract)" in out
+    assert "причина: result.json нет" in out
 
 
 def test_attempts_prints_only_the_timeline(home, frozen_now, capsys):
-    make_board(
-        home / "kanban" / "boards" / "b1" / "kanban.db",
-        tasks=[{"id": "t_aaa001", "title": "первое дело", "status": "review"}],
-        runs=[{"task_id": "t_aaa001", "status": "done", "outcome": "completed"}],
-    )
-    code, out, _ = run(["attempts", "b1", "t_aaa001"], capsys)
+    deal_id = make_deal(home, title="дело с попытками")
+    write_three_attempts(home, deal_id)
+
+    code, out, _ = run(["attempts", deal_id], capsys)
 
     assert code == 0
     assert out.startswith("ПОПЫТКИ")
     assert "лизинг:" not in out
-
-
 # ------------------------------- попытки своего дела в консоли (W18)
 #
 # Таймлайн своего дела строится по журналу: консоль печатает этап и номер,
@@ -436,7 +465,7 @@ def write_three_attempts(home: Path, deal_id: str) -> None:
             [
                 {
                     "deal_id": deal_id,
-                    "repo": "b1",
+                    "repo": REPO,
                     "kind": kind,
                     "ts": ts,
                     "recorded_at": ts,
@@ -485,10 +514,10 @@ def test_attempts_json_of_own_deal_is_exactly_the_route_payload(home, client, fr
     deal_id = own_deal(home)
     write_three_attempts(home, deal_id)
 
-    code, out, _ = run(["attempts", "b1", deal_id, "--json"], capsys)
+    code, out, _ = run(["attempts", deal_id, "--json"], capsys)
 
     assert code == 0
-    assert json.loads(out) == client.get(f"/duty/b1/{deal_id}/attempts").json()
+    assert json.loads(out) == client.get(f"/duty/{deal_id}/attempts").json()
 
 
 def test_attempts_of_own_deal_prints_stage_outcome_reason_and_short_sha(home, frozen_now, capsys):
@@ -496,7 +525,7 @@ def test_attempts_of_own_deal_prints_stage_outcome_reason_and_short_sha(home, fr
     deal_id = own_deal(home)
     write_three_attempts(home, deal_id)
 
-    code, out, _ = run(["attempts", "b1", deal_id], capsys)
+    code, out, _ = run(["attempts", deal_id], capsys)
 
     assert code == 0
     assert out.startswith("ПОПЫТКИ")
@@ -512,7 +541,7 @@ def test_attempts_of_own_deal_without_attempts_prints_the_note(home, frozen_now,
     """Пустой таймлайн своего дела называет настоящую причину, а не «спавна нет»."""
     deal_id = own_deal(home)
 
-    code, out, _ = run(["attempts", "b1", deal_id], capsys)
+    code, out, _ = run(["attempts", deal_id], capsys)
 
     assert code == 0
     assert "попыток не было" in out
@@ -538,7 +567,7 @@ def test_published_fact_is_shown_by_deal_now_and_attempts(home, frozen_now, caps
             [
                 {
                     "deal_id": deal_id,
-                    "repo": "b1",
+                    "repo": REPO,
                     "kind": "published",
                     "ts": NOW - 100,
                     "recorded_at": NOW - 100,
@@ -559,7 +588,7 @@ def test_published_fact_is_shown_by_deal_now_and_attempts(home, frozen_now, caps
     finally:
         conn.close()
 
-    code, out, _ = run(["deal", "b1", deal_id], capsys)
+    code, out, _ = run(["deal", deal_id], capsys)
 
     assert code == cli.EXIT_OK
     line = next(item for item in out.splitlines() if item.startswith("опубликовано:"))
@@ -584,7 +613,7 @@ def test_now_prints_a_dash_when_nothing_was_published(home, frozen_now, capsys):
     deal_id = own_deal(home)
     write_three_attempts(home, deal_id)
 
-    code, out, _ = run(["deal", "b1", deal_id], capsys)
+    code, out, _ = run(["deal", deal_id], capsys)
 
     assert code == cli.EXIT_OK
     assert "опубликовано:" not in out
@@ -612,7 +641,7 @@ def start_live_attempt(
             [
                 {
                     "deal_id": deal_id,
-                    "repo": "b1",
+                    "repo": REPO,
                     "kind": "attempt_started",
                     "ts": started_at,
                     "recorded_at": started_at,
@@ -643,7 +672,7 @@ def test_deal_of_own_deal_with_live_attempt_does_not_say_attempt_absent(home, fr
     deal_id = own_deal(home)
     start_live_attempt(home, deal_id, pid=os.getpid(), started_at=NOW - 60, expires_at=NOW + 600)
 
-    code, out, _ = run(["deal", "b1", deal_id], capsys)
+    code, out, _ = run(["deal", deal_id], capsys)
 
     assert code == cli.EXIT_OK
     assert "попытка: нет" not in out
@@ -664,36 +693,44 @@ def test_deal_of_own_deal_with_live_attempt_does_not_say_attempt_absent(home, fr
 
 
 def test_terminal_deal_has_no_invented_waiting_state(home, frozen_now, capsys):
-    make_board(
-        home / "kanban" / "boards" / "b1" / "kanban.db",
-        tasks=[{"id": "t_done01", "title": "закрытое дело", "status": "done"}],
-    )
-    code, out, _ = run(["deal", "b1", "t_done01"], capsys)
+    """Закрытое дело: состояние ожидания не выдумывается, назван факт закрытия."""
+    deal_id = own_deal(home, title="закрытое дело")
+    conn = cli.api().deals.open_store(home)
+    assert conn is not None
+    try:
+        cli.api().deals.close_deal(conn, deal_id, reason="не нужно", now=NOW - 30)
+    finally:
+        conn.close()
+
+    code, out, _ = run(["deal", deal_id], capsys)
     assert code == 0
-    assert "не считается: дело закрыто" in out
+    assert "закрыто —" in out and "status=done" in out
 
-    code, out, _ = run(["why", "b1", "t_done01"], capsys)
+    code, out, _ = run(["why", deal_id], capsys)
     assert code == 0
-    assert "доказательство: не записано" in out
+    # У закрытого дела состояния ожидания нет: `why` называет записанный факт
+    # закрытия, а не выдуманное ожидание и не пустоту.
+    assert "состояние ожидания: закрыто — completed" in out
+    assert "cause=closed_by_human" in out
 
 
-def test_why_prints_backend_evidence_verbatim(home, frozen_now, capsys):
-    code, out, _ = run(["why", "b1", "t_aaa001"], capsys)
-    evidence = cli.api().deal("b1", "t_aaa001")["deal"]["waiting"]["evidence"]
+def test_why_prints_backend_evidence_verbatim(home, deal, frozen_now, capsys):
+    code, out, _ = run(["why", deal], capsys)
+    evidence = cli.api().deal(deal)["deal"]["waiting"]["evidence"]
 
     assert code == 0
     assert evidence in out  # доказательство — слова бэкенда, CLI его не переписывает
     assert "факты, из которых оно собрано:" in out
 
 
-def seed_attempt(home: Path, *, deal_id: str = "t_aaa001", stage: str = "impl", attempt: int = 1) -> None:
+def seed_attempt(home: Path, *, deal_id: str, stage: str = "impl", attempt: int = 1) -> None:
     """Факты попытки в журнал плагина: `why <этап>` читает именно их."""
     journal = cli._load_journal()
     conn = journal.open_journal(home)
     assert conn is not None
     base = {
         "deal_id": deal_id,
-        "repo": "b1",
+        "repo": REPO,
         "source": "engine",
     }
     event = {
@@ -718,7 +755,7 @@ def seed_attempt(home: Path, *, deal_id: str = "t_aaa001", stage: str = "impl", 
             "kind": "contract",
             "reason": "result.json:evidence[0].exit: evidence.exit: exit=1, а объявлен must=0",
             "details": {
-                "workdir": str(home / "kanban" / "boards" / "b1" / "workspaces" / f"{deal_id}-{stage}-{attempt}"),
+                "workdir": str(home / "worktrees" / f"{deal_id}-{stage}-{attempt}"),
                 "verdict": {
                     "ok": False,
                     "kind": "contract",
@@ -736,8 +773,9 @@ def seed_attempt(home: Path, *, deal_id: str = "t_aaa001", stage: str = "impl", 
 
 
 def test_why_with_stage_prints_last_attempt_and_verdict(home, frozen_now, capsys):
-    seed_attempt(home)
-    code, out, _ = run(["why", "b1", "t_aaa001", "impl"], capsys)
+    deal_id = own_deal(home)
+    seed_attempt(home, deal_id=deal_id)
+    code, out, _ = run(["why", deal_id, "impl"], capsys)
 
     assert code == 0
     assert "последняя попытка этапа impl:" in out
@@ -749,27 +787,30 @@ def test_why_with_stage_prints_last_attempt_and_verdict(home, frozen_now, capsys
 
 
 def test_why_with_stage_reports_the_last_one_when_there_were_many(home, frozen_now, capsys):
-    seed_attempt(home, attempt=1)
-    seed_attempt(home, attempt=2)
-    code, out, _ = run(["why", "b1", "t_aaa001", "impl"], capsys)
+    deal_id = own_deal(home)
+    seed_attempt(home, deal_id=deal_id, attempt=1)
+    seed_attempt(home, deal_id=deal_id, attempt=2)
+    code, out, _ = run(["why", deal_id, "impl"], capsys)
     assert code == 0
     assert "попытка #2" in out
 
 
 def test_why_with_stage_says_when_attempts_are_missing(home, frozen_now, capsys):
-    code, out, _ = run(["why", "b1", "t_aaa001", "impl"], capsys)
+    deal_id = own_deal(home)
+    code, out, _ = run(["why", deal_id, "impl"], capsys)
     assert code == 0
     assert "последняя попытка этапа impl:" in out
-    assert "журнала ещё нет" in out
+    assert "в журнале нет попыток этапа impl" in out
 
 
 def test_why_json_with_stage_adds_verdict_without_touching_the_route_form(home, client, frozen_now, capsys):
-    seed_attempt(home)
-    code, out, _ = run(["why", "b1", "t_aaa001", "impl", "--json"], capsys)
+    deal_id = own_deal(home)
+    seed_attempt(home, deal_id=deal_id)
+    code, out, _ = run(["why", deal_id, "impl", "--json"], capsys)
     payload = json.loads(out)
 
     assert code == 0
-    route = client.get("/deal/b1/t_aaa001").json()
+    route = client.get(f"/deal/{deal_id}").json()
     assert {key: value for key, value in payload.items() if key not in WHY_EXTRA_KEYS} == route
     assert payload["verdict"]["attempt"] == 1
     assert payload["verdict"]["kind"] == "contract"
@@ -781,17 +822,67 @@ def test_why_json_with_stage_adds_verdict_without_touching_the_route_form(home, 
     assert payload["failures"]["items"][-1]["counter"] == "1/1 contract"
 
 
+def attempt_of(home: Path, deal_id: str, *, stage: str, number: int, started_at: int,
+               ended_at: Optional[int], outcome: str = "done") -> None:
+    """Попытка этапа в журнале — той же формой, что пишет движок."""
+    journal_module = cli._load_journal()
+    conn = cli.api().deals.open_store(home)
+    assert conn is not None
+    run_id = f"{deal_id}:{stage}#{number}"
+    events = [
+        {
+            "deal_id": deal_id,
+            "repo": REPO,
+            "kind": "attempt_started",
+            "ts": started_at,
+            "recorded_at": started_at,
+            "source": "engine",
+            "payload": {
+                "run_id": run_id,
+                "stage": stage,
+                "attempt": number,
+                "pid": None,
+                "lease_expires": None,
+                "contract": {"role": "implementer"},
+            },
+            "idempotency_key": f"test:{deal_id}:{stage}:{number}:started",
+        }
+    ]
+    if ended_at is not None:
+        events.append(
+            {
+                "deal_id": deal_id,
+                "repo": REPO,
+                "kind": "attempt_ended",
+                "ts": ended_at,
+                "recorded_at": ended_at,
+                "source": "engine",
+                "payload": {
+                    "run_id": run_id,
+                    "stage": stage,
+                    "attempt": number,
+                    "outcome": outcome,
+                    "kind": None,
+                    "reason": "",
+                    "base": None,
+                    "commit": None,
+                },
+                "idempotency_key": f"test:{deal_id}:{stage}:{number}:ended",
+            }
+        )
+    try:
+        journal_module.append(conn, events)
+    finally:
+        conn.close()
+
+
 def test_stats_prints_percentiles_and_first_try(home, frozen_now, capsys):
-    make_board(
-        home / "kanban" / "boards" / "b1" / "kanban.db",
-        tasks=[
-            {"id": "t_aaa001", "title": "раз", "status": "done", "created_at": NOW - 100},
-            {"id": "t_bbb002", "title": "два", "status": "done", "created_at": NOW - 200},
-        ],
-        runs=[
-            {"task_id": "t_aaa001", "status": "done", "outcome": "completed", "started_at": NOW - 90},
-            {"task_id": "t_bbb002", "status": "done", "outcome": "crashed", "started_at": NOW - 190},
-        ],
+    """Здоровье по журналу своего store: доля этапов с первой попытки и ожидание."""
+    first = make_deal(home, title="раз", created_at=NOW - 100)
+    second = make_deal(home, title="два", created_at=NOW - 200)
+    attempt_of(home, first, stage="impl", number=1, started_at=NOW - 90, ended_at=NOW - 80)
+    attempt_of(
+        home, second, stage="impl", number=1, started_at=NOW - 190, ended_at=NOW - 180, outcome="crashed"
     )
     code, out, _ = run(["stats"], capsys)
 
@@ -799,28 +890,24 @@ def test_stats_prints_percentiles_and_first_try(home, frozen_now, capsys):
     assert "p50" in out and "p90" in out
     assert "с первой попытки: 1/2 (50%)" in out
     assert "crashed 1" in out
+    assert f"{REPO}" in out  # группировка по репозиторию
 
 
 def test_stats_since_counts_only_deals_created_after_it(home, frozen_now, capsys):
-    make_board(
-        home / "kanban" / "boards" / "b1" / "kanban.db",
-        tasks=[
-            {"id": "t_old001", "title": "старое", "status": "done", "created_at": NOW - 10_000},
-            {"id": "t_new001", "title": "новое", "status": "done", "created_at": NOW - 100},
-        ],
-        runs=[
-            {"task_id": "t_old001", "status": "done", "outcome": "completed", "started_at": NOW - 9_000},
-            {"task_id": "t_new001", "status": "done", "outcome": "crashed", "started_at": NOW - 90},
-        ],
+    old = make_deal(home, title="старое", created_at=NOW - 10_000)
+    new = make_deal(home, title="новое", created_at=NOW - 100)
+    attempt_of(home, old, stage="impl", number=1, started_at=NOW - 9_000, ended_at=NOW - 8_900)
+    attempt_of(
+        home, new, stage="impl", number=1, started_at=NOW - 90, ended_at=NOW - 80, outcome="crashed"
     )
     full = cli.api().stats()
     windowed = cli.api().stats(since=NOW - 1000)
 
-    assert full["totals"]["tasks_total"] == 2
-    assert windowed["totals"]["tasks_total"] == 1
-    assert windowed["totals"]["runs_by_outcome"] == {"crashed": 1}
-    assert windowed["totals"]["first_try"] == {"ok": 0, "with_runs": 1, "share": 0.0}
-    # Ожидание пересчитано по окну (10 с), а не взято из полного среза (10 и 1000 с):
+    assert full["totals"]["deals"] == 3  # дело фикстуры плюс старое и новое
+    assert windowed["totals"]["deals"] == 1
+    assert windowed["totals"]["attempts_by_outcome"] == {"crashed": 1}
+    assert windowed["totals"]["first_try"] == {"ok": 0, "closed": 1, "share": 0.0}
+    # Ожидание пересчитано по окну (10 с), а не взято из полного среза (100 и 1000 с):
     # p90 полной выборки — 1000 с, у окна — 10 с.
     assert full["totals"]["waiting_sec"]["p90"] == 1000
     assert windowed["totals"]["waiting_sec"]["p90"] == 10
@@ -830,32 +917,31 @@ def test_stats_since_counts_only_deals_created_after_it(home, frozen_now, capsys
 # ----------------------------------------------------------------------- watch
 
 
-def test_watch_redraws_every_tick(home, frozen_now):
+def test_watch_redraws_every_tick(home, deal, frozen_now):
     stream = io.StringIO()
     code = cli.run_watch(interval=0, ticks=2, stream=stream)
     body = stream.getvalue()
 
     assert code == cli.EXIT_OK
     assert body.count("ДЕЛА СЕЙЧАС") == 2
-    assert "t_aaa001" in body
+    assert deal in body
 
 
-def test_watch_survives_source_degradation(home, frozen_now):
-    (home / "kanban" / "boards" / "broken").mkdir()
-    (home / "kanban" / "boards" / "broken" / "kanban.db").write_bytes(b"not a database")
+def test_watch_survives_source_degradation(home, deal, frozen_now):
+    (home / "messaging" / "pool.db").unlink()
     stream = io.StringIO()
 
     code = cli.run_watch(interval=0, ticks=2, stream=stream)
     body = stream.getvalue()
 
-    # Деградация не роняет тик: причина строкой, дела остальных досок напечатаны.
+    # Деградация не роняет тик: причина строкой, дела store напечатаны.
     assert code == cli.EXIT_OK
     assert body.count("ДЕЛА СЕЙЧАС") == 2
-    assert "! источник broken" in body
-    assert "t_aaa001" in body
+    assert "! источник messaging/pool.db" in body
+    assert deal in body
 
 
-def test_watch_of_missing_board_exits_1_instead_of_looping(home, capsys):
+def test_watch_of_missing_repo_exits_1_instead_of_looping(home, capsys):
     # `ticks` — страховка теста: если сопоставление 404 сломается, прогон кончится
     # тремя тиками с кодом 0, а не зависанием.
     code = cli.run_watch(interval=0, repo="nope", ticks=3, stream=io.StringIO())
@@ -933,27 +1019,29 @@ def test_watch_json_keeps_stdout_parsable_on_source_degradation(home, frozen_now
 # ---------------------------------------------------------- чтение без записи
 
 
-def test_no_command_writes_to_foreign_databases(home, frozen_now, monkeypatch):
+def test_no_command_writes_to_foreign_databases(home, deal, frozen_now, monkeypatch):
+    """Читающие команды не пишут ни в карточки, ни в пул, ни в свой журнал."""
     board = home / "kanban" / "boards" / "b1" / "kanban.db"
     pool = home / "messaging" / "pool.db"
-    board_before = board.stat().st_mtime_ns
-    pool_before = pool.stat().st_mtime_ns
     journal = home / "duty" / "duty.db"
+    board_before = board.read_bytes()
+    pool_before = pool.read_bytes()
+    journal_before = journal.read_bytes()
 
     for argv in (
         ["now"],
         ["now", "--json"],
-        ["deal", "b1", "t_aaa001"],
-        ["attempts", "b1", "t_aaa001"],
-        ["why", "b1", "t_aaa001"],
+        ["deal", deal],
+        ["attempts", deal],
+        ["why", deal],
         ["stats"],
     ):
         monkeypatch.setattr(sys, "stdout", io.StringIO())
         cli.main(argv)
 
-    assert board.stat().st_mtime_ns == board_before
-    assert pool.stat().st_mtime_ns == pool_before
-    assert not journal.exists()  # CLI не «включает» журнал как побочный эффект
+    assert board.read_bytes() == board_before, "карточки kanban — только чтение"
+    assert pool.read_bytes() == pool_before, "пул вопросов — только чтение"
+    assert journal.read_bytes() == journal_before, "чтение дописало факты в журнал"
 
 
 def test_help_without_command_is_not_an_error(capsys):
@@ -973,8 +1061,12 @@ ANSWER = "stop: прогон закрыт координатором — это 
 
 
 def own_deal(home: Path, *, title: str = "своё дело") -> str:
-    """Своё дело в store (`d_<hex>`): у него есть журнал и переходы."""
-    payload = cli.api().deals_create(home, {"repo": "b1", "title": title}, source="cli")
+    """Своё дело в store (`d_<hex>`) в репозитории фикстуры — через тот же роут.
+
+    Путь тот же, что у `bin/duty create`: тесты мутаций проверяют CLI, а не
+    второй способ завести дело.
+    """
+    payload = cli.api().deals_create(home, {"repo": REPO, "title": title}, source="cli")
     return str(payload["id"])
 
 
@@ -995,7 +1087,7 @@ def park_deal(home: Path, deal_id: str, *, question_id: int = 293, answer: str =
             [
                 {
                     "deal_id": deal_id,
-                    "repo": "b1",
+                    "repo": REPO,
                     "kind": "question_asked",
                     "ts": NOW - 30,
                     "recorded_at": NOW - 30,
@@ -1030,7 +1122,7 @@ def park_deal(home: Path, deal_id: str, *, question_id: int = 293, answer: str =
             [
                 {
                     "deal_id": deal_id,
-                    "repo": "b1",
+                    "repo": REPO,
                     "kind": "question_answered",
                     "ts": NOW - 10,
                     "recorded_at": NOW - 10,
@@ -1191,7 +1283,7 @@ def test_answer_text_is_not_a_command(home, frozen_now, capsys):
     deal_id = own_deal(home)
     park_deal(home, deal_id, answer="stop: закрываем, продолжать не нужно")
 
-    payload = cli.api().collect_now(home, NOW, ingest=True)
+    payload = cli.api().collect_now(home, NOW)
     shown = next(item for item in payload["deals"] if item["id"] == deal_id)
 
     assert shown["waiting"]["state"] == "wait_human"
@@ -1207,7 +1299,7 @@ def test_evidence_names_the_answer_and_the_decision_command(home, frozen_now, ca
     deal_id = own_deal(home)
     park_deal(home, deal_id)
 
-    code, out, _ = run(["why", "b1", deal_id], capsys)
+    code, out, _ = run(["why", deal_id], capsys)
     evidence = next(
         item for item in cli.api().now()["deals"] if item["id"] == deal_id
     )["waiting"]["evidence"]
@@ -1249,7 +1341,7 @@ def running_deal(home: Path, *, lease_expires: Optional[int] = None) -> str:
             [
                 {
                     "deal_id": deal_id,
-                    "repo": "b1",
+                    "repo": REPO,
                     "kind": "attempt_started",
                     "ts": NOW - 60,
                     "recorded_at": NOW - 60,
@@ -1393,7 +1485,7 @@ def test_deal_of_unblocked_own_deal_does_not_contradict_its_attempt_timeline(
     assert code == cli.EXIT_OK
     assert deal_status(home, deal_id) in ("ready", "todo")
 
-    code, out, _ = run(["deal", "b1", deal_id], capsys)
+    code, out, _ = run(["deal", deal_id], capsys)
 
     assert code == cli.EXIT_OK
     evidence = next(line for line in out.splitlines() if line.startswith("доказательство:"))
@@ -1409,7 +1501,7 @@ def test_deal_of_unblocked_own_deal_does_not_contradict_its_attempt_timeline(
     assert row["waiting"]["state"] == "wait_slot"
     assert row["waiting"]["evidence"].endswith(evidence.split("доказательство: ", 1)[1])
 
-    code, why_out, _ = run(["why", "b1", deal_id], capsys)
+    code, why_out, _ = run(["why", deal_id], capsys)
     assert code == cli.EXIT_OK
     assert row["waiting"]["evidence"] in why_out
     assert "состояние ожидания: wait_slot" in why_out

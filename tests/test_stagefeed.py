@@ -44,7 +44,8 @@ journal = sys.modules[plugin_api.JOURNAL_MODULE_NAME]
 stagefeed = plugin_api.stagefeed
 
 NOW = int(time.time()) - 10  # часы теста — почти настоящие: лизинг «в прошлом» обязан истечь
-BOARD = "b1"
+# Группировка дела — `repo` (0.0.6: доск нет); адрес дела — его `d_<hex>`.
+REPO = "sx-widgets-api"
 
 # Спека графа: два этапа, у первого объявлена команда и ретрай по `contract` —
 # ровно тот случай, который карточка называет фикстурой (одна попытка упала
@@ -64,17 +65,10 @@ stages:
 """
 
 
-def make_board_home(home: Path) -> None:
-    """kanban-доска с нужным слагом: своё дело заводится на существующей доске."""
-    path = home / "kanban" / "boards" / BOARD / "kanban.db"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    sqlite3.connect(path).close()
-
-
 @pytest.fixture()
 def home(tmp_path, monkeypatch):
+    """Корень Hermes: дело заводится своим store, доска для этого не нужна."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    make_board_home(tmp_path)
     return tmp_path
 
 
@@ -92,7 +86,7 @@ def spec_file(home: Path) -> Path:
 
 
 def new_deal(client: TestClient, home: Path, *, spec: bool = True) -> str:
-    payload = {"repo": BOARD, "title": "дело с лентой"}
+    payload = {"repo": REPO, "title": "дело с лентой"}
     if spec:
         payload["spec"] = str(spec_file(home))
     response = client.post("/deals", json=payload)
@@ -181,7 +175,7 @@ def test_deal_returns_stages_with_attempts(client, home):
     deal_id = new_deal(client, home)
     append(client, home, deal_id, two_attempts(deal_id))
 
-    body = client.get(f"/deal/{BOARD}/{deal_id}").json()
+    body = client.get(f"/deal/{deal_id}").json()
 
     assert body["spec"] == str(home / "duty.yaml")
     assert body["stages_note"] == ""
@@ -231,7 +225,7 @@ def test_deal_without_attempts_keeps_the_graph(client, home):
     """Дело без попыток: этапы видны, попыток ноль — граф не зависит от журнала."""
     deal_id = new_deal(client, home)
 
-    body = client.get(f"/deal/{BOARD}/{deal_id}").json()
+    body = client.get(f"/deal/{deal_id}").json()
 
     assert [stage["id"] for stage in body["stages"]] == ["impl", "review"]
     assert body["stages"][0]["state"] == "pending"
@@ -246,13 +240,13 @@ def test_deal_without_spec_names_the_reason(client, home):
     """Пустая лента называет причину: «нет спеки» и «этапов нет» — разные факты."""
     deal_id = new_deal(client, home, spec=False)
 
-    body = client.get(f"/deal/{BOARD}/{deal_id}").json()
+    body = client.get(f"/deal/{deal_id}").json()
 
     assert body["stages"] == []
     assert body["spec"] is None
     assert "нет спеки" in body["stages_note"]
     # явный ?spec= даёт граф и делу без записи в журнале
-    given = client.get(f"/deal/{BOARD}/{deal_id}", params={"spec": str(spec_file(home))}).json()
+    given = client.get(f"/deal/{deal_id}", params={"spec": str(spec_file(home))}).json()
     assert [stage["id"] for stage in given["stages"]] == ["impl", "review"]
 
 
@@ -261,7 +255,7 @@ def test_deal_with_unreadable_spec_names_the_reason(client, home):
     deal_id = new_deal(client, home)
 
     body = client.get(
-        f"/deal/{BOARD}/{deal_id}", params={"spec": str(home / "нет-такого.yaml")}
+        f"/deal/{deal_id}", params={"spec": str(home / "нет-такого.yaml")}
     ).json()
 
     assert body["stages"] == []
@@ -295,7 +289,7 @@ def test_dead_attempt_is_visible_without_invented_state(client, home):
         ],
     )
 
-    body = client.get(f"/deal/{BOARD}/{deal_id}").json()
+    body = client.get(f"/deal/{deal_id}").json()
     impl = body["stages"][0]
 
     assert impl["state"] == "running"
@@ -322,7 +316,7 @@ def test_attempt_without_lease_is_unknown_not_dead(client, home):
         ],
     )
 
-    attempt = client.get(f"/deal/{BOARD}/{deal_id}").json()["stages"][0]["attempts"][0]
+    attempt = client.get(f"/deal/{deal_id}").json()["stages"][0]["attempts"][0]
 
     assert attempt["live"] is None
     assert attempt["dead"] is None
@@ -443,8 +437,8 @@ def test_read_connection_refuses_writes(client, home):
     try:
         with pytest.raises(sqlite3.OperationalError, match="readonly|read-only"):
             conn.execute(
-                "INSERT INTO events (ts, recorded_at, deal_id, board, kind, payload, source,"
-                " idempotency_key) VALUES (1, 1, 'd_x', 'b', 'created', '{}', 'test', 'k-probe')"
+                "INSERT INTO events (ts, recorded_at, deal_id, kind, payload, source,"
+                " idempotency_key) VALUES (1, 1, 'd_x', 'created', '{}', 'test', 'k-probe')"
             )
     finally:
         conn.close()
@@ -465,8 +459,8 @@ def test_reading_routes_do_not_write_journal(client, home):
     assert before and "duty.db" in before, "журнал должен существовать после записи событий"
 
     assert client.get("/now").status_code == 200
-    assert client.get(f"/deal/{BOARD}/{deal_id}").status_code == 200
-    assert client.get(f"/deal/{BOARD}/{deal_id}", params={"spec": str(spec_file(home))}).status_code == 200
+    assert client.get(f"/deal/{deal_id}").status_code == 200
+    assert client.get(f"/deal/{deal_id}", params={"spec": str(spec_file(home))}).status_code == 200
 
     after = files_of(home)
     assert after["duty.db"] == before["duty.db"], "чтение изменило файл журнала"
@@ -661,7 +655,7 @@ def test_now_gate_question_shows_options_from_the_pool(home):
     app = FastAPI()
     app.include_router(plugin_api.router)
     client = TestClient(app)
-    created = client.post("/deals", json={"repo": BOARD, "title": "гейт", "spec": str(path)})
+    created = client.post("/deals", json={"repo": REPO, "title": "гейт", "spec": str(path)})
     assert created.status_code == 200, created.text
     deal_id = created.json()["id"]
     (home / "messaging").mkdir(parents=True, exist_ok=True)

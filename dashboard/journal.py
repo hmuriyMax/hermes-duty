@@ -129,6 +129,42 @@ NON_STATE_KINDS = (
     "published",
 )
 
+# Приговор ревью как факт графа: действие из структурного поля отчёта
+# (`result.json:verdict.action`) и вид журнального события, которым оно
+# становится. Словарь один на плагин: писатель (`runner.report_verdict`) и
+# читатели (`transit._fold`, `runner.previous_reports`) не должны расходиться в
+# том, какой факт означает «одобрено», — иначе гейт графа снова встанет навсегда
+# в ожидании приговора, которого никто не пишет.
+VERDICT_ACTION_APPROVE = "approve"
+VERDICT_ACTION_CHANGES = "changes"
+VERDICT_APPROVE = "collected"
+VERDICT_CHANGES = "changes_requested"
+VERDICT_FACTS = {
+    VERDICT_ACTION_APPROVE: VERDICT_APPROVE,
+    VERDICT_ACTION_CHANGES: VERDICT_CHANGES,
+}
+
+# Куда ведёт одобрение, когда отчёт не назвал этап: дальше по графу.
+VERDICT_NEXT = "next"
+
+
+def verdict_kind(action: str) -> str:
+    """Вид факта по действию приговора; неизвестное действие — пустая строка."""
+    return VERDICT_FACTS.get(str(action or "").strip().lower(), "")
+
+
+def verdict_action(kind: str) -> str:
+    """Действие приговора по виду факта; не приговор — пустая строка.
+
+    Обратное чтение того же словаря: `previous_reports` называет вердикт
+    предшественника словом отчёта (`approve`/`changes`), а не видом события.
+    """
+    for action, fact in VERDICT_FACTS.items():
+        if kind == fact:
+            return action
+    return ""
+
+
 # Вид `block_kind` парковки (`dashboard/failures.py`): попытки исчерпаны, дело
 # ждёт решения человека. Отдельного вида события для парковки нет — она выражена
 # существующим `blocked` (решение координатора по W7), поэтому набор видов
@@ -163,10 +199,16 @@ INGEST_EVENT_KINDS = ("created", "claimed", "blocked", "unblocked", "completed",
 # завершение дела. Без этого при равном `ts` порядок `id` решался бы порядком
 # таблиц-источников, и fold мог прочитать завершение раньше его начала.
 #
-# Ревью и гейт идут после вопросов и до `completed`: `changes_requested` обязан
-# примениться раньше `collected` того же дела, иначе возврат на доработку
-# прочитался бы как «ревью пройдено»; `gate_opened`/`gate_closed` — раньше
-# `completed`, чтобы гейт не перечитал закрытие как открытие.
+# Попытка идёт **раньше** приговора: движок пишет `collected`/`changes_requested`
+# в той же транзакции, что и `attempt_ended`, и при равном `ts` факт попытки
+# обязан примениться первым — иначе закрытие этапа («попытка done») сняло бы
+# приговор, записанный до него, и гейт снова ждал бы решение, которого в журнале
+# уже нет (`tests/test_runner.py::test_review_verdict_opens_the_gate`).
+#
+# `changes_requested` по-прежнему раньше `collected`: возврат на доработку и
+# одобрение одного дела не должны читаться как «ревью пройдено» в обратном
+# порядке. `gate_opened`/`gate_closed` — раньше `completed`, чтобы гейт не
+# перечитал закрытие как открытие.
 KIND_ORDER = (
     "created",
     "patched",
@@ -182,11 +224,11 @@ KIND_ORDER = (
     "commented",
     "attached",
     "review_requested",
+    "attempt_ended",
     "changes_requested",
     "collected",
     "gate_opened",
     "gate_closed",
-    "attempt_ended",
     "published",
     "lease_lost",
     "completed",

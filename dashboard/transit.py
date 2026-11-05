@@ -187,8 +187,10 @@ OK_OUTCOMES = ("ok", "done", "success", "passed", "accepted")
 # Словарь классов один на плагин — он живёт в `dashboard/failures.py`.
 UNCLASSIFIED = failures.UNCLASSIFIED
 
-# Вердикт «дальше по графу»: так пишет спека и так пишет событие.
-NEXT = "next"
+# Вердикт «дальше по графу»: так пишет спека и так пишет событие. Слово одно на
+# плагин — им же движок заполняет `verdict.target` по умолчанию
+# (`dashboard/runner.report_verdict`), а не своей копией.
+NEXT = journal.VERDICT_NEXT
 
 # Виды событий, которые срез этапа не меняют. Набор — журнальный
 # `NON_STATE_KINDS`, минус `question_answered`: для дела ответ закрывающий факт,
@@ -209,13 +211,13 @@ STAGE_KINDS = (
     "question_asked",
     "question_answered",
     "completed",
-    "collected",
-    "changes_requested",
+    journal.VERDICT_APPROVE,
+    journal.VERDICT_CHANGES,
 )
 
 # Вердикты этапа: это решения графа, а не факты попытки, поэтому они
 # применяются и к закрытому этапу (иначе приговор некуда было бы прочитать).
-VERDICT_KINDS = ("collected", "changes_requested")
+VERDICT_KINDS = (journal.VERDICT_APPROVE, journal.VERDICT_CHANGES)
 
 # Этап-гейт (`dashboard/spec.py`, `GATE_KIND`): сам ничего не исполняет, а задаёт
 # вопрос человеку. Слою вид нужен только для текста ожидания и причины парковки —
@@ -644,10 +646,10 @@ def _stage_event(
     """Один факт этапа. Неизвестный вид и мусорный payload не меняют ничего."""
     if kind in QUIET_KINDS:
         return
-    if kind == "collected":
+    if kind == journal.VERDICT_APPROVE:
         _verdict_approve(board, node, payload)
         return
-    if kind == "changes_requested":
+    if kind == journal.VERDICT_CHANGES:
         _verdict_changes(board, spec, node, payload)
         return
     if node.state in TERMINAL_STATES:

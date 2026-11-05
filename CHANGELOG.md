@@ -92,6 +92,37 @@
   Документация: `docs/SPEC.md` (правило и две проверки), `docs/JOURNAL.md`
   (вид `published`), `docs/OWNERSHIP.md` (кто пишет `published`).
 
+### FIX-V: приговор ревью — факт журнала, а не слово в отчёте
+
+- Гейт `review{verdict} → gate` в 0.0.5 стоял навсегда: правило 2
+  (`dashboard/transit.py`, `_gate`) требует **факт уровня этапа** — `collected` c
+  `payload.stage='review'` — а писать его было некому (движок по `done` писал только
+  `attempt_ended`, контракт ревьюера поля приговора не имел). Живой прогон `d_e25f89ba`
+  воспроизводил это на каждом повторе: `итог: ждём wait(verdict)`.
+- `report_schema` этапа с `verdict` получил поле `verdict: {action, target, reason}`
+  (`action`: `approve`/`changes`; `target`: `next`, id этапа или пустая строка —
+  умолчание `next` для `approve` и `verdict.changes` спеки для `changes`).
+- `runner.report_verdict` — единственная функция записи: по evidence-подтверждённому
+  отчёту она пишет **одно** событие `collected`/`changes_requested` с payload
+  `{stage, target, reason, attempt}` в той же транзакции, что и `attempt_ended`.
+  Словарь «действие → вид факта» живёт в `journal.VERDICT_FACTS` (одна копия на плагин:
+  пишет движок, читают `transit._fold` и `runner.previous_reports`).
+- Отказ класса `contract` вместо тишины: `done` без поля `verdict` («этап ревью обязан
+  вернуть verdict: {action, target, reason}: иначе следующий этап не знает, одобрено
+  ли»), неизвестный `action`, `target` вне спеки (`file:line` в причине), возврат сверх
+  `max_rounds` (раунды считаются по журналу, а не по памяти процесса).
+- `journal.KIND_ORDER`: `attempt_ended` применяется **раньше** `collected`/
+  `changes_requested` при равном `ts` — иначе закрытие этапа снимало бы приговор,
+  записанный в той же секунде, и гейт снова ждал бы его.
+- `examples/duty.yaml`: этап-команда `check` объявляет `workspace: worktree` — с
+  `workspace: none` команда бежит в пустом каталоге попытки, и `pytest tests/ -q`
+  падает `rc 4`; `docs/SPEC.md` называет это словами.
+- Тесты: `tests/test_runner.py::test_review_verdict_opens_the_gate` (красная проба —
+  `AssertionError: событий collected: 0`), `test_review_changes_returns_to_the_named_stage`,
+  `test_review_without_verdict_is_contract`, `test_review_verdict_with_unknown_target_is_contract`,
+  `test_review_verdict_beyond_max_rounds_is_contract`. Регрессия: 772 passed, 1 skipped
+  (+5 тестов).
+
 ### «Продолжить» заводит дело, а не карточку (`hermes-tickets` 0.2.7)
 
 - Кнопка «Продолжить» в плагине тикетов работает в режиме `deal` по умолчанию: заводит

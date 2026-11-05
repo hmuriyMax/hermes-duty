@@ -58,8 +58,8 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 | `unblocked` | был `blocked`, стал иной статус | `previous_kind` |
 | `completed` | `status=done` (или `archived` как отдельный факт: переносится тем же `completed` со `status="archived"`) | `status` |
 | `review_requested` | своё дело сдано в ревью (`duty complete d_… --review`) | `reviewer`, `summary` |
-| `changes_requested` | ревьюер вернул дело на доработку | `reason`, `reviewer` |
-| `collected` | ревью пройдено: вердикт снял ожидание | `summary` |
+| `changes_requested` | ревьюер вернул дело на доработку — или этап с `verdict` вернул граф на названный этап (payload тогда несёт `stage`, `target`, `attempt`) | `reason`, `reviewer` / `stage`, `target`, `attempt` |
+| `collected` | ревью пройдено: вердикт снял ожидание — или этап с `verdict` одобрил и открыл следующий (payload тогда несёт `stage`, `target`, `attempt`) | `summary` / `stage`, `target`, `reason`, `attempt` |
 | `gate_opened` | гейт по родителям открылся: все родители закрыты, ребёнок из `todo` стал `ready`. Пишет **мутация родителя**, а если гейт был открыт уже в момент создания — сам `create` (`cause: "created"`) | `from`, `to`, `parent`, `cause` (у перехода при создании) |
 | `gate_closed` | родитель перестал быть закрытым: ребёнок из `ready` снова `todo` (пишет мутация родителя) | `from`, `to`, `parent` |
 | `patched` | правка спецификации своего дела (`title`/`body`/`assignee`) через `PATCH`; `status` этим видом не меняется (архив — отдельный `completed`) | `fields` |

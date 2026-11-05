@@ -246,6 +246,11 @@ stages:
 `*_TOKEN*` в неё не передаются. Остальное окружение наследуется — команде этапа
 нужны `PATH`, `HOME` и то, чем она собирается.
 
+**`workspace: none` у команды — пустой каталог попытки**, а не репозиторий
+(`runner.prepare_tree`: «дерева нет, cwd — сам каталог попытки»): кода и тестов там
+нет, и `pytest tests/ -q` падает `rc 4` («file or directory not found»). Команде,
+которой нужен код, объявляют `workspace: worktree` — дерево этапа от базы дела.
+
 **Журнал.** Вид этапа не заводит новых событий: попытка пишется теми же
 `attempt_started`/`attempt_ended`, но с `source: "shell"` — по нему видно, что
 этап исполнила команда, а не профиль. В `attempt_ended.details` едут `cmd`,
@@ -391,6 +396,18 @@ verdict: {approve: next, changes: impl, max_rounds: 2}
 - `changes` — **обязательно предшественник** (транзитивно по `needs`); иначе
   возврат на доработку перескочил бы проверку, и такая спека не запускается;
 - `max_rounds` ≥ 1.
+
+**Приговор пишется отчётом, а не словом.** У этапа с `verdict` в `report_schema`
+появляется поле `verdict: {action, target, reason}`: `action` — `approve` или
+`changes`, `target` — `next`, `id` этапа или пустая строка (по умолчанию:
+`approve` → `next`, `changes` → `verdict.changes` спеки), `reason` — одна строка
+«почему». По этому полю движок (`runner.report_verdict`) в той же транзакции, что и
+`attempt_ended`, пишет **факт уровня этапа** — `collected` при `approve`,
+`changes_requested` при `changes`, payload `{stage, target, reason, attempt}`.
+Без этого факта следующий этап не двигается: правило 2 гейта ждёт приговор, а
+`attempt_ended` им не является. Отказ класса `contract` (а не тишина) — у `done` без
+поля `verdict`, у неизвестного `action`, у `target`, которого нет в спеке
+(`file:line` спеки в причине), и у возврата сверх `max_rounds`.
 
 Гейт «публикация не обгоняет ревью» — правило `review-gate`: этап, чья `role`
 входит в набор публикующих (`publisher`, `deployer`) или у которого

@@ -99,7 +99,15 @@ def two_stages(extra: str = "", verdict: str = "verdict: {approve: next, changes
 def test_full_example_is_ok(tmp_path: Path):
     """Полный пример из спеки-источника: ни одного отказа, база резолвится."""
     loaded = spec_module.load_spec(EXAMPLES / "duty.yaml")
-    assert [stage.id for stage in loaded.stages] == ["impl", "verify", "review", "gate", "publish", "docs"]
+    assert [stage.id for stage in loaded.stages] == [
+        "impl",
+        "verify",
+        "check",
+        "review",
+        "gate",
+        "publish",
+        "docs",
+    ]
     assert spec_module.errors(spec_module.validate_spec(loaded, profiles=PROFILES)) == []
     # Репозиторий примера живёт не на каждой машине, поэтому проверка `base`
     # проверяется на копии спеки со здешним путём: правило то же, дерево есть.
@@ -1376,11 +1384,14 @@ def test_shell_stage_without_role_is_ok(tmp_path: Path):
 def test_stage_without_kind_is_agent(tmp_path: Path):
     """Спека 0.0.4 читается без правок: нет `kind` — этап-агент.
 
-    В примере теперь есть гейт (`kind: gate`, 0.0.5), поэтому «нет `kind`» читается
-    по этапам, где он не объявлен: единственный не-агент — сам гейт.
+    В примере теперь два не-агента (`kind: gate` и `kind: shell`, 0.0.5), поэтому
+    «нет `kind`» читается по этапам, где он не объявлен: остальные — агенты.
     """
     loaded = spec_module.load_spec(EXAMPLES / "duty.yaml")
-    assert {stage.id for stage in loaded.stages if stage.kind != spec_module.DEFAULT_STAGE_KIND} == {"gate"}
+    assert {stage.id for stage in loaded.stages if stage.kind != spec_module.DEFAULT_STAGE_KIND} == {
+        "check",
+        "gate",
+    }
     assert spec_module.errors(spec_module.validate_spec(loaded, profiles=PROFILES)) == []
 
 

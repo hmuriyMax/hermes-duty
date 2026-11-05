@@ -730,8 +730,8 @@ def previous_reports(
         if kind == "attempt_ended":
             if isinstance(payload.get("result"), dict):
                 found[stage] = payload
-        elif kind in ("collected", "changes_requested"):
-            verdicts[stage] = "approve" if kind == "collected" else "changes"
+        elif kind in (journal.VERDICT_APPROVE, journal.VERDICT_CHANGES):
+            verdicts[stage] = journal.verdict_action(kind)
     out: list[dict[str, Any]] = []
     for stage in getattr(spec, "stages", ()):
         if stage.id == stage_id or (stage.id not in found and stage.id not in verdicts):
@@ -750,6 +750,89 @@ def previous_reports(
             }
         )
     return out
+
+
+def report_verdict(
+    deal: Any,
+    spec: Any,
+    stage: Any,
+    result: dict[str, Any],
+    attempt: int,
+    *,
+    events: Iterable[Any],
+    now: int,
+) -> tuple[Optional[dict[str, Any]], str]:
+    """Факт приговора этапа из структурного поля отчёта: (событие, причина отказа).
+
+    Гейт графа (`dashboard/transit.py`, правило 2) требует **факт уровня этапа** —
+    `collected`/`changes_requested` с `stage` в payload. `attempt_ended` таким
+    фактом не является: в нём исход попытки, а `verdict` в его `details` — гейт
+    пакета. Поэтому приговор берётся из отчёта полем `verdict: {action, target,
+    reason}` — единственной структурной формой слова «одобрено» — и становится
+    событием здесь, в той же транзакции, что и `attempt_ended`: читатель видит и
+    смерть попытки, и приговор, а не одно из двух.
+
+    Отказ, а не тишина: этап с `verdict` в спеке, отчитавшийся `done` без
+    приговора, останавливает попытку `contract` — иначе следующий этап снова
+    молча ждал бы приговор, которого никто не пишет. Тот же класс у приговора,
+    адресующего несуществующий этап, у неизвестного `action` и у возврата сверх
+    `max_rounds` (бесконечный возврат — не раунды ревью, а их отсутствие).
+    """
+    verdict = getattr(stage, "verdict", None)
+    if verdict is None:
+        return None, ""
+    where = f"{getattr(spec, 'path', '')}:{stage.line_of('verdict')}"
+    raw = result.get("verdict")
+    if not isinstance(raw, dict):
+        return None, (
+            f"{where}: этап ревью обязан вернуть verdict: {{action, target, reason}}: "
+            "иначе следующий этап не знает, одобрено ли"
+        )
+    action = str(raw.get("action") or "").strip().lower()
+    kind = journal.verdict_kind(action)
+    if not kind:
+        return None, (
+            f"{where}: verdict.action={raw.get('action')!r}: допустимо "
+            f"{journal.VERDICT_ACTION_APPROVE} (одобрено) "
+            f"или {journal.VERDICT_ACTION_CHANGES} (на доработку)"
+        )
+    target = str(raw.get("target") or "").strip()
+    if not target:
+        target = verdict.approve if action == journal.VERDICT_ACTION_APPROVE else verdict.changes
+    known = {item.id for item in getattr(spec, "stages", ())}
+    if target != journal.VERDICT_NEXT and target not in known:
+        return None, (
+            f"{where}: verdict.target={target!r}: такого этапа в спеке нет — "
+            "приговор адресует next или id существующего этапа"
+        )
+    if action == journal.VERDICT_ACTION_CHANGES:
+        rounds = sum(
+            1
+            for event in events
+            if str(event.get("kind")) == journal.VERDICT_CHANGES
+            and journal.payload_of(event).get("stage") == stage.id
+        )
+        max_rounds = int(getattr(verdict, "max_rounds", 1) or 1)
+        if rounds >= max_rounds:
+            return None, (
+                f"{where}: возвратов на доработку уже {rounds} при max_rounds={max_rounds}: "
+                "раунды ревью исчерпаны — решает человек"
+            )
+    return (
+        _event(
+            deal,
+            kind,
+            {
+                "stage": stage.id,
+                "target": target,
+                "reason": str(raw.get("reason") or "").strip(),
+                "attempt": int(attempt),
+            },
+            {"stage": stage.id, "attempt": int(attempt), "target": target},
+            now,
+        ),
+        "",
+    )
 
 
 def last_session(conn: sqlite3.Connection, deal: Any, stage_id: str) -> str:
@@ -2829,6 +2912,19 @@ def run_stage(
         else:
             published_fact = fact
 
+    # Приговор ревью — факт графа, а не слово в `summary`: отчёт
+    # `verdict: {action, target, reason}` становится `collected`/
+    # `changes_requested` с `stage` в payload — ровно того требует правило 2 гейта
+    # (`dashboard/transit.py`). Пишет движок по evidence-подтверждённому отчёту и
+    # в той же транзакции, что и `attempt_ended`; отказ — `contract` (этап с
+    # `verdict` в спеке обязан вынести приговор). Один писатель на весь плагин:
+    # `report_verdict` — единственная функция, превращающая действие в событие.
+    verdict_fact: Optional[dict[str, Any]] = None
+    if outcome == OUTCOME_DONE and not parked and result is not None:
+        verdict_fact, why = report_verdict(deal, spec, stage, result, attempt, events=events, now=now)
+        if verdict_fact is None and why:
+            outcome, kind, reason = OUTCOME_FAILED, FAIL_CONTRACT, why
+
     # Работа принята — движок фиксирует её коммитом **в дереве попытки**: только
     # так следующему этапу есть от чего отвести дерево (W14). `dir`/`none` не
     # коммитятся: у первого дерево чужое (каталог дела), у второго его нет.
@@ -2885,6 +2981,11 @@ def run_stage(
     facts_out = [ended]
     if published_fact is not None:
         facts_out.append(_published_event(deal, stage, attempt, published_fact, now))
+    # Приговор ложится рядом с `attempt_ended`, только если попытка действительно
+    # принята: отказ коммита или гейта пакета закрыл её `failed`, и приговор такой
+    # попытки не пропускал бы работу, которой никто не принимал.
+    if verdict_fact is not None and outcome == OUTCOME_DONE:
+        facts_out.append(verdict_fact)
     with conn:
         journal.append_in_tx(conn, facts_out)
         conn.execute(

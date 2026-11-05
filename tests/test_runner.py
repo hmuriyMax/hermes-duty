@@ -78,6 +78,7 @@ runner = load_module("hermes_duty_runner", "runner.py")
 journal = load_module("hermes_duty_journal", "journal.py")
 deals = load_module("hermes_duty_deals", "deals.py")
 spec_module = load_module("hermes_duty_spec", "spec.py")
+transit = load_module("hermes_duty_transit", "transit.py")
 
 
 # ------------------------------------------------------------------ фикстуры
@@ -1660,6 +1661,190 @@ def test_base_of_stage_reports_an_unresolvable_predecessor_commit(tmp_path: Path
     with pytest.raises(runner.BaseError) as caught:
         runner.base_of_stage(spec, spec.stage("verify"), seeded)
     assert "не резолвится" in str(caught.value)
+
+
+# ------------------------------------------------------------- приговор ревью
+#
+# Гейт графа (`dashboard/transit.py`, правило 2) требует **факт уровня этапа** —
+# `collected`/`changes_requested` с `stage` в payload. Пишет его движок по
+# структурному полю отчёта (`report_schema.verdict`), а не кто-то руками: живой
+# прогон `d_e25f89ba` встал навсегда в `wait(verdict)`, потому что писать было
+# некому. Тесты ниже держат именно эту цепочку: отчёт → факт журнала → решение
+# гейта, а не «функция что-то вернула».
+
+REVIEW_CHAIN = """
+        duty: probe
+        stages:
+          - id: impl
+            role: implementer
+            workspace: none
+          - id: review
+            role: reviewer
+            needs: [impl]
+            workspace: none
+            verdict: {approve: next, changes: impl, max_rounds: 2}
+          - id: gate
+            kind: gate
+            needs: [review]
+            ask: {q: "Продолжаем?", options: [да, нет]}
+        """
+
+
+def review_chain(tmp_path: Path) -> Any:
+    """Спека живой формы: `review{verdict} → gate`, дерево никому не нужно."""
+    return write_spec(tmp_path, REVIEW_CHAIN)
+
+
+def verdict_line() -> int:
+    """Строка ключа `verdict` в спеке пробы: отказ обязан назвать именно её."""
+    text = textwrap.dedent(REVIEW_CHAIN).splitlines()
+    return next(index for index, row in enumerate(text, start=1) if "verdict: {approve" in row)
+
+
+def seed_passed(conn, deal, stage: str = "impl", attempt: int = 1) -> None:
+    """Предшественник пройден: `impl` `done` до попытки ревью."""
+    seed(conn, deal, "attempt_started", {"stage": stage, "attempt": attempt}, key=f"test:{stage}:start")
+    seed(
+        conn,
+        deal,
+        "attempt_ended",
+        {"stage": stage, "attempt": attempt, "outcome": "done", "kind": None},
+        key=f"test:{stage}:end",
+    )
+
+
+def run_review(conn, spec, deal, home, verdict: Any, *, attempt: int = 1) -> dict[str, Any]:
+    """Шаг ревью с подменённым спавном: отчёт — `done` плюс приговор (или без)."""
+    result: dict[str, Any] = {"status": "done", "summary": "ревью прошло"}
+    if verdict is not None:
+        result["verdict"] = verdict
+    fake = Fake(result=result, pack=True)
+    return runner.run_stage(
+        conn, spec, deal, "review", attempt, home=home, clock=lambda: NOW, spawn=fake
+    )
+
+
+def review_ended(conn, deal, stage: str = "review") -> dict[str, Any]:
+    """`attempt_ended` ревью: в журнале есть и попытка предшественника."""
+    found = [
+        event
+        for event in events(conn, deal)
+        if event["kind"] == "attempt_ended" and event["payload"].get("stage") == stage
+    ]
+    assert len(found) == 1, f"попыток {stage}: {len(found)}"
+    return found[0]
+
+
+def test_review_verdict_opens_the_gate(tmp_path: Path) -> None:
+    """`verdict.approve` в отчёте — факт `collected` этапа, и гейт открывается.
+
+    Дефект `d_e25f89ba`: ревьюер писал «одобрено» словом в `summary`, факта
+    уровня этапа не было, и `transit` на каждом повторе отдавал
+    `wait(verdict)`. Проверяется вся цепочка: поле отчёта → событие журнала с
+    `payload.stage='review'` → решение `run(gate)`.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = review_chain(tmp_path)
+    seed_passed(conn, deal)
+
+    report = run_review(conn, spec, deal, home, {"action": "approve", "target": "", "reason": "дифф чистый"})
+
+    assert (report["outcome"], report["kind"]) == (runner.OUTCOME_DONE, None)
+    fact = only(conn, deal, "collected")
+    assert fact["payload"] == {
+        "stage": "review",
+        "target": "next",
+        "reason": "дифф чистый",
+        "attempt": 1,
+    }
+    assert fact["source"] == runner.ENGINE_SOURCE
+    decision = transit.next_stage(spec, events(conn, deal), NOW)
+    assert (decision.kind, decision.stages) == ("run", ("gate",))
+    assert transit.stage_states(spec, events(conn, deal))["gate"].state == "pending"
+
+
+def test_review_changes_returns_to_the_named_stage(tmp_path: Path) -> None:
+    """`verdict.changes` — факт `changes_requested`, и граф возвращает на цель."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = review_chain(tmp_path)
+    seed_passed(conn, deal)
+
+    report = run_review(conn, spec, deal, home, {"action": "changes", "target": "impl", "reason": "нет тестов"})
+
+    assert (report["outcome"], report["kind"]) == (runner.OUTCOME_DONE, None)
+    fact = only(conn, deal, "changes_requested")
+    assert fact["payload"] == {
+        "stage": "review",
+        "target": "impl",
+        "reason": "нет тестов",
+        "attempt": 1,
+    }
+    decision = transit.next_stage(spec, events(conn, deal), NOW)
+    assert (decision.kind, decision.pair) == ("run", [("impl", 2)])
+
+
+def test_review_without_verdict_is_contract(tmp_path: Path) -> None:
+    """`done` без приговора — отказ, а не тишина: иначе дефект вернётся молчанием."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = review_chain(tmp_path)
+    seed_passed(conn, deal)
+
+    report = run_review(conn, spec, deal, home, None)
+
+    assert (report["outcome"], report["kind"]) == (runner.OUTCOME_FAILED, runner.FAIL_CONTRACT)
+    assert "этап ревью обязан вернуть verdict: {action, target, reason}" in report["reason"]
+    assert f"{spec.path}:{verdict_line()}" in report["reason"]
+    assert "collected" not in kinds(conn, deal)
+    assert review_ended(conn, deal)["payload"]["kind"] == runner.FAIL_CONTRACT
+
+
+def test_review_verdict_with_unknown_target_is_contract(tmp_path: Path) -> None:
+    """Приговор адресует этап, которого нет, — отказ `contract` с `file:line`."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = review_chain(tmp_path)
+    seed_passed(conn, deal)
+
+    report = run_review(conn, spec, deal, home, {"action": "approve", "target": "нет-такого", "reason": ""})
+
+    assert (report["outcome"], report["kind"]) == (runner.OUTCOME_FAILED, runner.FAIL_CONTRACT)
+    assert "verdict.target='нет-такого'" in report["reason"]
+    assert f"{spec.path}:{verdict_line()}" in report["reason"]
+    assert "collected" not in kinds(conn, deal)
+
+
+def test_review_verdict_beyond_max_rounds_is_contract(tmp_path: Path) -> None:
+    """Возвратов больше `max_rounds` — отказ, а не бесконечный возврат.
+
+    Раунды считаются по журналу (`changes_requested` этого же этапа), поэтому
+    проверка не зависит от памяти процесса: после рестарта лимит тот же.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = review_chain(tmp_path)
+    seed_passed(conn, deal)
+    for round_no in (1, 2):
+        seed(
+            conn,
+            deal,
+            "changes_requested",
+            {"stage": "review", "target": "impl", "reason": "круг", "attempt": round_no},
+            key=f"test:review:changes:{round_no}",
+        )
+
+    report = run_review(conn, spec, deal, home, {"action": "changes", "target": "impl", "reason": "ещё раз"}, attempt=3)
+
+    assert (report["outcome"], report["kind"]) == (runner.OUTCOME_FAILED, runner.FAIL_CONTRACT)
+    assert "возвратов на доработку уже 2 при max_rounds=2" in report["reason"]
+    assert [event["payload"].get("attempt") for event in events(conn, deal) if event["kind"] == "changes_requested"] == [1, 2]
 
 
 # ------------------------------------------------------------- shell-этап

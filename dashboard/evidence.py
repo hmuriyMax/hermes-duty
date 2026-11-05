@@ -78,6 +78,10 @@ REPORT_KEYS = (
     # (`runner.published_claim`), а не этот слой: `git ls-remote` — сеть и git,
     # а гейт пакета остаётся сверкой заявленного с деревом.
     "published",
+    # Приговор ревью (0.0.5): {action, target, reason}. Читает его движок
+    # (`runner.report_verdict`) и пишет фактом графа; гейт пакета проверяет
+    # только то, что отчёт — объект нужной формы, а не смысл приговора.
+    "verdict",
 )
 
 # Имена правил: ими отказ называется в `details` и в `duty why`, чтобы человек
@@ -675,15 +679,32 @@ def report_schema(stage: Any) -> dict[str, Any]:
 
     Гейт, о схеме которого узнают только из отказа, — не контракт, а ловушка.
     Поэтому схема уходит в файл контракта тем же слоем, который её и проверяет.
+
+    Поле `verdict` появляется только у этапа с приговором (`verdict` в спеке):
+    это единственный способ, которым ревьюер говорит «одобрено» структурно, а не
+    словом в `summary`, — иначе следующему этапу нечего прочитать и гейт графа
+    (`dashboard/transit.py`, правило 2) ждёт приговор, которого никто не писал.
     """
     evidence = [
         {"cmd": getattr(item, "cmd", ""), "exit": getattr(item, "must", 0), "started_at": "unix-секунды"}
         for item in getattr(stage, "evidence", ())
     ]
-    return {
+    required = ["commit|artifacts", "evidence", "summary"]
+    verdict: dict[str, str] = {}
+    if getattr(stage, "verdict", None) is not None:
+        required.append("verdict")
+        verdict = {
+            "action": "approve (одобрено) | changes (на доработку) — приговор этапа",
+            "target": "next | id этапа | \"\" — по умолчанию: approve → next, changes → verdict.changes спеки",
+            "reason": "одна строка: на чём основан приговор",
+        }
+    schema: dict[str, Any] = {
         "status": list(STATUSES),
-        "required_for_done": ["commit|artifacts", "evidence", "summary"],
+        "required_for_done": required,
         "artifacts": {"path": "относительный путь внутри дерева попытки", "sha256": "полный sha256 файла"},
         "evidence": evidence,
         "usage": {"total_tokens": "необязательно: сверяется с бюджетом этапа"},
     }
+    if verdict:
+        schema["verdict"] = verdict
+    return schema

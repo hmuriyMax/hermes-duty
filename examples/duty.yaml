@@ -34,9 +34,18 @@ stages:
     role: tester
     needs: [impl]
 
+  # Этап-команда: проверки прогоняет команда в дереве этапа. `workspace: none`
+  # здесь дал бы cwd = пустой каталог попытки (`runner.py`, «дерева нет»), и
+  # `go build ./...` упал бы «нечего собирать»: команде нужен код, а он в дереве.
+  - id: check
+    kind: shell
+    cmd: "go build ./..."
+    needs: [verify]
+    workspace: worktree
+
   - id: review
     role: reviewer
-    needs: [verify]
+    needs: [check]
     verdict: {approve: next, changes: impl, max_rounds: 2}   # approve: next|<stage-id>
 
   # Публикация — вопрос человеку, а не этап роли: гейт сам ничего не исполняет,

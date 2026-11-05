@@ -1221,8 +1221,8 @@ bin/duty decide d_f8389a4b stop           # или закрыть: completed cau
 ## 14. Проверки: красные пробы 0.0.5
 
 Тот же вопрос, что у §13, но про решения 0.0.5: **какой тест докажет, что правило не
-откатилось**. Вид этапа (`shell`, `gate`), потолок дела и сверка публикации — четыре
-правила, у каждого один тест, который падает первым и по делу.
+откатилось**. Вид этапа (`shell`, `gate`), потолок дела, сверка публикации и приговор
+ревью как факт графа — пять правил, у каждого один тест, который падает первым и по делу.
 
 Проба берётся одной командой (имя теста — из правого столбца):
 
@@ -1236,6 +1236,7 @@ bin/duty decide d_f8389a4b stop           # или закрыть: completed cau
 | **S2 «ответ вне allow»** | `dashboard/runner.py:2136` (`gate_answer_allowed`): убрать сверку ответа с `allow` — гейт объявляет `done` на «нет» при `allow: [да]`, и отказ человека становится продолжением | `tests/test_runner.py::test_gate_answer_outside_allow_is_contract` — падает на исходе попытки (ждали `failed(contract)` с цитатой ответа, получили `done`) |
 | **S3 «потолок дела»** | `dashboard/runner.py:1558` (вызов `refuse_budget` в `run_stage`) или сам `refuse_budget` (`:1441`) — сделать «потолок не исчерпан» навсегда: исчерпанное дело поднимает ещё одну попытку и жжёт бюджет, которого нет | `tests/test_driver.py::test_second_attempt_does_not_start_when_deal_budget_is_spent` — падает на `assert fake.calls == []`: вторая попытка стартует |
 | **S4/FIX-S4a «один коммит в двух формах»** | `dashboard/publish.py:157` (`same_commit`): вернуть точное равенство строк вместо сверки по префиксу — «одобрен a1b2c3d, в дереве a1b2c3d4e5f6» снова читается как подмена дерева, и честная публикация получает отказ `contract` | `tests/test_publish.py::test_same_commit_takes_the_short_form` — падает на `same_commit("a1b2c3d", "a1b2c3d4e5f6") is True` |
+| **FIX-V «приговор ревью как факт»** | `dashboard/runner.py:2990` (`facts_out.append(verdict_fact)` в `run_stage`): убрать запись факта — отчёт ревьюера с `verdict.approve` перестаёт становиться событием, и гейт `review{verdict} → gate` встаёт навсегда в `wait(verdict)` (ровно дефект `d_e25f89ba`) | `tests/test_runner.py::test_review_verdict_opens_the_gate` — краснеет на `only(conn, deal, "collected")` («событий collected: 0»), а с ней и решение `transit`: `wait(verdict)` вместо `run(gate)` |
 
 ### Что проба ловит сверх одного теста
 
@@ -1248,14 +1249,24 @@ bin/duty decide d_f8389a4b stop           # или закрыть: completed cau
 | S2 | `test_gate_allow_defaults_to_every_option`, `test_gate_answer_outside_allow_stops_the_deal` |
 | S3 | `test_refused_shell_attempt_names_deal_minutes` — та же сверка в `run_shell_stage`: отказ обязан называть числа и у этапа-команды |
 | S4/FIX-S4a | `test_publish_claim_by_a_short_sha_is_confirmed_by_origin`, `test_approval_of_a_short_gate_commit_is_ok` (обе — `same_commit` на уровне прогона), `test_publish_claim_of_an_ambiguous_sha_is_contract`: без сверки по префиксу неоднозначность тоже перестаёт ловиться |
+| FIX-V | `test_review_changes_returns_to_the_named_stage` (приговор `changes` тоже обязан стать фактом, иначе возврат на доработку не читается), `test_review_without_verdict_is_contract` (`done` без приговора остаётся `done` — тишина вместо отказа) |
 
 ### Чем эта таблица отличается от §13
 
 В §13 каждая строка — транскрипт прогона `0.0.4` (`8a329d5`): откат → красный тест →
 возврат → зелёный. Откаты `0.0.5` делались там, где правило писалось, — в карточках S1,
-S2, S3 и FIX-S4a; их отчёты называют имена упавших тестов и числа полного прогона
-(656 → 696 → 722 → 755 → 767 passed). **Здесь откат не повторялся:** карточка DOC-4
-правит только документацию, код в ней не трогается. На `def83ee` проверено:
+S2, S3, FIX-S4a и FIX-V; их отчёты называют имена упавших тестов и числа полного прогона
+(656 → 696 → 722 → 755 → 767 → 772 passed). Проба FIX-V снята тем же способом, что и
+остальные (откат — `facts_out.append(verdict_fact)` в `runner.py`, возврат — строка назад):
+
+```bash
+~/.hermes/hermes-agent/venv/bin/python -m pytest "tests/test_runner.py::test_review_verdict_opens_the_gate" -q
+# откат:  E  AssertionError: событий collected: 0          (1 failed)
+# возврат: 1 passed
+```
+
+Строки S1–S4 здесь **не перепрогонялись**: карточка DOC-4 правила только документацию,
+код в ней не трогается. На `def83ee` проверено:
 
 ```bash
 # имена существуют, тесты зелёные — по каждой строке таблицы

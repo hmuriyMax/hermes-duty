@@ -1024,3 +1024,133 @@ def test_decide_continue_after_park_runs_a_new_attempt(spec: Any) -> None:
     states = transit.stage_states(spec, journal)
     assert states["impl"].state == "pending"
     assert states["impl"].failures == ()
+
+
+# ------------------------------------------------------------------ гейт
+#
+# `kind: gate` — этап, который сам ничего не делает, а спрашивает человека
+# (`dashboard/spec.py`). Для слоя переходов он обычный этап графа: те же
+# `needs`, те же состояния. Отличается только текст: ожидание называется гейтом
+# с вариантами ответа, а парковка по сроку — «человек не ответил», а не
+# «парковка 0/0 unknown».
+
+GATE_GRAPH = """
+duty: probe
+stages:
+  - id: impl
+    role: implementer
+  - id: gate
+    kind: gate
+    ask: {q: "Выкатываем?", options: [да, нет]}
+    needs: [impl]
+  - id: check
+    kind: shell
+    cmd: "true"
+    needs: [gate]
+    workspace: none
+"""
+
+
+@pytest.fixture
+def gate(tmp_path: Path) -> Any:
+    """Спека с гейтом в середине цепочки — прочитанная настоящим загрузчиком."""
+    return write_spec(tmp_path, GATE_GRAPH, "gate.yaml")
+
+
+def gate_asked(question_id: int, attempt: int = 1) -> dict[str, Any]:
+    """Вопрос гейта так, как его пишет движок: без `stage`, адрес — в `routing`."""
+    return ev("question_asked", question_id=question_id, routing={"stage": "gate", "attempt": attempt})
+
+
+def gate_parked(question_id: int = 284, minutes: int | None = 5) -> dict[str, Any]:
+    """Парковка гейта: `blocked` с `block_kind='parked'` и флагом `gate`.
+
+    Ни класса отказа, ни счётчика попыток у неё нет — у гейта их не было.
+    """
+    return ev(
+        "blocked",
+        "gate",
+        block_kind="parked",
+        reason=f"гейт: человек не ответил за {minutes} мин"
+        if minutes is not None
+        else "гейт: человек не ответил за отведённое время",
+        gate=True,
+        question_id=question_id,
+    )
+
+
+def test_gate_waits_for_human_with_options(gate: Any) -> None:
+    """Вопрос гейта — ожидание человека, и причина называет гейт с вариантами ответа."""
+    journal = passed("impl") + [gate_asked(284)]
+
+    decision = transit.next_stage(gate, journal, NOW)
+    states = transit.stage_states(gate, journal)
+
+    assert states["gate"].state == "wait_human"
+    assert states["gate"].question_id == "284"
+    assert (decision.kind, decision.what) == ("wait", transit.WAIT_QUESTION)
+    assert "гейт 'gate': вопрос #284" in decision.reason
+    assert "варианты: да, нет" in decision.reason
+
+
+def test_gate_answer_makes_the_stage_judge_it(gate: Any) -> None:
+    """Ответ получен — этап снова `pending`, и причина говорит, что его ждёт суд по allow."""
+    journal = passed("impl") + [gate_asked(284), deal_answered(284)]
+
+    decision = transit.next_stage(gate, journal, NOW)
+
+    assert decision.kind == "run"
+    assert decision.pair == [("gate", 2)]
+    assert "этап судит его по allow" in transit.stage_states(gate, journal)["gate"].reason
+
+
+def test_gate_expired_question_parks_with_gate_reason(gate: Any) -> None:
+    """Срок вопроса — не ответ: гейт `parked`, и причина называет человека, а не сбой."""
+    journal = passed("impl") + [gate_asked(284), deal_answered(284, 0, "expired")]
+
+    states = transit.stage_states(gate, journal)
+    decision = transit.next_stage(gate, journal, NOW)
+
+    assert states["gate"].state == "parked"
+    # Срок вопроса — это `park` того же этапа: решение «припарковано», которое
+    # драйвер запишет фактом (`_gate_park`), а не «продолжаем».
+    assert decision.kind == transit.PARK
+    assert decision.stage == "gate"
+    assert "гейт: человек не ответил" in states["gate"].reason
+    assert "гейт: человек не ответил" in decision.reason
+    assert "0/0" not in decision.reason
+
+
+def test_gate_park_names_the_declared_deadline(gate: Any) -> None:
+    """`budget.minutes` гейта — тот же срок в причине парковки: пять минут, а не «сколько-то»."""
+    spec_with_budget = write_spec(
+        tmp_path=gate.path.parent,
+        text=GATE_GRAPH.replace("    needs: [impl]", "    needs: [impl]\n    budget: {minutes: 5}"),
+        name="gate-budget.yaml",
+    )
+    journal = passed("impl") + [gate_asked(284), gate_parked(284)]
+
+    decision = transit.next_stage(spec_with_budget, journal, NOW)
+
+    assert decision.what == transit.WAIT_PARKED
+    assert "человек не ответил за 5 мин" in decision.reason
+    assert "parked 0/0" not in decision.reason
+
+
+def test_gate_park_without_budget_does_not_invent_a_number(gate: Any) -> None:
+    """Срок по умолчанию — «отведённое время»: второго написания константы `ask` нет."""
+    journal = passed("impl") + [gate_asked(284), gate_parked(284, minutes=None)]
+
+    decision = transit.next_stage(gate, journal, NOW)
+
+    assert "человек не ответил за отведённое время" in decision.reason
+
+
+def test_gate_done_lets_the_next_stage_run(gate: Any) -> None:
+    """Гейт закрыт ответом — граф идёт дальше обычным путём."""
+    journal = passed("impl") + [gate_asked(284), deal_answered(284)] + passed("gate", attempt=2)
+
+    decision = transit.next_stage(gate, journal, NOW)
+
+    assert decision.kind == "run"
+    assert decision.pair == [("check", 1)]

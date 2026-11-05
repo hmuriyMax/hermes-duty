@@ -584,3 +584,142 @@ def test_stagefeed_has_no_process_lookups():
     )
     assert "os.kill" not in source
     assert "popen" not in source
+
+
+# ------------------------------------------------------------------ гейт
+#
+# Гейт (`kind: gate`) в ленте — обычный этап: `wait_human` с номером вопроса.
+# Отличается только парковка: у неё нет класса отказа и счётчика попыток, и
+# нулевые поля вместо отсутствующих были бы утверждением о несуществующих
+# попытках.
+
+GATE_SPEC = """
+duty: гейт
+stages:
+  - id: gate
+    kind: gate
+    ask: {q: "Выкатываем?", options: [да, нет]}
+  - id: check
+    kind: shell
+    cmd: "true"
+    needs: [gate]
+    workspace: none
+"""
+
+
+def test_gate_question_is_wait_human_with_question_id(home):
+    """Ожидание гейта в ленте: `wait_human`, вид ожидания `question`, номер вопроса есть."""
+    path = home / "gate.yaml"
+    path.write_text(GATE_SPEC, encoding="utf-8")
+    spec = stagefeed.spec_module.load_spec(path)
+    events = [
+        {
+            "ts": NOW - 30,
+            "kind": "question_asked",
+            "payload": {
+                "question_id": 284,
+                "session_key": "t_0001",
+                "options": ["да", "нет"],
+                "routing": {"stage": "gate", "attempt": 1},
+            },
+        }
+    ]
+
+    rows = {row["id"]: row for row in stagefeed.stages(spec, events, NOW)}
+
+    assert rows["gate"]["state"] == "wait_human"
+    assert rows["gate"]["waits"]["kind"] == "question"
+    assert rows["gate"]["waits"]["question_id"] == 284
+    assert rows["gate"]["attempts"] == []  # попытки-процесса у гейта не было
+    assert rows["check"]["state"] == "wait_gate"
+
+
+def test_gate_park_waits_without_class_and_counter():
+    """Парковка гейта: вид `parked` и флаг `gate`, а полей класса и счётчика нет вовсе."""
+    waits = stagefeed._waits(
+        "parked",
+        "284",
+        "этап 'gate': гейт: человек не ответил за 5 мин",
+        {"gate": True, "reason": "гейт: человек не ответил за 5 мин"},
+    )
+
+    assert waits["kind"] == "parked"
+    assert waits["gate"] is True
+    assert waits["question_id"] == 284
+    assert "человек не ответил за 5 мин" in waits["reason"]
+    assert "class" not in waits and "attempts" not in waits and "limit" not in waits
+
+
+def test_now_gate_question_shows_options_from_the_pool(home):
+    """`/now` на ждущем гейте: `wait_human` с вопросом и вариантами ответа из пула.
+
+    Варианты — факт пула (`options_json`), а не догадка из журнала: человек
+    выбирает ответ, и «вопрос #284 без ответа» без вариантов заставляло бы
+    открывать панель, чтобы вспомнить, из чего выбирать.
+    """
+    path = home / "gate.yaml"
+    path.write_text(GATE_SPEC, encoding="utf-8")
+    app = FastAPI()
+    app.include_router(plugin_api.router)
+    client = TestClient(app)
+    created = client.post("/deals", json={"board": BOARD, "title": "гейт", "spec": str(path)})
+    assert created.status_code == 200, created.text
+    deal_id = created.json()["id"]
+    (home / "messaging").mkdir(parents=True, exist_ok=True)
+    pool = sqlite3.connect(home / "messaging" / "pool.db")
+    try:
+        pool.executescript(
+            """
+            CREATE TABLE questions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              session_key TEXT NOT NULL, project TEXT, text TEXT NOT NULL, text_full TEXT,
+              origin TEXT, options_json TEXT, status TEXT NOT NULL DEFAULT 'pending',
+              sender_rowid INTEGER, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+              sent_at TEXT, answered_at TEXT, answer TEXT, timeout REAL,
+              critical INTEGER NOT NULL DEFAULT 0, notified_at TEXT,
+              reminder_every REAL NOT NULL DEFAULT 4.0, kind TEXT NOT NULL DEFAULT 'question',
+              link TEXT, answered_via TEXT, external_notified_at TEXT, external_ref TEXT
+            );
+            """
+        )
+        pool.execute(
+            "INSERT INTO questions (id, session_key, text, origin, options_json, status) "
+            "VALUES (284, ?, 'Выкатываем?', 'duty', ?, 'pending')",
+            (f"t_{deal_id}", '["да", "нет"]'),
+        )
+        pool.commit()
+    finally:
+        pool.close()
+
+    conn = journal.open_journal(home)
+    try:
+        journal.append(
+            conn,
+            [
+                {
+                    "ts": NOW - 30,
+                    "recorded_at": NOW - 30,
+                    "deal_id": deal_id,
+                    "board": BOARD,
+                    "kind": "question_asked",
+                    "payload": {
+                        "question_id": 284,
+                        "session_key": f"t_{deal_id}",
+                        "routing": {"stage": "gate"},
+                    },
+                    "source": "ask",
+                    "idempotency_key": "ask:284:question_asked",
+                }
+            ],
+        )
+    finally:
+        conn.close()
+
+    row = next(deal for deal in client.get("/now").json()["deals"] if deal["id"] == deal_id)
+    waiting = row["waiting"]
+
+    assert waiting["state"] == "wait_human"
+    assert waiting["human_kind"] == "question"
+    assert "вопрос #284" in waiting["evidence"]
+    assert "варианты: да, нет" in waiting["evidence"]
+    assert "/imsg" in waiting["evidence"]

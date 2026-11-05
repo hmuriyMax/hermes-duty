@@ -494,14 +494,24 @@ def fold(
             # половины одного факта не повторяются: «ждёт решения» поверх
             # «ответ получен» читается как противоречие.
             needs = "" if parked_fact["answered"] else " — ждёт решения человека"
-            facts.setdefault("wait_human", []).append(
-                f"blocked: block_kind=parked, парковка: "
-                f"{parked_fact['attempts']}/{parked_fact['limit']} {parked_fact['kind']}"
-                f"{' на этапе ' + parked_fact['stage'] if parked_fact['stage'] else ''}, "
-                f"причина: {_short(reason) or 'не записана'}"
-                + (f", вопрос #{parked_fact['question_id']}" if parked_fact["question_id"] else "")
-                + needs
-            )
+            if parked_fact["gate"]:
+                # Парковка гейта: класса и счётчика у неё нет — человек не ответил
+                # на вопрос этапа, и «парковка 0/0» было бы выдумкой.
+                facts.setdefault("wait_human", []).append(
+                    "blocked: block_kind=parked, гейт: "
+                    f"{_short(reason) or 'человек не ответил'}"
+                    + (f", вопрос #{parked_fact['question_id']}" if parked_fact["question_id"] else "")
+                    + needs
+                )
+            else:
+                facts.setdefault("wait_human", []).append(
+                    f"blocked: block_kind=parked, парковка: "
+                    f"{parked_fact['attempts']}/{parked_fact['limit']} {parked_fact['kind']}"
+                    f"{' на этапе ' + parked_fact['stage'] if parked_fact['stage'] else ''}, "
+                    f"причина: {_short(reason) or 'не записана'}"
+                    + (f", вопрос #{parked_fact['question_id']}" if parked_fact["question_id"] else "")
+                    + needs
+                )
         elif block_kind == "capability" or any(word in reason.lower() for word in CAPABILITY_WORDS):
             facts.setdefault("capability", []).append(text)
         else:
@@ -809,6 +819,9 @@ def _parked_fact(payload: dict[str, Any]) -> dict[str, Any]:
     правила едет отдельным ключом `park_reason` (`retries_exhausted` /
     `too_many_failures`). `stage` — адрес отказа, а не принадлежность события
     этапу; `fold` читает такой `blocked` как факт дела.
+
+    `gate` — парковка гейта (`dashboard/runner.park_gate`): у неё нет ни класса
+    отказа, ни счётчика попыток, и текст ожидания не должен показывать «0/0».
     """
     return {
         "kind": str(payload.get("kind") or payload.get("fail_kind") or ""),
@@ -817,6 +830,7 @@ def _parked_fact(payload: dict[str, Any]) -> dict[str, Any]:
         "limit": _number(payload.get("limit")),
         "reason": str(payload.get("park_reason") or ""),
         "question_id": payload.get("question_id"),
+        "gate": bool(payload.get("gate")),
     }
 
 

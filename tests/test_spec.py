@@ -1374,9 +1374,10 @@ def test_shell_evidence_is_warning_not_refusal(tmp_path: Path):
 
 
 def test_unknown_kind_is_refused(tmp_path: Path):
-    found = issues(tmp_path, shell_spec(stage="    kind: gate\n    cmd: \"true\"\n"))
+    """Неизвестный вид этапа — отказ со списком допустимых: опечатка не «agent»."""
+    found = issues(tmp_path, shell_spec(stage="    kind: wizard\n    cmd: \"true\"\n"))
     assert "kind" in rules(found)
-    assert any("допустимо agent, shell" in issue.message for issue in found)
+    assert any("допустимо agent, shell, gate" in issue.message for issue in found)
 
 
 def test_agent_stage_refuses_cmd(tmp_path: Path):
@@ -1412,6 +1413,192 @@ def test_cli_check_shell_with_role_names_line(capsys, tmp_path: Path):
     path = write(
         tmp_path,
         "duty: probe\nstages:\n  - id: check\n    kind: shell\n    cmd: \"true\"\n    role: implementer\n",
+    )
+    code, out = run_cli(["spec", "check", str(path)], capsys)
+    assert code == 1
+    assert f"{path}:6: kind.role:" in out
+
+
+# --------------------------------------------------------------- гейт
+
+
+def gate_body(ask: str = "    ask: {q: \"Выкатываем?\", options: [да, нет]}\n", extra: str = "") -> str:
+    """Объявление этапа-гейта: вопрос и варианты ответа — его работа.
+
+    `ask` и `extra` подменяют объявление целиком: на них проверяются отказы
+    (нет `ask.q`, нет вариантов, чужое поле).
+    """
+    return "    kind: gate\n" + ask + extra
+
+
+def gate_spec(*, stage: str = "", after: str = "") -> str:
+    """Спека `impl → gate → check`: гейт в середине цепочки, как в приёмке.
+
+    Замысел тот же, что у `shell_spec`: у `gate` нет роли и команды, у `check`
+    (shell) нет роли, у `impl` — профиль. `stage` заменяет объявление гейта,
+    `after` добавляет хвост (например `budget`).
+    """
+    body = stage or gate_body(extra=after)
+    return (
+        "duty: probe\n"
+        "stages:\n"
+        "  - id: impl\n"
+        "    role: implementer\n"
+        "  - id: gate\n"
+        + body
+        + "    needs: [impl]\n"
+        "  - id: check\n"
+        "    kind: shell\n"
+        "    cmd: \"true\"\n"
+        "    needs: [gate]\n"
+        "    workspace: none\n"
+    )
+
+
+def test_gate_stage_with_question_is_ok(tmp_path: Path):
+    """Гейт с `ask.q`/`ask.options` и без роли — годная спека."""
+    found = issues(tmp_path, gate_spec())
+    assert found == []
+    loaded = spec_module.load_spec(write(tmp_path, gate_spec()))
+    stage = loaded.stage("gate")
+    assert (stage.kind, stage.role, stage.ask.q) == ("gate", "", "Выкатываем?")
+    assert stage.ask.options == ("да", "нет")
+    # Дерева у гейта нет даже после предшественника: исполнять ему нечего.
+    assert (stage.workspace, stage.workspace_default) == ("none", True)
+
+
+def test_gate_without_ask_is_refused(tmp_path: Path):
+    """Гейту нечего спрашивать без `ask` — отказ, а не «этап без вопросов»."""
+    found = issues(tmp_path, gate_spec(stage="    kind: gate\n"))
+    assert "kind.ask" in rules(found)
+    assert any("нечего спрашивать" in issue.message for issue in found)
+
+
+def test_gate_without_question_text_is_refused(tmp_path: Path):
+    """`ask` без `q`: строка вопроса — работа гейта, и её место в спеке."""
+    found = issues(tmp_path, gate_spec(stage=gate_body(ask="    ask: {options: [да, нет]}\n")))
+    assert "ask.q" in rules(found)
+
+
+def test_gate_without_options_is_refused(tmp_path: Path):
+    """`ask` без `options`: человеку не из чего выбирать — отказ."""
+    found = issues(tmp_path, gate_spec(stage=gate_body(ask="    ask: {q: \"Выкатываем?\"}\n")))
+    assert "ask.options" in rules(found)
+
+
+def test_gate_empty_option_is_refused(tmp_path: Path):
+    """Пустой вариант ответа неотличим от «не ответили» — отказ."""
+    found = issues(tmp_path, gate_spec(stage=gate_body(ask="    ask: {q: \"Выкатываем?\", options: [да, \"\"]}\n")))
+    assert "ask.options" in rules(found)
+
+
+def test_gate_allow_must_name_declared_option(tmp_path: Path):
+    """`allow` вне `options` — отказ: такого ответа не выбрать, и он бы не сработал."""
+    found = issues(
+        tmp_path,
+        gate_spec(stage=gate_body(extra="    allow: [да, может быть]\n")),
+    )
+    assert "allow" in rules(found)
+    assert any("которого нет в ask.options" in issue.message for issue in found)
+
+
+def test_gate_allow_inside_options_is_ok(tmp_path: Path):
+    """`allow: [да]` сужает продолжение до одного варианта — это годная спека."""
+    found = issues(tmp_path, gate_spec(stage=gate_body(extra="    allow: [да]\n")))
+    assert found == []
+    assert spec_module.load_spec(write(tmp_path, gate_spec(stage=gate_body(extra="    allow: [да]\n")))).stage("gate").allow == ("да",)
+
+
+def test_gate_refuses_role(tmp_path: Path):
+    """Приёмка: гейт с `role` — отказ (`kind.role`)."""
+    found = issues(tmp_path, gate_spec(stage=gate_body(extra="    role: implementer\n")))
+    assert "kind.role" in rules(found)
+
+
+def test_gate_refuses_workspace(tmp_path: Path):
+    """Гейт не работает в дереве: `workspace` у него — отказ, а не настройка."""
+    found = issues(tmp_path, gate_spec(stage=gate_body(extra="    workspace: none\n")))
+    assert "kind.workspace" in rules(found)
+
+
+def test_gate_refuses_verdict_retry_cmd(tmp_path: Path):
+    """`verdict`, `retry`, `cmd` (и поля команды) у гейта — отказы."""
+    found = issues(
+        tmp_path,
+        gate_spec(
+            stage=gate_body(
+                extra=(
+                    "    verdict: {approve: next, changes: impl, max_rounds: 1}\n"
+                    "    retry: {max: 1, on: [infra]}\n"
+                    "    cmd: \"true\"\n"
+                    "    must: 0\n"
+                )
+            )
+        ),
+    )
+    assert {"kind.verdict", "kind.retry", "kind.cmd", "kind.must"} <= rules(found)
+
+
+def test_gate_refuses_role_routing_of_the_question(tmp_path: Path):
+    """Маршрут вопроса у гейта не объявляется: он спрашивает человека напрямую."""
+    found = issues(
+        tmp_path,
+        gate_spec(stage=gate_body(ask="    ask: {q: \"Выкатываем?\", options: [да, нет], allowed: [reviewer]}\n")),
+    )
+    assert "kind.ask" in rules(found)
+
+
+def test_allow_on_agent_stage_is_refused(tmp_path: Path):
+    """`allow` — поле гейта: у агента оно отказывает, а не игнорируется."""
+    found = issues(tmp_path, two_stages(extra="    allow: [да]\n"))
+    assert "kind.allow" in rules(found)
+
+
+def test_gate_chain_graph_is_checked_as_usual(tmp_path: Path):
+    """Гейт в цепочке с `needs` — обычный этап графа: цикл и вход проверяются как всегда."""
+    ok = issues(tmp_path, gate_spec())
+    assert ok == []
+    cyclic = issues(
+        tmp_path,
+        "duty: probe\n"
+        "stages:\n"
+        "  - id: impl\n"
+        "    role: implementer\n"
+        "    needs: [gate]\n"
+        "  - id: gate\n"
+        + gate_body()
+        + "    needs: [impl]\n",
+    )
+    assert "cycle" in rules(cyclic)
+
+
+def test_cli_check_names_gate_kind(capsys, tmp_path: Path):
+    """Приёмка: `spec check` на спеке с гейтом — OK и вид этапа назван."""
+    path = write(tmp_path, gate_spec())
+    code, out = run_cli(["spec", "check", str(path)], capsys)
+    assert code == 0
+    assert out.startswith("OK ")
+    assert "kind: gate=gate" in out
+
+
+def test_cli_check_gate_without_question_names_line(capsys, tmp_path: Path):
+    """Приёмка: гейт без `ask.q`/`ask.options` — отказ с `file:line`."""
+    path = write(
+        tmp_path,
+        "duty: probe\nstages:\n  - id: gate\n    kind: gate\n    ask: {}\n",
+    )
+    code, out = run_cli(["spec", "check", str(path)], capsys)
+    assert code == 1
+    assert f"{path}:5: ask.q:" in out
+    assert f"{path}:5: ask.options:" in out
+
+
+def test_cli_check_gate_with_role_names_line(capsys, tmp_path: Path):
+    """Приёмка: гейт с `role` — отказ с `file:line` и правилом `kind.role`."""
+    path = write(
+        tmp_path,
+        "duty: probe\nstages:\n  - id: gate\n    kind: gate\n"
+        "    ask: {q: \"Выкатываем?\", options: [да, нет]}\n    role: implementer\n",
     )
     code, out = run_cli(["spec", "check", str(path)], capsys)
     assert code == 1

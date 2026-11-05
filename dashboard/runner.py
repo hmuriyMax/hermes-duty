@@ -141,9 +141,11 @@ KILL_GRACE_SEC = 10
 STDERR_TAIL = 20
 
 # Виды этапа (`dashboard/spec.py`): `agent` исполняет профиль роли, `shell` —
-# команду. Здесь — только исполнение: что запускать, решила спека.
+# команда, `gate` — никто: этап спрашивает человека. Здесь — только исполнение:
+# что запускать, решила спека.
 STAGE_KIND_AGENT = "agent"
 STAGE_KIND_SHELL = "shell"
+STAGE_KIND_GATE = "gate"
 
 # Источник событий shell-попытки в журнале: по нему видно, что этап исполнила
 # команда, а не процесс профиля. `engine` остаётся источником решений движка
@@ -1650,6 +1652,332 @@ def run_shell_stage(
     }
 
 
+# ---------------------------------------------------------------------- гейт
+
+
+# Класс отказа гейта, когда ответ человека не входит в `allow`: то же, что
+# «ревьюер сказал changes» — работа остановлена решением, а не сбоем процесса.
+GATE_REFUSED_KIND = FAIL_CONTRACT
+
+# Сколько знаков ответа цитируется в причине: цитата нужна, чтобы в журнале было
+# видно, **что именно** ответил человек, но весь ответ — факт пула, а не журнала.
+GATE_QUOTE_LIMIT = 80
+
+
+def gate_wait_sec(stage: Any) -> float:
+    """Сколько ждём человека на гейте: `budget.minutes` или срок вопроса (`ask`).
+
+    `budget.minutes` у гейта — не бюджет процесса (его нет), а срок ответа: по нему
+    вопрос уходит в пул и по нему же он однажды истекает. Не задан — тот же срок,
+    что у обычного некритичного вопроса (`ask.ASK_TIMEOUT_HOURS`).
+    """
+    budget = getattr(stage, "budget", None)
+    minutes = getattr(budget, "minutes", None) if budget is not None else None
+    if isinstance(minutes, int) and not isinstance(minutes, bool) and minutes > 0:
+        return float(minutes) * 60.0
+    return float(ask.ASK_TIMEOUT_HOURS) * 3600.0
+
+
+def gate_allow(stage: Any) -> tuple[str, ...]:
+    """Ответы, которые считаются продолжением: `allow`, а без него — все `options`.
+
+    Умолчание именно «все объявленные варианты», а не «любой текст»: гейт судит
+    ответ по объявлению, и свободный текст продолжением не считается.
+    """
+    declared = tuple(getattr(stage, "allow", ()) or ())
+    if declared:
+        return declared
+    ask_decl = getattr(stage, "ask", None)
+    return tuple(getattr(ask_decl, "options", ()) or ())
+
+
+def gate_answer_allowed(stage: Any, answer: Optional[str]) -> Optional[str]:
+    """Вариант из `allow`, совпавший с ответом; `None` — ответ не в списке.
+
+    Сравнение по точному тексту без пробелов по краям: варианты ответа объявлены
+    спекой, и «да» в пуле — это ровно «да», а не «наверное, да». Приведение
+    регистра или склейка слов сделали бы список допустимых ответов догадкой.
+    """
+    text = str(answer or "").strip()
+    return next((item for item in gate_allow(stage) if item.strip() == text), None)
+
+
+def _gate_quote(answer: Optional[str]) -> str:
+    """Ответ человека цитатой для журнала: одна строка, с многоточием на длинном."""
+    text = " ".join(str(answer or "").split())
+    if not text:
+        return "—"
+    return text if len(text) <= GATE_QUOTE_LIMIT else text[:GATE_QUOTE_LIMIT] + "…"
+
+
+def _gate_exchange(
+    events: Iterable[Any], stage_id: str
+) -> tuple[Optional[str], Optional[dict[str, Any]], int]:
+    """Последний вопрос этого гейта, ответ на него и время ответа.
+
+    Вопрос адресуется этапу в `payload.routing` (`ask()` пишет событие на уровне
+    дела), поэтому свой вопрос ищется по адресу, а не по «последнему вопросу
+    журнала»: у дела может быть вопрос другого этапа. Ответ сопоставляется по
+    `question_id` — чужой ответ гейт не судит.
+
+    Время ответа возвращается, потому что суд не может стоять в журнале **раньше**
+    того, что он судит. Вопрос и ответ пишет `ask()` живыми часами
+    (`time.time()`), а движок — своими (`clock`); при расхождении источников
+    `attempt_ended` оказался бы в журнале до `question_answered`, и fold вернул бы
+    гейт в ожидание уже после решения — прогон крутился бы на одном этапе.
+    """
+    asked: Optional[str] = None
+    answers: dict[str, tuple[dict[str, Any], int]] = {}
+    for event in sorted(
+        (item for item in events or () if isinstance(item, dict)),
+        key=lambda item: int(item.get("id") or 0),
+    ):
+        kind = str(event.get("kind") or "")
+        payload = journal.payload_of(event)
+        if kind == "question_asked":
+            routing = payload.get("routing")
+            if not isinstance(routing, dict) or str(routing.get("stage") or "") != stage_id:
+                continue
+            asked = _question_id(payload)
+            continue
+        if kind == "question_answered":
+            number = _question_id(payload)
+            if number is not None:
+                answers[number] = (payload, _int(event.get("ts")) or 0)
+    if asked is None:
+        return None, None, 0
+    answer, at = answers.get(asked, (None, 0))
+    return asked, answer, at
+
+
+def _question_id(payload: dict[str, Any]) -> Optional[str]:
+    """`question_id` строкой: пул отдаёт и числом, и строкой; пусто — `None`."""
+    raw = payload.get("question_id")
+    if raw is None or raw == "":
+        return None
+    return str(raw)
+
+
+def run_gate_stage(
+    conn: sqlite3.Connection,
+    spec: Any,
+    deal: Any,
+    stage_id: str,
+    attempt: int,
+    *,
+    home: Path,
+    clock: Optional[Callable[[], float]] = None,
+) -> dict[str, Any]:
+    """Одна передача этапа-гейта: вопрос человеку или решение по его ответу.
+
+    Процесса здесь нет вовсе, и лизинг не берётся: держать этап некому — гейт не
+    работает, а ждёт. Первая передача задаёт вопрос единственным каналом `ask()`
+    (`ask.q`/`ask.options` спеки) и оставляет дело человеку; после ответа,
+    доехавшего до журнала (`ask.sync_answers` в драйвере), следующая передача
+    судит ответ по `allow`. «Да» закрывает этап, всё остальное — отказ класса
+    `contract` с цитатой ответа: гейт не решает за человека, что «нет» значит
+    «продолжаем».
+
+    Факты журнала — ровно два вида, оба уже в закрытом наборе: `question_asked`
+    (его пишет `ask()`) и `attempt_ended` (исход гейта). `attempt_started` не
+    пишется: он означал бы процесс, которого нет, и уборка осиротевших попыток
+    закрыла бы ждущий человека гейт как мёртвый.
+    """
+    clock = clock or time.time
+    stage = next((item for item in spec.stages if item.id == stage_id), None)
+    if stage is None:
+        raise RunnerError(f"этапа {stage_id!r} нет в спеке {getattr(spec, 'path', '')}")
+    attempt = int(attempt)
+    if attempt < 1:
+        raise RunnerError(f"номер попытки {attempt}: попытки считаются с 1")
+    ask_decl = getattr(stage, "ask", None)
+    if ask_decl is None or not str(getattr(ask_decl, "q", "")).strip():
+        raise RunnerError(f"этап {stage_id!r} с kind: gate без ask.q: гейту нечего спрашивать")
+
+    events = journal.read_events(conn, str(deal["id"]))
+    asked, answer, answered_at = _gate_exchange(events, stage_id)
+    if asked is not None and answer is None:
+        # Вопрос уже задан и ответа ещё нет: второй вопрос не создаётся (его
+        # отклонил бы и пул), а шаг честно говорит, что ждёт.
+        return {
+            "started": False,
+            "stage": stage_id,
+            "attempt": attempt,
+            "question_id": int(asked),
+            "reason": f"гейт: вопрос #{asked} уже задан — ответа ещё нет",
+        }
+    if asked is None:
+        return _gate_ask(conn, deal, stage, attempt, home=home, clock=clock)
+    return _gate_judge(
+        conn, deal, stage, attempt, asked, answer or {}, home=home, clock=clock, answered_at=answered_at
+    )
+
+
+def _gate_ask(
+    conn: sqlite3.Connection,
+    deal: Any,
+    stage: Any,
+    attempt: int,
+    *,
+    home: Path,
+    clock: Callable[[], float],
+) -> dict[str, Any]:
+    """Задать вопрос гейта: пул, факт `question_asked`, дело в `blocked`.
+
+    Лизинг не берётся и статус `running` не ставится: ждущий человек этап ничего
+    не держит, и «идёт попытка» здесь было бы ложью. Вопрос адресуется человеку
+    (`routing.route` с властной разметкой: гейт — решение, а не справка), а срок
+    ответа — `budget.minutes` этапа.
+    """
+    question_id = _ask_gate(conn, deal, stage, attempt, home=home)
+    now = _now_sec(int(clock()))
+    deals.set_blocked(
+        conn,
+        str(deal["id"]),
+        kind="needs_input",
+        reason=(
+            f"гейт {stage.id}: вопрос #{question_id} человеку — без ответа "
+            f"(варианты: {', '.join(gate_allow(stage)) or '—'}; пул /imsg)"
+        ),
+        author=ENGINE_SOURCE,
+        source=ENGINE_SOURCE,
+        details={"stage": stage.id, "attempt": int(attempt), "question_id": int(question_id)},
+        now=now,
+    )
+    return {
+        "started": True,
+        "stage": stage.id,
+        "attempt": int(attempt),
+        "question_id": int(question_id),
+        "reason": f"гейт: вопрос #{question_id} задан человеку, ждём ответа",
+    }
+
+
+def _ask_gate(conn: sqlite3.Connection, deal: Any, stage: Any, attempt: int, *, home: Path) -> int:
+    """Вопрос гейта в пул через `ask()` — единственный канал вопросов.
+
+    Возвращает номер вопроса. Ответ на живом вопросе этого дела (`ask()` его
+    подхватывает) — тот же номер: второй вопрос человеку не задаётся.
+    """
+    ask_decl = stage.ask
+    question = str(ask_decl.q).strip()
+    options = [str(option) for option in ask_decl.options]
+    address = routing.route(stage, {"kind": "authority"}, 0)
+    asked = ask.ask(
+        conn,
+        {**deal, "home": Path(home)},
+        question,
+        f"{question}\n\nВарианты ответа: {', '.join(options)}. Продолжение — только ответ "
+        f"из списка: {', '.join(gate_allow(stage))}.",
+        options,
+        critical=False,
+        timeout=gate_wait_sec(stage),
+        routing={**address.as_payload(), "stage": stage.id, "attempt": int(attempt)},
+    )
+    return int(asked.question_id)
+
+
+def _gate_judge(
+    conn: sqlite3.Connection,
+    deal: Any,
+    stage: Any,
+    attempt: int,
+    question_id: str,
+    answer: dict[str, Any],
+    *,
+    home: Path,
+    clock: Callable[[], float],
+    answered_at: int = 0,
+) -> dict[str, Any]:
+    """Судить ответ человека: `allow` — продолжение, всё остальное — отказ контракта.
+
+    Текст ответа живёт в пуле, а не в журнале (`question_answered` хранит
+    `answer_len`), поэтому читается оттуда — только чтение (`ask.answer_of`).
+    Истёкший вопрос ответом не считается: это сделал не человек, и решение по
+    такому «ответу» было бы выдумкой (по сроку дело паркует `transit`).
+
+    Время факта — не раньше ответа (`answered_at`): суд, записанный раньше того,
+    что он судит, fold применил бы до ответа и вернул гейт в ожидание.
+    """
+    if _gate_expired(answer):
+        return {
+            "started": False,
+            "stage": stage.id,
+            "attempt": int(attempt),
+            "question_id": int(question_id),
+            "reason": f"гейт: вопрос #{question_id} закрыт по сроку — человек не ответил",
+        }
+    text = ask.answer_of(Path(home), question_id)
+    matched = gate_answer_allowed(stage, text)
+    allowed = ", ".join(gate_allow(stage)) or "—"
+    if matched is not None:
+        outcome, kind = OUTCOME_DONE, ""
+        reason = f"гейт: ответ «{matched}» входит в allow [{allowed}]"
+    else:
+        outcome, kind = OUTCOME_FAILED, GATE_REFUSED_KIND
+        reason = f"гейт: ответ «{_gate_quote(text)}» вне allow [{allowed}] — отказ контракта"
+
+    now = _now_sec(max(int(clock()), int(answered_at or 0)))
+    ended = _event(
+        deal,
+        "attempt_ended",
+        {
+            "run_id": f"{stage.id}#{int(attempt)}",
+            "stage": stage.id,
+            "attempt": int(attempt),
+            "outcome": outcome,
+            "kind": kind or None,
+            "reason": reason,
+            "details": {
+                "stage_kind": STAGE_KIND_GATE,
+                "question_id": int(question_id),
+                "answer": _gate_quote(text),
+                "allow": list(gate_allow(stage)),
+            },
+        },
+        {"stage": stage.id, "attempt": int(attempt), "outcome": outcome},
+        now,
+    )
+    journal.append(conn, [ended])
+    if outcome == OUTCOME_FAILED:
+        # Отказ человека виден поверхности: дело останавливается его решением, и
+        # без факта журнала экран показывал бы «status=running без живого факта».
+        # Парковкой это не делается: парковка спросила бы человека второй раз о
+        # том же самом, а он уже ответил.
+        deals.set_blocked(
+            conn,
+            str(deal["id"]),
+            kind="needs_input",
+            reason=f"гейт {stage.id}: {reason} — дальше дело не идёт",
+            author=ENGINE_SOURCE,
+            source=ENGINE_SOURCE,
+            details={"stage": stage.id, "attempt": int(attempt), "question_id": int(question_id)},
+            now=now,
+        )
+    return {
+        "started": True,
+        "stage": stage.id,
+        "attempt": int(attempt),
+        "outcome": outcome,
+        "kind": kind or None,
+        "reason": reason,
+        "question_id": int(question_id),
+        "answer": text,
+        "stage_kind": STAGE_KIND_GATE,
+    }
+
+
+def _gate_expired(answer: dict[str, Any]) -> bool:
+    """Закрыт ли вопрос по сроку: тот же признак, что у `transit._expired`.
+
+    `answered_via='expired'` ставит наш же синк ответов, а пустой ответ пул
+    оставляет у вопроса, закрытого по сроку: человека за ним не было.
+    """
+    if str(answer.get("answered_via") or "").strip().lower() == ask.EXPIRED_VIA:
+        return True
+    return _int(answer.get("answer_len")) == 0
+
+
 # ---------------------------------------------------------------------- шаг
 
 
@@ -1691,6 +2019,10 @@ def run_stage(
         return run_shell_stage(
             conn, spec, deal, stage_id, attempt, home=home, spawn=spawn, clock=clock, monotonic=monotonic
         )
+    if getattr(stage, "kind", STAGE_KIND_AGENT) == STAGE_KIND_GATE:
+        # Гейт — тоже отдельная ветка: ни процесса, ни дерева, ни лизинга у него
+        # нет, и общий путь агента для него был бы неверен в каждой строке.
+        return run_gate_stage(conn, spec, deal, stage_id, attempt, home=home, clock=clock)
     ttl = ttl_sec(stage)
     deadline_sec = ttl
     engine_pid = os.getpid()
@@ -2095,6 +2427,40 @@ def park_exhausted(
         "question_target": address.address,
         "question_reason": address.reason,
     }
+
+
+def park_gate(
+    conn: sqlite3.Connection,
+    deal: Any,
+    stage: Any,
+    reason: str,
+    *,
+    question_id: Any = None,
+    clock: Optional[Callable[[], float]] = None,
+) -> dict[str, Any]:
+    """Гейт не дождался человека — припарковать дело с причиной гейта.
+
+    Парковка — тот же `blocked` с `block_kind='parked'`, но без класса отказа и
+    счётчика: у гейта не было ни попыток, ни ошибки — человек просто не ответил.
+    Поэтому в payload едет `gate: true` (`journal` и `transit` по нему называют
+    причину, а не «парковка 0/0 unknown»), а причина приходит готовая из решения
+    `transit` («гейт: человек не ответил за N»).
+    """
+    now = _now_sec(int((clock or time.time)()))
+    details: dict[str, Any] = {"stage": stage.id, "gate": True}
+    if question_id is not None and str(question_id) != "":
+        details["question_id"] = int(str(question_id))
+    deals.set_blocked(
+        conn,
+        str(deal["id"]),
+        kind=failures.PARKED_KIND,
+        reason=reason,
+        author=ENGINE_SOURCE,
+        source=ENGINE_SOURCE,
+        details=details,
+        now=now,
+    )
+    return {"reason": reason, "stage": stage.id, "question_id": question_id, "gate": True}
 
 
 def hops_done(conn: sqlite3.Connection, deal: Any, stage_id: str) -> int:

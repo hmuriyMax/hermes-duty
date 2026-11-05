@@ -55,6 +55,12 @@ Python — то есть гейт «дело проходит impl → verify �
    `status='running'` (живой прогон `d_6e764042`). Печать итога — после записи и
    по ней. Повторный прогон на закрытом деле второго `completed` не пишет и
    отвечает «уже закрыто» с причиной и временем из журнала.
+9. **Парковка гейта — тоже факт, а не решение.** Когда `transit` отвечает `park`
+   по истечении вопроса гейта, драйвер пишет `blocked` с `block_kind='parked'` и
+   причиной решения («гейт: человек не ответил за N») — `_gate_park`. Иначе экран
+   показывал бы `running` без живого факта: решение «припарковано» без записи
+   неотличимо от «движок не дошёл». Парковку исчерпанных попыток по-прежнему
+   пишет `runner.park_exhausted` — второго писателя того же факта нет.
 
 ## Коды возврата — контракт `bin/duty run`
 
@@ -288,6 +294,10 @@ def _rows(number: int, step_result: dict[str, Any], duration: float) -> list[dic
                 "kind": str(run.get("kind") or "") or None,
                 "reason": str(run.get("reason") or ""),
                 "question_id": run.get("question_id"),
+                # Вид этапа: гейт отчитывается `done` и при этом называет вопрос —
+                # без вида строка «ждёт ответа» читалась бы как «человек ещё не
+                # ответил», хотя ответ уже разобран.
+                "stage_kind": run.get("stage_kind"),
                 # База дерева и коммит попытки: по ним видно, от чего этап работал
                 # и что оставил следующему (W14). В человеческую строку они не
                 # идут — она про исход, — но в `--json` и отчёте прогона нужны.
@@ -323,6 +333,7 @@ def _report(
     answers: Optional[dict[str, Any]] = None,
     answers_errors: Optional[list[dict[str, Any]]] = None,
     closed: Optional[dict[str, Any]] = None,
+    parked: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Отчёт прогона: шаги, уборка, ответы пула, финальное решение, исход и код.
 
@@ -338,6 +349,9 @@ def _report(
     закрытием. Строку «итог: дело закрыто» CLI печатает **по этому полю**, а не по
     своему решению: состояние называет факт, который записан, а не намерение
     напечатать.
+    `parked` — факт парковки гейта (`_gate_park`): записан ли `blocked` с причиной
+    «гейт: человек не ответил за N» или он уже был. `None` — прогон не парковал
+    гейт (парковку исчерпанных попыток пишет `runner.park_exhausted`).
     """
     return {
         "deal": str(deal.get("id") or ""),
@@ -351,6 +365,7 @@ def _report(
         "note": note,
         "decision": _decision_dict(decision),
         "closed": None if closed is None else dict(closed),
+        "parked": None if parked is None else dict(parked),
         "exit_code": EXIT_CODES[outcome],
     }
 
@@ -420,6 +435,38 @@ def _closure(conn: sqlite3.Connection, deal: Any, spec: Any, now: float) -> dict
     }
 
 
+def _gate_park(conn: sqlite3.Connection, deal: Any, spec: Any, decision: Any, now: float) -> Optional[dict[str, Any]]:
+    """Гейт не дождался человека — записать парковку, названную решением `transit`.
+
+    Это вторая половина требования «дело паркуется с причиной»: `transit` видит
+    истёкший вопрос и говорит `park` с причиной, но фактом журнала это станет
+    только здесь. Пишется тем же путём, что парковка исчерпанных попыток
+    (`deals.set_blocked` с `block_kind='parked'`), с флагом `gate`: у гейта нет ни
+    класса отказа, ни счётчика, и поверхность не должна показывать «парковка 0/0».
+    `None` — решение не про гейт (парковку исчерпанных попыток уже записал
+    `runner.park_exhausted`, второй факт не нужен).
+    """
+    stage_id = str(getattr(decision, "stage", "") or "")
+    finder = getattr(spec, "stage", None)
+    stage = finder(stage_id) if callable(finder) else None
+    if stage is None or str(getattr(stage, "kind", "")) != spec_module.GATE_KIND:
+        return None
+    if journal.parked_of(journal.read_events(conn, str(deal["id"]))) is not None:
+        return {"written": False, "already": True, "gate": True, "stage": stage_id}
+    try:
+        fact = runner.park_gate(
+            conn,
+            deal,
+            stage,
+            str(getattr(decision, "reason", "") or ""),
+            question_id=getattr(decision, "question_id", None),
+            clock=lambda: float(now),
+        )
+    except deals.DealError as exc:
+        return {"written": False, "already": False, "gate": True, "stage": stage_id, "refused": str(exc)}
+    return {"written": True, "already": False, **fact}
+
+
 def _release_mine(conn: sqlite3.Connection, deal: Any, spec: Any) -> None:
     """Отпустить лизинг, взятый самим драйвером, — в любом исходе прогона.
 
@@ -472,6 +519,7 @@ def run(
     outcome = ""
     note = ""
     closed: Optional[dict[str, Any]] = None
+    parked: Optional[dict[str, Any]] = None
 
     def decide() -> Any:
         """Уборка осиротевших попыток, дочитывание ответов пула, решение по журналу.
@@ -571,11 +619,25 @@ def run(
             # путём, что `bin/duty close` (`deals.close_stages_done`), и только
             # потом CLI печатает «итог: дело закрыто» — по записанному.
             closed = _closure(conn, deal, spec, tick())
+        if getattr(decision, "kind", "") == transit.PARK:
+            # Парковка гейта — тоже решение, а не факт: вопрос истёк, и дело
+            # паркуется здесь, с причиной «гейт: человек не ответил за N».
+            parked = _gate_park(conn, deal, spec, decision, tick())
     finally:
         children.stop()
         _release_mine(conn, deal, spec)
     return _report(
-        deal, spec, steps, decision, outcome, note, reaped, answers, answers_errors, closed=closed
+        deal,
+        spec,
+        steps,
+        decision,
+        outcome,
+        note,
+        reaped,
+        answers,
+        answers_errors,
+        closed=closed,
+        parked=parked,
     )
 
 

@@ -399,15 +399,26 @@ def _waits(
     отказ без единого слова о том, что человек уже решает, продолжать ли.
     """
     if parked is not None:
-        return {
+        fact: dict[str, Any] = {
             "kind": "parked",
             "question_id": _number(question_id),
             "reason": reason,
-            "class": parked.get("kind") or "",
-            "attempts": parked.get("attempts"),
-            "limit": parked.get("limit"),
             "park_reason": parked.get("reason") or "",
         }
+        if parked.get("gate"):
+            # Парковка гейта: ни класса, ни счётчика — этап не падал, человек не
+            # ответил. Поля оставляем отсутствующими, а не нулевыми: «0 из 0» —
+            # это утверждение о попытках, которых не было.
+            fact["gate"] = True
+            return fact
+        fact.update(
+            {
+                "class": parked.get("kind") or "",
+                "attempts": parked.get("attempts"),
+                "limit": parked.get("limit"),
+            }
+        )
+        return fact
     if state == transit.WAIT_HUMAN:
         return {
             "kind": "question" if question_id else "human",

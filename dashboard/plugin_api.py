@@ -1055,11 +1055,24 @@ def _journal_waiting(
 
 
 def _pool_waiting(folded: dict[str, Any], question: Optional[dict[str, Any]]) -> dict[str, Any]:
-    """Состояние журнала и живой вопрос пула в одном ответе (до строки решения)."""
+    """Состояние журнала и живой вопрос пула в одном ответе (до строки решения).
+
+    У вопроса, который журнал уже знает (`human_kind='question'`), рядом
+    называются **варианты ответа из пула**: гейт спрашивает человека выбором, и
+    «вопрос #N без ответа» без вариантов заставляло бы открывать панель `/imsg`,
+    чтобы узнать, из чего выбирать. Текст вариантов — факт пула, поэтому он
+    берётся из строки пула, а не из журнала.
+    """
     state = folded["state"]
     human_kind = folded["human_kind"]
-    if question is None or human_kind == "question":
+    if question is None:
         return {"state": state, "evidence": folded["evidence"], "human_kind": human_kind}
+    if human_kind == "question":
+        return {
+            "state": state,
+            "evidence": f"{folded['evidence']}; {_question_fact(question)}",
+            "human_kind": human_kind,
+        }
     pool_fact = (
         f"пул: вопрос #{question.get('id')} status='{question.get('status')}' "
         f"origin='{question.get('origin')}' — в журнале вопроса нет"
@@ -1071,6 +1084,31 @@ def _pool_waiting(folded: dict[str, Any], question: Optional[dict[str, Any]]) ->
             "human_kind": "question",
         }
     return {"state": state, "evidence": f"{folded['evidence']}; ещё: {pool_fact}", "human_kind": "question"}
+
+
+def _question_fact(question: dict[str, Any]) -> str:
+    """Живой вопрос пула словами: номер, варианты ответа и где отвечать.
+
+    Варианты — из `options_json` пула (`/imsg` показывает их кнопками). Вопрос без
+    вариантов — свободный ответ, и это сказано словами, а не пустым списком.
+    """
+    options = _question_options(question)
+    choices = f"варианты: {', '.join(options)}" if options else "вариантов нет — ответ свободным текстом"
+    return f"пул: вопрос #{question.get('id')} (status='{question.get('status')}'), {choices}; ответ — пул /imsg"
+
+
+def _question_options(question: dict[str, Any]) -> list[str]:
+    """Варианты ответа из строки пула: `options_json` — список строк, мусор — пусто."""
+    raw = question.get("options_json")
+    if not isinstance(raw, str) or not raw.strip():
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(item) for item in parsed if isinstance(item, (str, int, float))]
 
 
 def _decision_line(deal_id: str, question_id: Any, answer: Optional[str]) -> str:

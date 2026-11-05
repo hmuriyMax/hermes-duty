@@ -53,6 +53,7 @@ STAGE_KEYS = (
     "retry",
     "budget",
     "ask",
+    "allow",
     "verdict",
     "cmd",
     "must",
@@ -68,10 +69,13 @@ WORKSPACES = ("worktree", "dir", "none")
 TO_HUMAN = ("decisions_only", "never")
 
 # Виды этапа (спека P2, `docs/SPEC.md`): `agent` — процесс профиля роли,
-# `shell` — команда с кодом возврата вместо отчёта. Умолчание — `agent`:
-# спеки 0.0.4 объявляют этапы без `kind` и обязаны читаться без правок.
-STAGE_KINDS = ("agent", "shell")
+# `shell` — команда с кодом возврата вместо отчёта, `gate` — остановка на
+# человеке: этап ничего не исполняет, а задаёт вопрос и читает ответ. Умолчание —
+# `agent`: спеки 0.0.4 объявляют этапы без `kind` и обязаны читаться без правок.
+STAGE_KINDS = ("agent", "shell", "gate")
 DEFAULT_STAGE_KIND = "agent"
+SHELL_KIND = "shell"
+GATE_KIND = "gate"
 
 # Код возврата shell-этапа по умолчанию: «команда сходилась» — это 0.
 DEFAULT_SHELL_MUST = 0
@@ -209,8 +213,10 @@ class Stage:
 
     `kind` решает, кто исполняет этап: `agent` — процесс профиля `role`,
     `shell` — команда `cmd` с обязательным кодом возврата `must` и, если
-    объявлены, артефактами `artifacts`. Поля команды у `agent` не значат ничего
-    и потому отказывают (`_check_kind`), а не игнорируются.
+    объявлены, артефактами `artifacts`, `gate` — никто: этап задаёт вопрос
+    человеку (`ask.q`/`ask.options`) и читает ответ (допустимые — `allow`).
+    Поля чужого вида у этапа ничего не значат и потому отказывают
+    (`_check_kind`), а не игнорируются.
     """
 
     id: str
@@ -227,6 +233,9 @@ class Stage:
     retry: Optional[Retry] = None
     budget: Optional[Budget] = None
     ask: Optional[Ask] = None
+    # Гейт: ответы человека, которые считаются продолжением. Пусто — допустимы
+    # все `ask.options` (умолчание, а не «любой текст»).
+    allow: tuple[str, ...] = ()
     verdict: Optional[Verdict] = None
     # shell-этап: команда, её обязательный код возврата и то, что она предъявляет.
     cmd: str = ""
@@ -610,6 +619,17 @@ def _parse_stage(
             )
         )
         artifacts = ()
+    allow = _str_tuple(mapping.get("allow", []))
+    if allow is None:
+        issues.append(
+            Issue(
+                path,
+                lines.get(prefix + ("allow",), line),
+                "kind.allow",
+                "allow — список допустимых ответов человека (строк)",
+            )
+        )
+        allow = ()
     needs = _str_tuple(mapping.get("needs", []))
     parallel = _str_tuple(mapping.get("parallel_with", []))
     if needs is None:
@@ -629,8 +649,9 @@ def _parse_stage(
         # `workspace` работал в каталоге попытки и честно не нашёл файл `impl`).
         # Поэтому умолчание — `worktree`, а «дерева нет» стало явным
         # `workspace: none`. У входа предшественника нет и отводить нечего:
-        # там умолчание остаётся `none`.
-        workspace = "worktree" if needs else "none"
+        # там умолчание остаётся `none`. Гейт дерева не получает вовсе: он ничего
+        # не исполняет, и отводить ему нечего даже после предшественника.
+        workspace = "worktree" if needs and kind != GATE_KIND else "none"
     if not isinstance(workspace, str):
         issues.append(
             Issue(path, lines.get(prefix + ("workspace",), line), "workspace", f"workspace — одно из {', '.join(WORKSPACES)}")
@@ -649,6 +670,7 @@ def _parse_stage(
         retry=_parse_retry(mapping, path, lines, prefix, issues),
         budget=_parse_budget(mapping, path, lines, prefix, issues),
         ask=_parse_ask(mapping, path, lines, prefix, issues),
+        allow=allow,
         verdict=_parse_verdict(mapping, path, lines, prefix, issues),
         cmd=cmd,
         must=must,
@@ -1314,7 +1336,7 @@ def _check_retry(spec: Spec) -> list[Issue]:
 
 
 def _check_kind(spec: Spec) -> list[Issue]:
-    """Вид этапа: `agent` исполняет профиль, `shell` — команда, и вместе они не живут.
+    """Вид этапа: `agent` исполняет профиль, `shell` — команда, `gate` — человек.
 
     Отказ, а не тихий игнор. `role` у команды означал бы процесс профиля, которого
     никто не поднимает; `ask` — что этап задаст вопрос человеку, а он не умеет
@@ -1322,10 +1344,25 @@ def _check_kind(spec: Spec) -> list[Issue]:
     `retry` обещал бы повтор класса отказа, а у команды повтор выражается кодом
     возврата `must`, а не классом. Поля команды у `agent` отказывают по той же
     причине: объявленное и не прочитанное — это ложь спеки, а не запас на будущее.
+    `allow` — поле гейта: ограничение ответа имеет смысл только у этапа, который
+    сам ничего не делает, и у остальных видов оно отказывает.
     """
     issues: list[Issue] = []
     for stage in spec.stages:
-        if stage.kind == "shell":
+        if stage.kind == GATE_KIND:
+            issues += _check_gate_kind(spec, stage)
+            continue
+        if stage.allow:
+            issues.append(
+                Issue(
+                    spec.path,
+                    stage.line_of("allow"),
+                    "kind.allow",
+                    f"этап {stage.id!r} с kind: {stage.kind} не принимает allow: допустимые ответы "
+                    "ограничивают только этап-гейт, который сам ничего не исполняет",
+                )
+            )
+        if stage.kind == SHELL_KIND:
             issues += _check_shell_kind(spec, stage)
             continue
         for key in ("cmd", "must", "artifacts"):
@@ -1412,6 +1449,122 @@ def _check_shell_kind(spec: Spec, stage: Stage) -> list[Issue]:
                 "kind.evidence",
                 f"у этапа {stage.id!r} с kind: shell evidence не проверяется: договор команды — "
                 "код возврата must и список artifacts",
+                WARNING,
+            )
+        )
+    return issues
+
+
+def _check_gate_kind(spec: Spec, stage: Stage) -> list[Issue]:
+    """Правила одного `kind: gate`: вопрос обязателен, ответ ограничен, чужих полей нет.
+
+    Гейт — вид этапа, а не парковка: он сам ничего не делает и ничего не
+    исполняет, поэтому `role`, `workspace`, `verdict`, `retry`, `cmd` (и поля
+    команды) у него отказывают — объявленное и не прочитанное было бы ложью
+    спеки. Обязательное — вопрос (`ask.q`) и варианты ответа (`ask.options`):
+    гейт без вопроса нечего ждать, а без вариантов человеку не из чего выбрать.
+    `allow` сужает варианты до продолжения: ответ вне списка — отказ этапа, а не
+    «продолжаем», и потому `allow` обязан называть существующие варианты.
+    """
+    issues: list[Issue] = []
+    ask_decl = stage.ask
+    if ask_decl is None:
+        issues.append(
+            Issue(
+                spec.path,
+                stage.line_of("ask"),
+                "kind.ask",
+                f"этап {stage.id!r} с kind: gate без ask: гейту нечего спрашивать — "
+                f"задай ask.q (текст вопроса) и ask.options (варианты ответа)",
+            )
+        )
+    else:
+        if not ask_decl.q.strip():
+            issues.append(
+                Issue(
+                    spec.path,
+                    stage.lines.get("ask.q", ask_decl.line),
+                    "ask.q",
+                    f"этап {stage.id!r} с kind: gate без ask.q: вопрос человеку — работа гейта, "
+                    "и текст вопроса берётся из спеки, а не из отчёта процесса",
+                )
+            )
+        if not ask_decl.options:
+            issues.append(
+                Issue(
+                    spec.path,
+                    stage.lines.get("ask.options", ask_decl.line),
+                    "ask.options",
+                    f"этап {stage.id!r} с kind: gate без ask.options: человеку не из чего выбирать",
+                )
+            )
+        for option in ask_decl.options:
+            if option.strip():
+                continue
+            issues.append(
+                Issue(
+                    spec.path,
+                    stage.lines.get("ask.options", ask_decl.line),
+                    "ask.options",
+                    f"этап {stage.id!r}: вариант ответа пустой — пустой ответ неотличим от «не ответили»",
+                )
+            )
+        for answer in stage.allow:
+            if answer in ask_decl.options:
+                continue
+            issues.append(
+                Issue(
+                    spec.path,
+                    stage.line_of("allow"),
+                    "allow",
+                    f"этап {stage.id!r}: allow называет ответ {answer!r}, которого нет в ask.options "
+                    f"({', '.join(ask_decl.options) or '—'}): такой ответ не выбрать, и allow не сработает",
+                )
+            )
+        # Адрес гейта — человек, а не роль: `ask.allowed`/`max_hops`/`to_human`
+        # описывают передачу вопроса роли, а гейт никому его не передаёт.
+        for key in ("allowed", "to_human", "max_hops", "risky"):
+            if f"ask.{key}" not in stage.lines:
+                continue
+            issues.append(
+                Issue(
+                    spec.path,
+                    stage.line_of(f"ask.{key}"),
+                    "kind.ask",
+                    f"этап {stage.id!r} с kind: gate не принимает ask.{key}: гейт спрашивает "
+                    f"человека напрямую — маршрут вопроса и его риск здесь не объявляются",
+                )
+            )
+    if stage.role:
+        issues.append(
+            Issue(
+                spec.path,
+                stage.line_of("role"),
+                "kind.role",
+                f"этап {stage.id!r} с kind: gate не принимает role: гейт ничего не исполняет, "
+                "процесс профиля поднимать нечему",
+            )
+        )
+    for key in ("workspace", "verdict", "retry", "cmd", "must", "artifacts"):
+        if key not in stage.lines:
+            continue
+        issues.append(
+            Issue(
+                spec.path,
+                stage.line_of(key),
+                f"kind.{key}",
+                f"этап {stage.id!r} с kind: gate не принимает {key}: гейт не работает в дереве, "
+                "не запускает команду и не выносит приговора — он спрашивает человека",
+            )
+        )
+    if stage.evidence:
+        issues.append(
+            Issue(
+                spec.path,
+                stage.line_of("evidence"),
+                "kind.evidence",
+                f"у этапа {stage.id!r} с kind: gate evidence не проверяется: гейт ничего не "
+                "исполняет, его договор — вопрос и ответ",
                 WARNING,
             )
         )

@@ -1587,6 +1587,10 @@ def render_run_step(row: dict[str, Any]) -> str:
         duration = row.get("duration_sec")
         took = f" ({float(duration):.1f}s)" if isinstance(duration, (int, float)) else ""
         asked = row.get("question_id")
+        if asked and row.get("stage_kind") == "gate":
+            # Гейт отчитывается `done` по ответу: «ждёт ответа» здесь было бы
+            # прочитано наоборот — человек уже ответил, и это записано.
+            return f"{stage} · гейт · ответ на вопрос #{asked}: {row.get('reason') or 'принят'}{took}"
         if asked:
             # Попытка отчиталась, но не работой: она задала вопрос. Без этой
             # строки шаг читался бы как «ok», хотя дело ждёт человека, — та же

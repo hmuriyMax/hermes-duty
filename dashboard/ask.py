@@ -251,6 +251,7 @@ def ask(
     options: Optional[Iterable[str]] = None,
     critical: Optional[bool] = None,
     routing: Optional[dict[str, Any]] = None,
+    timeout: Optional[float] = None,
 ) -> AskResult:
     """Задать вопрос по делу; вернуть id вопроса и что именно произошло.
 
@@ -268,6 +269,12 @@ def ask(
     создании вопроса: у подхваченного живого вопроса аргументы (`text`, `text_full`,
     `options`, `critical`) не применяются — вопрос уже задан, и его факты берутся из
     строки пула (контракт `docs/JOURNAL.md`, «`ask()`»).
+
+    `timeout` — срок ответа в секундах, объявленный вызывающим (у гейта это
+    `budget.minutes`). Он сильнее расчёта по журналу и делает вопрос некритичным:
+    критичный вопрос пул не истекает вовсе, а срок гейта существует именно для
+    того, чтобы однажды истечь и вернуть дело человеку с причиной. `None` —
+    срок по общим правилам.
 
     Три исхода, все в `AskResult`:
 
@@ -310,8 +317,8 @@ def ask(
         )
         return AskResult(question_id=question_id, created=False, adopted=False)
 
-    flag = _critical(conn, deal_id, critical)
-    timeout = None if flag else ASK_TIMEOUT_HOURS
+    flag = 0 if timeout is not None else _critical(conn, deal_id, critical)
+    ttl = float(timeout) if timeout is not None else (None if flag else ASK_TIMEOUT_HOURS)
     question_id = _insert(
         pool_path(Path(home)),
         key=key,
@@ -320,7 +327,7 @@ def ask(
         text_full=(str(text_full).strip() or None) if text_full else None,
         options=list(options) if options else None,
         critical=flag,
-        timeout=timeout,
+        timeout=ttl,
     )
     if question_id <= 0:
         # `ask:0:*` в журнале заглушил бы ключом все будущие `question_asked`
@@ -333,7 +340,7 @@ def ask(
         question_id=question_id,
         key=key,
         critical=flag,
-        timeout=timeout,
+        timeout=ttl,
         ts=int(time.time()),
         routing=routing,
     )

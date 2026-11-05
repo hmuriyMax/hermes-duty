@@ -217,6 +217,11 @@ STAGE_KINDS = (
 # применяются и к закрытому этапу (иначе приговор некуда было бы прочитать).
 VERDICT_KINDS = ("collected", "changes_requested")
 
+# Этап-гейт (`dashboard/spec.py`, `GATE_KIND`): сам ничего не исполняет, а задаёт
+# вопрос человеку. Слою вид нужен только для текста ожидания и причины парковки —
+# переходы у гейта те же, что у любого этапа.
+GATE_KIND = "gate"
+
 APPROVE = "approve"
 CHANGES = "changes"
 
@@ -504,6 +509,12 @@ def _stage_spec(spec: Any, stage_id: str) -> Any:
     return finder(stage_id) if callable(finder) else None
 
 
+def _is_gate(spec: Any, stage_id: str) -> bool:
+    """Этап-гейт (`kind: gate`)? Один предикат: по нему различаются причина
+    парковки и текст ожидания, и второе написание этого сравнения разошлось бы."""
+    return str(getattr(_stage_spec(spec, stage_id), "kind", "")) == GATE_KIND
+
+
 def _retriable(stage_spec: Any, node: _Stage, fail_kind: str) -> bool:
     """Есть ли ещё попытка для этого класса отказа (правило 4).
 
@@ -544,6 +555,22 @@ def _expired(payload: dict[str, Any]) -> bool:
     if str(payload.get("answered_via") or "").strip().lower() == "expired":
         return True
     return _int(payload.get("answer_len")) == 0
+
+
+def _gate_park_reason(spec: Any, stage_id: str, question_id: Optional[str]) -> str:
+    """Почему гейт припаркован: человек не ответил за объявленный срок.
+
+    Срок берётся из `budget.minutes` этапа — того же поля, по которому вопрос ушёл
+    в пул (`dashboard/runner.py`). Поле не задано — срок брался по умолчанию
+    (`ask.ASK_TIMEOUT_HOURS`), и причина говорит «отведённое время», а не
+    выдуманное число: слою неоткуда взять чужую константу, не заведя вторую копию.
+    """
+    stage = _stage_spec(spec, stage_id)
+    minutes = getattr(getattr(stage, "budget", None), "minutes", None)
+    tail = f" (вопрос #{question_id} закрыт по сроку)" if question_id else ""
+    if isinstance(minutes, int) and not isinstance(minutes, bool) and minutes > 0:
+        return f"гейт: человек не ответил за {minutes} мин{tail}"
+    return f"гейт: человек не ответил за отведённое время{tail}"
 
 
 def _fail(node: _Stage, fail_kind: str, text: str, at: int = 0) -> None:
@@ -689,9 +716,14 @@ def _stage_event(
             return
         if _expired(payload):
             # Вопрос остаётся названным: припаркованное дело человек открывает по
-            # номеру вопроса, а не по тексту причины.
+            # номеру вопроса, а не по тексту причины. У гейта причина своя: он не
+            # «упал», а не дождался человека, и счётчика попыток у него нет.
             node.state = PARKED
-            node.reason = f"вопрос #{node.question_id} закрыт по сроку без ответа"
+            node.reason = (
+                _gate_park_reason(spec, node.id, node.question_id)
+                if _is_gate(spec, node.id)
+                else f"вопрос #{node.question_id} закрыт по сроку без ответа"
+            )
             return
         node.question_id = None
         if board.parked is not None:
@@ -711,7 +743,7 @@ def _question_id(payload: dict[str, Any]) -> Optional[str]:
     return str(raw)
 
 
-def _deal_question(board: _Board, payload: dict[str, Any]) -> None:
+def _deal_question(board: _Board, spec: Any, payload: dict[str, Any]) -> None:
     """Вопрос **без** `stage`: адресовать его некому, кроме названного адреса.
 
     `ask()` пишет `question_asked` на уровне дела (`dashboard/ask.py`): вопросам
@@ -735,7 +767,11 @@ def _deal_question(board: _Board, payload: dict[str, Any]) -> None:
         # исчерпанный этап остаётся `failed`, а дело — ждёт решения человека.
         return
     node.state = WAIT_HUMAN
-    node.reason = f"попытка {node.attempt} закончилась вопросом #{question_id}"
+    node.reason = (
+        f"гейт: вопрос #{question_id} человеку — ждёт ответа"
+        if _is_gate(spec, stage_id)
+        else f"попытка {node.attempt} закончилась вопросом #{question_id}"
+    )
 
 
 def _addressed(board: _Board, payload: dict[str, Any]) -> tuple[str, int]:
@@ -755,7 +791,7 @@ def _addressed(board: _Board, payload: dict[str, Any]) -> tuple[str, int]:
     return board.last_attempt
 
 
-def _deal_answer(board: _Board, payload: dict[str, Any]) -> None:
+def _deal_answer(board: _Board, spec: Any, payload: dict[str, Any]) -> None:
     """Ответ или срок по вопросу дела: новая попытка того же этапа либо `park`."""
     stage_id, asked = board.question
     question_id = _question_id(payload)
@@ -767,7 +803,11 @@ def _deal_answer(board: _Board, payload: dict[str, Any]) -> None:
         return
     if _expired(payload):
         node.state = PARKED
-        node.reason = f"вопрос #{asked} закрыт по сроку без ответа"
+        node.reason = (
+            _gate_park_reason(spec, stage_id, asked)
+            if _is_gate(spec, stage_id)
+            else f"вопрос #{asked} закрыт по сроку без ответа"
+        )
         return
     node.question_id = None
     if board.parked is not None:
@@ -776,7 +816,13 @@ def _deal_answer(board: _Board, payload: dict[str, Any]) -> None:
         node.reason = f"ответ #{asked}: дело запарковано — ждёт решения человека"
         return
     node.state = PENDING
-    node.reason = f"ответ #{asked}: новая попытка {node.attempt + 1}"
+    # У гейта следующая передача не «новая попытка процесса», а суд над ответом:
+    # ответ человека — вход этапа, и это сказано словами, а не номером попытки.
+    node.reason = (
+        f"гейт: ответ #{asked} получен — этап судит его по allow"
+        if _is_gate(spec, stage_id)
+        else f"ответ #{asked}: новая попытка {node.attempt + 1}"
+    )
 
 
 def _park_answered(board: _Board, payload: dict[str, Any]) -> None:
@@ -833,7 +879,12 @@ def _park_fact(board: _Board, kind: str, payload: dict[str, Any]) -> None:
 
 
 def _parked_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Факты парковки из `blocked`: класс, этап, сколько попыток, лимит и вопрос."""
+    """Факты парковки из `blocked`: класс, этап, сколько попыток, лимит и вопрос.
+
+    `gate` — парковка гейта (`dashboard/runner.park_gate`): у неё нет ни класса
+    отказа, ни счётчика попыток — человек просто не ответил, и «0/0 unknown»
+    выдавало бы отсутствие класса за класс.
+    """
     return {
         "kind": str(payload.get("kind") or payload.get("fail_kind") or UNCLASSIFIED),
         "stage": str(payload.get("stage") or ""),
@@ -841,6 +892,7 @@ def _parked_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "limit": _int(payload.get("limit")),
         "reason": str(payload.get("park_reason") or payload.get("reason") or ""),
         "question_id": _question_id(payload),
+        "gate": bool(payload.get("gate")),
         # Ответ человека по вопросу парковки: `False` до `question_answered`.
         "answered": False,
     }
@@ -877,9 +929,9 @@ def _fold(spec: Any, events: Iterable[Any]) -> _Board:
                 board.closed = True
                 board.closed_reason = "журнал: дело закрыто событием completed"
             elif kind == "question_asked":
-                _deal_question(board, payload)
+                _deal_question(board, spec, payload)
             elif kind == "question_answered":
-                _deal_answer(board, payload)
+                _deal_answer(board, spec, payload)
             continue
         if stage_id not in known or kind not in STAGE_KINDS:
             continue
@@ -1071,6 +1123,14 @@ def next_stage(spec: Any, events: Iterable[Any], now: Any) -> Decision:
 
     if board.parked is not None:
         parked = board.parked
+        if parked.get("gate"):
+            # Парковка гейта: ни класса, ни счётчика — человек не ответил вовремя.
+            return wait(
+                WAIT_PARKED,
+                "дело запарковано: {}; продолжение — только решением человека".format(
+                    parked["reason"] or "гейт: человек не ответил"
+                ),
+            )
         # Ответ получен, а решение — нет: без этой половины фразы («продолжение —
         # только решением человека») не видно, что ответ уже есть и чего не хватает.
         tail = (
@@ -1125,6 +1185,16 @@ def next_stage(spec: Any, events: Iterable[Any], now: Any) -> Decision:
     question = _first(spec, states, WAIT_HUMAN)
     if question is not None:
         node = board.stages[question.id]
+        if _is_gate(spec, question.id):
+            # Гейт: у ожидания есть варианты ответа, и они объявлены спекой —
+            # человеку не нужно открывать панель, чтобы вспомнить, из чего выбирать.
+            stage = _stage_spec(spec, question.id)
+            options = ", ".join(getattr(getattr(stage, "ask", None), "options", ()) or ()) or "—"
+            return wait(
+                WAIT_QUESTION,
+                f"гейт {question.id!r}: вопрос #{node.question_id or '—'} без ответа, "
+                f"варианты: {options}, {_age(node.since, seconds)}",
+            )
         return wait(
             WAIT_QUESTION,
             f"этап {question.id!r}: вопрос #{node.question_id or '—'} без ответа, "

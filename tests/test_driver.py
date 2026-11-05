@@ -691,6 +691,7 @@ def test_json_report_schema(tmp_path: Path) -> None:
         "note",
         "decision",
         "closed",
+        "parked",
         "exit_code",
     }
     assert restored["deal"] == deal["id"]
@@ -725,6 +726,7 @@ def test_json_report_schema(tmp_path: Path) -> None:
         "kind",
         "reason",
         "question_id",
+        "stage_kind",
         "base",
         "commit",
         "duration_sec",
@@ -1550,3 +1552,132 @@ def test_run_does_not_revive_a_deal_closed_by_human(tmp_path: Path) -> None:
     assert kinds(conn, deal).count("completed") == 1, "второй факт не пишется"
     assert deals.deal_row(conn, str(deal["id"]))["status"] == "done"
     assert cli.render_run_final(report).startswith("итог: дело уже закрыто")
+
+
+# ------------------------------------------------------------------ гейт
+#
+# Гейт в цепочке — обычный этап дела: `impl → gate → check`. Драйвер его не
+# исполняет (процесса нет), а доводит до вопроса человеку и останавливается;
+# ответ пула доезжает журналом, и следующий прогон судит его по `allow`.
+
+GATE_CHAIN = """
+duty: probe
+stages:
+  - id: impl
+    role: implementer
+  - id: gate
+    kind: gate
+    ask: {q: "Выкатываем?", options: [да, нет]}
+    needs: [impl]
+    budget: {minutes: 5}
+  - id: check
+    role: tester
+    needs: [gate]
+    workspace: none
+"""
+
+
+def gate_home(tmp_path: Path) -> tuple[Path, sqlite3.Connection, Any, dict[str, Any]]:
+    """Своё дело на цепочке с гейтом: дом, store, спека и строка дела."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, GATE_CHAIN)
+    deal = make_deal(conn, spec_path=spec.path)
+    return home, conn, spec, deal
+
+
+def test_gate_chain_stops_at_the_question(tmp_path: Path) -> None:
+    """Прогон доводит дело до вопроса гейта и выходит ожиданием, а не ошибкой.
+
+    Проверяется записанное: шаг `impl` сделан процессом, у гейта процесса нет
+    (ни одного `attempt_started`), вопрос задан, дело ждёт человека.
+    """
+    home, conn, spec, deal = gate_home(tmp_path)
+    fake = Fake()
+
+    report = run(conn, spec, deal, home, fake)
+
+    assert report["decision"]["kind"] == "wait"
+    assert report["outcome"] == "wait"
+    assert [call["stage"] for call in fake.calls] == ["impl"]
+    assert asked_question_id(conn, deal) > 0
+    staged = {str(payload["stage"]) for payload in process_stages(conn, deal)}
+    assert staged == {"impl"}  # гейт попытки-процесса не начинал
+    assert deal_state(conn, deal, spec) == "wait_human"
+
+
+def test_gate_answer_in_allow_lets_the_chain_finish(tmp_path: Path) -> None:
+    """Ответ «да» доезжает пулом: гейт закрыт, `check` выполнен, дело закрыто.
+
+    Перезапуска драйвера не требуется — ответ читает тот же прогон
+    (`ask.sync_answers` до решения), и это ровно приёмка карточки.
+    """
+    home, conn, spec, deal = gate_home(tmp_path)
+    run(conn, spec, deal, home, Fake())
+    answer_in_pool(home, asked_question_id(conn, deal), answer="да")
+
+    report = run(conn, spec, deal, home, Fake())
+
+    assert report["outcome"] == "done"
+    assert report["closed"] is not None and report["closed"]["written"] is True
+    ended = [event["payload"] for event in events(conn, deal) if str(event["kind"]) == "attempt_ended"]
+    gate_ended = next(payload for payload in ended if str(payload.get("stage")) == "gate")
+    assert gate_ended["outcome"] == "done"
+    assert gate_ended["details"]["answer"] == "да"
+    assert transit.deal_state(spec, events(conn, deal)) == "done"
+
+
+def test_gate_answer_outside_allow_stops_the_deal(tmp_path: Path) -> None:
+    """Ответ «нет» при `allow: [да]` — отказ контракта: дело дальше не идёт, `check` не запущен.
+
+    Это и приёмка «ответ вне allow — отказ», и красная проба: без сверки с `allow`
+    гейт закрылся бы успехом, и `check` выполнился бы.
+    """
+    home, conn, spec, deal = gate_home(tmp_path)
+    narrow = write_spec(tmp_path, GATE_CHAIN.replace("    budget: {minutes: 5}", "    budget: {minutes: 5}\n    allow: [да]"))
+    run(conn, narrow, deal, home, Fake())
+    answer_in_pool(home, asked_question_id(conn, deal), answer="нет")
+    fake = Fake()
+
+    report = run(conn, narrow, deal, home, fake)
+
+    assert report["outcome"] == "failed"
+    assert fake.calls == []  # `check` не запускался: решение человека — не продолжать
+    gate_ended = next(
+        event["payload"]
+        for event in events(conn, deal)
+        if str(event["kind"]) == "attempt_ended" and str(event["payload"].get("stage")) == "gate"
+    )
+    assert gate_ended["kind"] == runner.FAIL_CONTRACT
+    # Цитата ответа — в факте, а не в пересказе: по журналу видно, **что** ответил человек.
+    assert "«нет»" in gate_ended["reason"] and "вне allow" in gate_ended["reason"]
+    assert gate_ended["details"]["answer"] == "нет"
+    assert transit.deal_state(narrow, events(conn, deal)) == "failed"
+
+
+def test_gate_expired_question_parks_the_deal_with_the_gate_reason(tmp_path: Path) -> None:
+    """Человек не ответил за срок — дело запарковано с причиной гейта, а не «0/0 unknown».
+
+    Срок объявлен спекой (`budget.minutes: 5`), и причина называет его же: число в
+    журнале обязано совпадать с числом, по которому вопрос ушёл в пул.
+    """
+    home, conn, spec, deal = gate_home(tmp_path)
+    run(conn, spec, deal, home, Fake())
+    answer_in_pool(home, asked_question_id(conn, deal), status="expired")
+
+    report = run(conn, spec, deal, home, Fake())
+
+    assert report["parked"] is not None
+    assert report["parked"]["written"] is True
+    evidence = str(journal.fold(events(conn, deal), now=NOW)["evidence"])
+    assert "гейт: человек не ответил за 5 мин" in evidence
+    assert "0/0" not in evidence
+
+
+def process_stages(conn: sqlite3.Connection, deal: dict[str, Any]) -> list[dict[str, Any]]:
+    """Этапы, у которых была попытка-процесс: только они попадают в `attempt_started`."""
+    return [
+        dict(event["payload"])
+        for event in events(conn, deal)
+        if str(event["kind"]) == "attempt_started"
+    ]

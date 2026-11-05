@@ -1555,3 +1555,61 @@ def test_deal_screen_uses_the_same_journal_state(home: Path, client: TestClient)
 
     assert body["deal"]["waiting"]["state"] == "wait_human"
     assert body["deal"]["waiting"]["evidence"].startswith("journal: empty — состояние из kanban")
+
+
+# ------------------------------------------------------- парковка гейта
+#
+# Гейт (`kind: gate`) паркуется, когда человек не ответил за срок: класса отказа
+# и счётчика попыток у него нет, поэтому «парковка 0/0 unknown» было бы выдумкой.
+
+
+def test_fold_gate_park_is_wait_human_without_counter() -> None:
+    """Парковка гейта — `wait_human` с причиной гейта и без счётчика попыток."""
+    folded = journal.fold(
+        events(
+            (
+                "blocked",
+                {
+                    "block_kind": "parked",
+                    "reason": "гейт: человек не ответил за 5 мин",
+                    "gate": True,
+                    "stage": "gate",
+                    "question_id": 284,
+                },
+            ),
+        ),
+        now=NOW,
+    )
+
+    assert folded["state"] == "wait_human"
+    assert folded["human_kind"] == "status"
+    evidence = folded["evidence"]
+    assert "гейт" in evidence and "человек не ответил за 5 мин" in evidence
+    assert "вопрос #284" in evidence
+    # Ни класса, ни счётчика: у гейта не было ни попыток, ни ошибки процесса.
+    assert "0/0" not in evidence
+    assert "unknown" not in evidence
+    assert "парковка" not in evidence
+
+
+def test_fold_gate_park_with_answer_asks_for_the_decision() -> None:
+    """Ответ на вопрос парковки получен — ждём решения, а не ответа."""
+    folded = journal.fold(
+        events(
+            (
+                "blocked",
+                {
+                    "block_kind": "parked",
+                    "reason": "гейт: человек не ответил за 5 мин",
+                    "gate": True,
+                    "stage": "gate",
+                    "question_id": 284,
+                },
+            ),
+            ("question_answered", {"question_id": 284, "answer_len": 2, "answered_via": "pool"}),
+        ),
+        now=NOW,
+    )
+
+    assert folded["state"] == "wait_human"
+    assert "ждёт решения человека" not in folded["evidence"]

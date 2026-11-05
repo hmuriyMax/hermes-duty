@@ -1938,3 +1938,260 @@ def test_live_trivial_stage(tmp_path: Path) -> None:
         assert report["kind"] == runner.FAIL_CONTRACT
         assert report["verdict"] and report["verdict"]["ok"] is False
 
+
+
+# ---------------------------------------------------------------- гейт
+
+
+def gate_spec(
+    tmp_path: Path,
+    *,
+    ask: str = 'q: "Выкатываем?", options: [да, нет]',
+    extra: str = "",
+    needs: str = "",
+    gate_needs: str = "",
+    after: str = "",
+) -> Any:
+    """Спека с этапом-гейтом: вопрос человеку и (по желанию) хвост/предшественник.
+
+    Строки собираются по одной, а не подстановкой в общий шаблон: `dedent` в
+    `write_spec` выровнял бы вставку по общему отступу и сломал YAML — проверка
+    спеки от этого падала бы не тем отказом, который проверяет тест.
+    """
+    lines = ["duty: probe", "stages:"]
+    if needs:
+        lines.append(textwrap.indent(textwrap.dedent(needs).strip("\n"), "  "))
+    lines += ["  - id: gate", "    kind: gate", f"    ask: {{{ask}}}"]
+    if gate_needs:
+        lines.append(f"    needs: [{gate_needs}]")
+    if extra:
+        lines.append(textwrap.indent(textwrap.dedent(extra).strip("\n"), "    "))
+    if after:
+        lines.append(textwrap.indent(textwrap.dedent(after).strip("\n"), "  "))
+    return write_spec(tmp_path, "\n".join(lines) + "\n")
+
+
+def run_gate(conn, spec, deal, home, *, attempt: int = 1) -> dict[str, Any]:
+    """Один шаг гейта: неподвижные часы, никакой процесс не нужен."""
+    return runner.run_stage(conn, spec, deal, "gate", attempt, home=home, clock=lambda: NOW)
+
+
+def pool_rows(home: Path) -> list[dict[str, Any]]:
+    conn = sqlite3.connect(home / "messaging" / "pool.db")
+    conn.row_factory = sqlite3.Row
+    try:
+        return [dict(row) for row in conn.execute("SELECT * FROM questions ORDER BY id")]
+    finally:
+        conn.close()
+
+
+def answer_gate(home: Path, question_id: Any, text: str | None, *, status: str = "answered") -> None:
+    """Человек ответил (или вопрос истёк) — так вопрос закрывает пул, не duty."""
+    conn = sqlite3.connect(home / "messaging" / "pool.db")
+    try:
+        conn.execute(
+            "UPDATE questions SET status = ?, answer = ?, answered_at = ?, answered_via = ? WHERE id = ?",
+            (status, text, "2026-01-01T00:00:00.000Z", None if status == "answered" else None, int(question_id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def sync(conn, home: Path) -> dict[str, Any]:
+    """Дочитать пул в журнал — то, что в живом прогоне делает драйвер."""
+    return load_module("hermes_duty_ask", "ask.py").sync_answers(conn, home)
+
+
+def test_gate_asks_human_and_waits(tmp_path: Path) -> None:
+    """Гейт спрашивает человека и уходит ждать: ни процесса, ни лизинга, ни дерева.
+
+    Проверяется то, что записалось: `question_asked` с адресом этапа в
+    `routing`, вопрос в пуле с вариантами ответа и сроком, дело в `blocked` с
+    `needs_input`, и **отсутствие** `attempt_started` — попытки-процесса у гейта
+    нет, а её факт закрыла бы уборка осиротевших.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = gate_spec(tmp_path)
+    report = run_gate(conn, spec, deal, home)
+
+    assert report["started"] is True
+    question_id = report["question_id"]
+    # Исхода у вопроса нет: его назовёт ответ человека, и пустое поле «исход»
+    # здесь читалось бы как решение, которого ещё не было.
+    assert "outcome" not in report
+    assert f"вопрос #{question_id}" in report["reason"]
+    asked = only(conn, deal, "question_asked")
+    assert asked["source"] == "ask"
+    assert asked["payload"]["question_id"] == question_id
+    assert asked["payload"]["routing"]["stage"] == "gate"
+    assert asked["payload"]["routing"]["attempt"] == 1
+    assert "attempt_started" not in kinds(conn, deal)
+    assert runner.lease_of(conn, deal, "gate") is None
+
+    row = pool_rows(home)[0]
+    assert (row["status"], row["critical"]) == ("pending", 0)
+    assert json.loads(row["options_json"]) == ["да", "нет"]
+    # Умолчание срока — общий срок вопроса в секундах: `budget.minutes` гейт не задавал.
+    assert row["timeout"] == load_module("hermes_duty_ask", "ask.py").ASK_TIMEOUT_HOURS * 3600.0
+
+    blocked = only(conn, deal, "blocked")
+    assert blocked["payload"]["block_kind"] == "needs_input"
+    assert blocked["payload"]["question_id"] == question_id
+    assert "гейт gate" in blocked["payload"]["reason"]
+
+
+def test_gate_second_pass_does_not_ask_again(tmp_path: Path) -> None:
+    """Повторный шаг до ответа второго вопроса не задаёт: человек отвечает на один."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = gate_spec(tmp_path)
+    first = run_gate(conn, spec, deal, home)
+    second = run_gate(conn, spec, deal, home)
+
+    assert second["started"] is False
+    assert second["question_id"] == first["question_id"]
+    assert "ответа ещё нет" in second["reason"]
+    assert len(pool_rows(home)) == 1
+    assert len([e for e in events(conn, deal) if e["kind"] == "question_asked"]) == 1
+
+
+def test_gate_answer_inside_allow_is_done(tmp_path: Path) -> None:
+    """Ответ из `allow` («да») закрывает этап: `attempt_ended` done с цитатой ответа."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = gate_spec(tmp_path)
+    asked = run_gate(conn, spec, deal, home)
+    answer_gate(home, asked["question_id"], "да")
+    assert sync(conn, home)["appended"] == 1
+
+    report = run_gate(conn, spec, deal, home, attempt=2)
+
+    assert (report["started"], report["outcome"], report["kind"]) == (True, runner.OUTCOME_DONE, None)
+    assert report["answer"] == "да"
+    assert report["stage_kind"] == "gate"
+    ended = only(conn, deal, "attempt_ended")
+    assert (ended["payload"]["outcome"], ended["payload"].get("kind")) == (runner.OUTCOME_DONE, None)
+    details = ended["payload"]["details"]
+    assert (details["stage_kind"], details["answer"], details["allow"]) == (
+        "gate",
+        "да",
+        ["да", "нет"],
+    )
+    assert details["question_id"] == asked["question_id"]
+    assert "attempt_started" not in kinds(conn, deal)
+
+
+def test_gate_answer_outside_allow_is_contract(tmp_path: Path) -> None:
+    """Ответ «нет» при `allow: [да]` — отказ класса `contract` с цитатой ответа.
+
+    Это красная проба приёмки: если убрать сверку с `allow`, гейт объявит `done`
+    на «нет», и тест упадёт на первой же проверке.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = gate_spec(tmp_path, extra="allow: [да]")
+    asked = run_gate(conn, spec, deal, home)
+    answer_gate(home, asked["question_id"], "нет")
+    sync(conn, home)
+
+    report = run_gate(conn, spec, deal, home, attempt=2)
+
+    assert (report["outcome"], report["kind"]) == (runner.OUTCOME_FAILED, runner.FAIL_CONTRACT)
+    assert "«нет»" in report["reason"] and "вне allow" in report["reason"]
+    ended = only(conn, deal, "attempt_ended")
+    assert ended["payload"]["kind"] == runner.FAIL_CONTRACT
+    assert ended["payload"]["details"]["answer"] == "нет"
+    # Отказ человека виден поверхности: решение «дальше не идём» — факт, а не тишина.
+    blocked = [e for e in events(conn, deal) if e["kind"] == "blocked"]
+    assert blocked and "дальше дело не идёт" in blocked[-1]["payload"]["reason"]
+
+
+def test_gate_allow_defaults_to_every_option(tmp_path: Path) -> None:
+    """Без `allow` продолжением считается любой объявленный вариант, а не любой текст."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = gate_spec(tmp_path)
+    asked = run_gate(conn, spec, deal, home)
+    answer_gate(home, asked["question_id"], "наверное")
+    sync(conn, home)
+
+    report = run_gate(conn, spec, deal, home, attempt=2)
+
+    assert (report["outcome"], report["kind"]) == (runner.OUTCOME_FAILED, runner.FAIL_CONTRACT)
+    assert "«наверное»" in report["reason"]
+
+
+def test_gate_budget_minutes_is_the_question_deadline(tmp_path: Path) -> None:
+    """`budget.minutes` гейта — срок ответа в пуле, а не бюджет процесса."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = gate_spec(tmp_path, extra="budget: {minutes: 5}")
+    run_gate(conn, spec, deal, home)
+
+    row = pool_rows(home)[0]
+    assert row["timeout"] == 300.0
+    # Срок существует, чтобы однажды истечь: критичный вопрос пул не истекает.
+    assert row["critical"] == 0
+
+
+def test_gate_expired_question_is_not_an_answer(tmp_path: Path) -> None:
+    """Истёкший вопрос — не ответ: гейт говорит «человек не ответил», а не судит тишину."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = gate_spec(tmp_path)
+    asked = run_gate(conn, spec, deal, home)
+    answer_gate(home, asked["question_id"], None, status="expired")
+    sync(conn, home)
+
+    report = run_gate(conn, spec, deal, home, attempt=2)
+
+    assert report["started"] is False
+    assert "закрыт по сроку" in report["reason"]
+    assert "attempt_ended" not in kinds(conn, deal)
+
+
+def test_gate_runs_without_tree_even_with_needs(tmp_path: Path) -> None:
+    """У гейта нет дерева даже после предшественника: работы, для которой оно нужно, нет.
+
+    Спека без `repo`/`base` проходит проверку именно потому, что `gate` не просит
+    `worktree`: будь иначе, умолчание этапа с `needs` потребовало бы репозиторий.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = gate_spec(
+        tmp_path,
+        needs="""
+        - id: impl
+          role: implementer
+        """,
+        gate_needs="impl",
+    )
+    assert spec.stage("gate").workspace == "none"
+    assert spec_module.validate_spec(spec, profiles=frozenset({"implementer"})) == []
+    report = run_gate(conn, spec, deal, home)
+    assert report["started"] is True
+    assert not (home / "worktrees").exists()
+
+
+def test_run_stage_dispatches_gate_kind(tmp_path: Path) -> None:
+    """`kind: gate` — диспетчер вида этапа, а не режим агента: спавн не зовётся."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = gate_spec(tmp_path)
+
+    def no_spawn(*args: Any, **kwargs: Any) -> Any:  # pragma: no cover - не должен зваться
+        raise AssertionError("гейт не спавнит процесс")
+
+    report = runner.run_stage(conn, spec, deal, "gate", 1, home=home, spawn=no_spawn, clock=lambda: NOW)
+    assert report["question_id"] > 0

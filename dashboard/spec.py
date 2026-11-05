@@ -41,7 +41,7 @@ import yaml
 
 # --------------------------------------------------------------- ключи формата
 
-TOP_KEYS = ("duty", "repo", "base", "stages")
+TOP_KEYS = ("duty", "repo", "base", "budget", "stages")
 STAGE_KEYS = (
     "id",
     "kind",
@@ -177,7 +177,12 @@ class Retry:
 
 @dataclass(frozen=True)
 class Budget:
-    """Бюджет попытки: токены и минуты. Незаданное поле — не ограничено."""
+    """Потолок расхода: токены и минуты. Незаданное поле — не ограничено.
+
+    Одна форма на два уровня: `budget` этапа — потолок одной попытки (у гейта —
+    срок ответа человека), `budget` в корне спеки — потолок **дела целиком**,
+    суммарно по всем этапам и попыткам (`dashboard/budget.py` считает расход).
+    """
 
     tokens: Optional[int] = None
     minutes: Optional[int] = None
@@ -251,13 +256,19 @@ class Stage:
 
 @dataclass(frozen=True)
 class Spec:
-    """Спека дела: имя, база и этапы. `parse_issues` — то, что нашлось при разборе."""
+    """Спека дела: имя, база и этапы. `parse_issues` — то, что нашлось при разборе.
+
+    `budget` — потолок на дело целиком (рядом с `repo`/`base`), `None` — потолка
+    нет и дело ограничено только этапными бюджетами: спеки 0.0.4 читаются без
+    правок и ведут себя как раньше.
+    """
 
     path: Path
     duty: str
     repo: Optional[str]
     base: Optional[str]
     stages: tuple[Stage, ...]
+    budget: Optional[Budget] = None
     lines: dict[str, int] = field(default_factory=dict)
     parse_issues: tuple[Issue, ...] = ()
 
@@ -737,9 +748,26 @@ def load_spec(path: str | Path) -> Spec:
         repo=repo if isinstance(repo, str) and repo.strip() else None,
         base=base if isinstance(base, str) and base.strip() else None,
         stages=stages,
-        lines={key: lines[(key,)] for key in TOP_KEYS if (key,) in lines},
+        # Верхний `budget` — потолок на дело целиком, а не на попытку: тот же
+        # разбор `{tokens, minutes}`, что у этапа, и те же отказы на мусор.
+        budget=_parse_budget(data, spec_path, lines, (), issues),
+        lines=_top_lines(lines),
         parse_issues=tuple(issues),
     )
+
+
+def _top_lines(lines: dict[tuple[Any, ...], int]) -> dict[str, int]:
+    """Строки верхнего уровня и полей `budget` — для `file:line` без догадок.
+
+    Ключи верхнего уровня нужны отказам про `repo`/`base`/`stages`, а
+    `budget.tokens`/`budget.minutes` — отказам про потолок дела: без них отказ
+    указывал бы на первую строку файла, и человек искал бы число не там.
+    """
+    found = {key: lines[(key,)] for key in TOP_KEYS if (key,) in lines}
+    for name in BUDGET_KEYS:
+        if ("budget", name) in lines:
+            found[f"budget.{name}"] = lines[("budget", name)]
+    return found
 
 
 # ---------------------------------------------------------------- профили роли
@@ -1261,7 +1289,21 @@ def _check_ask(spec: Spec) -> list[Issue]:
 
 
 def _check_budget(spec: Spec) -> list[Issue]:
+    """Бюджеты положительные — и у этапа, и у дела; дело не меньше суммы этапов."""
     issues: list[Issue] = []
+    if spec.budget is not None:
+        for name in BUDGET_KEYS:
+            value = getattr(spec.budget, name)
+            if value is None or value > 0:
+                continue
+            issues.append(
+                Issue(
+                    spec.path,
+                    spec.line_of(f"budget.{name}"),
+                    "budget",
+                    f"budget.{name}={value}: бюджет дела — положительное число",
+                )
+            )
     for stage in spec.stages:
         budget = stage.budget
         if budget is None:
@@ -1280,6 +1322,48 @@ def _check_budget(spec: Spec) -> list[Issue]:
                         f"budget.{name}={value}: бюджет — положительное число",
                     )
                 )
+    issues += _check_deal_budget(spec)
+    return issues
+
+
+def _check_deal_budget(spec: Spec) -> list[Issue]:
+    """Потолок дела не меньше суммы этапных: иначе спека обещает невозможное.
+
+    Сумма берётся по объявленным числам: этап без `budget.tokens` в неё не
+    входит (он не ограничен сам по себе). Считается **только** объявленное —
+    никаких умолчаний на дело: спека без верхнего `budget` проходит эту проверку
+    всегда, и это её обратная совместимость.
+
+    Гейт не считается: его `budget.minutes` — срок ответа человека, а не расход
+    дела (`docs/SPEC.md`), и складывать ожидание с работой значило бы требовать
+    бюджета на чужое время.
+    """
+    cap = spec.budget
+    if cap is None:
+        return []
+    issues: list[Issue] = []
+    for name in BUDGET_KEYS:
+        declared = getattr(cap, name)
+        if declared is None or declared <= 0:
+            continue  # непозитивный потолок уже назван отказом выше
+        asked = sum(
+            int(getattr(stage.budget, name) or 0)
+            for stage in spec.stages
+            if stage.budget is not None
+            and stage.kind != GATE_KIND
+            and int(getattr(stage.budget, name) or 0) > 0
+        )
+        if asked <= declared:
+            continue
+        issues.append(
+            Issue(
+                spec.path,
+                spec.line_of(f"budget.{name}"),
+                "budget",
+                f"этапы просят больше, чем есть у дела: сумма budget.{name} этапов "
+                f"{asked} больше бюджета дела {declared}",
+            )
+        )
     return issues
 
 

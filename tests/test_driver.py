@@ -162,14 +162,19 @@ def kinds(conn: sqlite3.Connection, deal: dict[str, Any]) -> list[str]:
     return [str(event["kind"]) for event in events(conn, deal)]
 
 
-def seed(conn: sqlite3.Connection, deal: dict[str, Any], kind: str, payload: dict[str, Any], *, key: str) -> None:
-    """Факт в журнал руками: предыстория, которую драйвер обязан прочитать."""
+def seed(conn: sqlite3.Connection, deal: dict[str, Any], kind: str, payload: dict[str, Any], *, key: str, ts: int = NOW) -> None:
+    """Факт в журнал руками: предыстория, которую драйвер обязан прочитать.
+
+    `ts` — время факта: предыстория бывает старше прогона, и тогда пауза политики
+    повтора (`retry_at`) уже прошла — иначе тест проверял бы ожидание паузы вместо
+    того правила, ради которого факт положен.
+    """
     journal.append(
         conn,
         [
             {
-                "ts": NOW,
-                "recorded_at": NOW,
+                "ts": ts,
+                "recorded_at": ts,
                 "deal_id": str(deal["id"]),
                 "board": str(deal["board"]),
                 "kind": kind,
@@ -727,6 +732,7 @@ def test_json_report_schema(tmp_path: Path) -> None:
         "reason",
         "question_id",
         "stage_kind",
+        "refused",
         "base",
         "commit",
         "duration_sec",
@@ -1681,3 +1687,169 @@ def process_stages(conn: sqlite3.Connection, deal: dict[str, Any]) -> list[dict[
         for event in events(conn, deal)
         if str(event["kind"]) == "attempt_started"
     ]
+
+
+# --------------------------------------- потолок дела целиком (0.0.5, карточка S3)
+
+
+BUDGET_STOP = """
+duty: budget-stop
+budget:
+  tokens: 500
+  minutes: 60
+
+stages:
+  - id: impl
+    role: implementer
+    retry: {max: 3, on: [infra]}
+  - id: verify
+    role: tester
+    needs: [impl]
+    workspace: none
+"""
+
+
+def spent_attempt(
+    conn: sqlite3.Connection,
+    deal: dict[str, Any],
+    *,
+    run_id: str,
+    stage: str,
+    tokens: int,
+    seconds: int,
+    kind: str = "infra",
+) -> None:
+    """Первая попытка уже была: начало, провал и телеметрия токенов на конце.
+
+    Ровно та форма, которую пишет `runner`, включая `details.usage_tokens` —
+    расход считается по журналу (`dashboard/budget.py`), поэтому предыстория
+    должна выглядеть как настоящий факт, а не как «поставим счётчик в память».
+    """
+    started = NOW - 600
+    seed(
+        conn,
+        deal,
+        "attempt_started",
+        {"run_id": run_id, "stage": stage, "attempt": 1, "pid": 4300, "contract": {"role": stage}},
+        key=f"start:{run_id}",
+        ts=started,
+    )
+    seed(
+        conn,
+        deal,
+        "attempt_ended",
+        {
+            "run_id": run_id,
+            "stage": stage,
+            "attempt": 1,
+            "outcome": "failed",
+            "kind": kind,
+            "reason": "процесс упал",
+            "duration_sec": seconds,
+            "details": {"usage_tokens": tokens},
+        },
+        key=f"end:{run_id}",
+        ts=started + seconds,
+    )
+
+
+def test_second_attempt_does_not_start_when_deal_budget_is_spent(tmp_path: Path) -> None:
+    """Исчерпанный потолок дела останавливает ретрай — попытка не поднимается вовсе.
+
+    Красная проба карточки S3. Первая попытка провалилась классом `infra`, политика
+    разрешает повтор — и до 0.0.5 он бы поднялся: потолок был только у этапа, а
+    сумма по делу не смотрел никто. Проверяется то, что видно снаружи: спавна нет
+    (`fake.calls` пуст), отказ лежит фактом журнала с числами, дело остановлено
+    классом `capability`, и те же числа называет строка прогона.
+
+    Уберите сверку в `runner.run_stage` — тест падает на первом же утверждении:
+    вторая попытка стартует и жжёт бюджет, которого уже нет.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, BUDGET_STOP)
+    deal = make_deal(conn, spec_path=spec.path)
+    spent_attempt(conn, deal, run_id=f"{deal['id']}:impl#1", stage="impl", tokens=900, seconds=60)
+    fake = Fake()
+
+    report = run(conn, spec, deal, home, fake)
+
+    assert fake.calls == [], "вторая попытка не стартует при исчерпанном бюджете"
+    assert leases(conn, deal) == [], "лизинг не берётся: этапа за процессом нет"
+    assert report["outcome"] == "failed"
+    assert report["exit_code"] == 1
+    assert report["steps"][0]["started"] is False
+    assert report["steps"][0]["refused"] is True
+    assert report["steps"][0]["kind"] == "capability"
+    assert "бюджет дела исчерпан: 900/500 токенов" in report["note"]
+    assert "900/500" in cli.render_run_final(report), "причина с числами видна человеку"
+    assert report["decision"]["kind"] == "failed"
+    assert report["decision"]["fail_kind"] == "capability"
+
+    # Факт отказа — в журнале, а не только в выводе прогона: по нему живут `why`
+    # и `deal`, и он же переживает рестарт движка.
+    refused = [
+        dict(event["payload"])
+        for event in events(conn, deal)
+        if str(event["kind"]) == "attempt_ended" and dict(event["payload"]).get("details", {}).get("refused")
+    ]
+    assert len(refused) == 1
+    assert refused[0]["kind"] == "capability"
+    assert refused[0]["reason"] == "бюджет дела исчерпан: 900/500 токенов"
+    assert refused[0]["details"]["budget"] == {"kind": "tokens", "used": 900, "limit": 500}
+    assert refused[0]["attempt"] == 2, "отказ относится ко второй попытке"
+
+    row = deals.deal_row(conn, str(deal["id"]))
+    assert str(row["status"]) == "blocked"
+    folded = journal.fold(events(conn, deal), now=NOW)
+    assert folded["state"] == "capability"
+    assert "block_kind=capability" in str(folded["evidence"])
+    assert "900/500 токенов" in str(folded["evidence"])
+    assert deal_state(conn, deal, spec) == "capability"
+
+
+def test_refused_shell_attempt_names_deal_minutes(tmp_path: Path) -> None:
+    """Минуты дела — тоже потолок: shell-этап не стартует, причина называет минуты."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(
+        tmp_path,
+        """
+        duty: minutes-stop
+        repo: .
+        budget:
+          minutes: 5
+        stages:
+          - id: check
+            kind: shell
+            cmd: "true"
+            retry: {max: 3, on: [infra]}
+        """,
+    )
+    deal = make_deal(conn, spec_path=spec.path)
+    spent_attempt(conn, deal, run_id=f"{deal['id']}:check#1", stage="check", tokens=0, seconds=301)
+    fake = Fake()
+
+    report = run(conn, spec, deal, home, fake)
+
+    assert fake.calls == [], "shell-этап тоже не стартует при исчерпанных минутах"
+    assert report["outcome"] == "failed"
+    assert "бюджет дела исчерпан: 5/5 минут" in report["note"]
+    assert report["steps"][0]["kind"] == "capability"
+
+
+def test_attempt_starts_while_deal_has_room(tmp_path: Path) -> None:
+    """Потолок не тратится на здоровые прогоны: место есть — попытка идёт."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, BUDGET_STOP)
+    deal = make_deal(conn, spec_path=spec.path)
+    spent_attempt(conn, deal, run_id=f"{deal['id']}:impl#1", stage="impl", tokens=100, seconds=60)
+    fake = Fake()
+
+    report = run(conn, spec, deal, home, fake)
+
+    assert [(call["stage"], call["attempt"]) for call in fake.calls] == [("impl", 2), ("verify", 1)], (
+        "место есть — повтор разрешён, и дело идёт дальше по графу"
+    )
+    assert report["outcome"] == "done"

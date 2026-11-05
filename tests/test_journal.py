@@ -1406,6 +1406,9 @@ def test_now_deal_shape_is_pinned(home: Path, client: TestClient) -> None:
         # дела. Вложенный объект, потому что имя `attempt` в этой форме уже
         # занято фактом рана kanban.
         "stage",
+        # 0.0.5: расход против верхнего `budget` спеки (`dashboard/budget.py`);
+        # `null` — потолка на дело нет.
+        "budget",
         "waiting",
     ]
     assert list(deal["attempt"]) == [

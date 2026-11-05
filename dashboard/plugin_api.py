@@ -64,6 +64,8 @@ ASK_MODULE_NAME = "hermes_duty_ask"
 DEALS_MODULE_NAME = "hermes_duty_deals"
 # `dashboard/stagefeed.py` — лента этапов и попыток дела (`GET /deal`, `GET /now`).
 STAGEFEED_MODULE_NAME = "hermes_duty_stagefeed"
+# `dashboard/budget.py` — расход дела по журналу против верхнего `budget` спеки.
+BUDGET_MODULE_NAME = "hermes_duty_budget"
 
 
 def _load_journal() -> Any:
@@ -136,6 +138,24 @@ def _load_stagefeed() -> Any:
 
 
 stagefeed = _load_stagefeed()
+
+
+def _load_budget() -> Any:
+    """Загрузить `dashboard/budget.py` — расход дела и потолок `budget` спеки."""
+    loaded = sys.modules.get(BUDGET_MODULE_NAME)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / "budget.py"
+    spec = importlib.util.spec_from_file_location(BUDGET_MODULE_NAME, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise ImportError(f"budget module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[BUDGET_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+budget = _load_budget()
 
 
 # Один набор заголовков на все ответы: и 200, и ошибки. Кэш промежуточного
@@ -1309,6 +1329,9 @@ def _board_deals(
                 # что поле `attempt` в этой же форме уже занято фактом рана
                 # kanban — одно имя не может значить две вещи.
                 "stage": stagefeed.current(journal_events.get(task_id, []), now),
+                # Расход против верхнего `budget` спеки, если она записана в
+                # журнале: у наблюдаемого дела спеки обычно нет — `null`.
+                "budget": budget.describe_events(journal_events.get(task_id, [])),
                 "waiting": waiting,
                 "_age_sec": (attempt or {}).get("age_sec")
                 if attempt is not None
@@ -1556,6 +1579,9 @@ def _own_shaped(
         # Этап и номер попытки — из журнала, как и у наблюдаемых дел: экран не
         # знает, откуда дело, и форма одна (`dashboard/stagefeed.py`).
         "stage": stagefeed.current(events, now),
+        # Расход дела против верхнего `budget` спеки (`dashboard/budget.py`):
+        # `null` — потолка на дело нет, и поверхность не выдумывает нули.
+        "budget": budget.describe_events(events),
         "waiting": _own_waiting(
             folded, question, str(row["status"]), journal_note, pool_note,
             home=home, deal_id=str(row["id"]), attempts=attempts,
@@ -1663,6 +1689,7 @@ def _deal_response(
     spec: Optional[str] = None,
     errors: Optional[list[dict[str, str]]] = None,
     closed: Optional[dict[str, Any]] = None,
+    budget_block: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Ответ «одно дело» — одна форма и для kanban-дела, и для своего.
 
@@ -1683,6 +1710,11 @@ def _deal_response(
     дело не закрывалось фактом журнала. Один ответ на вопрос «почему закрыто» для
     `deal`, `why` и `run`: состояния ожидания у закрытого дела нет, и вместо него
     называется записанный факт, а не пересказ статуса.
+
+    `budget_block` — расход дела против верхнего `budget` спеки
+    (`dashboard/budget.py`): у закрытого дела состояния ожидания нет, а расход
+    остаётся фактом, поэтому блок живёт здесь, а не в `deal`-срезе. `null` —
+    потолка на дело нет.
     """
     body_text = str(row.get("body") or "")
     status = str(row.get("status") or "")
@@ -1706,6 +1738,7 @@ def _deal_response(
         "spec": spec,
         "stages": list(stages or []),
         "stages_note": stages_note,
+        "budget": budget_block,
         "errors": list(errors or []),
     }
 
@@ -1768,6 +1801,7 @@ def _own_response(
         stages_note=feed["note"],
         spec=feed["spec"],
         closed=journal.closed_fact(events),
+        budget_block=budget.describe_events(events),
     )
 
 
@@ -2188,6 +2222,7 @@ def deal(board: str, task_id: str, spec: Optional[str] = None) -> dict[str, Any]
         stages_note=feed["note"],
         spec=feed["spec"],
         closed=journal.closed_fact(events),
+        budget_block=budget.describe_events(events),
     )
 
 
@@ -2350,6 +2385,7 @@ def _error_body(board: Optional[str], deal_id: Optional[str], reason: str) -> di
         "comments": [],
         "attachments": [],
         "timeline": [],
+        "budget": None,
         "errors": [{"board": board or DEALS_SOURCE, "reason": reason}],
     }
 
@@ -3070,6 +3106,10 @@ def duty_attempts(board: str, task_id: str) -> dict[str, Any]:
         # Пометка о пустом ответе — в одной форме у обоих пространств: у
         # kanban-дела попытки читаются из `task_runs`, и объяснять нечего.
         "note": "",
+        # Строка итога по журналу дела; у наблюдаемого дела спеки обычно нет.
+        "budget": budget.describe_events(
+            _journal_context(home, [])[0].get(task_id, [])
+        ),
     }
 
 
@@ -3170,6 +3210,9 @@ def _own_attempts(home: Path, board: str, task_id: str) -> dict[str, Any]:
         "count": len(attempts),
         "crash_outcomes": list(CRASH_OUTCOMES),
         "attempts": attempts,
+        # Строка итога: расход дела целиком против верхнего `budget` спеки —
+        # рядом с по-попыточным расходом, а не вместо него.
+        "budget": budget.describe_events(events),
         "note": "" if attempts else OWN_NO_ATTEMPTS,
     }
 

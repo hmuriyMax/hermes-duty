@@ -53,7 +53,7 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 | `lease_lost` | лизинг исчез без завершения | `previous_expires` |
 | `attempt_started` | открылся ран в `task_runs` (движок: попытка заспавнена) | `run_id`, `pid`, `stage`, `attempt`, `cmd`, `cwd`, `workdir`, `tree`, `base` (фактическая база дерева — коммит, от которого этап отведён), `lease_expires`, `contract` — фактическая команда и вход целиком |
 | `attempt_progress` | шаг попытки движка: вызов инструмента или его результат (телеметрия, состояние дела не меняет) | `stage`, `attempt`, `seq`, `phase` (`tool_use`/`tool_result`), `name`, `duration_ms` (только у результата), `ts` |
-| `attempt_ended` | ран закрыт (движок: попытка отчиталась, не отчиталась или упала; `done` — только при принятом evidence-пакете; `reaped: true` — попытку закрыл `reaper.sweep`, отчёта от неё не было) | `run_id`, `stage`, `attempt`, `outcome` (`done`/`failed`), `kind` (`infra`/`contract`/`capability`/`null`), `reason`, `base` (база дерева попытки), `commit` (что произвела принятая попытка — коммит движка в её дереве или коммит исполнителя; от него отводится дерево следующего этапа; `null` — произвести было нечего), `details` (в том числе `verdict`: вердикт гейта с `details`), `result` (если отчёт разобран), `reaped` (только у убранных), `pid` (у убранных — из `attempt_started`) |
+| `attempt_ended` | ран закрыт (движок: попытка отчиталась, не отчиталась или упала; `done` — только при принятом evidence-пакете; `reaped: true` — попытку закрыл `reaper.sweep`, отчёта от неё не было; `refused: true` в `details` — попытку не поднимали вовсе: потолок дела исчерпан, `details.budget` называет числа) | `run_id`, `stage`, `attempt`, `outcome` (`done`/`failed`), `kind` (`infra`/`contract`/`capability`/`null`), `reason`, `base` (база дерева попытки), `commit` (что произвела принятая попытка — коммит движка в её дереве или коммит исполнителя; от него отводится дерево следующего этапа; `null` — произвести было нечего), `details` (в том числе `verdict`: вердикт гейта с `details`), `result` (если отчёт разобран), `reaped` (только у убранных), `pid` (у убранных — из `attempt_started`) |
 | `blocked` | `status=blocked` | `block_kind`, `reason` |
 | `unblocked` | был `blocked`, стал иной статус | `previous_kind` |
 | `completed` | `status=done` (или `archived` как отдельный факт: переносится тем же `completed` со `status="archived"`) | `status` |
@@ -380,6 +380,7 @@ fold (14), а не второй вид на каждое событие попы
 | `status: "refused"` | `contract` | нет | `kind=contract`, `summary` исполнителя |
 | схема/артефакты/коммит/evidence не сходятся (гейт) | `contract` | нет | `details.verdict.details`, первые три отказа в `reason` |
 | `usage.total_tokens` больше бюджета этапа | `capability` | нет | `kind=capability`, `budget.tokens` в `details` |
+| потолок дела (`budget` в корне спеки) исчерпан по журналу | `capability` | нет | `kind=capability`, `attempt_ended` без начала с `details.refused: true` и `details.budget`, плюс `blocked` с `block_kind=capability`; причина «бюджет дела исчерпан: N/M токенов» |
 | нужна роль/доступ, которых нет | `capability` | нет | `kind=capability`, вопрос человеку |
 | класс не определён | `UNCLASSIFIED` | нет | `kind` пуст: честное «класса нет», а не догадка |
 

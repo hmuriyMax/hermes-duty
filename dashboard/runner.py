@@ -95,6 +95,7 @@ SPEC_MODULE_NAME = "hermes_duty_spec"
 EVIDENCE_MODULE_NAME = "hermes_duty_evidence"
 ROUTING_MODULE_NAME = "hermes_duty_routing"
 FAILURES_MODULE_NAME = "hermes_duty_failures"
+BUDGET_MODULE_NAME = "hermes_duty_budget"
 
 
 def _load(name: str, filename: str) -> Any:
@@ -121,6 +122,10 @@ routing = _load(ROUTING_MODULE_NAME, "routing.py")
 # Классы отказа и политика ретраев — одно место на плагин (`dashboard/failures.py`):
 # движок берёт класс оттуда и не выводит его из текста ошибки.
 failures = _load(FAILURES_MODULE_NAME, "failures.py")
+# Расход дела и потолок `budget` (0.0.5): движок сверяет сумму по журналу с
+# потолком спеки до спавна, а числа для причины берёт оттуда же — второй счётчик
+# в памяти процесса не пережил бы рестарт.
+budget = _load(BUDGET_MODULE_NAME, "budget.py")
 
 # Источник событий движка в журнале: `engine`, а не `cli`/`api`/`ingest` — по нему
 # видно, что факт записал движок, а не человек и не проход по чужой доске.
@@ -1392,6 +1397,85 @@ def shell_result(stage: Any, root: Path, *, exit_code: int, duration_sec: float)
     }
 
 
+def refuse_budget(
+    conn: sqlite3.Connection,
+    spec: Any,
+    deal: Any,
+    stage: Any,
+    attempt: int,
+    cap: Any,
+    *,
+    clock: Callable[[], float],
+) -> Optional[dict[str, Any]]:
+    """Потолок дела исчерпан — попытка не поднимается, но факт в журнале есть.
+
+    Проверка живёт **до** лизинга и спавна: лизинг означал бы «этап за процессом»,
+    которого нет, а `attempt_started` — попытку, которую никто не начинал (уборка
+    закрыла бы её как мёртвую). Поэтому отказ пишется `attempt_ended` без начала —
+    ровно так же, как отказ гейта (`_gate_judge`): факт исхода без факт процесса.
+
+    Два вида, оба уже в закрытом наборе журнала:
+
+    - `attempt_ended` с `kind: capability` и причиной с числами — по нему `transit`
+      переводит этап в `failed` (класс `capability` по умолчанию не повторяется,
+      `dashboard/failures.py`), и дело останавливается, а не крутится;
+    - `blocked` с `block_kind='capability'` и той же причиной — по нему `fold`
+      показывает состояние `capability` и те же числа в `bin/duty why` и `duty deal`:
+      без него поверхность сказала бы «status=running без живого факта».
+
+    Парковки здесь нет намеренно: парковка спрашивает человека «продолжать?», а
+    продолжать при исчерпанном потолке нечего — ответ «continue» сжёг бы ещё
+    столько же. Потолок — стена, а не исчерпанный счётчик ретраев.
+
+    `None` — потолок не исчерпан или его нет вовсе: запускать можно, и это ответ,
+    а не отсутствие проверки.
+    """
+    if cap is None:
+        return None
+    now = _now_sec(int(clock()))
+    run_id = f"{stage.id}#{int(attempt)}"
+    ended = _event(
+        deal,
+        "attempt_ended",
+        {
+            "run_id": run_id,
+            "stage": stage.id,
+            "attempt": int(attempt),
+            "outcome": OUTCOME_FAILED,
+            "kind": FAIL_CAPABILITY,
+            "reason": cap.reason(),
+            "details": {
+                "refused": True,
+                "stage_kind": getattr(stage, "kind", STAGE_KIND_AGENT),
+                "budget": cap.as_payload(),
+            },
+        },
+        {"stage": stage.id, "attempt": int(attempt), "refused": True},
+        now,
+    )
+    journal.append(conn, [ended])
+    reason = f"этап {stage.id}: {cap.reason()} — попытка {int(attempt)} не поднималась"
+    deals.set_blocked(
+        conn,
+        str(deal["id"]),
+        kind=FAIL_CAPABILITY,
+        reason=reason,
+        author=ENGINE_SOURCE,
+        source=ENGINE_SOURCE,
+        details={"stage": stage.id, "attempt": int(attempt), "budget": cap.as_payload()},
+        now=now,
+    )
+    return {
+        "started": False,
+        "refused": True,
+        "stage": stage.id,
+        "attempt": int(attempt),
+        "outcome": OUTCOME_FAILED,
+        "kind": FAIL_CAPABILITY,
+        "reason": cap.reason(),
+    }
+
+
 def run_shell_stage(
     conn: sqlite3.Connection,
     spec: Any,
@@ -1426,6 +1510,13 @@ def run_shell_stage(
     engine_pid = os.getpid()
     workdir = attempt_dir(home, deal, stage_id, attempt)
     run_id = f"{stage_id}#{attempt}"
+
+    # Тот же потолок дела, что у агента: shell-этап токенов не тратит, но тратит
+    # минуты, и исчерпанный потолок останавливает и его.
+    spent = budget.refusal(spec, journal.read_events(conn, str(deal["id"])))
+    refused = refuse_budget(conn, spec, deal, stage, attempt, spent, clock=clock)
+    if refused is not None:
+        return refused
 
     held_at = _now_sec(int(clock()))
     if not lease(conn, deal=deal, stage=stage_id, attempt=attempt, pid=engine_pid, ttl=ttl, now=held_at):
@@ -2028,6 +2119,15 @@ def run_stage(
     engine_pid = os.getpid()
     workdir = attempt_dir(home, deal, stage_id, attempt)
     run_id = f"{stage_id}#{attempt}"
+
+    # Потолок дела целиком (0.0.5) проверяется до лизинга и до спавна: расход
+    # считается по журналу (`dashboard/budget.py`), поэтому переживает рестарт и
+    # не требует счётчика в памяти. Исчерпан — попытка не поднимается вовсе,
+    # а отказ ложится фактом (`refuse_budget`).
+    spent = budget.refusal(spec, journal.read_events(conn, str(deal["id"])))
+    refused = refuse_budget(conn, spec, deal, stage, attempt, spent, clock=clock)
+    if refused is not None:
+        return refused
 
     held_at = _now_sec(int(clock()))
     if not lease(

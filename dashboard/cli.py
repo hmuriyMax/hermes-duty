@@ -696,6 +696,7 @@ NOW_COLUMNS = (
     ("СОСТОЯНИЕ", 20),
     ("ОЖИДАНИЕ", 9),
     ("ВОЗРАСТ", 8),
+    ("РАСХОД", 34),
     ("ДЕЛО", 28),
     ("ДОКАЗАТЕЛЬСТВО", 72),
 )
@@ -717,7 +718,9 @@ def _now_row(deal: dict[str, Any], now: Any) -> list[Any]:
 
     `ОЖИДАНИЕ` — возраст текущей попытки, а если попытки нет — возраст дела: ровно
     то число, по которому `/now` сортирует дела. `ВОЗРАСТ` — возраст самого дела.
-    Обе колонки — вычитание полей ответа, не новые правила.
+    `РАСХОД` — «N из M токенов / X из Y минут» рядом с состоянием
+    (`dashboard/budget.py`); прочерк — потолка на дело спека не объявляла.
+    Остальные колонки — вычитание полей ответа, не новые правила.
     """
     waiting = deal.get("waiting") or {}
     attempt = deal.get("attempt") or {}
@@ -729,12 +732,16 @@ def _now_row(deal: dict[str, Any], now: Any) -> list[Any]:
     wait_age = attempt.get("age_sec")
     if wait_age is None:
         wait_age = deal_age
+    block = deal.get("budget")
+    caption = str(block.get("text") or "") if isinstance(block, dict) else ""
+    spent = caption.replace("израсходовано ", "")
     return [
         deal.get("board"),
         deal.get("id"),
         state,
         _fmt_age(wait_age),
         _fmt_age(deal_age),
+        spent or "—",
         deal.get("title"),
         waiting.get("evidence"),
     ]
@@ -873,6 +880,9 @@ def render_attempts(payload: dict[str, Any]) -> str:
         # Причина пустого таймлайна — из ответа роута: «попыток нет» без причины
         # не отличить от «роут не умеет» (W18).
         lines.append(payload.get("note") or "попыток нет")
+        total = _budget_line(payload.get("budget"))
+        if total:
+            lines.append(total)
         return "\n".join(lines)
     for attempt in attempts:
         lines.append("")
@@ -901,7 +911,27 @@ def render_attempts(payload: dict[str, Any]) -> str:
         for event in attempt.get("events") or []:
             summary = event.get("summary") or ""
             lines.append(f"  {_fmt_clock(event.get('at'))}  {event.get('kind')}  {summary}".rstrip())
+    # Строка итога: расход по попыткам выше, потолок дела — здесь. Второй счётчик
+    # по тем же событиям консоль не заводит (`dashboard/budget.py`).
+    total = _budget_line(payload.get("budget"))
+    if total:
+        lines.append("")
+        lines.append(total)
     return "\n".join(lines)
+
+
+def _budget_line(block: Any) -> str:
+    """Строка расхода дела: «бюджет дела: израсходовано N из M токенов / X из Y минут».
+
+    Текст целиком берётся из ответа роута (`budget.text`, `dashboard/budget.py`):
+    второй счётчик в консоли разошёлся бы с журналом на первом же повторе. Нет
+    блока — нет и строки: потолка на дело спека не объявляла, и «0 из 0» здесь
+    было бы выдумкой.
+    """
+    if not isinstance(block, dict) or not block.get("text"):
+        return ""
+    exhausted = f" · потолок исчерпан: {block['exhausted']}" if block.get("exhausted") else ""
+    return f"бюджет дела: {block['text']}{exhausted}"
 
 
 def _closure_text(closed: dict[str, Any]) -> str:
@@ -953,6 +983,9 @@ def render_deal(payload: dict[str, Any], timeline: Optional[dict[str, Any]], tim
     ]
     lines.append(f"заголовок: {payload.get('title') or '—'}")
     lines.append(f"состояние ожидания: {_waiting_head(payload)}")
+    budget_line = _budget_line(payload.get("budget"))
+    if budget_line:
+        lines.append(budget_line)
     shaped = payload.get("deal")
     if shaped is not None:
         lines.append(f"доказательство: {(shaped.get('waiting') or {}).get('evidence') or 'не записано'}")

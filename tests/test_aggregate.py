@@ -1,19 +1,24 @@
-"""Тесты агрегатора «сейчас»: таксономия ожиданий, лизинги, таймлайн попыток.
+"""Тесты агрегатора «сейчас» без досок (0.0.6): таксономия ожиданий по журналу.
 
-Фикстуры — маленькие `kanban.db`/`pool.db`, собранные в `tmp_path` по реальной
-схеме (колонки скопированы из живых БД, не выдуманы). Живые БД в тестах не
-участвуют: агрегатор получает корень Hermes через `HERMES_HOME`.
+Срез «сейчас» собирается из двух источников: строки своего store
+(`dashboard/deals.py`) и фактов журнала (`dashboard/journal.py`) плюс таблицы
+лизингов. Карточки kanban — наблюдение (`/cards`) и в срез дел не входят, поэтому
+доски в фикстурах нет: тесты строят дело в store и пишут его факты журналом.
+
+Фикстуры — маленькие `duty.db`/`pool.db` в `tmp_path` по реальной схеме; живые
+БД не читаются и не пишутся: агрегатор получает корень Hermes через `HERMES_HOME`.
 """
 
 from __future__ import annotations
 
 import importlib.util
-import json
+import itertools
 import os
 import sqlite3
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi import FastAPI
@@ -26,74 +31,15 @@ plugin_api = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = plugin_api
 _SPEC.loader.exec_module(plugin_api)
 
+journal = plugin_api.journal
+deals = plugin_api.deals
+
 # Фиксированное «сейчас»: все возраста в тестах считаются от него.
 NOW = 1_800_000_000
 
-# Схема скопирована с живой `kanban.db` (колонки, которыми пользуется агрегатор,
-# плюс обязательные NOT NULL из настоящего DDL).
-KANBAN_SCHEMA = """
-CREATE TABLE tasks (
-    id                   TEXT PRIMARY KEY,
-    title                TEXT NOT NULL,
-    body                 TEXT,
-    assignee             TEXT,
-    status               TEXT NOT NULL,
-    priority             INTEGER DEFAULT 0,
-    created_by           TEXT,
-    created_at           INTEGER NOT NULL,
-    started_at           INTEGER,
-    completed_at         INTEGER,
-    workspace_kind       TEXT NOT NULL DEFAULT 'scratch',
-    workspace_path       TEXT,
-    branch_name          TEXT,
-    project_id           TEXT,
-    claim_lock           TEXT,
-    claim_expires        INTEGER,
-    tenant               TEXT,
-    result               TEXT,
-    consecutive_failures INTEGER NOT NULL DEFAULT 0,
-    worker_pid           INTEGER,
-    last_failure_error   TEXT,
-    max_runtime_seconds  INTEGER,
-    last_heartbeat_at    INTEGER,
-    current_run_id       INTEGER,
-    block_kind           TEXT,
-    block_recurrences    INTEGER NOT NULL DEFAULT 0,
-    merged_into          TEXT
-);
-CREATE TABLE task_runs (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id             TEXT NOT NULL,
-    profile             TEXT,
-    step_key            TEXT,
-    status              TEXT NOT NULL,
-    claim_lock          TEXT,
-    claim_expires       INTEGER,
-    worker_pid          INTEGER,
-    worker_started_at   INTEGER,
-    max_runtime_seconds INTEGER,
-    last_heartbeat_at   INTEGER,
-    started_at          INTEGER NOT NULL,
-    ended_at            INTEGER,
-    outcome             TEXT,
-    summary             TEXT,
-    metadata            TEXT,
-    error               TEXT
-);
-CREATE TABLE task_events (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id    TEXT NOT NULL,
-    run_id     INTEGER,
-    kind       TEXT NOT NULL,
-    payload    TEXT,
-    created_at INTEGER NOT NULL
-);
-CREATE TABLE task_links (
-    parent_id  TEXT NOT NULL,
-    child_id   TEXT NOT NULL,
-    PRIMARY KEY (parent_id, child_id)
-);
-"""
+# Счётчик ключей идемпотентности: у каждого факта свой, иначе `INSERT OR IGNORE`
+# молча отбросит вторую попытку с тем же видом и той же секундой.
+_SEQ = itertools.count(1)
 
 POOL_SCHEMA = """
 CREATE TABLE questions (
@@ -113,30 +59,13 @@ CREATE TABLE questions (
   timeout REAL,
   critical INTEGER NOT NULL DEFAULT 0,
   kind TEXT NOT NULL DEFAULT 'question',
-  link TEXT
+  link TEXT,
+  answered_via TEXT
 );
 """
 
 
 # ------------------------------------------------------------------ фикстуры
-
-
-def board_db(home: Path, slug: str) -> Path:
-    """Путь к БД доски в фикстурном корне Hermes (`default` — корневой kanban.db)."""
-    if slug == "default":
-        return home / "kanban.db"
-    return home / "kanban" / "boards" / slug / "kanban.db"
-
-
-def make_board(home: Path, slug: str, schema: str = KANBAN_SCHEMA) -> Path:
-    """Создать БД доски по реальной схеме (пустой файл агрегатор не увидит)."""
-    path = board_db(home, slug)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
-    conn.executescript(schema)
-    conn.commit()
-    conn.close()
-    return path
 
 
 def make_pool(home: Path) -> Path:
@@ -154,111 +83,182 @@ def make_pool(home: Path) -> Path:
     return path
 
 
-def add_task(
-    conn: sqlite3.Connection,
-    task_id: str,
+def store(home: Path) -> sqlite3.Connection:
+    """Соединение своего store: схему (и журнал рядом) доводит открытие на запись."""
+    conn = deals.open_store(home)
+    assert conn is not None
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def make_deal(
+    home: Path,
     *,
     status: str = "todo",
-    assignee: str = "implementer",
-    title: str | None = None,
+    repo: str | None = "stack",
     created_at: int = NOW - 3600,
-    started_at: int | None = None,
-    claim_lock: str | None = None,
-    claim_expires: int | None = None,
-    consecutive_failures: int = 0,
-    worker_pid: int | None = None,
-    last_heartbeat_at: int | None = None,
-    current_run_id: int | None = None,
-    block_kind: str | None = None,
-) -> None:
-    conn.execute(
-        "INSERT INTO tasks (id, title, body, assignee, status, created_at, started_at, "
-        "claim_lock, claim_expires, consecutive_failures, worker_pid, last_heartbeat_at, "
-        "current_run_id, block_kind) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (
-            task_id,
-            title or f"дело {task_id}",
-            "тело дела",
-            assignee,
-            status,
-            created_at,
-            started_at,
-            claim_lock,
-            claim_expires,
-            consecutive_failures,
-            worker_pid,
-            last_heartbeat_at,
-            current_run_id,
-            block_kind,
-        ),
-    )
+    parents: tuple[str, ...] = (),
+    assignee: str | None = "implementer",
+    title: str = "дело",
+) -> str:
+    """Своё дело в store: строка плюс `created` — как их пишет мутация."""
+    conn = store(home)
+    try:
+        result = deals.create_deal(
+            conn,
+            repo=repo,
+            title=title,
+            assignee=assignee,
+            parents=parents,
+            now=created_at,
+        )
+        deal_id = str(result["deal"]["id"])
+        if status != str(result["deal"]["status"]):
+            # Статус жизни ставится командой, а не созданием: в тесте — в строку.
+            with conn:
+                conn.execute("UPDATE deals SET status = ? WHERE id = ?", (status, deal_id))
+    finally:
+        conn.close()
+    return deal_id
 
 
-def add_run(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    status: str = "running",
-    profile: str = "implementer",
-    started_at: int = NOW - 600,
-    ended_at: int | None = None,
-    outcome: str | None = None,
-    worker_pid: int | None = None,
-    last_heartbeat_at: int | None = None,
-    claim_lock: str | None = None,
-    claim_expires: int | None = None,
-    error: str | None = None,
-) -> int:
-    cur = conn.execute(
-        "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, "
-        "worker_pid, last_heartbeat_at, claim_lock, claim_expires, error) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (
-            task_id,
-            profile,
-            status,
-            started_at,
-            ended_at,
-            outcome,
-            worker_pid,
-            last_heartbeat_at,
-            claim_lock,
-            claim_expires,
-            error,
-        ),
-    )
-    return int(cur.lastrowid or 0)
-
-
-def add_event(
-    conn: sqlite3.Connection,
-    task_id: str,
+def append(
+    home: Path,
+    deal_id: str,
     kind: str,
+    payload: dict[str, Any] | None = None,
     *,
-    run_id: int | None = None,
-    payload: dict | str | None = None,
-    created_at: int = NOW - 120,
+    ts: int = NOW - 120,
+) -> None:
+    """Дописать факт журнала дела так, как его пишет движок."""
+    conn = journal.open_journal(home)
+    assert conn is not None
+    try:
+        journal.append(
+            conn,
+            [
+                {
+                    "deal_id": deal_id,
+                    "kind": kind,
+                    "ts": ts,
+                    "recorded_at": ts,
+                    "source": "engine",
+                    "payload": payload or {},
+                    "idempotency_key": f"test:{deal_id}:{kind}:{next(_SEQ)}",
+                }
+            ],
+        )
+    finally:
+        conn.close()
+
+
+def attempt_started(
+    home: Path,
+    deal_id: str,
+    *,
+    stage: str = "impl",
+    attempt: int = 1,
+    pid: int | None = 4242,
+    started_at: int = NOW - 300,
+    lease_expires: int | None = None,
+    role: str = "implementer",
+) -> str:
+    """`attempt_started` — той же формой, что пишет движок (`runner.step`)."""
+    run_id = f"{deal_id}:{stage}#{attempt}"
+    append(
+        home,
+        deal_id,
+        "attempt_started",
+        {
+            "run_id": run_id,
+            "stage": stage,
+            "attempt": attempt,
+            "pid": pid,
+            "lease_expires": lease_expires,
+            "contract": {"role": role},
+        },
+        ts=started_at,
+    )
+    return run_id
+
+
+def attempt_ended(
+    home: Path,
+    deal_id: str,
+    *,
+    stage: str = "impl",
+    attempt: int = 1,
+    outcome: str = "done",
+    kind: str | None = None,
+    reason: str = "",
+    ended_at: int = NOW - 200,
+    commit: str | None = None,
+) -> str:
+    """`attempt_ended` — исход попытки словами движка."""
+    run_id = f"{deal_id}:{stage}#{attempt}"
+    append(
+        home,
+        deal_id,
+        "attempt_ended",
+        {
+            "run_id": run_id,
+            "stage": stage,
+            "attempt": attempt,
+            "outcome": outcome,
+            "kind": kind,
+            "reason": reason,
+            "base": None,
+            "commit": commit,
+        },
+        ts=ended_at,
+    )
+    return run_id
+
+
+def hold_lease(
+    home: Path,
+    deal_id: str,
+    *,
+    stage: str = "impl",
+    attempt: int = 1,
+    pid: int = 4242,
+    expires_at: int,
+    taken_at: int | None = None,
+) -> None:
+    """Строка лизинга этапа — то, что читает движок и `_own_attempt_facts`."""
+    conn = store(home)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO leases (deal_id, stage, attempt, pid, taken_at, expires_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (deal_id, stage, attempt, pid, taken_at or expires_at - 300, expires_at),
+            )
+    finally:
+        conn.close()
+
+
+def add_question(
+    home: Path,
+    *,
+    session_key: str,
+    status: str = "sent",
+    origin: str = "duty",
+    text: str = "вопрос по делу",
+    project: str | None = None,
 ) -> int:
-    raw = payload if isinstance(payload, str) or payload is None else json.dumps(payload, ensure_ascii=False)
-    cur = conn.execute(
-        "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?,?,?,?,?)",
-        (task_id, run_id, kind, raw, created_at),
-    )
-    return int(cur.lastrowid or 0)
-
-
-def add_link(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
-    conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?,?)", (parent_id, child_id))
-
-
-def add_question(conn: sqlite3.Connection, *, session_key: str, status: str = "sent", origin: str = "card",
-                 text: str = "вопрос по делу", project: str | None = None) -> int:
-    cur = conn.execute(
-        "INSERT INTO questions (session_key, project, text, text_full, origin, status, kind) "
-        "VALUES (?,?,?,?,?,?,'question')",
-        (session_key, project, text, text, origin, status),
-    )
-    return int(cur.lastrowid or 0)
+    """Живой вопрос пула по делу: `session_key` — `t_<deal_id>`."""
+    conn = sqlite3.connect(make_pool(home))
+    try:
+        cur = conn.execute(
+            "INSERT INTO questions (session_key, project, text, text_full, origin, status, kind) "
+            "VALUES (?,?,?,?,?,?,'question')",
+            (session_key, project, text, text, origin, status),
+        )
+        conn.commit()
+        return int(cur.lastrowid or 0)
+    finally:
+        conn.close()
 
 
 def absent_pid() -> int:
@@ -301,436 +301,286 @@ def deals_by_id(result: dict) -> dict[str, dict]:
 # --------------------------------------------------------------------- тесты
 
 
-def test_clean_board_child_waits_for_unfinished_parent(home: Path) -> None:
-    """Чистая доска: попытки нет, дело стоит на незавершённом родителе (wait_gate)."""
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_parent", status="todo", created_at=NOW - 7200)
-    add_task(conn, "t_child", status="todo", created_at=NOW - 3600)
-    add_link(conn, "t_parent", "t_child")
-    conn.commit()
-    conn.close()
+def test_gate_child_waits_for_unfinished_parent(home: Path) -> None:
+    """Гейт: ребёнок стоит на незавершённом родителе, родитель — очередь слота."""
+    parent = make_deal(home, status="todo", created_at=NOW - 7200, title="родитель")
+    child = make_deal(
+        home, status="todo", created_at=NOW - 3600, parents=(parent,), title="ребёнок"
+    )
 
     result = plugin_api.collect_now(home, NOW)
-    deals = deals_by_id(result)
+    indexed = deals_by_id(result)
 
     assert result["errors"] == []
-    child = deals["t_child"]
-    assert child["attempt"] is None
-    assert child["last_action"]["kind"] is None
-    assert child["waiting"]["state"] == "wait_gate"
-    assert "t_parent" in child["waiting"]["evidence"]
+    assert indexed[child]["attempt"] is None
+    assert indexed[child]["last_action"]["kind"] == "created"
+    assert indexed[child]["waiting"]["state"] == "wait_gate"
+    assert parent in indexed[child]["waiting"]["evidence"]
     # Родитель без родителей — очередь диспетчера, а не гейт.
-    assert deals["t_parent"]["waiting"]["state"] == "wait_slot"
-    # Готовый родитель снимает гейт: ребёнок больше не ждёт графа.
-    conn = sqlite3.connect(board_db(home, "stack"))
-    conn.execute("UPDATE tasks SET status='done', completed_at=? WHERE id='t_parent'", (NOW,))
-    conn.commit()
-    conn.close()
+    assert indexed[parent]["waiting"]["state"] == "wait_slot"
+
+    # Закрытие родителя открывает гейт фактом журнала ребёнка: дело уходит в очередь.
+    conn = store(home)
+    try:
+        deals.complete_deal(conn, parent, summary="готово", now=NOW)
+    finally:
+        conn.close()
+
     after = deals_by_id(plugin_api.collect_now(home, NOW))
-    assert after["t_child"]["waiting"]["state"] == "wait_slot"
-    assert "незавершённые родители" not in after["t_child"]["waiting"]["evidence"]
+    assert after[child]["status"] == "ready"
+    assert after[child]["waiting"]["state"] == "wait_slot"
+    assert "незавершённые родители" not in after[child]["waiting"]["evidence"]
 
 
-def test_running_with_dead_pid_is_dead_lease(home: Path) -> None:
-    """Ран `running`, pid мёртв, лизинг ещё жив и heartbeat свежий → dead_lease, не working."""
+def test_attempt_with_dead_pid_is_crashed(home: Path) -> None:
+    """Незакрытая попытка с мёртвым pid — падение, а не работа и не лизинг."""
     pid = absent_pid()
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_dead", status="running", created_at=NOW - 500)
-    run_id = add_run(
-        conn,
-        "t_dead",
-        status="running",
-        worker_pid=pid,
-        started_at=NOW - 400,
-        last_heartbeat_at=NOW - 20,
-        claim_lock="mbp-test:1",
-        claim_expires=NOW + 600,
-    )
-    conn.execute(
-        "UPDATE tasks SET worker_pid=?, current_run_id=?, claim_lock='mbp-test:1', "
-        "claim_expires=?, started_at=?, last_heartbeat_at=? WHERE id='t_dead'",
-        (pid, run_id, NOW + 600, NOW - 400, NOW - 20),
-    )
-    conn.commit()
-    conn.close()
+    deal_id = make_deal(home, status="running", created_at=NOW - 500)
+    run_id = attempt_started(home, deal_id, pid=pid, started_at=NOW - 400)
+    hold_lease(home, deal_id, pid=pid, expires_at=NOW + 600)
 
-    deal = deals_by_id(plugin_api.collect_now(home, NOW))["t_dead"]
+    deal = deals_by_id(plugin_api.collect_now(home, NOW))[deal_id]
 
     assert deal["attempt"]["run_id"] == run_id
+    assert deal["attempt"]["source"] == "journal"
     assert deal["attempt"]["pid_alive"] is False
     assert deal["attempt"]["age_sec"] == 400
     assert deal["lease"]["state"] == "live"
-    assert deal["waiting"]["state"] == "dead_lease"
+    assert deal["waiting"]["state"] == "crashed"
     assert "мёртв" in deal["waiting"]["evidence"]
 
 
-def test_running_with_live_pid_and_stale_heartbeat_is_crashed(home: Path) -> None:
-    """pid жив, но heartbeat молчит 15 минут → воркер завис, это crashed."""
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_hung", status="running", created_at=NOW - 2000)
-    run_id = add_run(
-        conn,
-        "t_hung",
-        status="running",
-        worker_pid=os.getpid(),
-        started_at=NOW - 1800,
-        last_heartbeat_at=NOW - 900,
-        claim_expires=NOW + 600,
-    )
-    conn.execute(
-        "UPDATE tasks SET worker_pid=?, current_run_id=?, claim_expires=?, last_heartbeat_at=? "
-        "WHERE id='t_hung'",
-        (os.getpid(), run_id, NOW + 600, NOW - 900),
-    )
-    conn.commit()
-    conn.close()
+def test_attempt_with_live_pid_is_working(home: Path) -> None:
+    """Незакрытая попытка с живым pid — `working`; heartbeat журнал не пишет."""
+    deal_id = make_deal(home, status="running", created_at=NOW - 700)
+    attempt_started(home, deal_id, pid=os.getpid(), started_at=NOW - 600)
+    hold_lease(home, deal_id, pid=os.getpid(), expires_at=NOW + 300)
 
-    deal = deals_by_id(plugin_api.collect_now(home, NOW))["t_hung"]
+    deal = deals_by_id(plugin_api.collect_now(home, NOW))[deal_id]
 
     assert deal["attempt"]["pid_alive"] is True
-    assert deal["attempt"]["heartbeat_age_sec"] == 900
-    assert deal["waiting"]["state"] == "crashed"
-    assert "heartbeat 900с назад" in deal["waiting"]["evidence"]
+    # Сердцебиение в журнал не пишется: поля пусты, и это названо словами.
+    assert deal["attempt"]["heartbeat_age_sec"] is None
+    assert deal["attempt"]["run_status"] is None
+    assert deal["waiting"]["state"] == "working"
+    assert "heartbeat в журнале не пишется" in deal["waiting"]["evidence"]
+    assert deal["lease"]["state"] == "live"
+    assert deal["lease"]["expires_in_sec"] == 300
 
 
-def test_crashed_with_unknown_pid_state_does_not_call_pid_alive(
+def test_attempt_with_unknown_pid_state_is_not_reported_as_missing(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`crashed` при `pid_alive=None`: pid записан, но жив ли он — неизвестно.
-
-    Раньше ветка `crashed` печатала «pid 50124 жив» безусловно, хотя `os.kill`
-    вернул прочий `OSError` (например `EPERM`) и ответа о живости не было.
-    """
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_0c0a0001", status="running", created_at=NOW - 2000)
-    run_id = add_run(
-        conn,
-        "t_0c0a0001",
-        status="running",
-        worker_pid=50124,
-        started_at=NOW - 1800,
-        last_heartbeat_at=NOW - 900,
-        claim_expires=NOW + 600,
-    )
-    conn.execute(
-        "UPDATE tasks SET worker_pid=50124, current_run_id=?, claim_expires=?, "
-        "last_heartbeat_at=? WHERE id='t_0c0a0001'",
-        (run_id, NOW + 600, NOW - 900),
-    )
-    conn.commit()
-    conn.close()
-
+    """`os.kill` ответил прочим `OSError` (`pid_alive=None`) → «состояние pid неизвестно»."""
+    deal_id = make_deal(home, status="running", created_at=NOW - 700)
+    attempt_started(home, deal_id, pid=50123, started_at=NOW - 600)
+    # Живость решают два места: fold журнала и поля попытки в ответе — оба на шве.
+    monkeypatch.setattr(journal, "pid_alive", lambda pid: None)
     monkeypatch.setattr(plugin_api, "_pid_alive", lambda pid: None)
 
-    deal = deals_by_id(plugin_api.collect_now(home, NOW))["t_0c0a0001"]
+    deal = deals_by_id(plugin_api.collect_now(home, NOW))[deal_id]
 
     assert deal["attempt"]["pid_alive"] is None
-    assert deal["waiting"]["state"] == "crashed"
-    assert "состояние pid 50124 неизвестно" in deal["waiting"]["evidence"]
-    assert "жив" not in deal["waiting"]["evidence"]
+    assert deal["waiting"]["state"] == "no_signal"
+    assert "состояние pid 50123 неизвестно" in deal["waiting"]["evidence"]
+    assert "не записан" not in deal["waiting"]["evidence"]
 
 
-def test_crashed_without_recorded_pid_says_not_recorded(home: Path) -> None:
-    """`crashed` при пустом `worker_pid`: «pid не записан», а не «pid None жив»."""
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_0c0a0002", status="running", created_at=NOW - 2000)
-    run_id = add_run(
-        conn,
-        "t_0c0a0002",
-        status="running",
-        started_at=NOW - 1800,
-        last_heartbeat_at=NOW - 900,
-        claim_expires=NOW + 600,
-    )
-    conn.execute(
-        "UPDATE tasks SET current_run_id=?, claim_expires=?, last_heartbeat_at=? "
-        "WHERE id='t_0c0a0002'",
-        (run_id, NOW + 600, NOW - 900),
-    )
-    conn.commit()
-    conn.close()
+def test_attempt_without_pid_says_pid_not_recorded(home: Path) -> None:
+    """Попытка без pid: «pid не записан» — и без «None» в тексте доказательства."""
+    deal_id = make_deal(home, status="running", created_at=NOW - 700)
+    attempt_started(home, deal_id, pid=None, started_at=NOW - 600)
 
-    deal = deals_by_id(plugin_api.collect_now(home, NOW))["t_0c0a0002"]
+    deal = deals_by_id(plugin_api.collect_now(home, NOW))[deal_id]
 
     assert deal["attempt"]["pid"] is None
-    assert deal["attempt"]["pid_alive"] is None
-    assert deal["waiting"]["state"] == "crashed"
+    assert deal["waiting"]["state"] == "no_signal"
     assert "pid не записан" in deal["waiting"]["evidence"]
-    assert "жив" not in deal["waiting"]["evidence"]
     assert "None" not in deal["waiting"]["evidence"]
 
 
-def test_consecutive_failures_is_crashed_with_evidence(home: Path) -> None:
-    """Счётчик отказов 2 — падение, даже если карточка уже вернулась в очередь."""
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_breaker", status="ready", created_at=NOW - 5000, consecutive_failures=2)
-    run_id = add_run(
-        conn,
-        "t_breaker",
-        status="crashed",
-        started_at=NOW - 900,
-        ended_at=NOW - 600,
-        outcome="gave_up",
-        error="retries exhausted 2/2",
+def test_claim_with_expired_term_is_dead_lease(home: Path) -> None:
+    """Лизинг взят, срок истёк, попытки за ним нет — `dead_lease`."""
+    deal_id = make_deal(home, status="ready", created_at=NOW - 900)
+    append(
+        home,
+        deal_id,
+        "claimed",
+        {"claim_lock": "mbp-test:1", "claim_expires": NOW - 300},
+        ts=NOW - 800,
     )
-    conn.execute("UPDATE tasks SET current_run_id=NULL, last_failure_error='retries exhausted 2/2' WHERE id='t_breaker'")
-    conn.commit()
-    conn.close()
 
-    deal = deals_by_id(plugin_api.collect_now(home, NOW))["t_breaker"]
+    deal = deals_by_id(plugin_api.collect_now(home, NOW))[deal_id]
 
-    assert deal["consecutive_failures"] == 2
+    assert deal["waiting"]["state"] == "dead_lease"
+    assert "mbp-test:1" in deal["waiting"]["evidence"]
+    assert "срок истёк" in deal["waiting"]["evidence"]
+
+
+def test_claim_without_term_is_not_dead_lease(home: Path) -> None:
+    """`claimed` без срока: срок — данные, а не происхождение записи, — жалобы нет."""
+    deal_id = make_deal(home, status="ready", created_at=NOW - 900)
+    append(home, deal_id, "claimed", {"claim_lock": "mbp-test:1"}, ts=NOW - 800)
+
+    deal = deals_by_id(plugin_api.collect_now(home, NOW))[deal_id]
+
+    assert deal["waiting"]["state"] == "wait_slot"
+    assert "нет живых фактов" in deal["waiting"]["evidence"]
+
+
+def test_lease_row_without_attempt_is_visible(home: Path) -> None:
+    """Строка лизинга без `attempt_started` — факт store, а не «лизинга нет»."""
+    deal_id = make_deal(home, status="ready", created_at=NOW - 400)
+    hold_lease(home, deal_id, expires_at=NOW + 120)
+
+    deal = deals_by_id(plugin_api.collect_now(home, NOW))[deal_id]
+
     assert deal["attempt"] is None
-    assert deal["last_run"]["run_id"] == run_id
-    assert deal["last_run"]["outcome"] == "gave_up"
-    assert deal["waiting"]["state"] == "crashed"
-    assert "consecutive_failures=2" in deal["waiting"]["evidence"]
-    assert "outcome=gave_up" in deal["waiting"]["evidence"]
+    assert deal["lease"]["state"] == "live"
+    assert deal["lease"]["expires_at"] == NOW + 120
+    assert deal["lease"]["expires_in_sec"] == 120
 
 
-def test_ready_card_waits_for_busy_profile(home: Path) -> None:
-    """`ready` при занятом том же профиле → wait_slot, а занятое дело — working."""
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_busy", status="running", created_at=NOW - 700)
-    run_id = add_run(
-        conn,
-        "t_busy",
-        status="running",
-        worker_pid=os.getpid(),
-        started_at=NOW - 660,
-        last_heartbeat_at=NOW - 30,
-        claim_expires=NOW + 300,
+def test_wait_human_from_pool_question(home: Path) -> None:
+    """Живой вопрос пула по делу → wait_human, и номер вопроса назван в evidence."""
+    asked = make_deal(home, status="blocked", created_at=NOW - 900)
+    silent = make_deal(home, status="blocked", created_at=NOW - 800)
+    question_id = add_question(home, session_key=f"t_{asked}", project="stack")
+    # Факт вопроса пишет `ask()` — вместе со строкой пула, под тем же `deal_id`.
+    append(
+        home,
+        asked,
+        "question_asked",
+        {"question_id": question_id, "session_key": f"t_{asked}", "critical": 1},
+        ts=NOW - 850,
     )
-    conn.execute(
-        "UPDATE tasks SET worker_pid=?, current_run_id=?, claim_expires=?, last_heartbeat_at=? "
-        "WHERE id='t_busy'",
-        (os.getpid(), run_id, NOW + 300, NOW - 30),
+
+    indexed = deals_by_id(plugin_api.collect_now(home, NOW))
+
+    assert indexed[asked]["waiting"]["state"] == "wait_human"
+    assert indexed[asked]["waiting"]["human_kind"] == "question"
+    assert f"#{question_id}" in indexed[asked]["waiting"]["evidence"]
+    # У дела без вопроса тот же статус, но вид ожидания другой: «по статусу».
+    assert indexed[silent]["waiting"]["state"] == "wait_human"
+    assert indexed[silent]["waiting"]["human_kind"] == "status"
+
+
+def test_capability_block_wins_over_human_fallback(home: Path) -> None:
+    """Блок с typed-причиной `capability` — отдельное состояние, а не «ждёт человека»."""
+    blocked = make_deal(home, status="blocked", created_at=NOW - 700)
+    plain = make_deal(home, status="blocked", created_at=NOW - 600)
+    append(
+        home,
+        blocked,
+        "blocked",
+        {"block_kind": "capability", "reason": "нет доступа к репозиторию: role-access"},
+        ts=NOW - 690,
     )
-    add_task(conn, "t_queued", status="ready", created_at=NOW - 400)
-    add_task(conn, "t_other", status="ready", assignee="tester", created_at=NOW - 300)
-    conn.commit()
-    conn.close()
-
-    deals = deals_by_id(plugin_api.collect_now(home, NOW))
-
-    assert deals["t_busy"]["waiting"]["state"] == "working"
-    assert deals["t_queued"]["waiting"]["state"] == "wait_slot"
-    assert "t_busy" in deals["t_queued"]["waiting"]["evidence"]
-    # Чужой профиль занят не этим делом — очередь, но другой исполнитель свободен.
-    assert deals["t_other"]["waiting"]["state"] == "wait_slot"
-
-
-def test_attempts_timeline_is_ordered_with_durations(home: Path) -> None:
-    """Два рана + события: таймлайн по возрастанию старта, длительности посчитаны."""
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_two", status="ready", created_at=NOW - 5000, consecutive_failures=1)
-    first = add_run(
-        conn,
-        "t_two",
-        status="crashed",
-        started_at=NOW - 4000,
-        ended_at=NOW - 3400,
-        outcome="crashed",
-        error="worker died",
+    append(
+        home,
+        plain,
+        "blocked",
+        {"block_kind": "needs_input", "reason": "выбери вариант"},
+        ts=NOW - 590,
     )
-    second = add_run(
-        conn,
-        "t_two",
-        status="crashed",
-        started_at=NOW - 3300,
-        ended_at=NOW - 3200,
-        outcome="timed_out",
-        error="max runtime",
-    )
-    add_event(conn, "t_two", "spawned", run_id=first, payload={"pid": 111}, created_at=NOW - 3990)
-    add_event(conn, "t_two", "worker_result", run_id=first, payload={"summary": "упал"}, created_at=NOW - 3401)
-    add_event(conn, "t_two", "spawned", run_id=second, payload={"pid": 222}, created_at=NOW - 3290)
-    add_event(conn, "t_two", "commented", payload={"author": "lead"}, created_at=NOW - 3250)
-    conn.commit()
-    conn.close()
 
-    app = FastAPI()
-    app.include_router(plugin_api.router)
-    body = TestClient(app).get("/duty/stack/t_two/attempts").json()
+    indexed = deals_by_id(plugin_api.collect_now(home, NOW))
 
-    assert body["task_id"] == "t_two"
-    assert body["count"] == 2
-    first_attempt, second_attempt = body["attempts"]
-    assert (first_attempt["run_id"], second_attempt["run_id"]) == (first, second)
-    assert first_attempt["duration_sec"] == 600
-    assert second_attempt["duration_sec"] == 100
-    assert [event["kind"] for event in first_attempt["events"]] == ["spawned", "worker_result"]
-    assert [event["kind"] for event in second_attempt["events"]] == ["spawned"]
-    assert first_attempt["events"][1]["summary"] == "упал"
-    assert first_attempt["outcome"] == "crashed"
-    assert first_attempt["error"] == "worker died"
-    # Событие без run_id к попыткам не приклеивается.
-    assert all(event["kind"] != "commented" for event in first_attempt["events"] + second_attempt["events"])
+    assert indexed[blocked]["waiting"]["state"] == "capability"
+    assert "role-access" in indexed[blocked]["waiting"]["evidence"]
+    assert indexed[plain]["waiting"]["state"] == "wait_human"
 
 
-def test_broken_board_lands_in_errors_and_route_stays_200(home: Path, client: TestClient) -> None:
-    """Битая доска (нет таблицы tasks) не валит роут: 200, доска в errors, живая доска в ответе."""
-    healthy = make_board(home, "stack")
-    conn = sqlite3.connect(healthy)
-    add_task(conn, "t_ok", status="todo", created_at=NOW - 100)
-    conn.commit()
-    conn.close()
+def test_review_requested_waits_for_verdict_and_return_is_a_slot(home: Path) -> None:
+    """Сдача в ревью — `wait_human`; возврат на доработку — `wait_slot` с причиной."""
+    deal_id = make_deal(home, status="review", created_at=NOW - 900)
+    append(home, deal_id, "review_requested", {"reviewer": "reviewer"}, ts=NOW - 800)
 
-    make_board(home, "broken", schema="CREATE TABLE unrelated (x INTEGER);")
-    (home / "kanban" / "boards" / "gar-bage").mkdir(parents=True)
-    (home / "kanban" / "boards" / "gar-bage" / "kanban.db").write_bytes(b"not a database at all")
+    waiting = deals_by_id(plugin_api.collect_now(home, NOW))[deal_id]["waiting"]
+    assert waiting["state"] == "wait_human"
+    assert "вердикта в журнале нет" in waiting["evidence"]
+
+    append(home, deal_id, "changes_requested", {"reason": "поправь тесты"}, ts=NOW - 700)
+    waiting = deals_by_id(plugin_api.collect_now(home, NOW))[deal_id]["waiting"]
+    assert waiting["state"] == "wait_slot"
+    assert "поправь тесты" in waiting["evidence"]
+
+
+def test_state_and_repo_filters(home: Path, client: TestClient) -> None:
+    """`?repo=` и `?state=` фильтруют один и тот же детерминированный срез."""
+    stack = make_deal(home, status="todo", repo="stack", created_at=NOW - 100)
+    other = make_deal(home, status="blocked", repo="other", created_at=NOW - 100)
+
+    everything = client.get("/now").json()
+    assert everything["count"] == 2
+    # Сортировка по таксономии: wait_human раньше wait_slot.
+    assert [deal["id"] for deal in everything["deals"]] == [other, stack]
+
+    one_repo = client.get("/now", params={"repo": "other"}).json()
+    assert [deal["id"] for deal in one_repo["deals"]] == [other]
+
+    one_state = client.get("/now", params={"state": "wait_slot"}).json()
+    assert [deal["id"] for deal in one_state["deals"]] == [stack]
+    assert one_state["by_state"]["wait_human"] == 1
+
+    assert client.get("/now", params={"repo": "nope"}).status_code == 404
+    assert client.get("/now", params={"state": "nonsense"}).status_code == 400
+    assert client.get("/duty/d_00000000/attempts").status_code == 404
+    assert client.get("/duty/nonsense/attempts").status_code == 400
+
+
+def test_sorting_is_deterministic_between_polls(home: Path) -> None:
+    """Повторный срез на тех же данных даёт тот же порядок и те же возраста."""
+    old_a = make_deal(home, status="todo", created_at=NOW - 5000)
+    old_z = make_deal(home, status="todo", created_at=NOW - 5000)
+    busy = make_deal(home, status="running", created_at=NOW - 100)
+    attempt_started(home, busy, pid=os.getpid(), started_at=NOW - 90)
+
+    first = plugin_api.collect_now(home, NOW)
+    second = plugin_api.collect_now(home, NOW)
+
+    expected = [busy] + sorted([old_a, old_z])
+    assert [deal["id"] for deal in first["deals"]] == expected
+    assert [deal["waiting"]["state"] for deal in first["deals"]] == [
+        "working",
+        "wait_slot",
+        "wait_slot",
+    ]
+    assert first["deals"] == second["deals"]
+
+
+def test_sources_untouched_by_now(home: Path) -> None:
+    """Срез «сейчас» не меняет источники: mtime, размер и состав файлов те же."""
+    deal_id = make_deal(home, status="running", created_at=NOW - 100)
+    attempt_started(home, deal_id, pid=os.getpid(), started_at=NOW - 60)
+
+    sources = sorted(path for path in home.rglob("*") if path.is_file())
+    before = {path: (path.stat().st_mtime_ns, path.stat().st_size) for path in sources}
+    time.sleep(0.01)
+    plugin_api.collect_now(home, NOW)
+    after_paths = sorted(path for path in home.rglob("*") if path.is_file())
+    after = {path: (path.stat().st_mtime_ns, path.stat().st_size) for path in after_paths}
+
+    assert after_paths == sources
+    assert after == before
+
+
+def test_unreadable_store_lands_in_errors_and_route_stays_200(
+    home: Path, client: TestClient
+) -> None:
+    """Битый `duty/duty.db` не валит роут: 200, причина в `errors`, дел нет."""
+    path = home / "duty" / "duty.db"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"not a database at all")
 
     response = client.get("/now")
 
     assert response.status_code == 200
     body = response.json()
-    assert [deal["id"] for deal in body["deals"]] == ["t_ok"]
-    broken = {error["board"]: error["reason"] for error in body["errors"]}
-    assert "broken" in broken and "tasks" in broken["broken"]
-    assert "gar-bage" in broken
-    assert {board["slug"]: board["read"] for board in body["boards"]} == {
-        "broken": False,
-        "gar-bage": False,
-        "stack": True,
-    }
-
-
-def test_wait_human_from_pool_question(home: Path) -> None:
-    """Живой вопрос пула по делу → wait_human (id карточки в session_key и в тексте)."""
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_a5ca0001", status="blocked", block_kind="needs_input", created_at=NOW - 900)
-    add_task(conn, "t_a5ce0002", status="blocked", block_kind="needs_input", created_at=NOW - 800)
-    conn.commit()
-    conn.close()
-
-    pool = sqlite3.connect(make_pool(home))
-    question_id = add_question(pool, session_key="t_a5ca0001", origin="card", project="stack")
-    add_question(pool, session_key="agent:main:local:dm", origin="session", text="уточни t_a5ce0002, пожалуйста")
-    add_question(pool, session_key="t_a5ca0001", origin="card", status="answered", text="старый вопрос")
-    pool.commit()
-    pool.close()
-
-    deals = deals_by_id(plugin_api.collect_now(home, NOW))
-
-    assert deals["t_a5ca0001"]["waiting"]["state"] == "wait_human"
-    assert f"#{question_id}" in deals["t_a5ca0001"]["waiting"]["evidence"]
-    assert deals["t_a5ce0002"]["waiting"]["state"] == "wait_human"
-
-
-def test_capability_block_wins_over_human_fallback(home: Path) -> None:
-    """Блок с typed-причиной `capability` — отдельное состояние, а не «ждёт человека»."""
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_cap", status="blocked", block_kind="capability", created_at=NOW - 700)
-    add_task(conn, "t_plain", status="blocked", block_kind="needs_input", created_at=NOW - 600)
-    add_event(
-        conn,
-        "t_cap",
-        "blocked",
-        payload={"kind": "capability", "reason": "нет доступа к репозиторию: role-access"},
-        created_at=NOW - 690,
-    )
-    add_event(conn, "t_plain", "blocked", payload={"kind": "needs_input", "reason": "выбери вариант"}, created_at=NOW - 590)
-    conn.commit()
-    conn.close()
-
-    deals = deals_by_id(plugin_api.collect_now(home, NOW))
-
-    assert deals["t_cap"]["waiting"]["state"] == "capability"
-    assert "role-access" in deals["t_cap"]["waiting"]["evidence"]
-    assert deals["t_plain"]["waiting"]["state"] == "wait_human"
-
-
-def test_ended_run_with_dead_pid_is_not_dead_lease(home: Path) -> None:
-    """Мёртвый pid у уже завершённого рана — не dead_lease: лизинг кончился вместе с раном."""
-    pid = absent_pid()
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_done_run", status="ready", created_at=NOW - 3000, worker_pid=pid, consecutive_failures=1)
-    add_run(
-        conn,
-        "t_done_run",
-        status="released",
-        worker_pid=pid,
-        started_at=NOW - 2000,
-        ended_at=NOW - 1500,
-        outcome="crashed",
-    )
-    conn.commit()
-    conn.close()
-
-    deal = deals_by_id(plugin_api.collect_now(home, NOW))["t_done_run"]
-
-    assert deal["attempt"] is None
-    assert deal["waiting"]["state"] == "crashed"
-
-
-def test_state_and_board_filters(home: Path, client: TestClient) -> None:
-    """`?repo=` и `?state=` фильтруют один и тот же детерминированный срез."""
-    for slug, task_id, status in (("stack", "t_a", "todo"), ("other", "t_b", "blocked")):
-        conn = sqlite3.connect(make_board(home, slug))
-        add_task(conn, task_id, status=status, created_at=NOW - 100)
-        conn.commit()
-        conn.close()
-
-    everything = client.get("/now").json()
-    assert everything["count"] == 2
-    assert [deal["id"] for deal in everything["deals"]] == ["t_b", "t_a"]  # сортировка по таксономии
-
-    one_board = client.get("/now", params={"repo": "other"}).json()
-    assert [deal["id"] for deal in one_board["deals"]] == ["t_b"]
-
-    one_state = client.get("/now", params={"state": "wait_slot"}).json()
-    assert [deal["id"] for deal in one_state["deals"]] == ["t_a"]
-    assert one_state["by_state"]["wait_human"] == 1
-
-    assert client.get("/now", params={"repo": "nope"}).status_code == 404
-    assert client.get("/now", params={"state": "nonsense"}).status_code == 400
-    assert client.get("/duty/nope/t_a/attempts").status_code == 404
-    assert client.get("/duty/stack/missing/attempts").status_code == 404
-
-
-def test_sorting_is_deterministic_between_polls(home: Path) -> None:
-    """Повторный срез на тех же данных даёт тот же порядок и те же возраста."""
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_z", status="todo", created_at=NOW - 5000)
-    add_task(conn, "t_a", status="todo", created_at=NOW - 5000)
-    add_task(conn, "t_m", status="todo", created_at=NOW - 100)
-    run_id = add_run(
-        conn,
-        "t_m",
-        status="running",
-        worker_pid=os.getpid(),
-        started_at=NOW - 2000,
-        last_heartbeat_at=NOW - 10,
-    )
-    conn.execute("UPDATE tasks SET status='running', current_run_id=?, worker_pid=? WHERE id='t_m'", (run_id, os.getpid()))
-    conn.commit()
-    conn.close()
-
-    first = plugin_api.collect_now(home, NOW)
-    second = plugin_api.collect_now(home, NOW)
-    # Возраст одинаковый (created_at совпадает) → решает id по возрастанию.
-    assert [deal["id"] for deal in first["deals"]] == ["t_m", "t_a", "t_z"]
-    assert [deal["waiting"]["state"] for deal in first["deals"]] == ["working", "wait_slot", "wait_slot"]
-    assert first["deals"] == second["deals"]
-
-
-def test_sources_untouched_by_now(home: Path) -> None:
-    """Срез «сейчас» не меняет источники: mtime и размер до/после совпадают."""
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_ro", status="running", created_at=NOW - 100)
-    run_id = add_run(conn, "t_ro", status="running", worker_pid=os.getpid(), started_at=NOW - 60, last_heartbeat_at=NOW - 5)
-    conn.execute("UPDATE tasks SET worker_pid=?, current_run_id=? WHERE id='t_ro'", (os.getpid(), run_id))
-    conn.commit()
-    conn.close()
-
-    sources = [board_db(home, "stack")]
-    before = [(path.stat().st_mtime_ns, path.stat().st_size) for path in sources]
-    time.sleep(0.01)
-    plugin_api.collect_now(home, NOW)
-    after = [(path.stat().st_mtime_ns, path.stat().st_size) for path in sources]
-
-    assert before == after
-    assert not list(home.rglob("*-wal")) and not list(home.rglob("*-journal"))
+    assert body["deals"] == []
+    sources = [error["source"] for error in body["errors"]]
+    assert plugin_api.DEALS_SOURCE in sources
+    assert body["repos"]["read"] is False
 
 
 def test_missing_pool_db_lands_in_errors_and_is_not_silent(
@@ -741,22 +591,18 @@ def test_missing_pool_db_lands_in_errors_and_is_not_silent(
     Иначе `wait_human` тихо не срабатывает: «вопросов нет» и «канал вопросов не
     читается» неотличимы ни в API, ни в UI.
     """
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_90b10001", status="blocked", block_kind="needs_input", created_at=NOW - 900)
-    conn.commit()
-    conn.close()
+    deal_id = make_deal(home, status="blocked", created_at=NOW - 900)
     (home / "messaging" / "pool.db").unlink()
 
     response = client.get("/now")
 
     assert response.status_code == 200
     body = response.json()
-    errors = {error["board"]: error["reason"] for error in body["errors"]}
+    errors = {error["source"]: error["reason"] for error in body["errors"]}
     assert "messaging/pool.db" in errors
     assert "pool.db not found" in errors["messaging/pool.db"]
-    # Доска и её дело не теряются: роут не валится, срез на месте.
-    assert [deal["id"] for deal in body["deals"]] == ["t_90b10001"]
-    assert {board["slug"]: board["read"] for board in body["boards"]} == {"stack": True}
+    # Дело не теряется: роут не валится, срез на месте.
+    assert [deal["id"] for deal in body["deals"]] == [deal_id]
     # Состояние остаётся wait_human, но evidence честно говорит, что факт не проверен.
     waiting = body["deals"][0]["waiting"]
     assert waiting["state"] == "wait_human"
@@ -765,10 +611,7 @@ def test_missing_pool_db_lands_in_errors_and_is_not_silent(
 
 def test_pool_db_that_is_not_a_database_is_reported(home: Path, client: TestClient) -> None:
     """Файл `messaging/pool.db` есть, но не БД → причина называет пул, а не «вопросов нет»."""
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_90b10002", status="todo", created_at=NOW - 700)
-    conn.commit()
-    conn.close()
+    deal_id = make_deal(home, status="todo", created_at=NOW - 700)
     (home / "messaging" / "pool.db").write_bytes(b"not a database at all")
 
     questions, err, truncated = plugin_api._pool_questions(home)
@@ -777,18 +620,15 @@ def test_pool_db_that_is_not_a_database_is_reported(home: Path, client: TestClie
     assert err is not None and "pool.db unreadable" in err
     assert truncated is False
     body = client.get("/now").json()
-    errors = {error["board"]: error["reason"] for error in body["errors"]}
+    errors = {error["source"]: error["reason"] for error in body["errors"]}
     assert "messaging/pool.db" in errors
     assert "not a database" in errors["messaging/pool.db"]
-    assert [deal["id"] for deal in body["deals"]] == ["t_90b10002"]
+    assert [deal["id"] for deal in body["deals"]] == [deal_id]
 
 
 def test_pool_absent_question_is_checked_on_clean_pool(home: Path) -> None:
     """Пустой, но читаемый пул — это именно «вопросов нет»: ошибки нет."""
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_90b10003", status="todo", created_at=NOW - 600)
-    conn.commit()
-    conn.close()
+    make_deal(home, status="todo", created_at=NOW - 600)
 
     questions, err, truncated = plugin_api._pool_questions(home)
     result = plugin_api.collect_now(home, NOW)
@@ -799,265 +639,36 @@ def test_pool_absent_question_is_checked_on_clean_pool(home: Path) -> None:
     assert "не проверен" not in result["deals"][0]["waiting"]["evidence"]
 
 
-def test_stale_running_run_with_dead_pid_is_dead_lease(home: Path) -> None:
-    """Старый ран остался `running` с мёртвым pid, новый уже стартовал → dead_lease.
-
-    Факты одного рана: статус берётся из той же попытки, что дала pid, иначе
-    `running` последнего рана склеивается со старым pid и правило не срабатывает.
-    """
-    pid = absent_pid()
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_5a1e0001", status="running", created_at=NOW - 900)
-    stale = add_run(
-        conn,
-        "t_5a1e0001",
-        status="running",
-        worker_pid=pid,
-        started_at=NOW - 800,
-        last_heartbeat_at=NOW - 700,
-        claim_expires=NOW + 600,
-    )
-    newer = add_run(
-        conn,
-        "t_5a1e0001",
-        status="released",
-        started_at=NOW - 400,
-        ended_at=NOW - 300,
-        outcome="reclaimed",
-    )
-    conn.execute(
-        "UPDATE tasks SET worker_pid=?, current_run_id=?, claim_expires=? WHERE id='t_5a1e0001'",
-        (pid, stale, NOW + 600),
-    )
-    conn.commit()
-    conn.close()
-
-    deal = deals_by_id(plugin_api.collect_now(home, NOW))["t_5a1e0001"]
-
-    # Последний ран — новый, но попытка и её факты — про старый незакрытый ран.
-    assert deal["last_run"]["run_id"] == newer
-    assert deal["attempt"]["run_id"] == stale
-    assert deal["attempt"]["pid_alive"] is False
-    assert deal["waiting"]["state"] == "dead_lease"
-    assert f"ран {stale} в статусе running" in deal["waiting"]["evidence"]
-
-
 def test_crash_outcomes_come_from_the_backend_constant(
     home: Path, client: TestClient
 ) -> None:
     """Набор «падений» — один источник: бэкенд отдаёт его клиенту в `crash_outcomes`."""
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_c0de0001", status="ready", created_at=NOW - 100)
-    add_run(
-        conn,
-        "t_c0de0001",
-        status="crashed",
-        started_at=NOW - 90,
-        ended_at=NOW - 60,
-        outcome="crashed",
-    )
-    conn.commit()
-    conn.close()
+    deal_id = make_deal(home, status="ready", created_at=NOW - 100)
+    attempt_started(home, deal_id, started_at=NOW - 90)
+    attempt_ended(home, deal_id, outcome="crashed", kind="infra", ended_at=NOW - 60)
 
     assert list(plugin_api.CRASH_OUTCOMES) == ["crashed", "gave_up", "spawn_failed", "timed_out"]
     now_body = client.get("/now").json()
     assert now_body["crash_outcomes"] == list(plugin_api.CRASH_OUTCOMES)
-    assert [deal["last_run"]["outcome"] for deal in now_body["deals"]] == ["crashed"]
-    attempts = client.get("/duty/stack/t_c0de0001/attempts").json()
+    attempts = client.get(f"/duty/{deal_id}/attempts").json()
     assert attempts["crash_outcomes"] == list(plugin_api.CRASH_OUTCOMES)
-
-
-def test_pid_state_unknown_is_not_reported_as_missing(
-    home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """`os.kill` ответил прочим `OSError` (`pid_alive=None`) → «состояние pid неизвестно».
-
-    Раньше evidence печатал «pid 50123 не записан», хотя pid в источнике есть:
-    сигнал сообщал об отсутствии данных, которых не было.
-    """
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_0dd00001", status="running", created_at=NOW - 700)
-    run_id = add_run(
-        conn,
-        "t_0dd00001",
-        status="running",
-        worker_pid=50123,
-        started_at=NOW - 600,
-        last_heartbeat_at=NOW - 20,
-    )
-    conn.execute(
-        "UPDATE tasks SET worker_pid=50123, current_run_id=? WHERE id='t_0dd00001'", (run_id,)
-    )
-    conn.commit()
-    conn.close()
-
-    monkeypatch.setattr(plugin_api, "_pid_alive", lambda pid: None)
-
-    deal = deals_by_id(plugin_api.collect_now(home, NOW))["t_0dd00001"]
-
-    assert deal["attempt"]["pid_alive"] is None
-    # Все факты попытки — из записи рана, а не из карточки.
-    assert deal["attempt"]["source"] == "run"
-    assert deal["waiting"]["state"] == "working"
-    assert "состояние pid 50123 неизвестно" in deal["waiting"]["evidence"]
-    assert "не записан" not in deal["waiting"]["evidence"]
-
-
-def test_working_without_recorded_pid_does_not_leak_none(home: Path) -> None:
-    """`working` при пустом `worker_pid`: «pid не записан», без «pid None неизвестно».
-
-    Раньше ветка `working` печатала `состояние pid None неизвестно`: и `None` в
-    тексте, и неверная формулировка — pid не «неизвестен», его не записали.
-    """
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_0c0a0003", status="running", created_at=NOW - 700)
-    run_id = add_run(
-        conn,
-        "t_0c0a0003",
-        status="running",
-        started_at=NOW - 600,
-        last_heartbeat_at=NOW - 20,
-        claim_expires=NOW + 600,
-    )
-    conn.execute(
-        "UPDATE tasks SET current_run_id=?, claim_expires=?, last_heartbeat_at=? "
-        "WHERE id='t_0c0a0003'",
-        (run_id, NOW + 600, NOW - 20),
-    )
-    conn.commit()
-    conn.close()
-
-    deal = deals_by_id(plugin_api.collect_now(home, NOW))["t_0c0a0003"]
-
-    assert deal["attempt"]["pid"] is None
-    assert deal["waiting"]["state"] == "working"
-    assert "pid не записан" in deal["waiting"]["evidence"]
-    assert "None" not in deal["waiting"]["evidence"]
+    assert attempts["attempts"][0]["outcome"] == "crashed"
 
 
 def test_running_without_any_live_signal_is_no_signal(home: Path, client: TestClient) -> None:
-    """`status=running` без рана/pid/heartbeat — не «работает», а «нет сигнала»."""
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_05a10001", status="running", created_at=NOW - 400)
-    conn.commit()
-    conn.close()
+    """`status=running` без попытки и лизинга — не «работает», а «нет сигнала»."""
+    deal_id = make_deal(home, status="running", created_at=NOW - 400)
 
     body = client.get("/now").json()
-    deal = deals_by_id(body)["t_05a10001"]
+    deal = deals_by_id(body)[deal_id]
 
     assert deal["attempt"] is None
+    assert deal["lease"]["state"] == "none"
     assert deal["waiting"]["state"] == "no_signal"
-    assert "без живого сигнала" in deal["waiting"]["evidence"]
+    assert "идёт ли попытка — неизвестно" in deal["waiting"]["evidence"]
     # Таксономия остаётся взаимоисключающей: дело попало ровно в одну корзину.
     assert body["by_state"]["no_signal"] == 1
     assert sum(body["by_state"].values()) == 1
-
-
-def test_foreign_schema_does_not_500_and_names_the_type(
-    home: Path, client: TestClient
-) -> None:
-    """Чужая схема доски (`claim_expires` текстом) → 200, причина в `errors` с типом."""
-    legacy = make_board(home, "legacy")
-    conn = sqlite3.connect(legacy)
-    add_task(conn, "t_1e9ac001", status="running", created_at=NOW - 300)
-    conn.execute("UPDATE tasks SET claim_expires='soon' WHERE id='t_1e9ac001'")
-    conn.commit()
-    conn.close()
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_0k000001", status="todo", created_at=NOW - 200)
-    conn.commit()
-    conn.close()
-
-    response = client.get("/now")
-
-    assert response.status_code == 200
-    body = response.json()
-    errors = {error["board"]: error["reason"] for error in body["errors"]}
-    assert "ValueError" in errors["legacy"]
-    assert {board["slug"]: board["read"] for board in body["boards"]}["legacy"] is False
-    # Здоровая доска в срезе осталась: один сбой источника не отменяет остальные.
-    assert [deal["id"] for deal in body["deals"]] == ["t_0k000001"]
-
-
-def test_empty_kanban_db_is_visible_as_unread_board(home: Path, client: TestClient) -> None:
-    """0-байтная `kanban.db` не исчезает: `read:false`, note `empty db` и причина в `errors`."""
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_3e0b0001", status="todo", created_at=NOW - 100)
-    conn.commit()
-    conn.close()
-    empty = home / "kanban" / "boards" / "empty-board" / "kanban.db"
-    empty.parent.mkdir(parents=True)
-    empty.write_bytes(b"")
-
-    body = client.get("/now").json()
-
-    boards = {board["slug"]: board for board in body["boards"]}
-    assert boards["empty-board"]["read"] is False
-    assert boards["empty-board"]["note"] == "empty db"
-    errors = {error["board"]: error["reason"] for error in body["errors"]}
-    assert "empty db" in errors["empty-board"]
-    assert [deal["id"] for deal in body["deals"]] == ["t_3e0b0001"]
-
-
-def test_archived_namespace_is_not_a_live_source(home: Path, client: TestClient) -> None:
-    """`boards/_archived/` — не доска: в срез не читается, в `errors[]` не шумит.
-
-    Раньше `_archived/kanban.db` попадал в обнаружение как ещё одна доска и висел
-    в `errors[]` на каждом ответе («empty db»), хотя это каталог выбывших досок.
-    """
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_3e0c0001", status="todo", created_at=NOW - 100)
-    conn.commit()
-    conn.close()
-    retired = make_board(home, "_archived/old-board")
-    conn = sqlite3.connect(retired)
-    add_task(conn, "t_3e0c0002", status="running", created_at=NOW - 100)
-    conn.commit()
-    conn.close()
-    empty_ns = home / "kanban" / "boards" / "_archived" / "kanban.db"
-    empty_ns.write_bytes(b"")
-
-    body = client.get("/now").json()
-
-    assert [deal["id"] for deal in body["deals"]] == ["t_3e0c0001"]
-    assert body["errors"] == []
-    assert {board["slug"] for board in body["boards"]} == {"stack"}
-    archived = {entry["slug"]: entry for entry in client.get("/sources").json()["archived"]}
-    assert archived["old-board"]["reason"] == "_archived: выбывшие доски, не живой источник"
-    assert archived["old-board"]["path"].endswith("_archived/old-board/kanban.db")
-    assert "_archived" in archived
-
-
-def test_archived_tombstone_board_is_skipped(home: Path, client: TestClient) -> None:
-    """Доска с камнем `board.json: archived` не читается в срез и видна в `/sources`."""
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_3e0d0001", status="todo", created_at=NOW - 100)
-    conn.commit()
-    conn.close()
-    legacy = make_board(home, "legacy")
-    conn = sqlite3.connect(legacy)
-    add_task(conn, "t_3e0d0002", status="blocked", created_at=NOW - 100)
-    conn.commit()
-    conn.close()
-    (legacy.parent / "board.json").write_text('{"slug": "legacy", "archived": true}')
-
-    body = client.get("/now").json()
-
-    assert [deal["id"] for deal in body["deals"]] == ["t_3e0d0001"]
-    assert body["errors"] == []
-    archived = {entry["slug"]: entry for entry in client.get("/sources").json()["archived"]}
-    assert archived["legacy"]["reason"] == "board.json: archived"
-
-
-def test_archived_board_is_not_routable(home: Path, client: TestClient) -> None:
-    """`/board/<выбывшая>/tasks` — 404: архив не источник, его нельзя читать как доску."""
-    make_board(home, "_archived/old-board")
-    legacy = make_board(home, "legacy")
-    (legacy.parent / "board.json").write_text('{"slug": "legacy", "archived": true}')
-
-    assert client.get("/board/_archived/tasks").status_code == 404
-    assert client.get("/board/old-board/tasks").status_code == 404
-    assert client.get("/board/legacy/tasks").status_code == 404
 
 
 def test_question_pool_limit_is_not_silent(
@@ -1065,22 +676,16 @@ def test_question_pool_limit_is_not_silent(
 ) -> None:
     """Пул обрезан лимитом → причина в `errors` и в evidence дел без вопроса."""
     monkeypatch.setattr(plugin_api, "QUESTION_LIMIT", 2)
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(conn, "t_9e570001", status="review", created_at=NOW - 500)
-    conn.commit()
-    conn.close()
-    pool = sqlite3.connect(make_pool(home))
-    add_question(pool, session_key="t_9e570001")
-    add_question(pool, session_key="agent:a")
-    add_question(pool, session_key="agent:b")
-    pool.commit()
-    pool.close()
+    deal_id = make_deal(home, status="review", created_at=NOW - 500)
+    add_question(home, session_key=f"t_{deal_id}")
+    add_question(home, session_key="agent:a")
+    add_question(home, session_key="agent:b")
 
     body = plugin_api.collect_now(home, NOW)
 
-    errors = {error["board"]: error["reason"] for error in body["errors"]}
+    errors = {error["source"]: error["reason"] for error in body["errors"]}
     assert "questions truncated" in errors["messaging/pool.db"]
-    deal = deals_by_id(body)["t_9e570001"]
+    deal = deals_by_id(body)[deal_id]
     # Вопрос этого дела не вошёл в срез — состояние не выдаёт проверку за факт.
     assert deal["waiting"]["state"] == "wait_human"
     assert "живых вопросов в пуле больше 2" in deal["waiting"]["evidence"]
@@ -1089,28 +694,73 @@ def test_question_pool_limit_is_not_silent(
     # Ровно лимит живых вопросов — это ещё не обрез: помечать нечего.
     monkeypatch.setattr(plugin_api, "QUESTION_LIMIT", 3)
     clean = plugin_api.collect_now(home, NOW)
-    assert "messaging/pool.db" not in {error["board"] for error in clean["errors"]}
+    assert "messaging/pool.db" not in {error["source"] for error in clean["errors"]}
 
 
-def test_attempt_reports_where_its_facts_came_from(home: Path) -> None:
-    """`attempt.source=task`, когда pid/heartbeat добраны из карточки, а не из рана."""
-    conn = sqlite3.connect(make_board(home, "stack"))
-    add_task(
-        conn,
-        "t_50d4c001",
-        status="running",
-        created_at=NOW - 700,
-        started_at=NOW - 600,
-        worker_pid=os.getpid(),
-        last_heartbeat_at=NOW - 30,
+def test_attempts_timeline_is_ordered_with_durations(home: Path, client: TestClient) -> None:
+    """Две попытки из журнала: таймлайн по возрастанию старта, длительности посчитаны."""
+    deal_id = make_deal(home, status="ready", created_at=NOW - 5000)
+    first = attempt_started(home, deal_id, stage="impl", started_at=NOW - 4000)
+    attempt_ended(
+        home, deal_id, stage="impl", outcome="crashed", kind="infra", reason="worker died",
+        ended_at=NOW - 3400,
     )
-    run_id = add_run(conn, "t_50d4c001", status="running", started_at=NOW - 600)
-    conn.execute("UPDATE tasks SET current_run_id=? WHERE id='t_50d4c001'", (run_id,))
+    second = attempt_started(home, deal_id, stage="impl", attempt=2, started_at=NOW - 3300)
+    attempt_ended(
+        home, deal_id, stage="impl", attempt=2, outcome="timed_out", kind="infra",
+        reason="max runtime", ended_at=NOW - 3200,
+    )
+    append(home, deal_id, "commented", {"author": "lead"}, ts=NOW - 3250)
+
+    body = client.get(f"/duty/{deal_id}/attempts").json()
+
+    assert body["deal_id"] == deal_id
+    assert body["count"] == 2
+    first_attempt, second_attempt = body["attempts"]
+    assert (first_attempt["run_id"], second_attempt["run_id"]) == (first, second)
+    assert first_attempt["duration_sec"] == 600
+    assert second_attempt["duration_sec"] == 100
+    assert first_attempt["outcome"] == "crashed"
+    assert first_attempt["reason"] == "worker died"
+    assert first_attempt["error"] == first_attempt["reason"]
+    assert first_attempt["stage"] == "impl"
+    assert first_attempt["profile"] == "implementer"
+
+
+def test_open_attempt_with_dead_lease_is_orphan(home: Path, client: TestClient) -> None:
+    """Незакрытая попытка с истёкшим лизингом — осиротевшая: её закроет уборка.
+
+    Срок лизинга живёт по настоящим часам (`/duty/.../attempts` не подставляет
+    `now`), поэтому фикстура берёт текущее время, а не фиксированное `NOW`.
+    """
+    moment = int(time.time())
+    deal_id = make_deal(home, status="running", created_at=NOW - 900)
+    attempt_started(home, deal_id, pid=absent_pid(), started_at=moment - 800)
+    hold_lease(home, deal_id, pid=absent_pid(), expires_at=moment - 100)
+
+    attempt = client.get(f"/duty/{deal_id}/attempts").json()["attempts"][0]
+
+    assert attempt["status"] == "orphan"
+    assert attempt["ended_at"] is None
+    assert "bin/duty reap" in attempt["reason"]
+
+
+def test_kanban_cards_are_not_deals(home: Path, client: TestClient) -> None:
+    """Карточка kanban — наблюдение, не дело: в срез она не попадает (0.0.6)."""
+    board = home / "kanban" / "boards" / "stack" / "kanban.db"
+    board.parent.mkdir(parents=True)
+    conn = sqlite3.connect(board)
+    conn.executescript(
+        "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, "
+        "created_at INTEGER NOT NULL);"
+        "INSERT INTO tasks (id, title, status, created_at) "
+        "VALUES ('t_0000aa', 'карточка', 'blocked', 1);"
+    )
     conn.commit()
     conn.close()
 
-    deal = deals_by_id(plugin_api.collect_now(home, NOW))["t_50d4c001"]
+    body = client.get("/now").json()
 
-    assert deal["attempt"]["run_id"] == run_id
-    assert deal["attempt"]["source"] == "task"
-    assert deal["attempt"]["pid"] == os.getpid()
+    assert body["deals"] == []
+    assert body["count"] == 0
+    assert client.get("/deal/t_0000aa").status_code == 400

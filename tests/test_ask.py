@@ -39,73 +39,11 @@ _SPEC.loader.exec_module(plugin_api)
 
 journal = plugin_api.journal
 ask = plugin_api.ask
+deals = plugin_api.deals
 
 NOW = 1_800_000_000
-DEAL = "t_0000aa"
-
-KANBAN_SCHEMA = """
-CREATE TABLE tasks (
-    id                   TEXT PRIMARY KEY,
-    title                TEXT NOT NULL,
-    body                 TEXT,
-    assignee             TEXT,
-    status               TEXT NOT NULL,
-    priority             INTEGER DEFAULT 0,
-    created_by           TEXT,
-    created_at           INTEGER NOT NULL,
-    started_at           INTEGER,
-    completed_at         INTEGER,
-    workspace_kind       TEXT NOT NULL DEFAULT 'scratch',
-    workspace_path       TEXT,
-    branch_name          TEXT,
-    project_id           TEXT,
-    claim_lock           TEXT,
-    claim_expires        INTEGER,
-    tenant               TEXT,
-    result               TEXT,
-    consecutive_failures INTEGER NOT NULL DEFAULT 0,
-    worker_pid           INTEGER,
-    last_failure_error   TEXT,
-    max_runtime_seconds  INTEGER,
-    last_heartbeat_at    INTEGER,
-    current_run_id       INTEGER,
-    block_kind           TEXT,
-    block_recurrences    INTEGER NOT NULL DEFAULT 0,
-    merged_into          TEXT
-);
-CREATE TABLE task_runs (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id             TEXT NOT NULL,
-    profile             TEXT,
-    step_key            TEXT,
-    status              TEXT NOT NULL,
-    claim_lock          TEXT,
-    claim_expires       INTEGER,
-    worker_pid          INTEGER,
-    worker_started_at   INTEGER,
-    max_runtime_seconds INTEGER,
-    last_heartbeat_at   INTEGER,
-    started_at          INTEGER NOT NULL,
-    ended_at            INTEGER,
-    outcome             TEXT,
-    summary             TEXT,
-    metadata            TEXT,
-    error               TEXT
-);
-CREATE TABLE task_events (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id    TEXT NOT NULL,
-    run_id     INTEGER,
-    kind       TEXT NOT NULL,
-    payload    TEXT,
-    created_at INTEGER NOT NULL
-);
-CREATE TABLE task_links (
-    parent_id  TEXT NOT NULL,
-    child_id   TEXT NOT NULL,
-    PRIMARY KEY (parent_id, child_id)
-);
-"""
+# Своё дело в store: адресация только `d_<hex>` (0.0.6), доски больше нет.
+DEAL = "d_0000aa11"
 
 # Схема пула скопирована с живого `messaging/pool.db` (колонки, которые читает
 # и пишет imessage-gateway); `answered_via` нужен `sync_answers`.
@@ -141,20 +79,25 @@ CREATE TABLE questions (
 # ------------------------------------------------------------------ фикстуры
 
 
-def make_board(home: Path, slug: str = "stack") -> Path:
-    """Доска в `kanban/boards/<slug>/kanban.db` с одним заблокированным делом."""
-    path = home / "kanban" / "boards" / slug / "kanban.db"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
-    conn.executescript(KANBAN_SCHEMA)
-    conn.execute(
-        "INSERT INTO tasks (id, title, body, assignee, status, created_at, block_kind) "
-        "VALUES (?, 'дело с вопросом', 'тело дела', 'implementer', 'blocked', ?, 'needs_input')",
-        (DEAL, NOW - 3600),
-    )
-    conn.commit()
-    conn.close()
-    return path
+def make_deal(home: Path, *, status: str = "blocked", repo: str = "stack") -> str:
+    """Своё дело в store — строкой, без события: тесты считают события журнала.
+
+    Схему доводит открытие store на запись (`deals.open_store`). Факта `created`
+    намеренно нет: `ask()` обязан быть **первым** событием дела, и тесты это
+    проверяют (`journal_events(home) == []` до вопроса).
+    """
+    conn = deals.open_store(home)
+    assert conn is not None
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO deals (id, repo, title, body, assignee, status, origin, created_at, updated_at) "
+                "VALUES (?, ?, 'дело с вопросом', 'тело дела', 'implementer', ?, 'duty', ?, ?)",
+                (DEAL, repo, status, NOW - 3600, NOW - 3600),
+            )
+    finally:
+        conn.close()
+    return DEAL
 
 
 def make_pool(home: Path) -> Path:
@@ -177,7 +120,7 @@ def pool_rows(home: Path) -> list[dict[str, Any]]:
 
 
 def add_foreign_question(
-    home: Path, *, status: str = "sent", origin: str = "card", session_key: str = "t_0000aa"
+    home: Path, *, status: str = "sent", origin: str = "card", session_key: str = f"t_{DEAL}"
 ) -> int:
     """Строка пула от чужого продюсера — так выглядит карточный вопрос сканера."""
     conn = sqlite3.connect(home / "messaging" / "pool.db")
@@ -242,11 +185,11 @@ def open_questions(home: Path) -> list[int]:
 
 @pytest.fixture()
 def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Корень Hermes: доска с заблокированным делом и пустой пул вопросов."""
+    """Корень Hermes: своё заблокированное дело в store и пустой пул вопросов."""
     root = tmp_path / "hermes"
     root.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(root))
-    make_board(root)
+    make_deal(root)
     make_pool(root)
     return root
 
@@ -299,7 +242,7 @@ def test_ask_writes_pool_row_and_journal_event(home: Path) -> None:
     assert len(rows) == 1
     row = rows[0]
     assert question_id == row["id"]
-    assert row["session_key"] == "t_0000aa"
+    assert row["session_key"] == f"t_{DEAL}"
     assert row["origin"] == ask.ASK_ORIGIN == "duty"
     assert row["kind"] == "decision"
     assert row["project"] == "stack"
@@ -314,12 +257,11 @@ def test_ask_writes_pool_row_and_journal_event(home: Path) -> None:
     assert [event["kind"] for event in events] == ["question_asked"]
     asked = events[0]
     assert asked["deal_id"] == DEAL
-    assert asked["board"] == "stack"
     assert asked["source"] == "ask"
     assert asked["idempotency_key"] == f"ask:{question_id}:question_asked"
     assert asked["payload"] == {
         "question_id": question_id,
-        "session_key": "t_0000aa",
+        "session_key": f"t_{DEAL}",
         "critical": 0,
         "timeout": ask.ASK_TIMEOUT_HOURS,
     }
@@ -371,8 +313,8 @@ def test_adopted_own_question_takes_ts_from_pool_created_at(home: Path) -> None:
     conn = sqlite3.connect(home / "messaging" / "pool.db")
     conn.execute(
         "INSERT INTO questions (session_key, text, origin, status, critical, timeout, created_at) "
-        "VALUES ('t_0000aa', 'наш вопрос', 'duty', 'sent', 0, 24.0, ?)",
-        (created,),
+        "VALUES (?, 'наш вопрос', 'duty', 'sent', 0, 24.0, ?)",
+        (f"t_{DEAL}", created),
     )
     conn.commit()
     conn.close()
@@ -403,7 +345,7 @@ def test_ask_marks_long_waiting_deal_critical(home: Path) -> None:
                     "kind": "blocked",
                     "payload": {"block_kind": "needs_input", "reason": "нужно решение"},
                     "source": "ingest",
-                    "idempotency_key": "ingest:stack:t_0000aa:blocked:1",
+                    "idempotency_key": f"engine:{DEAL}:blocked:1",
                 }
             ],
         )
@@ -520,15 +462,15 @@ def test_ask_route_reports_pool_failure_in_errors(client: TestClient, home: Path
     """Сбой пула на роуте: 503 и `errors[]`, где назван пул и дело."""
     (home / "messaging" / "pool.db").unlink()
 
-    response = client.post("/ask/stack/t_0000aa", json={"text": "Вопрос"})
+    response = client.post(f"/ask/{DEAL}", json={"text": "Вопрос"})
 
     assert response.status_code == 503
     body = response.json()
     assert body["question_id"] is None
     assert body["created"] is False
     assert body["adopted"] is False
-    assert body["errors"][0]["board"] == "messaging/pool.db"
-    assert "t_0000aa" in body["errors"][0]["reason"]
+    assert body["errors"][0]["source"] == ask.QUESTION_SOURCE
+    assert DEAL in body["errors"][0]["reason"]
     assert journal_events(home) == []
 
 
@@ -538,7 +480,7 @@ def test_ask_route_reports_pool_failure_in_errors(client: TestClient, home: Path
 def test_ask_route_creates_then_dedups(client: TestClient) -> None:
     """Роут: первый вызов создаёт вопрос, второй возвращает тот же (`deduped`)."""
     first = client.post(
-        "/ask/stack/t_0000aa",
+        f"/ask/{DEAL}",
         json={"text": "Даёшь ок?", "text_full": "### Вопрос\n\nРазвёрнутая версия", "options": ["ок", "нет"]},
     )
     assert first.status_code == 200
@@ -549,7 +491,7 @@ def test_ask_route_creates_then_dedups(client: TestClient) -> None:
     assert body["adopted"] is False
     question_id = body["question_id"]
 
-    second = client.post("/ask/stack/t_0000aa", json={"text": "повтор"})
+    second = client.post(f"/ask/{DEAL}", json={"text": "повтор"})
     assert second.status_code == 200
     assert second.json() == {
         "question_id": question_id,
@@ -564,7 +506,7 @@ def test_ask_route_marks_adopted_foreign_question(client: TestClient, home: Path
     """Роут называет подхват чужого вопроса: `adopted: true`, а не молчаливый dedup."""
     foreign_id = add_foreign_question(home)
 
-    body = client.post("/ask/stack/t_0000aa", json={"text": "наш вопрос"}).json()
+    body = client.post(f"/ask/{DEAL}", json={"text": "наш вопрос"}).json()
 
     assert body == {
         "question_id": foreign_id,
@@ -577,17 +519,18 @@ def test_ask_route_marks_adopted_foreign_question(client: TestClient, home: Path
 
 
 def test_ask_route_validates_deal_and_text(client: TestClient) -> None:
-    """Неизвестное дело — 404, пустой текст — 400, кривые options — 400."""
-    assert client.post("/ask/stack/t_dead", json={"text": "?"}).status_code == 404
-    assert client.post("/ask/nope/t_0000aa", json={"text": "?"}).status_code == 404
-    assert client.post("/ask/stack/t_0000aa", json={"text": "   "}).status_code == 400
-    bad_options = client.post("/ask/stack/t_0000aa", json={"text": "?", "options": [{"label": "ок"}]})
+    """Неизвестное дело — 404, карточка kanban — 400, пустой текст — 400, кривые options — 400."""
+    assert client.post("/ask/d_ffffff", json={"text": "?"}).status_code == 404
+    assert client.post("/ask/t_dead", json={"text": "?"}).status_code == 400
+    assert client.post("/ask/nope", json={"text": "?"}).status_code == 400
+    assert client.post(f"/ask/{DEAL}", json={"text": "   "}).status_code == 400
+    bad_options = client.post(f"/ask/{DEAL}", json={"text": "?", "options": [{"label": "ок"}]})
     assert bad_options.status_code == 400
 
 
 def test_ask_route_does_not_duplicate_and_marks_not_cacheable(client: TestClient) -> None:
     """Ответ роута не кэшируется: иначе «вопрос создан» переживёт сам вопрос."""
-    response = client.post("/ask/stack/t_0000aa", json={"text": "Вопрос"})
+    response = client.post(f"/ask/{DEAL}", json={"text": "Вопрос"})
 
     assert response.headers.get("cache-control") == "no-store, no-cache, must-revalidate"
 
@@ -619,7 +562,6 @@ def test_sync_answers_is_idempotent(home: Path) -> None:
         "answered_via": "manual",
     }
     assert answered[0]["deal_id"] == DEAL
-    assert answered[0]["board"] == "stack"
     assert answered[0]["ts"] == int(datetime.fromisoformat("2026-11-03T10:00:00+00:00").timestamp())
 
 
@@ -709,20 +651,33 @@ def test_sync_answers_reports_missing_pool(home: Path) -> None:
         conn.close()
 
     assert report["appended"] == 0
-    assert report["errors"][0]["board"] == "messaging/pool.db"
+    assert report["errors"][0]["source"] == ask.QUESTION_SOURCE
 
 
-def test_ingest_pass_syncs_answers(client: TestClient) -> None:
-    """`POST /ingest` дочитывает ответы пула: блок `answers` и идемпотентность."""
-    home = Path(os.environ["HERMES_HOME"])
+def sync_now(home: Path) -> dict[str, Any]:
+    """Обратный ход пула: `ask.sync_answers` под соединением журнала (так зовёт драйвер).
+
+    Роут `POST /ingest` убран вместе с досками (0.0.6): ответы дочитывает драйвер,
+    и тесты обязаны проверять тот же шов, а не удалённую ручку.
+    """
+    conn = journal.open_journal(home)
+    assert conn is not None
+    try:
+        return ask.sync_answers(conn, home)
+    finally:
+        conn.close()
+
+
+def test_ingest_pass_syncs_answers(home: Path) -> None:
+    """Проход `sync_answers` дочитывает ответ пула ровно один раз."""
     question_id = ask_once(home).question_id
     pool_close(home, question_id, "answered")
 
-    first = client.post("/ingest").json()
-    second = client.post("/ingest").json()
+    first = sync_now(home)
+    second = sync_now(home)
 
-    assert first["answers"] == {"appended": 1, "errors": []}
-    assert second["answers"] == {"appended": 0, "errors": []}
+    assert first == {"appended": 1, "errors": []}
+    assert second == {"appended": 0, "errors": []}
     assert question_id in {
         event["payload"]["question_id"]
         for event in journal_events(home)
@@ -743,7 +698,7 @@ def test_human_kind_status_until_a_question_exists(client: TestClient) -> None:
 
 def test_human_kind_question_after_ask(client: TestClient) -> None:
     """После `ask()` дело ждёт ответа на конкретный вопрос: `human_kind=question`."""
-    question_id = client.post("/ask/stack/t_0000aa", json={"text": "Даёшь ок?"}).json()["question_id"]
+    question_id = client.post(f"/ask/{DEAL}", json={"text": "Даёшь ок?"}).json()["question_id"]
 
     waiting = waiting_now(client)
 
@@ -766,7 +721,7 @@ def test_foreign_question_answer_does_not_leave_deal_waiting_for_answer(
     """
     foreign_id = add_foreign_question(home)
 
-    adopted = client.post("/ask/stack/t_0000aa", json={"text": "наш вопрос"}).json()
+    adopted = client.post(f"/ask/{DEAL}", json={"text": "наш вопрос"}).json()
     assert adopted["adopted"] is True and adopted["question_id"] == foreign_id
     # Живой вопрос пула ещё виден поверхности — честно, с пометкой «в журнале нет».
     live = waiting_now(client)
@@ -774,7 +729,7 @@ def test_foreign_question_answer_does_not_leave_deal_waiting_for_answer(
     assert live["human_kind"] == "question"
 
     pool_close(home, foreign_id, "answered", answer="да")
-    answers = client.post("/ingest").json()["answers"]
+    answers = sync_now(home)
     assert answers["appended"] == 0
 
     # Сначала то, что видит человек: дело больше не «ждёт ответа».
@@ -788,11 +743,11 @@ def test_expired_ttl_does_not_leave_deal_waiting_for_answer(
     client: TestClient, home: Path
 ) -> None:
     """Цикл B1, случай «истёк TTL»: свой вопрос → пул `expired` → `sync` → не «ждёт ответа»."""
-    question_id = client.post("/ask/stack/t_0000aa", json={"text": "Нужен ответ"}).json()["question_id"]
+    question_id = client.post(f"/ask/{DEAL}", json={"text": "Нужен ответ"}).json()["question_id"]
     assert waiting_now(client)["human_kind"] == "question"
 
     pool_close(home, question_id, "expired")
-    answers = client.post("/ingest").json()["answers"]
+    answers = sync_now(home)
     assert answers == {"appended": 1, "errors": []}
 
     assert open_questions(home) == []
@@ -803,11 +758,11 @@ def test_expired_ttl_does_not_leave_deal_waiting_for_answer(
 
 def test_answered_own_question_closes_one_fact(client: TestClient, home: Path) -> None:
     """Цикл B1, случай «ответ»: `answered` → ровно один факт, повтор — no-op."""
-    question_id = client.post("/ask/stack/t_0000aa", json={"text": "Нужен ответ"}).json()["question_id"]
+    question_id = client.post(f"/ask/{DEAL}", json={"text": "Нужен ответ"}).json()["question_id"]
     pool_close(home, question_id, "answered", answer="ок")
 
-    assert client.post("/ingest").json()["answers"] == {"appended": 1, "errors": []}
-    assert client.post("/ingest").json()["answers"] == {"appended": 0, "errors": []}
+    assert sync_now(home) == {"appended": 1, "errors": []}
+    assert sync_now(home) == {"appended": 0, "errors": []}
 
     answered = [event for event in journal_events(home) if event["kind"] == "question_answered"]
     assert [event["payload"]["question_id"] for event in answered] == [question_id]
@@ -903,10 +858,10 @@ def test_read_routes_do_not_touch_the_pool(client: TestClient, home: Path) -> No
     before = (db.stat().st_mtime_ns, db.stat().st_size)
 
     client.get("/now")
-    client.get("/deal/stack/t_0000aa")
+    client.get(f"/deal/{DEAL}")
     client.get("/health")
     client.get("/sources")
-    client.get("/now", params={"ingest": 1})
+    client.get(f"/duty/{DEAL}/attempts")
 
     after = (db.stat().st_mtime_ns, db.stat().st_size)
     assert after == before

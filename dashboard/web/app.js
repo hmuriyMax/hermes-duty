@@ -58,11 +58,19 @@ const stampEl = document.getElementById('stamp')
 const verEl = document.getElementById('ver')
 const humanEl = document.getElementById('human')
 
+// Элементы с этой осью — не HTML: `createElement('svg')` создаёт элемент в
+// HTML-namespace, и браузер его не рисует вовсе. Ошибка не видна в разметке, и
+// именно поэтому список назван явно, а не выводится из имени тега.
+const SVG_NS = 'http://www.w3.org/2000/svg'
+const SVG_TAGS = new Set(['svg', 'path', 'circle', 'rect', 'line', 'polyline', 'g', 'use'])
+
 function h(tag, props, ...children) {
-  const el = document.createElement(tag)
+  const el = SVG_TAGS.has(tag) ? document.createElementNS(SVG_NS, tag) : document.createElement(tag)
   for (const [key, value] of Object.entries(props || {})) {
     if (value === null || value === undefined || value === false) continue
-    if (key === 'class') el.className = value
+    // `className` у SVGElement только для чтения: присваивание молча падает
+    // исключением и роняет всю отрисовку, поэтому класс ставится атрибутом.
+    if (key === 'class') el.setAttribute('class', value)
     else if (key === 'text') el.textContent = value
     else if (key === 'html') el.innerHTML = value
     else if (key.startsWith('on')) el.addEventListener(key.slice(2).toLowerCase(), value)

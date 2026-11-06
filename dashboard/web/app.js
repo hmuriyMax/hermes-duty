@@ -41,6 +41,7 @@ import {
   shapeStages,
   stateLabel,
   stateMeta,
+  TOOL_LEGEND,
 } from './model.js'
 
 const TOKEN = window.__HERMES_SESSION_TOKEN__ || ''
@@ -62,7 +63,7 @@ const humanEl = document.getElementById('human')
 // HTML-namespace, и браузер его не рисует вовсе. Ошибка не видна в разметке, и
 // именно поэтому список назван явно, а не выводится из имени тега.
 const SVG_NS = 'http://www.w3.org/2000/svg'
-const SVG_TAGS = new Set(['svg', 'path', 'circle', 'rect', 'line', 'polyline', 'g', 'use', 'text'])
+const SVG_TAGS = new Set(['svg', 'path', 'circle', 'rect', 'line', 'polyline', 'g', 'use', 'text', 'title'])
 
 function h(tag, props, ...children) {
   const el = SVG_TAGS.has(tag) ? document.createElementNS(SVG_NS, tag) : document.createElement(tag)
@@ -1134,11 +1135,15 @@ function markerLegend(scale) {
 // Палитра — единственное, что остаётся своего у поверхности: тон вызова
 // приходит из шейпера ключом (`read`/`write`/`run`/`net`/`other`), а во что он
 // красится, знает только свой CSS.
+// Тон вызова приходит из шейпера ключом; здесь — только палитра поверхности.
+// Поиск отделён от чтения: в деле их сотни, и одним цветом карта вызовов
+// читалась как «всё одно и то же».
 const TONE_VAR = {
   read: 'var(--accent)',
+  search: 'var(--purple)',
   write: 'var(--ok)',
   run: 'var(--warn)',
-  net: 'var(--purple)',
+  net: 'var(--danger)',
   other: 'var(--text-3)',
 }
 function toneVar(tone) {
@@ -1146,45 +1151,49 @@ function toneVar(tone) {
 }
 
 /**
- * Строка попытки: свёрнутая полоса штрихов, карта вызовов по наведению.
+ * Строка попытки: фон-полоса на всю длительность, чипы вызовов и маркеры внутри.
  *
- * Геометрия, подпись и счётчики приходят готовым видом (`attemptView`): здесь
- * только элементы. Свой расчёт здесь означал бы второй рисунок того же дела.
+ * Границы попытки показывает фон, поэтому засечек старта/конца больше нет, а
+ * время начала, конца и длительность живут в подсказке строки — они не спорят с
+ * чипами за место на дорожке.
  */
 function attemptRowNode(view) {
   const label = h(
     'div',
-    { class: 'tl-lbl' },
+    { class: 'tl-lbl', 'data-tip': view.bandTip || view.title || '' },
     h('span', { class: 'tl-n' }, view.label.number),
     h('span', { class: `tl-st t-${view.label.tone}` }, view.label.status),
-    h('span', { class: 'tl-ms' }, view.label.time),
-    // Надбавка «не всё показано» — на экране, а не только в тултипе: иначе
-    // обрезанная попытка читается как полная.
+    // Надбавка «не всё показано» — в подписи, а не поверх дорожки: она не
+    // должна перекрывать чипы.
     view.badge ? h('span', { class: 'tl-more', title: view.note || view.title }, view.badge) : null,
   )
-  const mini = h('div', { class: 'tl-mini' })
-  const stack = h('div', { class: 'tl-stack' })
-  for (const tick of view.ticks) {
-    mini.append(
+  const track = h('div', { class: 'tl-track' })
+  if (view.band) {
+    track.append(
       h('span', {
-        class: `tl-tick${tick.unfinished ? ' tl-unfinished' : ''}`,
-        // У оборванного вызова цвет — это цвет контура: заливки у него нет.
-        style: tick.unfinished
-          ? `left:${tick.leftPct}%;width:${tick.widthPct}%;color:${toneVar(tick.tone)}`
-          : `left:${tick.leftPct}%;width:${tick.widthPct}%;background:${toneVar(tick.tone)}`,
+        class: 'tl-band',
+        style: `left:${view.band.leftPct}%;width:${view.band.widthPct}%`,
+        'data-tip': view.bandTip,
+      }),
+    )
+  }
+  // Пауза «вопрос → ответ» — подсветка времени, которое дело стояло на человеке.
+  for (const wait of view.waits) {
+    track.append(
+      h('span', {
+        class: 'tl-wait',
+        style: `left:${wait.fromPct}%;width:${wait.widthPct}%`,
+        'data-tip': wait.title,
       }),
     )
   }
   for (const chip of view.chips) {
-    stack.append(
+    track.append(
       h('span', {
         class: `tl-call${chip.unfinished ? ' tl-unfinished' : ''}`,
         style: chip.unfinished
           ? `left:${chip.leftPct}%;top:${chip.top}px;width:${chip.widthPct}%;color:${toneVar(chip.tone)}`
           : `left:${chip.leftPct}%;top:${chip.top}px;width:${chip.widthPct}%;background:${toneVar(chip.tone)}`,
-        // Подсказка — своим слоем (`data-tip`), а не системным `title`:
-        // у нативного тултипа задержка в секунду, и на 10-пиксельном чипе его
-        // никто не дождётся. `title` не ставим, чтобы не было двух подсказок.
         'data-tip': chip.tip,
         role: 'button',
         tabindex: '-1',
@@ -1193,11 +1202,29 @@ function attemptRowNode(view) {
       }),
     )
   }
+  if (view.marks.length) {
+    const marks = h('div', { class: 'tl-marks' })
+    for (const mark of view.marks) {
+      marks.append(
+        h(
+          'span',
+          {
+            class: `tl-mark t-${mark.tone}`,
+            style: `left:${mark.pct}%`,
+            'data-tip': mark.title,
+            'aria-label': mark.ariaLabel,
+          },
+          h('i'),
+        ),
+      )
+    }
+    track.append(marks)
+  }
   return h(
     'div',
-    { class: 'tl-row', title: view.title, tabindex: '0', style: `--tl-full:${view.full}px` },
+    { class: 'tl-row', style: `height:${view.full}px` },
     label,
-    h('div', { class: 'tl-track' }, mini, stack),
+    track,
   )
 }
 
@@ -1285,54 +1312,14 @@ function inspectorNode(call) {
   )
 }
 
-/** Ряды маркеров: вердикты, вопросы человеку, публикация, засечки попыток. */
-function marksRows(scale) {
-  if (!scale.marks.length) return null
-  return h(
-    'div',
-    { class: 'scale-marks' },
-    ...scale.marks.map((row) =>
-      h(
-        'div',
-        { class: 'smk-row' },
-        h('span', { class: 'smk-name' }, row.label),
-        h(
-          'div',
-          { class: 'smk-line' },
-          ...row.items.map((marker) => {
-            const wait =
-              marker.waitPct > 0
-                ? h('span', {
-                    class: `smk-wait t-${marker.tone}`,
-                    style: `left:${marker.pct}%;width:${marker.waitPct}%`,
-                    title: `${marker.clock} → сейчас: ${marker.waitText}`,
-                  })
-                : null
-            const mark = h(
-              'span',
-              {
-                class: `smk t-${marker.tone}${marker.tick ? ' tick' : ''}`,
-                style: `left:${marker.pct}%`,
-                'data-tip': marker.title,
-                'aria-label': marker.ariaLabel,
-              },
-              h('i'),
-            )
-            return wait ? h('span', null, wait, mark) : mark
-          }),
-        ),
-      ),
-    ),
-  )
-}
-
 /**
- * Граф спеки: узлы-этапы и рёбра `needs`.
+ * Граф спеки компактной полосой: мелкие узлы и рёбра `needs`.
  *
- * Координаты приходят из шейпера (`scale.spec`), поэтому веб и десктоп рисуют
- * одну картинку. Здесь только `svg` из элементов правильного namespace.
+ * Это схема зависимостей, а не главный объект экрана: крупные прямоугольники
+ * занимали пол-экрана и ничего не сообщали. Координаты считает шейпер
+ * (`scale.spec`), поверхности только рисуют.
  */
-function specPanel(spec) {
+function specStrip(spec) {
   if (!spec) return null
   const pos = new Map(spec.nodes.map((node) => [node.id, node]))
   const edges = spec.edges
@@ -1344,39 +1331,31 @@ function specPanel(spec) {
       const y1 = from.y + spec.nodeH / 2
       const x2 = to.x
       const y2 = to.y + spec.nodeH / 2
-      const mid = Math.round((x1 + x2) / 2)
-      return h('path', {
-        class: 'spec-edge',
-        d: `M${x1},${y1} C${mid},${y1} ${mid},${y2} ${x2},${y2}`,
-      })
+      return h('path', { class: 'spec-edge', d: `M${x1},${y1} L${x2},${y2}` })
     })
     .filter(Boolean)
   return h(
     'div',
-    { class: 'panel', style: 'margin-bottom:14px' },
-    h('div', { class: 'panel-h' }, `граф спеки · этапов ${spec.nodes.length}, связей ${spec.edges.length}`),
+    { class: 'spec-strip' },
+    h('span', { class: 'spec-strip-name' }, 'граф спеки'),
     h(
-      'div',
-      { class: 'panel-b' },
-      h(
-        'svg',
-        {
-          class: 'spec-graph',
-          viewBox: `0 0 ${spec.width} ${spec.height}`,
-          width: spec.width,
-          height: spec.height,
-          role: 'img',
-          'aria-label': 'граф этапов',
-        },
-        ...edges,
-        ...spec.nodes.map((node) =>
-          h(
-            'g',
-            { class: `spec-node t-${node.tone}` },
-            h('rect', { x: node.x, y: node.y, width: spec.nodeW, height: spec.nodeH, rx: 6 }),
-            h('text', { x: node.x + 8, y: node.y + spec.nodeH / 2 + 4, class: 'spec-id' }, node.id),
-            h('text', { x: node.x + spec.nodeW - 8, y: node.y + spec.nodeH / 2 + 4, class: 'spec-st', 'text-anchor': 'end' }, node.label),
-          ),
+      'svg',
+      {
+        class: 'spec-graph',
+        viewBox: `0 0 ${spec.width} ${spec.height}`,
+        width: spec.width,
+        height: spec.height,
+        role: 'img',
+        'aria-label': `граф этапов: ${spec.nodes.map((node) => node.id).join(' → ')}`,
+      },
+      ...edges,
+      ...spec.nodes.map((node) =>
+        h(
+          'g',
+          { class: `spec-node t-${node.tone}` },
+          h('title', null, `${node.id} · ${node.label}${node.needsText ? ` · ${node.needsText}` : ''}`),
+          h('rect', { x: node.x, y: node.y, width: spec.nodeW, height: spec.nodeH, rx: 4 }),
+          h('text', { x: node.x + spec.nodeW / 2, y: node.y + spec.nodeH / 2 + 3, class: 'spec-id', 'text-anchor': 'middle' }, node.id),
         ),
       ),
     ),
@@ -1408,15 +1387,37 @@ function scalePanel(scale) {
     h(
       'div',
       { class: 'panel-b' },
+      // Ось стоит ровно над дорожками: слева колонка с легендой семейств
+      // инструментов, справа — та же область, где рисуются чипы.
       h(
         'div',
-        { class: 'scale-axis' },
-        // Линейка: подпись у каждой метки, у краёв — словами «нач./кон.».
-        ...scale.axis.ticks.map((tick) =>
-          h(
-            'span',
-            { class: `scale-tick align-${tick.align}`, style: `left:${tick.pct}%`, title: tick.clock },
-            tick.edge ? `${tick.edge} ${tick.clock}` : tick.clock,
+        { class: 'scale-head' },
+        // Легенда семейств — колонкой слева, там же, где подписи попыток: числа
+        // вызовов из шейпера (`scale.tools`), а не пять слов из константы.
+        h(
+          'div',
+          { class: 'scale-keys' },
+          h('span', { class: 'scale-keys-h' }, 'инструменты'),
+          ...scale.tools.map((item) =>
+            h(
+              'span',
+              { class: 'scale-key' },
+              h('span', { class: `scale-key-dot t-${item.tone}` }),
+              h('span', { class: 'scale-key-l' }, item.label),
+              h('span', { class: 'scale-key-n' }, String(item.count)),
+            ),
+          ),
+        ),
+        h(
+          'div',
+          { class: 'scale-axis' },
+          // Линейка: подпись у каждой метки, у краёв — словами «нач./кон.».
+          ...scale.axis.ticks.map((tick) =>
+            h(
+              'span',
+              { class: `scale-tick align-${tick.align}`, style: `left:${tick.pct}%`, title: tick.clock },
+              tick.edge ? `${tick.edge} ${tick.clock}` : tick.clock,
+            ),
           ),
         ),
       ),
@@ -1447,8 +1448,9 @@ function scalePanel(scale) {
         ),
         ),
       ),
-      marksRows(scale),
+      specStrip(scale.spec),
       h('div', { class: 'tl-insp-host' }, inspectorNode(selectedCall(scale))),
+      // Легенда маркеров: что означают точки внутри строк попыток.
       markerLegend(scale),
       scale.facts.attempts.journal ? h('div', { class: 'muted' }, 'полосы собраны из журнала: ответ попыток пуст') : null,
     ),
@@ -1571,7 +1573,6 @@ function viewDeal(dealId) {
     head,
     kpiStrip(scale),
     scalePanel(scale),
-    specPanel(scale.spec),
     stageFeedPanel(data),
     h('div', { class: 'two-col' }, left, right),
   )

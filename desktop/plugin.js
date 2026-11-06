@@ -994,18 +994,6 @@ const MARKER_META = {
 }
 
 /**
- * Ряды под шкалой: маркеры разложены по смыслу, а не сыпятся в одну полосу
- * вперемешку с засечками попыток. У каждого ряда своя подпись слева — так
- * «вердикты» и «вопросы человеку» читаются как строки, а не как шум.
- */
-const MARK_ROWS = [
-  { key: 'verdicts', label: 'вердикты', types: ['verdict', 'budget'] },
-  { key: 'questions', label: 'вопросы', types: ['question', 'answer'] },
-  { key: 'lifecycle', label: 'публикация', types: ['published', 'closed'] },
-  { key: 'attempts', label: 'попытки', types: ['started', 'ended'] },
-]
-
-/**
  * Вид маркера по событию журнала; пусто — маркера нет.
  *
  * Гейт и отказ по бюджету узнаются по причине из `attempt_ended`
@@ -1161,17 +1149,39 @@ function layoutCalls(calls, options) {
 // Геометрия строки: свёрнутая полоса, шаг уровня, отступ сверху, потолок уровней
 // и запас под раскрытую карту. Числа живут здесь, а не в двух файлах.
 /** Геометрия узла графа спеки: одна на обе поверхности. */
-const SPEC_NODE = { w: 108, h: 26, gapX: 26, gapY: 10 }
+const SPEC_NODE = { w: 76, h: 18, gapX: 14, gapY: 6 }
 
-const TL = { collapsed: 20, levelH: 12, top: 6, maxLevels: 5, pad: 8 }
+// Геометрия строки попытки: полоса фона, уровни чипов и строка маркеров.
+const TL = { collapsed: 20, levelH: 12, top: 6, maxLevels: 5, pad: 8, marksH: 12 }
+
+// Узлы графа спеки — мелкие: это схема зависимостей, а не главный объект экрана.
+
 
 // Тон вызова — семантический ключ («чтение», «правка», «запуск», «внешнее»), а не
 // CSS-цвет: палитры у поверхностей разные, а вид работы — общий факт.
 const TOOL_TONE = [
-  [/^(read_file|search_files|grep|ls|list|view|cat|find)/i, 'read'],
-  [/^(write_file|patch|apply_patch|edit|create|mkdir)/i, 'write'],
-  [/^(terminal|shell|bash|run|exec|python|node|go|npm)/i, 'run'],
-  [/^(web_|browser|http|fetch|curl)/i, 'net'],
+  // Поиск отделён от чтения: в деле их сотни, и одним цветом карта вызовов
+  // читалась как «всё одно и то же».
+  [/^(search_files|grep|glob|find|ripgrep)/i, 'search'],
+  [/^(read_file|view|cat|ls|list|head|tail|stat)/i, 'read'],
+  [/^(write_file|patch|apply_patch|edit|create|mkdir|mv|cp|rm)/i, 'write'],
+  [/^(terminal|shell|bash|zsh|sh|run|exec|python|node|go|npm|git|make|cargo)/i, 'run'],
+  [/^(web_|browser|http|fetch|curl|wget)/i, 'net'],
+]
+
+/**
+ * Легенда семейств инструментов: одна на обе поверхности.
+ *
+ * Цвет на экране имеет смысл только вместе с подписью — иначе «жёлтый» надо
+ * угадывать. Легенда живёт слева от дорожек, в той же колонке, что и подписи
+ * попыток.
+ */
+const TOOL_LEGEND = [
+  { tone: 'read', label: 'файлы' },
+  { tone: 'search', label: 'поиск' },
+  { tone: 'write', label: 'правка' },
+  { tone: 'run', label: 'команды' },
+  { tone: 'net', label: 'сеть' },
 ]
 
 /** Тон инструмента по имени; неизвестный — `other` («не знаю, что это» — факт). */
@@ -1237,13 +1247,55 @@ function attemptView(bar, scale) {
     }
   })
   const status = b.outcomeText || (b.open ? b.leaseText : b.outcome || b.status || b.durationText)
+
+  // Фон попытки: длительность видна полосой, а не только по чипам вызовов.
+  // Кромка не бывает уже 0.6% — иначе короткая попытка исчезла бы с экрана.
+  const bandLeft = b.start === null ? null : b.leftPct
+  const bandWidth =
+    b.start === null || b.endPct === null
+      ? null
+      : Math.max(0.6, Math.round((b.endPct - b.leftPct) * 10) / 10)
+  const bandTip =
+    b.start === null
+      ? ''
+      : `${b.clockStart || '—'}–${b.clockEnd || (b.open ? 'идёт' : '—')} · ${b.durationText || '—'}` +
+        `${calls.length ? ` · ${fmtCount(calls.length)} ${plural(calls.length, 'вызов', 'вызова', 'вызовов')}` : ''}`
+
+  // Маркеры внутри попытки: вердикты, вопросы человеку, публикация, закрытие.
+  // Засечки старта/конца больше не рисуются — их роль играет фон попытки.
+  const inside = (scale && Array.isArray(scale.markers) ? scale.markers : []).filter(
+    (marker) =>
+      marker.type !== 'started' &&
+      marker.type !== 'ended' &&
+      b.start !== null &&
+      b.end !== null &&
+      marker.at >= b.start &&
+      marker.at <= b.end,
+  )
+  const marks = inside.map((marker) => ({
+    type: marker.type,
+    tone: marker.tone,
+    pct: marker.pct,
+    title: marker.title,
+    ariaLabel: marker.ariaLabel,
+  }))
+  // Пауза рисуется в строке попытки, где вопрос задан: ответ мог прийти уже в
+  // следующей попытке, но «стояло на человеке» — здесь.
+  const waits = (scale && Array.isArray(scale.waitSpans) ? scale.waitSpans : [])
+    .filter((span) => b.start !== null && b.end !== null && span.fromAt >= b.start && span.fromAt <= b.end)
+    .map((span) => ({
+      fromPct: span.fromPct,
+      widthPct: span.widthPct,
+      title: span.title,
+    }))
   return {
-    full: Math.max(TL.collapsed, layout.height + TL.pad),
+    full: Math.max(TL.collapsed, layout.height + TL.pad + (marks.length ? TL.marksH : 0)),
     collapsed: TL.collapsed,
+    band: bandLeft === null || bandWidth === null ? null : { leftPct: bandLeft, widthPct: bandWidth },
+    bandTip,
     label: {
       number: b.number || '—',
       status: status || '—',
-      time: b.clockStart || '—',
       tone: b.tone || 'grey',
     },
     ticks: chips.map((chip) => ({
@@ -1253,6 +1305,8 @@ function attemptView(bar, scale) {
       unfinished: chip.unfinished,
     })),
     chips,
+    marks,
+    waits,
     // Надбавка на экране: `+N` — обрезано данными, `⋯M` — наложено рисунком.
     badge: [omitted ? `+${fmtCount(omitted)}` : '', clipped ? `⋯${fmtCount(clipped)}` : '']
       .filter(Boolean)
@@ -1667,6 +1721,36 @@ function shapeDealTime(detail, attemptsPayload) {
     else if (type === 'answer' && pending.length) pending.shift().answered = true
     markers.push(marker)
   }
+  // Паузы «вопрос → ответ»: считается на всю ось, потому что ответ часто
+  // приходит уже в следующей попытке. Полоса рисуется в строке той попытки, где
+  // вопрос был задан, — там, где дело и встало.
+  const waitSpans = []
+  {
+    let asked = null
+    for (const marker of markers) {
+      if (marker.type === 'question') asked = marker
+      else if (marker.type === 'answer' && asked) {
+        waitSpans.push({
+          fromAt: asked.at,
+          toAt: marker.at,
+          fromPct: asked.pct,
+          widthPct: Math.max(0.4, Math.round((marker.pct - asked.pct) * 10) / 10),
+          title: `${asked.clock} → ${marker.clock}: ждал человека`,
+        })
+        asked = null
+      }
+    }
+    if (asked && now !== null) {
+      waitSpans.push({
+        fromAt: asked.at,
+        toAt: now,
+        fromPct: asked.pct,
+        widthPct: Math.max(0.4, Math.round((pctOf(now) - asked.pct) * 10) / 10),
+        title: `${asked.clock} → сейчас: ждёт ответа`,
+      })
+    }
+  }
+
   for (const marker of pending) {
     marker.waitText = 'ждёт ответа'
     if (now !== null && marker.at > 0) {
@@ -1752,6 +1836,19 @@ function shapeDealTime(detail, attemptsPayload) {
   const callsHidden = bars.reduce((sum, bar) => sum + (bar.callsOmitted || 0), 0)
   const tokensKnown = bars.some((bar) => bar.tokens !== null && bar.tokens !== undefined)
   const tokensTotal = bars.reduce((sum, bar) => sum + (numOrNull(bar.tokens) || 0), 0)
+  // Легенда семейств инструментов с числами: цвет без подписи — ребус, без
+  // числа — «что-то было». Порядок как в `TOOL_LEGEND`, чтобы легенда не
+  // прыгала от дела к делу.
+  const toolCounts = new Map()
+  for (const bar of bars) {
+    for (const call of bar.calls) {
+      const tone = toolTone(call.name)
+      toolCounts.set(tone, (toolCounts.get(tone) || 0) + 1)
+    }
+  }
+  const tools = TOOL_LEGEND.map((item) => ({ tone: item.tone, label: item.label, count: toolCounts.get(item.tone) || 0 }))
+    .filter((item) => item.count > 0)
+
   const kpi = [
     { key: 'duration', label: 'длительность', value: durationSec === null ? '—' : fmtDuration(durationSec) },
     { key: 'stages', label: 'этапов', value: fmtCount(lanes.filter((lane) => lane.count > 0).length) },
@@ -1766,13 +1863,6 @@ function shapeDealTime(detail, attemptsPayload) {
       ? { key: 'tokens', label: 'токенов', value: fmtCount(tokensTotal) }
       : { key: 'tokens', label: 'токенов', value: '—', note: 'телеметрия не писала' },
   ]
-
-  // Ряды маркеров: вердикты, вопросы человеку, публикация, засечки попыток.
-  const marks = MARK_ROWS.map((row) => ({
-    key: row.key,
-    label: row.label,
-    items: markers.filter((marker) => row.types.indexOf(marker.type) >= 0),
-  })).filter((row) => row.items.length > 0)
 
   return {
     now,
@@ -1789,7 +1879,8 @@ function shapeDealTime(detail, attemptsPayload) {
     lanes,
     bars,
     markers,
-    marks,
+    waitSpans,
+    tools,
     kpi,
     // Граф спеки — из `stages[]` ответа `/deal`; нет этапов — нет и графа.
     spec: specView(d.stages),
@@ -1828,84 +1919,95 @@ function shapeDealTime(detail, attemptsPayload) {
 /* ------------------------------- таймлайн вызовов внутри попытки (0.0.8) */
 
 // Палитра — единственное своё у поверхности: тон приходит из шейпера ключом.
+// Тон приходит из шейпера ключом; палитра — единственное своё у поверхности.
 const DUTY_TONE_VAR = {
   read: 'var(--ui-blue)',
+  search: 'var(--ui-purple)',
   write: 'var(--ui-green)',
   run: 'var(--ui-yellow)',
-  net: 'var(--ui-purple)',
+  net: 'var(--ui-red)',
   other: 'var(--ui-text-tertiary)',
 }
 function dutyToneVar(tone) {
   return DUTY_TONE_VAR[tone] || DUTY_TONE_VAR.other
 }
 
-/** Строка попытки: вид приходит готовым (`attemptView`), здесь только DOM. */
+/**
+ * Строка попытки: фон-полоса на всю длительность, чипы вызовов и маркеры внутри.
+ *
+ * Границы попытки показывает фон, поэтому засечек старта/конца нет, а время
+ * начала, конца и длительность живут в подсказке строки — они не спорят с чипами
+ * за место на дорожке. Вид приходит готовым (`attemptView`), здесь только DOM.
+ */
 function DutyAttemptRow({ view, callSel, onSelectCall }) {
+  const label = h(
+    'div',
+    { className: 'duty-tl-lbl', 'data-tip': view.bandTip || view.title || '' },
+    h('span', { className: 'duty-tl-n' }, view.label.number),
+    h('span', { className: `duty-tl-st t-${view.label.tone}` }, view.label.status),
+    view.badge ? h('span', { className: 'duty-tl-more', title: view.note || view.title }, view.badge) : null,
+  )
+  const track = []
+  if (view.band) {
+    track.push(
+      h('span', {
+        key: 'band',
+        className: 'duty-tl-band',
+        style: { left: `${view.band.leftPct}%`, width: `${view.band.widthPct}%` },
+        'data-tip': view.bandTip,
+      }),
+    )
+  }
+  for (const [i, wait] of view.waits.entries()) {
+    track.push(
+      h('span', {
+        key: `wait-${i}`,
+        className: 'duty-tl-wait',
+        style: { left: `${wait.fromPct}%`, width: `${wait.widthPct}%` },
+        'data-tip': wait.title,
+      }),
+    )
+  }
+  for (const [i, chip] of view.chips.entries()) {
+    track.push(
+      h('span', {
+        key: `call-${i}`,
+        className: `duty-tl-call${chip.unfinished ? ' duty-tl-unfinished' : ''}${callSel === chip.id ? ' duty-tl-sel' : ''}`,
+        'data-tip': chip.tip || chip.title,
+        'aria-label': chip.tip || chip.title,
+        onClick: onSelectCall ? (event) => { event.stopPropagation(); onSelectCall(chip.id) } : undefined,
+        style: chip.unfinished
+          ? { left: `${chip.leftPct}%`, width: `${chip.widthPct}%`, top: `${chip.top}px`, color: dutyToneVar(chip.tone) }
+          : { left: `${chip.leftPct}%`, width: `${chip.widthPct}%`, top: `${chip.top}px`, background: dutyToneVar(chip.tone) },
+      }),
+    )
+  }
+  if (view.marks.length) {
+    track.push(
+      h(
+        'div',
+        { key: 'marks', className: 'duty-tl-marks' },
+        ...view.marks.map((mark, i) =>
+          h(
+            'span',
+            {
+              key: `mark-${i}`,
+              className: `duty-tl-mark t-${mark.tone}`,
+              style: { left: `${mark.pct}%` },
+              'data-tip': mark.title,
+              'aria-label': mark.ariaLabel,
+            },
+            h('i', null),
+          ),
+        ),
+      ),
+    )
+  }
   return h(
     'div',
-    {
-      className: 'duty-tl-row',
-      title: view.title,
-      tabIndex: 0,
-      // Высота раскрытия — в переменной: сам переход делает CSS по :hover, JS
-      // здесь не нужен, и веб с десктопом ведут себя одинаково.
-      style: { '--duty-tl-full': `${view.full}px` },
-    },
-    h(
-      'div',
-      { className: 'duty-tl-lbl' },
-      h('span', { className: 'duty-tl-n' }, view.label.number),
-      h('span', { className: `duty-tl-st t-${view.label.tone}` }, view.label.status),
-      h('span', { className: 'duty-tl-ms' }, view.label.time),
-      // Надбавка «не всё показано» — на экране, а не только в тултипе.
-      view.badge ? h('span', { className: 'duty-tl-more', title: view.note || view.title }, view.badge) : null,
-    ),
-    h(
-      'div',
-      { className: 'duty-tl-track' },
-      h(
-        'div',
-        { className: 'duty-tl-mini' },
-        ...view.ticks.map((tick, index) =>
-          h('span', {
-            key: `tick-${index}`,
-            className: `duty-tl-tick${tick.unfinished ? ' duty-tl-unfinished' : ''}`,
-            // У оборванного вызова цвет — цвет контура: заливки у него нет.
-            style: tick.unfinished
-              ? { left: `${tick.leftPct}%`, width: `${tick.widthPct}%`, color: dutyToneVar(tick.tone) }
-              : { left: `${tick.leftPct}%`, width: `${tick.widthPct}%`, background: dutyToneVar(tick.tone) },
-          }),
-        ),
-      ),
-      h(
-        'div',
-        { className: 'duty-tl-stack' },
-        ...view.chips.map((chip, index) =>
-          h('span', {
-            key: `call-${index}`,
-            // Выбранный вызов помечается классом: подсветка — единственное, что
-            // экран прибавляет к чипу; подсказка идёт своим слоем (`data-tip`).
-            className: `duty-tl-call${chip.unfinished ? ' duty-tl-unfinished' : ''}${callSel === chip.id ? ' duty-tl-sel' : ''}`,
-            'data-tip': chip.tip || chip.title,
-            'aria-label': chip.tip || chip.title,
-            onClick: onSelectCall ? (event) => { event.stopPropagation(); onSelectCall(chip.id) } : undefined,
-            style: chip.unfinished
-              ? {
-                  left: `${chip.leftPct}%`,
-                  width: `${chip.widthPct}%`,
-                  top: `${chip.top}px`,
-                  color: dutyToneVar(chip.tone),
-                }
-              : {
-                  left: `${chip.leftPct}%`,
-                  width: `${chip.widthPct}%`,
-                  top: `${chip.top}px`,
-                  background: dutyToneVar(chip.tone),
-                },
-          }),
-        ),
-      ),
-    ),
+    { className: 'duty-tl-row', style: { height: `${view.full}px` } },
+    label,
+    h('div', { className: 'duty-tl-track' }, ...track),
   )
 }
 
@@ -2075,13 +2177,10 @@ const CSS = `
 .duty-tl-kind-agent .duty-tl-kind-ico{stroke:var(--ui-blue)}
 .duty-tl-kind-gate{color:var(--ui-yellow);border-color:var(--ui-yellow);background:color-mix(in srgb, var(--ui-yellow) 12%, transparent)}
 .duty-tl-rows{display:flex;flex-direction:column;gap:4px}
-.duty-tl-row{position:relative;display:grid;grid-template-columns:186px 1fr;gap:8px;height:20px;align-items:center;border-radius:6px;transition:height .26s cubic-bezier(.22,.8,.24,1)}
-/* Разворот — только под указателем или по клавиатурному фокусу самой строки:
-   :focus-within держал строку развёрнутой после клика по чипу. */
-.duty-tl-row:hover,.duty-tl-row:focus-visible{height:var(--duty-tl-full, 20px)}
+.duty-tl-row{position:relative;display:grid;grid-template-columns:var(--duty-tl-gutter, 186px) 1fr;gap:var(--duty-tl-gap, 8px);align-items:stretch;border-radius:6px}
 .duty-tl-row:focus-visible{outline:2px solid var(--ui-accent);outline-offset:1px}
 /* Колонки подписи фиксированы: иначе статус разной ширины двигал время в каждой строке. */
-.duty-tl-lbl{display:grid;grid-template-columns:26px 76px 62px auto;align-items:center;gap:6px;height:20px;line-height:20px;white-space:nowrap;font-variant-numeric:tabular-nums}
+.duty-tl-lbl{display:grid;grid-template-columns:26px 1fr auto;align-self:center;align-items:center;gap:6px;line-height:20px;white-space:nowrap;font-variant-numeric:tabular-nums}
 .duty-tl-lbl>*{overflow:hidden;text-overflow:ellipsis}
 .duty-tl-n{font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:10px;color:var(--ui-text-tertiary);text-align:right}
 .duty-tl-st{font-size:10.5px;font-weight:700;color:var(--ui-text-secondary)}
@@ -2095,18 +2194,25 @@ const CSS = `
 /* Вызов без результата: полый чип — длительности нет, а не ноль. */
 .duty-tl-call.duty-tl-unfinished,.duty-tl-tick.duty-tl-unfinished{background:transparent !important;box-shadow:inset 0 0 0 1.5px currentColor !important;opacity:.9}
 .duty-tl-track{position:relative;height:100%}
-.duty-tl-mini{position:absolute;left:0;right:0;top:6px;height:7px;transition:opacity .16s ease, transform .2s ease}
-.duty-tl-stack{position:absolute;left:0;right:0;top:0;opacity:0;pointer-events:none;transform:translateY(-3px) scaleY(.86);transform-origin:top;transition:opacity .18s ease .04s, transform .24s cubic-bezier(.22,.8,.24,1)}
-.duty-tl-row:hover .duty-tl-mini,.duty-tl-row:focus-visible .duty-tl-mini{opacity:0;transform:translateY(3px)}
-.duty-tl-row:hover .duty-tl-stack,.duty-tl-row:focus-visible .duty-tl-stack{opacity:1;pointer-events:auto;transform:none}
-.duty-tl-tick{position:absolute;top:0;height:7px;border-radius:1.5px;opacity:.9}
-.duty-tl-call{position:absolute;height:10px;border-radius:2px;box-shadow:inset 0 0 0 1px rgba(0,0,0,.22);opacity:0;transform:translateY(-3px);transition:opacity .16s ease, transform .18s ease}
-.duty-tl-row:hover .duty-tl-call,.duty-tl-row:focus-visible .duty-tl-call{opacity:1;transform:none}
-.duty-tl-empty{font-size:11.5px;color:var(--ui-text-tertiary)}
-.duty-tl-call{cursor:pointer}
-/* Подсказка своим слоем: нативный title на 10-пиксельном чипе ждать секунду. */
-.duty-tl-call::after{content:attr(data-tip);position:absolute;left:50%;bottom:calc(100% + 7px);transform:translateX(-50%);padding:3px 7px;border-radius:5px;white-space:nowrap;background:var(--ui-surface-raised, var(--ui-surface-background));color:var(--ui-text-primary);border:1px solid var(--ui-stroke-tertiary);box-shadow:0 8px 20px rgba(0,0,0,.38);font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:10.5px;line-height:1.5;opacity:0;pointer-events:none;transition:opacity .09s ease;z-index:30}
-.duty-tl-call:hover::after{opacity:1}
+.duty-tl-track{position:relative;min-height:20px}
+/* Фон попытки: длительность видна полосой, а не только по чипам вызовов. */
+.duty-tl-band{position:absolute;top:1px;bottom:1px;border-radius:4px;background:color-mix(in srgb, var(--ui-text-tertiary) 13%, transparent);border:1px solid color-mix(in srgb, var(--ui-text-tertiary) 22%, transparent)}
+/* Пауза «вопрос → ответ»: время, которое дело стояло на человеке. */
+.duty-tl-wait{position:absolute;top:1px;bottom:1px;border-radius:3px;background:color-mix(in srgb, var(--ui-yellow) 26%, transparent);border-left:1.5px solid var(--ui-yellow);border-right:1.5px solid var(--ui-yellow)}
+/* Маркеры событий — внутри строки той попытки, где событие произошло. */
+.duty-tl-marks{position:absolute;left:0;right:0;bottom:-1px;height:11px}
+.duty-tl-mark{position:absolute;bottom:0;transform:translateX(-50%);line-height:0}
+.duty-tl-mark i{display:block;width:6px;height:6px;border-radius:50%;background:currentColor}
+.duty-tl-mark.t-green{color:var(--ui-green)}
+.duty-tl-mark.t-red{color:var(--ui-red)}
+.duty-tl-mark.t-yellow{color:var(--ui-yellow)}
+.duty-tl-mark.t-blue{color:var(--ui-blue)}
+.duty-tl-mark.t-gray{color:var(--ui-text-tertiary)}
+.duty-tl-call{position:absolute;height:10px;border-radius:2px;cursor:pointer;box-shadow:inset 0 0 0 1px rgba(0,0,0,.22)}
+.duty-tl-row:hover .duty-tl-call{box-shadow:inset 0 0 0 1px rgba(0,0,0,.45)}
+/* Подсказка — общий слой для чипа, полосы попытки, подписи и маркера. */
+.duty-tl-call::after,.duty-tl-band::after,.duty-tl-lbl::after,.duty-tl-mark::after,.duty-tl-wait::after{content:attr(data-tip);position:absolute;left:50%;bottom:calc(100% + 7px);transform:translateX(-50%);padding:3px 7px;border-radius:5px;white-space:nowrap;background:var(--ui-surface-raised, var(--ui-surface-background));color:var(--ui-text-primary);border:1px solid var(--ui-stroke-tertiary);box-shadow:0 8px 20px rgba(0,0,0,.38);font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:10.5px;line-height:1.5;opacity:0;pointer-events:none;transition:opacity .09s ease;z-index:30}
+.duty-tl-call:hover::after,.duty-tl-band:hover::after,.duty-tl-lbl:hover::after,.duty-tl-mark:hover::after,.duty-tl-wait:hover::after{opacity:1}
 .duty-tl-call.duty-tl-sel{box-shadow:inset 0 0 0 1.5px var(--ui-accent),0 0 0 2px color-mix(in srgb, var(--ui-accent) 35%, transparent)}
 .duty-tl-insp{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-height:26px;margin-top:10px;padding:4px 9px;border-radius:6px;border:1px solid var(--ui-stroke-tertiary);background:var(--ui-surface-raised, var(--ui-surface-background));font-size:11.5px}
 .duty-tl-insp.empty{color:var(--ui-text-tertiary);border-style:dashed;background:transparent}
@@ -2116,20 +2222,27 @@ const CSS = `
 .duty-kpi-v{font-size:15px;font-weight:700;font-variant-numeric:tabular-nums}
 .duty-kpi-l{font-size:10.5px;color:var(--ui-text-tertiary)}
 .duty-kpi-n{font-size:10px;color:var(--ui-text-tertiary);opacity:.8}
-/* Маркеры — строками по смыслу: вердикты, вопросы человеку, публикация, засечки. */
-.duty-scale-marks{margin-top:10px;border-top:1px solid var(--ui-stroke-tertiary);padding-top:6px}
-.duty-smk-row{display:grid;grid-template-columns:186px 1fr;gap:8px;align-items:center;height:18px}
-.duty-smk-name{font-size:10.5px;color:var(--ui-text-tertiary);text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.duty-smk-line{position:relative;height:18px}
-.duty-smk{position:absolute;top:50%;transform:translate(-50%,-50%);line-height:0}
-.duty-smk i{display:block;width:7px;height:7px;border-radius:50%;background:currentColor}
-.duty-smk.tick i{width:1px;height:11px;border-radius:0;opacity:.55}
-.duty-smk-wait{position:absolute;left:0;top:50%;height:3px;transform:translateY(-50%);border-radius:2px;opacity:.35;background:currentColor}
-.duty-spec-graph{display:block;width:100%;height:auto;overflow:visible;fill:none;stroke:none}
-.duty-spec-edge{fill:none;stroke:var(--ui-stroke-tertiary);stroke-width:1.2;stroke-dasharray:4 3}
-.duty-spec-node rect{fill:var(--ui-surface-raised, var(--ui-surface-background));stroke:var(--ui-stroke-tertiary);stroke-width:1.2}
-.duty-spec-node .duty-spec-id{fill:var(--ui-text-primary);font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:11px}
-.duty-spec-node .duty-spec-st{fill:var(--ui-text-tertiary);font-size:9.5px}
+/* Ось и сетка начинаются там же, где дорожки: колонка подписей — одна ширина. */
+.duty-scale-head{display:grid;grid-template-columns:var(--duty-tl-gutter, 186px) 1fr;gap:var(--duty-tl-gap, 8px);align-items:end;margin-bottom:6px;--duty-tl-gutter:186px;--duty-tl-gap:8px}
+.duty-scale-keys{display:flex;flex-direction:column;gap:1px;font-size:10px;color:var(--ui-text-tertiary);line-height:1.45}
+.duty-scale-keys-h{font-size:9.5px;text-transform:uppercase;letter-spacing:.06em;opacity:.7}
+.duty-scale-key{display:grid;grid-template-columns:7px 1fr auto;align-items:center;gap:5px;white-space:nowrap}
+.duty-scale-key-l{overflow:hidden;text-overflow:ellipsis}
+.duty-scale-key-n{font-family:var(--ui-font-mono, ui-monospace, monospace);font-variant-numeric:tabular-nums;opacity:.8}
+.duty-scale-key{display:inline-flex;align-items:center;gap:4px;white-space:nowrap}
+.duty-scale-key-dot{width:7px;height:7px;border-radius:2px;background:var(--ui-text-tertiary)}
+.duty-scale-key-dot.duty-t-read{background:var(--ui-blue)}
+.duty-scale-key-dot.duty-t-search{background:var(--ui-purple)}
+.duty-scale-key-dot.duty-t-write{background:var(--ui-green)}
+.duty-scale-key-dot.duty-t-run{background:var(--ui-yellow)}
+.duty-scale-key-dot.duty-t-net{background:var(--ui-red)}
+/* Граф — полосой: мелкие узлы, а не главный объект экрана. */
+.duty-spec-strip{display:grid;grid-template-columns:var(--duty-tl-gutter, 186px) auto;gap:var(--duty-tl-gap, 8px);align-items:center;margin-top:10px}
+.duty-spec-strip-name{font-size:10.5px;color:var(--ui-text-tertiary);text-align:right;white-space:nowrap}
+.duty-spec-graph{display:block;width:auto;height:auto;max-width:100%;overflow:visible;fill:none;stroke:none}
+.duty-spec-edge{fill:none;stroke:var(--ui-stroke-tertiary);stroke-width:1}
+.duty-spec-node rect{fill:var(--ui-surface-raised, var(--ui-surface-background));stroke:var(--ui-stroke-tertiary);stroke-width:1}
+.duty-spec-node .duty-spec-id{fill:var(--ui-text-secondary);font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:9px}
 .duty-spec-node.t-green rect{stroke:var(--ui-green)}
 .duty-spec-node.t-red rect{stroke:var(--ui-red)}
 .duty-spec-node.t-yellow rect{stroke:var(--ui-yellow)}
@@ -2668,50 +2781,6 @@ function DealFactSpans({ scale }) {
   )
 }
 
-/**
- * Ряд маркеров: подпись слева, отметки на линии.
- *
- * Маркеры разложены по смыслу (вердикты, вопросы человеку, публикация, засечки
- * попыток) — раньше они сыпались в одну полосу вперемешку с засечками, и
- * «кривовато» было не оформлением, а отсутствием рядов.
- */
-function MarksRows({ scale }) {
-  if (!scale.marks || !scale.marks.length) return null
-  return h(
-    'div',
-    { className: 'duty-scale-marks' },
-    ...scale.marks.map((row) =>
-      h(
-        'div',
-        { className: 'duty-smk-row', key: `smk-${row.key}` },
-        h('span', { className: 'duty-smk-name' }, row.label),
-        h(
-          'div',
-          { className: 'duty-smk-line' },
-          ...row.items.map((marker) =>
-            h(
-              'span',
-              {
-                key: `smk-${row.key}-${marker.at}-${marker.type}`,
-                className: `duty-smk${marker.tick ? ' tick' : ''}`,
-                style: { left: `${marker.pct}%`, color: TONE_COLOR[marker.tone] || TONE_COLOR.gray },
-              },
-              marker.waitPct > 0
-                ? h('span', {
-                    className: 'duty-smk-wait',
-                    style: { width: `${marker.waitPct}%` },
-                    title: `${marker.clock} → сейчас: ${marker.waitText}`,
-                  })
-                : null,
-              h('i', { title: marker.title, 'aria-label': marker.ariaLabel, role: 'img', tabIndex: 0 }),
-            ),
-          ),
-        ),
-      ),
-    ),
-  )
-}
-
 /** Инспектор вызова: инструмент, начало, длительность, место в деле. */
 function CallInspector({ call }) {
   if (!call) {
@@ -2747,12 +2816,12 @@ function KpiStrip({ scale }) {
 }
 
 /**
- * Граф спеки: узлы-этапы и рёбра `needs`.
+ * Граф спеки компактной полосой: мелкие узлы и рёбра `needs`.
  *
- * Координаты посчитаны в шейпере (`scale.spec`), поэтому картинка не может
- * разъехаться с вебом: здесь только элементы `svg`.
+ * Схема зависимостей — не главный объект экрана: крупные прямоугольники
+ * занимали пол-экрана и ничего не сообщали. Координаты считает шейпер.
  */
-function SpecGraph({ spec }) {
+function SpecStrip({ spec }) {
   if (!spec) return null
   const pos = new Map(spec.nodes.map((node) => [node.id, node]))
   const edges = spec.edges
@@ -2760,29 +2829,40 @@ function SpecGraph({ spec }) {
       const from = pos.get(edge.from)
       const to = pos.get(edge.to)
       if (!from || !to) return null
-      const x1 = from.x + spec.nodeW
-      const y1 = from.y + spec.nodeH / 2
-      const x2 = to.x
-      const y2 = to.y + spec.nodeH / 2
-      const mid = Math.round((x1 + x2) / 2)
-      return h('path', { key: `e-${edge.from}-${edge.to}`, className: 'duty-spec-edge', d: `M${x1},${y1} C${mid},${y1} ${mid},${y2} ${x2},${y2}` })
+      return h('path', {
+        key: `e-${edge.from}-${edge.to}`,
+        className: 'duty-spec-edge',
+        d: `M${from.x + spec.nodeW},${from.y + spec.nodeH / 2} L${to.x},${to.y + spec.nodeH / 2}`,
+      })
     })
     .filter(Boolean)
   return h(
     'div',
-    { className: 'duty-deal-spec-graph' },
-    h('div', { className: 'duty-group-h' }, h('span', null, 'граф спеки'), h('span', { className: 'duty-mono' }, `этапов ${spec.nodes.length} · связей ${spec.edges.length}`)),
+    { className: 'duty-spec-strip' },
+    h('span', { className: 'duty-spec-strip-name' }, 'граф спеки'),
     h(
       'svg',
-      { className: 'duty-spec-graph', viewBox: `0 0 ${spec.width} ${spec.height}`, width: spec.width, height: spec.height, role: 'img', 'aria-label': 'граф этапов' },
+      {
+        className: 'duty-spec-graph',
+        viewBox: `0 0 ${spec.width} ${spec.height}`,
+        width: spec.width,
+        height: spec.height,
+        role: 'img',
+        'aria-label': `граф этапов: ${spec.nodes.map((node) => node.id).join(' → ')}`,
+      },
       ...edges,
       ...spec.nodes.map((node) =>
         h(
           'g',
           { key: `n-${node.id}`, className: `duty-spec-node t-${node.tone}` },
-          h('rect', { x: node.x, y: node.y, width: spec.nodeW, height: spec.nodeH, rx: 6 }),
-          h('text', { x: node.x + 8, y: node.y + spec.nodeH / 2 + 4, className: 'duty-spec-id' }, node.id),
-          h('text', { x: node.x + spec.nodeW - 8, y: node.y + spec.nodeH / 2 + 4, className: 'duty-spec-st', textAnchor: 'end' }, node.label),
+          h('title', null, `${node.id} · ${node.label}${node.needsText ? ` · ${node.needsText}` : ''}`),
+          h('rect', { x: node.x, y: node.y, width: spec.nodeW, height: spec.nodeH, rx: 4 }),
+          h('text', {
+            x: node.x + spec.nodeW / 2,
+            y: node.y + spec.nodeH / 2 + 3,
+            className: 'duty-spec-id',
+            textAnchor: 'middle',
+          }, node.id),
         ),
       ),
     ),
@@ -2825,14 +2905,36 @@ function ScalePanel({ scale, callSel, onSelectCall }) {
     'div',
     { className: 'duty-deal-scale' },
     head,
+    // Ось ровно над дорожками: слева колонка с легендой семейств инструментов,
+    // справа — та же область, где рисуются чипы.
     h(
       'div',
-      { className: 'duty-scale-axis' },
-      ...scale.axis.ticks.map((tick) =>
-        h(
-          'span',
-          { className: `duty-scale-tick align-${tick.align}`, style: { left: `${tick.pct}%` }, title: tick.clock },
-          tick.edge ? `${tick.edge} ${tick.clock}` : tick.clock,
+      { className: 'duty-scale-head' },
+      h(
+        'div',
+        { className: 'duty-scale-keys' },
+        // Легенда семейств — колонкой слева, там же, где подписи попыток; числа
+        // вызовов приходят из шейпера (`scale.tools`), а не из константы.
+        h('span', { className: 'duty-scale-keys-h' }, 'инструменты'),
+        ...scale.tools.map((item) =>
+          h(
+            'span',
+            { className: 'duty-scale-key', key: `key-${item.tone}` },
+            h('span', { className: `duty-scale-key-dot duty-t-${item.tone}` }),
+            h('span', { className: 'duty-scale-key-l' }, item.label),
+            h('span', { className: 'duty-scale-key-n' }, String(item.count)),
+          ),
+        ),
+      ),
+      h(
+        'div',
+        { className: 'duty-scale-axis' },
+        ...scale.axis.ticks.map((tick) =>
+          h(
+            'span',
+            { className: `duty-scale-tick align-${tick.align}`, style: { left: `${tick.pct}%` }, title: tick.clock },
+            tick.edge ? `${tick.edge} ${tick.clock}` : tick.clock,
+          ),
         ),
       ),
     ),
@@ -2866,7 +2968,7 @@ function ScalePanel({ scale, callSel, onSelectCall }) {
         ),
       ),
     ),
-    h(MarksRows, { scale }),
+    h(SpecStrip, { spec: scale.spec }),
     h(CallInspector, { call: callOf(scale, callSel) }),
     kinds.length
       ? h(
@@ -3325,7 +3427,6 @@ function DealScreen({ sel, onBack }) {
       // лента — пояснение к нему.
       h(KpiStrip, { scale }),
       h(ScalePanel, { scale, callSel, onSelectCall: selectCall }),
-      h(SpecGraph, { spec: scale.spec }),
       h(
         'div',
         { className: 'duty-deal-spec' },

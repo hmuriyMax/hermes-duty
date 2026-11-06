@@ -59,7 +59,7 @@ function moduleForRender(root) {
   )
   const source = read('desktop/plugin.js')
     .replace(/from '@hermes\/plugin-sdk'/, "from './sdk.mjs'")
-    .concat('\nexport { DutyLane, DutyAttemptRow, ScalePanel, MarksRows, KpiStrip, SpecGraph, CallInspector }\n')
+    .concat('\nexport { DutyLane, DutyAttemptRow, ScalePanel, KpiStrip, SpecStrip, CallInspector }\n')
   const file = join(dir, 'plugin.mjs')
   writeFileSync(file, source)
   return file
@@ -130,7 +130,17 @@ test('десктоп: DutyLane рисует svg-значок, который л�
       ],
       stages: [{ id: 'impl', needs: [] }],
     },
-    { attempts: sampleBars.map((bar) => ({ ...bar, stage: 'impl', attempt: bar.number, started_at: 1_000, ended_at: 2_000 })) },
+    {
+      attempts: sampleBars.map((bar, index) => ({
+        ...bar,
+        stage: 'impl',
+        attempt: bar.number,
+        // Ручка попыток зовёт границы `start`/`end`: именно их читает шейпер.
+        start: 1_000 + index * 100,
+        end: 1_600 + index * 100,
+        duration_sec: 500,
+      })),
+    },
   )
   const panel = renderToStaticMarkup(React.createElement(mod.ScalePanel, { scale: scaleModel }))
   const gridLines = (panel.match(/duty-scale-grid-line/g) || []).length
@@ -140,11 +150,29 @@ test('десктоп: DutyLane рисует svg-значок, который л�
   // Между краями — подписи без слов: чистое время.
   assert.match(panel, /duty-scale-tick align-center[^>]*>\s*\d\d:\d\d:\d\d/, 'нет меток-времени между краями')
 
+  // Легенда семейств — в левой колонке, ровно из шейпера (`scale.tools`), с числом.
+  const keysHtml = renderToStaticMarkup(React.createElement(mod.ScalePanel, { scale: scaleModel }))
+  assert.match(keysHtml, /duty-scale-keys/, 'нет колонки легенды')
+  const keyBlocks = (keysHtml.match(/duty-scale-key"/g) || []).length
+  assert.equal(keyBlocks, scaleModel.tools.length, `блоков легенды ${keyBlocks}, семейств ${scaleModel.tools.length}`)
+  for (const item of scaleModel.tools) {
+    assert.ok(
+      new RegExp(`${item.label}<\\/span><span class="duty-scale-key-n">${item.count}<`).test(keysHtml),
+      `у семейства ${item.label} нет числа ${item.count} рядом с подписью`,
+    )
+  }
+
   // Ряды маркеров: вердикты/вопросы/публикация/засечки — отдельными строками.
-  const marksHtml = renderToStaticMarkup(React.createElement(mod.MarksRows, { scale: scaleModel }))
-  const markRows = (marksHtml.match(/duty-smk-row/g) || []).length
-  assert.ok(markRows >= 1, `рядов маркеров: ${markRows}`)
-  assert.match(marksHtml, /duty-smk-name[^>]*>\s*(вердикты|вопросы|публикация|попытки)/, 'у ряда нет подписи слева')
+  // Маркеры живут внутри строки попытки, фон показывает её длительность,
+  // пауза вопроса подсвечена — отдельных рядов под шкалой больше нет.
+  const banded = scaleModel.bars.find((bar) => bar.start !== null && bar.end !== null)
+  assert.ok(banded, 'в фикстуре нет закрытой попытки — проверка фона потеряла предмет')
+  const view = modelMod.attemptView(banded, scaleModel)
+  const rowHtml = renderToStaticMarkup(React.createElement(mod.DutyAttemptRow, { view }))
+  assert.match(rowHtml, /duty-tl-band/, 'нет фона-полосы длительности попытки')
+  assert.match(rowHtml, /duty-tl-lbl[^>]*data-tip/, 'у подписи строки нет подсказки с временем начала/конца')
+  assert.doesNotMatch(rowHtml, /duty-tl-tick/, 'в строке остались засечки старта/конца попытки')
+  assert.doesNotMatch(rowHtml, /duty-smk-row/, 'вернулись отдельные ряды под шкалой')
 
   // KPI-строка: пять чисел шапки из шейпера.
   const kpiHtml = renderToStaticMarkup(React.createElement(mod.KpiStrip, { scale: scaleModel }))
@@ -152,10 +180,12 @@ test('десктоп: DutyLane рисует svg-значок, который л�
   for (const item of scaleModel.kpi) assert.ok(kpiHtml.includes(item.value), `в KPI нет значения ${item.value}`)
 
   // Граф спеки: узлы на месте, рёбра — из `needs`.
-  const specHtml = renderToStaticMarkup(React.createElement(mod.SpecGraph, { spec: scaleModel.spec }))
+  // Граф — компактной полосой: мелкие узлы (76×18), а не прямоугольники на пол-экрана.
+  const specHtml = renderToStaticMarkup(React.createElement(mod.SpecStrip, { spec: scaleModel.spec }))
   if (scaleModel.spec) {
     assert.equal((specHtml.match(/duty-spec-node/g) || []).length, scaleModel.spec.nodes.length, 'узлов графа не столько, сколько этапов')
-    assert.match(specHtml, /duty-spec-graph/, 'нет svg графа')
+    assert.match(specHtml, /duty-spec-strip/, 'граф не в компактной полосе')
+    assert.ok(scaleModel.spec.nodeW <= 90 && scaleModel.spec.nodeH <= 24, `узел графа крупный: ${scaleModel.spec.nodeW}×${scaleModel.spec.nodeH}`)
   }
 
   // Инспектор: пустой зовёт выбрать вызов, с вызовом называет инструмент и время.

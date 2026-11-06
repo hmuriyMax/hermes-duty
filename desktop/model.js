@@ -945,18 +945,6 @@ const MARKER_META = {
 }
 
 /**
- * Ряды под шкалой: маркеры разложены по смыслу, а не сыпятся в одну полосу
- * вперемешку с засечками попыток. У каждого ряда своя подпись слева — так
- * «вердикты» и «вопросы человеку» читаются как строки, а не как шум.
- */
-const MARK_ROWS = [
-  { key: 'verdicts', label: 'вердикты', types: ['verdict', 'budget'] },
-  { key: 'questions', label: 'вопросы', types: ['question', 'answer'] },
-  { key: 'lifecycle', label: 'публикация', types: ['published', 'closed'] },
-  { key: 'attempts', label: 'попытки', types: ['started', 'ended'] },
-]
-
-/**
  * Вид маркера по событию журнала; пусто — маркера нет.
  *
  * Гейт и отказ по бюджету узнаются по причине из `attempt_ended`
@@ -1112,17 +1100,39 @@ function layoutCalls(calls, options) {
 // Геометрия строки: свёрнутая полоса, шаг уровня, отступ сверху, потолок уровней
 // и запас под раскрытую карту. Числа живут здесь, а не в двух файлах.
 /** Геометрия узла графа спеки: одна на обе поверхности. */
-const SPEC_NODE = { w: 108, h: 26, gapX: 26, gapY: 10 }
+const SPEC_NODE = { w: 76, h: 18, gapX: 14, gapY: 6 }
 
-const TL = { collapsed: 20, levelH: 12, top: 6, maxLevels: 5, pad: 8 }
+// Геометрия строки попытки: полоса фона, уровни чипов и строка маркеров.
+const TL = { collapsed: 20, levelH: 12, top: 6, maxLevels: 5, pad: 8, marksH: 12 }
+
+// Узлы графа спеки — мелкие: это схема зависимостей, а не главный объект экрана.
+
 
 // Тон вызова — семантический ключ («чтение», «правка», «запуск», «внешнее»), а не
 // CSS-цвет: палитры у поверхностей разные, а вид работы — общий факт.
 const TOOL_TONE = [
-  [/^(read_file|search_files|grep|ls|list|view|cat|find)/i, 'read'],
-  [/^(write_file|patch|apply_patch|edit|create|mkdir)/i, 'write'],
-  [/^(terminal|shell|bash|run|exec|python|node|go|npm)/i, 'run'],
-  [/^(web_|browser|http|fetch|curl)/i, 'net'],
+  // Поиск отделён от чтения: в деле их сотни, и одним цветом карта вызовов
+  // читалась как «всё одно и то же».
+  [/^(search_files|grep|glob|find|ripgrep)/i, 'search'],
+  [/^(read_file|view|cat|ls|list|head|tail|stat)/i, 'read'],
+  [/^(write_file|patch|apply_patch|edit|create|mkdir|mv|cp|rm)/i, 'write'],
+  [/^(terminal|shell|bash|zsh|sh|run|exec|python|node|go|npm|git|make|cargo)/i, 'run'],
+  [/^(web_|browser|http|fetch|curl|wget)/i, 'net'],
+]
+
+/**
+ * Легенда семейств инструментов: одна на обе поверхности.
+ *
+ * Цвет на экране имеет смысл только вместе с подписью — иначе «жёлтый» надо
+ * угадывать. Легенда живёт слева от дорожек, в той же колонке, что и подписи
+ * попыток.
+ */
+const TOOL_LEGEND = [
+  { tone: 'read', label: 'файлы' },
+  { tone: 'search', label: 'поиск' },
+  { tone: 'write', label: 'правка' },
+  { tone: 'run', label: 'команды' },
+  { tone: 'net', label: 'сеть' },
 ]
 
 /** Тон инструмента по имени; неизвестный — `other` («не знаю, что это» — факт). */
@@ -1188,13 +1198,55 @@ function attemptView(bar, scale) {
     }
   })
   const status = b.outcomeText || (b.open ? b.leaseText : b.outcome || b.status || b.durationText)
+
+  // Фон попытки: длительность видна полосой, а не только по чипам вызовов.
+  // Кромка не бывает уже 0.6% — иначе короткая попытка исчезла бы с экрана.
+  const bandLeft = b.start === null ? null : b.leftPct
+  const bandWidth =
+    b.start === null || b.endPct === null
+      ? null
+      : Math.max(0.6, Math.round((b.endPct - b.leftPct) * 10) / 10)
+  const bandTip =
+    b.start === null
+      ? ''
+      : `${b.clockStart || '—'}–${b.clockEnd || (b.open ? 'идёт' : '—')} · ${b.durationText || '—'}` +
+        `${calls.length ? ` · ${fmtCount(calls.length)} ${plural(calls.length, 'вызов', 'вызова', 'вызовов')}` : ''}`
+
+  // Маркеры внутри попытки: вердикты, вопросы человеку, публикация, закрытие.
+  // Засечки старта/конца больше не рисуются — их роль играет фон попытки.
+  const inside = (scale && Array.isArray(scale.markers) ? scale.markers : []).filter(
+    (marker) =>
+      marker.type !== 'started' &&
+      marker.type !== 'ended' &&
+      b.start !== null &&
+      b.end !== null &&
+      marker.at >= b.start &&
+      marker.at <= b.end,
+  )
+  const marks = inside.map((marker) => ({
+    type: marker.type,
+    tone: marker.tone,
+    pct: marker.pct,
+    title: marker.title,
+    ariaLabel: marker.ariaLabel,
+  }))
+  // Пауза рисуется в строке попытки, где вопрос задан: ответ мог прийти уже в
+  // следующей попытке, но «стояло на человеке» — здесь.
+  const waits = (scale && Array.isArray(scale.waitSpans) ? scale.waitSpans : [])
+    .filter((span) => b.start !== null && b.end !== null && span.fromAt >= b.start && span.fromAt <= b.end)
+    .map((span) => ({
+      fromPct: span.fromPct,
+      widthPct: span.widthPct,
+      title: span.title,
+    }))
   return {
-    full: Math.max(TL.collapsed, layout.height + TL.pad),
+    full: Math.max(TL.collapsed, layout.height + TL.pad + (marks.length ? TL.marksH : 0)),
     collapsed: TL.collapsed,
+    band: bandLeft === null || bandWidth === null ? null : { leftPct: bandLeft, widthPct: bandWidth },
+    bandTip,
     label: {
       number: b.number || '—',
       status: status || '—',
-      time: b.clockStart || '—',
       tone: b.tone || 'grey',
     },
     ticks: chips.map((chip) => ({
@@ -1204,6 +1256,8 @@ function attemptView(bar, scale) {
       unfinished: chip.unfinished,
     })),
     chips,
+    marks,
+    waits,
     // Надбавка на экране: `+N` — обрезано данными, `⋯M` — наложено рисунком.
     badge: [omitted ? `+${fmtCount(omitted)}` : '', clipped ? `⋯${fmtCount(clipped)}` : '']
       .filter(Boolean)
@@ -1618,6 +1672,36 @@ function shapeDealTime(detail, attemptsPayload) {
     else if (type === 'answer' && pending.length) pending.shift().answered = true
     markers.push(marker)
   }
+  // Паузы «вопрос → ответ»: считается на всю ось, потому что ответ часто
+  // приходит уже в следующей попытке. Полоса рисуется в строке той попытки, где
+  // вопрос был задан, — там, где дело и встало.
+  const waitSpans = []
+  {
+    let asked = null
+    for (const marker of markers) {
+      if (marker.type === 'question') asked = marker
+      else if (marker.type === 'answer' && asked) {
+        waitSpans.push({
+          fromAt: asked.at,
+          toAt: marker.at,
+          fromPct: asked.pct,
+          widthPct: Math.max(0.4, Math.round((marker.pct - asked.pct) * 10) / 10),
+          title: `${asked.clock} → ${marker.clock}: ждал человека`,
+        })
+        asked = null
+      }
+    }
+    if (asked && now !== null) {
+      waitSpans.push({
+        fromAt: asked.at,
+        toAt: now,
+        fromPct: asked.pct,
+        widthPct: Math.max(0.4, Math.round((pctOf(now) - asked.pct) * 10) / 10),
+        title: `${asked.clock} → сейчас: ждёт ответа`,
+      })
+    }
+  }
+
   for (const marker of pending) {
     marker.waitText = 'ждёт ответа'
     if (now !== null && marker.at > 0) {
@@ -1703,6 +1787,19 @@ function shapeDealTime(detail, attemptsPayload) {
   const callsHidden = bars.reduce((sum, bar) => sum + (bar.callsOmitted || 0), 0)
   const tokensKnown = bars.some((bar) => bar.tokens !== null && bar.tokens !== undefined)
   const tokensTotal = bars.reduce((sum, bar) => sum + (numOrNull(bar.tokens) || 0), 0)
+  // Легенда семейств инструментов с числами: цвет без подписи — ребус, без
+  // числа — «что-то было». Порядок как в `TOOL_LEGEND`, чтобы легенда не
+  // прыгала от дела к делу.
+  const toolCounts = new Map()
+  for (const bar of bars) {
+    for (const call of bar.calls) {
+      const tone = toolTone(call.name)
+      toolCounts.set(tone, (toolCounts.get(tone) || 0) + 1)
+    }
+  }
+  const tools = TOOL_LEGEND.map((item) => ({ tone: item.tone, label: item.label, count: toolCounts.get(item.tone) || 0 }))
+    .filter((item) => item.count > 0)
+
   const kpi = [
     { key: 'duration', label: 'длительность', value: durationSec === null ? '—' : fmtDuration(durationSec) },
     { key: 'stages', label: 'этапов', value: fmtCount(lanes.filter((lane) => lane.count > 0).length) },
@@ -1717,13 +1814,6 @@ function shapeDealTime(detail, attemptsPayload) {
       ? { key: 'tokens', label: 'токенов', value: fmtCount(tokensTotal) }
       : { key: 'tokens', label: 'токенов', value: '—', note: 'телеметрия не писала' },
   ]
-
-  // Ряды маркеров: вердикты, вопросы человеку, публикация, засечки попыток.
-  const marks = MARK_ROWS.map((row) => ({
-    key: row.key,
-    label: row.label,
-    items: markers.filter((marker) => row.types.indexOf(marker.type) >= 0),
-  })).filter((row) => row.items.length > 0)
 
   return {
     now,
@@ -1740,7 +1830,8 @@ function shapeDealTime(detail, attemptsPayload) {
     lanes,
     bars,
     markers,
-    marks,
+    waitSpans,
+    tools,
     kpi,
     // Граф спеки — из `stages[]` ответа `/deal`; нет этапов — нет и графа.
     spec: specView(d.stages),
@@ -1808,6 +1899,7 @@ export {
   laneView,
   attemptView,
   toolTone,
+  TOOL_LEGEND,
   KIND_ICON,
   TL,
   outcomeWord,

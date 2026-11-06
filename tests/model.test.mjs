@@ -547,6 +547,45 @@ const TIME_ATTEMPTS = {
   ],
 }
 
+test('легенда инструментов: семейства с числами вызовов, порядок постоянный', () => {
+  const scale = shapeDealTime(
+    { now: 1_400, terminal: true, timeline: [{ kind: 'created', at: 1_000, summary: '' }], stages: [{ id: 'impl', needs: [] }] },
+    {
+      attempts: [
+        {
+          stage: 'impl',
+          attempt: 1,
+          started_at: 1_000,
+          ended_at: 1_400,
+          status: 'done',
+          calls: [
+            { seq: 1, name: 'read_file', at: 1_010, ms: 40 },
+            { seq: 2, name: 'read_file', at: 1_020, ms: 30 },
+            { seq: 3, name: 'search_files', at: 1_030, ms: 50 },
+            { seq: 4, name: 'terminal', at: 1_040, ms: 60 },
+            { seq: 5, name: 'skill_view', at: 1_050, ms: 20 },
+          ],
+        },
+      ],
+    },
+  )
+  // Семейства идут в порядке константы, а не по частоте: легенда не прыгает.
+  assert.deepEqual(
+    scale.tools.map((item) => [item.tone, item.count]),
+    [
+      ['read', 2],
+      ['search', 1],
+      ['run', 1],
+    ],
+  )
+  // Инструмент без семейства в легенду не попадает: цвет у него значил бы «не знаю».
+  assert.equal(scale.tools.some((item) => item.tone === 'other'), false)
+  // Сумма по легенде плюс неизвестные = все вызовы дела.
+  const known = scale.tools.reduce((sum, item) => sum + item.count, 0)
+  const all = scale.bars.reduce((sum, bar) => sum + bar.calls.length, 0)
+  assert.equal(known, all - 1, `в легенде ${known}, вызовов ${all}`)
+})
+
 test('ось: шаг линейки растёт с длиной дела, метки не липнут к краям', () => {
   const long = shapeDealTime(
     { now: 9000, terminal: false, timeline: [{ kind: 'created', at: 1000, summary: '' }], stages: [] },

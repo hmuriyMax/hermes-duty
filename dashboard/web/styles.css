@@ -509,7 +509,22 @@ pre.body {
    длительность, каждый этап — своей дорожкой, поэтому перекрытие видно глазом.
    Цвета — только переменные палитры (`--ok/--warn/--danger/--accent/...`), чтобы
    шкала читалась и в тёмной, и в светлой теме. */
-.scale-axis { position: relative; height: 15px; margin: 0 0 6px; }
+/* Ось и сетка начинаются там же, где дорожки: колонка подписей слева — одна
+ * ширина на всё (--tl-gutter + gap), иначе шкала «заходила» на подписи. */
+.scale-head { display: grid; grid-template-columns: var(--tl-gutter, 186px) 1fr; gap: var(--tl-gap, 8px); align-items: end; margin-bottom: 6px; --tl-gutter: 186px; --tl-gap: 8px; }
+/* Легенда — колонкой слева, ровно над колонкой подписей попыток. */
+.scale-keys { display: flex; flex-direction: column; gap: 1px; font-size: 10px; color: var(--text-3); line-height: 1.45; }
+.scale-keys-h { font-size: 9.5px; text-transform: uppercase; letter-spacing: .06em; opacity: .7; }
+.scale-key { display: grid; grid-template-columns: 7px 1fr auto; align-items: center; gap: 5px; white-space: nowrap; }
+.scale-key-l { overflow: hidden; text-overflow: ellipsis; }
+.scale-key-n { font-family: var(--mono); font-variant-numeric: tabular-nums; opacity: .8; }
+.scale-key-dot { width: 7px; height: 7px; border-radius: 2px; background: var(--text-3); }
+.scale-key-dot.t-read { background: var(--accent); }
+.scale-key-dot.t-search { background: var(--purple); }
+.scale-key-dot.t-write { background: var(--ok); }
+.scale-key-dot.t-run { background: var(--warn); }
+.scale-key-dot.t-net { background: var(--danger); }
+.scale-axis { position: relative; height: 15px; }
 .scale-tick { position: absolute; font-size: 11px; color: var(--text-3); white-space: nowrap; font-variant-numeric: tabular-nums; }
 .scale-tick.align-start { transform: translateX(0); }
 .scale-tick.align-center { transform: translateX(-50%); }
@@ -676,9 +691,9 @@ pre.body {
  * наведению/фокусу. Цвета — только переменные темы: страница следует за системой,
  * и второй палитры у неё нет. */
 
-.scale-plot { position: relative; }
+.scale-plot { position: relative; --tl-gutter: 186px; --tl-gap: 8px; }
 /* Сетка под дорожками: линии по меткам оси, чтобы время читалось поперёк дорожек. */
-.scale-grid { position: absolute; top: -2px; bottom: 0; left: 0; right: 0; pointer-events: none; z-index: 0; }
+.scale-grid { position: absolute; top: -2px; bottom: 0; left: calc(var(--tl-gutter) + var(--tl-gap)); right: 0; pointer-events: none; z-index: 0; }
 .scale-grid-line { position: absolute; top: 0; bottom: 0; border-left: 1px dashed color-mix(in srgb, var(--text-3) 34%, transparent); }
 .tl-lanes { position: relative; z-index: 1; display: flex; flex-direction: column; gap: 10px; }
 .tl-lane { display: flex; flex-direction: column; gap: 4px; }
@@ -707,25 +722,24 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 
 /* Строка: слева стабильная подпись (ширина не меняется при раскрытии), справа
  * дорожка со штрихами и карта вызовов. */
+/* Строка попытки: высоту задаёт содержимое (уровни чипов + строка маркеров),
+ * фон-полоса показывает длительность, поэтому раскрытия по наведению нет. */
 .tl-row {
   position: relative;
   display: grid;
-  grid-template-columns: 186px 1fr;
-  gap: 8px;
-  height: 20px;
-  align-items: center;
+  grid-template-columns: var(--tl-gutter, 186px) 1fr;
+  gap: var(--tl-gap, 8px);
+  align-items: stretch;
   border-radius: 6px;
-  transition: height .26s cubic-bezier(.22, .8, .24, 1);
 }
-.tl-row:hover, .tl-row:focus-visible { height: var(--tl-full, 20px); }
-.tl-row:hover:not(.tl-row-open) { box-shadow: inset 0 0 0 1px var(--border); }
 .tl-row:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* Колонки подписи фиксированы: номер, статус, время, надбавка. Иначе «готово»
  * и «вердиктов много» разной ширины двигали время в каждой строке. */
 .tl-lbl {
   display: grid;
-  grid-template-columns: 26px 76px 62px auto;
+  grid-template-columns: 26px 1fr auto;
+  align-self: center;
   align-items: center;
   gap: 6px;
   height: 20px; line-height: 20px; white-space: nowrap;
@@ -756,25 +770,36 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 }
 .tl-ms { font-family: var(--mono); font-size: 10px; color: var(--text-3); text-align: right; }
 
-.tl-track { position: relative; height: 100%; }
-.tl-mini { position: absolute; left: 0; right: 0; top: 6px; height: 7px; transition: opacity .16s ease, transform .2s ease; }
-.tl-stack {
-  position: absolute; left: 0; right: 0; top: 0; opacity: 0; pointer-events: none;
-  transform: translateY(-3px) scaleY(.86); transform-origin: top;
-  transition: opacity .18s ease .04s, transform .24s cubic-bezier(.22, .8, .24, 1);
-}
-.tl-row:hover .tl-mini, .tl-row:focus-visible .tl-mini { opacity: 0; transform: translateY(3px); }
-.tl-row:hover .tl-stack, .tl-row:focus-visible .tl-stack { opacity: 1; pointer-events: auto; transform: none; }
+.tl-track { position: relative; min-height: 20px; }
 
-.tl-tick { position: absolute; top: 0; height: 7px; border-radius: 1.5px; opacity: .9; }
-.tl-call {
-  position: absolute; height: 10px; border-radius: 2px; cursor: default;
-  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .22);
-  opacity: 0; transform: translateY(-3px);
-  transition: opacity .16s ease, transform .18s ease, box-shadow .12s;
+/* Фон попытки: длительность видна полосой, а не только по чипам вызовов. */
+.tl-band {
+  position: absolute; top: 1px; bottom: 1px; border-radius: 4px;
+  background: color-mix(in srgb, var(--text-3) 13%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text-3) 22%, transparent);
 }
-.tl-row:hover .tl-call, .tl-row:focus-visible .tl-call { opacity: 1; transform: none; }
-.tl-call:hover { box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .5); }
+/* Пауза «вопрос → ответ»: время, которое дело стояло на человеке. */
+.tl-wait {
+  position: absolute; top: 1px; bottom: 1px; border-radius: 3px;
+  background: color-mix(in srgb, var(--warn) 26%, transparent);
+  border-left: 1.5px solid var(--warn); border-right: 1.5px solid var(--warn);
+}
+/* Маркеры событий — внутри строки той попытки, где событие произошло. */
+.tl-marks { position: absolute; left: 0; right: 0; bottom: -1px; height: 11px; }
+.tl-mark { position: absolute; bottom: 0; transform: translateX(-50%); line-height: 0; }
+.tl-mark i { display: block; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.tl-mark.t-green { color: var(--ok); }
+.tl-mark.t-red { color: var(--danger); }
+.tl-mark.t-yellow { color: var(--warn); }
+.tl-mark.t-blue { color: var(--accent); }
+.tl-mark.t-gray { color: var(--text-3); }
+
+.tl-call {
+  position: absolute; height: 10px; border-radius: 2px; cursor: pointer;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .22);
+}
+.tl-row:hover .tl-call { box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .45); }
+
 .tl-row-empty { font-size: 11.5px; color: var(--text-3); }
 
 @media (prefers-reduced-motion: reduce) {
@@ -783,7 +808,7 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 
 /* --------------------------------------------- подсказка вызова и инспектор */
 /* Подсказка своим слоем: на 10-пиксельном чипе нативный `title` ждать секунду. */
-.tl-call::after {
+.tl-call::after, .tl-band::after, .tl-lbl::after, .tl-mark::after, .tl-wait::after {
   content: attr(data-tip);
   position: absolute; left: 50%; bottom: calc(100% + 7px); transform: translateX(-50%);
   padding: 3px 7px; border-radius: 5px; white-space: nowrap;
@@ -792,7 +817,8 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
   font-family: var(--mono); font-size: 10.5px; line-height: 1.5;
   opacity: 0; pointer-events: none; transition: opacity .09s ease; z-index: 30;
 }
-.tl-call:hover::after { opacity: 1; }
+.tl-call:hover::after, .tl-band:hover::after, .tl-lbl:hover::after,
+.tl-mark:hover::after, .tl-wait:hover::after { opacity: 1; }
 .tl-call.tl-sel { box-shadow: inset 0 0 0 1.5px var(--accent), 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent); }
 .tl-call { cursor: pointer; }
 
@@ -838,11 +864,14 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 .smk-wait.t-yellow { color: var(--warn); }
 
 /* ------------------------------------------------------------- граф спеки */
-svg.spec-graph { display: block; width: 100%; height: auto; overflow: visible; fill: none; stroke: none; }
+/* Граф — полосой: мелкие узлы, а не главный объект экрана. */
+.spec-strip { display: grid; grid-template-columns: var(--tl-gutter, 186px) auto; gap: var(--tl-gap, 8px); align-items: center; margin-top: 10px; }
+.spec-strip-name { font-size: 10.5px; color: var(--text-3); text-align: right; white-space: nowrap; }
+svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; overflow: visible; fill: none; stroke: none; }
 .spec-edge { fill: none; stroke: var(--border); stroke-width: 1.2; stroke-dasharray: 4 3; }
-.spec-node rect { fill: var(--card); stroke: var(--border); stroke-width: 1.2; }
-.spec-node .spec-id { fill: var(--text); font-family: var(--mono); font-size: 11px; }
-.spec-node .spec-st { fill: var(--text-3); font-size: 9.5px; }
+.spec-node rect { fill: var(--card); stroke: var(--border); stroke-width: 1; }
+.spec-node .spec-id { fill: var(--text-2); font-family: var(--mono); font-size: 9px; }
+
 .spec-node.t-green rect { stroke: var(--ok); }
 .spec-node.t-red rect { stroke: var(--danger); }
 .spec-node.t-yellow rect { stroke: var(--warn); }

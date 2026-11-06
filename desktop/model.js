@@ -707,7 +707,12 @@ const OUTCOME_WORD = {
   reclaimed: 'снята',
 }
 
-/** Слово исхода для подписи строки; живёт рядом с тоном, чтобы не разъезжаться. */
+/**
+ * Слово исхода для подписи строки; живёт рядом с тоном, чтобы не разъезжаться.
+ *
+ * Незнакомый исход показывается как есть: новый класс в журнале — факт, и
+ * подменять его на «—» значило бы его спрятать.
+ */
 function outcomeWord(value) {
   const key = String(value || '')
   return OUTCOME_WORD[key] || key
@@ -1048,12 +1053,17 @@ function layoutCalls(calls, options) {
     const value = Math.max(0, Number(ms) || 0)
     return Math.round(3 + (11 * Math.log10(1 + value / 100)) / Math.log10(1 + 12000 / 100))
   }
+  // `ms: null` — вызов без результата. Рисовать его минимальной шириной значило
+  // бы утверждать «0 мс»: длительности нет, а не она нулевая. Отдельная ширина и
+  // флаг `unfinished` дают поверхности возможность показать это иначе.
+  const UNFINISHED_W = 5
   const lastEnd = []
   const chips = []
   let clipped = 0
   for (const call of list) {
     const px = Math.max(0, Math.min(width, ((call.at - from) / span) * width))
-    const size = chipWidth(call.ms)
+    const unfinished = call.ms === null || call.ms === undefined
+    const size = unfinished ? UNFINISHED_W : chipWidth(call.ms)
     let level = lastEnd.findIndex((end) => px - end >= gap)
     if (level < 0) {
       if (lastEnd.length >= maxLevels) {
@@ -1074,10 +1084,134 @@ function layoutCalls(calls, options) {
       widthPct: Math.round((size / width) * 10000) / 100,
       level,
       top: top + level * levelH,
+      unfinished,
     })
   }
   const levels = lastEnd.length
   return { chips, levels, height: top + levels * levelH, clipped }
+}
+
+/* ------------------------------------------- вид таймлайна: одна арифметика
+ * Обе поверхности рисуют по этим функциям, а сами только подставляют свой
+ * элемент и свои CSS-переменные. Иначе «один расчёт на два экрана» — обещание в
+ * комментарии, которое никто не проверяет.
+ */
+
+// Геометрия строки: свёрнутая полоса, шаг уровня, отступ сверху, потолок уровней
+// и запас под раскрытую карту. Числа живут здесь, а не в двух файлах.
+const TL = { collapsed: 20, levelH: 12, top: 6, maxLevels: 5, pad: 8 }
+
+// Тон вызова — семантический ключ («чтение», «правка», «запуск», «внешнее»), а не
+// CSS-цвет: палитры у поверхностей разные, а вид работы — общий факт.
+const TOOL_TONE = [
+  [/^(read_file|search_files|grep|ls|list|view|cat|find)/i, 'read'],
+  [/^(write_file|patch|apply_patch|edit|create|mkdir)/i, 'write'],
+  [/^(terminal|shell|bash|run|exec|python|node|go|npm)/i, 'run'],
+  [/^(web_|browser|http|fetch|curl)/i, 'net'],
+]
+
+/** Тон инструмента по имени; неизвестный — `other` («не знаю, что это» — факт). */
+function toolTone(name) {
+  const hit = TOOL_TONE.find(([pattern]) => pattern.test(String(name || '')))
+  return hit ? hit[1] : 'other'
+}
+
+// Значки вида этапа: пути в `viewBox 0 0 16 16`. Одна геометрия на обе
+// поверхности — разъехавшиеся значки читались бы как разные виды этапов.
+const KIND_ICON = {
+  agent: 'M8 2.4a2.6 2.6 0 1 0 0 5.2 2.6 2.6 0 0 0 0-5.2ZM3 13.2c0-2.5 2.2-4.1 5-4.1s5 1.6 5 4.1',
+  shell: 'M4 5.2 7 8l-3 2.8M8.6 11.4h3.6',
+  gate: 'M8 2.2 13.4 8 8 13.8 2.6 8Z',
+}
+
+/**
+ * Вид строки попытки: подпись, штрихи, чипы и надбавка «сколько не показано».
+ *
+ * `badge` — то, что нельзя прятать: `+N` вызовов отрезано потолком и `⋯M`
+ * наложено из-за нехватки уровней. Обе цифры приходят из данных, а не из
+ * «сколько влезло».
+ */
+function attemptView(bar, scale) {
+  const b = bar && typeof bar === 'object' ? bar : {}
+  const calls = Array.isArray(b.calls) ? b.calls : []
+  const axis = (scale && scale.axis) || {}
+  const layout = calls.length
+    ? layoutCalls(calls, {
+        from: axis.start,
+        to: axis.end,
+        levelH: TL.levelH,
+        top: TL.top,
+        maxLevels: TL.maxLevels,
+      })
+    : { chips: [], height: TL.top + TL.levelH, clipped: 0 }
+  const omitted = numOrNull(b.callsOmitted) || 0
+  const clipped = layout.clipped || 0
+  const notes = []
+  if (omitted) notes.push(`ещё ${fmtCount(omitted)} ${plural(omitted, 'вызов', 'вызова', 'вызовов')} не показано (потолок)`)
+  if (clipped) notes.push(`${fmtCount(clipped)} ${plural(clipped, 'вызов', 'вызова', 'вызовов')} наложено: уровней не хватило`)
+  const chips = layout.chips.map((chip) => {
+    const call = chip.call || {}
+    return {
+      leftPct: chip.leftPct,
+      widthPct: chip.widthPct,
+      top: chip.top,
+      tone: toolTone(call.name),
+      unfinished: chip.unfinished === true,
+      title: `${call.name || '—'} · ${call.clock || '—'} · ${call.msText || '—'}`,
+    }
+  })
+  const status = b.outcomeText || (b.open ? b.leaseText : b.outcome || b.status || b.durationText)
+  return {
+    full: Math.max(TL.collapsed, layout.height + TL.pad),
+    collapsed: TL.collapsed,
+    label: {
+      number: b.number || '—',
+      status: status || '—',
+      time: b.clockStart || '—',
+      tone: b.tone || 'grey',
+    },
+    ticks: chips.map((chip) => ({
+      leftPct: chip.leftPct,
+      widthPct: chip.widthPct,
+      tone: chip.tone,
+      unfinished: chip.unfinished,
+    })),
+    chips,
+    // Надбавка на экране: `+N` — обрезано данными, `⋯M` — наложено рисунком.
+    badge: [omitted ? `+${fmtCount(omitted)}` : '', clipped ? `⋯${fmtCount(clipped)}` : '']
+      .filter(Boolean)
+      .join(' '),
+    note: notes.join(' · '),
+    title: [b.title || '', notes.join(' · ')].filter(Boolean).join(' · '),
+  }
+}
+
+/** Вид дорожки этапа: имя, вид, сводка попыток и строки. */
+function laneView(lane, bars, scale) {
+  const list = Array.isArray(bars) ? bars : []
+  const first = list[0]
+  const shown = list.reduce((sum, bar) => sum + (Array.isArray(bar.calls) ? bar.calls.length : 0), 0)
+  const omitted = list.reduce((sum, bar) => sum + (numOrNull(bar.callsOmitted) || 0), 0)
+  const total = shown + omitted
+  const meta = [
+    `${list.length} ${plural(list.length, 'попытка', 'попытки', 'попыток')}`,
+    total
+      ? `${fmtCount(total)} ${plural(total, 'вызов', 'вызова', 'вызовов')}${
+          omitted ? ` (показано ${fmtCount(shown)})` : ''
+        }`
+      : '',
+  ]
+    .filter(Boolean)
+    .join(' · ')
+  return {
+    name: String((lane && lane.label) || '—'),
+    kind: first ? String(first.kind || 'agent') : '',
+    kindText: first ? (first.kind === 'agent' ? String(first.role || 'профиль') : String(first.kind)) : '',
+    icon: first ? KIND_ICON[first.kind] || KIND_ICON.shell : '',
+    meta,
+    empty: list.length === 0,
+    rows: list.map((bar) => ({ key: `${bar.laneKey || ''}-${bar.number || ''}`, view: attemptView(bar, scale) })),
+  }
 }
 
 function attemptBar(attempt, crashes) {
@@ -1352,17 +1486,17 @@ function shapeDealTime(detail, attemptsPayload) {
     bar.toolsText = bar.tools === null ? '' : `инструментов ${fmtCount(bar.tools)}`
     // Вызовы: сколько их в телеметрии и не обрезано ли. Это отдельная строка от
     // `инструментов` — там счётчик движка, здесь то, что реально можно нарисовать.
+    // Здесь только то, что реально нарисовано: «ещё N не показано» называет
+    // вид строки (`attemptView`), иначе одна и та же цифра звучала бы дважды.
     bar.callsText = (bar.calls || []).length
-      ? `${fmtCount(bar.calls.length)} ${plural(bar.calls.length, 'вызов', 'вызова', 'вызовов')}${
-          bar.callsOmitted ? ` (ещё ${fmtCount(bar.callsOmitted)} не показано)` : ''
-        }`
+      ? `${fmtCount(bar.calls.length)} ${plural(bar.calls.length, 'вызов', 'вызова', 'вызовов')}`
       : ''
     // Подпись внутри полосы — исход, а не догадка: у незакрытой это слово о
     // лизинге, у закрытой без исхода — её длительность.
     bar.label = bar.open ? bar.leaseText : bar.outcome || bar.status || bar.durationText
     // Короткая подпись строки таймлайна: исход по-русски, у незакрытой — лизинг.
     bar.outcomeText = bar.open ? bar.leaseText : outcomeWord(bar.outcome) || bar.status || bar.durationText
-    const details = [bar.progressText, bar.toolsText].filter(Boolean).join(', ')
+    const details = [bar.progressText, bar.toolsText, bar.callsText].filter(Boolean).join(', ')
     const head = `${bar.laneLabel} · попытка ${bar.number || '—'}`
     const interval = `${bar.clockStart}–${bar.clockEnd} (${bar.durationText})`
     const tail = bar.open ? `лизинг: ${bar.leaseText}` : `исход: ${bar.outcome || bar.status || 'не записан'}`
@@ -1545,6 +1679,11 @@ export {
   filterNow,
   outcomeTone,
   layoutCalls,
+  laneView,
+  attemptView,
+  toolTone,
+  KIND_ICON,
+  TL,
   outcomeWord,
   plural,
   shapeAttempts,

@@ -756,7 +756,12 @@ const OUTCOME_WORD = {
   reclaimed: 'снята',
 }
 
-/** Слово исхода для подписи строки; живёт рядом с тоном, чтобы не разъезжаться. */
+/**
+ * Слово исхода для подписи строки; живёт рядом с тоном, чтобы не разъезжаться.
+ *
+ * Незнакомый исход показывается как есть: новый класс в журнале — факт, и
+ * подменять его на «—» значило бы его спрятать.
+ */
 function outcomeWord(value) {
   const key = String(value || '')
   return OUTCOME_WORD[key] || key
@@ -1097,12 +1102,17 @@ function layoutCalls(calls, options) {
     const value = Math.max(0, Number(ms) || 0)
     return Math.round(3 + (11 * Math.log10(1 + value / 100)) / Math.log10(1 + 12000 / 100))
   }
+  // `ms: null` — вызов без результата. Рисовать его минимальной шириной значило
+  // бы утверждать «0 мс»: длительности нет, а не она нулевая. Отдельная ширина и
+  // флаг `unfinished` дают поверхности возможность показать это иначе.
+  const UNFINISHED_W = 5
   const lastEnd = []
   const chips = []
   let clipped = 0
   for (const call of list) {
     const px = Math.max(0, Math.min(width, ((call.at - from) / span) * width))
-    const size = chipWidth(call.ms)
+    const unfinished = call.ms === null || call.ms === undefined
+    const size = unfinished ? UNFINISHED_W : chipWidth(call.ms)
     let level = lastEnd.findIndex((end) => px - end >= gap)
     if (level < 0) {
       if (lastEnd.length >= maxLevels) {
@@ -1123,10 +1133,134 @@ function layoutCalls(calls, options) {
       widthPct: Math.round((size / width) * 10000) / 100,
       level,
       top: top + level * levelH,
+      unfinished,
     })
   }
   const levels = lastEnd.length
   return { chips, levels, height: top + levels * levelH, clipped }
+}
+
+/* ------------------------------------------- вид таймлайна: одна арифметика
+ * Обе поверхности рисуют по этим функциям, а сами только подставляют свой
+ * элемент и свои CSS-переменные. Иначе «один расчёт на два экрана» — обещание в
+ * комментарии, которое никто не проверяет.
+ */
+
+// Геометрия строки: свёрнутая полоса, шаг уровня, отступ сверху, потолок уровней
+// и запас под раскрытую карту. Числа живут здесь, а не в двух файлах.
+const TL = { collapsed: 20, levelH: 12, top: 6, maxLevels: 5, pad: 8 }
+
+// Тон вызова — семантический ключ («чтение», «правка», «запуск», «внешнее»), а не
+// CSS-цвет: палитры у поверхностей разные, а вид работы — общий факт.
+const TOOL_TONE = [
+  [/^(read_file|search_files|grep|ls|list|view|cat|find)/i, 'read'],
+  [/^(write_file|patch|apply_patch|edit|create|mkdir)/i, 'write'],
+  [/^(terminal|shell|bash|run|exec|python|node|go|npm)/i, 'run'],
+  [/^(web_|browser|http|fetch|curl)/i, 'net'],
+]
+
+/** Тон инструмента по имени; неизвестный — `other` («не знаю, что это» — факт). */
+function toolTone(name) {
+  const hit = TOOL_TONE.find(([pattern]) => pattern.test(String(name || '')))
+  return hit ? hit[1] : 'other'
+}
+
+// Значки вида этапа: пути в `viewBox 0 0 16 16`. Одна геометрия на обе
+// поверхности — разъехавшиеся значки читались бы как разные виды этапов.
+const KIND_ICON = {
+  agent: 'M8 2.4a2.6 2.6 0 1 0 0 5.2 2.6 2.6 0 0 0 0-5.2ZM3 13.2c0-2.5 2.2-4.1 5-4.1s5 1.6 5 4.1',
+  shell: 'M4 5.2 7 8l-3 2.8M8.6 11.4h3.6',
+  gate: 'M8 2.2 13.4 8 8 13.8 2.6 8Z',
+}
+
+/**
+ * Вид строки попытки: подпись, штрихи, чипы и надбавка «сколько не показано».
+ *
+ * `badge` — то, что нельзя прятать: `+N` вызовов отрезано потолком и `⋯M`
+ * наложено из-за нехватки уровней. Обе цифры приходят из данных, а не из
+ * «сколько влезло».
+ */
+function attemptView(bar, scale) {
+  const b = bar && typeof bar === 'object' ? bar : {}
+  const calls = Array.isArray(b.calls) ? b.calls : []
+  const axis = (scale && scale.axis) || {}
+  const layout = calls.length
+    ? layoutCalls(calls, {
+        from: axis.start,
+        to: axis.end,
+        levelH: TL.levelH,
+        top: TL.top,
+        maxLevels: TL.maxLevels,
+      })
+    : { chips: [], height: TL.top + TL.levelH, clipped: 0 }
+  const omitted = numOrNull(b.callsOmitted) || 0
+  const clipped = layout.clipped || 0
+  const notes = []
+  if (omitted) notes.push(`ещё ${fmtCount(omitted)} ${plural(omitted, 'вызов', 'вызова', 'вызовов')} не показано (потолок)`)
+  if (clipped) notes.push(`${fmtCount(clipped)} ${plural(clipped, 'вызов', 'вызова', 'вызовов')} наложено: уровней не хватило`)
+  const chips = layout.chips.map((chip) => {
+    const call = chip.call || {}
+    return {
+      leftPct: chip.leftPct,
+      widthPct: chip.widthPct,
+      top: chip.top,
+      tone: toolTone(call.name),
+      unfinished: chip.unfinished === true,
+      title: `${call.name || '—'} · ${call.clock || '—'} · ${call.msText || '—'}`,
+    }
+  })
+  const status = b.outcomeText || (b.open ? b.leaseText : b.outcome || b.status || b.durationText)
+  return {
+    full: Math.max(TL.collapsed, layout.height + TL.pad),
+    collapsed: TL.collapsed,
+    label: {
+      number: b.number || '—',
+      status: status || '—',
+      time: b.clockStart || '—',
+      tone: b.tone || 'grey',
+    },
+    ticks: chips.map((chip) => ({
+      leftPct: chip.leftPct,
+      widthPct: chip.widthPct,
+      tone: chip.tone,
+      unfinished: chip.unfinished,
+    })),
+    chips,
+    // Надбавка на экране: `+N` — обрезано данными, `⋯M` — наложено рисунком.
+    badge: [omitted ? `+${fmtCount(omitted)}` : '', clipped ? `⋯${fmtCount(clipped)}` : '']
+      .filter(Boolean)
+      .join(' '),
+    note: notes.join(' · '),
+    title: [b.title || '', notes.join(' · ')].filter(Boolean).join(' · '),
+  }
+}
+
+/** Вид дорожки этапа: имя, вид, сводка попыток и строки. */
+function laneView(lane, bars, scale) {
+  const list = Array.isArray(bars) ? bars : []
+  const first = list[0]
+  const shown = list.reduce((sum, bar) => sum + (Array.isArray(bar.calls) ? bar.calls.length : 0), 0)
+  const omitted = list.reduce((sum, bar) => sum + (numOrNull(bar.callsOmitted) || 0), 0)
+  const total = shown + omitted
+  const meta = [
+    `${list.length} ${plural(list.length, 'попытка', 'попытки', 'попыток')}`,
+    total
+      ? `${fmtCount(total)} ${plural(total, 'вызов', 'вызова', 'вызовов')}${
+          omitted ? ` (показано ${fmtCount(shown)})` : ''
+        }`
+      : '',
+  ]
+    .filter(Boolean)
+    .join(' · ')
+  return {
+    name: String((lane && lane.label) || '—'),
+    kind: first ? String(first.kind || 'agent') : '',
+    kindText: first ? (first.kind === 'agent' ? String(first.role || 'профиль') : String(first.kind)) : '',
+    icon: first ? KIND_ICON[first.kind] || KIND_ICON.shell : '',
+    meta,
+    empty: list.length === 0,
+    rows: list.map((bar) => ({ key: `${bar.laneKey || ''}-${bar.number || ''}`, view: attemptView(bar, scale) })),
+  }
 }
 
 function attemptBar(attempt, crashes) {
@@ -1401,17 +1535,17 @@ function shapeDealTime(detail, attemptsPayload) {
     bar.toolsText = bar.tools === null ? '' : `инструментов ${fmtCount(bar.tools)}`
     // Вызовы: сколько их в телеметрии и не обрезано ли. Это отдельная строка от
     // `инструментов` — там счётчик движка, здесь то, что реально можно нарисовать.
+    // Здесь только то, что реально нарисовано: «ещё N не показано» называет
+    // вид строки (`attemptView`), иначе одна и та же цифра звучала бы дважды.
     bar.callsText = (bar.calls || []).length
-      ? `${fmtCount(bar.calls.length)} ${plural(bar.calls.length, 'вызов', 'вызова', 'вызовов')}${
-          bar.callsOmitted ? ` (ещё ${fmtCount(bar.callsOmitted)} не показано)` : ''
-        }`
+      ? `${fmtCount(bar.calls.length)} ${plural(bar.calls.length, 'вызов', 'вызова', 'вызовов')}`
       : ''
     // Подпись внутри полосы — исход, а не догадка: у незакрытой это слово о
     // лизинге, у закрытой без исхода — её длительность.
     bar.label = bar.open ? bar.leaseText : bar.outcome || bar.status || bar.durationText
     // Короткая подпись строки таймлайна: исход по-русски, у незакрытой — лизинг.
     bar.outcomeText = bar.open ? bar.leaseText : outcomeWord(bar.outcome) || bar.status || bar.durationText
-    const details = [bar.progressText, bar.toolsText].filter(Boolean).join(', ')
+    const details = [bar.progressText, bar.toolsText, bar.callsText].filter(Boolean).join(', ')
     const head = `${bar.laneLabel} · попытка ${bar.number || '—'}`
     const interval = `${bar.clockStart}–${bar.clockEnd} (${bar.durationText})`
     const tail = bar.open ? `лизинг: ${bar.leaseText}` : `исход: ${bar.outcome || bar.status || 'не записан'}`
@@ -1567,68 +1701,38 @@ function shapeDealTime(detail, attemptsPayload) {
 
 /* ------------------------------- таймлайн вызовов внутри попытки (0.0.8) */
 
-// Геометрия и палитра — те же числа, что у веб-страницы: расхождение дало бы
-// два разных рисунка одного дела. Раскладка считается общим шейпером
-// (`layoutCalls`), здесь только DOM.
-const TL_COLLAPSED = 20
-const TL_LEVEL_H = 12
-const TL_TOP = 6
-const TL_MAX_LEVELS = 5
-
-// Значок вида этапа: профиль — силуэт человека, shell — приглашение терминала,
-// гейт — ромб вопроса. Слово рядом лишнее: значок и есть подпись вида.
-const KIND_ICON = {
-  agent: 'M8 2.4a2.6 2.6 0 1 0 0 5.2 2.6 2.6 0 0 0 0-5.2ZM3 13.2c0-2.5 2.2-4.1 5-4.1s5 1.6 5 4.1',
-  shell: 'M4 5.2 7 8l-3 2.8M8.6 11.4h3.6',
-  gate: 'M8 2.2 13.4 8 8 13.8 2.6 8Z',
+// Палитра — единственное своё у поверхности: тон приходит из шейпера ключом.
+const DUTY_TONE_VAR = {
+  read: 'var(--ui-blue)',
+  write: 'var(--ui-green)',
+  run: 'var(--ui-yellow)',
+  net: 'var(--ui-purple)',
+  other: 'var(--ui-text-tertiary)',
+}
+function dutyToneVar(tone) {
+  return DUTY_TONE_VAR[tone] || DUTY_TONE_VAR.other
 }
 
-// Цвет вызова — по виду инструмента: чтение, правка, запуск, внешнее.
-const TOOL_TONE = [
-  [/^(read_file|search_files|grep|ls|list|view|cat|find)/i, 'var(--ui-blue)'],
-  [/^(write_file|patch|apply_patch|edit|create|mkdir)/i, 'var(--ui-green)'],
-  [/^(terminal|shell|bash|run|exec|python|node|go|npm)/i, 'var(--ui-yellow)'],
-  [/^(web_|browser|http|fetch|curl)/i, 'var(--ui-purple)'],
-]
-
-function dutyToolColor(name) {
-  const hit = TOOL_TONE.find(([pattern]) => pattern.test(String(name || '')))
-  return hit ? hit[1] : 'var(--ui-text-tertiary)'
-}
-
-/** Одна строка попытки: подпись, полоса штрихов и карта вызовов. */
-function DutyAttemptRow({ bar, scale }) {
-  const layout = useMemo(
-    () =>
-      bar.calls.length
-        ? layoutCalls(bar.calls, {
-            from: scale.axis.start,
-            to: scale.axis.end,
-            levelH: TL_LEVEL_H,
-            top: TL_TOP,
-            maxLevels: TL_MAX_LEVELS,
-          })
-        : { chips: [], height: TL_COLLAPSED },
-    [bar, scale],
-  )
-  const full = Math.max(TL_COLLAPSED, layout.height + 8)
-  const status = bar.outcomeText || (bar.open ? bar.leaseText : bar.outcome || bar.status || bar.durationText)
+/** Строка попытки: вид приходит готовым (`attemptView`), здесь только DOM. */
+function DutyAttemptRow({ view }) {
   return h(
     'div',
     {
       className: 'duty-tl-row',
-      title: bar.title,
+      title: view.title,
       tabIndex: 0,
       // Высота раскрытия — в переменной: сам переход делает CSS по :hover, JS
       // здесь не нужен, и веб с десктопом ведут себя одинаково.
-      style: { '--duty-tl-full': `${full}px` },
+      style: { '--duty-tl-full': `${view.full}px` },
     },
     h(
       'div',
       { className: 'duty-tl-lbl' },
-      h('span', { className: 'duty-tl-n' }, bar.number || '—'),
-      h('span', { className: `duty-tl-st t-${bar.tone}` }, status || '—'),
-      h('span', { className: 'duty-tl-ms' }, bar.clockStart),
+      h('span', { className: 'duty-tl-n' }, view.label.number),
+      h('span', { className: `duty-tl-st t-${view.label.tone}` }, view.label.status),
+      h('span', { className: 'duty-tl-ms' }, view.label.time),
+      // Надбавка «не всё показано» — на экране, а не только в тултипе.
+      view.badge ? h('span', { className: 'duty-tl-more', title: view.note || view.title }, view.badge) : null,
     ),
     h(
       'div',
@@ -1636,33 +1740,39 @@ function DutyAttemptRow({ bar, scale }) {
       h(
         'div',
         { className: 'duty-tl-mini' },
-        ...layout.chips.map((chip, index) =>
+        ...view.ticks.map((tick, index) =>
           h('span', {
             key: `tick-${index}`,
-            className: 'duty-tl-tick',
-            style: {
-              left: `${chip.leftPct}%`,
-              width: `${chip.widthPct}%`,
-              background: dutyToolColor(chip.call.name),
-            },
+            className: `duty-tl-tick${tick.unfinished ? ' duty-tl-unfinished' : ''}`,
+            // У оборванного вызова цвет — цвет контура: заливки у него нет.
+            style: tick.unfinished
+              ? { left: `${tick.leftPct}%`, width: `${tick.widthPct}%`, color: dutyToneVar(tick.tone) }
+              : { left: `${tick.leftPct}%`, width: `${tick.widthPct}%`, background: dutyToneVar(tick.tone) },
           }),
         ),
       ),
       h(
         'div',
         { className: 'duty-tl-stack' },
-        ...layout.chips.map((chip, index) =>
+        ...view.chips.map((chip, index) =>
           h('span', {
             key: `call-${index}`,
-            className: 'duty-tl-call',
-            title: `${chip.call.name} · ${chip.call.clock} · ${chip.call.msText}`,
-            'aria-label': `${chip.call.name}, ${chip.call.clock}, ${chip.call.msText}`,
-            style: {
-              left: `${chip.leftPct}%`,
-              width: `${chip.widthPct}%`,
-              top: `${chip.top}px`,
-              background: dutyToolColor(chip.call.name),
-            },
+            className: `duty-tl-call${chip.unfinished ? ' duty-tl-unfinished' : ''}`,
+            title: chip.title,
+            'aria-label': chip.title,
+            style: chip.unfinished
+              ? {
+                  left: `${chip.leftPct}%`,
+                  width: `${chip.widthPct}%`,
+                  top: `${chip.top}px`,
+                  color: dutyToneVar(chip.tone),
+                }
+              : {
+                  left: `${chip.leftPct}%`,
+                  width: `${chip.widthPct}%`,
+                  top: `${chip.top}px`,
+                  background: dutyToneVar(chip.tone),
+                },
           }),
         ),
       ),
@@ -1672,50 +1782,40 @@ function DutyAttemptRow({ bar, scale }) {
 
 /** Дорожка этапа: имя, значок вида, сводка и строки попыток. */
 function DutyLane({ lane, bars, scale }) {
-  const first = bars[0]
-  const calls = bars.reduce((sum, bar) => sum + bar.calls.length, 0)
-  const meta = [
-    `${bars.length} ${bars.length === 1 ? 'попытка' : bars.length < 5 ? 'попытки' : 'попыток'}`,
-    calls ? `${calls} ${calls % 10 === 1 && calls % 100 !== 11 ? 'вызов' : 'вызовов'}` : '',
-  ]
-    .filter(Boolean)
-    .join(' · ')
+  const view = laneView(lane, bars, scale)
   return h(
     'div',
     { className: 'duty-tl-lane' },
     h(
       'div',
       { className: 'duty-tl-lane-h' },
-      h('span', { className: 'duty-tl-lane-name', title: lane.label }, lane.label),
-      first
+      h('span', { className: 'duty-tl-lane-name', title: view.name }, view.name),
+      view.kind
         ? h(
             'span',
             {
-              className: `duty-tl-kind duty-tl-kind-${first.kind}`,
-              title: first.kind === 'agent' ? `профиль: ${first.role || '—'}` : first.kind,
+              className: `duty-tl-kind duty-tl-kind-${view.kind}`,
+              title: view.kind === 'agent' ? `профиль: ${view.kindText}` : view.kind,
             },
             h(
               'svg',
               { className: 'duty-tl-kind-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' },
-              h('path', { d: KIND_ICON[first.kind] || KIND_ICON.shell }),
+              h('path', { d: view.icon }),
             ),
-            first.kind === 'agent' ? first.role || 'профиль' : first.kind,
+            view.kindText,
           )
         : null,
-      h('span', { className: 'duty-tl-lane-meta' }, meta),
+      h('span', { className: 'duty-tl-lane-meta' }, view.meta),
     ),
-    bars.length
-      ? h(
+    view.empty
+      ? h('div', { className: 'duty-tl-empty' }, 'попыток не было')
+      : h(
           'div',
           { className: 'duty-tl-rows' },
-          ...bars.map((bar) => h(DutyAttemptRow, { key: `row-${bar.key}`, bar, scale })),
-        )
-      : h('div', { className: 'duty-tl-empty' }, 'попыток не было'),
+          ...view.rows.map((row) => h(DutyAttemptRow, { key: row.key, view: row.view })),
+        ),
   )
 }
-
-
-/* ---------------- стили страницы ---------------- */
 
 const CSS = `
 .duty-page{display:flex;flex-direction:column;height:100%;min-height:0;background:var(--ui-surface-background);color:var(--ui-text-primary);font-size:13px}
@@ -1852,6 +1952,10 @@ const CSS = `
 .duty-tl-st.t-yellow{color:var(--ui-yellow)}
 .duty-tl-st.t-blue{color:var(--ui-blue)}
 .duty-tl-ms{font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:10px;color:var(--ui-text-tertiary)}
+/* Надбавка «сколько не показано»: обрезанное нельзя показывать полным. */
+.duty-tl-more{font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:9.5px;font-weight:700;color:var(--ui-yellow);padding:0 3px;border-radius:3px;background:color-mix(in srgb, var(--ui-yellow) 16%, transparent)}
+/* Вызов без результата: полый чип — длительности нет, а не ноль. */
+.duty-tl-call.duty-tl-unfinished,.duty-tl-tick.duty-tl-unfinished{background:transparent !important;box-shadow:inset 0 0 0 1.5px currentColor !important;opacity:.9}
 .duty-tl-track{position:relative;height:100%}
 .duty-tl-mini{position:absolute;left:0;right:0;top:6px;height:7px;transition:opacity .16s ease, transform .2s ease}
 .duty-tl-stack{position:absolute;left:0;right:0;top:0;opacity:0;pointer-events:none;transform:translateY(-3px) scaleY(.86);transform-origin:top;transition:opacity .18s ease .04s, transform .24s cubic-bezier(.22,.8,.24,1)}

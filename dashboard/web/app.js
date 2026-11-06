@@ -23,12 +23,13 @@
 import {
   ALL_REPOS,
   WITHOUT_REPO_LABEL,
+  attemptView,
+  laneView,
   filterNow,
   fmtAge,
   fmtClock,
   groupStatesText,
   humanLine,
-  layoutCalls,
   noticeLines,
   plural,
   repoLabel,
@@ -1122,129 +1123,102 @@ function markerLegend(scale) {
 
 /* ------------------------------------- таймлайн вызовов внутри попытки (0.0.8) */
 
-// Геометрия строки: свёрнутая полоса 20 px, раскрытая карта — по числу уровней.
-// Числа общие с десктопом (там те же значения), а сама раскладка считается
-// шейпером (`layoutCalls`), чтобы обе поверхности рисовали одно и то же.
-const TL_COLLAPSED = 20
-const TL_LEVEL_H = 12
-const TL_TOP = 6
-const TL_MAX_LEVELS = 5
-
-// Значки вида этапа: профиль — силуэт человека, shell — приглашение терминала,
-// gate — ромб вопроса. Слово рядом не нужно: значок и есть подпись вида.
-const KIND_ICON = {
-  agent:
-    '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="5" r="2.6"/><path d="M3 13.2c0-2.5 2.2-4.1 5-4.1s5 1.6 5 4.1"/></svg>',
-  shell: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 5.2 7 8l-3 2.8"/><path d="M8.6 11.4h3.6"/></svg>',
-  gate:
-    '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.2 13.4 8 8 13.8 2.6 8Z"/><path d="M8 6.1v.2c0 .5-.6.7-.6 1.3"/><circle cx="8" cy="9.7" r=".5" fill="currentColor" stroke="none"/></svg>',
+// Палитра — единственное, что остаётся своего у поверхности: тон вызова
+// приходит из шейпера ключом (`read`/`write`/`run`/`net`/`other`), а во что он
+// красится, знает только свой CSS.
+const TONE_VAR = {
+  read: 'var(--accent)',
+  write: 'var(--ok)',
+  run: 'var(--warn)',
+  net: 'var(--purple)',
+  other: 'var(--text-3)',
 }
-
-// Цвет вызова — по виду инструмента: чтение, правка, запуск, внешнее. Одна
-// палитра на обе поверхности; неизвестный инструмент остаётся нейтральным,
-// потому что «не знаю, что это» — тоже факт.
-const TOOL_TONE = [
-  [/^(read_file|search_files|grep|ls|list|view|cat|find)/i, 'var(--accent)'],
-  [/^(write_file|patch|apply_patch|edit|create|mkdir)/i, 'var(--ok)'],
-  [/^(terminal|shell|bash|run|exec|python|node|go|npm)/i, 'var(--warn)'],
-  [/^(web_|browser|http|fetch|curl)/i, 'var(--purple)'],
-]
-function toolColor(name) {
-  const hit = TOOL_TONE.find(([pattern]) => pattern.test(String(name || '')))
-  return hit ? hit[1] : 'var(--text-3)'
-}
-
-/** Один чип: место, ширина по длительности (логарифм), цвет инструмента. */
-function chipNode(chip, scale) {
-  const call = chip.call
-  return h('span', {
-    class: 'tl-call',
-    style: `left:${chip.leftPct}%;top:${chip.top}px;width:${chip.widthPct}%;background:${toolColor(call.name)}`,
-    title: `${call.name} · ${call.clock} · ${call.msText}`,
-    'aria-label': `${call.name}, ${call.clock}, ${call.msText}`,
-  })
+function toneVar(tone) {
+  return TONE_VAR[tone] || TONE_VAR.other
 }
 
 /**
- * Строка попытки: свёрнутая полоса штрихов по умолчанию, карта вызовов по наведению.
+ * Строка попытки: свёрнутая полоса штрихов, карта вызовов по наведению.
  *
- * Вызов один и тот же в обоих состояниях: в полосе — один ряд штрихов, в карте —
- * раскладка по уровням. Так свёрнутый вид не «другая картинка», а сжатая та же.
+ * Геометрия, подпись и счётчики приходят готовым видом (`attemptView`): здесь
+ * только элементы. Свой расчёт здесь означал бы второй рисунок того же дела.
  */
-function attemptRowNode(bar, scale) {
-  const status = bar.outcomeText || (bar.open ? bar.leaseText : bar.outcome || bar.status || bar.durationText)
+function attemptRowNode(view) {
   const label = h(
     'div',
     { class: 'tl-lbl' },
-    h('span', { class: 'tl-n' }, bar.number || '—'),
-    h('span', { class: `tl-st t-${bar.tone}` }, status || '—'),
-    h('span', { class: 'tl-ms' }, bar.clockStart),
+    h('span', { class: 'tl-n' }, view.label.number),
+    h('span', { class: `tl-st t-${view.label.tone}` }, view.label.status),
+    h('span', { class: 'tl-ms' }, view.label.time),
+    // Надбавка «не всё показано» — на экране, а не только в тултипе: иначе
+    // обрезанная попытка читается как полная.
+    view.badge ? h('span', { class: 'tl-more', title: view.note || view.title }, view.badge) : null,
   )
   const mini = h('div', { class: 'tl-mini' })
   const stack = h('div', { class: 'tl-stack' })
-  const track = h('div', { class: 'tl-track' }, mini, stack)
-  const layout = bar.calls.length
-    ? layoutCalls(bar.calls, {
-        from: scale.axis.start,
-        to: scale.axis.end,
-        levelH: TL_LEVEL_H,
-        top: TL_TOP,
-        maxLevels: TL_MAX_LEVELS,
-      })
-    : { chips: [], height: TL_COLLAPSED }
-  const full = Math.max(TL_COLLAPSED, layout.height + 8)
-  for (const chip of layout.chips) {
+  for (const tick of view.ticks) {
     mini.append(
       h('span', {
-        class: 'tl-tick',
-        style: `left:${chip.leftPct}%;width:${chip.widthPct}%;background:${toolColor(chip.call.name)}`,
+        class: `tl-tick${tick.unfinished ? ' tl-unfinished' : ''}`,
+        // У оборванного вызова цвет — это цвет контура: заливки у него нет.
+        style: tick.unfinished
+          ? `left:${tick.leftPct}%;width:${tick.widthPct}%;color:${toneVar(tick.tone)}`
+          : `left:${tick.leftPct}%;width:${tick.widthPct}%;background:${toneVar(tick.tone)}`,
       }),
     )
-    stack.append(chipNode(chip, scale))
   }
-  // Раскрытие — чистый CSS по :hover/:focus-within: высота едет к `--tl-full`.
-  // Обработчики не нужны, поэтому же одинаково в вебе и на десктопе.
-  const row = h(
+  for (const chip of view.chips) {
+    stack.append(
+      h('span', {
+        class: `tl-call${chip.unfinished ? ' tl-unfinished' : ''}`,
+        style: chip.unfinished
+          ? `left:${chip.leftPct}%;top:${chip.top}px;width:${chip.widthPct}%;color:${toneVar(chip.tone)}`
+          : `left:${chip.leftPct}%;top:${chip.top}px;width:${chip.widthPct}%;background:${toneVar(chip.tone)}`,
+        title: chip.title,
+        'aria-label': chip.title,
+      }),
+    )
+  }
+  return h(
     'div',
-    { class: 'tl-row', title: bar.title, tabindex: '0', style: `--tl-full:${full}px` },
+    { class: 'tl-row', title: view.title, tabindex: '0', style: `--tl-full:${view.full}px` },
     label,
-    track,
+    h('div', { class: 'tl-track' }, mini, stack),
   )
-  return row
 }
 
 /** Дорожка этапа: имя, значок вида, состояние и строки попыток. */
 function laneNode(lane, bars, scale) {
-  const first = bars[0]
-  const calls = bars.reduce((sum, bar) => sum + bar.calls.length, 0)
-  const meta = [
-    `${bars.length} ${plural(bars.length, 'попытка', 'попытки', 'попыток')}`,
-    calls ? `${calls} ${plural(calls, 'вызов', 'вызова', 'вызовов')}` : '',
-  ]
-    .filter(Boolean)
-    .join(' · ')
+  const view = laneView(lane, bars, scale)
   const head = h(
     'div',
     { class: 'tl-lane-h' },
-    h('span', { class: 'tl-lane-name', title: lane.label }, lane.label),
-    first
+    h('span', { class: 'tl-lane-name', title: view.name }, view.name),
+    view.kind
       ? h(
           'span',
-          { class: `tl-kind tl-kind-${first.kind}`, title: first.kind === 'agent' ? `профиль: ${first.role || '—'}` : first.kind },
-          h('i', { class: 'tl-kind-ico', html: KIND_ICON[first.kind] || KIND_ICON.shell }),
-          first.kind === 'agent' ? first.role || 'профиль' : first.kind,
+          {
+            class: `tl-kind tl-kind-${view.kind}`,
+            title: view.kind === 'agent' ? `профиль: ${view.kindText}` : view.kind,
+          },
+          h(
+            'svg',
+            { class: 'tl-kind-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' },
+            h('path', { d: view.icon }),
+          ),
+          view.kindText,
         )
       : null,
     h('span', { class: 'sp' }),
-    h('span', { class: 'tl-lane-meta' }, meta),
+    h('span', { class: 'tl-lane-meta' }, view.meta),
   )
   return h(
     'div',
     { class: 'tl-lane' },
     head,
-    bars.length
-      ? h('div', { class: 'tl-rows' }, ...bars.map((bar) => attemptRowNode(bar, scale)))
-      : h('div', { class: 'tl-row-empty' }, 'попыток не было'),
+    view.empty
+      ? h('div', { class: 'tl-row-empty' }, 'попыток не было')
+      : h('div', { class: 'tl-rows' }, ...view.rows.map((row) => attemptRowNode(row.view))),
   )
 }
 

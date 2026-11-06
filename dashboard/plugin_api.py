@@ -3089,8 +3089,8 @@ def _own_attempt(row: dict[str, Any], now: int) -> dict[str, Any]:
         # Вызовы инструментов из телеметрии (`attempt_progress`): по паре
         # «старт ↔ результат» на вызов. Без них таймлайн рисует только полосу
         # попытки — а вопрос «что она делала» остаётся без ответа.
-        "calls": row["calls"],
-        "calls_omitted": row["calls_omitted"],
+        "calls": row.get("calls") or [],
+        "calls_omitted": row.get("calls_omitted") or 0,
         # Событий доски у своей попытки нет: шаги процесса считаны числом
         # (`progress`), а не подставлены чужими по виду строками.
         "events": [],

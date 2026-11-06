@@ -728,6 +728,21 @@ pre.body {
 .tl-st.t-red { color: var(--danger); }
 .tl-st.t-yellow { color: var(--warn); }
 .tl-st.t-blue { color: var(--accent); }
+.tl-more {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 9.5px;
+  font-weight: 700;
+  color: var(--warn);
+  padding: 0 3px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--warn) 16%, transparent);
+}
+/* Вызов без результата: полый чип — длительности нет, а не ноль. */
+.tl-call.tl-unfinished, .tl-tick.tl-unfinished {
+  background: transparent !important;
+  box-shadow: inset 0 0 0 1.5px currentColor !important;
+  opacity: .9;
+}
 .tl-ms { font-family: var(--mono); font-size: 10px; color: var(--text-3); }
 
 .tl-track { position: relative; height: 100%; }

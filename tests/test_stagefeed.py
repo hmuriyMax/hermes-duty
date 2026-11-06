@@ -832,3 +832,43 @@ def test_now_gate_question_shows_options_from_the_pool(home):
     assert "вопрос #284" in waiting["evidence"]
     assert "варианты: да, нет" in waiting["evidence"]
     assert "/imsg" in waiting["evidence"]
+
+
+def test_чужая_фаза_не_съедает_открытый_вызов():
+    """Фаза вне {tool_use, tool_result} вызовов не описывает.
+
+    `attempt_progress` пишет и `thinking`/`message`. Раньше любая такая запись
+    считалась результатом: она закрывала открытый вызов (или делала вызов с
+    пустым именем), и настоящий результат уже не находил пары.
+    """
+    calls, omitted = stagefeed._calls(
+        [
+            {"seq": 1, "phase": "tool_use", "name": "read_file", "ts": NOW},
+            {"seq": 2, "phase": "thinking", "ts": NOW + 1},
+            {"seq": 3, "phase": "tool_result", "name": "read_file", "ts": NOW + 2, "duration_ms": 1900},
+        ]
+    )
+    assert omitted == 0
+    # Начало считается назад от конца: (NOW + 2) − 1.9 s. Секунды журнала целые,
+    # поэтому и результат дробный — это факт о точности журнала, не о тесте.
+    assert calls == [{"seq": 1, "name": "read_file", "at": NOW + 0.1, "ms": 1900}]
+
+
+def test_результат_с_чужим_именем_не_забирает_чужой_вызов():
+    """Рассинхрон имён — сирота, а не повод закрыть другой вызов.
+
+    Пара ищется по имени; если имени нет среди открытых, прежний `index = 0`
+    приписывал `duration_ms` другому инструменту, и настоящий вызов исчезал.
+    """
+    calls, _ = stagefeed._calls(
+        [
+            {"seq": 1, "phase": "tool_use", "name": "read_file", "ts": NOW},
+            {"seq": 2, "phase": "tool_result", "name": "terminal", "ts": NOW + 1, "duration_ms": 1000},
+            {"seq": 3, "phase": "tool_result", "name": "read_file", "ts": NOW + 3, "duration_ms": 3000},
+        ]
+    )
+    by_name = {call["name"]: call for call in calls}
+    # Оба инструмента на месте, и длительности у каждого свои.
+    assert by_name["read_file"]["ms"] == 3000
+    assert by_name["terminal"]["ms"] == 1000
+    assert by_name["terminal"]["at"] == NOW

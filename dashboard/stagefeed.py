@@ -285,13 +285,19 @@ def _calls(payloads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
         if phase == "tool_use":
             open_uses.append({"seq": _int(item.get("seq")), "name": name, "at": at})
             continue
+        # Прочие фазы (`thinking`, `message`, что угодно из будущих версий) вызовов
+        # не описывают: закрывать ими открытый вызов значило бы съесть чужой
+        # факт, а делать из них вызов — нарисовать несуществующий.
+        if phase != "tool_result":
+            continue
         duration = _maybe_int(item.get("duration_ms"))
         index = next((i for i, use in enumerate(open_uses) if use["name"] == name), None)
-        if index is None and open_uses:
-            index = 0
         if index is None:
-            # Результат без начала: вызов начался до журнала (или старт потерян).
-            out.append({"seq": _int(item.get("seq")), "name": name, "at": at, "ms": duration})
+            # Результат без своего начала: старт потерян или имя разошлось.
+            # Это сирота — с именем из результата и посчитанным началом, а не
+            # повод забрать чужой открытый вызов (`index=0` терял настоящий).
+            start = at if duration is None else round(at - duration / 1000.0, 3)
+            out.append({"seq": _int(item.get("seq")), "name": name, "at": start, "ms": duration})
             continue
         use = open_uses.pop(index)
         start = at if duration is None else round(at - duration / 1000.0, 3)

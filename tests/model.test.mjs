@@ -27,6 +27,8 @@ import {
   humanCounts,
   humanLine,
   noticeLines,
+  attemptView,
+  laneView,
   layoutCalls,
   outcomeTone,
   repoLabel,
@@ -1190,4 +1192,106 @@ test('раскладка вызовов: без оси рисовать нече
   assert.equal(chips.length, 1)
   assert.equal(chips[0].leftPct, 10)
   assert.ok(chips[0].widthPct > 0 && chips[0].widthPct < 2)
+})
+
+
+/* ------------------------------------- вид таймлайна: общее для двух поверхностей */
+
+/** Попытка в форме шейпера: минимум полей, которые читает вид. */
+function bar(calls, extra = {}) {
+  return {
+    number: '#1',
+    tone: 'green',
+    open: false,
+    outcomeText: 'готово',
+    clockStart: '13:38:02',
+    title: 'check · попытка #1',
+    calls: shapeCalls(calls || []),
+    callsOmitted: 0,
+    ...extra,
+  }
+}
+
+const axis = { axis: { start: 0, end: 10 } }
+
+test('обрезанные вызовы видны на экране, а не только в данных', () => {
+  const view = attemptView(bar([{ name: 'read_file', at: 1, ms: 100 }], { callsOmitted: 3 }), axis)
+  // Нарисовано ровно то, что пришло; остальное названо надбавкой.
+  assert.equal(view.chips.length, 1)
+  assert.equal(view.badge, '+3')
+  assert.match(view.note, /ещё 3 вызова не показано/)
+  assert.match(view.title, /не показано/)
+})
+
+test('вызов без результата ≠ вызов длиной 0 мс', () => {
+  const unfinished = attemptView(bar([{ name: 'terminal', at: 1, ms: null }]), axis)
+  const instant = attemptView(bar([{ name: 'terminal', at: 1, ms: 0 }]), axis)
+  assert.equal(unfinished.chips[0].unfinished, true)
+  assert.equal(instant.chips[0].unfinished, false)
+  assert.notEqual(unfinished.chips[0].widthPct, instant.chips[0].widthPct)
+})
+
+test('попытка без поля calls не роняет вид', () => {
+  const broken = bar([])
+  delete broken.calls
+  const view = attemptView(broken, axis)
+  assert.deepEqual(view.chips, [])
+  assert.deepEqual(view.ticks, [])
+  assert.equal(view.badge, '')
+})
+
+test('нехватка уровней названа, а не спрятана', () => {
+  // Двенадцать вызовов в одном и том же месте: уровней пять, остальные лягут
+  // друг на друга — и это число обязано быть на экране.
+  const calls = Array.from({ length: 12 }, (_, index) => ({ name: 'read_file', at: 1, ms: 100 + index }))
+  const view = attemptView(bar(calls), axis)
+  assert.match(view.badge, /⋯/)
+  assert.match(view.note, /уровней не хватило/)
+})
+
+test('сводка дорожки считает всё, включая невидимое', () => {
+  const bars = [
+    bar([{ name: 'read_file', at: 1, ms: 100 }], { callsOmitted: 4 }),
+    bar([{ name: 'patch', at: 2, ms: 200 }], { number: '#2' }),
+  ]
+  const view = laneView({ label: 'review' }, bars, axis)
+  // Шесть вызовов было, показано два: сводка называет оба числа.
+  assert.match(view.meta, /6 вызовов \(показано 2\)/)
+  assert.match(view.meta, /2 попытки/)
+  assert.equal(view.rows.length, 2)
+  assert.equal(view.kind, 'agent')
+  assert.match(view.meta, /попытки/)
+})
+
+test('склонение одно на обе поверхности', () => {
+  const three = laneView({ label: 'check' }, [bar([]), bar([]), bar([])], axis)
+  assert.match(three.meta, /3 попытки/)
+  const many = laneView({ label: 'check' }, Array.from({ length: 5 }, () => bar([])), axis)
+  assert.match(many.meta, /5 попыток/)
+  assert.doesNotMatch(three.meta, /попыток/)
+})
+
+test('пустая дорожка говорит об этом словами, а не пустотой', () => {
+  const view = laneView({ label: 'verify' }, [], axis)
+  assert.equal(view.empty, true)
+  assert.equal(view.icon, '')
+  assert.deepEqual(view.rows, [])
+})
+
+test('обе поверхности берут геометрию и склонения из шейпера', () => {
+  const shaper = readFileSync(new URL('../desktop/model.js', import.meta.url), 'utf8')
+  for (const [name, file] of [
+    ['веб', '../dashboard/web/app.js'],
+    ['десктоп', '../desktop/plugin.js'],
+  ]) {
+    const raw = readFileSync(new URL(file, import.meta.url), 'utf8')
+    // У десктопа шейпер вшит блоком `duty:model-*` — там свои константы законны.
+    // Проверяем то, что написано руками ВОКРУГ блока.
+    const text = raw.replace(/\/\/ duty:model-start[\s\S]*?\/\/ duty:model-end/, '')
+    assert.ok(!/^const TL_/m.test(text), `${name}: своя геометрия TL_* вместо шейпера`)
+    assert.ok(!/const TOOL_TONE/.test(text), `${name}: своя палитра инструментов`)
+    assert.ok(!/function plural\(/.test(text), `${name}: своё склонение вместо plural из шейпера`)
+    assert.ok(/attemptView|laneView/.test(text), `${name}: вид таймлайна не из шейпера`)
+  }
+  assert.ok(/function attemptView\(/.test(shaper))
 })

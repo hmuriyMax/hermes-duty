@@ -17,7 +17,7 @@ duty: cards-and-finished
 repo: ~/.hermes/plugins/hermes-duty
 base: release/v0.0.7
 
-budget: {tokens: 1500000, minutes: 300}
+budget: {minutes: 300}
 
 stages:
   - id: impl-cards
@@ -27,7 +27,7 @@ stages:
       - {cmd: "env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python3 -m pytest tests/test_health.py tests/test_budget.py -q", must: 0, timeout_sec: 600}
       - {cmd: "node --test tests/model.test.mjs", must: 0, timeout_sec: 300}
     retry: {max: 1, on: [infra, contract]}
-    budget: {tokens: 500000, minutes: 90}
+    budget: {minutes: 90}
 
   - id: impl-finished
     role: implementer
@@ -37,8 +37,10 @@ stages:
       - {cmd: "env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python3 -m pytest tests/ -q", must: 0, timeout_sec: 900}
       - {cmd: "node --test tests/model.test.mjs", must: 0, timeout_sec: 300}
       - {cmd: "env -u PYTHONPATH bin/duty-model-sync --check", must: 0, timeout_sec: 120}
-    retry: {max: 1, on: [infra, contract]}
-    budget: {tokens: 600000, minutes: 120}
+    # Три, а не одна: эта попытка умирает не от своего кода, а от внешних kill
+    # (рестарт бэкенда, снятый прогон), и каждая такая смерть — `infra`.
+    retry: {max: 3, on: [infra, contract]}
+    budget: {minutes: 120}
 
   # Прогоны повторяются командой в дереве: агент уже сказал «готово», а доказательство —
   # это повторный запуск, а не отчёт.

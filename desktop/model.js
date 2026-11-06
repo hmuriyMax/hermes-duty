@@ -945,6 +945,18 @@ const MARKER_META = {
 }
 
 /**
+ * Ряды под шкалой: маркеры разложены по смыслу, а не сыпятся в одну полосу
+ * вперемешку с засечками попыток. У каждого ряда своя подпись слева — так
+ * «вердикты» и «вопросы человеку» читаются как строки, а не как шум.
+ */
+const MARK_ROWS = [
+  { key: 'verdicts', label: 'вердикты', types: ['verdict', 'budget'] },
+  { key: 'questions', label: 'вопросы', types: ['question', 'answer'] },
+  { key: 'lifecycle', label: 'публикация', types: ['published', 'closed'] },
+  { key: 'attempts', label: 'попытки', types: ['started', 'ended'] },
+]
+
+/**
  * Вид маркера по событию журнала; пусто — маркера нет.
  *
  * Гейт и отказ по бюджету узнаются по причине из `attempt_ended`
@@ -1099,6 +1111,9 @@ function layoutCalls(calls, options) {
 
 // Геометрия строки: свёрнутая полоса, шаг уровня, отступ сверху, потолок уровней
 // и запас под раскрытую карту. Числа живут здесь, а не в двух файлах.
+/** Геометрия узла графа спеки: одна на обе поверхности. */
+const SPEC_NODE = { w: 108, h: 26, gapX: 26, gapY: 10 }
+
 const TL = { collapsed: 20, levelH: 12, top: 6, maxLevels: 5, pad: 8 }
 
 // Тон вызова — семантический ключ («чтение», «правка», «запуск», «внешнее»), а не
@@ -1151,13 +1166,25 @@ function attemptView(bar, scale) {
   if (clipped) notes.push(`${fmtCount(clipped)} ${plural(clipped, 'вызов', 'вызова', 'вызовов')} наложено: уровней не хватило`)
   const chips = layout.chips.map((chip) => {
     const call = chip.call || {}
+    // Подсказка и инспектор читают одни и те же поля: имя инструмента, время
+    // начала и длительность. Поверхность ничего не досчитывает.
+    const tip = `${call.name || '—'} · ${call.clock || '—'} · ${call.msText || '—'}`
     return {
+      // Идентификатор вызова — ключ выбора в инспекторе (`stage:attempt:seq`).
+      id: `${b.stage || '—'}:${b.number || '—'}:${call.seq === null || call.seq === undefined ? '—' : call.seq}`,
+      name: call.name || '—',
+      clock: call.clock || '—',
+      msText: call.msText || '—',
+      seq: call.seq === null || call.seq === undefined ? null : call.seq,
+      stage: b.stage || '—',
+      attempt: b.number || '—',
       leftPct: chip.leftPct,
       widthPct: chip.widthPct,
       top: chip.top,
       tone: toolTone(call.name),
       unfinished: chip.unfinished === true,
-      title: `${call.name || '—'} · ${call.clock || '—'} · ${call.msText || '—'}`,
+      tip,
+      title: tip,
     }
   })
   const status = b.outcomeText || (b.open ? b.leaseText : b.outcome || b.status || b.durationText)
@@ -1252,6 +1279,8 @@ function attemptBar(attempt, crashes) {
     // и разницу называет `callsText`.
     calls: shapeCalls(a.calls),
     callsOmitted: numOrNull(a.calls_omitted) || 0,
+    // Израсходовано токенов, если телеметрия их записала: `null` — не «ноль».
+    tokens: numOrNull(a.tokens),
     callsText: '',
     outcome: String(a.outcome || ''),
     status: String(a.status || ''),
@@ -1402,6 +1431,59 @@ function journalBars(events, crashes) {
  * публикация — блоком `published`, закрытие — блоком `closed`; здесь только
  * раскладка по словам и процентам.
  */
+/**
+ * Граф спеки: узлы — этапы, рёбра — `needs`. Считается здесь, а не на
+ * поверхностях: обе рисуют одни и те же координаты, поэтому картинка не может
+ * «поехать» на одной из них. Глубина узла — самый длинный путь от корня, так что
+ * этап встаёт правее всех, после кого он ждёт.
+ */
+function specView(rawStages) {
+  const stages = (Array.isArray(rawStages) ? rawStages : []).map(shapeStage)
+  if (!stages.length) return null
+  const byId = new Map(stages.map((stage) => [stage.id, stage]))
+  const depths = new Map()
+  const depthOf = (id, trail) => {
+    if (depths.has(id)) return depths.get(id)
+    // Цикл в `needs` — не повод падать: этап встаёт на первый уровень.
+    if (trail.has(id)) return 0
+    trail.add(id)
+    const stage = byId.get(id)
+    const needs = stage ? stage.needs.filter((need) => byId.has(need)) : []
+    const depth = needs.length ? Math.max(...needs.map((need) => depthOf(need, trail) + 1)) : 0
+    trail.delete(id)
+    depths.set(id, depth)
+    return depth
+  }
+  const columns = []
+  const nodes = stages.map((stage) => {
+    const depth = depthOf(stage.id, new Set())
+    const row = columns[depth] === undefined ? 0 : columns[depth]
+    columns[depth] = row + 1
+    return {
+      id: stage.id,
+      role: stage.role,
+      label: stage.stateLabel,
+      tone: stage.tone,
+      kind: stage.kind || 'agent',
+      needsText: stage.needsText,
+      depth,
+      row,
+      x: depth * (SPEC_NODE.w + SPEC_NODE.gapX),
+      y: row * (SPEC_NODE.h + SPEC_NODE.gapY),
+    }
+  })
+  const edges = []
+  for (const stage of stages) {
+    for (const need of stage.needs) {
+      if (!byId.has(need)) continue
+      edges.push({ from: need, to: stage.id })
+    }
+  }
+  const width = Math.max(...nodes.map((node) => node.x + SPEC_NODE.w))
+  const height = Math.max(...nodes.map((node) => node.y + SPEC_NODE.h))
+  return { nodes, edges, width, height, nodeW: SPEC_NODE.w, nodeH: SPEC_NODE.h }
+}
+
 function shapeDealTime(detail, attemptsPayload) {
   const d = detail && typeof detail === 'object' ? detail : {}
   const a = attemptsPayload && typeof attemptsPayload === 'object' ? attemptsPayload : {}
@@ -1614,6 +1696,35 @@ function shapeDealTime(detail, attemptsPayload) {
     }
     axisTicks.push({ pct: 100, edge: 'кон.', align: 'end', clock: fmtClock(axisEnd) })
   }
+  // KPI-строка (макет `d-merge`): пять чисел шапки, все — суммы по уже собранным
+  // полосам и попыткам. Токены показываем только когда их записала телеметрия:
+  // «—» здесь честнее нуля.
+  const callsShown = bars.reduce((sum, bar) => sum + bar.calls.length, 0)
+  const callsHidden = bars.reduce((sum, bar) => sum + (bar.callsOmitted || 0), 0)
+  const tokensKnown = bars.some((bar) => bar.tokens !== null && bar.tokens !== undefined)
+  const tokensTotal = bars.reduce((sum, bar) => sum + (numOrNull(bar.tokens) || 0), 0)
+  const kpi = [
+    { key: 'duration', label: 'длительность', value: durationSec === null ? '—' : fmtDuration(durationSec) },
+    { key: 'stages', label: 'этапов', value: fmtCount(lanes.filter((lane) => lane.count > 0).length) },
+    { key: 'attempts', label: 'попыток', value: fmtCount(bars.length) },
+    {
+      key: 'calls',
+      label: 'вызовов',
+      value: callsShown + callsHidden > 0 ? fmtCount(callsShown + callsHidden) : '—',
+      note: callsHidden > 0 ? `показано ${fmtCount(callsShown)}` : '',
+    },
+    tokensKnown
+      ? { key: 'tokens', label: 'токенов', value: fmtCount(tokensTotal) }
+      : { key: 'tokens', label: 'токенов', value: '—', note: 'телеметрия не писала' },
+  ]
+
+  // Ряды маркеров: вердикты, вопросы человеку, публикация, засечки попыток.
+  const marks = MARK_ROWS.map((row) => ({
+    key: row.key,
+    label: row.label,
+    items: markers.filter((marker) => row.types.indexOf(marker.type) >= 0),
+  })).filter((row) => row.items.length > 0)
+
   return {
     now,
     live,
@@ -1629,6 +1740,10 @@ function shapeDealTime(detail, attemptsPayload) {
     lanes,
     bars,
     markers,
+    marks,
+    kpi,
+    // Граф спеки — из `stages[]` ответа `/deal`; нет этапов — нет и графа.
+    spec: specView(d.stages),
     facts: {
       attempts: {
         total: bars.length,

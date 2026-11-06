@@ -62,7 +62,7 @@ const humanEl = document.getElementById('human')
 // HTML-namespace, и браузер его не рисует вовсе. Ошибка не видна в разметке, и
 // именно поэтому список назван явно, а не выводится из имени тега.
 const SVG_NS = 'http://www.w3.org/2000/svg'
-const SVG_TAGS = new Set(['svg', 'path', 'circle', 'rect', 'line', 'polyline', 'g', 'use'])
+const SVG_TAGS = new Set(['svg', 'path', 'circle', 'rect', 'line', 'polyline', 'g', 'use', 'text'])
 
 function h(tag, props, ...children) {
   const el = SVG_TAGS.has(tag) ? document.createElementNS(SVG_NS, tag) : document.createElement(tag)
@@ -1182,8 +1182,14 @@ function attemptRowNode(view) {
         style: chip.unfinished
           ? `left:${chip.leftPct}%;top:${chip.top}px;width:${chip.widthPct}%;color:${toneVar(chip.tone)}`
           : `left:${chip.leftPct}%;top:${chip.top}px;width:${chip.widthPct}%;background:${toneVar(chip.tone)}`,
-        title: chip.title,
-        'aria-label': chip.title,
+        // Подсказка — своим слоем (`data-tip`), а не системным `title`:
+        // у нативного тултипа задержка в секунду, и на 10-пиксельном чипе его
+        // никто не дождётся. `title` не ставим, чтобы не было двух подсказок.
+        'data-tip': chip.tip,
+        role: 'button',
+        tabindex: '-1',
+        'aria-label': chip.tip,
+        'data-call-id': chip.id,
       }),
     )
   }
@@ -1230,11 +1236,163 @@ function laneNode(lane, bars, scale) {
   )
 }
 
+// Выбранный вызов и его данные: выбор живёт на экране «Дело» и переживает
+// перерисовку панели. Ключ — `stage:attempt:seq` из шейпера, индекс собирается
+// при отрисовке шкалы: у поверхности нет своего знания о вызовах.
+let dutySelectedCallId = ''
+const dutyCallIndex = new Map()
+
+/** Выбранный вызов или `null`; индекс наполняет `scalePanel`. */
+function selectedCall() {
+  return dutySelectedCallId ? dutyCallIndex.get(dutySelectedCallId) || null : null
+}
+
+/** KPI-строка дела: пять чисел шапки, все — из шейпера (`scale.kpi`). */
+function kpiStrip(scale) {
+  return h(
+    'div',
+    { class: 'duty-kpi' },
+    ...scale.kpi.map((item) =>
+      h(
+        'div',
+        { class: 'duty-kpi-cell' },
+        h('span', { class: 'duty-kpi-v' }, item.value),
+        h('span', { class: 'duty-kpi-l' }, item.label),
+        item.note ? h('span', { class: 'duty-kpi-n' }, item.note) : null,
+      ),
+    ),
+  )
+}
+
+/**
+ * Инспектор вызова: что за инструмент, когда начался, сколько шёл.
+ *
+ * Экран показывает факты вызова, а не «открывает» попытку второй раз: строка
+ * попытки остаётся свёрнутой, развёртка живёт только под указателем.
+ */
+function inspectorNode(call) {
+  if (!call) {
+    return h('div', { class: 'tl-insp empty' }, 'выбери вызов на дорожке — покажу инструмент, начало и длительность')
+  }
+  return h(
+    'div',
+    { class: 'tl-insp' },
+    h('span', { class: `tl-insp-dot t-${call.tone}` }),
+    h('b', null, call.name),
+    h('span', { class: 'mono muted' }, call.clock),
+    h('span', null, call.msText),
+    h('span', { class: 'muted' }, `${call.stage} · попытка ${call.attempt}${call.seq === null ? '' : ` · вызов ${call.seq}`}`),
+  )
+}
+
+/** Ряды маркеров: вердикты, вопросы человеку, публикация, засечки попыток. */
+function marksRows(scale) {
+  if (!scale.marks.length) return null
+  return h(
+    'div',
+    { class: 'scale-marks' },
+    ...scale.marks.map((row) =>
+      h(
+        'div',
+        { class: 'smk-row' },
+        h('span', { class: 'smk-name' }, row.label),
+        h(
+          'div',
+          { class: 'smk-line' },
+          ...row.items.map((marker) => {
+            const wait =
+              marker.waitPct > 0
+                ? h('span', {
+                    class: `smk-wait t-${marker.tone}`,
+                    style: `left:${marker.pct}%;width:${marker.waitPct}%`,
+                    title: `${marker.clock} → сейчас: ${marker.waitText}`,
+                  })
+                : null
+            const mark = h(
+              'span',
+              {
+                class: `smk t-${marker.tone}${marker.tick ? ' tick' : ''}`,
+                style: `left:${marker.pct}%`,
+                'data-tip': marker.title,
+                'aria-label': marker.ariaLabel,
+              },
+              h('i'),
+            )
+            return wait ? h('span', null, wait, mark) : mark
+          }),
+        ),
+      ),
+    ),
+  )
+}
+
+/**
+ * Граф спеки: узлы-этапы и рёбра `needs`.
+ *
+ * Координаты приходят из шейпера (`scale.spec`), поэтому веб и десктоп рисуют
+ * одну картинку. Здесь только `svg` из элементов правильного namespace.
+ */
+function specPanel(spec) {
+  if (!spec) return null
+  const pos = new Map(spec.nodes.map((node) => [node.id, node]))
+  const edges = spec.edges
+    .map((edge) => {
+      const from = pos.get(edge.from)
+      const to = pos.get(edge.to)
+      if (!from || !to) return null
+      const x1 = from.x + spec.nodeW
+      const y1 = from.y + spec.nodeH / 2
+      const x2 = to.x
+      const y2 = to.y + spec.nodeH / 2
+      const mid = Math.round((x1 + x2) / 2)
+      return h('path', {
+        class: 'spec-edge',
+        d: `M${x1},${y1} C${mid},${y1} ${mid},${y2} ${x2},${y2}`,
+      })
+    })
+    .filter(Boolean)
+  return h(
+    'div',
+    { class: 'panel', style: 'margin-bottom:14px' },
+    h('div', { class: 'panel-h' }, `граф спеки · этапов ${spec.nodes.length}, связей ${spec.edges.length}`),
+    h(
+      'div',
+      { class: 'panel-b' },
+      h(
+        'svg',
+        {
+          class: 'spec-graph',
+          viewBox: `0 0 ${spec.width} ${spec.height}`,
+          width: spec.width,
+          height: spec.height,
+          role: 'img',
+          'aria-label': 'граф этапов',
+        },
+        ...edges,
+        ...spec.nodes.map((node) =>
+          h(
+            'g',
+            { class: `spec-node t-${node.tone}` },
+            h('rect', { x: node.x, y: node.y, width: spec.nodeW, height: spec.nodeH, rx: 6 }),
+            h('text', { x: node.x + 8, y: node.y + spec.nodeH / 2 + 4, class: 'spec-id' }, node.id),
+            h('text', { x: node.x + spec.nodeW - 8, y: node.y + spec.nodeH / 2 + 4, class: 'spec-st', 'text-anchor': 'end' }, node.label),
+          ),
+        ),
+      ),
+    ),
+  )
+}
+
 /**
  * Панель шкалы времени: подписанная ось, дорожка на этап, полосы попыток и лента
  * маркеров. Геометрия приходит посчитанной (`shapeDealTime`); здесь только DOM.
  */
 function scalePanel(scale) {
+  // Индекс вызовов: чип и инспектор читают один и тот же вид (`attemptView`).
+  dutyCallIndex.clear()
+  for (const bar of scale.bars) {
+    for (const chip of attemptView(bar, scale).chips) dutyCallIndex.set(chip.id, chip)
+  }
   if (scale.empty) {
     return h(
       'div',
@@ -1243,7 +1401,7 @@ function scalePanel(scale) {
       h('div', { class: 'panel-b muted' }, 'событий и попыток нет: рисовать нечего'),
     )
   }
-  return h(
+  const panel = h(
     'div',
     { class: 'panel', style: 'margin-bottom:14px' },
     h('div', { class: 'panel-h' }, `шкала времени · ${scale.axis.text}`),
@@ -1289,30 +1447,26 @@ function scalePanel(scale) {
         ),
         ),
       ),
-      scale.markers.length
-        ? h(
-            'div',
-            { class: 'scale-markers' },
-            ...scale.markers.map((marker, index) =>
-              marker.waitPct > 0
-                ? h(
-                    'span',
-                    {
-                      class: 'scale-wait t-yellow',
-                      style: `left:${marker.pct}%;width:${marker.waitPct}%`,
-                      title: `${marker.clock} → сейчас: ${marker.waitText}`,
-                    },
-                    h('span', { class: 'scale-wait-k' }, marker.waitText),
-                  )
-                : null,
-            ),
-            ...scale.markers.map(markerNode),
-          )
-        : null,
+      marksRows(scale),
+      h('div', { class: 'tl-insp-host' }, inspectorNode(selectedCall(scale))),
       markerLegend(scale),
       scale.facts.attempts.journal ? h('div', { class: 'muted' }, 'полосы собраны из журнала: ответ попыток пуст') : null,
     ),
   )
+  // Клик по вызову выбирает его, но не разворачивает строку попытки: развёртка
+  // живёт под указателем, а выбор — в инспекторе под шкалой.
+  panel.addEventListener('click', (event) => {
+    const chip = event.target.closest && event.target.closest('.tl-call')
+    const host = panel.querySelector('.tl-insp-host')
+    if (!chip || !host) return
+    const id = chip.getAttribute('data-call-id') || ''
+    dutySelectedCallId = dutySelectedCallId === id ? '' : id
+    for (const el of panel.querySelectorAll('.tl-call.tl-sel')) el.classList.remove('tl-sel')
+    if (dutySelectedCallId) chip.classList.add('tl-sel')
+    host.replaceChildren(inspectorNode(selectedCall()))
+    if (document.activeElement && document.activeElement.blur) document.activeElement.blur()
+  })
+  return panel
 }
 
 function attemptCard(attempt) {
@@ -1415,7 +1569,9 @@ function viewDeal(dealId) {
     null,
     h('div', { style: 'margin-bottom:10px' }, h('a', { href: '#/deal' }, '← к списку дел')),
     head,
+    kpiStrip(scale),
     scalePanel(scale),
+    specPanel(scale.spec),
     stageFeedPanel(data),
     h('div', { class: 'two-col' }, left, right),
   )

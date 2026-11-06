@@ -994,6 +994,18 @@ const MARKER_META = {
 }
 
 /**
+ * Ряды под шкалой: маркеры разложены по смыслу, а не сыпятся в одну полосу
+ * вперемешку с засечками попыток. У каждого ряда своя подпись слева — так
+ * «вердикты» и «вопросы человеку» читаются как строки, а не как шум.
+ */
+const MARK_ROWS = [
+  { key: 'verdicts', label: 'вердикты', types: ['verdict', 'budget'] },
+  { key: 'questions', label: 'вопросы', types: ['question', 'answer'] },
+  { key: 'lifecycle', label: 'публикация', types: ['published', 'closed'] },
+  { key: 'attempts', label: 'попытки', types: ['started', 'ended'] },
+]
+
+/**
  * Вид маркера по событию журнала; пусто — маркера нет.
  *
  * Гейт и отказ по бюджету узнаются по причине из `attempt_ended`
@@ -1148,6 +1160,9 @@ function layoutCalls(calls, options) {
 
 // Геометрия строки: свёрнутая полоса, шаг уровня, отступ сверху, потолок уровней
 // и запас под раскрытую карту. Числа живут здесь, а не в двух файлах.
+/** Геометрия узла графа спеки: одна на обе поверхности. */
+const SPEC_NODE = { w: 108, h: 26, gapX: 26, gapY: 10 }
+
 const TL = { collapsed: 20, levelH: 12, top: 6, maxLevels: 5, pad: 8 }
 
 // Тон вызова — семантический ключ («чтение», «правка», «запуск», «внешнее»), а не
@@ -1200,13 +1215,25 @@ function attemptView(bar, scale) {
   if (clipped) notes.push(`${fmtCount(clipped)} ${plural(clipped, 'вызов', 'вызова', 'вызовов')} наложено: уровней не хватило`)
   const chips = layout.chips.map((chip) => {
     const call = chip.call || {}
+    // Подсказка и инспектор читают одни и те же поля: имя инструмента, время
+    // начала и длительность. Поверхность ничего не досчитывает.
+    const tip = `${call.name || '—'} · ${call.clock || '—'} · ${call.msText || '—'}`
     return {
+      // Идентификатор вызова — ключ выбора в инспекторе (`stage:attempt:seq`).
+      id: `${b.stage || '—'}:${b.number || '—'}:${call.seq === null || call.seq === undefined ? '—' : call.seq}`,
+      name: call.name || '—',
+      clock: call.clock || '—',
+      msText: call.msText || '—',
+      seq: call.seq === null || call.seq === undefined ? null : call.seq,
+      stage: b.stage || '—',
+      attempt: b.number || '—',
       leftPct: chip.leftPct,
       widthPct: chip.widthPct,
       top: chip.top,
       tone: toolTone(call.name),
       unfinished: chip.unfinished === true,
-      title: `${call.name || '—'} · ${call.clock || '—'} · ${call.msText || '—'}`,
+      tip,
+      title: tip,
     }
   })
   const status = b.outcomeText || (b.open ? b.leaseText : b.outcome || b.status || b.durationText)
@@ -1301,6 +1328,8 @@ function attemptBar(attempt, crashes) {
     // и разницу называет `callsText`.
     calls: shapeCalls(a.calls),
     callsOmitted: numOrNull(a.calls_omitted) || 0,
+    // Израсходовано токенов, если телеметрия их записала: `null` — не «ноль».
+    tokens: numOrNull(a.tokens),
     callsText: '',
     outcome: String(a.outcome || ''),
     status: String(a.status || ''),
@@ -1451,6 +1480,59 @@ function journalBars(events, crashes) {
  * публикация — блоком `published`, закрытие — блоком `closed`; здесь только
  * раскладка по словам и процентам.
  */
+/**
+ * Граф спеки: узлы — этапы, рёбра — `needs`. Считается здесь, а не на
+ * поверхностях: обе рисуют одни и те же координаты, поэтому картинка не может
+ * «поехать» на одной из них. Глубина узла — самый длинный путь от корня, так что
+ * этап встаёт правее всех, после кого он ждёт.
+ */
+function specView(rawStages) {
+  const stages = (Array.isArray(rawStages) ? rawStages : []).map(shapeStage)
+  if (!stages.length) return null
+  const byId = new Map(stages.map((stage) => [stage.id, stage]))
+  const depths = new Map()
+  const depthOf = (id, trail) => {
+    if (depths.has(id)) return depths.get(id)
+    // Цикл в `needs` — не повод падать: этап встаёт на первый уровень.
+    if (trail.has(id)) return 0
+    trail.add(id)
+    const stage = byId.get(id)
+    const needs = stage ? stage.needs.filter((need) => byId.has(need)) : []
+    const depth = needs.length ? Math.max(...needs.map((need) => depthOf(need, trail) + 1)) : 0
+    trail.delete(id)
+    depths.set(id, depth)
+    return depth
+  }
+  const columns = []
+  const nodes = stages.map((stage) => {
+    const depth = depthOf(stage.id, new Set())
+    const row = columns[depth] === undefined ? 0 : columns[depth]
+    columns[depth] = row + 1
+    return {
+      id: stage.id,
+      role: stage.role,
+      label: stage.stateLabel,
+      tone: stage.tone,
+      kind: stage.kind || 'agent',
+      needsText: stage.needsText,
+      depth,
+      row,
+      x: depth * (SPEC_NODE.w + SPEC_NODE.gapX),
+      y: row * (SPEC_NODE.h + SPEC_NODE.gapY),
+    }
+  })
+  const edges = []
+  for (const stage of stages) {
+    for (const need of stage.needs) {
+      if (!byId.has(need)) continue
+      edges.push({ from: need, to: stage.id })
+    }
+  }
+  const width = Math.max(...nodes.map((node) => node.x + SPEC_NODE.w))
+  const height = Math.max(...nodes.map((node) => node.y + SPEC_NODE.h))
+  return { nodes, edges, width, height, nodeW: SPEC_NODE.w, nodeH: SPEC_NODE.h }
+}
+
 function shapeDealTime(detail, attemptsPayload) {
   const d = detail && typeof detail === 'object' ? detail : {}
   const a = attemptsPayload && typeof attemptsPayload === 'object' ? attemptsPayload : {}
@@ -1663,6 +1745,35 @@ function shapeDealTime(detail, attemptsPayload) {
     }
     axisTicks.push({ pct: 100, edge: 'кон.', align: 'end', clock: fmtClock(axisEnd) })
   }
+  // KPI-строка (макет `d-merge`): пять чисел шапки, все — суммы по уже собранным
+  // полосам и попыткам. Токены показываем только когда их записала телеметрия:
+  // «—» здесь честнее нуля.
+  const callsShown = bars.reduce((sum, bar) => sum + bar.calls.length, 0)
+  const callsHidden = bars.reduce((sum, bar) => sum + (bar.callsOmitted || 0), 0)
+  const tokensKnown = bars.some((bar) => bar.tokens !== null && bar.tokens !== undefined)
+  const tokensTotal = bars.reduce((sum, bar) => sum + (numOrNull(bar.tokens) || 0), 0)
+  const kpi = [
+    { key: 'duration', label: 'длительность', value: durationSec === null ? '—' : fmtDuration(durationSec) },
+    { key: 'stages', label: 'этапов', value: fmtCount(lanes.filter((lane) => lane.count > 0).length) },
+    { key: 'attempts', label: 'попыток', value: fmtCount(bars.length) },
+    {
+      key: 'calls',
+      label: 'вызовов',
+      value: callsShown + callsHidden > 0 ? fmtCount(callsShown + callsHidden) : '—',
+      note: callsHidden > 0 ? `показано ${fmtCount(callsShown)}` : '',
+    },
+    tokensKnown
+      ? { key: 'tokens', label: 'токенов', value: fmtCount(tokensTotal) }
+      : { key: 'tokens', label: 'токенов', value: '—', note: 'телеметрия не писала' },
+  ]
+
+  // Ряды маркеров: вердикты, вопросы человеку, публикация, засечки попыток.
+  const marks = MARK_ROWS.map((row) => ({
+    key: row.key,
+    label: row.label,
+    items: markers.filter((marker) => row.types.indexOf(marker.type) >= 0),
+  })).filter((row) => row.items.length > 0)
+
   return {
     now,
     live,
@@ -1678,6 +1789,10 @@ function shapeDealTime(detail, attemptsPayload) {
     lanes,
     bars,
     markers,
+    marks,
+    kpi,
+    // Граф спеки — из `stages[]` ответа `/deal`; нет этапов — нет и графа.
+    spec: specView(d.stages),
     facts: {
       attempts: {
         total: bars.length,
@@ -1725,7 +1840,7 @@ function dutyToneVar(tone) {
 }
 
 /** Строка попытки: вид приходит готовым (`attemptView`), здесь только DOM. */
-function DutyAttemptRow({ view }) {
+function DutyAttemptRow({ view, callSel, onSelectCall }) {
   return h(
     'div',
     {
@@ -1768,9 +1883,12 @@ function DutyAttemptRow({ view }) {
         ...view.chips.map((chip, index) =>
           h('span', {
             key: `call-${index}`,
-            className: `duty-tl-call${chip.unfinished ? ' duty-tl-unfinished' : ''}`,
-            title: chip.title,
-            'aria-label': chip.title,
+            // Выбранный вызов помечается классом: подсветка — единственное, что
+            // экран прибавляет к чипу; подсказка идёт своим слоем (`data-tip`).
+            className: `duty-tl-call${chip.unfinished ? ' duty-tl-unfinished' : ''}${callSel === chip.id ? ' duty-tl-sel' : ''}`,
+            'data-tip': chip.tip || chip.title,
+            'aria-label': chip.tip || chip.title,
+            onClick: onSelectCall ? (event) => { event.stopPropagation(); onSelectCall(chip.id) } : undefined,
             style: chip.unfinished
               ? {
                   left: `${chip.leftPct}%`,
@@ -1792,7 +1910,7 @@ function DutyAttemptRow({ view }) {
 }
 
 /** Дорожка этапа: имя, значок вида, сводка и строки попыток. */
-function DutyLane({ lane, bars, scale }) {
+function DutyLane({ lane, bars, scale, callSel, onSelectCall }) {
   const view = laneView(lane, bars, scale)
   return h(
     'div',
@@ -1823,7 +1941,9 @@ function DutyLane({ lane, bars, scale }) {
       : h(
           'div',
           { className: 'duty-tl-rows' },
-          ...view.rows.map((row) => h(DutyAttemptRow, { key: row.key, view: row.view })),
+          ...view.rows.map((row) =>
+            h(DutyAttemptRow, { key: row.key, view: row.view, callSel, onSelectCall }),
+          ),
         ),
   )
 }
@@ -1955,17 +2075,21 @@ const CSS = `
 .duty-tl-kind-agent .duty-tl-kind-ico{stroke:var(--ui-blue)}
 .duty-tl-kind-gate{color:var(--ui-yellow);border-color:var(--ui-yellow);background:color-mix(in srgb, var(--ui-yellow) 12%, transparent)}
 .duty-tl-rows{display:flex;flex-direction:column;gap:4px}
-.duty-tl-row{position:relative;display:grid;grid-template-columns:132px 1fr;gap:8px;height:20px;align-items:center;border-radius:6px;transition:height .26s cubic-bezier(.22,.8,.24,1)}
-.duty-tl-row:hover,.duty-tl-row:focus-within{height:var(--duty-tl-full, 20px)}
+.duty-tl-row{position:relative;display:grid;grid-template-columns:186px 1fr;gap:8px;height:20px;align-items:center;border-radius:6px;transition:height .26s cubic-bezier(.22,.8,.24,1)}
+/* Разворот — только под указателем или по клавиатурному фокусу самой строки:
+   :focus-within держал строку развёрнутой после клика по чипу. */
+.duty-tl-row:hover,.duty-tl-row:focus-visible{height:var(--duty-tl-full, 20px)}
 .duty-tl-row:focus-visible{outline:2px solid var(--ui-accent);outline-offset:1px}
-.duty-tl-lbl{display:flex;align-items:center;justify-content:flex-end;gap:6px;height:20px;line-height:20px;white-space:nowrap;font-variant-numeric:tabular-nums}
-.duty-tl-n{font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:10px;color:var(--ui-text-tertiary)}
+/* Колонки подписи фиксированы: иначе статус разной ширины двигал время в каждой строке. */
+.duty-tl-lbl{display:grid;grid-template-columns:26px 76px 62px auto;align-items:center;gap:6px;height:20px;line-height:20px;white-space:nowrap;font-variant-numeric:tabular-nums}
+.duty-tl-lbl>*{overflow:hidden;text-overflow:ellipsis}
+.duty-tl-n{font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:10px;color:var(--ui-text-tertiary);text-align:right}
 .duty-tl-st{font-size:10.5px;font-weight:700;color:var(--ui-text-secondary)}
 .duty-tl-st.t-green{color:var(--ui-green)}
 .duty-tl-st.t-red{color:var(--ui-red)}
 .duty-tl-st.t-yellow{color:var(--ui-yellow)}
 .duty-tl-st.t-blue{color:var(--ui-blue)}
-.duty-tl-ms{font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:10px;color:var(--ui-text-tertiary)}
+.duty-tl-ms{font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:10px;color:var(--ui-text-tertiary);text-align:right}
 /* Надбавка «сколько не показано»: обрезанное нельзя показывать полным. */
 .duty-tl-more{font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:9.5px;font-weight:700;color:var(--ui-yellow);padding:0 3px;border-radius:3px;background:color-mix(in srgb, var(--ui-yellow) 16%, transparent)}
 /* Вызов без результата: полый чип — длительности нет, а не ноль. */
@@ -1973,12 +2097,43 @@ const CSS = `
 .duty-tl-track{position:relative;height:100%}
 .duty-tl-mini{position:absolute;left:0;right:0;top:6px;height:7px;transition:opacity .16s ease, transform .2s ease}
 .duty-tl-stack{position:absolute;left:0;right:0;top:0;opacity:0;pointer-events:none;transform:translateY(-3px) scaleY(.86);transform-origin:top;transition:opacity .18s ease .04s, transform .24s cubic-bezier(.22,.8,.24,1)}
-.duty-tl-row:hover .duty-tl-mini,.duty-tl-row:focus-within .duty-tl-mini{opacity:0;transform:translateY(3px)}
-.duty-tl-row:hover .duty-tl-stack,.duty-tl-row:focus-within .duty-tl-stack{opacity:1;pointer-events:auto;transform:none}
+.duty-tl-row:hover .duty-tl-mini,.duty-tl-row:focus-visible .duty-tl-mini{opacity:0;transform:translateY(3px)}
+.duty-tl-row:hover .duty-tl-stack,.duty-tl-row:focus-visible .duty-tl-stack{opacity:1;pointer-events:auto;transform:none}
 .duty-tl-tick{position:absolute;top:0;height:7px;border-radius:1.5px;opacity:.9}
 .duty-tl-call{position:absolute;height:10px;border-radius:2px;box-shadow:inset 0 0 0 1px rgba(0,0,0,.22);opacity:0;transform:translateY(-3px);transition:opacity .16s ease, transform .18s ease}
-.duty-tl-row:hover .duty-tl-call,.duty-tl-row:focus-within .duty-tl-call{opacity:1;transform:none}
+.duty-tl-row:hover .duty-tl-call,.duty-tl-row:focus-visible .duty-tl-call{opacity:1;transform:none}
 .duty-tl-empty{font-size:11.5px;color:var(--ui-text-tertiary)}
+.duty-tl-call{cursor:pointer}
+/* Подсказка своим слоем: нативный title на 10-пиксельном чипе ждать секунду. */
+.duty-tl-call::after{content:attr(data-tip);position:absolute;left:50%;bottom:calc(100% + 7px);transform:translateX(-50%);padding:3px 7px;border-radius:5px;white-space:nowrap;background:var(--ui-surface-raised, var(--ui-surface-background));color:var(--ui-text-primary);border:1px solid var(--ui-stroke-tertiary);box-shadow:0 8px 20px rgba(0,0,0,.38);font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:10.5px;line-height:1.5;opacity:0;pointer-events:none;transition:opacity .09s ease;z-index:30}
+.duty-tl-call:hover::after{opacity:1}
+.duty-tl-call.duty-tl-sel{box-shadow:inset 0 0 0 1.5px var(--ui-accent),0 0 0 2px color-mix(in srgb, var(--ui-accent) 35%, transparent)}
+.duty-tl-insp{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-height:26px;margin-top:10px;padding:4px 9px;border-radius:6px;border:1px solid var(--ui-stroke-tertiary);background:var(--ui-surface-raised, var(--ui-surface-background));font-size:11.5px}
+.duty-tl-insp.empty{color:var(--ui-text-tertiary);border-style:dashed;background:transparent}
+.duty-tl-insp-dot{width:8px;height:8px;border-radius:2px;background:var(--ui-text-tertiary)}
+.duty-kpi{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px}
+.duty-kpi-cell{display:grid;grid-auto-flow:column;align-items:baseline;gap:6px;padding:5px 10px;border-radius:7px;border:1px solid var(--ui-stroke-tertiary);background:var(--ui-surface-raised, var(--ui-surface-background))}
+.duty-kpi-v{font-size:15px;font-weight:700;font-variant-numeric:tabular-nums}
+.duty-kpi-l{font-size:10.5px;color:var(--ui-text-tertiary)}
+.duty-kpi-n{font-size:10px;color:var(--ui-text-tertiary);opacity:.8}
+/* Маркеры — строками по смыслу: вердикты, вопросы человеку, публикация, засечки. */
+.duty-scale-marks{margin-top:10px;border-top:1px solid var(--ui-stroke-tertiary);padding-top:6px}
+.duty-smk-row{display:grid;grid-template-columns:186px 1fr;gap:8px;align-items:center;height:18px}
+.duty-smk-name{font-size:10.5px;color:var(--ui-text-tertiary);text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.duty-smk-line{position:relative;height:18px}
+.duty-smk{position:absolute;top:50%;transform:translate(-50%,-50%);line-height:0}
+.duty-smk i{display:block;width:7px;height:7px;border-radius:50%;background:currentColor}
+.duty-smk.tick i{width:1px;height:11px;border-radius:0;opacity:.55}
+.duty-smk-wait{position:absolute;left:0;top:50%;height:3px;transform:translateY(-50%);border-radius:2px;opacity:.35;background:currentColor}
+.duty-spec-graph{display:block;width:100%;height:auto;overflow:visible;fill:none;stroke:none}
+.duty-spec-edge{fill:none;stroke:var(--ui-stroke-tertiary);stroke-width:1.2;stroke-dasharray:4 3}
+.duty-spec-node rect{fill:var(--ui-surface-raised, var(--ui-surface-background));stroke:var(--ui-stroke-tertiary);stroke-width:1.2}
+.duty-spec-node .duty-spec-id{fill:var(--ui-text-primary);font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:11px}
+.duty-spec-node .duty-spec-st{fill:var(--ui-text-tertiary);font-size:9.5px}
+.duty-spec-node.t-green rect{stroke:var(--ui-green)}
+.duty-spec-node.t-red rect{stroke:var(--ui-red)}
+.duty-spec-node.t-yellow rect{stroke:var(--ui-yellow)}
+.duty-spec-node.t-blue rect{stroke:var(--ui-accent)}
 @media (prefers-reduced-motion: reduce){.duty-tl-row,.duty-tl-mini,.duty-tl-stack,.duty-tl-call{transition:none}}
 
 .duty-scale-lanes{display:flex;flex-direction:column;gap:5px}
@@ -2513,24 +2668,145 @@ function DealFactSpans({ scale }) {
   )
 }
 
-/** Маркер события: засечка старта/закрытия попытки или заметная точка события. */
-function ScaleMarker({ marker, index }) {
+/**
+ * Ряд маркеров: подпись слева, отметки на линии.
+ *
+ * Маркеры разложены по смыслу (вердикты, вопросы человеку, публикация, засечки
+ * попыток) — раньше они сыпались в одну полосу вперемешку с засечками, и
+ * «кривовато» было не оформлением, а отсутствием рядов.
+ */
+function MarksRows({ scale }) {
+  if (!scale.marks || !scale.marks.length) return null
   return h(
-    'span',
-    {
-      className: `duty-scale-marker${marker.tick ? ' tick' : ''}`,
-      style: { left: `${marker.pct}%`, top: `${(index % 2) * 13}px`, color: TONE_COLOR[marker.tone] || TONE_COLOR.gray },
-      title: marker.title,
-      'aria-label': marker.ariaLabel,
-      role: 'img',
-      tabIndex: 0,
-    },
-    h('span', { className: 'duty-scale-dot' }, MARKER_GLYPH[marker.type] || ''),
+    'div',
+    { className: 'duty-scale-marks' },
+    ...scale.marks.map((row) =>
+      h(
+        'div',
+        { className: 'duty-smk-row', key: `smk-${row.key}` },
+        h('span', { className: 'duty-smk-name' }, row.label),
+        h(
+          'div',
+          { className: 'duty-smk-line' },
+          ...row.items.map((marker) =>
+            h(
+              'span',
+              {
+                key: `smk-${row.key}-${marker.at}-${marker.type}`,
+                className: `duty-smk${marker.tick ? ' tick' : ''}`,
+                style: { left: `${marker.pct}%`, color: TONE_COLOR[marker.tone] || TONE_COLOR.gray },
+              },
+              marker.waitPct > 0
+                ? h('span', {
+                    className: 'duty-smk-wait',
+                    style: { width: `${marker.waitPct}%` },
+                    title: `${marker.clock} → сейчас: ${marker.waitText}`,
+                  })
+                : null,
+              h('i', { title: marker.title, 'aria-label': marker.ariaLabel, role: 'img', tabIndex: 0 }),
+            ),
+          ),
+        ),
+      ),
+    ),
   )
 }
 
+/** Инспектор вызова: инструмент, начало, длительность, место в деле. */
+function CallInspector({ call }) {
+  if (!call) {
+    return h('div', { className: 'duty-tl-insp empty' }, 'выбери вызов на дорожке — покажу инструмент, начало и длительность')
+  }
+  return h(
+    'div',
+    { className: 'duty-tl-insp' },
+    h('span', { className: 'duty-tl-insp-dot', style: { background: TONE_COLOR[call.tone] || TONE_COLOR.gray } }),
+    h('b', null, call.name),
+    h('span', { className: 'duty-mono' }, call.clock),
+    h('span', null, call.msText),
+    h('span', { className: 'duty-muted' }, `${call.stage} · попытка ${call.attempt}${call.seq === null ? '' : ` · вызов ${call.seq}`}`),
+  )
+}
+
+/** KPI-строка дела: пять чисел шапки, все — из шейпера (`scale.kpi`). */
+function KpiStrip({ scale }) {
+  if (!scale.kpi || !scale.kpi.length) return null
+  return h(
+    'div',
+    { className: 'duty-kpi' },
+    ...scale.kpi.map((item) =>
+      h(
+        'div',
+        { className: 'duty-kpi-cell', key: `kpi-${item.key}` },
+        h('span', { className: 'duty-kpi-v' }, item.value),
+        h('span', { className: 'duty-kpi-l' }, item.label),
+        item.note ? h('span', { className: 'duty-kpi-n' }, item.note) : null,
+      ),
+    ),
+  )
+}
+
+/**
+ * Граф спеки: узлы-этапы и рёбра `needs`.
+ *
+ * Координаты посчитаны в шейпере (`scale.spec`), поэтому картинка не может
+ * разъехаться с вебом: здесь только элементы `svg`.
+ */
+function SpecGraph({ spec }) {
+  if (!spec) return null
+  const pos = new Map(spec.nodes.map((node) => [node.id, node]))
+  const edges = spec.edges
+    .map((edge) => {
+      const from = pos.get(edge.from)
+      const to = pos.get(edge.to)
+      if (!from || !to) return null
+      const x1 = from.x + spec.nodeW
+      const y1 = from.y + spec.nodeH / 2
+      const x2 = to.x
+      const y2 = to.y + spec.nodeH / 2
+      const mid = Math.round((x1 + x2) / 2)
+      return h('path', { key: `e-${edge.from}-${edge.to}`, className: 'duty-spec-edge', d: `M${x1},${y1} C${mid},${y1} ${mid},${y2} ${x2},${y2}` })
+    })
+    .filter(Boolean)
+  return h(
+    'div',
+    { className: 'duty-deal-spec-graph' },
+    h('div', { className: 'duty-group-h' }, h('span', null, 'граф спеки'), h('span', { className: 'duty-mono' }, `этапов ${spec.nodes.length} · связей ${spec.edges.length}`)),
+    h(
+      'svg',
+      { className: 'duty-spec-graph', viewBox: `0 0 ${spec.width} ${spec.height}`, width: spec.width, height: spec.height, role: 'img', 'aria-label': 'граф этапов' },
+      ...edges,
+      ...spec.nodes.map((node) =>
+        h(
+          'g',
+          { key: `n-${node.id}`, className: `duty-spec-node t-${node.tone}` },
+          h('rect', { x: node.x, y: node.y, width: spec.nodeW, height: spec.nodeH, rx: 6 }),
+          h('text', { x: node.x + 8, y: node.y + spec.nodeH / 2 + 4, className: 'duty-spec-id' }, node.id),
+          h('text', { x: node.x + spec.nodeW - 8, y: node.y + spec.nodeH / 2 + 4, className: 'duty-spec-st', textAnchor: 'end' }, node.label),
+        ),
+      ),
+    ),
+  )
+}
+
+/**
+ * Выбранный вызов по ключу `stage:attempt:seq`.
+ *
+ * Ищется тем же видом, которым рисуются чипы (`attemptView`): второго описания
+ * вызова у инспектора нет.
+ */
+function callOf(scale, callId) {
+  if (!callId) return null
+  for (const bar of scale.bars) {
+    for (const chip of attemptView(bar, scale).chips) {
+      if (chip.id === callId) return chip
+    }
+  }
+  return null
+}
+
 /** Панель шкалы времени: подписанная ось, дорожка на этап, полосы и маркеры. */
-function ScalePanel({ scale }) {
+function ScalePanel({ scale, callSel, onSelectCall }) {
   const head = h(
     'div',
     { className: 'duty-group-h' },
@@ -2584,31 +2860,14 @@ function ScalePanel({ scale }) {
             lane,
             bars: scale.bars.filter((bar) => bar.lane === index),
             scale,
+            callSel,
+            onSelectCall,
           }),
         ),
       ),
     ),
-    scale.markers.length
-      ? h(
-          'div',
-          { className: 'duty-scale-markers' },
-          ...scale.markers
-            .filter((marker) => marker.waitPct > 0)
-            .map((marker) =>
-              h(
-                'span',
-                {
-                  key: `wait-${marker.at}`,
-                  className: 'duty-scale-wait',
-                  style: { left: `${marker.pct}%`, width: `${marker.waitPct}%` },
-                  title: `${marker.clock} → сейчас: ${marker.waitText}`,
-                },
-                h('span', { className: 'duty-scale-wait-k' }, marker.waitText),
-              ),
-            ),
-          ...scale.markers.map((marker, index) => h(ScaleMarker, { key: `mk-${marker.at}-${marker.type}-${index}`, marker, index })),
-        )
-      : null,
+    h(MarksRows, { scale }),
+    h(CallInspector, { call: callOf(scale, callSel) }),
     kinds.length
       ? h(
           'div',
@@ -3012,6 +3271,12 @@ function DealScreen({ sel, onBack }) {
   // Лента этапов приходит тем же ответом `/deal` (`stages`), что и голова дела:
   // одна ручка — один кадр, этапы не могут отставать от фактов дела.
   const feed = useMemo(() => shapeStages(detail.data), [detail.data])
+  // Выбранный вызов живёт на экране дела: клик по чипу открывает инспектор, но
+  // строку попытки не разворачивает — развёртка осталась под указателем.
+  const [callSel, setCallSel] = React.useState('')
+  const selectCall = React.useCallback((id) => {
+    setCallSel((prev) => (prev === id ? '' : id))
+  }, [])
 
   const head = h(
     'div',
@@ -3058,7 +3323,9 @@ function DealScreen({ sel, onBack }) {
       { className: 'duty-deal-body' },
       // Шкала — первой и во всю ширину: это главный факт дела, а спецификация и
       // лента — пояснение к нему.
-      h(ScalePanel, { scale }),
+      h(KpiStrip, { scale }),
+      h(ScalePanel, { scale, callSel, onSelectCall: selectCall }),
+      h(SpecGraph, { spec: scale.spec }),
       h(
         'div',
         { className: 'duty-deal-spec' },

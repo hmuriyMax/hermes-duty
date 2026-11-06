@@ -445,6 +445,26 @@ def _closed_rows(db: Path) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+ASK_DEDUPE_HOURS = 24.0
+
+
+def _recent_same_question(conn: sqlite3.Connection, key: str, text: str) -> Optional[int]:
+    """id недавнего вопроса того же дела с тем же текстом (антидубль), иначе None."""
+    norm = " ".join((text or "").split()).strip().lower()
+    if not norm or ASK_DEDUPE_HOURS <= 0:
+        return None
+    row = conn.execute(
+        "SELECT id, text FROM questions WHERE session_key = ? AND origin = ? "
+        "AND created_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now', ?) "
+        "ORDER BY id DESC LIMIT 20",
+        (key, ASK_ORIGIN, f"-{ASK_DEDUPE_HOURS:g} hours"),
+    ).fetchall()
+    for candidate in row:
+        if " ".join((candidate[1] or "").split()).strip().lower() == norm:
+            return int(candidate[0])
+    return None
+
+
 def _insert(
     db: Path,
     *,
@@ -474,6 +494,12 @@ def _insert(
         conn = sqlite3.connect(db, timeout=BUSY_TIMEOUT_MS / 1000)
         try:
             conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+            dup = _recent_same_question(conn, key, text)
+            if dup is not None:
+                # то же дело уже спрашивали этим же текстом недавно — второй раз
+                # человека не дёргаем (иначе в пуле копятся «старые» вопросы)
+                conn.rollback()
+                return dup
             cur = conn.execute(
                 "INSERT INTO questions "
                 "(session_key, project, text, text_full, origin, options_json, status,"

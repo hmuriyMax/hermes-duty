@@ -1253,18 +1253,31 @@ function scalePanel(scale) {
       h(
         'div',
         { class: 'scale-axis' },
+        // Линейка: подпись у каждой метки, у краёв — словами «нач./кон.».
         ...scale.axis.ticks.map((tick) =>
           h(
             'span',
             { class: `scale-tick align-${tick.align}`, style: `left:${tick.pct}%`, title: tick.clock },
-            `${tick.edge} ${tick.clock}`,
+            tick.edge ? `${tick.edge} ${tick.clock}` : tick.clock,
           ),
         ),
       ),
       // Дорожки этапов — таймлайн вызовов: полоса на попытку, раскрывается по
       // наведению. Полосы `scale-bar` остались в шейпере (desktop 0.0.7), но
       // второй рисунок того же дела на экране не нужен.
+      // Одна нулевая линия на все дорожки: часы читаются по сетке, а не
+      // угадываются по трём подписям на оси (как в макете `d-merge`).
       h(
+        'div',
+        { class: 'scale-plot' },
+        h(
+          'div',
+          { class: 'scale-grid', 'aria-hidden': 'true' },
+          ...scale.axis.ticks.map((tick) =>
+            h('span', { class: 'scale-grid-line', style: `left:${tick.pct}%` }),
+          ),
+        ),
+        h(
         'div',
         { class: 'tl-lanes' },
         ...scale.lanes.map((lane, index) =>
@@ -1273,6 +1286,7 @@ function scalePanel(scale) {
             scale.bars.filter((bar) => bar.lane === index),
             scale,
           ),
+        ),
         ),
       ),
       scale.markers.length

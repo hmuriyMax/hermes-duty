@@ -1595,7 +1595,25 @@ function shapeDealTime(detail, attemptsPayload) {
     : null
   const durationSec = axisStart === null || axisEnd === null ? null : Math.max(0, axisEnd - axisStart)
 
-  const midAt = axisStart === null || axisEnd === null ? null : axisStart + Math.round((axisEnd - axisStart) / 2)
+  // Ось — линейка, а не три подписи (как в согласованном макете `d-merge`):
+  // деление выбирается так, чтобы на ширине было 4–8 меток, и через каждую метку
+  // идёт вертикальная линия по всем дорожкам. Шаг кратен 2/5/10 минутам, поэтому
+  // метки попадают на «круглые» секунды и не пляшут при обновлении.
+  const axisTicks = []
+  if (axisStart !== null && axisEnd !== null && durationSec > 0) {
+    // Лестница делений: берём первое, при котором на оси не больше восьми меток.
+    // Иначе часовое дело получало бы тринадцать подписей, а минутное — две.
+    const step = [60, 120, 300, 600, 900, 1200, 1800, 2400, 3600, 7200, 10800, 21600, 43200, 86400]
+      .find((candidate) => durationSec / candidate <= 8) || 86400
+    axisTicks.push({ pct: 0, edge: 'нач.', align: 'start', clock: fmtClock(axisStart) })
+    for (let at = Math.ceil(axisStart / step) * step; at < axisEnd; at += step) {
+      const pct = Math.round(((at - axisStart) / durationSec) * 1000) / 10
+      // Метка впритык к краю наезжает на подписи начала/конца — её не рисуем.
+      if (pct < 6 || pct > 94) continue
+      axisTicks.push({ pct, edge: '', align: 'center', clock: fmtClock(at) })
+    }
+    axisTicks.push({ pct: 100, edge: 'кон.', align: 'end', clock: fmtClock(axisEnd) })
+  }
   return {
     now,
     live,
@@ -1606,14 +1624,7 @@ function shapeDealTime(detail, attemptsPayload) {
       spanSec: durationSec,
       live,
       text: axisStart === null || axisEnd === null ? 'времени в журнале нет' : `${fmtClockShort(axisStart)}–${fmtClockShort(axisEnd)}`,
-      ticks:
-        axisStart === null || axisEnd === null
-          ? []
-          : [
-              { pct: 0, edge: 'нач.', align: 'start', clock: fmtClock(axisStart) },
-              { pct: 50, edge: 'сер.', align: 'center', clock: fmtClock(midAt) },
-              { pct: 100, edge: 'кон.', align: 'end', clock: fmtClock(axisEnd) },
-            ],
+      ticks: axisTicks,
     },
     lanes,
     bars,

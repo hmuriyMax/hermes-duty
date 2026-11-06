@@ -54,7 +54,7 @@ function moduleForRender(root) {
   )
   const source = read('desktop/plugin.js')
     .replace(/from '@hermes\/plugin-sdk'/, "from './sdk.mjs'")
-    .concat('\nexport { DutyLane, DutyAttemptRow }\n')
+    .concat('\nexport { DutyLane, DutyAttemptRow, ScalePanel }\n')
   const file = join(dir, 'plugin.mjs')
   writeFileSync(file, source)
   return file
@@ -109,6 +109,19 @@ test('десктоп: DutyLane рисует svg-значок, который л�
 
   // Потолок назван числом на экране, а не только в тултипе.
   assert.match(html, /class="[^"]*\bduty-tl-more\b[^>]*>\+6</, 'надбавка +6 не отрисована')
+  // Ось — линейка: метки-времена и вертикальная сетка по ним (макет d-merge).
+  const scaleModel = (await import(pathToFileURL(join(pluginRoot, 'desktop/model.js')).href)).shapeDealTime(
+    { now: 2_000, terminal: false, timeline: [{ kind: 'created', at: 1_000, summary: '' }], stages: [{ id: 'impl' }] },
+    { attempts: sampleBars.map((bar) => ({ ...bar, stage: 'impl', attempt: bar.number, started_at: 1_000, ended_at: 2_000 })) },
+  )
+  const panel = renderToStaticMarkup(React.createElement(mod.ScalePanel, { scale: scaleModel }))
+  const gridLines = (panel.match(/duty-scale-grid-line/g) || []).length
+  assert.ok(gridLines >= 3, `сетка оси: линий ${gridLines}, должно быть по числу меток`)
+  assert.match(panel, /duty-scale-tick[^>]*>\s*нач\. /, 'край оси подписан словом «нач.»')
+  assert.match(panel, /duty-scale-tick[^>]*>\s*кон\. /, 'край оси подписан словом «кон.»')
+  // Между краями — подписи без слов: чистое время.
+  assert.match(panel, /duty-scale-tick align-center[^>]*>\s*\d\d:\d\d:\d\d/, 'нет меток-времени между краями')
+
   // Класс оборванного вызова — на элементе, а не подстрокой где-то в CSS: плагин
   // держит стили строкой в этом же модуле, и поиск подстроки «duty-tl-unfinished»
   // зеленел бы на тексте правила без единого чипа.

@@ -547,15 +547,52 @@ const TIME_ATTEMPTS = {
   ],
 }
 
+test('ось: шаг линейки растёт с длиной дела, метки не липнут к краям', () => {
+  const long = shapeDealTime(
+    { now: 9000, terminal: false, timeline: [{ kind: 'created', at: 1000, summary: '' }], stages: [] },
+    { attempts: [{ stage: 'impl', attempt: 1, started_at: 1000, ended_at: 9000, status: 'done' }] },
+  )
+  // 8000 с > часа: шаг 10 минут, промежуточные метки — через 600 с.
+  assert.equal(long.axis.spanSec, 8000)
+  const middles = long.axis.ticks.slice(1, -1)
+  assert.ok(middles.length >= 2 && middles.length <= 8, `меток между краями: ${middles.length}`)
+  for (const tick of middles) assert.ok(tick.pct > 5 && tick.pct < 95, `метка на краю: ${tick.pct}`)
+
+  const short = shapeDealTime(
+    { now: 1500, terminal: false, timeline: [{ kind: 'created', at: 1000, summary: '' }], stages: [] },
+    { attempts: [{ stage: 'impl', attempt: 1, started_at: 1000, ended_at: 1400, status: 'done' }] },
+  )
+  // 500 с: шаг 2 минуты → метки не чаще, чем каждые 120 с.
+  const secOfDay = (clock) => {
+    const [h, m, sec] = clock.split(':').map(Number)
+    return h * 3600 + m * 60 + sec
+  }
+  const shortTicks = short.axis.ticks.slice(1, -1)
+  assert.equal(shortTicks.length, 4, `меток между краями: ${shortTicks.length}`)
+  for (let i = 1; i < shortTicks.length; i += 1) {
+    // шаг деления — две минуты, а не «как получилось»
+    assert.equal(secOfDay(shortTicks[i].clock) - secOfDay(shortTicks[i - 1].clock), 120)
+  }
+})
+
 test('шкала времени: смещение полосы — от начала оси, а не от нуля', () => {
   const scale = shapeDealTime(TIME_DETAIL, TIME_ATTEMPTS)
   // ось: начало — первое событие, конец — `now` живого дела
   assert.equal(scale.axis.start, 1000)
   assert.equal(scale.axis.end, 1500)
   assert.equal(scale.axis.spanSec, 500)
+  // Ось — линейка: края подписаны словами, между ними метки шагом оси.
+  const ticks = scale.axis.ticks
+  assert.equal(ticks[0].edge, 'нач.')
+  assert.equal(ticks[ticks.length - 1].edge, 'кон.')
   assert.deepEqual(
-    scale.axis.ticks.map((tick) => tick.pct),
-    [0, 50, 100],
+    ticks.map((tick) => tick.pct),
+    [0, 16, 40, 64, 88, 100],
+  )
+  // промежуточные метки — без слова, только время
+  assert.deepEqual(
+    ticks.slice(1, -1).map((tick) => tick.edge),
+    ['', '', '', ''],
   )
   // offsets — проценты от общей оси дела, а не от собственной длительности
   assert.deepEqual(

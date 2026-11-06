@@ -1644,7 +1644,25 @@ function shapeDealTime(detail, attemptsPayload) {
     : null
   const durationSec = axisStart === null || axisEnd === null ? null : Math.max(0, axisEnd - axisStart)
 
-  const midAt = axisStart === null || axisEnd === null ? null : axisStart + Math.round((axisEnd - axisStart) / 2)
+  // Ось — линейка, а не три подписи (как в согласованном макете `d-merge`):
+  // деление выбирается так, чтобы на ширине было 4–8 меток, и через каждую метку
+  // идёт вертикальная линия по всем дорожкам. Шаг кратен 2/5/10 минутам, поэтому
+  // метки попадают на «круглые» секунды и не пляшут при обновлении.
+  const axisTicks = []
+  if (axisStart !== null && axisEnd !== null && durationSec > 0) {
+    // Лестница делений: берём первое, при котором на оси не больше восьми меток.
+    // Иначе часовое дело получало бы тринадцать подписей, а минутное — две.
+    const step = [60, 120, 300, 600, 900, 1200, 1800, 2400, 3600, 7200, 10800, 21600, 43200, 86400]
+      .find((candidate) => durationSec / candidate <= 8) || 86400
+    axisTicks.push({ pct: 0, edge: 'нач.', align: 'start', clock: fmtClock(axisStart) })
+    for (let at = Math.ceil(axisStart / step) * step; at < axisEnd; at += step) {
+      const pct = Math.round(((at - axisStart) / durationSec) * 1000) / 10
+      // Метка впритык к краю наезжает на подписи начала/конца — её не рисуем.
+      if (pct < 6 || pct > 94) continue
+      axisTicks.push({ pct, edge: '', align: 'center', clock: fmtClock(at) })
+    }
+    axisTicks.push({ pct: 100, edge: 'кон.', align: 'end', clock: fmtClock(axisEnd) })
+  }
   return {
     now,
     live,
@@ -1655,14 +1673,7 @@ function shapeDealTime(detail, attemptsPayload) {
       spanSec: durationSec,
       live,
       text: axisStart === null || axisEnd === null ? 'времени в журнале нет' : `${fmtClockShort(axisStart)}–${fmtClockShort(axisEnd)}`,
-      ticks:
-        axisStart === null || axisEnd === null
-          ? []
-          : [
-              { pct: 0, edge: 'нач.', align: 'start', clock: fmtClock(axisStart) },
-              { pct: 50, edge: 'сер.', align: 'center', clock: fmtClock(midAt) },
-              { pct: 100, edge: 'кон.', align: 'end', clock: fmtClock(axisEnd) },
-            ],
+      ticks: axisTicks,
     },
     lanes,
     bars,
@@ -1929,7 +1940,10 @@ const CSS = `
  * Свёрнутая попытка — 20 px, раскрытие по наведению/фокусу. Высота приходит
  * переменной --duty-tl-full со строки, переход делает CSS. */
 
-.duty-tl-lanes{display:flex;flex-direction:column;gap:10px}
+.duty-scale-plot{position:relative}
+.duty-scale-grid{position:absolute;top:-2px;bottom:0;left:0;right:0;pointer-events:none;z-index:0}
+.duty-scale-grid-line{position:absolute;top:0;bottom:0;border-left:1px dashed color-mix(in srgb, var(--ui-text-tertiary) 34%, transparent)}
+.duty-tl-lanes{position:relative;z-index:1;display:flex;flex-direction:column;gap:10px}
 .duty-tl-lane{display:flex;flex-direction:column;gap:4px}
 .duty-tl-lane + .duty-tl-lane{border-top:1px solid var(--ui-border-primary, rgba(127,127,127,.2));padding-top:10px}
 .duty-tl-lane-h{display:flex;align-items:center;gap:8px;min-height:20px}
@@ -2542,23 +2556,36 @@ function ScalePanel({ scale }) {
         h(
           'span',
           { className: `duty-scale-tick align-${tick.align}`, style: { left: `${tick.pct}%` }, title: tick.clock },
-          `${tick.edge} ${tick.clock}`,
+          tick.edge ? `${tick.edge} ${tick.clock}` : tick.clock,
         ),
       ),
     ),
     // Дорожки этапов — таймлайн вызовов (0.0.8): тонкая полоса по умолчанию,
     // карта вызовов по наведению. Полосы `duty-scale-bar` больше не рисуются:
     // второй рисунок того же дела на экране не нужен.
+    // Сетка по меткам оси — одна на все дорожки: время читается поперёк, а не
+    // угадывается по трём подписям (макет `d-merge`).
     h(
       'div',
-      { className: 'duty-tl-lanes' },
-      ...scale.lanes.map((lane, index) =>
-        h(DutyLane, {
-          key: `lane-${lane.key}`,
-          lane,
-          bars: scale.bars.filter((bar) => bar.lane === index),
-          scale,
-        }),
+      { className: 'duty-scale-plot' },
+      h(
+        'div',
+        { className: 'duty-scale-grid', 'aria-hidden': 'true' },
+        ...scale.axis.ticks.map((tick) =>
+          h('span', { key: `grid-${tick.pct}`, className: 'duty-scale-grid-line', style: { left: `${tick.pct}%` } }),
+        ),
+      ),
+      h(
+        'div',
+        { className: 'duty-tl-lanes' },
+        ...scale.lanes.map((lane, index) =>
+          h(DutyLane, {
+            key: `lane-${lane.key}`,
+            lane,
+            bars: scale.bars.filter((bar) => bar.lane === index),
+            scale,
+          }),
+        ),
       ),
     ),
     scale.markers.length

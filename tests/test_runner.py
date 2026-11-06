@@ -973,8 +973,8 @@ def test_refused_result_is_contract(tmp_path: Path) -> None:
     assert report["question_id"] is None
 
 
-def test_token_budget_exceeded_is_capability(tmp_path: Path) -> None:
-    """Превышение бюджета токенов останавливает попытку: класс `capability`."""
+def test_token_budget_exceeded_without_result_is_capability(tmp_path: Path) -> None:
+    """Превышение бюджета без отчёта — `capability`: процесс снят, отчёта нет."""
     home = make_home(tmp_path)
     conn = open_store(home)
     deal = make_deal(conn)
@@ -993,11 +993,52 @@ def test_token_budget_exceeded_is_capability(tmp_path: Path) -> None:
             {"type": "system", "subtype": "init", "session_id": ""},
             {"type": "result", "session_id": "local-x", "tokens": {"total": 5000}},
         ],
-        result={"status": "done"},
+        result=None,
     )
     report = run(conn, spec, deal, home, fake)
     assert (report["outcome"], report["kind"]) == ("failed", "capability")
     assert fake.stopped == 1
+    ended = only(conn, deal, "attempt_ended")
+    assert ended["payload"]["details"]["over_budget"] is True
+    assert ended["payload"]["details"]["usage_tokens"] == 5000
+
+
+def test_finished_report_wins_over_token_budget(tmp_path: Path) -> None:
+    """Готовый отчёт сильнее потолка: сделанная работа не выбрасывается.
+
+    Так умерла попытка `impl-finished#3` дела `d_a7040118` (2026-11-06): воркер
+    закоммитил работу и написал `result.json` со `status=done` и тремя
+    доказательствами с кодом 0, а движок снял его за токены и записал
+    `failed`/`capability` — коммит остался сиротой.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = write_spec(
+        tmp_path,
+        """
+        duty: probe
+        stages:
+          - id: impl
+            role: implementer
+            budget: {tokens: 1000}
+        """,
+    )
+    fake = Fake(
+        lines=[
+            {"type": "system", "subtype": "init", "session_id": ""},
+            {"type": "result", "session_id": "local-x", "tokens": {"total": 5000}},
+        ],
+        # `pack=True` — отчёт с пакетом: этап с ролью проходит гейт доказательств,
+        # и проверяется ровно то, что нужно: чей вердикт сильнее — потолка или отчёта.
+        result={"status": "done", "summary": "работа сделана"},
+        pack=True,
+    )
+    report = run(conn, spec, deal, home, fake)
+
+    # Процесс всё равно снят по потолку — но исход берётся из отчёта.
+    assert fake.stopped == 1
+    assert report["outcome"] == "done"
     ended = only(conn, deal, "attempt_ended")
     assert ended["payload"]["details"]["over_budget"] is True
     assert ended["payload"]["details"]["usage_tokens"] == 5000

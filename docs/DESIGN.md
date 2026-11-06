@@ -196,7 +196,7 @@ failures.classify → policy → decide_park
 | Состояние дела и ожидание (восемь состояний) | `fold(events)` | `dashboard/journal.py` |
 | Сколько шагов делать и когда выйти? | `run()`/`drive()`: `--once`, `--max-steps`, SIGINT, коды `0/1/2/3/4/130` | `dashboard/driver.py` |
 | Человек ответил в пуле — кто это заберёт? | `sync_answers(conn, home)` перед каждым решением: `answered`/`expired` → `question_answered`; блок `needs_input`, который держал вопрос, снимает шаг движка (`close_answered_block`) | `dashboard/ask.py`, `dashboard/runner.py` |
-| Попытка начата и не отчиталась — кто её закроет? | `sweep(conn, now)`: `attempt_started` без `attempt_ended`, лизинг истёк и возраст больше `ttl + max(60 с, ttl/3)` → `attempt_ended` (`kind=infra`, `reaped: true`); живой лизинг не трогается, `ps` не смотрится | `dashboard/reaper.py` |
+| Попытка начата и не отчиталась — кто её закроет? | `sweep(conn, now)`: `attempt_started` без `attempt_ended` закрывается, если истёк лизинг **или** умер её pid → `attempt_ended` (`kind=infra`, `reaped: true`); живой лизинг живого pid не трогается; срок — `ttl + max(60 с, ttl/3)`, pid спрашивается только у своего дела и не раньше минуты жизни попытки | `dashboard/reaper.py` |
 | Чьё это дело и не дубль ли? | `create_deal(external_ref=…, dedup_window=…)`, id `d_<hex>` | `dashboard/deals.py` |
 | Что видно на экране и в терминале? | `stages[]` / `stage`; `--json` = дословный ответ роута | `dashboard/stagefeed.py`, `dashboard/cli.py`, `dashboard/plugin_api.py` |
 
@@ -691,7 +691,7 @@ duty why <deal_id> <этап>              плюс приговор после�
 duty watch [--interval 10] [--repo R]  тот же now, перерисовка в терминале
 duty run <deal_id> [--spec P] [--max-steps N] [--once]
                                        довести дело по спеке: решение → шаг → перечитать журнал
-duty reap [--dry-run]                  закрыть осиротевшие попытки (лизинг истёк, конца нет)
+duty reap [--dry-run]                  закрыть осиротевшие попытки (лизинг истёк или pid мёртв)
 duty decide <deal_id> continue|stop    решение человека: продолжить или закрыть
 duty close <deal_id> [--reason R]      закрыть дело решением человека
 duty demo [--home DIR] [--keep]        прогон дела по спеке на песочном корне

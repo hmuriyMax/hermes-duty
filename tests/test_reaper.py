@@ -7,7 +7,7 @@
 
 Правила карточки — по одному тесту на каждое:
 
-1. живой лизинг — не трогать, даже если pid не отвечает;
+1. живой лизинг живого pid — не трогать; мёртвый pid закрывает и при живом лизинге;
 2. повторный `sweep` не пишет второй `attempt_ended`;
 3. запас TTL (`ttl + max(60, ttl/3)`) соблюдён: попытка моложе порога цела;
 4. драйвер зовёт уборку перед решением — дело с сиротой трогается с места
@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sqlite3
 import sys
 import textwrap
@@ -275,7 +276,8 @@ def test_orphan_with_expired_lease_is_closed_as_infra(tmp_path: Path) -> None:
     conn = open_store(home)
     spec = write_spec(tmp_path, CHAIN)
     deal = make_deal(conn, spec_path=spec.path)
-    start_attempt(conn, deal)
+    # pid не записан: причина закрытия — только срок, и текст обязан назвать срок.
+    start_attempt(conn, deal, pid=None)
     take_lease(conn, deal, expires_at=NOW + TTL_DEFAULT)
 
     rows = reaper.sweep(conn, NOW + 2401)
@@ -310,12 +312,30 @@ def test_orphan_with_expired_lease_is_closed_as_infra(tmp_path: Path) -> None:
 # --------------------------------------------------------- 1. живой лизинг цел
 
 
-def test_live_lease_is_not_touched_even_with_dead_pid(tmp_path: Path) -> None:
-    """Живой лизинг — не трогать: pid здесь не спрашивается вовсе (правило 1).
+def test_live_lease_with_live_pid_is_not_touched(tmp_path: Path) -> None:
+    """Живой лизинг живого процесса — не трогать: этап ведёт движок (правило 1)."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, CHAIN)
+    deal = make_deal(conn, spec_path=spec.path)
+    # Свой процесс заведомо жив: pid не выдуман, а проверен тем же `os.kill`.
+    start_attempt(conn, deal, pid=os.getpid())
+    take_lease(conn, deal, pid=os.getpid(), expires_at=NOW + 5000)
 
-    Движок может быть на другой машине или в другом namespace, `ps` ему
-    недоступен — поэтому pid в тесте заведомо несуществующий, и это ничего не
-    меняет: срок лизинга ещё не вышел.
+    rows = reaper.sweep(conn, NOW + 3000)
+
+    assert rows == []
+    assert ends(conn, deal) == []
+    # Лизинг живого этапа уборка не отпускает.
+    assert leases(conn, deal)[0]["expires_at"] == NOW + 5000
+
+
+def test_live_lease_with_dead_pid_is_closed(tmp_path: Path) -> None:
+    """Мёртвый pid закрывает попытку даже при живом лизинге — факт сильнее срока.
+
+    Так умирает воркер, когда рестартуют бэкенд: `attempt_ended` писать некому,
+    лизинг ещё час живой, а дела нет. Ждать срока при готовом доказательстве
+    смерти — значит держать дело колом.
     """
     home = make_home(tmp_path)
     conn = open_store(home)
@@ -324,12 +344,14 @@ def test_live_lease_is_not_touched_even_with_dead_pid(tmp_path: Path) -> None:
     start_attempt(conn, deal, pid=64511)
     take_lease(conn, deal, pid=64511, expires_at=NOW + 5000)
 
-    rows = reaper.sweep(conn, NOW + 3000)
+    rows = reaper.sweep(conn, NOW + 900)
 
-    assert rows == []
-    assert ends(conn, deal) == []
-    # Лизинг живого этапа уборка не отпускает.
-    assert leases(conn, deal)[0]["expires_at"] == NOW + 5000
+    assert len(rows) == 1
+    assert rows[0]["reason"] == "процесс попытки умер: pid 64511 не найден"
+    assert rows[0]["pid"] == 64511
+    assert len(ends(conn, deal)) == 1
+    # Лизинг убитой попытки отпущен: иначе следующая попытка ждала бы его конца.
+    assert leases(conn, deal) == []
 
 
 # ------------------------------------------------------ 2. идемпотентность
@@ -383,12 +405,12 @@ def test_closed_attempt_is_not_closed_again(tmp_path: Path) -> None:
 
 
 def test_attempt_younger_than_threshold_is_left_alone(tmp_path: Path) -> None:
-    """Попытка на секунду моложе порога не закрывается; на пороге — закрывается."""
+    """Попытка с живым pid моложе порога не закрывается; на пороге — закрывается."""
     home = make_home(tmp_path)
     conn = open_store(home)
     spec = write_spec(tmp_path, CHAIN)
     deal = make_deal(conn, spec_path=spec.path)
-    start_attempt(conn, deal)
+    start_attempt(conn, deal, pid=os.getpid())
     take_lease(conn, deal, expires_at=NOW + TTL_DEFAULT)
 
     assert reaper.sweep(conn, NOW + THRESHOLD_DEFAULT - 1) == []
@@ -407,7 +429,7 @@ def test_stage_budget_sets_the_deadline(tmp_path: Path) -> None:
     conn = open_store(home)
     spec = write_spec(tmp_path, SHORT_BUDGET)
     deal = make_deal(conn, spec_path=spec.path)
-    start_attempt(conn, deal, lease_expires=NOW + 60)
+    start_attempt(conn, deal, pid=None, lease_expires=NOW + 60)
     take_lease(conn, deal, expires_at=NOW + 60)
 
     assert reaper.threshold_sec(60) == 120
@@ -434,8 +456,8 @@ def test_reaped_payload_names_the_engine_and_keeps_pid(tmp_path: Path) -> None:
     payload = journal.payload_of(ends(conn, deal)[0])
     assert payload["reaped"] is True
     assert payload["pid"] == 64511
-    # Мы знаем только, что отчёта нет: «исполнитель упал» — не наш факт.
-    assert payload["reason"].startswith("процесс попытки не отчитался")
+    # Знаем ровно одно: процесса нет. «Исполнитель упал» — по-прежнему не наш факт.
+    assert payload["reason"] == "процесс попытки умер: pid 64511 не найден"
     assert "details" not in payload
     assert "result" not in payload
 

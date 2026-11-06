@@ -17,10 +17,13 @@
 
 ## Правила
 
-1. **Только по факту срока.** Живой лизинг этапа — не трогать, даже если pid не
-   отвечает: движок может быть на другой машине или в другом namespace, а `ps`
-   движку недоступен (`docs/PROBES.md`: журнал, не процессы). Живость pid здесь
-   не спрашивается вовсе — иначе уборка решала бы по тому, чего не знает.
+1. **Факт сильнее срока.** Попытка закрывается, если истёк лизинг **или** умер её
+   процесс. Смерть pid — прямое доказательство (рестарт бэкенда, OOM, Ctrl-C):
+   ждать конца лизинга в этом случае значит держать дело колом при том, что факт
+   уже в руках. Живой лизинг без мёртвого pid — не трогать: этап ведёт движок.
+   Проверка спрашивает pid только у себя (`deals.is_own`) и только через минуту
+   жизни попытки — гонка «процесс ещё не появился» смертью не считается; чужой
+   namespace даёт только `PermissionError`, который живым и остаётся.
 2. **Идемпотентность.** Наличие парного `attempt_ended` — единственный признак
    «попытка закрыта». Повторный `sweep` не пишет второй факт: пары ищутся по
    `run_id`, а ключ идемпотентности события — от того же `run_id`.
@@ -41,7 +44,8 @@
 
 ## Чего модуль не делает
 
-Не смотрит процессы (`ps`, `lsof`, `/proc`), не меняет схему `events`, не заводит
+Не читает чужие процессы (`ps`, `lsof`, `/proc` — только `os.kill(pid, 0)` по
+своему pid из журнала), не меняет схему `events`, не заводит
 новых видов событий (`attempt_ended` уже есть), не трогает `fold` и `transit`, не
 закрывает дело и не паркует его: уборка одного факта — один факт.
 """
@@ -49,6 +53,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import time
 from pathlib import Path
@@ -228,15 +233,23 @@ def sweep(
         deal_spec = _spec_of(by_deal[deal_id], spec=spec, cache=specs)
         for attempt in attempts:
             ttl = _ttl(deal_spec, attempt["stage"])
-            if at - attempt["started_at"] < threshold_sec(ttl):
-                continue  # попытка моложе порога: может, ещё думает
+            age = at - attempt["started_at"]
+            dead_pid = _dead_pid(attempt, age)
+            if dead_pid is None and age < threshold_sec(ttl):
+                continue  # попытка молодая и pid жив: может, ещё думает
             # Лизинг читается тем же аксессором, что у движка: «жив ли этап» —
             # одно правило, и второй его копии здесь быть не должно.
             lease = runner.lease_of(conn, {"id": deal_id}, attempt["stage"])
-            if lease is not None and int(lease["expires_at"]) > at:
+            live_lease = lease is not None and int(lease["expires_at"]) > at
+            if live_lease and dead_pid is None:
                 continue  # этап ведёт живой движок — не трогаем (правило 1)
+            # Смерть процесса — факт сильнее срока: убитый воркер (рестарт
+            # бэкенда, OOM, Ctrl-C) иначе держал бы дело до конца лизинга, а
+            # доказательство уже есть. `pid` не найден — значит его нет.
             reason = (
-                "процесс попытки не отчитался: лизинг истёк "
+                f"процесс попытки умер: pid {dead_pid} не найден"
+                if dead_pid is not None
+                else "процесс попытки не отчитался: лизинг истёк "
                 f"{max(0, at - _expired_at(lease, attempt, ttl))}с назад"
             )
             payload = _ended_payload(attempt, reason)
@@ -276,6 +289,38 @@ def _load_spec(path: str) -> Any:
         return spec_module.load_spec(Path(path).expanduser())
     except Exception:  # noqa: BLE001 - чужая спека не повод ронять уборку
         return None
+
+
+def _dead_pid(attempt: dict[str, Any], age: int) -> Optional[int]:
+    """pid попытки, если процесса уже нет; иначе `None`.
+
+    `age` — сколько попытка живёт: первую минуту `pid` не спрашивается вовсе.
+    Процесс мог ещё не появиться в таблице (движок только записал `attempt_started`),
+    и «не нашли» на первой секунде — не смерть, а гонка.
+
+    Проверка честна только там, где процессы общие с движком: если воркер запущен
+    в другом namespace, `os.kill` скажет «нет процесса» про живого. Поэтому pid,
+    которого не видно, считается мёртвым **только** для своего движка — сирот
+    чужой доски здесь и так не убирают (`deals.is_own`).
+    """
+    pid = attempt.get("pid")
+    if isinstance(pid, bool) or pid is None:
+        return None
+    try:
+        number = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if number <= 0 or age < GRACE_MIN_SEC:
+        return None
+    try:
+        os.kill(number, 0)
+    except ProcessLookupError:
+        return number
+    except PermissionError:
+        return None  # процесс есть, просто он не наш
+    except OSError:
+        return None  # проверить не смогли — молчим, лизинг решит
+    return None
 
 
 def _expired_at(lease: Optional[dict[str, Any]], attempt: dict[str, Any], ttl: int) -> int:

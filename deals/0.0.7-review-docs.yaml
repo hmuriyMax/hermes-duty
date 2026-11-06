@@ -56,8 +56,11 @@ stages:
     needs: [review]
     workspace: worktree
     evidence:
-      - {cmd: "env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python3 bin/duty deals --limit 3", must: 0, timeout_sec: 120}
-      - {cmd: "env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python3 bin/duty now", must: 0, timeout_sec: 120}
+      # `HERMES_HOME` задан явно: у профиля воркера (`profiles/tester`) своего store и пула
+      # нет, и `bin/duty now`/`deals` там честно деградируют кодом 2 — это окружение
+      # воркера, а не поведение линии. Домашний корень Hermes — тот, где живёт duty.db.
+      - {cmd: "HERMES_HOME=/Users/mshchemilkin/.hermes env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python3 bin/duty deals --limit 3", must: 0, timeout_sec: 120}
+      - {cmd: "HERMES_HOME=/Users/mshchemilkin/.hermes env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python3 bin/duty now", must: 0, timeout_sec: 120}
       - {cmd: "cmp desktop/model.js /Users/mshchemilkin/.hermes/desktop-plugins/hermes-duty/model.js", must: 0, timeout_sec: 60}
       - {cmd: "node --test tests/model.test.mjs tests/web.test.mjs", must: 0, timeout_sec: 300}
       - {cmd: "cd /Users/mshchemilkin/.hermes/plugins/hermes-duty && grep -q 'GET /deals' README.md && grep -q 'bin/duty deals' docs/RUNBOOK.md", must: 0, timeout_sec: 60}

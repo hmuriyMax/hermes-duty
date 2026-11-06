@@ -1191,6 +1191,7 @@ function attemptRowNode(view) {
     track.append(
       h('span', {
         class: `tl-call${chip.unfinished ? ' tl-unfinished' : ''}`,
+        'data-level': String(chip.level || 0),
         style: chip.unfinished
           ? `left:${chip.leftPct}%;top:${chip.top}px;width:${chip.widthPct}%;color:${toneVar(chip.tone)}`
           : `left:${chip.leftPct}%;top:${chip.top}px;width:${chip.widthPct}%;background:${toneVar(chip.tone)}`,
@@ -1222,7 +1223,9 @@ function attemptRowNode(view) {
   }
   return h(
     'div',
-    { class: 'tl-row', style: `height:${view.full}px` },
+    // Свёрнутая высота показывает первый уровень вызовов и маркеры, полная
+    // раскрывается под указателем. Числа — из шейпера, CSS только переключает.
+    { class: 'tl-row', style: `--tl-collapsed:${view.collapsed}px;--tl-full:${view.full}px` },
     label,
     track,
   )
@@ -1352,8 +1355,12 @@ function specStrip(spec) {
       ...spec.nodes.map((node) =>
         h(
           'g',
-          { class: `spec-node t-${node.tone}` },
-          h('title', null, `${node.id} · ${node.label}${node.needsText ? ` · ${node.needsText}` : ''}`),
+          { class: `spec-node t-${node.tone}${node.fails ? ' has-fail' : ''}` },
+          h(
+            'title',
+            null,
+            `${node.id} · ${node.label}${node.failsText ? ` · ${node.failsText}` : ''}${node.needsText ? ` · ${node.needsText}` : ''}`,
+          ),
           h('rect', { x: node.x, y: node.y, width: spec.nodeW, height: spec.nodeH, rx: 4 }),
           h('text', { x: node.x + spec.nodeW / 2, y: node.y + spec.nodeH / 2 + 3, class: 'spec-id', 'text-anchor': 'middle' }, node.id),
         ),
@@ -1387,27 +1394,18 @@ function scalePanel(scale) {
     h(
       'div',
       { class: 'panel-b' },
-      // Ось стоит ровно над дорожками: слева колонка с легендой семейств
-      // инструментов, справа — та же область, где рисуются чипы.
+      // Ось стоит ровно над дорожками: слева пустая колонка шириной подписей,
+      // справа — та же область, где рисуются чипы.
       h(
         'div',
-        { class: 'scale-head' },
-        // Легенда семейств — колонкой слева, там же, где подписи попыток: числа
-        // вызовов из шейпера (`scale.tools`), а не пять слов из константы.
+        { class: 'scale-wrap' },
         h(
-          'div',
-          { class: 'scale-keys' },
-          h('span', { class: 'scale-keys-h' }, 'инструменты'),
-          ...scale.tools.map((item) =>
-            h(
-              'span',
-              { class: 'scale-key' },
-              h('span', { class: `scale-key-dot t-${item.tone}` }),
-              h('span', { class: 'scale-key-l' }, item.label),
-              h('span', { class: 'scale-key-n' }, String(item.count)),
-            ),
-          ),
-        ),
+        'div',
+        { class: 'scale-main' },
+        h(
+        'div',
+        { class: 'scale-head' },
+        h('div', { class: 'scale-head-gap' }),
         h(
           'div',
           { class: 'scale-axis' },
@@ -1448,7 +1446,24 @@ function scalePanel(scale) {
         ),
         ),
       ),
-      specStrip(scale.spec),
+        ),
+        // Легенда семейств — правой колонкой: числа вызовов из шейпера
+        // (`scale.tools`), а не пять слов из константы.
+        h(
+          'div',
+          { class: 'scale-side' },
+          h('span', { class: 'scale-keys-h' }, 'инструменты'),
+          ...scale.tools.map((item) =>
+            h(
+              'span',
+              { class: 'scale-key' },
+              h('span', { class: `scale-key-dot t-${item.tone}` }),
+              h('span', { class: 'scale-key-l' }, item.label),
+              h('span', { class: 'scale-key-n' }, String(item.count)),
+            ),
+          ),
+        ),
+      ),
       h('div', { class: 'tl-insp-host' }, inspectorNode(selectedCall(scale))),
       // Легенда маркеров: что означают точки внутри строк попыток.
       markerLegend(scale),
@@ -1527,15 +1542,27 @@ function viewDeal(dealId) {
   // (`shapeDealTime`), того же, что вшит в десктопный плагин.
   const scale = shapeDealTime(data, dealSnap.attempts)
 
+  // Заголовок: слева repo/id, имя дела и граф этапов (список того, что прошло,
+  // и того, где падало), справа — статус. Статус раньше стоял в левой колонке и
+  // отбирал место у графа, а сам граф висел отдельной панелью внизу.
   const head = h(
     'div',
     { class: 'deal-head' },
-    h('div', { class: 'mono muted' }, `${repoLabel(data.repo)} · ${data.id}`),
-    h('h1', null, data.title || '—'),
     h(
       'div',
-      { class: 'why-meta' },
-      deal ? Badge(deal.state, deal.humanKind) : h('span', { class: 'badge t-gray' }, h('i'), `завершено: ${data.status}`),
+      { class: 'deal-head-top' },
+      h(
+        'div',
+        { class: 'deal-head-main' },
+        h('div', { class: 'mono muted' }, `${repoLabel(data.repo)} · ${data.id}`),
+        h('h1', null, data.title || '—'),
+        specStrip(scale.spec),
+      ),
+      h(
+        'div',
+        { class: 'deal-head-side' },
+        deal ? Badge(deal.state, deal.humanKind) : h('span', { class: 'badge t-gray' }, h('i'), `завершено: ${data.status}`),
+      ),
     ),
     h(
       'div',

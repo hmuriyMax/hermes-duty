@@ -415,6 +415,11 @@ td.n { font-variant-numeric: tabular-nums; white-space: nowrap; }
 }
 
 .deal-head h1 { margin: 4px 0 8px; font-size: 19px; line-height: 1.3; }
+/* Слева — имя дела и граф этапов, справа в углу — статус. */
+.deal-head-top { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px 18px; align-items: start; }
+.deal-head-main { min-width: 0; }
+.deal-head-side { display: flex; align-items: flex-start; justify-content: flex-end; }
+.deal-head-side .badge { white-space: nowrap; }
 .deal-facts { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12.5px; color: var(--text-2); }
 .deal-facts b { color: var(--text); font-weight: 600; }
 
@@ -511,6 +516,11 @@ pre.body {
    шкала читалась и в тёмной, и в светлой теме. */
 /* Ось и сетка начинаются там же, где дорожки: колонка подписей слева — одна
  * ширина на всё (--tl-gutter + gap), иначе шкала «заходила» на подписи. */
+.scale-wrap, .scale-main { min-width: 0; }
+/* Шкала: дорожки слева, легенда семейств — правой колонкой, как в макете `d-merge`
+ * (статистика инструментов стояла сбоку справа, а не над дорожками). */
+.scale-wrap { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; align-items: start; }
+.scale-side { display: flex; flex-direction: column; gap: 1px; min-width: 104px; padding-left: 10px; border-left: 1px solid var(--border); font-size: 10px; color: var(--text-3); line-height: 1.45; }
 .scale-head { display: grid; grid-template-columns: var(--tl-gutter, 186px) 1fr; gap: var(--tl-gap, 8px); align-items: end; margin-bottom: 6px; --tl-gutter: 186px; --tl-gap: 8px; }
 /* Легенда — колонкой слева, ровно над колонкой подписей попыток. */
 .scale-keys { display: flex; flex-direction: column; gap: 1px; font-size: 10px; color: var(--text-3); line-height: 1.45; }
@@ -525,6 +535,7 @@ pre.body {
 .scale-key-dot.t-run { background: var(--warn); }
 .scale-key-dot.t-net { background: var(--danger); }
 .scale-axis { position: relative; height: 15px; }
+.scale-head-gap { min-width: 0; }
 .scale-tick { position: absolute; font-size: 11px; color: var(--text-3); white-space: nowrap; font-variant-numeric: tabular-nums; }
 .scale-tick.align-start { transform: translateX(0); }
 .scale-tick.align-center { transform: translateX(-50%); }
@@ -722,8 +733,10 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 
 /* Строка: слева стабильная подпись (ширина не меняется при раскрытии), справа
  * дорожка со штрихами и карта вызовов. */
-/* Строка попытки: высоту задаёт содержимое (уровни чипов + строка маркеров),
- * фон-полоса показывает длительность, поэтому раскрытия по наведению нет. */
+/* Строка попытки: свёрнутая показывает первый уровень вызовов и маркеры, полная
+ * раскрывается под указателем. Высоты приходят переменными от шейпера
+ * (--tl-collapsed/--tl-full), режет их только CSS — без overflow, иначе
+ * подсказка чипа, растущая вверх, обрезалась бы вместе с содержимым. */
 .tl-row {
   position: relative;
   display: grid;
@@ -731,7 +744,14 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
   gap: var(--tl-gap, 8px);
   align-items: stretch;
   border-radius: 6px;
+  height: var(--tl-collapsed, 20px);
+  transition: height .12s ease;
 }
+.tl-row:hover, .tl-row:focus-visible { height: var(--tl-full, 20px); }
+/* Глубокие уровни вызовов видны только в раскрытой строке. visibility, а не
+ * display: чипы позиционированы абсолютно, разметка не прыгает. */
+.tl-call[data-level]:not([data-level="0"]) { visibility: hidden; }
+.tl-row:hover .tl-call[data-level], .tl-row:focus-visible .tl-call[data-level] { visibility: visible; }
 .tl-row:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* Колонки подписи фиксированы: номер, статус, время, надбавка. Иначе «готово»
@@ -811,7 +831,7 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 .tl-call::after, .tl-band::after, .tl-lbl::after, .tl-mark::after, .tl-wait::after {
   content: attr(data-tip);
   position: absolute; left: 50%; bottom: calc(100% + 7px); transform: translateX(-50%);
-  padding: 3px 7px; border-radius: 5px; white-space: nowrap;
+  padding: 3px 7px; border-radius: 5px; white-space: normal; max-width: 240px; width: max-content; text-align: left;
   background: var(--card); color: var(--text); border: 1px solid var(--border);
   box-shadow: 0 8px 20px rgba(0, 0, 0, .38);
   font-family: var(--mono); font-size: 10.5px; line-height: 1.5;
@@ -865,8 +885,12 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 
 /* ------------------------------------------------------------- граф спеки */
 /* Граф — полосой: мелкие узлы, а не главный объект экрана. */
-.spec-strip { display: grid; grid-template-columns: var(--tl-gutter, 186px) auto; gap: var(--tl-gap, 8px); align-items: center; margin-top: 10px; }
-.spec-strip-name { font-size: 10.5px; color: var(--text-3); text-align: right; white-space: nowrap; }
+.spec-strip { display: flex; align-items: center; gap: 8px; margin: 2px 0 0; }
+/* Узел с провалом: штриховая красная обводка поверх состояния этапа — «здесь
+ * падало» остаётся видно и после того, как этап прошли. */
+.spec-node.has-fail rect { stroke: var(--danger); stroke-width: 1.4; stroke-dasharray: 3 2; }
+.spec-node.has-fail .spec-id { fill: var(--danger); }
+.spec-strip-name { font-size: 10px; color: var(--text-3); text-align: left; white-space: nowrap; }
 svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; overflow: visible; fill: none; stroke: none; }
 .spec-edge { fill: none; stroke: var(--border); stroke-width: 1.2; stroke-dasharray: 4 3; }
 .spec-node rect { fill: var(--card); stroke: var(--border); stroke-width: 1; }

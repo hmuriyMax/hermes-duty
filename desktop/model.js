@@ -1191,6 +1191,7 @@ function attemptView(bar, scale) {
       leftPct: chip.leftPct,
       widthPct: chip.widthPct,
       top: chip.top,
+      level: chip.level,
       tone: toolTone(call.name),
       unfinished: chip.unfinished === true,
       tip,
@@ -1249,9 +1250,14 @@ function attemptView(bar, scale) {
       widthPct: span.widthPct,
       title: span.title,
     }))
+  // Свёрнутая строка показывает первый уровень вызовов и маркеры; остальные
+  // уровни раскрываются по наведению. Высоту считает шейпер — иначе две
+  // поверхности разойдутся в том, «сколько строки видно без наведения».
+  const full = Math.max(TL.collapsed, layout.height + TL.pad + (marks.length ? TL.marksH : 0))
+  const collapsed = Math.min(full, TL.collapsed + (marks.length ? TL.marksH : 0))
   return {
-    full: Math.max(TL.collapsed, layout.height + TL.pad + (marks.length ? TL.marksH : 0)),
-    collapsed: TL.collapsed,
+    full,
+    collapsed,
     band: bandLeft === null || bandWidth === null ? null : { leftPct: bandLeft, widthPct: bandWidth },
     bandTip,
     label: {
@@ -1523,11 +1529,16 @@ function specView(rawStages) {
     const depth = depthOf(stage.id, new Set())
     const row = columns[depth] === undefined ? 0 : columns[depth]
     columns[depth] = row + 1
+    // Провал попытки — факт этапа, даже если сейчас он пройден: раньше схема
+    // показывала только текущее состояние, и «здесь падало» исчезало из памяти.
+    const fails = stage.attempts.filter((attempt) => attempt.tone === 'red').length
     return {
       id: stage.id,
       role: stage.role,
       label: stage.stateLabel,
       tone: stage.tone,
+      fails,
+      failsText: fails ? `провалов ${fails}` : '',
       kind: stage.kind || 'agent',
       needsText: stage.needsText,
       depth,

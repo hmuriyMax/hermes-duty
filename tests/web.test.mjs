@@ -152,3 +152,45 @@ test('десктопная лента берёт те же `stages` из ctx.res
   // ожидание вопроса — ссылкой на пул, как и в вебе
   assert.match(pluginSource, /href: stage\.questionHref/)
 })
+
+test('разворот строки и правки экрана дела: правила есть на обеих поверхностях', () => {
+  const css = read('dashboard/web/styles.css')
+  const app = read('dashboard/web/app.js')
+  const plugin = read('desktop/plugin.js')
+
+  // Разворот: свёрнутая высота, полная по наведению, глубокие чипы скрыты.
+  const surfaces = [
+    ['веб', css, '--tl-collapsed', '--tl-full'],
+    ['десктоп', plugin, '--duty-tl-collapsed', '--duty-tl-full'],
+  ]
+  for (const [name, text, collapsed, full] of surfaces) {
+    assert.match(text, new RegExp(`height:\\s*var\\(${collapsed}`), `${name}: нет свёрнутой высоты строки`)
+    assert.match(text, new RegExp(`:hover[^{]*\\{[^}]*height:\\s*var\\(${full}`), `${name}: наведение не раскрывает строку`)
+    assert.match(text, /data-level\]:not\(\[data-level="0"\]\)[^{]*\{[^}]*visibility:\s*hidden/, `${name}: глубокие чипы не прячутся`)
+  }
+  assert.match(app, /'data-level':\s*String\(chip\.level/, 'веб не отдаёт уровень чипа в разметку')
+  assert.match(plugin, /'data-level':\s*String\(chip\.level/, 'десктоп не отдаёт уровень чипа в разметку')
+  assert.match(app, /--tl-collapsed:\$\{view\.collapsed\}px;--tl-full:\$\{view\.full\}px/, 'веб не передаёт высоты из шейпера')
+  assert.match(plugin, /'--duty-tl-collapsed':\s*`\$\{view\.collapsed\}px`/, 'десктоп не передаёт высоты из шейпера')
+
+  // Подсказки переносятся по словам, а не висят одной строкой.
+  for (const [name, text] of [['веб', css], ['десктоп', plugin]]) {
+    const rule = text.slice(text.indexOf('content:attr(data-tip)') >= 0 ? text.indexOf('content:attr(data-tip)') - 400 : text.indexOf('content: attr(data-tip)') - 400)
+    assert.match(rule.slice(0, 900), /white-space:\s*normal/, `${name}: подсказка не переносится`)
+    assert.match(rule.slice(0, 900), /max-width:\s*240px/, `${name}: у подсказки нет предела ширины`)
+  }
+
+  // Граф этапов — в заголовке дела, статус — в правом углу.
+  assert.match(app, /deal-head-top[\s\S]{0,700}specStrip\(scale\.spec\)/, 'веб: граф не в заголовке')
+  assert.match(app, /deal-head-side/, 'веб: у заголовка нет правой колонки под статус')
+  assert.match(plugin, /duty-deal-head-top[\s\S]{0,700}SpecStrip/, 'десктоп: граф не в заголовке')
+  assert.match(plugin, /duty-deal-head-side[\s\S]{0,400}StateBadge/, 'десктоп: статус не в правой колонке')
+
+  // Статистика инструментов — правой колонкой от дорожек.
+  assert.match(app, /class: 'scale-side'/, 'веб: нет правой колонки легенды')
+  assert.match(plugin, /className: 'duty-scale-side'/, 'десктоп: нет правой колонки легенды')
+
+  // Провал попытки отмечается на узле графа.
+  assert.match(css, /\.spec-node\.has-fail rect\s*\{[^}]*var\(--danger\)/, 'веб: провал не отмечен')
+  assert.match(plugin, /\.duty-spec-node\.has-fail rect\{[^}]*var\(--ui-red\)/, 'десктоп: провал не отмечен')
+})

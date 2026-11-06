@@ -18,6 +18,7 @@ import {
   STATE_META,
   WAIT_HUMAN_LABEL,
   WITHOUT_REPO_LABEL,
+  TL,
   filterNow,
   fmtAge,
   fmtTitle,
@@ -584,6 +585,47 @@ test('маркеры: событие принадлежит одной попы�
   // Ответ человеку, пришедший в промежутке между попытками, остаётся у той, где спросили.
   const answerRow = rows.findIndex((marks) => marks.some((title) => title.includes('13:30:00') || title.includes('ответ')))
   assert.ok(answerRow >= 0, 'ответ человека не попал ни в одну строку')
+})
+
+test('разворот строки: свёрнутая высота меньше полной, маркеры видны и без наведения', () => {
+  // Вызовы в одну секунду накладываются друг на друга — уровней больше одного.
+  const calls = Array.from({ length: 6 }, (_, i) => ({ seq: i + 1, name: 'read_file', at: 1_000, ms: 400 }))
+  const scale = shapeDealTime(
+    { now: 1_100, terminal: true, timeline: [{ kind: 'created', at: 1_000, summary: '' }], stages: [{ id: 'impl', needs: [] }] },
+    { attempts: [{ stage: 'impl', attempt: 1, start: 1_000, end: 1_010, status: 'done', outcome: 'done', calls }] },
+  )
+  const view = attemptView(scale.bars[0], scale)
+  const levels = new Set(view.chips.map((chip) => chip.level))
+  assert.ok(levels.size > 1, `уровней ${levels.size}: разворачивать нечего`)
+  assert.ok(view.collapsed > 0 && view.collapsed < view.full, `свёрнутая ${view.collapsed}, полная ${view.full}`)
+  // Свёрнутая высота — первый уровень плюс строка маркеров, иначе точки фактов
+  // исчезали бы вместе с глубокими чипами.
+  // 20 px — свёрнутая строка из `TL.collapsed`, 12 px — строка маркеров (`TL.marksH`).
+  assert.equal(view.collapsed, 20 + (view.marks.length ? 12 : 0))
+  // Уровень приходит в вид: поверхности прячут глубокие чипы, не считая сами.
+  assert.deepEqual([...new Set(view.chips.map((chip) => chip.level))].sort(), [...levels].sort())
+})
+
+test('граф спеки: провал попытки этапа виден, даже если этап потом прошли', () => {
+  const scale = shapeDealTime(
+    {
+      now: 1_600,
+      terminal: true,
+      timeline: [{ kind: 'created', at: 1_000, summary: '' }],
+      stages: [
+        { id: 'impl', role: 'implementer', state: 'done', needs: [], attempts: [{ attempt: 1, outcome: 'done' }] },
+        { id: 'check', role: 'reviewer', state: 'done', needs: ['impl'], attempts: [{ attempt: 1, outcome: 'failed' }, { attempt: 2, outcome: 'done' }] },
+      ],
+    },
+    {},
+  )
+  const check = scale.spec.nodes.find((node) => node.id === 'check')
+  const impl = scale.spec.nodes.find((node) => node.id === 'impl')
+  assert.equal(check.fails, 1, 'провал не посчитан')
+  assert.equal(check.failsText, 'провалов 1')
+  assert.equal(impl.fails, 0)
+  // Тон узла остаётся состоянием этапа: провал — отдельная отметка, а не подмена.
+  assert.equal(check.tone, 'green')
 })
 
 test('легенда инструментов: семейства с числами вызовов, порядок постоянный', () => {

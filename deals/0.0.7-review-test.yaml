@@ -1,0 +1,52 @@
+# Дело: ревью и живая проверка доработок 0.0.7
+#
+# Второе дело линии 0.0.7. Работу сделало первое дело (`deals/0.0.7-cards-and-finished.yaml`,
+# `d_a7040118`): его попытка `impl-finished#3` закоммитила `b2ae868`, движок снял её за
+# токены и выбросил отчёт — работа принята координатором, проверена в отдельном worktree
+# (811 passed) и влита в `release/v0.0.7` вместе с двумя правками движка.
+#
+# Здесь только то, чего в том деле не случилось: независимое ревью диффа и живая проверка
+# поверхностей. Реализация уже в дереве, поэтому этапа-реализации нет.
+#
+# Этапы:
+#   check   детерминированные прогоны на этом base (команда, без агента)
+#   review  независимый ревьюер: дифф всей линии 0.0.7, вердикт файлом
+#   verify  живая проверка поверхностей тестировщиком
+#
+# Возврат ревью: `changes: check`. Правок в этом деле нет по построению — реализации здесь
+# не живёт. Ревьюер, потребовавший правок, запускает повтор проверок и второе ревью; если
+# он не согласен и во второй раз, дело падает `contract` и паркуется вопросом человеку —
+# правки идут новым делом. Токеновых потолков нет: минуты, и только они (замер 06.11:
+# одна попытка implementer — 34.7M токенов, потолок в токенах ничего не ограничивает).
+
+duty: 0.0.7-review-test
+repo: ~/.hermes/plugins/hermes-duty
+base: 05b8d61
+
+budget: {minutes: 180}
+
+stages:
+  - id: check
+    kind: shell
+    cmd: "env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python3 -m pytest tests/ -q && node --test tests/model.test.mjs tests/web.test.mjs && env -u PYTHONPATH bin/duty-model-sync --check && env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/hermes plugins validate . && env -u PYTHONPATH bin/duty-version check"
+    must: 0
+    workspace: worktree
+
+  - id: review
+    role: reviewer
+    needs: [check]
+    workspace: worktree
+    verdict: {approve: next, changes: check, max_rounds: 1}
+    budget: {minutes: 60}
+
+  - id: verify
+    role: tester
+    needs: [review]
+    workspace: worktree
+    evidence:
+      - {cmd: "env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python3 bin/duty deals --limit 3", must: 0, timeout_sec: 120}
+      - {cmd: "env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python3 bin/duty now", must: 0, timeout_sec: 120}
+      - {cmd: "cmp desktop/model.js /Users/mshchemilkin/.hermes/desktop-plugins/hermes-duty/model.js", must: 0, timeout_sec: 60}
+      - {cmd: "node --test tests/model.test.mjs tests/web.test.mjs", must: 0, timeout_sec: 300}
+    retry: {max: 1, on: [infra, contract]}
+    budget: {minutes: 60}

@@ -1,0 +1,70 @@
+# Дело: доработки 0.0.7 в hermes-duty
+#
+# Первое дело, которое ведёт сам движок на собственном репозитории: спека лежит в
+# репозитории дела, а не в карточке. Правила формата — `docs/SPEC.md`.
+#
+#   impl-cards     убрать блок карточек канбана из /stats и CLI (наблюдение — только /cards)
+#   impl-finished  список завершённых дел: ручка, CLI, веб, десктоп
+#   check          детерминированные прогоны целиком (команда, без агента)
+#   review         приговор ревьюера; возврат — в impl-finished
+#   gate           публикация — вопрос человеку
+#   publish        публикует publisher, движок сверяет коммит по git ls-remote
+#
+# Чего в деле нет: тегов и выпуска версии — это отдельное решение человека (гейт
+# публикации пушит ветку, версию двигает `bin/duty-version` по команде).
+
+duty: cards-and-finished
+repo: ~/.hermes/plugins/hermes-duty
+base: release/v0.0.7
+
+budget: {tokens: 1500000, minutes: 300}
+
+stages:
+  - id: impl-cards
+    role: implementer
+    workspace: worktree
+    evidence:
+      - {cmd: "env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python3 -m pytest tests/test_health.py tests/test_budget.py -q", must: 0, timeout_sec: 600}
+      - {cmd: "node --test tests/model.test.mjs", must: 0, timeout_sec: 300}
+    retry: {max: 1, on: [infra, contract]}
+    budget: {tokens: 500000, minutes: 90}
+
+  - id: impl-finished
+    role: implementer
+    needs: [impl-cards]
+    workspace: worktree
+    evidence:
+      - {cmd: "env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python3 -m pytest tests/ -q", must: 0, timeout_sec: 900}
+      - {cmd: "node --test tests/model.test.mjs", must: 0, timeout_sec: 300}
+      - {cmd: "env -u PYTHONPATH bin/duty-model-sync --check", must: 0, timeout_sec: 120}
+    retry: {max: 1, on: [infra, contract]}
+    budget: {tokens: 600000, minutes: 120}
+
+  # Прогоны повторяются командой в дереве: агент уже сказал «готово», а доказательство —
+  # это повторный запуск, а не отчёт.
+  - id: check
+    kind: shell
+    cmd: "env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python3 -m pytest tests/ -q && node --test tests/model.test.mjs && env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/hermes plugins validate . && env -u PYTHONPATH /Users/mshchemilkin/.hermes/plugins/hermes-duty/bin/duty-version check"
+    must: 0
+    needs: [impl-finished]
+    workspace: worktree
+
+  - id: review
+    role: reviewer
+    needs: [check]
+    verdict: {approve: next, changes: impl-finished, max_rounds: 2}
+    workspace: worktree
+
+  - id: gate
+    kind: gate
+    needs: [review]
+    ask:
+      q: "Публикуем коммит дела cards-and-finished в ветку release/v0.0.7?"
+      options: ["публиковать", "не публиковать"]
+    allow: ["публиковать"]
+    budget: {minutes: 1440}
+
+  - id: publish
+    role: publisher
+    needs: [gate]
+    workspace: worktree

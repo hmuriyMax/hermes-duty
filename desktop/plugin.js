@@ -1443,6 +1443,44 @@ function attemptsBreakdown(lanes, bars) {
   return list.map((lane) => `${lane.label} ${fmtCount(lane.count)}`).join(' · ')
 }
 
+/**
+ * Блоки документации дела: `[{kind, label, name, path, text, truncated}]`.
+ *
+ * `body` из store и спека — разные документы, и называть одно другим нельзя.
+ * У дел из `bin/duty create` свободного `body` нет вовсе: описание живёт
+ * комментариями в шапке `duty.yaml`, поэтому спека показывается первой, а `body`
+ * — отдельным блоком, когда он есть. Пустой список — нечего рисовать: панель,
+ * которая говорит «пусто», отбирает колонку и ничего не сообщает. Порядок
+ * стабилен (тело, затем спека), чтобы поверхность не решала, что важнее.
+ */
+function docBlocks(data) {
+  const src = data || {}
+  const out = []
+  const body = String(src.body || '').trim()
+  if (body) {
+    out.push({
+      kind: 'body',
+      label: 'описание',
+      name: '',
+      path: '',
+      text: body,
+      truncated: Boolean(src.body_truncated),
+    })
+  }
+  const specText = String(src.spec_text || '').trim()
+  if (specText) {
+    out.push({
+      kind: 'spec',
+      label: 'спецификация',
+      name: fileLabel(src.spec),
+      path: String(src.spec || ''),
+      text: specText,
+      truncated: Boolean(src.spec_text_truncated),
+    })
+  }
+  return out
+}
+
 /** Вид дорожки этапа: имя, вид, сводка попыток и строки. */
 function laneView(lane, bars, scale) {
   const list = Array.isArray(bars) ? bars : []
@@ -3682,16 +3720,24 @@ function DealScreen({ sel, onBack }) {
       // лента — пояснение к нему.
       h(KpiStrip, { scale }),
       h(ScalePanel, { scale, callSel, onSelectCall: selectCall, toolFilter, onToggleTool: toggleTool }),
-      // Пустая спецификация не занимает колонку — иначе панель «тело дела пустое»
-      // отбирает место у попыток, ничего не сообщая.
-      detail.data.body
-        ? h(
+      // Документы дела: тело из store и спека — разные документы, подменять один
+      // другим нельзя (у дел из `bin/duty create` описания в store нет вовсе).
+      // Нет документов — нет панели: она отбирала бы место у попыток.
+      ...docBlocks(detail.data).map((doc) =>
+        h(
+          'div',
+          { className: 'duty-deal-spec', key: `doc-${doc.kind}` },
+          h(
             'div',
-            { className: 'duty-deal-spec' },
-            h('div', { className: 'duty-group-h' }, h('span', null, 'спецификация'), detail.data.body_truncated ? h('span', { className: 'duty-mono' }, 'обрезана лимитом') : null),
-            h('div', { className: 'duty-spec duty-md' }, h(Streamdown, null, detail.data.body)),
-          )
-        : null,
+            { className: 'duty-group-h', title: doc.path || '' },
+            h('span', null, doc.name ? `${doc.label} · ${doc.name}` : doc.label),
+            doc.truncated ? h('span', { className: 'duty-mono' }, 'обрезана лимитом') : null,
+          ),
+          doc.kind === 'spec'
+            ? h('pre', { className: 'duty-spec duty-doc-src duty-mono' }, doc.text)
+            : h('div', { className: 'duty-spec duty-md' }, h(Streamdown, null, doc.text)),
+        ),
+      ),
       h(StageFeed, { feed }),
       h(
         'div',

@@ -683,6 +683,27 @@ SUCCESS_OUTCOMES = ("completed", "done", "succeeded")
 # Сколько тела дела отдаём на экран «Дело» (тело карточки — спецификация, в
 # ответе она нужна целиком, но не бесконечно).
 DEAL_BODY_LIMIT = 20000
+# Текст спеки для экрана дела. 20 000 — тот же потолок, что у `body`: спека это
+# файл репозитория, и страница не обязана пересказывать его целиком.
+SPEC_TEXT_LIMIT = 20000
+
+
+def _spec_text(path: Optional[str]) -> tuple[str, bool]:
+    """Текст спеки как есть: `(текст, обрезан)`.
+
+    У дел из `bin/duty create` свободного `body` в store нет — описание живёт
+    комментариями в шапке `duty.yaml`. Без файла экран показывал «тело дела
+    пустое» при живой спеке, то есть называл спецификацией другое поле.
+    Отсутствующий или нечитаемый файл — пустая строка, а не ошибка: страница
+    дела остаётся страницей дела, а причина уже видна в `stages_note`.
+    """
+    if not path:
+        return "", False
+    try:
+        text = Path(path).expanduser().read_text(encoding="utf-8")
+    except OSError:
+        return "", False
+    return text[:SPEC_TEXT_LIMIT], len(text) > SPEC_TEXT_LIMIT
 
 
 def _now_sec() -> int:
@@ -1367,6 +1388,7 @@ def _deal_response(
     """
     body_text = str(row.get("body") or "")
     status = str(row.get("status") or "")
+    spec_text, spec_text_truncated = _spec_text(spec)
     return {
         "now": now,
         "repo": row.get("repo"),
@@ -1385,6 +1407,8 @@ def _deal_response(
         "attachments": attachments,
         "timeline": timeline,
         "spec": spec,
+        "spec_text": spec_text,
+        "spec_text_truncated": spec_text_truncated,
         "stages": list(stages or []),
         "stages_note": stages_note,
         "budget": budget_block,
@@ -2280,6 +2304,8 @@ def _error_body(deal_id: Optional[str], reason: str) -> dict[str, Any]:
         "created_at": None,
         "body": "",
         "body_truncated": False,
+        "spec_text": "",
+        "spec_text_truncated": False,
         "deal": None,
         "comments": [],
         "attachments": [],

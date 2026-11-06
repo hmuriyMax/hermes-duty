@@ -250,19 +250,20 @@ test('разворот строки и правки экрана дела: пр�
   assert.match(plugin, /\.duty-spec-node\.has-fail rect\{[^}]*var\(--ui-red\)/, 'десктоп: провал не отмечен')
 })
 
-test('карточка дела не повторяет числа и не рисует пустую спеку', () => {
+test('карточка дела не повторяет числа и не подменяет спеку телом', () => {
   const app = read('dashboard/web/app.js')
   // Длительность и попытки живут в KPI: в строке фактов их больше нет.
   const facts = app.slice(app.indexOf('function dealFactSpans'), app.indexOf('function kpiStrip'))
   assert.doesNotMatch(facts, /'длительность: '/, 'длительность повторяется в фактах и в KPI')
   assert.doesNotMatch(facts, /'попыток: '/, 'попытки повторяются в фактах и в KPI')
-  // Панель спецификации — только при непустом теле дела.
-  assert.match(app, /const left = data\.body/, 'спецификация рисуется всегда, даже пустая')
-  assert.match(app, /left \? h\('div', \{ class: 'two-col' \}, left, right\) : right/, 'без спеки попытки остаются в узкой колонке')
+  // Документы дела строятся шейпером; панели нет только когда нет ни тела, ни спеки.
+  assert.match(app, /const docs = docBlocks\(data\)/, 'документы дела решает поверхность, а не шейпер')
+  assert.match(app, /const left = docs\.length/, 'панель документов рисуется всегда, даже пустая')
+  assert.match(app, /left \? h\('div', \{ class: 'two-col' \}, left, right\) : right/, 'без документов попытки остаются в узкой колонке')
   // Заголовок этапов не повторяет счёт попыток из KPI.
   assert.doesNotMatch(app, /этапы · \$\{feed\.count\}, попыток/, 'счёт попыток дублируется в заголовке этапов')
   // Пути — именами, полный путь в подсказке.
-  assert.match(app, /repoShort\(data\.repo\),|\$\{repoShort\(data\.repo\)\}/, 'шапка печатает полный путь репозитория')
+  assert.match(app, /repoShort\(data\.repo\)/, 'шапка печатает полный путь репозитория')
   assert.match(app, /fileLabel\(feed\.spec\)/, 'путь к спеке печатается целиком')
 })
 
@@ -271,7 +272,7 @@ test('десктопная карточка дела: те же правила, 
   const facts = plugin.slice(plugin.indexOf('function DealFactSpans'), plugin.indexOf('function StageFeed'))
   assert.doesNotMatch(facts, /'длительность: '/, 'десктоп: длительность дублируется')
   assert.doesNotMatch(facts, /'попыток: '/, 'десктоп: попытки дублируются')
-  assert.match(plugin, /detail\.data\.body\s*\n?\s*\?/, 'десктоп: спека рисуется всегда')
+  assert.match(plugin, /\.\.\.docBlocks\(detail\.data\)/, 'десктоп: документы дела решает поверхность')
   assert.match(plugin, /fileLabel\(feed\.spec\)/, 'десктоп: путь к спеке печатается целиком')
   assert.match(plugin, /repoShort\(/, 'десктоп: шапка печатает полный путь репозитория')
   assert.doesNotMatch(plugin, /попыток \$\{feed\.attempts\}/, 'десктоп: счёт попыток дублируется в заголовке этапов')

@@ -35,6 +35,7 @@ import {
   repoLabel,
   repoShort,
   fileLabel,
+  docBlocks,
   finishedStatusMeta,
   shapeAttempts,
   shapeCalls,
@@ -832,6 +833,37 @@ test('слова вместо машинных значений: исход по
   assert.equal(finishedStatusMeta('done').label, 'завершено')
   assert.equal(finishedStatusMeta('archived').label, 'в архиве')
   assert.equal(finishedStatusMeta('weird').label, 'weird')
+})
+
+test('документы дела: спека — файл, тело — отдельный блок', () => {
+  // Дело из `bin/duty create`: тело пустое, описание живёт шапкой спеки — панель
+  // обязана показать спеку, а не «тело дела пустое».
+  const specOnly = docBlocks({
+    body: '',
+    spec: '/Users/x/.hermes/plugins/hermes-duty/deals/0.0.7-review-docs.yaml',
+    spec_text: '# Дело: повторное ревью\n#\n# Третье дело линии 0.0.7.',
+  })
+  assert.equal(specOnly.length, 1, 'спека без тела не показана')
+  assert.equal(specOnly[0].kind, 'spec')
+  assert.equal(specOnly[0].label, 'спецификация')
+  assert.equal(specOnly[0].name, '0.0.7-review-docs.yaml', 'имя спеки с каталогами')
+  assert.match(specOnly[0].text, /повторное ревью/)
+
+  // Дело с телом и без файла: тело остаётся описанием, а не выдаётся за спеку.
+  const bodyOnly = docBlocks({ body: 'проверить рецепт', spec: '/nope/verify-recipe.yaml', spec_text: '' })
+  assert.deepEqual(bodyOnly.map((doc) => [doc.kind, doc.label]), [['body', 'описание']])
+  assert.equal(bodyOnly[0].text, 'проверить рецепт')
+
+  // Оба документа: тело первым, спека вторым — порядок решает шейпер, не поверхность.
+  const both = docBlocks({ body: 'тело', spec: '/x/y.yaml', spec_text: 'duty: y' })
+  assert.deepEqual(both.map((doc) => doc.kind), ['body', 'spec'])
+
+  // Нечего показывать — пустой список: панель «пусто» отбирала бы колонку.
+  assert.deepEqual(docBlocks({ body: '', spec_text: '' }), [])
+  assert.deepEqual(docBlocks(null), [])
+
+  // Обрезанный файл называет причину, а не молчит.
+  assert.equal(docBlocks({ spec: '/x/y.yaml', spec_text: 'duty: y', spec_text_truncated: true })[0].truncated, true)
 })
 
 test('короткие имена: репозиторий и файл спеки без каталогов', () => {

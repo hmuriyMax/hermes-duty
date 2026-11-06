@@ -35,6 +35,7 @@ import {
   repoLabel,
   repoShort,
   fileLabel,
+  docBlocks,
   finishedStatusMeta,
   shapeAttempts,
   shapeDeal,
@@ -1641,14 +1642,29 @@ function viewDeal(dealId) {
     deal && deal.evidence ? h('div', { class: 'why-evidence', style: 'margin-top:10px', text: deal.evidence }) : null,
   )
 
-  // Пустая спецификация не занимает колонку: панель, которая говорит «пусто»,
-  // отбирает место у попыток и ничего не сообщает.
-  const left = data.body
+  // Документы дела: тело из store и спека — разные вещи, и рисовать вместо одной
+  // другую нельзя (у дел из `bin/duty create` описания в store нет вовсе).
+  // Нет документов — нет колонки: панель «пусто» отбирает место у попыток.
+  const docs = docBlocks(data)
+  const left = docs.length
     ? h(
         'div',
         { class: 'panel' },
-        h('div', { class: 'panel-h' }, `спецификация${data.body_truncated ? ' (обрезана лимитом)' : ''}`),
-        h('div', { class: 'panel-b' }, mdNode(data.body)),
+        ...docs.map((doc) =>
+          h(
+            'div',
+            { class: 'panel-doc' },
+            h(
+              'div',
+              { class: 'panel-h', title: doc.path || '' },
+              doc.name ? `${doc.label} · ${doc.name}` : doc.label,
+              doc.truncated ? ' (обрезана лимитом)' : '',
+            ),
+            doc.kind === 'spec'
+              ? h('pre', { class: 'panel-b doc-src mono' }, doc.text)
+              : h('div', { class: 'panel-b' }, mdNode(doc.text)),
+          ),
+        ),
       )
     : null
 

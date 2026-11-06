@@ -461,6 +461,25 @@ td.n { font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 .panel-b { padding: 12px; }
 
+/* Документ дела в панели: у панели может быть два блока (описание и спека),
+   поэтому заголовок повторяется внутри, а не один на всю панель. */
+.panel-doc + .panel-doc { border-top: 1px solid var(--border); }
+
+/* Текст спеки — исходник YAML: он длинный и его читают глазами по строкам,
+   поэтому перенос по словам, моноширинный и собственный скролл, чтобы панель
+   не растягивала страницу на несколько экранов. */
+.panel-b.doc-src {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-2);
+  max-height: 46vh;
+  overflow: auto;
+}
+
 pre.body {
   margin: 0;
   white-space: pre-wrap;

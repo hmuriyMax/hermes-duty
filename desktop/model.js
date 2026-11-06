@@ -154,6 +154,28 @@ function repoLabel(repo) {
   return String(repo || '') || WITHOUT_REPO_LABEL
 }
 
+/**
+ * Короткое имя репозитория для шапки: последний сегмент пути.
+ *
+ * В store репозиторий живёт абсолютным путём (`/Users/…/plugins/hermes-duty`), и
+ * этот путь как кикер заголовка — шум: человеку нужно имя. Полный путь остаётся
+ * в подсказке, `repoLabel` не меняется — по нему группируются дела.
+ */
+function repoShort(repo) {
+  const text = String(repo || '').trim()
+  if (!text) return WITHOUT_REPO_LABEL
+  const tail = text.replace(/[\\/]+$/, '').split(/[\\/]/).pop()
+  return tail || text
+}
+
+/** Имя файла без каталогов: полный путь — в подсказке, здесь только хвост. */
+function fileLabel(path) {
+  const text = String(path || '').trim()
+  if (!text) return ''
+  const tail = text.replace(/[\\/]+$/, '').split(/[\\/]/).pop()
+  return tail || text
+}
+
 /** Возраст/длительность в человекочитаемом виде: `45 с`, `12 мин`, `3 ч`, `2 д`. */
 function fmtAge(sec) {
   if (sec === null || sec === undefined || sec === '') return '—'
@@ -819,7 +841,7 @@ function shapeStageAttempt(attempt) {
   if (live) liveText = 'идёт'
   else if (dead) liveText = 'процесс мёртв: лизинг истёк, завершения нет'
   else if (lease === 'unknown') liveText = 'живость неизвестна: лизинг не записан'
-  else if (outcome) liveText = `исход: ${outcome}`
+  else if (outcome) liveText = `исход: ${outcomeWord(outcome)}`
   const tone = live ? 'blue' : dead ? 'red' : ATTEMPT_TONE[outcome] || 'gray'
   const records = (Array.isArray(a.evidence) ? a.evidence : []).map((record) => {
     const r = record && typeof record === 'object' ? record : {}
@@ -1360,6 +1382,18 @@ function attemptView(bar, scale) {
   }
 }
 
+/**
+ * Разбивка попыток по этапам одной фразой: `check 1 · review 1 · verify 3`.
+ *
+ * Пустая строка, когда разбивать нечего (попыток нет или все в одном этапе):
+ * подсказка, повторяющая число, ничего не добавляет.
+ */
+function attemptsBreakdown(lanes, bars) {
+  const list = Array.isArray(lanes) ? lanes.filter((lane) => Number(lane.count) > 0) : []
+  if (list.length < 2) return ''
+  return list.map((lane) => `${lane.label} ${fmtCount(lane.count)}`).join(' · ')
+}
+
 /** Вид дорожки этапа: имя, вид, сводка попыток и строки. */
 function laneView(lane, bars, scale) {
   const list = Array.isArray(bars) ? bars : []
@@ -1747,14 +1781,16 @@ function shapeDealTime(detail, attemptsPayload) {
       : ''
     // Подпись внутри полосы — исход, а не догадка: у незакрытой это слово о
     // лизинге, у закрытой без исхода — её длительность.
-    bar.label = bar.open ? bar.leaseText : bar.outcome || bar.status || bar.durationText
+    bar.label = bar.open ? bar.leaseText : outcomeWord(bar.outcome) || bar.status || bar.durationText
     // Короткая подпись строки таймлайна: исход по-русски, у незакрытой — лизинг.
     bar.outcomeText = bar.open ? bar.leaseText : outcomeWord(bar.outcome) || bar.status || bar.durationText
     const details = [bar.progressText, bar.toolsText, bar.callsText].filter(Boolean).join(', ')
     const head = `${bar.laneLabel} · попытка ${bar.number || '—'}`
     const interval = `${bar.clockStart}–${bar.clockEnd} (${bar.durationText})`
     const cause = barReasonText(bar)
-    const tail = bar.open ? `лизинг: ${bar.leaseText}` : `исход: ${bar.outcome || bar.status || 'не записан'}${cause ? ` · ${cause}` : ''}`
+    const tail = bar.open
+      ? `лизинг: ${bar.leaseText}`
+      : `исход: ${outcomeWord(bar.outcome) || bar.status || 'не записан'}${cause ? ` · ${cause}` : ''}`
     bar.title = `${head} · ${interval} · ${tail}${details ? ` · ${details}` : ''}`
     bar.ariaLabel = bar.title
   }
@@ -1882,7 +1918,11 @@ function shapeDealTime(detail, attemptsPayload) {
         at: numOrNull(closedRaw.at),
         clock: fmtClock(closedRaw.at),
         cause: String(closedRaw.cause || ''),
-        text: `закрыто ${fmtClock(closedRaw.at)}${closedRaw.cause ? `: ${closedRaw.cause}` : ''}`,
+        // Причина закрытия — словами, как и в маркере: `all_stages_done` в
+        // человеческой строке читается как сбой экрана, а не как факт.
+        text: `закрыто ${fmtClock(closedRaw.at)}${
+          closedRaw.cause ? `: ${CLOSE_CAUSE_WORD[String(closedRaw.cause)] || closedRaw.cause}` : ''
+        }`,
       }
     : null
   const durationSec = axisStart === null || axisEnd === null ? null : Math.max(0, axisEnd - axisStart)
@@ -1933,7 +1973,14 @@ function shapeDealTime(detail, attemptsPayload) {
   const kpi = [
     { key: 'duration', label: 'длительность', value: durationSec === null ? '—' : fmtDuration(durationSec) },
     { key: 'stages', label: 'этапов', value: fmtCount(lanes.filter((lane) => lane.count > 0).length) },
-    { key: 'attempts', label: 'попыток', value: fmtCount(bars.length) },
+    // Разбивка по этапам живёт подсказкой этой ячейки: отдельной строкой она
+    // повторяла то же число второй раз.
+    {
+      key: 'attempts',
+      label: 'попыток',
+      value: fmtCount(bars.length),
+      title: attemptsBreakdown(lanes, bars),
+    },
     {
       key: 'calls',
       label: 'вызовов',
@@ -2005,6 +2052,8 @@ export {
   WITHOUT_REPO_LABEL,
   ALL_REPOS,
   repoLabel,
+  repoShort,
+  fileLabel,
   stateMeta,
   stageMeta,
   finishedStatusMeta,

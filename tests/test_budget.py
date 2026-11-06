@@ -29,6 +29,8 @@ import textwrap
 from pathlib import Path
 from typing import Any
 
+import time
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -594,7 +596,9 @@ def test_stats_window_in_the_future_is_called_empty_not_zero(home: Path, client:
     не должна им противоречить бодрым «0 с». Красная проба: вернуть старую строку
     `{span} {source}` без ветки `sec <= 0` — тест падает на «0 с задано».
     """
-    body = client.get("/stats", params={"since": 1793999999}).json()
+    # Окно в будущем считается от «сейчас»: приколоченный epoch однажды
+    # перестаёт быть будущим и тест падает по календарю, а не по коду.
+    body = client.get("/stats", params={"since": int(time.time()) + 3600}).json()
 
     printed = cli.render_stats(body)
 

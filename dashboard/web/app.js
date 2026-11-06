@@ -33,6 +33,9 @@ import {
   noticeLines,
   plural,
   repoLabel,
+  repoShort,
+  fileLabel,
+  finishedStatusMeta,
   shapeAttempts,
   shapeDeal,
   shapeDealTime,
@@ -1019,7 +1022,7 @@ function stageRow(stage) {
  */
 function stageFeedPanel(data) {
   const feed = shapeStages(data)
-  const title = feed.empty ? 'этапы' : `этапы · ${feed.count}, попыток ${feed.attempts}`
+  const title = feed.empty ? 'этапы' : `этапы · ${feed.count}`
   const body = feed.empty
     ? h('div', { class: 'panel-b muted' }, feed.note || 'этапов нет')
     : h('div', null, ...feed.stages.map(stageRow))
@@ -1027,7 +1030,13 @@ function stageFeedPanel(data) {
     'div',
     { class: 'panel', style: 'margin-bottom:14px' },
     h('div', { class: 'panel-h' }, title),
-    feed.spec ? h('div', { class: 'panel-b mono muted', style: 'padding-bottom:0' }, feed.spec) : null,
+    feed.spec
+      ? h(
+          'div',
+          { class: 'panel-b mono muted', style: 'padding-bottom:0', title: feed.spec },
+          fileLabel(feed.spec),
+        )
+      : null,
     body,
   )
 }
@@ -1054,20 +1063,9 @@ const MARKER_GLYPH = {
  */
 function dealFactSpans(scale) {
   const facts = scale.facts
+  // Числа, которые уже стоят в KPI (попытки, длительность), здесь не повторяются:
+  // одна цифра в двух местах читается как два разных факта.
   const parts = [
-    h(
-      'span',
-      { title: 'попыток всего и по этапам' },
-      'попыток: ',
-      h('b', null, `${facts.attempts.total}${facts.attempts.text ? ` (${facts.attempts.text})` : ''}`),
-    ),
-    h(
-      'span',
-      { title: scale.axis.text },
-      'длительность: ',
-      h('b', null, facts.duration.text),
-      facts.duration.live ? ' · идёт' : '',
-    ),
     h('span', { title: 'вопросы человеку по таймлайну' }, 'вопросы: ', h('b', null, facts.questions.text)),
   ]
   if (facts.budget) {
@@ -1314,7 +1312,7 @@ function kpiStrip(scale) {
     ...scale.kpi.map((item) =>
       h(
         'div',
-        { class: 'duty-kpi-cell' },
+        { class: 'duty-kpi-cell', title: item.title || '' },
         h('span', { class: 'duty-kpi-v' }, item.value),
         h('span', { class: 'duty-kpi-l' }, item.label),
         item.note ? h('span', { class: 'duty-kpi-n' }, item.note) : null,
@@ -1616,21 +1614,23 @@ function viewDeal(dealId) {
       h(
         'div',
         { class: 'deal-head-main' },
-        h('div', { class: 'mono muted' }, `${repoLabel(data.repo)} · ${data.id}`),
+        h('div', { class: 'mono muted', title: repoLabel(data.repo) }, `${repoShort(data.repo)} · ${data.id}`),
         h('h1', null, data.title || '—'),
         specStrip(scale.spec),
       ),
       h(
         'div',
         { class: 'deal-head-side' },
-        deal ? Badge(deal.state, deal.humanKind) : h('span', { class: 'badge t-gray' }, h('i'), `завершено: ${data.status}`),
+        // Закрытое дело: статус словами (`завершено`/`в архиве`), а не значением store.
+        deal ? Badge(deal.state, deal.humanKind) : h('span', { class: 'badge t-gray' }, h('i'), finishedStatusMeta(data.status).label),
       ),
     ),
     h(
       'div',
       { class: 'deal-facts' },
-      h('span', null, 'статус: ', h('b', null, data.status || '—')),
-      h('span', null, 'исполнитель: ', h('b', null, data.assignee || '—')),
+      // Статус уже стоит бейджем справа, исполнитель у дела без рана не записан:
+      // «исполнитель: —» — это пустое поле, а не факт.
+      data.assignee ? h('span', null, 'исполнитель: ', h('b', null, data.assignee)) : null,
       deal ? h('span', null, 'попытка: ', h('b', null, `${deal.attemptAgeText} (${deal.attemptNote})`)) : null,
       deal ? h('span', null, 'лизинг: ', h('b', null, `${deal.leaseText}`)) : null,
       h('span', null, 'создано: ', h('b', null, fmtClock(data.created_at))),
@@ -1641,12 +1641,16 @@ function viewDeal(dealId) {
     deal && deal.evidence ? h('div', { class: 'why-evidence', style: 'margin-top:10px', text: deal.evidence }) : null,
   )
 
-  const left = h(
-    'div',
-    { class: 'panel' },
-    h('div', { class: 'panel-h' }, `спецификация${data.body_truncated ? ' (обрезана лимитом)' : ''}`),
-    h('div', { class: 'panel-b' }, data.body ? mdNode(data.body) : h('div', { class: 'muted' }, 'тело дела пустое')),
-  )
+  // Пустая спецификация не занимает колонку: панель, которая говорит «пусто»,
+  // отбирает место у попыток и ничего не сообщает.
+  const left = data.body
+    ? h(
+        'div',
+        { class: 'panel' },
+        h('div', { class: 'panel-h' }, `спецификация${data.body_truncated ? ' (обрезана лимитом)' : ''}`),
+        h('div', { class: 'panel-b' }, mdNode(data.body)),
+      )
+    : null
 
   let attemptsBody
   if (!timeline) attemptsBody = h('div', { class: 'panel-b' }, h('div', { class: 'skel', style: 'width:70%' }))
@@ -1663,7 +1667,7 @@ function viewDeal(dealId) {
     kpiStrip(scale),
     scalePanel(scale),
     stageFeedPanel(data),
-    h('div', { class: 'two-col' }, left, right),
+    left ? h('div', { class: 'two-col' }, left, right) : right,
   )
 }
 

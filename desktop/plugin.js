@@ -203,6 +203,28 @@ function repoLabel(repo) {
   return String(repo || '') || WITHOUT_REPO_LABEL
 }
 
+/**
+ * Короткое имя репозитория для шапки: последний сегмент пути.
+ *
+ * В store репозиторий живёт абсолютным путём (`/Users/…/plugins/hermes-duty`), и
+ * этот путь как кикер заголовка — шум: человеку нужно имя. Полный путь остаётся
+ * в подсказке, `repoLabel` не меняется — по нему группируются дела.
+ */
+function repoShort(repo) {
+  const text = String(repo || '').trim()
+  if (!text) return WITHOUT_REPO_LABEL
+  const tail = text.replace(/[\\/]+$/, '').split(/[\\/]/).pop()
+  return tail || text
+}
+
+/** Имя файла без каталогов: полный путь — в подсказке, здесь только хвост. */
+function fileLabel(path) {
+  const text = String(path || '').trim()
+  if (!text) return ''
+  const tail = text.replace(/[\\/]+$/, '').split(/[\\/]/).pop()
+  return tail || text
+}
+
 /** Возраст/длительность в человекочитаемом виде: `45 с`, `12 мин`, `3 ч`, `2 д`. */
 function fmtAge(sec) {
   if (sec === null || sec === undefined || sec === '') return '—'
@@ -868,7 +890,7 @@ function shapeStageAttempt(attempt) {
   if (live) liveText = 'идёт'
   else if (dead) liveText = 'процесс мёртв: лизинг истёк, завершения нет'
   else if (lease === 'unknown') liveText = 'живость неизвестна: лизинг не записан'
-  else if (outcome) liveText = `исход: ${outcome}`
+  else if (outcome) liveText = `исход: ${outcomeWord(outcome)}`
   const tone = live ? 'blue' : dead ? 'red' : ATTEMPT_TONE[outcome] || 'gray'
   const records = (Array.isArray(a.evidence) ? a.evidence : []).map((record) => {
     const r = record && typeof record === 'object' ? record : {}
@@ -1409,6 +1431,18 @@ function attemptView(bar, scale) {
   }
 }
 
+/**
+ * Разбивка попыток по этапам одной фразой: `check 1 · review 1 · verify 3`.
+ *
+ * Пустая строка, когда разбивать нечего (попыток нет или все в одном этапе):
+ * подсказка, повторяющая число, ничего не добавляет.
+ */
+function attemptsBreakdown(lanes, bars) {
+  const list = Array.isArray(lanes) ? lanes.filter((lane) => Number(lane.count) > 0) : []
+  if (list.length < 2) return ''
+  return list.map((lane) => `${lane.label} ${fmtCount(lane.count)}`).join(' · ')
+}
+
 /** Вид дорожки этапа: имя, вид, сводка попыток и строки. */
 function laneView(lane, bars, scale) {
   const list = Array.isArray(bars) ? bars : []
@@ -1796,14 +1830,16 @@ function shapeDealTime(detail, attemptsPayload) {
       : ''
     // Подпись внутри полосы — исход, а не догадка: у незакрытой это слово о
     // лизинге, у закрытой без исхода — её длительность.
-    bar.label = bar.open ? bar.leaseText : bar.outcome || bar.status || bar.durationText
+    bar.label = bar.open ? bar.leaseText : outcomeWord(bar.outcome) || bar.status || bar.durationText
     // Короткая подпись строки таймлайна: исход по-русски, у незакрытой — лизинг.
     bar.outcomeText = bar.open ? bar.leaseText : outcomeWord(bar.outcome) || bar.status || bar.durationText
     const details = [bar.progressText, bar.toolsText, bar.callsText].filter(Boolean).join(', ')
     const head = `${bar.laneLabel} · попытка ${bar.number || '—'}`
     const interval = `${bar.clockStart}–${bar.clockEnd} (${bar.durationText})`
     const cause = barReasonText(bar)
-    const tail = bar.open ? `лизинг: ${bar.leaseText}` : `исход: ${bar.outcome || bar.status || 'не записан'}${cause ? ` · ${cause}` : ''}`
+    const tail = bar.open
+      ? `лизинг: ${bar.leaseText}`
+      : `исход: ${outcomeWord(bar.outcome) || bar.status || 'не записан'}${cause ? ` · ${cause}` : ''}`
     bar.title = `${head} · ${interval} · ${tail}${details ? ` · ${details}` : ''}`
     bar.ariaLabel = bar.title
   }
@@ -1931,7 +1967,11 @@ function shapeDealTime(detail, attemptsPayload) {
         at: numOrNull(closedRaw.at),
         clock: fmtClock(closedRaw.at),
         cause: String(closedRaw.cause || ''),
-        text: `закрыто ${fmtClock(closedRaw.at)}${closedRaw.cause ? `: ${closedRaw.cause}` : ''}`,
+        // Причина закрытия — словами, как и в маркере: `all_stages_done` в
+        // человеческой строке читается как сбой экрана, а не как факт.
+        text: `закрыто ${fmtClock(closedRaw.at)}${
+          closedRaw.cause ? `: ${CLOSE_CAUSE_WORD[String(closedRaw.cause)] || closedRaw.cause}` : ''
+        }`,
       }
     : null
   const durationSec = axisStart === null || axisEnd === null ? null : Math.max(0, axisEnd - axisStart)
@@ -1982,7 +2022,14 @@ function shapeDealTime(detail, attemptsPayload) {
   const kpi = [
     { key: 'duration', label: 'длительность', value: durationSec === null ? '—' : fmtDuration(durationSec) },
     { key: 'stages', label: 'этапов', value: fmtCount(lanes.filter((lane) => lane.count > 0).length) },
-    { key: 'attempts', label: 'попыток', value: fmtCount(bars.length) },
+    // Разбивка по этапам живёт подсказкой этой ячейки: отдельной строкой она
+    // повторяла то же число второй раз.
+    {
+      key: 'attempts',
+      label: 'попыток',
+      value: fmtCount(bars.length),
+      title: attemptsBreakdown(lanes, bars),
+    },
     {
       key: 'calls',
       label: 'вызовов',
@@ -2887,7 +2934,7 @@ function StageFeed({ feed }) {
     'div',
     { className: 'duty-group-h' },
     h('span', null, 'этапы'),
-    h('span', { className: 'duty-num' }, feed.empty ? '—' : `${feed.count} · попыток ${feed.attempts}`),
+    h('span', { className: 'duty-num' }, feed.empty ? '—' : `${feed.count}`),
   )
   if (feed.empty) {
     return h('div', { className: 'duty-deal-stages' }, head, h('div', { className: 'duty-muted' }, feed.note || 'этапов нет'))
@@ -2896,7 +2943,7 @@ function StageFeed({ feed }) {
     'div',
     { className: 'duty-deal-stages' },
     head,
-    feed.spec ? h('div', { className: 'duty-mono duty-muted' }, feed.spec) : null,
+    feed.spec ? h('div', { className: 'duty-mono duty-muted', title: feed.spec }, fileLabel(feed.spec)) : null,
     h('div', null, ...feed.stages.map((stage) => h(StageRow, { key: `st-${stage.id}`, stage }))),
   )
 }
@@ -2922,13 +2969,7 @@ function DealFactSpans({ scale }) {
   return h(
     'div',
     { className: 'duty-deal-facts' },
-    h(
-      'span',
-      { title: 'попыток всего и по этапам' },
-      'попыток: ',
-      h('b', null, `${facts.attempts.total}${facts.attempts.text ? ` (${facts.attempts.text})` : ''}`),
-    ),
-    h('span', { title: scale.axis.text }, 'длительность: ', h('b', null, facts.duration.text), facts.duration.live ? ' · идёт' : ''),
+    // Попытки и длительность стоят в KPI: второй раз они читаются как другой факт.
     h('span', { title: 'вопросы человеку по таймлайну' }, 'вопросы: ', h('b', null, facts.questions.text)),
     facts.budget
       ? h(
@@ -2975,7 +3016,7 @@ function KpiStrip({ scale }) {
     ...scale.kpi.map((item) =>
       h(
         'div',
-        { className: 'duty-kpi-cell', key: `kpi-${item.key}` },
+        { className: 'duty-kpi-cell', key: `kpi-${item.key}`, title: item.title || '' },
         h('span', { className: 'duty-kpi-v' }, item.value),
         h('span', { className: 'duty-kpi-l' }, item.label),
         item.note ? h('span', { className: 'duty-kpi-n' }, item.note) : null,
@@ -3592,7 +3633,11 @@ function DealScreen({ sel, onBack }) {
       h(
         'div',
         { style: { flex: '1 1 auto', minWidth: 0 } },
-        h('div', { className: 'duty-mono' }, `${repoLabel((detail.data && detail.data.repo) || sel.repo)} · ${sel.id}`),
+        h(
+          'div',
+          { className: 'duty-mono', title: repoLabel((detail.data && detail.data.repo) || sel.repo) },
+          `${repoShort((detail.data && detail.data.repo) || sel.repo)} · ${sel.id}`,
+        ),
         h('div', { className: 'duty-deal-title' }, (detail.data && detail.data.title) || sel.titleFull || '—'),
         detail.data ? h(SpecStrip, { spec: scale.spec }) : null,
       ),
@@ -3602,7 +3647,9 @@ function DealScreen({ sel, onBack }) {
         deal
           ? h(StateBadge, { label: deal.stateLabel, tone: deal.tone, title: deal.state })
           : detail.data
-            ? h(StateBadge, { label: `завершено: ${detail.data.status}`, tone: 'gray', title: detail.data.status })
+            // Закрытое дело: статус словами (`завершено`/`в архиве`), значение
+            // store — в подсказке.
+            ? h(StateBadge, { label: finishedStatusMeta(detail.data.status).label, tone: 'gray', title: detail.data.status })
             : null,
         h(Button, { size: 'xs', variant: 'secondary', onClick: onBack }, '← к списку'),
       ),
@@ -3635,14 +3682,16 @@ function DealScreen({ sel, onBack }) {
       // лента — пояснение к нему.
       h(KpiStrip, { scale }),
       h(ScalePanel, { scale, callSel, onSelectCall: selectCall, toolFilter, onToggleTool: toggleTool }),
-      h(
-        'div',
-        { className: 'duty-deal-spec' },
-        h('div', { className: 'duty-group-h' }, h('span', null, 'спецификация'), detail.data.body_truncated ? h('span', { className: 'duty-mono' }, 'обрезана лимитом') : null),
-        detail.data.body
-          ? h('div', { className: 'duty-spec duty-md' }, h(Streamdown, null, detail.data.body))
-          : h('div', { className: 'duty-muted' }, 'тело дела пустое'),
-      ),
+      // Пустая спецификация не занимает колонку — иначе панель «тело дела пустое»
+      // отбирает место у попыток, ничего не сообщая.
+      detail.data.body
+        ? h(
+            'div',
+            { className: 'duty-deal-spec' },
+            h('div', { className: 'duty-group-h' }, h('span', null, 'спецификация'), detail.data.body_truncated ? h('span', { className: 'duty-mono' }, 'обрезана лимитом') : null),
+            h('div', { className: 'duty-spec duty-md' }, h(Streamdown, null, detail.data.body)),
+          )
+        : null,
       h(StageFeed, { feed }),
       h(
         'div',

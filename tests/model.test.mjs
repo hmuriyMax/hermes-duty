@@ -33,6 +33,9 @@ import {
   layoutCalls,
   outcomeTone,
   repoLabel,
+  repoShort,
+  fileLabel,
+  finishedStatusMeta,
   shapeAttempts,
   shapeCalls,
   shapeDeal,
@@ -808,6 +811,60 @@ test('шкала времени: маркеры — только факты жу
   assert.equal(scale.counts.lanes, 2)
 })
 
+test('слова вместо машинных значений: исход попытки, причина закрытия, статус дела', () => {
+  // Исход попытки в ленте этапа — словом, а не значением store.
+  const detail = {
+    stages: [{ id: 'impl', state: 'done', attempts: [{ n: 1, attempt: 1, started_at: 1000, finished_at: 1200, outcome: 'failed', kind: 'contract', reason: 'commit.foreign' }] }],
+  }
+  const feed = shapeStages(detail)
+  assert.match(feed.stages[0].attempts[0].liveText, /исход: провал/, 'исход попытки не переведён')
+  assert.doesNotMatch(feed.stages[0].attempts[0].liveText, /failed/)
+
+  // Закрытие — словами причины, а не её машинным ключом.
+  const scale = shapeDealTime(
+    { terminal: true, closed: { at: 2000, cause: 'all_stages_done' }, timeline: [] },
+    { attempts: [{ n: 1, attempt: 1, stage: 'impl', start: 1000, end: 2000, outcome: 'done', calls: [] }] },
+  )
+  assert.match(scale.facts.closed.text, /все этапы пройдены/)
+  assert.doesNotMatch(scale.facts.closed.text, /all_stages_done/)
+
+  // Незнакомый статус закрытого дела остаётся своим именем: подменять его нельзя.
+  assert.equal(finishedStatusMeta('done').label, 'завершено')
+  assert.equal(finishedStatusMeta('archived').label, 'в архиве')
+  assert.equal(finishedStatusMeta('weird').label, 'weird')
+})
+
+test('короткие имена: репозиторий и файл спеки без каталогов', () => {
+  assert.equal(repoShort('/Users/x/.hermes/plugins/hermes-duty'), 'hermes-duty')
+  assert.equal(repoShort('hermes-duty/'), 'hermes-duty')
+  assert.equal(repoShort(''), WITHOUT_REPO_LABEL)
+  // Полное имя репозитория не меняется: по нему группируются дела.
+  assert.equal(repoLabel('/Users/x/.hermes/plugins/hermes-duty'), '/Users/x/.hermes/plugins/hermes-duty')
+  assert.equal(fileLabel('/Users/x/deals/0.0.7-review-docs.yaml'), '0.0.7-review-docs.yaml')
+  assert.equal(fileLabel(''), '')
+})
+
+test('KPI: разбивка попыток — подсказка ячейки, а не вторая строка фактов', () => {
+  const scale = shapeDealTime(
+    { terminal: true, timeline: [] },
+    {
+      attempts: [
+        { n: 1, attempt: 1, stage: 'check', start: 1000, end: 1100, outcome: 'done', calls: [] },
+        { n: 2, attempt: 2, stage: 'verify', start: 1200, end: 1300, outcome: 'done', calls: [] },
+        { n: 3, attempt: 3, stage: 'verify', start: 1400, end: 1500, outcome: 'failed', calls: [] },
+      ],
+    },
+  )
+  const cell = scale.kpi.find((item) => item.key === 'attempts')
+  assert.equal(cell.value, '3')
+  assert.equal(cell.title, 'check 1 · verify 2')
+  // Один этап — разбивка не нужна: подсказка повторяла бы число.
+  const single = shapeDealTime({ terminal: true, timeline: [] }, {
+    attempts: [{ n: 1, attempt: 1, stage: 'impl', start: 1000, end: 1100, outcome: 'done', calls: [] }],
+  })
+  assert.equal(single.kpi.find((item) => item.key === 'attempts').title, '')
+})
+
 test('ось: метка, попадающая под подпись края, не рисуется', () => {
   // Дело на 30 минут: шаг 5 минут, первая метка пришлась на 7.8 % — её линия
   // перечёркивала бы «нач. 13:37:35», поэтому в резерве края метки нет вовсе.
@@ -852,7 +909,7 @@ test('провал называет причину и класс отказа в
   const [failed, done] = rows.map((row) => row.view)
   // Причина рядом с исходом — на полосе и в подписи строки.
   assert.match(failed.bandTip, /отказ contract: commit\.foreign: commit=835507b/)
-  assert.match(failed.title, /исход: failed · отказ contract: commit\.foreign/)
+  assert.match(failed.title, /исход: провал · отказ contract: commit\.foreign/)
   // У успешной попытки причины нет: выдумывать её шейпер не станет.
   assert.doesNotMatch(done.bandTip, /отказ|причина/)
 })
@@ -946,7 +1003,7 @@ test('шкала времени: закрытие и публикация — и
   )
   assert.equal(scale.live, false)
   assert.equal(scale.axis.end, 1400)
-  assert.equal(scale.facts.closed.text, `закрыто ${scale.facts.closed.clock}: all_stages_done`)
+  assert.equal(scale.facts.closed.text, `закрыто ${scale.facts.closed.clock}: все этапы пройдены`)
   assert.equal(scale.facts.published.shaShort, 'f750c785')
   assert.equal(scale.facts.published.text, 'f750c785')
   assert.deepEqual(
@@ -963,7 +1020,7 @@ test('шкала времени: закрытое дело не тянет ос�
   assert.equal(closed.live, false)
   assert.equal(closed.axis.end, 1340)
   assert.equal(closed.facts.duration.live, false)
-  assert.equal(closed.facts.closed.text, `закрыто ${closed.facts.closed.clock}: all_stages_done`)
+  assert.equal(closed.facts.closed.text, `закрыто ${closed.facts.closed.clock}: все этапы пройдены`)
   // бюджет и публикация — блоками ответа, без своего пересчёта
   assert.equal(closed.facts.budget.text, 'токенов 1 500 / 6 000 (25%)')
   assert.equal(closed.facts.published.text, 'f750c785 · release/pub · git ls-remote')
@@ -1078,7 +1135,7 @@ test('лента этапов: этапы в порядке графа, у по�
   assert.equal(first.toolsText, '17')
   assert.equal(first.kind, 'contract')
   assert.equal(first.reason, 'нет evidence по go build ./...')
-  assert.equal(first.liveText, 'исход: failed')
+  assert.equal(first.liveText, 'исход: провал')
   assert.equal(first.tone, 'red')
 })
 

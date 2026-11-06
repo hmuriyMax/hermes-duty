@@ -15,7 +15,7 @@
  *
  * UI собран без JSX (файл грузится нескомпилированным, см. kanban-graph).
  */
-import { Button, Codicon, Input } from '@hermes/plugin-sdk'
+import { Button, Codicon, Input, Streamdown } from '@hermes/plugin-sdk'
 import { createElement as h, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 const ID = 'hermes-duty'
@@ -1511,6 +1511,27 @@ const CSS = `
 .duty-deal-spec,.duty-deal-attempts{min-width:0}
 .duty-deal-scale{grid-column:1/-1;min-width:0}
 .duty-spec{margin:0;white-space:pre-wrap;word-break:break-word;font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:11px;line-height:1.5;color:var(--ui-text-secondary);max-height:60vh;overflow:auto;border:1px solid var(--ui-stroke-tertiary);border-radius:6px;padding:8px}
+/* Спецификация дела — markdown, а не дамп: pre-блок переносил строки так, что
+   YAML разъезжался, а заголовки и списки читались как текст. Шрифт возвращаем к
+   обычному, моно — только для кода. */
+.duty-md{white-space:normal;font-family:var(--ui-font-default, inherit);font-size:12.5px;line-height:1.55;padding:10px 12px}
+.duty-md h1,.duty-md h2,.duty-md h3,.duty-md h4{margin:12px 0 6px;line-height:1.3;font-weight:600;color:var(--ui-text-primary)}
+.duty-md h1{font-size:15px}
+.duty-md h2{font-size:13.5px;border-bottom:1px solid var(--ui-stroke-tertiary);padding-bottom:4px}
+.duty-md h3{font-size:13px}
+.duty-md h4{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--ui-text-secondary)}
+.duty-md p{margin:6px 0}
+.duty-md ul,.duty-md ol{margin:6px 0;padding-left:20px;list-style:revert}
+.duty-md li{margin:2px 0}
+.duty-md code{font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:11px;background:var(--ui-bg-quaternary);border:1px solid var(--ui-stroke-tertiary);border-radius:4px;padding:1px 5px}
+.duty-md pre{background:var(--ui-bg-quaternary);border:1px solid var(--ui-stroke-tertiary);border-radius:8px;padding:9px 11px;overflow:auto;margin:8px 0}
+.duty-md pre code{background:none;border:none;padding:0;line-height:1.5}
+.duty-md blockquote{margin:8px 0;padding:2px 0 2px 10px;border-left:2px solid var(--ui-stroke-tertiary);color:var(--ui-text-tertiary)}
+.duty-md table{border-collapse:collapse;margin:8px 0;font-size:12px;display:block;overflow-x:auto}
+.duty-md th,.duty-md td{border:1px solid var(--ui-stroke-tertiary);padding:5px 9px;text-align:left}
+.duty-md th{background:var(--ui-bg-quaternary);font-weight:600;color:var(--ui-text-primary)}
+.duty-md hr{border:none;border-top:1px solid var(--ui-stroke-tertiary);margin:12px 0}
+.duty-md a{text-decoration:underline;text-underline-offset:2px}
 .duty-scale-axis{position:relative;height:15px;margin:0 0 6px}
 .duty-scale-tick{position:absolute;font-size:11px;color:var(--ui-text-tertiary);white-space:nowrap;font-variant-numeric:tabular-nums}
 .duty-scale-tick.align-start{transform:translateX(0)}
@@ -2612,7 +2633,7 @@ function DealScreen({ sel, onBack }) {
         { className: 'duty-deal-spec' },
         h('div', { className: 'duty-group-h' }, h('span', null, 'спецификация'), detail.data.body_truncated ? h('span', { className: 'duty-mono' }, 'обрезана лимитом') : null),
         detail.data.body
-          ? h('pre', { className: 'duty-spec' }, detail.data.body)
+          ? h('div', { className: 'duty-spec duty-md' }, h(Streamdown, null, detail.data.body))
           : h('div', { className: 'duty-muted' }, 'тело дела пустое'),
       ),
       h(StageFeed, { feed }),

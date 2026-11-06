@@ -73,6 +73,32 @@ function h(tag, props, ...children) {
   return el
 }
 
+/* Markdown для тела дела. Библиотека вендорена (`vendor/marked.min.js`): страница
+ * живёт в прослойке без сети, поэтому брать её с CDN нельзя. Рендер идёт через
+ * `template`, из которого вычищается всё исполняемое (`script`/`style`/`iframe`,
+ * атрибуты `on*`, `javascript:`-ссылки): тело дела пишет человек или воркер, но
+ * страница не должна выполнять чужой код.
+ */
+function mdNode(text, fallbackClass) {
+  const marked = window.marked
+  if (!marked || typeof marked.parse !== 'function' || !text) {
+    return h('pre', { class: fallbackClass || 'body' }, text || '')
+  }
+  const tpl = document.createElement('template')
+  tpl.innerHTML = marked.parse(text, { gfm: true, breaks: false })
+  for (const bad of tpl.content.querySelectorAll('script, style, iframe, object, embed, link, meta')) bad.remove()
+  for (const el of tpl.content.querySelectorAll('*')) {
+    for (const attr of [...el.attributes]) {
+      const name = attr.name.toLowerCase()
+      const value = String(attr.value || '').toLowerCase()
+      if (name.startsWith('on') || (name === 'href' && value.startsWith('javascript:'))) el.removeAttribute(attr.name)
+    }
+  }
+  const box = h('div', { class: 'md' })
+  box.append(tpl.content)
+  return box
+}
+
 const clear = (node) => {
   while (node.firstChild) node.removeChild(node.firstChild)
   return node
@@ -1270,7 +1296,7 @@ function viewDeal(dealId) {
     'div',
     { class: 'panel' },
     h('div', { class: 'panel-h' }, `спецификация${data.body_truncated ? ' (обрезана лимитом)' : ''}`),
-    h('div', { class: 'panel-b' }, data.body ? h('pre', { class: 'body' }, data.body) : h('div', { class: 'muted' }, 'тело дела пустое')),
+    h('div', { class: 'panel-b' }, data.body ? mdNode(data.body) : h('div', { class: 'muted' }, 'тело дела пустое')),
   )
 
   let attemptsBody

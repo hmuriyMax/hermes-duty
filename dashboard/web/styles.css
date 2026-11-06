@@ -468,6 +468,33 @@ pre.body {
   overflow: auto;
 }
 
+/* ---------- markdown тела дела ----------
+ * Спецификация дела — текст, а не дамп: заголовки, списки и таблицы читаются
+ * глазами, `pre` переносил строки так, что YAML-блоки разъезжались.
+ */
+.md { font-size: 13px; line-height: 1.55; color: var(--text-2); max-height: 60vh; overflow: auto; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md h1, .md h2, .md h3, .md h4 { color: var(--text-1); line-height: 1.25; margin: 14px 0 6px; font-weight: 600; }
+.md h1 { font-size: 16px; }
+.md h2 { font-size: 14.5px; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+.md h3 { font-size: 13.5px; }
+.md h4 { font-size: 12.5px; color: var(--text-2); text-transform: uppercase; letter-spacing: .04em; }
+.md p { margin: 6px 0; }
+.md ul, .md ol { margin: 6px 0; padding-left: 20px; }
+.md li { margin: 2px 0; }
+.md li::marker { color: var(--text-3); }
+.md code { font-family: var(--mono); font-size: 11.5px; background: var(--bg-2); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; color: var(--text-1); }
+.md pre { background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; overflow: auto; margin: 8px 0; }
+.md pre code { background: none; border: none; padding: 0; font-size: 11.5px; line-height: 1.5; }
+.md blockquote { margin: 8px 0; padding: 2px 0 2px 12px; border-left: 2px solid var(--border); color: var(--text-3); }
+.md table { border-collapse: collapse; margin: 8px 0; font-size: 12px; display: block; overflow-x: auto; }
+.md th, .md td { border: 1px solid var(--border); padding: 5px 9px; text-align: left; }
+.md th { background: var(--bg-2); color: var(--text-1); font-weight: 600; }
+.md hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+.md a { color: var(--accent, var(--text-1)); text-decoration: underline; text-underline-offset: 2px; }
+.md :is(h1,h2,h3,h4) code { background: none; border: none; padding: 0; }
+
 /* таймлайн попыток */
 .att { border-top: 1px solid var(--border); padding: 10px 12px; }
 .att:first-child { border-top: none; }

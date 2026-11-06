@@ -1,0 +1,51 @@
+# Дело: этапы и попытки — один тонкий столбец рядом с описанием
+#
+# Правка вида, а не поведения: на странице дела две панели рассказывают об одних и тех же
+# попытках (широкая «этапы» с доказательствами и отдельная «попытки» карточками с журналом),
+# шапка попытки повторяется в обеих, страница выросла до трёх с половиной экранов.
+#
+# Тело дела (`BODY-compact-deal-page.md`) — точная спека вида: геометрия колонок, что в
+# строке этапа, что в строке попытки, что раскрыто по умолчанию, что делает шейпер и что
+# удаляется. Исполнитель читает его как контракт, а не как пожелание.
+#
+# Этапа реализации в дереве нет по построению: правку вносит implementer в worktree от
+# `base` ниже, проверки — shell-этап, приговор — ревьюер. Адреса приговора: `next` (дальше)
+# и `impl` (вернуть на доработку). Других этапов в этой спеке нет.
+#
+# base приколот к коммиту, на котором страница уже говорит словами и показывает спеку
+# (`00819b1`): новое дерево после правок — новое дело, продолжение старого перегонит
+# прежний base.
+
+duty: 0.0.8-compact-deal-page
+repo: ~/.hermes/plugins/hermes-duty
+base: 00819b1
+
+budget: {minutes: 180}
+
+stages:
+  - id: impl
+    role: implementer
+    workspace: worktree
+    budget: {minutes: 90}
+    evidence:
+      - {cmd: "node --test tests/model.test.mjs tests/web.test.mjs tests/desktop-render.test.mjs", must: 0, timeout_sec: 300}
+      - {cmd: "env -u PYTHONPATH bin/duty-model-sync --check", must: 0, timeout_sec: 120}
+
+  - id: check
+    kind: shell
+    needs: [impl]
+    workspace: worktree
+    cmd: "node --test tests/*.test.mjs && env -u PYTHONPATH bin/duty-model-sync --check && env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q -p no:randomly && env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/hermes plugins validate ."
+    must: 0
+    budget: {minutes: 30}
+
+  - id: review
+    role: reviewer
+    needs: [check]
+    workspace: worktree
+    # Приговор адресует только `next` и `impl` — других этапов в графе нет. Первый
+    # приговор перечисляет не все места сразу, поэтому раундов два: правки между ними
+    # вносит исполнитель, дерево дела при этом меняется его же коммитом.
+    verdict: {approve: next, changes: impl, max_rounds: 2}
+    retry: {max: 1, on: [contract]}
+    budget: {minutes: 60}

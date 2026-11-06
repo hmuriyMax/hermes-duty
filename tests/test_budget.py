@@ -585,3 +585,20 @@ def test_why_carries_ceiling_numbers(tmp_path: Path, home: Path, client: TestCli
 
     assert json.loads(json.dumps(body["budget"], ensure_ascii=False)) == body["budget"]
     assert body["budget"]["attempts"] == 2
+
+
+def test_stats_window_in_the_future_is_called_empty_not_zero(home: Path, client: TestClient) -> None:
+    """`--since` в будущем — пустое окно словами, а не «0 с задано».
+
+    Числа в таком окне честно пустые (`доля не считается`, `нет данных`), и шапка
+    не должна им противоречить бодрым «0 с». Красная проба: вернуть старую строку
+    `{span} {source}` без ветки `sec <= 0` — тест падает на «0 с задано».
+    """
+    body = client.get("/stats", params={"since": 1793999999}).json()
+
+    printed = cli.render_stats(body)
+
+    assert body["window"]["sec"] == 0
+    assert "0 с" not in printed, printed
+    assert "пустое — граница в будущем" in printed
+    assert "доля не считается" in printed

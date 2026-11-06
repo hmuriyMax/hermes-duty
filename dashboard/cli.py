@@ -698,12 +698,18 @@ def _tokens(block: Any) -> str:
 
 
 def _window(window: Any) -> str:
-    """Окно здоровья словами: «за сутки с …», иначе «с …» — граница видна всегда."""
+    """Окно здоровья словами: «за сутки с …», иначе «с …» — граница видна всегда.
+
+    `--since` в будущем — не «окно 0 с»: это пустое окно, и оно называется пустым.
+    Иначе шапка бодро сообщает «0 с задано», хотя данных в окне ноль по построению.
+    """
     data = window or {}
     since = data.get("since")
     if since is None:
         return "без окна (за всё время)"
     sec = int(data.get("sec") or 0)
+    if sec <= 0:
+        return f"пустое — граница в будущем, с {_fmt_stamp(since)}"
     span = "сутки" if sec == 86400 else _fmt_age(sec)
     source = "по умолчанию" if data.get("source") == "default" else "задано"
     return f"{span} {source}, с {_fmt_stamp(since)}"

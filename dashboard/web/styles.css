@@ -807,6 +807,16 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
   background: color-mix(in srgb, var(--text-3) 13%, transparent);
   border: 1px solid color-mix(in srgb, var(--text-3) 22%, transparent);
 }
+
+/* Тон исхода: провал читается полосой на дорожке, а не только словом слева. */
+.tl-band.t-red { background: color-mix(in srgb, var(--danger) 15%, transparent); border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
+.tl-band.t-yellow { background: color-mix(in srgb, var(--warn) 13%, transparent); border-color: color-mix(in srgb, var(--warn) 38%, transparent); }
+.tl-band.t-blue { background: color-mix(in srgb, var(--accent) 12%, transparent); border-color: color-mix(in srgb, var(--accent) 34%, transparent); }
+/* Провалившаяся попытка: красная кромка в подписи и «провал» жирным — строка
+ * находится глазом даже когда тонов на дорожке много. */
+.tl-row.is-failed .tl-lbl { border-left: 2px solid var(--danger); padding-left: 6px; margin-left: -8px; }
+.tl-row.is-failed .tl-n { color: var(--danger); }
+
 /* Пауза «вопрос → ответ»: время, которое дело стояло на человеке. */
 .tl-wait {
   position: absolute; top: 1px; bottom: 1px; border-radius: 3px;

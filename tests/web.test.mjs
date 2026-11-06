@@ -198,6 +198,20 @@ test('разворот строки и правки экрана дела: пр�
   assert.match(app, /class: 'scale-side'/, 'веб: нет правой колонки легенды')
   assert.match(plugin, /className: 'duty-scale-side'/, 'десктоп: нет правой колонки легенды')
 
+  // Провал попытки виден на дорожке: красный фон и кромка в подписи, а не
+  // только слово «провал» цветным текстом.
+  for (const [name, text, cls, lbl] of [
+    ['веб', css, '.tl-band.t-red', '.tl-row.is-failed .tl-lbl'],
+    ['десктоп', plugin, '.duty-tl-band.t-red', '.duty-tl-row.is-failed .duty-tl-lbl'],
+  ]) {
+    assert.ok(text.includes(cls), `${name}: у красной полосы нет своего стиля`)
+    assert.ok(text.includes(lbl), `${name}: провалившаяся строка не помечена`)
+  }
+  assert.match(app, /class: `tl-band t-\$\{view\.band\.tone \|\| 'grey'\}`/, 'веб: фон попытки не знает тона')
+  assert.match(app, /tl-row\$\{view\.failed \? ' is-failed' : ''\}/, 'веб: строка не помечает провал')
+  assert.match(plugin, /duty-tl-band t-\$\{view\.band\.tone \|\| 'grey'\}/, 'десктоп: фон попытки не знает тона')
+  assert.match(plugin, /duty-tl-row\$\{view\.failed \? ' is-failed' : ''\}/, 'десктоп: строка не помечает провал')
+
   // Легенда семейств — переключатель: клик подсвечивает семейство на дорожках.
   for (const [name, text] of [['веб', css], ['десктоп', plugin]]) {
     assert.match(text, /scale-key\.on[^{]*\{[^}]*background/, `${name}: выбранное семейство не отмечено`)

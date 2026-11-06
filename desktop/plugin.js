@@ -113,10 +113,15 @@ const TONE_COLOR = {
 // Тон исхода попытки: успех — зелёное, отложенное — жёлтое. Падений здесь нет:
 // их набор приходит с бэкенда (`crash_outcomes`), чтобы красный тон не разъехался
 // с правилами сервера.
+// Исход → тон. `failed` — собственный исход попытки, он красный без всякого
+// набора «падений»: без этой записи провал попадал в «незнакомый исход» и
+// выглядел серым. Краши (`crashed`, `gave_up`) по-прежнему узнаются только из
+// `crash_outcomes` ответа — UI их не угадывает.
 const OUTCOME_TONE = {
   done: 'green',
   completed: 'green',
   succeeded: 'green',
+  failed: 'red',
   rate_limited: 'yellow',
   reclaimed: 'yellow',
 }
@@ -1310,7 +1315,13 @@ function attemptView(bar, scale) {
   return {
     full,
     collapsed,
-    band: bandLeft === null || bandWidth === null ? null : { leftPct: bandLeft, widthPct: bandWidth },
+    // Тон фона — тон исхода попытки: провал виден полосой на дорожке, а не
+    // только словом в подписи слева.
+    band:
+      bandLeft === null || bandWidth === null
+        ? null
+        : { leftPct: bandLeft, widthPct: bandWidth, tone: b.tone || 'grey' },
+    failed: b.tone === 'red',
     bandTip,
     label: {
       number: b.number || '—',
@@ -1979,7 +1990,7 @@ function DutyAttemptRow({ view, callSel, onSelectCall, toolFilter }) {
     track.push(
       h('span', {
         key: 'band',
-        className: 'duty-tl-band',
+        className: `duty-tl-band t-${view.band.tone || 'grey'}`,
         style: { left: `${view.band.leftPct}%`, width: `${view.band.widthPct}%` },
         'data-tip': view.bandTip,
       }),
@@ -2035,7 +2046,10 @@ function DutyAttemptRow({ view, callSel, onSelectCall, toolFilter }) {
     'div',
     // Свёрнутая высота — первый уровень вызовов и маркеры, полная раскрывается
     // под указателем. Числа из шейпера, CSS только переключает.
-    { className: 'duty-tl-row', style: { '--duty-tl-collapsed': `${view.collapsed}px`, '--duty-tl-full': `${view.full}px` } },
+    {
+      className: `duty-tl-row${view.failed ? ' is-failed' : ''}`,
+      style: { '--duty-tl-collapsed': `${view.collapsed}px`, '--duty-tl-full': `${view.full}px` },
+    },
     label,
     h('div', { className: 'duty-tl-track' }, ...track),
   )
@@ -2232,6 +2246,13 @@ const CSS = `
 .duty-tl-track{position:relative;min-height:20px}
 /* Фон попытки: длительность видна полосой, а не только по чипам вызовов. */
 .duty-tl-band{position:absolute;top:1px;bottom:1px;border-radius:4px;background:color-mix(in srgb, var(--ui-text-tertiary) 13%, transparent);border:1px solid color-mix(in srgb, var(--ui-text-tertiary) 22%, transparent)}
+/* Тон исхода: провал читается полосой на дорожке, а не только словом слева. */
+.duty-tl-band.t-red{background:color-mix(in srgb, var(--ui-red) 15%, transparent);border-color:color-mix(in srgb, var(--ui-red) 45%, transparent)}
+.duty-tl-band.t-yellow{background:color-mix(in srgb, var(--ui-yellow) 13%, transparent);border-color:color-mix(in srgb, var(--ui-yellow) 38%, transparent)}
+.duty-tl-band.t-blue{background:color-mix(in srgb, var(--ui-blue) 12%, transparent);border-color:color-mix(in srgb, var(--ui-blue) 34%, transparent)}
+/* Провалившаяся попытка: красная кромка в подписи и номер красным. */
+.duty-tl-row.is-failed .duty-tl-lbl{border-left:2px solid var(--ui-red);padding-left:6px;margin-left:-8px}
+.duty-tl-row.is-failed .duty-tl-n{color:var(--ui-red)}
 /* Пауза «вопрос → ответ»: время, которое дело стояло на человеке. */
 .duty-tl-wait{position:absolute;top:1px;bottom:1px;border-radius:3px;background:color-mix(in srgb, var(--ui-yellow) 26%, transparent);border-left:1.5px solid var(--ui-yellow);border-right:1.5px solid var(--ui-yellow)}
 /* Маркеры событий — внутри строки той попытки, где событие произошло. */

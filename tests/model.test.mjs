@@ -67,6 +67,29 @@ const pluginSource = readFileSync(new URL('../desktop/plugin.js', import.meta.ur
 
 const model = shapeNow(nowPayload)
 
+test('провал попытки: красный тон, своя полоса и подпись по-русски', () => {
+  const detail = { timeline: [], terminal: true }
+  const attempts = {
+    attempts: [
+      { attempt: 1, stage: 'verify', start: 1_000_000, end: 1_000_600, outcome: 'done', status: 'completed', calls: [] },
+      { attempt: 2, stage: 'verify', start: 1_000_900, end: 1_001_000, outcome: 'failed', status: 'failed', calls: [] },
+    ],
+    crash_outcomes: ['rate_limited', 'reclaimed', 'blocked', 'refused'],
+  }
+  const scale = shapeDealTime(detail, attempts)
+  const views = scale.bars.map((bar) => attemptView(bar, scale))
+  const ok = views[0]
+  const bad = views[1]
+  assert.equal(ok.label.tone, 'green')
+  assert.equal(ok.failed, false)
+  // Провал не «незнакомый исход»: тон красный, иначе строка выглядела серой.
+  assert.equal(bad.label.tone, 'red')
+  assert.equal(bad.label.status, 'провал')
+  assert.equal(bad.failed, true)
+  assert.equal(bad.band.tone, 'red')
+  assert.equal(ok.band.tone, 'green')
+})
+
 test('группы — по репозиторию: названные по имени, «без репозитория» последней', () => {
   // Доска ушла (0.0.6): группировка списка — `repo`, а дело адресуется своим id.
   assert.deepEqual(

@@ -1173,7 +1173,7 @@ function attemptRowNode(view) {
   if (view.band) {
     track.append(
       h('span', {
-        class: 'tl-band',
+        class: `tl-band t-${view.band.tone || 'grey'}`,
         style: `left:${view.band.leftPct}%;width:${view.band.widthPct}%`,
         'data-tip': view.bandTip,
       }),
@@ -1228,7 +1228,10 @@ function attemptRowNode(view) {
     'div',
     // Свёрнутая высота показывает первый уровень вызовов и маркеры, полная
     // раскрывается под указателем. Числа — из шейпера, CSS только переключает.
-    { class: 'tl-row', style: `--tl-collapsed:${view.collapsed}px;--tl-full:${view.full}px` },
+    {
+      class: `tl-row${view.failed ? ' is-failed' : ''}`,
+      style: `--tl-collapsed:${view.collapsed}px;--tl-full:${view.full}px`,
+    },
     label,
     track,
   )

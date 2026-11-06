@@ -64,10 +64,15 @@ const TONE_COLOR = {
 // Тон исхода попытки: успех — зелёное, отложенное — жёлтое. Падений здесь нет:
 // их набор приходит с бэкенда (`crash_outcomes`), чтобы красный тон не разъехался
 // с правилами сервера.
+// Исход → тон. `failed` — собственный исход попытки, он красный без всякого
+// набора «падений»: без этой записи провал попадал в «незнакомый исход» и
+// выглядел серым. Краши (`crashed`, `gave_up`) по-прежнему узнаются только из
+// `crash_outcomes` ответа — UI их не угадывает.
 const OUTCOME_TONE = {
   done: 'green',
   completed: 'green',
   succeeded: 'green',
+  failed: 'red',
   rate_limited: 'yellow',
   reclaimed: 'yellow',
 }
@@ -1261,7 +1266,13 @@ function attemptView(bar, scale) {
   return {
     full,
     collapsed,
-    band: bandLeft === null || bandWidth === null ? null : { leftPct: bandLeft, widthPct: bandWidth },
+    // Тон фона — тон исхода попытки: провал виден полосой на дорожке, а не
+    // только словом в подписи слева.
+    band:
+      bandLeft === null || bandWidth === null
+        ? null
+        : { leftPct: bandLeft, widthPct: bandWidth, tone: b.tone || 'grey' },
+    failed: b.tone === 'red',
     bandTip,
     label: {
       number: b.number || '—',

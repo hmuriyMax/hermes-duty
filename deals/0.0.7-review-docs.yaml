@@ -1,0 +1,55 @@
+# Дело: повторное ревью 0.0.7 после правок по вердикту
+#
+# Третье дело линии 0.0.7. Второе (`d_1e5735de`, `deals/0.0.7-review-test.yaml`) дошло до
+# вердикта и запарковалось на `contract`: ревьюер написал `changes → impl-finished` —
+# этапа с таким именем в его графе нет (оно из первого дела и упомянуто в шапке той спеки).
+#
+# По существу вердикт был верным и указывал на документацию, а не на код:
+#   docs/DESIGN.md, docs/JOURNAL.md, docs/RUNBOOK.md, CHANGELOG.md — четыре места
+#   утверждали обратное правилу reaper («живой лизинг не трогается даже при мёртвом pid»),
+#   README не называл `GET /deals`, таблица команд RUNBOOK — `bin/duty deals`,
+#   а CHANGELOG 0.0.7 не нёс трёх уже сделанных правок.
+# Правки внёс координатор коммитом `297eb3b` — это и есть base этого дела.
+#
+# Здесь проверяется ровно результат: независимое ревью дельты документации и живая
+# проверка поверхностей. Этапа реализации нет по построению, поэтому приговор `changes`
+# адресует `check` (повтор проверок) или `next`; правки после него снова идут координатору.
+#
+# Урок второй спеки, учтённый здесь: ревьюер получает явный список адресов приговора
+# (`next`, `check`), а не подсмотренное имя из шапки.
+
+duty: 0.0.7-review-docs
+repo: ~/.hermes/plugins/hermes-duty
+base: 297eb3b
+
+budget: {minutes: 150}
+
+stages:
+  - id: check
+    kind: shell
+    cmd: "env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python3 -m pytest tests/ -q && node --test tests/model.test.mjs tests/web.test.mjs && env -u PYTHONPATH bin/duty-model-sync --check && env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/hermes plugins validate . && env -u PYTHONPATH bin/duty-version check"
+    must: 0
+    workspace: worktree
+
+  - id: review
+    role: reviewer
+    needs: [check]
+    workspace: worktree
+    # Адреса приговора: только `next` (дальше) и `check` (повторить проверки). Этапов
+    # реализации в графе нет — правки делает координатор, а не воркер этого дела.
+    verdict: {approve: next, changes: check, max_rounds: 1}
+    retry: {max: 1, on: [contract]}
+    budget: {minutes: 60}
+
+  - id: verify
+    role: tester
+    needs: [review]
+    workspace: worktree
+    evidence:
+      - {cmd: "env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python3 bin/duty deals --limit 3", must: 0, timeout_sec: 120}
+      - {cmd: "env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python3 bin/duty now", must: 0, timeout_sec: 120}
+      - {cmd: "cmp desktop/model.js /Users/mshchemilkin/.hermes/desktop-plugins/hermes-duty/model.js", must: 0, timeout_sec: 60}
+      - {cmd: "node --test tests/model.test.mjs tests/web.test.mjs", must: 0, timeout_sec: 300}
+      - {cmd: "cd /Users/mshchemilkin/.hermes/plugins/hermes-duty && grep -q 'GET /deals' README.md && grep -q 'bin/duty deals' docs/RUNBOOK.md", must: 0, timeout_sec: 60}
+    retry: {max: 1, on: [infra, contract]}
+    budget: {minutes: 60}

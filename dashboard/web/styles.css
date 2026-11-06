@@ -827,8 +827,11 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 /* Маркеры журнала — вертикальные палки на всю высоту строки: точка на нижней
  * кромке убегала при разворачивании, а палка стоит на своём времени всегда. */
 .tl-marks { position: absolute; inset: 0; pointer-events: none; }
-.tl-mark { position: absolute; top: -3px; bottom: -3px; width: 3px; transform: translateX(-50%); pointer-events: auto; }
+.tl-mark { position: absolute; top: -3px; bottom: -3px; width: 3px; transform: translateX(-50%); pointer-events: auto; cursor: pointer; }
 .tl-mark i { display: block; width: 100%; height: 100%; border-radius: 2px; background: currentColor; opacity: .9; }
+/* Палка тонкая: попадание мышью расширяется невидимым «полем» вокруг, иначе
+ * в неё почти невозможно попасть и подсказка не появляется. */
+.tl-mark::before { content: ''; position: absolute; left: -4px; right: -4px; top: 0; bottom: 0; }
 .tl-mark.t-green { color: var(--ok); }
 .tl-mark.t-red { color: var(--danger); }
 .tl-mark.t-yellow { color: var(--warn); }

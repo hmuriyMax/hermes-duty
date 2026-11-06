@@ -799,10 +799,44 @@ test('шкала времени: маркеры — только факты жу
   assert.equal(waiting[0].waitText, 'ждёт ответа')
   assert.equal(waiting[0].pct, 68)
   assert.equal(waiting[0].waitPct, 32)
-  // тултип — `summary` события, а не придуманная фраза
-  assert.match(scale.markers[3].title, /вопрос человеку — \{"question_id": 7\}/)
+  // тултип — текст для человека: JSON payload'а и номера вопросов на экран не идут
+  assert.match(scale.markers[3].title, /вопрос человеку — текст вопроса не сохранён/)
+  for (const marker of scale.markers) {
+    assert.doesNotMatch(marker.title, /\{|question_id/, `в подсказке ${marker.type} остался JSON payload'а`)
+  }
   assert.equal(scale.counts.markers, 8)
   assert.equal(scale.counts.lanes, 2)
+})
+
+test('маркеры называют вопрос, ответ и причину закрытия словами, а не номерами', () => {
+  const detail = {
+    terminal: true,
+    timeline: [
+      { kind: 'question_asked', at: 1000, summary: '{"question_id": 357}', question_text: 'Код корректен, но now даёт EXIT_SOURCE=2' },
+      {
+        kind: 'question_answered',
+        at: 1600,
+        summary: '{"question_id": 357, "answer_len": 279}',
+        answer_text: 'evidence проверяет линию, а не окружение воркера',
+      },
+      {
+        kind: 'completed',
+        at: 2000,
+        summary: '{"cause": "all_stages_done", "stages": ["check","review","verify"]}',
+        cause: 'all_stages_done',
+        stages: ['check', 'review', 'verify'],
+      },
+    ],
+  }
+  const scale = shapeDealTime(detail, { attempts: [] })
+  const [question, answer, closed] = scale.markers
+  assert.match(question.title, /вопрос человеку — «Код корректен, но now даёт EXIT_SOURCE=2»/)
+  assert.match(answer.title, /ответ человека — «evidence проверяет линию, а не окружение воркера»/)
+  // Закрытие — словами причины и списком этапов, без JSON.
+  assert.match(closed.title, /закрыто — все этапы пройдены · этапы: check → review → verify/)
+  // Пауза «вопрос → ответ» называет сам вопрос, а не его номер.
+  assert.equal(scale.waitSpans.length, 1)
+  assert.match(scale.waitSpans[0].title, /ждал человека — «Код корректен/)
 })
 
 test('шкала времени: событие без маркера — не маркер (телеметрия попытки не считается)', () => {

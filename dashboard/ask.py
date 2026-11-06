@@ -209,6 +209,49 @@ def answer_of(home: Path, question_id: Any) -> Optional[str]:
     return text or None
 
 
+def exchange_of(home: Path, question_id: Any) -> dict[str, str]:
+    """Вопрос и ответ человека из пула — текстом, а не номерами.
+
+    Журнал хранит только `question_id` и `answer_len`, поэтому экран, которому
+    нужен сам текст, обязан спросить пул. Читается одна строка `mode=ro`:
+    переводы строк схлопываются в пробел (текст живёт в подсказке одной строкой),
+    а длинный текст обрезается многоточием — в маркере таймлайна он подпись, а
+    не документ. Вопрос без номера, чужой номер и недоступный пул дают пустые
+    строки: это «текста нет», а не ошибка чтения среза.
+    """
+    db = pool_path(Path(home))
+    if not db.is_file():
+        return {}
+    try:
+        number = int(str(question_id).strip())
+    except (TypeError, ValueError):
+        return {}
+    try:
+        conn = sqlite3.connect(
+            db.resolve().as_uri() + "?mode=ro", uri=True, timeout=BUSY_TIMEOUT_MS / 1000
+        )
+        try:
+            row = conn.execute(
+                "SELECT text, answer FROM questions WHERE id = ?", (number,)
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return {}
+    if row is None:
+        return {}
+    text, answer = (" ".join(str(row[0] or "").split()), " ".join(str(row[1] or "").split()))
+    return {"question": _clip(text), "answer": _clip(answer)}
+
+
+def _clip(text: str, limit: int = 160) -> str:
+    """Одна строка в пределах подписи: хвост длинного вопроса в подсказке не нужен."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0].rstrip(",;:—-")
+    return f"{cut}…"
+
+
 def find_live(home: Path, deal_id: str) -> Optional[dict[str, Any]]:
     """Живой вопрос дела в пуле (`pending`/`sent`) или `None`.
 

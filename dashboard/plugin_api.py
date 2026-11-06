@@ -1030,24 +1030,52 @@ def _own_waiting_fallback(status: str, attempts: int) -> tuple[str, str]:
     return state, f"{head}: шага движка ещё не было (bin/duty run)"
 
 
-def _timeline(events: list[dict[str, Any]], now: int) -> list[dict[str, Any]]:
+def _timeline(
+    events: list[dict[str, Any]], now: int, home: Optional[Path] = None
+) -> list[dict[str, Any]]:
     """Таймлайн дела по событиям журнала: что произошло, когда и с чем.
 
     Одна форма для своих и наблюдаемых дел: экран рисует её одинаково. Выжимка
     payload'а берётся тем же `_payload_summary`, что у последнего действия, —
     второго форматтера в ответе быть не должно.
+
+    Вопросу и ответу добавляется их текст из пула (`ask.exchange_of`): журнал
+    хранит только номер вопроса, а человеку на экране нужен сам вопрос, а не
+    `question_id`. Пул читается только на чтение и только когда он есть: без
+    `home` (наблюдаемое дело) факты остаются номерами, и это видно в подписи.
     """
-    return [
-        {
-            "kind": event.get("kind"),
+    rows = []
+    for event in events:
+        kind = event.get("kind")
+        payload = event.get("payload") or {}
+        row = {
+            "kind": kind,
             "at": event.get("ts"),
             "recorded_at": event.get("recorded_at"),
             "age_sec": _age_sec(event.get("ts"), now),
             "source": event.get("source"),
-            "summary": _payload_summary(json.dumps(event.get("payload") or {}, ensure_ascii=False)),
+            "summary": _payload_summary(json.dumps(payload, ensure_ascii=False)),
         }
-        for event in events
-    ]
+        if kind == "question_asked":
+            row["question_id"] = payload.get("question_id")
+            row["routing"] = (payload.get("routing") or {}).get("target") if isinstance(payload.get("routing"), dict) else None
+        elif kind == "question_answered":
+            row["question_id"] = payload.get("question_id")
+            row["answered_via"] = payload.get("answered_via")
+        elif kind == "completed":
+            row["cause"] = payload.get("cause")
+            row["stages"] = payload.get("stages")
+        if home is not None and kind in ("question_asked", "question_answered"):
+            text = ask.exchange_of(home, payload.get("question_id"))
+            if text.get("question"):
+                row["question_text"] = text["question"]
+            # Ответ показывается только там, где он был фактом: у `question_asked`
+            # ответа ещё не было, и подставлять текущий текст пула значило бы
+            # переписать историю.
+            if kind == "question_answered" and text.get("answer"):
+                row["answer_text"] = text["answer"]
+        rows.append(row)
+    return rows
 
 
 def _own_waiting(
@@ -1421,7 +1449,7 @@ def _own_response(
         shaped=shaped,
         comments=deals.comments_of(conn, deal_id),
         attachments=deals.attachments_of(conn, deal_id),
-        timeline=_timeline(events, now),
+        timeline=_timeline(events, now, home),
         stages=feed["stages"],
         stages_note=feed["note"],
         spec=feed["spec"],

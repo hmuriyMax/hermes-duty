@@ -949,6 +949,45 @@ const MARKER_META = {
   ended: { label: 'конец попытки', tone: 'gray', tick: true },
 }
 
+// Причина закрытия по-русски: `cause` из журнала — машинное слово, экран его
+// не показывает, но и не выдумывает: незнакомая причина остаётся как есть.
+const CLOSE_CAUSE_WORD = {
+  all_stages_done: 'все этапы пройдены',
+  closed_by_human: 'закрыто человеком',
+  stopped_by_human: 'остановлено человеком',
+}
+
+/**
+ * Тело подписи маркера — то, что человек читает после названия события.
+ *
+ * Вопрос и ответ берутся текстом из пула (`question_text`/`answer_text` ответа
+ * бэкенда), закрытие — словами причины и списком этапов. Выжимка payload'а
+ * (`summary`) остаётся запасным путём: у приговора и отказа по бюджету она уже
+ * написана словами движком, и второго форматтера здесь не заводится.
+ */
+function markerBody(type, event) {
+  const e = event && typeof event === 'object' ? event : {}
+  const text = String(e.summary || '')
+  if (type === 'question') {
+    const question = String(e.question_text || '')
+    if (question) return `«${question}»`
+    return 'текст вопроса не сохранён'
+  }
+  if (type === 'answer') {
+    const answer = String(e.answer_text || '')
+    if (answer) return `«${answer}»`
+    return 'ответ без текста'
+  }
+  if (type === 'closed') {
+    const cause = CLOSE_CAUSE_WORD[String(e.cause || '')] || String(e.cause || '')
+    const stages = Array.isArray(e.stages) ? e.stages.filter(Boolean).map(String) : []
+    return [cause, stages.length ? `этапы: ${stages.join(' → ')}` : ''].filter(Boolean).join(' · ')
+  }
+  // `summary` приговора и отказа по бюджету — уже фраза движка, а не JSON;
+  // JSON-выжимку в подсказку не пускаем: это телеметрия.
+  return text.startsWith('{') ? '' : text
+}
+
 /**
  * Вид маркера по событию журнала; пусто — маркера нет.
  *
@@ -1582,7 +1621,17 @@ function shapeDealTime(detail, attemptsPayload) {
   // Событие закрытия в журнале — тот же признак, если сервер не отдал `terminal`.
   const events = (Array.isArray(d.timeline) ? d.timeline : []).map((event) => {
     const e = event && typeof event === 'object' ? event : {}
-    return { kind: String(e.kind || ''), at: numOrNull(e.at) || 0, summary: String(e.summary || '') }
+    // Текст вопроса и ответа, причина закрытия — поля ответа бэкенда, а не
+    // разбор `summary`: журнал хранит номер вопроса, пул — сам вопрос.
+    return {
+      kind: String(e.kind || ''),
+      at: numOrNull(e.at) || 0,
+      summary: String(e.summary || ''),
+      question_text: e.question_text ? String(e.question_text) : '',
+      answer_text: e.answer_text ? String(e.answer_text) : '',
+      cause: e.cause ? String(e.cause) : '',
+      stages: Array.isArray(e.stages) ? e.stages.map(String) : [],
+    }
   })
   const closedInJournal = events.some((event) => markerType(event.kind, event.summary) === 'closed')
   const live = d.terminal !== true && !closedInJournal
@@ -1684,7 +1733,11 @@ function shapeDealTime(detail, attemptsPayload) {
     if (!type) continue
     const meta = MARKER_META[type]
     const clock = fmtClock(event.at)
-    const title = `${clock} · ${meta.label}${event.summary ? ` — ${event.summary}` : ''}`
+    // Подпись маркера — слова, а не payload: номер вопроса и JSON причины
+    // человеку ничего не говорят. Текст вопроса и ответа даёт бэкенд
+    // (`question_text`/`answer_text` из пула), причину закрытия — поля `cause`.
+    const body = markerBody(type, event)
+    const title = `${clock} · ${meta.label}${body ? ` — ${body}` : ''}`
     const marker = {
       type,
       kind: event.kind,
@@ -1695,6 +1748,9 @@ function shapeDealTime(detail, attemptsPayload) {
       tone: meta.tone,
       tick: meta.tick,
       summary: event.summary,
+      // Человеческое тело подписи: вопрос/ответ текстом, причина закрытия
+      // словами. Пауза «вопрос → ответ» называет им сам вопрос.
+      text: body,
       title,
       ariaLabel: title,
       answered: false,
@@ -1721,7 +1777,7 @@ function shapeDealTime(detail, attemptsPayload) {
           toAt: marker.at,
           fromPct: asked.pct,
           widthPct: Math.max(0.4, Math.round((marker.pct - asked.pct) * 10) / 10),
-          title: `${asked.clock} → ${marker.clock}: ждал человека`,
+          title: `${asked.clock} → ${marker.clock}: ждал человека${asked.text ? ` — ${asked.text}` : ''}`,
         })
         asked = null
       }

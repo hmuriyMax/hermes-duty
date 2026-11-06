@@ -685,6 +685,65 @@ def test_ingest_pass_syncs_answers(home: Path) -> None:
     }
 
 
+# ------------------------------- текст вопроса и ответа вместо номеров
+
+
+def test_exchange_of_returns_question_and_answer_text(home: Path) -> None:
+    """Пул отдаёт вопрос и ответ текстом — экран не показывает номер."""
+    question_id = ask_once(home).question_id
+    pool_close(home, question_id, "answered")
+
+    text = ask.exchange_of(home, question_id)
+
+    assert text["question"]
+    assert text["answer"]
+    # Одна строка: текст живёт в подсказке маркера, переносы ломают вёрстку.
+    assert "\n" not in text["question"] and "\n" not in text["answer"]
+
+
+def test_exchange_of_is_quiet_without_pool_or_number(home: Path) -> None:
+    """Нет пула, нет номера, чужой номер — пустой ответ, а не исключение."""
+    question_id = ask_once(home).question_id
+    assert ask.exchange_of(home, question_id)["question"]
+    assert ask.exchange_of(home, None) == {}
+    assert ask.exchange_of(home, "не номер") == {}
+    assert ask.exchange_of(home, 999_999) == {}
+    (home / "messaging" / "pool.db").unlink()
+    assert ask.exchange_of(home, question_id) == {}
+
+
+def test_exchange_of_clips_long_text_to_one_line(home: Path) -> None:
+    """Длинный вопрос обрезается многоточием: подпись, а не документ."""
+    long_text = "очень длинный вопрос " * 20
+    question_id = ask_once(home, text=long_text).question_id
+
+    text = ask.exchange_of(home, question_id)
+
+    assert len(text["question"]) <= 161
+    assert text["question"].endswith("…")
+
+
+
+def test_deal_timeline_carries_question_and_answer_text(client: TestClient, home: Path) -> None:
+    """Таймлайн дела отдаёт текст вопроса и ответа: экран не рисует номера."""
+    question_id = ask_once(home).question_id
+    pool_close(home, question_id, "answered")
+    # Ответ становится фактом журнала только после дочитывания пула.
+    sync_now(home)
+
+    timeline = client.get(f"/deal/{DEAL}").json()["timeline"]
+    asked = next(event for event in timeline if event["kind"] == "question_asked")
+    answered = next(event for event in timeline if event["kind"] == "question_answered")
+
+    # Вопрос несёт свой текст и номер; ответ — и текст ответа.
+    assert asked["question_text"]
+    assert asked["question_id"] == question_id
+    assert answered["answer_text"]
+    # Ответа у момента вопроса ещё не было: история не переписывается.
+    assert "answer_text" not in asked
+
+
+
 # ----------------------------------------------------- human_kind в /now
 
 

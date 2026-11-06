@@ -212,6 +212,19 @@ test('разворот строки и правки экрана дела: пр�
   assert.match(plugin, /duty-tl-band t-\$\{view\.band\.tone \|\| 'grey'\}/, 'десктоп: фон попытки не знает тона')
   assert.match(plugin, /duty-tl-row\$\{view\.failed \? ' is-failed' : ''\}/, 'десктоп: строка не помечает провал')
 
+  // Маркеры-палки: по ним ходят мышью, значит курсор — поинтер, и попадание
+  // шире самого штриха (3 px иначе не поймать).
+  for (const [name, text, sel] of [
+    ['веб', css, '.tl-mark {'],
+    ['десктоп', plugin, '.duty-tl-mark{'],
+  ]) {
+    const at = text.indexOf(sel)
+    assert.ok(at > -1, `${name}: нет правила маркера`)
+    const rule = text.slice(at, text.indexOf('}', at))
+    assert.match(rule, /cursor:\s*pointer/, `${name}: у палки нет курсора-поинтера`)
+    assert.ok(text.includes(name === 'веб' ? '.tl-mark::before' : '.duty-tl-mark::before'), `${name}: попадание мышью не расширено`)
+  }
+
   // Легенда семейств — переключатель: клик подсвечивает семейство на дорожках.
   for (const [name, text] of [['веб', css], ['десктоп', plugin]]) {
     assert.match(text, /scale-key\.on[^{]*\{[^}]*background/, `${name}: выбранное семейство не отмечено`)

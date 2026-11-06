@@ -3569,14 +3569,14 @@ function DealScreen({ sel, onBack }) {
   const feed = useMemo(() => shapeStages(detail.data), [detail.data])
   // Выбранный вызов живёт на экране дела: клик по чипу открывает инспектор, но
   // строку попытки не разворачивает — развёртка осталась под указателем.
-  const [callSel, setCallSel] = React.useState('')
-  const selectCall = React.useCallback((id) => {
+  const [callSel, setCallSel] = useState('')
+  const selectCall = useCallback((id) => {
     setCallSel((prev) => (prev === id ? '' : id))
   }, [])
   // Подсветка семейства инструментов: набор тонов из легенды. Клик по семейству
   // гасит остальные вызовы, повторный — снимает подсветку.
-  const [toolFilter, setToolFilter] = React.useState([])
-  const toggleTool = React.useCallback((tone) => {
+  const [toolFilter, setToolFilter] = useState([])
+  const toggleTool = useCallback((tone) => {
     setToolFilter((prev) => (prev.includes(tone) ? prev.filter((item) => item !== tone) : [...prev, tone]))
   }, [])
 

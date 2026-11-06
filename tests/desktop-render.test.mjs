@@ -28,6 +28,8 @@ function pluginSource() {
 }
 
 const pluginRoot = new URL('..', import.meta.url).pathname
+/** Окно jsdom последнего монтажа: держим ссылку, чтобы оно не собиралось GC. */
+let keepWindow = null
 const read = (path) => readFileSync(join(pluginRoot, path), 'utf8')
 
 /** Где лежит React: свои node_modules у плагина не заводятся. */
@@ -223,4 +225,137 @@ test('десктоп: DutyLane рисует svg-значок, который л�
     /class="[^"]*\bduty-tl-unfinished\b/,
     'оборванный вызов (ms:null) должен иметь класс на элементе',
   )
+})
+
+test('десктоп: к React не обращаются мимо импорта', () => {
+  // Поломка, которую этот тест держит: в `DealScreen` стояло `React.useState`
+  // без импорта `React` — экран дела падал с `ReferenceError` и не открывался
+  // вовсе, а серверный рендер компонентов этого не видел.
+  const source = pluginSource()
+  const bare = source.match(/(^|[^.\w])React\./g) || []
+  if (!bare.length) return
+  assert.match(
+    source,
+    /import\s+React|const\s+React\s*=/,
+    `в плагине ${bare.length} обращений к React, но React не импортирован`,
+  )
+})
+
+test('десктоп: экран «Дело» монтируется и рисует дорожки', async (t) => {
+  const reactModules = reactRoot()
+  if (!reactModules) return t.skip('нет React в ~/.hermes/hermes-agent/node_modules')
+  if (!existsSync(join(reactModules, 'jsdom', 'package.json'))) return t.skip('нет jsdom')
+
+  // jsdom-монтаж вместо серверного рендера: только так выполняются эффекты, а
+  // падение внутри компонента (`ReferenceError`, `TypeError`) видно тесту.
+  const dir = mkdtempSync(join(tmpdir(), 'duty-mount-'))
+  mkdirSync(join(dir, 'node_modules'))
+  for (const name of ['react', 'react-dom', 'scheduler', 'jsdom']) {
+    const target = join(reactModules, name)
+    if (existsSync(target)) symlinkSync(target, join(dir, 'node_modules', name), 'dir')
+  }
+  writeFileSync(
+    join(dir, 'sdk.mjs'),
+    ['Button', 'Input', 'Codicon', 'Streamdown']
+      .map((name) => `export const ${name} = (props) => null`)
+      .join('\n'),
+  )
+  writeFileSync(
+    join(dir, 'plugin.mjs'),
+    pluginSource()
+      .replace(/from '@hermes\/plugin-sdk'/, "from './sdk.mjs'")
+      .concat("\nexport function __setRest(fn) { rest = fn }\nexport { DealScreen }\n"),
+  )
+
+  const { JSDOM } = await import(pathToFileURL(join(reactModules, 'jsdom', 'lib', 'api.js')).href)
+  const dom = new JSDOM('<!doctype html><div id="root"></div>', { url: 'http://localhost/' })
+  globalThis.window = dom.window
+  globalThis.document = dom.window.document
+  Object.defineProperty(globalThis, 'navigator', { value: dom.window.navigator, configurable: true })
+  globalThis.HTMLElement = dom.window.HTMLElement
+  globalThis.Element = dom.window.Element
+  globalThis.Node = dom.window.Node
+  globalThis.requestAnimationFrame = (cb) => setTimeout(() => cb(Date.now()), 0)
+  globalThis.cancelAnimationFrame = (id) => clearTimeout(id)
+
+  let mounted = null
+  const failures = []
+  const origError = console.error
+  console.error = (...args) => {
+    const text = args.map((item) => (item && item.stack) || String(item)).join(' ')
+    // Предупреждения act() — артефакт ручного монтажа, а не ошибка экрана.
+    if (!/not wrapped in act/.test(text)) failures.push(text)
+  }
+
+  try {
+    const mod = await import(pathToFileURL(join(dir, 'plugin.mjs')).href)
+    mod.__setRest(async (path) => {
+      if (path.startsWith('/deal/')) {
+        return {
+          repo: 'hermes-duty',
+          title: 'дело из фикстуры',
+          status: 'done',
+          stages: [
+            { id: 'check', needs: [], state: 'done' },
+            { id: 'verify', needs: ['check'], state: 'done' },
+          ],
+          timeline: [
+            { kind: 'question_asked', at: 1_200, summary: 'нужно ок', question_text: 'вопрос текстом' },
+            { kind: 'question_answered', at: 1_300, summary: 'ок', answer_text: 'ответ текстом' },
+          ],
+          closed: { at: 2_000, cause: 'all_stages_done' },
+        }
+      }
+      if (path.includes('/attempts')) {
+        return {
+          attempts: [
+            {
+              n: 1, attempt: 1, stage: 'check', start: 1_000, end: 1_500, outcome: 'done', status: 'completed',
+              calls: [{ seq: 1, name: 'read_file', at: 1_050, ms: 120 }],
+            },
+            {
+              n: 2, attempt: 2, stage: 'verify', start: 1_600, end: 2_000, outcome: 'failed', status: 'failed',
+              kind: 'contract', reason: 'commit.foreign: чужое готовое',
+              calls: [{ seq: 1, name: 'shell.exec', at: 1_650, ms: 400 }],
+            },
+          ],
+        }
+      }
+      return {}
+    })
+
+    const React = (await import(pathToFileURL(join(reactModules, 'react', 'index.js')).href)).default
+    const { createRoot } = await import(pathToFileURL(join(reactModules, 'react-dom', 'client.js')).href)
+    const container = dom.window.document.getElementById('root')
+    mounted = createRoot(container)
+    mounted.render(
+      React.createElement(mod.DealScreen, {
+        sel: { id: 'd_fixture', titleFull: 'дело из фикстуры', repo: 'hermes-duty' },
+        onBack: () => {},
+      }),
+    )
+    await new Promise((resolve) => setTimeout(resolve, 800))
+
+    assert.equal(failures.length, 0, `экран дела упал: ${failures[0] || ''}`.slice(0, 600))
+    const text = container.textContent || ''
+    assert.ok(text.length > 200, `экран дела пуст (${text.length} символов)`)
+    assert.ok(container.querySelectorAll('.duty-tl-row').length >= 2, 'дорожки попыток не нарисованы')
+    // Причина провала — в подсказке полосы, а не только словом «провал».
+    const tips = [...container.querySelectorAll('.duty-tl-band')].map((node) => node.getAttribute('data-tip') || '')
+    assert.ok(tips.some((tip) => tip.includes('отказ contract')), `нет причины провала в подсказке: ${tips.join(' | ')}`)
+  } finally {
+    console.error = origError
+    // jsdom держит таймеры и окно: без размонтирования и `window.close()` тест
+    // не отпускает event loop и `node --test` висит до внешнего таймаута.
+    try {
+      if (mounted) mounted.unmount()
+    } catch {
+      /* не смонтировалось — размонтировать нечего */
+    }
+    // Глобалы jsdom не снимаем: у плагина остаются отложенные таймеры (перерисовка
+    // по `requestAnimationFrame`), и снятое `window` превращало их в
+    // `ReferenceError: window is not defined` уже после теста. Файл идёт в своём
+    // процессе `node --test`, так что подмена глобалов никому не мешает.
+    keepWindow = dom.window
+  }
 })

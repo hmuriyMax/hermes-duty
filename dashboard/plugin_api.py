@@ -1756,53 +1756,6 @@ def _repo_metrics(
     }
 
 
-def _cards_summary(home: Path) -> dict[str, Any]:
-    """Карточки kanban счётом: `tasks_total`/`runs_total`, статусы и исходы ранов.
-
-    Это **наблюдение, не дела**: у карточки нет этапов, отказов контракта и
-    токенов, поэтому её числа живут отдельным блоком ответа (`cards`) и ни одним
-    полем не попадают в `totals`. Источник — те же живые `kanban.db`, что у
-    `/cards`; отсутствие канбана — не ошибка, а ноль карточек.
-    """
-    found = _card_databases(home)
-    by_status: dict[str, int] = {}
-    runs_by_outcome: dict[str, int] = {}
-    tasks_total = 0
-    runs_total = 0
-    warnings: list[str] = []
-    for name, database in found:
-        rows, error = _query_checked(
-            database, "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
-        )
-        if error:
-            warnings.append(f"{name}: tasks: {error}")
-        for row in rows:
-            count = int(row.get("n") or 0)
-            status = str(row.get("status") or "—")
-            by_status[status] = by_status.get(status, 0) + count
-            tasks_total += count
-        rows, error = _query_checked(
-            database, "SELECT outcome, COUNT(*) AS n FROM task_runs GROUP BY outcome"
-        )
-        if error:
-            warnings.append(f"{name}: task_runs: {error}")
-        for row in rows:
-            count = int(row.get("n") or 0)
-            key = str(row.get("outcome") or "running")
-            runs_by_outcome[key] = runs_by_outcome.get(key, 0) + count
-            runs_total += count
-    return {
-        "kind": "observation",
-        "label": CARDS_LABEL,
-        "databases": len(found),
-        "tasks_total": tasks_total,
-        "runs_total": runs_total,
-        "by_status": by_status,
-        "runs_by_outcome": runs_by_outcome,
-        "warnings": warnings,
-    }
-
-
 def _pooled(metric: str, groups: list[dict[str, Any]]) -> dict[str, Any]:
     """Распределение по объединённой выборке групп: перцентиль групп — не перцентиль целого."""
     values: list[int] = []
@@ -1834,8 +1787,11 @@ def collect_stats(
 
     Распределения считаются по объединённой выборке группы, а не как среднее:
     перцентиль перцентилей не равен перцентилю объединённой выборки. Нечитаемый
-    store или журнал попадает в `errors`, нечитаемые карточки — в
-    `cards.warnings`, и ответ остаётся 200.
+    store или журнал попадает в `errors`, и ответ остаётся 200.
+
+    Карточек kanban здесь нет ни одним полем: у карточки нет этапов, отказов
+    контракта и токенов, а здоровье обязано отвечать про **дела**. Наблюдение за
+    карточками живёт отдельным ответом `GET /cards`.
     """
     errors: list[dict[str, str]] = []
     since_value = int(since) if since is not None else int(now) - HEALTH_WINDOW_SEC
@@ -1896,7 +1852,6 @@ def collect_stats(
             "токены: ни одна закрытая попытка окна не записала details.usage_tokens — "
             "сумма не считается (null, а не 0)"
         )
-    cards = _cards_summary(home)
     return {
         "now": now,
         "window": {
@@ -1907,11 +1862,8 @@ def collect_stats(
         "repos": groups,
         "without_repo": without_group,
         "totals": totals,
-        # Карточки kanban — наблюдение с своим именем: два объекта, две таблицы,
-        # ни одного общего числа (см. тест `test_health_cards_and_deals_do_not_mix`).
-        "cards": cards,
         "errors": errors,
-        "warnings": warnings + cards["warnings"],
+        "warnings": warnings,
         "success_outcomes": list(SUCCESS_OUTCOMES),
         "crash_outcomes": list(CRASH_OUTCOMES),
     }
@@ -1934,9 +1886,8 @@ def stats(
     поведение на обеих ручках — `docs/SPEC.md`). `?board=` — отказ (400) с
     подсказкой: доск нет, фильтр называется `repo`.
 
-    Карточки kanban приходят отдельным блоком `cards` (наблюдение, не дела): у
-    карточки нет этапов, отказов контракта и токенов, и ни одно её число не
-    попадает в `totals`.
+    Ответ описывает только **дела**: карточек kanban в нём нет ни одним полем —
+    наблюдение за ними живёт отдельным роутом `GET /cards`.
     """
     _refuse_board_filter(board)
     return collect_stats(_hermes_home(), _now_sec(), repo=repo, since=since)

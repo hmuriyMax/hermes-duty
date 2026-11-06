@@ -921,12 +921,13 @@ def test_stats_since_counts_only_deals_created_after_it(home, frozen_now, capsys
     assert windowed["totals"]["waiting_sec"]["count"] == 1
 
 
-def test_stats_prints_deals_and_cards_as_two_sections(home, frozen_now, capsys):
-    """Терминал печатает две секции с разными заголовками и не смешивает числа.
+def test_stats_prints_deals_only_and_no_card_section(home, frozen_now, capsys):
+    """Терминал печатает здоровье дел и ни одной строки про карточки kanban.
 
-    Секция дел отвечает спека-вопросами (этапы, ожидание человека, отказы
-    контракта, токены), секция карточек kanban — своя, подписанная «наблюдение,
-    не дела». Карточка фикстуры (`make_card`) в счёт дел не входит, и наоборот.
+    Секция отвечает спека-вопросами (этапы, ожидание человека, отказы контракта,
+    токены). Карточка фикстуры (`make_card`) в счёт дел не входит, а блока
+    «КАРТОЧКИ КАНБАНА» в выводе больше нет: наблюдение живёт в `GET /cards`.
+    Красная проба: вернуть в `render_stats` секцию карточек — тест падает.
     """
     deal_id = make_deal(home, title="с вопросами", created_at=NOW - 500)
     attempt_of(
@@ -972,21 +973,19 @@ def test_stats_prints_deals_and_cards_as_two_sections(home, frozen_now, capsys):
     code, out, _ = run(["stats"], capsys)
 
     assert code == 0
-    deals_section, cards_section = out.split("КАРТОЧКИ КАНБАНА (наблюдение, не дела)")
-    assert "ЗДОРОВЬЕ ДЕЛ" in deals_section
-    assert "этапов с первой попытки: 1/1 (100%)" in deals_section
+    assert "ЗДОРОВЬЕ ДЕЛ" in out
+    assert "этапов с первой попытки: 1/1 (100%)" in out
     # Ожидание человека — 300 с (question_asked → question_answered), а не 100 с
     # (created → первая попытка): это две разные величины спеки.
-    assert "ожидание человека: p50 5 мин" in deals_section
-    assert "ожидание до первой попытки этапа: p50 1 мин" in deals_section
-    assert "токены за окно: 2k (по 1 попыткам)" in deals_section
-    assert "отказы контракта: не было" in deals_section
-    # Секция карточек: своё имя, свои числа, ни одного числа дел.
-    assert "статусы карточек: blocked 1" in cards_section
-    assert "ранов: 0" in cards_section
-    assert "карточек:" not in deals_section
-    assert "дел с фактами в окне" not in cards_section
-    assert "первой попытки" not in cards_section
+    assert "ожидание человека: p50 5 мин" in out
+    assert "ожидание до первой попытки этапа: p50 1 мин" in out
+    assert "токены за окно: 2k (по 1 попыткам)" in out
+    assert "отказы контракта: не было" in out
+    # Карточек в здоровье нет: ни блока, ни их чисел, ни подписи наблюдения.
+    assert "КАРТОЧКИ КАНБАНА" not in out
+    assert "карточек:" not in out
+    assert "статусы карточек" not in out
+    assert "ранов:" not in out
 
 
 # ----------------------------------------------------------------------- watch

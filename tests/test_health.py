@@ -14,11 +14,14 @@ kanban: у карточки нет этапов, нет отказов конт�
   `details.class`) и разбиваются по правилу причины;
 - пустая база отдаёт `null` и `count: 0`, а не нули: «нет данных» и «ноль» —
   разные факты;
-- числа карточек kanban и числа дел живут двумя объектами и не пересекаются.
+- карточек kanban в `/stats` нет ни одним полем: здоровье отвечает про **дела**,
+  а карточки живут отдельным наблюдением `GET /cards`.
 
 Красная проба живёт здесь же: `test_health_counts_deal_stages_not_kanban_tasks`
 падает, если источником «Здоровья» подменить `tasks` канбана, — у карточки нет
-этапов, и доля «с первой попытки» по ней не считается.
+этапов, и доля «с первой попытки» по ней не считается;
+`test_health_cards_and_deals_do_not_mix` падает, если в ответ `/stats` вернуть
+ключ `cards`: наблюдение за карточками осталось только в `GET /cards`.
 """
 
 from __future__ import annotations
@@ -58,7 +61,7 @@ CREATE TABLE questions (
 );
 """
 
-# Наблюдение за карточками: только те колонки, которые читает `/stats` (`cards`).
+# Наблюдение за карточками: только те колонки, которые читает `/cards`.
 CARDS_SCHEMA = """
 CREATE TABLE tasks (
   id TEXT PRIMARY KEY,
@@ -390,31 +393,37 @@ def test_health_window_defaults_to_a_day_and_since_narrows_it(client: TestClient
     assert windowed["totals"]["first_try"]["closed"] == 1
 
 
-# --------------------- (е) карточки и дела — два объекта, два блока, без смешивания
+# --------------------- (е) карточки живут в `/cards`, а не в здоровье дел
 
 
 def test_health_cards_and_deals_do_not_mix(client: TestClient, home: Path) -> None:
+    """`/stats` — только про дела: ключа `cards` в ответе нет, карточки — в `/cards`.
+
+    Красная проба: вернуть в ответ `/stats` блок `cards` (счёт карточек канбана) —
+    тест падает. Здоровье обязано отвечать про **дела**, а наблюдение за
+    карточками осталось одним роутом `GET /cards`.
+    """
     deal_id = make_deal(home)
     attempt(home, deal_id, started_at=NOW - 900, ended_at=NOW - 850)
     make_cards(home, {"t_a": "done", "t_b": "archived", "t_c": "running"}, {"completed": 4, "crashed": 2})
 
     body = client.get("/stats").json()
     totals = body["totals"]
-    cards = body["cards"]
 
     # Дела: одно дело, один этап, одна попытка — и ни одного числа карточек.
+    assert "cards" not in body
     assert totals["deals"] == 1
     assert totals["attempts_total"] == 1
-    assert "tasks_total" not in totals and "by_status" not in totals
+    assert "tasks_total" not in totals and "runs_total" not in totals and "by_status" not in totals
     assert totals["deals_by_status"] == {"ready": 1}
-    # Карточки: своя таблица и своя подпись.
-    assert cards["kind"] == "observation"
-    assert cards["label"] == "карточки kanban (наблюдение, не дела)"
-    assert cards["tasks_total"] == 3
-    assert cards["runs_total"] == 6
-    assert cards["by_status"] == {"done": 1, "archived": 1, "running": 1}
-    assert "deals" not in cards and "first_try" not in cards
-    assert body["cards"]["by_status"] != totals["deals_by_status"]
+    # Карточки никуда не делись: они в наблюдении, своим ответом и своей подписью.
+    # Наблюдение показывает живые карточки, поэтому закрытые (`done`/`archived`) в
+    # нём не значатся — их видно только счётом в этом тесте.
+    observed = client.get("/cards").json()
+    assert observed["kind"] == "observation"
+    assert observed["label"] == "карточки kanban (наблюдение, не дела)"
+    assert observed["count"] == 1
+    assert [card["id"] for entry in observed["cards"] for card in entry["cards"]] == ["t_c"]
 
 
 # ---------------------------------------------------------- красная проба
@@ -439,4 +448,5 @@ def test_health_counts_deal_stages_not_kanban_tasks(client: TestClient, home: Pa
     assert body["totals"]["first_try"] == {"ok": 1, "closed": 1, "share": 1.0}
     assert body["totals"]["stages"] == {"total": 1, "closed": 1}
     assert body["totals"]["deals_by_status"] == {"ready": 1}
-    assert body["cards"]["tasks_total"] == 3
+    # Карточка не этап и не дело: в ответе здоровья её нет ни одним полем.
+    assert "cards" not in body

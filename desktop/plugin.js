@@ -1263,15 +1263,25 @@ function attemptView(bar, scale) {
 
   // Маркеры внутри попытки: вердикты, вопросы человеку, публикация, закрытие.
   // Засечки старта/конца больше не рисуются — их роль играет фон попытки.
-  const inside = (scale && Array.isArray(scale.markers) ? scale.markers : []).filter(
-    (marker) =>
-      marker.type !== 'started' &&
-      marker.type !== 'ended' &&
-      b.start !== null &&
-      b.end !== null &&
-      marker.at >= b.start &&
-      marker.at <= b.end,
-  )
+  //
+  // Интервал попытки полуоткрытый: событие ровно в секунду стыка принадлежит
+  // следующей попытке, а не обеим. Иначе вердикт на стыке рисовался дважды —
+  // в той попытке, что закончилась, и в той, что началась.
+  // Попытка «владеет» отрезком от своего начала до начала следующей: так
+  // событие в промежутке между попытками (человек ответил, следующая ещё не
+  // началась) остаётся видимым у той попытки, где вопрос задали, и при этом
+  // ни одно событие не рисуется дважды.
+  const siblings = scale && Array.isArray(scale.bars) ? scale.bars : []
+  const nextStart = siblings.reduce((min, other) => {
+    if (other === b || other.start === null || b.start === null || other.start <= b.start) return min
+    return min === null || other.start < min ? other.start : min
+  }, null)
+  const inside = (scale && Array.isArray(scale.markers) ? scale.markers : []).filter((marker) => {
+    if (marker.type === 'started' || marker.type === 'ended') return false
+    if (b.start === null) return false
+    if (marker.at < b.start) return false
+    return nextStart === null || marker.at < nextStart
+  })
   const marks = inside.map((marker) => ({
     type: marker.type,
     tone: marker.tone,

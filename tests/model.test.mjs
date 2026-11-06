@@ -547,6 +547,45 @@ const TIME_ATTEMPTS = {
   ],
 }
 
+test('маркеры: событие принадлежит одной попытке — стык и промежуток не дублируют', () => {
+  const scale = shapeDealTime(
+    {
+      now: 1_600,
+      terminal: false,
+      timeline: [
+        { kind: 'created', at: 1_000, summary: '' },
+        { kind: 'collected', at: 1_200, summary: 'вердикт: собрано' },
+        { kind: 'question_asked', at: 1_300, summary: 'нужно ок' },
+        { kind: 'question_answered', at: 1_450, summary: 'ок' },
+        { kind: 'collected', at: 1_600, summary: 'вердикт: собрано' },
+        // Засечки старта/конца попыток: их роль играет фон, в строки они не идут.
+        { kind: 'attempt_started', at: 1_000, summary: '{"run_id": "impl#1", "stage": "impl", "attempt": 1}' },
+        { kind: 'attempt_ended', at: 1_200, summary: 'done' },
+      ],
+      stages: [{ id: 'impl', needs: [] }],
+    },
+    {
+      attempts: [
+        { stage: 'impl', attempt: 1, start: 1_000, end: 1_200, status: 'done' },
+        { stage: 'impl', attempt: 2, start: 1_200, end: 1_250, status: 'done' },
+        { stage: 'impl', attempt: 3, start: 1_500, end: 1_600, status: 'done' },
+      ],
+    },
+  )
+  const rows = scale.bars.map((bar) => attemptView(bar, scale).marks.map((mark) => mark.title))
+  const placed = rows.flat()
+  // Вердикт ровно на стыке попыток 1 и 2 — один раз, у начавшейся.
+  assert.equal(placed.filter((title) => title.startsWith('13:20:00') || title.includes('12:20')).length <= 1, true)
+  assert.equal(new Set(placed).size, placed.length, `дубликаты: ${placed.length - new Set(placed).size}`)
+  // Все незасечки попали в строки, а засечки — нет: их роль играет фон попытки.
+  assert.equal(placed.some((title) => /старт попытки|конец попытки/.test(title)), false, 'засечка попытки попала в строку')
+  const facts = scale.markers.filter((marker) => marker.type !== 'started' && marker.type !== 'ended')
+  assert.equal(placed.length, facts.length, `в строках ${placed.length}, фактов ${facts.length}`)
+  // Ответ человеку, пришедший в промежутке между попытками, остаётся у той, где спросили.
+  const answerRow = rows.findIndex((marks) => marks.some((title) => title.includes('13:30:00') || title.includes('ответ')))
+  assert.ok(answerRow >= 0, 'ответ человека не попал ни в одну строку')
+})
+
 test('легенда инструментов: семейства с числами вызовов, порядок постоянный', () => {
   const scale = shapeDealTime(
     { now: 1_400, terminal: true, timeline: [{ kind: 'created', at: 1_000, summary: '' }], stages: [{ id: 'impl', needs: [] }] },

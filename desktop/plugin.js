@@ -686,6 +686,8 @@ function shapeAttempts(payload) {
       // этой подписи негде.
       progressText: attempt.progress === null || attempt.progress === undefined ? '' : `шагов ${fmtCount(attempt.progress)}`,
       toolsText: attempt.tools === null || attempt.tools === undefined ? '' : `инструментов ${fmtCount(attempt.tools)}`,
+      calls: shapeCalls(attempt.calls),
+      callsOmitted: numOrNull(attempt.calls_omitted) || 0,
       outcome: String(attempt.outcome || ''),
       outcomeTone: outcomeTone(attempt.outcome, attempt.status, crashes),
       error: String(attempt.error || ''),
@@ -739,6 +741,27 @@ const STAGE_META = {
 // Чем кончился процесс: `blocked`/`refused` янтарные — это не падение
 // исполнения, а отказ гейта или вопрос человеку. Незнакомый исход остаётся
 // серым: тон не выдумывается (тот же принцип, что у `outcomeTone`).
+// Исход попытки по-русски. Английские слова из журнала (`done`, `failed`)
+// на экран не идут: подпись строки — для человека, а не телеметрия.
+const OUTCOME_WORD = {
+  done: 'готово',
+  ok: 'готово',
+  success: 'готово',
+  passed: 'готово',
+  accepted: 'готово',
+  failed: 'провал',
+  blocked: 'отказ',
+  refused: 'отказ',
+  rate_limited: 'лимит',
+  reclaimed: 'снята',
+}
+
+/** Слово исхода для подписи строки; живёт рядом с тоном, чтобы не разъезжаться. */
+function outcomeWord(value) {
+  const key = String(value || '')
+  return OUTCOME_WORD[key] || key
+}
+
 const ATTEMPT_TONE = {
   done: 'green',
   ok: 'green',
@@ -1020,6 +1043,92 @@ function numOrNull(value) {
 }
 
 /** Попытка из ответа `/attempts` в полосу шкалы: время, дорожка, подписи. */
+function shapeCalls(raw) {
+  const list = Array.isArray(raw) ? raw : []
+  const calls = []
+  for (const item of list) {
+    const call = item && typeof item === 'object' ? item : {}
+    const at = numOrNull(call.at)
+    if (at === null) continue
+    const ms = numOrNull(call.ms)
+    calls.push({
+      seq: numOrNull(call.seq),
+      name: String(call.name || '—'),
+      at,
+      ms,
+      // Длительность словами: `null` — результат не пришёл, и «0 мс» здесь было
+      // бы враньём (вызов не мгновенный, он просто не доложил).
+      msText: ms === null ? 'длительность неизвестна' : fmtDuration(Math.max(0, Math.round(ms / 1000))),
+      clock: fmtClock(at),
+    })
+  }
+  return calls
+}
+
+/**
+ * Раскладка вызовов на дорожке попытки: где чип, какой ширины, на каком уровне.
+ *
+ * Ширина чипа — логарифм длительности (`3 + 11·log10(1+ms/100)/log10(1+12000/100)`):
+ * линейная шкала превратила бы 136 мс в точку, а 11.5 с — в половину дорожки, и
+ * таймлайн перестал бы читаться. Уровни нужны, потому что чипы идут вплотную:
+ * сосед занят — берём следующий уровень, дорожка растёт вниз.
+ *
+ * Арифметика общая для веб-страницы и десктопа: разъехавшиеся формулы дали бы две
+ * несравнимые картинки одного и того же дела.
+ */
+function layoutCalls(calls, options) {
+  const opts = options && typeof options === 'object' ? options : {}
+  const from = numOrNull(opts.from)
+  const to = numOrNull(opts.to)
+  // Ширина — виртуальная: раскладка считается в ней, а на экран уходит долями
+  // (`leftPct`/`widthPct`). Так обе поверхности рисуют одно и то же без замера
+  // DOM: чипы масштабируются вместе с дорожкой, а не разъезжаются по ней.
+  const width = Number(opts.width) || 1000
+  const levelH = Number(opts.levelH) || 12
+  const top = Number(opts.top) || 0
+  const maxLevels = Math.max(1, Number(opts.maxLevels) || 5)
+  const gap = Number(opts.gap) || 2
+  const span = from === null || to === null ? 0 : to - from
+  const list = Array.isArray(calls) ? calls : []
+  if (!list.length || width <= 0 || span <= 0) {
+    return { chips: [], levels: 0, height: top + levelH, clipped: 0 }
+  }
+  const chipWidth = (ms) => {
+    const value = Math.max(0, Number(ms) || 0)
+    return Math.round(3 + (11 * Math.log10(1 + value / 100)) / Math.log10(1 + 12000 / 100))
+  }
+  const lastEnd = []
+  const chips = []
+  let clipped = 0
+  for (const call of list) {
+    const px = Math.max(0, Math.min(width, ((call.at - from) / span) * width))
+    const size = chipWidth(call.ms)
+    let level = lastEnd.findIndex((end) => px - end >= gap)
+    if (level < 0) {
+      if (lastEnd.length >= maxLevels) {
+        // Уровни кончились — вызов всё равно показываем: прятать факт хуже, чем
+        // наложить его на соседа. Число наложенных считается в `clipped`.
+        level = lastEnd.indexOf(Math.min(...lastEnd))
+        clipped += 1
+      } else {
+        level = lastEnd.length
+      }
+    }
+    lastEnd[level] = px + size
+    chips.push({
+      call,
+      left: Math.round(px * 10) / 10,
+      width: size,
+      leftPct: Math.round((px / width) * 10000) / 100,
+      widthPct: Math.round((size / width) * 10000) / 100,
+      level,
+      top: top + level * levelH,
+    })
+  }
+  const levels = lastEnd.length
+  return { chips, levels, height: top + levels * levelH, clipped }
+}
+
 function attemptBar(attempt, crashes) {
   const a = attempt && typeof attempt === 'object' ? attempt : {}
   const start = numOrNull(a.start)
@@ -1036,6 +1145,12 @@ function attemptBar(attempt, crashes) {
     laneKey: stage,
     laneLabel: stage,
     lane: 0,
+    // Вид этапа и роль — из попытки: значок на дорожке («профиль», `shell`)
+    // говорит то же, что и лента этапов, а не угадывается по имени этапа.
+    kind: String(a.stage_kind || 'agent'),
+    // Роль приходит как `role` (`/deal`) или `profile` (`/duty/{id}/attempts`) —
+    // две ручки зовут одно и то же по-разному, и значок должен знать оба имени.
+    role: String(a.role || a.profile || ''),
     start,
     end,
     endAt: null,
@@ -1047,6 +1162,12 @@ function attemptBar(attempt, crashes) {
     leaseText: open ? leaseWord(lease, a.status) : '',
     progress: numOrNull(a.progress),
     tools: numOrNull(a.tools),
+    // Вызовы инструментов: `[{seq, name, at, ms}]` из телеметрии. Пустой список —
+    // у попытки не было телеметрии, а не «вызовов не делала»: это разные факты,
+    // и разницу называет `callsText`.
+    calls: shapeCalls(a.calls),
+    callsOmitted: numOrNull(a.calls_omitted) || 0,
+    callsText: '',
     outcome: String(a.outcome || ''),
     status: String(a.status || ''),
     tone: open ? (dead ? 'red' : 'blue') : outcomeTone(a.outcome, a.status, crashes),
@@ -1144,6 +1265,14 @@ function journalBars(events, crashes) {
         leaseText: '',
         progress: null,
         tools: null,
+        // У полосы из журнала телеметрии нет: событие `attempt_started` знает
+        // только про старт. Пустой список здесь — «вызовов в журнале нет», а не
+        // «попытка ничего не делала»: экран так и подписывает.
+        calls: [],
+        callsOmitted: 0,
+        callsText: '',
+        kind: 'agent',
+        role: '',
         outcome: '',
         status: '',
         tone: 'gray',
@@ -1270,9 +1399,18 @@ function shapeDealTime(detail, attemptsPayload) {
     bar.clockEnd = bar.open ? (now !== null ? fmtClock(now) : '—') : fmtClock(stop)
     bar.progressText = bar.progress === null ? '' : `шагов ${fmtCount(bar.progress)}`
     bar.toolsText = bar.tools === null ? '' : `инструментов ${fmtCount(bar.tools)}`
+    // Вызовы: сколько их в телеметрии и не обрезано ли. Это отдельная строка от
+    // `инструментов` — там счётчик движка, здесь то, что реально можно нарисовать.
+    bar.callsText = (bar.calls || []).length
+      ? `${fmtCount(bar.calls.length)} ${plural(bar.calls.length, 'вызов', 'вызова', 'вызовов')}${
+          bar.callsOmitted ? ` (ещё ${fmtCount(bar.callsOmitted)} не показано)` : ''
+        }`
+      : ''
     // Подпись внутри полосы — исход, а не догадка: у незакрытой это слово о
     // лизинге, у закрытой без исхода — её длительность.
     bar.label = bar.open ? bar.leaseText : bar.outcome || bar.status || bar.durationText
+    // Короткая подпись строки таймлайна: исход по-русски, у незакрытой — лизинг.
+    bar.outcomeText = bar.open ? bar.leaseText : outcomeWord(bar.outcome) || bar.status || bar.durationText
     const details = [bar.progressText, bar.toolsText].filter(Boolean).join(', ')
     const head = `${bar.laneLabel} · попытка ${bar.number || '—'}`
     const interval = `${bar.clockStart}–${bar.clockEnd} (${bar.durationText})`
@@ -1427,6 +1565,156 @@ function shapeDealTime(detail, attemptsPayload) {
 }
 // duty:model-end
 
+/* ------------------------------- таймлайн вызовов внутри попытки (0.0.8) */
+
+// Геометрия и палитра — те же числа, что у веб-страницы: расхождение дало бы
+// два разных рисунка одного дела. Раскладка считается общим шейпером
+// (`layoutCalls`), здесь только DOM.
+const TL_COLLAPSED = 20
+const TL_LEVEL_H = 12
+const TL_TOP = 6
+const TL_MAX_LEVELS = 5
+
+// Значок вида этапа: профиль — силуэт человека, shell — приглашение терминала,
+// гейт — ромб вопроса. Слово рядом лишнее: значок и есть подпись вида.
+const KIND_ICON = {
+  agent: 'M8 2.4a2.6 2.6 0 1 0 0 5.2 2.6 2.6 0 0 0 0-5.2ZM3 13.2c0-2.5 2.2-4.1 5-4.1s5 1.6 5 4.1',
+  shell: 'M4 5.2 7 8l-3 2.8M8.6 11.4h3.6',
+  gate: 'M8 2.2 13.4 8 8 13.8 2.6 8Z',
+}
+
+// Цвет вызова — по виду инструмента: чтение, правка, запуск, внешнее.
+const TOOL_TONE = [
+  [/^(read_file|search_files|grep|ls|list|view|cat|find)/i, 'var(--ui-blue)'],
+  [/^(write_file|patch|apply_patch|edit|create|mkdir)/i, 'var(--ui-green)'],
+  [/^(terminal|shell|bash|run|exec|python|node|go|npm)/i, 'var(--ui-yellow)'],
+  [/^(web_|browser|http|fetch|curl)/i, 'var(--ui-purple)'],
+]
+
+function dutyToolColor(name) {
+  const hit = TOOL_TONE.find(([pattern]) => pattern.test(String(name || '')))
+  return hit ? hit[1] : 'var(--ui-text-tertiary)'
+}
+
+/** Одна строка попытки: подпись, полоса штрихов и карта вызовов. */
+function DutyAttemptRow({ bar, scale }) {
+  const layout = useMemo(
+    () =>
+      bar.calls.length
+        ? layoutCalls(bar.calls, {
+            from: scale.axis.start,
+            to: scale.axis.end,
+            levelH: TL_LEVEL_H,
+            top: TL_TOP,
+            maxLevels: TL_MAX_LEVELS,
+          })
+        : { chips: [], height: TL_COLLAPSED },
+    [bar, scale],
+  )
+  const full = Math.max(TL_COLLAPSED, layout.height + 8)
+  const status = bar.outcomeText || (bar.open ? bar.leaseText : bar.outcome || bar.status || bar.durationText)
+  return h(
+    'div',
+    {
+      className: 'duty-tl-row',
+      title: bar.title,
+      tabIndex: 0,
+      // Высота раскрытия — в переменной: сам переход делает CSS по :hover, JS
+      // здесь не нужен, и веб с десктопом ведут себя одинаково.
+      style: { '--duty-tl-full': `${full}px` },
+    },
+    h(
+      'div',
+      { className: 'duty-tl-lbl' },
+      h('span', { className: 'duty-tl-n' }, bar.number || '—'),
+      h('span', { className: `duty-tl-st t-${bar.tone}` }, status || '—'),
+      h('span', { className: 'duty-tl-ms' }, bar.clockStart),
+    ),
+    h(
+      'div',
+      { className: 'duty-tl-track' },
+      h(
+        'div',
+        { className: 'duty-tl-mini' },
+        ...layout.chips.map((chip, index) =>
+          h('span', {
+            key: `tick-${index}`,
+            className: 'duty-tl-tick',
+            style: {
+              left: `${chip.leftPct}%`,
+              width: `${chip.widthPct}%`,
+              background: dutyToolColor(chip.call.name),
+            },
+          }),
+        ),
+      ),
+      h(
+        'div',
+        { className: 'duty-tl-stack' },
+        ...layout.chips.map((chip, index) =>
+          h('span', {
+            key: `call-${index}`,
+            className: 'duty-tl-call',
+            title: `${chip.call.name} · ${chip.call.clock} · ${chip.call.msText}`,
+            'aria-label': `${chip.call.name}, ${chip.call.clock}, ${chip.call.msText}`,
+            style: {
+              left: `${chip.leftPct}%`,
+              width: `${chip.widthPct}%`,
+              top: `${chip.top}px`,
+              background: dutyToolColor(chip.call.name),
+            },
+          }),
+        ),
+      ),
+    ),
+  )
+}
+
+/** Дорожка этапа: имя, значок вида, сводка и строки попыток. */
+function DutyLane({ lane, bars, scale }) {
+  const first = bars[0]
+  const calls = bars.reduce((sum, bar) => sum + bar.calls.length, 0)
+  const meta = [
+    `${bars.length} ${bars.length === 1 ? 'попытка' : bars.length < 5 ? 'попытки' : 'попыток'}`,
+    calls ? `${calls} ${calls % 10 === 1 && calls % 100 !== 11 ? 'вызов' : 'вызовов'}` : '',
+  ]
+    .filter(Boolean)
+    .join(' · ')
+  return h(
+    'div',
+    { className: 'duty-tl-lane' },
+    h(
+      'div',
+      { className: 'duty-tl-lane-h' },
+      h('span', { className: 'duty-tl-lane-name', title: lane.label }, lane.label),
+      first
+        ? h(
+            'span',
+            {
+              className: `duty-tl-kind duty-tl-kind-${first.kind}`,
+              title: first.kind === 'agent' ? `профиль: ${first.role || '—'}` : first.kind,
+            },
+            h(
+              'svg',
+              { className: 'duty-tl-kind-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' },
+              h('path', { d: KIND_ICON[first.kind] || KIND_ICON.shell }),
+            ),
+            first.kind === 'agent' ? first.role || 'профиль' : first.kind,
+          )
+        : null,
+      h('span', { className: 'duty-tl-lane-meta' }, meta),
+    ),
+    bars.length
+      ? h(
+          'div',
+          { className: 'duty-tl-rows' },
+          ...bars.map((bar) => h(DutyAttemptRow, { key: `row-${bar.key}`, bar, scale })),
+        )
+      : h('div', { className: 'duty-tl-empty' }, 'попыток не было'),
+  )
+}
+
+
 /* ---------------- стили страницы ---------------- */
 
 const CSS = `
@@ -1537,6 +1825,44 @@ const CSS = `
 .duty-scale-tick.align-start{transform:translateX(0)}
 .duty-scale-tick.align-center{transform:translateX(-50%)}
 .duty-scale-tick.align-end{transform:translateX(-100%)}
+/* ------------------------------------- таймлайн вызовов (0.0.8)
+ * Свёрнутая попытка — 20 px, раскрытие по наведению/фокусу. Высота приходит
+ * переменной --duty-tl-full со строки, переход делает CSS. */
+
+.duty-tl-lanes{display:flex;flex-direction:column;gap:10px}
+.duty-tl-lane{display:flex;flex-direction:column;gap:4px}
+.duty-tl-lane + .duty-tl-lane{border-top:1px solid var(--ui-border-primary, rgba(127,127,127,.2));padding-top:10px}
+.duty-tl-lane-h{display:flex;align-items:center;gap:8px;min-height:20px}
+.duty-tl-lane-name{font-size:12.5px;font-weight:600;color:var(--ui-text-primary);letter-spacing:.01em}
+.duty-tl-lane-meta{margin-left:auto;font-size:11px;color:var(--ui-text-tertiary);font-variant-numeric:tabular-nums;white-space:nowrap}
+.duty-tl-kind{display:inline-flex;align-items:center;gap:5px;height:19px;padding:0 7px;border-radius:5px;border:1px solid var(--ui-border-primary, rgba(127,127,127,.3));background:var(--ui-bg-quaternary);font-size:10.5px;font-weight:600;color:var(--ui-text-secondary)}
+.duty-tl-kind-ico{width:12px;height:12px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+.duty-tl-kind-agent{color:var(--ui-text-primary);border-color:var(--ui-blue);background:color-mix(in srgb, var(--ui-blue) 12%, transparent)}
+.duty-tl-kind-agent .duty-tl-kind-ico{stroke:var(--ui-blue)}
+.duty-tl-kind-gate{color:var(--ui-yellow);border-color:var(--ui-yellow);background:color-mix(in srgb, var(--ui-yellow) 12%, transparent)}
+.duty-tl-rows{display:flex;flex-direction:column;gap:4px}
+.duty-tl-row{position:relative;display:grid;grid-template-columns:132px 1fr;gap:8px;height:20px;align-items:center;border-radius:6px;transition:height .26s cubic-bezier(.22,.8,.24,1)}
+.duty-tl-row:hover,.duty-tl-row:focus-within{height:var(--duty-tl-full, 20px)}
+.duty-tl-row:focus-visible{outline:2px solid var(--ui-accent);outline-offset:1px}
+.duty-tl-lbl{display:flex;align-items:center;justify-content:flex-end;gap:6px;height:20px;line-height:20px;white-space:nowrap;font-variant-numeric:tabular-nums}
+.duty-tl-n{font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:10px;color:var(--ui-text-tertiary)}
+.duty-tl-st{font-size:10.5px;font-weight:700;color:var(--ui-text-secondary)}
+.duty-tl-st.t-green{color:var(--ui-green)}
+.duty-tl-st.t-red{color:var(--ui-red)}
+.duty-tl-st.t-yellow{color:var(--ui-yellow)}
+.duty-tl-st.t-blue{color:var(--ui-blue)}
+.duty-tl-ms{font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:10px;color:var(--ui-text-tertiary)}
+.duty-tl-track{position:relative;height:100%}
+.duty-tl-mini{position:absolute;left:0;right:0;top:6px;height:7px;transition:opacity .16s ease, transform .2s ease}
+.duty-tl-stack{position:absolute;left:0;right:0;top:0;opacity:0;pointer-events:none;transform:translateY(-3px) scaleY(.86);transform-origin:top;transition:opacity .18s ease .04s, transform .24s cubic-bezier(.22,.8,.24,1)}
+.duty-tl-row:hover .duty-tl-mini,.duty-tl-row:focus-within .duty-tl-mini{opacity:0;transform:translateY(3px)}
+.duty-tl-row:hover .duty-tl-stack,.duty-tl-row:focus-within .duty-tl-stack{opacity:1;pointer-events:auto;transform:none}
+.duty-tl-tick{position:absolute;top:0;height:7px;border-radius:1.5px;opacity:.9}
+.duty-tl-call{position:absolute;height:10px;border-radius:2px;box-shadow:inset 0 0 0 1px rgba(0,0,0,.22);opacity:0;transform:translateY(-3px);transition:opacity .16s ease, transform .18s ease}
+.duty-tl-row:hover .duty-tl-call,.duty-tl-row:focus-within .duty-tl-call{opacity:1;transform:none}
+.duty-tl-empty{font-size:11.5px;color:var(--ui-text-tertiary)}
+@media (prefers-reduced-motion: reduce){.duty-tl-row,.duty-tl-mini,.duty-tl-stack,.duty-tl-call{transition:none}}
+
 .duty-scale-lanes{display:flex;flex-direction:column;gap:5px}
 .duty-scale-lane{display:grid;grid-template-columns:92px 1fr;gap:8px;align-items:center}
 .duty-scale-lane-k{font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:11.5px;color:var(--ui-text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -2116,45 +2442,19 @@ function ScalePanel({ scale }) {
         ),
       ),
     ),
+    // Дорожки этапов — таймлайн вызовов (0.0.8): тонкая полоса по умолчанию,
+    // карта вызовов по наведению. Полосы `duty-scale-bar` больше не рисуются:
+    // второй рисунок того же дела на экране не нужен.
     h(
       'div',
-      { className: 'duty-scale-lanes' },
+      { className: 'duty-tl-lanes' },
       ...scale.lanes.map((lane, index) =>
-        h(
-          'div',
-          { className: 'duty-scale-lane' },
-          h(
-            'span',
-            { className: 'duty-scale-lane-k', title: lane.count ? lane.label : `${lane.label}: попыток не было` },
-            lane.label,
-            lane.count ? null : h('i', { className: 'duty-scale-lane-none' }, ' ·'),
-          ),
-          h(
-            'div',
-            { className: 'duty-scale-track' },
-            ...scale.bars
-              .filter((bar) => bar.lane === index)
-              .map((bar) =>
-                h(
-                  'div',
-                  {
-                    key: `bar-${bar.key}`,
-                    className: `duty-scale-bar${bar.open ? ' open' : ''}`,
-                    style: {
-                      left: `${bar.leftPct}%`,
-                      width: `${bar.widthPct}%`,
-                      color: TONE_COLOR[bar.tone] || TONE_COLOR.gray,
-                    },
-                    title: bar.title,
-                    'aria-label': bar.ariaLabel,
-                    role: 'img',
-                    tabIndex: 0,
-                  },
-                  h('span', { className: 'duty-scale-bar-k' }, bar.label),
-                ),
-              ),
-          ),
-        ),
+        h(DutyLane, {
+          key: `lane-${lane.key}`,
+          lane,
+          bars: scale.bars.filter((bar) => bar.lane === index),
+          scale,
+        }),
       ),
     ),
     scale.markers.length

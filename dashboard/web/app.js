@@ -28,7 +28,9 @@ import {
   fmtClock,
   groupStatesText,
   humanLine,
+  layoutCalls,
   noticeLines,
+  plural,
   repoLabel,
   shapeAttempts,
   shapeDeal,
@@ -1118,6 +1120,134 @@ function markerLegend(scale) {
   )
 }
 
+/* ------------------------------------- таймлайн вызовов внутри попытки (0.0.8) */
+
+// Геометрия строки: свёрнутая полоса 20 px, раскрытая карта — по числу уровней.
+// Числа общие с десктопом (там те же значения), а сама раскладка считается
+// шейпером (`layoutCalls`), чтобы обе поверхности рисовали одно и то же.
+const TL_COLLAPSED = 20
+const TL_LEVEL_H = 12
+const TL_TOP = 6
+const TL_MAX_LEVELS = 5
+
+// Значки вида этапа: профиль — силуэт человека, shell — приглашение терминала,
+// gate — ромб вопроса. Слово рядом не нужно: значок и есть подпись вида.
+const KIND_ICON = {
+  agent:
+    '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="5" r="2.6"/><path d="M3 13.2c0-2.5 2.2-4.1 5-4.1s5 1.6 5 4.1"/></svg>',
+  shell: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 5.2 7 8l-3 2.8"/><path d="M8.6 11.4h3.6"/></svg>',
+  gate:
+    '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.2 13.4 8 8 13.8 2.6 8Z"/><path d="M8 6.1v.2c0 .5-.6.7-.6 1.3"/><circle cx="8" cy="9.7" r=".5" fill="currentColor" stroke="none"/></svg>',
+}
+
+// Цвет вызова — по виду инструмента: чтение, правка, запуск, внешнее. Одна
+// палитра на обе поверхности; неизвестный инструмент остаётся нейтральным,
+// потому что «не знаю, что это» — тоже факт.
+const TOOL_TONE = [
+  [/^(read_file|search_files|grep|ls|list|view|cat|find)/i, 'var(--accent)'],
+  [/^(write_file|patch|apply_patch|edit|create|mkdir)/i, 'var(--ok)'],
+  [/^(terminal|shell|bash|run|exec|python|node|go|npm)/i, 'var(--warn)'],
+  [/^(web_|browser|http|fetch|curl)/i, 'var(--purple)'],
+]
+function toolColor(name) {
+  const hit = TOOL_TONE.find(([pattern]) => pattern.test(String(name || '')))
+  return hit ? hit[1] : 'var(--text-3)'
+}
+
+/** Один чип: место, ширина по длительности (логарифм), цвет инструмента. */
+function chipNode(chip, scale) {
+  const call = chip.call
+  return h('span', {
+    class: 'tl-call',
+    style: `left:${chip.leftPct}%;top:${chip.top}px;width:${chip.widthPct}%;background:${toolColor(call.name)}`,
+    title: `${call.name} · ${call.clock} · ${call.msText}`,
+    'aria-label': `${call.name}, ${call.clock}, ${call.msText}`,
+  })
+}
+
+/**
+ * Строка попытки: свёрнутая полоса штрихов по умолчанию, карта вызовов по наведению.
+ *
+ * Вызов один и тот же в обоих состояниях: в полосе — один ряд штрихов, в карте —
+ * раскладка по уровням. Так свёрнутый вид не «другая картинка», а сжатая та же.
+ */
+function attemptRowNode(bar, scale) {
+  const status = bar.outcomeText || (bar.open ? bar.leaseText : bar.outcome || bar.status || bar.durationText)
+  const label = h(
+    'div',
+    { class: 'tl-lbl' },
+    h('span', { class: 'tl-n' }, bar.number || '—'),
+    h('span', { class: `tl-st t-${bar.tone}` }, status || '—'),
+    h('span', { class: 'tl-ms' }, bar.clockStart),
+  )
+  const mini = h('div', { class: 'tl-mini' })
+  const stack = h('div', { class: 'tl-stack' })
+  const track = h('div', { class: 'tl-track' }, mini, stack)
+  const layout = bar.calls.length
+    ? layoutCalls(bar.calls, {
+        from: scale.axis.start,
+        to: scale.axis.end,
+        levelH: TL_LEVEL_H,
+        top: TL_TOP,
+        maxLevels: TL_MAX_LEVELS,
+      })
+    : { chips: [], height: TL_COLLAPSED }
+  const full = Math.max(TL_COLLAPSED, layout.height + 8)
+  for (const chip of layout.chips) {
+    mini.append(
+      h('span', {
+        class: 'tl-tick',
+        style: `left:${chip.leftPct}%;width:${chip.widthPct}%;background:${toolColor(chip.call.name)}`,
+      }),
+    )
+    stack.append(chipNode(chip, scale))
+  }
+  // Раскрытие — чистый CSS по :hover/:focus-within: высота едет к `--tl-full`.
+  // Обработчики не нужны, поэтому же одинаково в вебе и на десктопе.
+  const row = h(
+    'div',
+    { class: 'tl-row', title: bar.title, tabindex: '0', style: `--tl-full:${full}px` },
+    label,
+    track,
+  )
+  return row
+}
+
+/** Дорожка этапа: имя, значок вида, состояние и строки попыток. */
+function laneNode(lane, bars, scale) {
+  const first = bars[0]
+  const calls = bars.reduce((sum, bar) => sum + bar.calls.length, 0)
+  const meta = [
+    `${bars.length} ${plural(bars.length, 'попытка', 'попытки', 'попыток')}`,
+    calls ? `${calls} ${plural(calls, 'вызов', 'вызова', 'вызовов')}` : '',
+  ]
+    .filter(Boolean)
+    .join(' · ')
+  const head = h(
+    'div',
+    { class: 'tl-lane-h' },
+    h('span', { class: 'tl-lane-name', title: lane.label }, lane.label),
+    first
+      ? h(
+          'span',
+          { class: `tl-kind tl-kind-${first.kind}`, title: first.kind === 'agent' ? `профиль: ${first.role || '—'}` : first.kind },
+          h('i', { class: 'tl-kind-ico', html: KIND_ICON[first.kind] || KIND_ICON.shell }),
+          first.kind === 'agent' ? first.role || 'профиль' : first.kind,
+        )
+      : null,
+    h('span', { class: 'sp' }),
+    h('span', { class: 'tl-lane-meta' }, meta),
+  )
+  return h(
+    'div',
+    { class: 'tl-lane' },
+    head,
+    bars.length
+      ? h('div', { class: 'tl-rows' }, ...bars.map((bar) => attemptRowNode(bar, scale)))
+      : h('div', { class: 'tl-row-empty' }, 'попыток не было'),
+  )
+}
+
 /**
  * Панель шкалы времени: подписанная ось, дорожка на этап, полосы попыток и лента
  * маркеров. Геометрия приходит посчитанной (`shapeDealTime`); здесь только DOM.
@@ -1149,39 +1279,17 @@ function scalePanel(scale) {
           ),
         ),
       ),
+      // Дорожки этапов — таймлайн вызовов: полоса на попытку, раскрывается по
+      // наведению. Полосы `scale-bar` остались в шейпере (desktop 0.0.7), но
+      // второй рисунок того же дела на экране не нужен.
       h(
         'div',
-        { class: 'scale-lanes' },
+        { class: 'tl-lanes' },
         ...scale.lanes.map((lane, index) =>
-          h(
-            'div',
-            { class: 'scale-lane' },
-            h(
-              'span',
-              { class: 'scale-lane-k', title: lane.count ? lane.label : `${lane.label}: попыток не было` },
-              lane.label,
-              lane.count ? null : h('i', { class: 'scale-lane-none' }, ' ·'),
-            ),
-            h(
-              'div',
-              { class: 'scale-track' },
-              ...scale.bars
-                .filter((bar) => bar.lane === index)
-                .map((bar) =>
-                  h(
-                    'div',
-                    {
-                      class: `scale-bar t-${bar.tone}${bar.open ? ' open' : ''}`,
-                      style: `left:${bar.leftPct}%;width:${bar.widthPct}%`,
-                      title: bar.title,
-                      'aria-label': bar.ariaLabel,
-                      role: 'img',
-                      tabindex: '0',
-                    },
-                    h('span', { class: 'scale-bar-k' }, bar.label),
-                  ),
-                ),
-            ),
+          laneNode(
+            lane,
+            scale.bars.filter((bar) => bar.lane === index),
+            scale,
           ),
         ),
       ),

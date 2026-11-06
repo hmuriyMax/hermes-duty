@@ -27,9 +27,11 @@ import {
   humanCounts,
   humanLine,
   noticeLines,
+  layoutCalls,
   outcomeTone,
   repoLabel,
   shapeAttempts,
+  shapeCalls,
   shapeDeal,
   shapeDealTime,
   shapeFinished,
@@ -1113,4 +1115,79 @@ test('plugin.js: форма плагина, маршрут, пункт сайд�
     specifiers.filter((spec) => spec !== '@hermes/plugin-sdk' && !spec.startsWith('react')),
     [],
   )
+})
+
+
+/* --------------------------------- вызовы инструментов и их раскладка (0.0.8) */
+
+test('вызовы: длительность остаётся null, если результат не пришёл', () => {
+  const calls = shapeCalls([
+    { seq: 1, name: 'read_file', at: 1000, ms: 412 },
+    { seq: 3, name: 'terminal', at: 1010, ms: null },
+    { name: 'мусор' },
+    'мусор',
+  ])
+  assert.equal(calls.length, 2)
+  assert.equal(calls[0].name, 'read_file')
+  assert.equal(calls[0].msText, '<1с')
+  assert.match(calls[1].msText, /неизвестна/)
+  assert.equal(calls[1].clock.length > 0, true)
+  assert.equal(shapeCalls(null).length, 0)
+})
+
+test('раскладка вызовов: ширина растёт с длительностью, уровень не пересекается', () => {
+  const calls = shapeCalls([
+    { seq: 1, name: 'a', at: 0, ms: 50 },
+    { seq: 3, name: 'b', at: 0.2, ms: 100 },
+    { seq: 5, name: 'c', at: 5, ms: 11000 },
+  ])
+  const layout = layoutCalls(calls, { from: 0, to: 10, width: 700, levelH: 12, top: 6 })
+  assert.equal(layout.chips.length, 3)
+  // Вызовы разнесены по оси — одним уровнем и обходимся: лишние уровни означали
+  // бы, что дорожка растёт вниз без причины.
+  assert.equal(layout.levels, 1)
+  assert.equal(layout.height, 6 + layout.levels * 12)
+  const widths = layout.chips.map((chip) => chip.width)
+  assert.ok(widths[2] > widths[1], 'медленный вызов шире быстрого')
+  assert.ok(widths[1] >= widths[0])
+  // Соседи по уровню не наезжают друг на друга
+  for (const level of new Set(layout.chips.map((chip) => chip.level))) {
+    const row = layout.chips.filter((chip) => chip.level === level)
+    for (let i = 1; i < row.length; i += 1) {
+      assert.ok(row[i].left >= row[i - 1].left + row[i - 1].width - 0.01, 'чипы одного уровня перекрылись')
+    }
+  }
+})
+
+test('раскладка вызовов: вызовы в одну секунду расходятся по уровням, а не липнут', () => {
+  const calls = shapeCalls(
+    Array.from({ length: 6 }, (_, index) => ({ seq: index * 2 + 1, name: 'read_file', at: 5 + index * 0.05, ms: 120 })),
+  )
+  const layout = layoutCalls(calls, { from: 0, to: 10, width: 700, levelH: 12, top: 6 })
+  assert.equal(layout.chips.length, 6)
+  assert.ok(layout.levels > 1, 'шесть вызовов в 0.3 с не влезают в один уровень')
+  assert.equal(layout.clipped, 0, 'пока уровней хватает, наложений быть не должно')
+})
+
+test('раскладка вызовов: потолок уровней не теряет вызовы, а считает наложения', () => {
+  const calls = shapeCalls(
+    Array.from({ length: 20 }, (_, index) => ({ seq: index * 2 + 1, name: 'read_file', at: index * 0.01, ms: 10 })),
+  )
+  const layout = layoutCalls(calls, { from: 0, to: 10, width: 700, maxLevels: 2, levelH: 12, top: 6 })
+  assert.equal(layout.chips.length, 20)
+  assert.equal(layout.levels, 2)
+  assert.ok(layout.clipped > 0)
+})
+
+test('раскладка вызовов: без оси рисовать нечего, а ширина — виртуальная', () => {
+  const calls = shapeCalls([{ name: 'a', at: 1, ms: 5 }])
+  assert.deepEqual(layoutCalls([], { from: 0, to: 10, width: 700 }).chips, [])
+  // Нет `from`/`to` — нет шкалы: пустая картинка честнее выдуманной оси.
+  assert.deepEqual(layoutCalls(calls, { width: 700 }).chips, [])
+  assert.deepEqual(layoutCalls(calls, { from: 5, to: 5 }).chips, [])
+  // Ширина не задана — считается в виртуальной (1000): на экран уходят доли.
+  const chips = layoutCalls(calls, { from: 0, to: 10 }).chips
+  assert.equal(chips.length, 1)
+  assert.equal(chips[0].leftPct, 10)
+  assert.ok(chips[0].widthPct > 0 && chips[0].widthPct < 2)
 })

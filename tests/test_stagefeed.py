@@ -557,6 +557,123 @@ def test_shell_attempt_is_named_by_kind_not_by_role(home):
     assert row["duration_sec"] == 5
 
 
+def _progress(stage: str, attempt: int, seq: int, phase: str, name: str, ts: int, ms: int | None = None) -> dict:
+    """Событие телеметрии шага — в той форме, что пишет `runner._progress_event`."""
+    payload = {"stage": stage, "attempt": attempt, "seq": seq, "phase": phase, "name": name, "ts": ts}
+    if ms is not None:
+        payload["duration_ms"] = ms
+    return {"ts": ts, "kind": "attempt_progress", "payload": payload}
+
+
+def _attempt(stage: str, attempt: int, started: int, ended: int | None, outcome: str = "done") -> list[dict]:
+    events = [
+        {
+            "ts": started,
+            "kind": "attempt_started",
+            "payload": {
+                "run_id": f"{stage}#{attempt}",
+                "stage": stage,
+                "attempt": attempt,
+                "pid": 4242,
+                "lease_expires": started + 600,
+                "contract": {"role": "implementer"},
+            },
+        }
+    ]
+    if ended is not None:
+        events.append(
+            {
+                "ts": ended,
+                "kind": "attempt_ended",
+                "payload": {
+                    "run_id": f"{stage}#{attempt}",
+                    "stage": stage,
+                    "attempt": attempt,
+                    "outcome": outcome,
+                    "details": {"exit_code": 0},
+                },
+            }
+        )
+    return events
+
+
+def test_calls_pair_start_with_result_and_keep_duration():
+    """Вызов — пара `tool_use` ↔ `tool_result`: начало считается назад от конца.
+
+    Длительность есть только у результата, поэтому начало вызова выводится из
+    неё. Время старта без этой арифметики поехало бы вправо на всю длительность,
+    и таймлайн показывал бы вызовы там, где они закончились.
+    """
+    events = _attempt("impl", 1, NOW - 100, NOW - 10)
+    events += [
+        _progress("impl", 1, 1, "tool_use", "read_file", NOW - 90),
+        _progress("impl", 1, 2, "tool_result", "read_file", NOW - 88, ms=1900),
+        _progress("impl", 1, 3, "tool_use", "search_files", NOW - 60),
+        _progress("impl", 1, 4, "tool_result", "search_files", NOW - 49, ms=11000),
+    ]
+    row = stagefeed.attempts(events, NOW)[0]
+    assert [(call["name"], call["at"], call["ms"]) for call in row["calls"]] == [
+        ("read_file", NOW - 89.9, 1900),
+        ("search_files", NOW - 60, 11000),
+    ]
+    assert row["calls_omitted"] == 0
+
+
+def test_call_without_result_keeps_its_start_and_null_duration():
+    """Вызов, чей результат не пришёл (попытка оборвалась) — `ms: null`, но виден.
+
+    Спрятать его значило бы показать меньше работы, чем было; придумать срок —
+    показать больше. Поэтому он остаётся с началом из `tool_use` и без числа.
+    """
+    events = _attempt("impl", 1, NOW - 100, NOW - 10)
+    events += [
+        _progress("impl", 1, 1, "tool_use", "terminal", NOW - 70),
+        _progress("impl", 1, 2, "tool_use", "read_file", NOW - 40),
+        _progress("impl", 1, 3, "tool_result", "read_file", NOW - 39, ms=500),
+    ]
+    row = stagefeed.attempts(events, NOW)[0]
+    calls = {call["name"]: call for call in row["calls"]}
+    assert calls["terminal"]["ms"] is None
+    assert calls["terminal"]["at"] == NOW - 70
+    assert calls["read_file"]["ms"] == 500
+
+
+def test_repeated_tool_name_pairs_in_order():
+    """Два вызова одного инструмента подряд склеиваются по порядку, а не крест-накрест."""
+    events = _attempt("impl", 1, NOW - 100, NOW - 10)
+    events += [
+        _progress("impl", 1, 1, "tool_use", "read_file", NOW - 90),
+        _progress("impl", 1, 2, "tool_result", "read_file", NOW - 89, ms=300),
+        _progress("impl", 1, 3, "tool_use", "read_file", NOW - 80),
+        _progress("impl", 1, 4, "tool_result", "read_file", NOW - 70, ms=9000),
+    ]
+    calls = stagefeed.attempts(events, NOW)[0]["calls"]
+    assert [call["ms"] for call in calls] == [300, 9000]
+    assert calls[0]["at"] == NOW - 89.3
+    assert calls[1]["at"] == NOW - 79
+
+
+def test_calls_are_capped_and_the_remainder_is_named():
+    """Потолок вызовов: лишние не молча выкидываются, а считаются в `calls_omitted`."""
+    events = _attempt("impl", 1, NOW - 5000, NOW - 10)
+    budget = stagefeed.MAX_CALLS + 7
+    for index in range(budget):
+        seq = index * 2 + 1
+        moment = NOW - 4000 + index
+        events.append(_progress("impl", 1, seq, "tool_use", "read_file", moment))
+        events.append(_progress("impl", 1, seq + 1, "tool_result", "read_file", moment + 1, ms=10))
+    row = stagefeed.attempts(events, NOW)[0]
+    assert len(row["calls"]) == stagefeed.MAX_CALLS
+    assert row["calls_omitted"] == 7
+
+
+def test_attempt_without_telemetry_has_empty_calls():
+    """Нет событий прогресса — пустой список, а не выдуманная строка."""
+    row = stagefeed.attempts(_attempt("impl", 1, NOW - 100, NOW - 10), NOW)[0]
+    assert row["calls"] == []
+    assert row["calls_omitted"] == 0
+
+
 def test_stagefeed_has_no_process_lookups():
     """Источник ленты — журнал: ни процессов, ни их проб.
 

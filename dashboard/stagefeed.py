@@ -74,6 +74,11 @@ spec_module = _load(SPEC_MODULE_NAME, "spec.py")
 ATTEMPT_STARTED = "attempt_started"
 ATTEMPT_ENDED = "attempt_ended"
 ATTEMPT_PROGRESS = "attempt_progress"
+
+# Потолок вызовов на попытку в ответе: телеметрия пишется на каждый шаг, и у
+# длинной попытки их тысячи. Обрезанное число честно называется в `calls_omitted`,
+# а не прячется: экран рисует ровно то, что отдал журнал.
+MAX_CALLS = 800
 # Факт публикации (0.0.5): что ушло в origin и чем это подтверждено. Ложится в
 # строку своей попытки — «опубликовано» видно там же, где вердикт этапа.
 PUBLISHED = "published"
@@ -177,6 +182,7 @@ def _attempts(
     order: list[str] = []
     progress: dict[tuple[str, int], int] = {}
     published: dict[tuple[str, int], dict[str, Any]] = {}
+    raw_calls: dict[tuple[str, int], list[dict[str, Any]]] = {}
     for event in sorted(
         (item for item in events or () if isinstance(item, dict)),
         key=lambda item: _int(item.get("id")),
@@ -187,6 +193,7 @@ def _attempts(
         if kind == ATTEMPT_PROGRESS:
             key = (str(payload.get("stage") or ""), _int(payload.get("attempt")))
             progress[key] = progress.get(key, 0) + 1
+            raw_calls.setdefault(key, []).append(payload)
         elif kind == PUBLISHED:
             # Публикация — факт попытки, а не отдельная попытка: она ложится в ту
             # строку, чей этап её записал (`runner._published_event`).
@@ -200,6 +207,13 @@ def _attempts(
             started[run_id]["end_payload"] = payload
 
     rows: list[dict[str, Any]] = []
+    # Вызовы инструментов сводятся в пары «старт ↔ результат» один раз на ключ
+    # `(stage, attempt)`: у событий прогресса нет `run_id`, поэтому пара ищется
+    # там же, где считается `progress`.
+    calls: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    omitted: dict[tuple[str, int], int] = {}
+    for key, payloads in raw_calls.items():
+        calls[key], omitted[key] = _calls(payloads)
     for run_id in order:
         item = started[run_id]
         start, start_payload = item["start"], item["start_payload"]
@@ -239,12 +253,54 @@ def _attempts(
                 "commit": str(end_payload.get("commit") or ""),
                 "reaped": bool(end_payload.get("reaped")),
                 "progress": progress.get((stage, number), 0),
+                "calls": calls.get((stage, number), []),
+                "calls_omitted": omitted.get((stage, number), 0),
                 "evidence": _records(end_payload.get("result")),
                 "published": published.get((stage, number)),
                 "end": end is not None,
             }
         )
     return rows
+
+
+def _calls(payloads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """Вызовы инструментов попытки: старт, длительность, имя — парами.
+
+    Телеметрия пишет два события на вызов: `tool_use` (имя и момент старта, без
+    длительности) и `tool_result` (то же имя и `duration_ms`). Длительность есть
+    только у результата — поэтому вызов получает её из своей пары, а его начало
+    считается назад от конца (`ts - duration_ms`). Вызов без результата остаётся
+    с `ms: null`: попытка оборвалась посреди вызова, и придумывать ей срок нельзя.
+
+    Пара ищется по имени, ближайшая по порядку `seq`: параллельных вызовов у
+    исполнителя нет, но повтор имени подряд — обычное дело (`read_file` дважды).
+    """
+    ordered = sorted(payloads, key=lambda item: _int(item.get("seq")))
+    open_uses: list[dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
+    for item in ordered:
+        phase = str(item.get("phase") or "")
+        name = str(item.get("name") or "")
+        at = _int(item.get("ts"))
+        if phase == "tool_use":
+            open_uses.append({"seq": _int(item.get("seq")), "name": name, "at": at})
+            continue
+        duration = _maybe_int(item.get("duration_ms"))
+        index = next((i for i, use in enumerate(open_uses) if use["name"] == name), None)
+        if index is None and open_uses:
+            index = 0
+        if index is None:
+            # Результат без начала: вызов начался до журнала (или старт потерян).
+            out.append({"seq": _int(item.get("seq")), "name": name, "at": at, "ms": duration})
+            continue
+        use = open_uses.pop(index)
+        start = at if duration is None else round(at - duration / 1000.0, 3)
+        out.append({"seq": use["seq"], "name": use["name"] or name, "at": start, "ms": duration})
+    for use in open_uses:
+        out.append({"seq": use["seq"], "name": use["name"], "at": use["at"], "ms": None})
+    out.sort(key=lambda call: (call["at"], call["seq"]))
+    omitted = max(0, len(out) - MAX_CALLS)
+    return out[:MAX_CALLS], omitted
 
 
 def _records(result: Any) -> list[dict[str, Any]]:
@@ -319,6 +375,12 @@ def _public(row: dict[str, Any], now: int) -> dict[str, Any]:
         "commit": row["commit"],
         "reaped": row["reaped"],
         "progress": row["progress"],
+        # Вызовы инструментов попытки: `[{seq, name, at, ms}]`, где `at` — начало
+        # вызова (по результату и длительности), `ms` — длительность или `null`,
+        # если результат не пришёл. `calls_omitted` — сколько не поместилось под
+        # потолком `MAX_CALLS`: экран называет это числом, а не молчит.
+        "calls": row["calls"],
+        "calls_omitted": row["calls_omitted"],
         "live": alive["live"],
         "dead": alive["dead"],
         "lease": alive["lease"],

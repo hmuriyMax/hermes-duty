@@ -637,6 +637,8 @@ function shapeAttempts(payload) {
       // этой подписи негде.
       progressText: attempt.progress === null || attempt.progress === undefined ? '' : `шагов ${fmtCount(attempt.progress)}`,
       toolsText: attempt.tools === null || attempt.tools === undefined ? '' : `инструментов ${fmtCount(attempt.tools)}`,
+      calls: shapeCalls(attempt.calls),
+      callsOmitted: numOrNull(attempt.calls_omitted) || 0,
       outcome: String(attempt.outcome || ''),
       outcomeTone: outcomeTone(attempt.outcome, attempt.status, crashes),
       error: String(attempt.error || ''),
@@ -690,6 +692,27 @@ const STAGE_META = {
 // Чем кончился процесс: `blocked`/`refused` янтарные — это не падение
 // исполнения, а отказ гейта или вопрос человеку. Незнакомый исход остаётся
 // серым: тон не выдумывается (тот же принцип, что у `outcomeTone`).
+// Исход попытки по-русски. Английские слова из журнала (`done`, `failed`)
+// на экран не идут: подпись строки — для человека, а не телеметрия.
+const OUTCOME_WORD = {
+  done: 'готово',
+  ok: 'готово',
+  success: 'готово',
+  passed: 'готово',
+  accepted: 'готово',
+  failed: 'провал',
+  blocked: 'отказ',
+  refused: 'отказ',
+  rate_limited: 'лимит',
+  reclaimed: 'снята',
+}
+
+/** Слово исхода для подписи строки; живёт рядом с тоном, чтобы не разъезжаться. */
+function outcomeWord(value) {
+  const key = String(value || '')
+  return OUTCOME_WORD[key] || key
+}
+
 const ATTEMPT_TONE = {
   done: 'green',
   ok: 'green',
@@ -971,6 +994,92 @@ function numOrNull(value) {
 }
 
 /** Попытка из ответа `/attempts` в полосу шкалы: время, дорожка, подписи. */
+function shapeCalls(raw) {
+  const list = Array.isArray(raw) ? raw : []
+  const calls = []
+  for (const item of list) {
+    const call = item && typeof item === 'object' ? item : {}
+    const at = numOrNull(call.at)
+    if (at === null) continue
+    const ms = numOrNull(call.ms)
+    calls.push({
+      seq: numOrNull(call.seq),
+      name: String(call.name || '—'),
+      at,
+      ms,
+      // Длительность словами: `null` — результат не пришёл, и «0 мс» здесь было
+      // бы враньём (вызов не мгновенный, он просто не доложил).
+      msText: ms === null ? 'длительность неизвестна' : fmtDuration(Math.max(0, Math.round(ms / 1000))),
+      clock: fmtClock(at),
+    })
+  }
+  return calls
+}
+
+/**
+ * Раскладка вызовов на дорожке попытки: где чип, какой ширины, на каком уровне.
+ *
+ * Ширина чипа — логарифм длительности (`3 + 11·log10(1+ms/100)/log10(1+12000/100)`):
+ * линейная шкала превратила бы 136 мс в точку, а 11.5 с — в половину дорожки, и
+ * таймлайн перестал бы читаться. Уровни нужны, потому что чипы идут вплотную:
+ * сосед занят — берём следующий уровень, дорожка растёт вниз.
+ *
+ * Арифметика общая для веб-страницы и десктопа: разъехавшиеся формулы дали бы две
+ * несравнимые картинки одного и того же дела.
+ */
+function layoutCalls(calls, options) {
+  const opts = options && typeof options === 'object' ? options : {}
+  const from = numOrNull(opts.from)
+  const to = numOrNull(opts.to)
+  // Ширина — виртуальная: раскладка считается в ней, а на экран уходит долями
+  // (`leftPct`/`widthPct`). Так обе поверхности рисуют одно и то же без замера
+  // DOM: чипы масштабируются вместе с дорожкой, а не разъезжаются по ней.
+  const width = Number(opts.width) || 1000
+  const levelH = Number(opts.levelH) || 12
+  const top = Number(opts.top) || 0
+  const maxLevels = Math.max(1, Number(opts.maxLevels) || 5)
+  const gap = Number(opts.gap) || 2
+  const span = from === null || to === null ? 0 : to - from
+  const list = Array.isArray(calls) ? calls : []
+  if (!list.length || width <= 0 || span <= 0) {
+    return { chips: [], levels: 0, height: top + levelH, clipped: 0 }
+  }
+  const chipWidth = (ms) => {
+    const value = Math.max(0, Number(ms) || 0)
+    return Math.round(3 + (11 * Math.log10(1 + value / 100)) / Math.log10(1 + 12000 / 100))
+  }
+  const lastEnd = []
+  const chips = []
+  let clipped = 0
+  for (const call of list) {
+    const px = Math.max(0, Math.min(width, ((call.at - from) / span) * width))
+    const size = chipWidth(call.ms)
+    let level = lastEnd.findIndex((end) => px - end >= gap)
+    if (level < 0) {
+      if (lastEnd.length >= maxLevels) {
+        // Уровни кончились — вызов всё равно показываем: прятать факт хуже, чем
+        // наложить его на соседа. Число наложенных считается в `clipped`.
+        level = lastEnd.indexOf(Math.min(...lastEnd))
+        clipped += 1
+      } else {
+        level = lastEnd.length
+      }
+    }
+    lastEnd[level] = px + size
+    chips.push({
+      call,
+      left: Math.round(px * 10) / 10,
+      width: size,
+      leftPct: Math.round((px / width) * 10000) / 100,
+      widthPct: Math.round((size / width) * 10000) / 100,
+      level,
+      top: top + level * levelH,
+    })
+  }
+  const levels = lastEnd.length
+  return { chips, levels, height: top + levels * levelH, clipped }
+}
+
 function attemptBar(attempt, crashes) {
   const a = attempt && typeof attempt === 'object' ? attempt : {}
   const start = numOrNull(a.start)
@@ -987,6 +1096,12 @@ function attemptBar(attempt, crashes) {
     laneKey: stage,
     laneLabel: stage,
     lane: 0,
+    // Вид этапа и роль — из попытки: значок на дорожке («профиль», `shell`)
+    // говорит то же, что и лента этапов, а не угадывается по имени этапа.
+    kind: String(a.stage_kind || 'agent'),
+    // Роль приходит как `role` (`/deal`) или `profile` (`/duty/{id}/attempts`) —
+    // две ручки зовут одно и то же по-разному, и значок должен знать оба имени.
+    role: String(a.role || a.profile || ''),
     start,
     end,
     endAt: null,
@@ -998,6 +1113,12 @@ function attemptBar(attempt, crashes) {
     leaseText: open ? leaseWord(lease, a.status) : '',
     progress: numOrNull(a.progress),
     tools: numOrNull(a.tools),
+    // Вызовы инструментов: `[{seq, name, at, ms}]` из телеметрии. Пустой список —
+    // у попытки не было телеметрии, а не «вызовов не делала»: это разные факты,
+    // и разницу называет `callsText`.
+    calls: shapeCalls(a.calls),
+    callsOmitted: numOrNull(a.calls_omitted) || 0,
+    callsText: '',
     outcome: String(a.outcome || ''),
     status: String(a.status || ''),
     tone: open ? (dead ? 'red' : 'blue') : outcomeTone(a.outcome, a.status, crashes),
@@ -1095,6 +1216,14 @@ function journalBars(events, crashes) {
         leaseText: '',
         progress: null,
         tools: null,
+        // У полосы из журнала телеметрии нет: событие `attempt_started` знает
+        // только про старт. Пустой список здесь — «вызовов в журнале нет», а не
+        // «попытка ничего не делала»: экран так и подписывает.
+        calls: [],
+        callsOmitted: 0,
+        callsText: '',
+        kind: 'agent',
+        role: '',
         outcome: '',
         status: '',
         tone: 'gray',
@@ -1221,9 +1350,18 @@ function shapeDealTime(detail, attemptsPayload) {
     bar.clockEnd = bar.open ? (now !== null ? fmtClock(now) : '—') : fmtClock(stop)
     bar.progressText = bar.progress === null ? '' : `шагов ${fmtCount(bar.progress)}`
     bar.toolsText = bar.tools === null ? '' : `инструментов ${fmtCount(bar.tools)}`
+    // Вызовы: сколько их в телеметрии и не обрезано ли. Это отдельная строка от
+    // `инструментов` — там счётчик движка, здесь то, что реально можно нарисовать.
+    bar.callsText = (bar.calls || []).length
+      ? `${fmtCount(bar.calls.length)} ${plural(bar.calls.length, 'вызов', 'вызова', 'вызовов')}${
+          bar.callsOmitted ? ` (ещё ${fmtCount(bar.callsOmitted)} не показано)` : ''
+        }`
+      : ''
     // Подпись внутри полосы — исход, а не догадка: у незакрытой это слово о
     // лизинге, у закрытой без исхода — её длительность.
     bar.label = bar.open ? bar.leaseText : bar.outcome || bar.status || bar.durationText
+    // Короткая подпись строки таймлайна: исход по-русски, у незакрытой — лизинг.
+    bar.outcomeText = bar.open ? bar.leaseText : outcomeWord(bar.outcome) || bar.status || bar.durationText
     const details = [bar.progressText, bar.toolsText].filter(Boolean).join(', ')
     const head = `${bar.laneLabel} · попытка ${bar.number || '—'}`
     const interval = `${bar.clockStart}–${bar.clockEnd} (${bar.durationText})`
@@ -1406,7 +1544,11 @@ export {
   shapeNow,
   filterNow,
   outcomeTone,
+  layoutCalls,
+  outcomeWord,
+  plural,
   shapeAttempts,
+  shapeCalls,
   shapeDealTime,
   shapeStages,
   noticeLines,

@@ -762,6 +762,22 @@ const OUTCOME_WORD = {
 }
 
 /**
+ * Причина отказа одной фразой — для подсказки провалившейся попытки.
+ *
+ * «Провал» без причины ничего не объясняет, поэтому рядом с исходом идут класс
+ * отказа (`contract`, `infra`, …) и текст причины из журнала. Текст обрезается
+ * до подписи: целиком он живёт в ленте этапа и в журнале, а подсказка читается
+ * поверх таймлайна. Нет причины — нет и фразы: выдумывать её экран не станет.
+ */
+function barReasonText(bar) {
+  const b = bar && typeof bar === 'object' ? bar : {}
+  const reason = String(b.reason || '').trim()
+  if (!reason) return ''
+  const kind = String(b.failureKind || '').trim()
+  return `${kind ? `отказ ${kind}` : 'причина'}: ${fmtTitle(reason, 140)}`
+}
+
+/**
  * Слово исхода для подписи строки; живёт рядом с тоном, чтобы не разъезжаться.
  *
  * Незнакомый исход показывается как есть: новый класс в журнале — факт, и
@@ -1300,11 +1316,13 @@ function attemptView(bar, scale) {
     b.start === null || b.endPct === null
       ? null
       : Math.max(0.6, Math.round((b.endPct - b.leftPct) * 10) / 10)
+  const bandCause = barReasonText(b)
   const bandTip =
     b.start === null
       ? ''
       : `${b.clockStart || '—'}–${b.clockEnd || (b.open ? 'идёт' : '—')} · ${b.durationText || '—'}` +
-        `${calls.length ? ` · ${fmtCount(calls.length)} ${plural(calls.length, 'вызов', 'вызова', 'вызовов')}` : ''}`
+        `${calls.length ? ` · ${fmtCount(calls.length)} ${plural(calls.length, 'вызов', 'вызова', 'вызовов')}` : ''}` +
+        `${bandCause ? ` · ${bandCause}` : ''}`
 
   // Маркеры внутри попытки: вердикты, вопросы человеку, публикация, закрытие.
   // Засечки старта/конца больше не рисуются — их роль играет фон попытки.
@@ -1456,6 +1474,11 @@ function attemptBar(attempt, crashes) {
     callsText: '',
     outcome: String(a.outcome || ''),
     status: String(a.status || ''),
+    // Причина отказа и его класс (`contract`, `infra`, …): экран называет их
+    // в подсказке провалившейся попытки — «провал» без причины ничего не
+    // объясняет, а лезть за ней в журнал руками человек не должен.
+    reason: String(a.reason || '').trim(),
+    failureKind: String(a.kind || '').trim(),
     tone: open ? (dead ? 'red' : 'blue') : outcomeTone(a.outcome, a.status, crashes),
     leftPct: 0,
     endPct: 0,
@@ -1582,6 +1605,11 @@ function journalBars(events, crashes) {
       bar.end = event.at
       bar.duration = event.at - bar.start
       bar.outcome = String((/"outcome":\s*"([^"]*)"/.exec(event.summary) || [])[1] || '')
+      // Журнал пишет причину и класс отказа рядом с исходом — берём их оттуда,
+      // иначе у дела без ручки попыток провал остаётся без объяснения.
+      const ended = summaryFields(event.summary, ['reason', 'kind'])
+      bar.reason = String(ended.reason || '').trim()
+      bar.failureKind = String(ended.kind || '').trim()
       bar.tone = outcomeTone(bar.outcome, '', crashes)
     }
   }
@@ -1768,7 +1796,8 @@ function shapeDealTime(detail, attemptsPayload) {
     const details = [bar.progressText, bar.toolsText, bar.callsText].filter(Boolean).join(', ')
     const head = `${bar.laneLabel} · попытка ${bar.number || '—'}`
     const interval = `${bar.clockStart}–${bar.clockEnd} (${bar.durationText})`
-    const tail = bar.open ? `лизинг: ${bar.leaseText}` : `исход: ${bar.outcome || bar.status || 'не записан'}`
+    const cause = barReasonText(bar)
+    const tail = bar.open ? `лизинг: ${bar.leaseText}` : `исход: ${bar.outcome || bar.status || 'не записан'}${cause ? ` · ${cause}` : ''}`
     bar.title = `${head} · ${interval} · ${tail}${details ? ` · ${details}` : ''}`
     bar.ariaLabel = bar.title
   }

@@ -808,6 +808,53 @@ test('шкала времени: маркеры — только факты жу
   assert.equal(scale.counts.lanes, 2)
 })
 
+test('провал называет причину и класс отказа в подсказке попытки', () => {
+  const attempts = {
+    attempts: [
+      {
+        n: 1,
+        attempt: 1,
+        stage: 'verify',
+        start: 1000,
+        end: 1200,
+        outcome: 'failed',
+        status: 'failed',
+        kind: 'contract',
+        reason: 'commit.foreign: commit=835507b уже был предком базы до попытки — это чужое готовое',
+        calls: [],
+      },
+      { n: 2, attempt: 2, stage: 'verify', start: 1300, end: 1500, outcome: 'done', status: 'completed', calls: [] },
+    ],
+  }
+  const scale = shapeDealTime({ terminal: true, timeline: [] }, attempts)
+  const lane = scale.lanes.find((item) => item.key === 'verify')
+  const rows = laneView(lane, scale.bars.filter((bar) => bar.laneKey === 'verify'), scale).rows
+  const [failed, done] = rows.map((row) => row.view)
+  // Причина рядом с исходом — на полосе и в подписи строки.
+  assert.match(failed.bandTip, /отказ contract: commit\.foreign: commit=835507b/)
+  assert.match(failed.title, /исход: failed · отказ contract: commit\.foreign/)
+  // У успешной попытки причины нет: выдумывать её шейпер не станет.
+  assert.doesNotMatch(done.bandTip, /отказ|причина/)
+})
+
+test('причина отказа из журнала, когда ручка попыток пуста', () => {
+  const detail = {
+    terminal: true,
+    timeline: [
+      { kind: 'attempt_started', at: 1000, summary: '{"run_id": "verify#1", "stage": "verify", "attempt": 1}' },
+      {
+        kind: 'attempt_ended',
+        at: 1200,
+        summary: '{"outcome": "failed", "kind": "infra", "reason": "Vault 403 на секрете pg__main"}',
+      },
+    ],
+  }
+  const scale = shapeDealTime(detail, { attempts: [] })
+  const lane = scale.lanes.find((item) => item.key === 'verify')
+  const rows = laneView(lane, scale.bars.filter((bar) => bar.laneKey === 'verify'), scale).rows
+  assert.match(rows[0].view.bandTip, /отказ infra: Vault 403 на секрете pg__main/)
+})
+
 test('маркеры называют вопрос, ответ и причину закрытия словами, а не номерами', () => {
   const detail = {
     terminal: true,

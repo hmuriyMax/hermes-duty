@@ -12,7 +12,7 @@
     bin/duty watch [--interval 10]
     bin/duty run <deal_id> [--spec <duty.yaml>] [--max-steps N] [--once]
                                        (движок доводит дело: решение → шаг → журнал)
-    bin/duty reap [--dry-run]          (закрыть осиротевшие попытки: лизинг истёк, срок прошёл)
+    bin/duty reap [--dry-run]          (закрыть осиротевшие попытки: лизинг истёк или умер pid)
     bin/duty demo [--keep]
     bin/duty spec check <file>   (OK либо file:line: правило: текст; --json — та же форма)
     --json  (глобальный флаг: ровно форма роута)

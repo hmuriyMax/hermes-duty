@@ -440,11 +440,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--once", action="store_true", help="один шаг и выход (отладка и тесты)")
 
     # Уборка осиротевших попыток (`dashboard/reaper.py`): попытка без
-    # `attempt_ended`, чей лизинг истёк и чей срок прошёл, закрывается движком
-    # как `infra`. `--dry-run` показывает, что было бы закрыто, ничего не записывая.
+    # `attempt_ended` закрывается движком как `infra`, если её лизинг истёк и
+    # прошёл срок или если умер её pid (`os.kill(pid, 0)`). `--dry-run`
+    # показывает, что было бы закрыто, ничего не записывая.
     reap = command(
         "reap",
-        "закрыть осиротевшие попытки: `attempt_started` без конца, лизинг истёк, срок прошёл",
+        "закрыть осиротевшие попытки: `attempt_started` без конца — лизинг истёк или умер pid",
     )
     reap.add_argument(
         "--dry-run",

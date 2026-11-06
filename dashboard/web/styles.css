@@ -525,7 +525,16 @@ pre.body {
 /* Легенда — колонкой слева, ровно над колонкой подписей попыток. */
 .scale-keys { display: flex; flex-direction: column; gap: 1px; font-size: 10px; color: var(--text-3); line-height: 1.45; }
 .scale-keys-h { font-size: 9.5px; text-transform: uppercase; letter-spacing: .06em; opacity: .7; }
-.scale-key { display: grid; grid-template-columns: 7px 1fr auto; align-items: center; gap: 5px; white-space: nowrap; }
+.scale-key { display: grid; grid-template-columns: 7px 1fr auto; align-items: center; gap: 5px; white-space: nowrap; cursor: pointer; border-radius: 4px; padding: 1px 3px; margin: 0 -3px; }
+.scale-key:hover { background: color-mix(in srgb, var(--text-3) 12%, transparent); }
+.scale-key:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* Выбранное семейство: легенда говорит, что именно подсвечено на дорожках. */
+.scale-key.on { background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--text); }
+.scale-key.on .scale-key-n { opacity: 1; font-weight: 600; }
+/* Чужие семейства гаснут, а не исчезают: картина дела остаётся целой. */
+.tl-call.tl-dim { opacity: .18; filter: saturate(.35); }
+.tl-row:hover .tl-call.tl-dim { opacity: .3; }
+.tl-call.tl-dim { pointer-events: none; }
 .scale-key-l { overflow: hidden; text-overflow: ellipsis; }
 .scale-key-n { font-family: var(--mono); font-variant-numeric: tabular-nums; opacity: .8; }
 .scale-key-dot { width: 7px; height: 7px; border-radius: 2px; background: var(--text-3); }

@@ -1963,7 +1963,10 @@ function dutyToneVar(tone) {
  * начала, конца и длительность живут в подсказке строки — они не спорят с чипами
  * за место на дорожке. Вид приходит готовым (`attemptView`), здесь только DOM.
  */
-function DutyAttemptRow({ view, callSel, onSelectCall }) {
+function DutyAttemptRow({ view, callSel, onSelectCall, toolFilter }) {
+  // Подсветка семейства: чужие вызовы гаснут, но остаются на месте — картина
+  // дела не рассыпается, просто читается другое.
+  const active = Array.isArray(toolFilter) ? toolFilter : []
   const label = h(
     'div',
     { className: 'duty-tl-lbl', 'data-tip': view.bandTip || view.title || '' },
@@ -1996,7 +1999,7 @@ function DutyAttemptRow({ view, callSel, onSelectCall }) {
     track.push(
       h('span', {
         key: `call-${i}`,
-        className: `duty-tl-call${chip.unfinished ? ' duty-tl-unfinished' : ''}${callSel === chip.id ? ' duty-tl-sel' : ''}`,
+        className: `duty-tl-call${chip.unfinished ? ' duty-tl-unfinished' : ''}${callSel === chip.id ? ' duty-tl-sel' : ''}${active.length && !active.includes(chip.tone) ? ' duty-tl-dim' : ''}`,
         'data-level': String(chip.level || 0),
         'data-tip': chip.tip || chip.title,
         'aria-label': chip.tip || chip.title,
@@ -2039,7 +2042,7 @@ function DutyAttemptRow({ view, callSel, onSelectCall }) {
 }
 
 /** Дорожка этапа: имя, значок вида, сводка и строки попыток. */
-function DutyLane({ lane, bars, scale, callSel, onSelectCall }) {
+function DutyLane({ lane, bars, scale, callSel, onSelectCall, toolFilter }) {
   const view = laneView(lane, bars, scale)
   return h(
     'div',
@@ -2071,7 +2074,7 @@ function DutyLane({ lane, bars, scale, callSel, onSelectCall }) {
           'div',
           { className: 'duty-tl-rows' },
           ...view.rows.map((row) =>
-            h(DutyAttemptRow, { key: row.key, view: row.view, callSel, onSelectCall }),
+            h(DutyAttemptRow, { key: row.key, view: row.view, callSel, onSelectCall, toolFilter }),
           ),
         ),
   )
@@ -2260,7 +2263,15 @@ const CSS = `
 .duty-scale-head{display:grid;grid-template-columns:var(--duty-tl-gutter, 186px) 1fr;gap:var(--duty-tl-gap, 8px);align-items:end;margin-bottom:6px;--duty-tl-gutter:186px;--duty-tl-gap:8px}
 .duty-scale-keys{display:flex;flex-direction:column;gap:1px;font-size:10px;color:var(--ui-text-tertiary);line-height:1.45}
 .duty-scale-keys-h{font-size:9.5px;text-transform:uppercase;letter-spacing:.06em;opacity:.7}
-.duty-scale-key{display:grid;grid-template-columns:7px 1fr auto;align-items:center;gap:5px;white-space:nowrap}
+.duty-scale-key{display:grid;grid-template-columns:7px 1fr auto;align-items:center;gap:5px;white-space:nowrap;cursor:pointer;border-radius:4px;padding:1px 3px;margin:0 -3px}
+.duty-scale-key:hover{background:color-mix(in srgb, var(--ui-text-tertiary) 12%, transparent)}
+.duty-scale-key:focus-visible{outline:2px solid var(--ui-accent);outline-offset:1px}
+/* Выбранное семейство: легенда говорит, что именно подсвечено на дорожках. */
+.duty-scale-key.on{background:color-mix(in srgb, var(--ui-accent) 16%, transparent);color:var(--ui-text-primary)}
+.duty-scale-key.on .duty-scale-key-n{opacity:1;font-weight:600}
+/* Чужие семейства гаснут, а не исчезают: картина дела остаётся целой. */
+.duty-tl-call.duty-tl-dim{opacity:.18;filter:saturate(.35);pointer-events:none}
+.duty-tl-row:hover .duty-tl-call.duty-tl-dim{opacity:.3}
 .duty-scale-key-l{overflow:hidden;text-overflow:ellipsis}
 .duty-scale-key-n{font-family:var(--ui-font-mono, ui-monospace, monospace);font-variant-numeric:tabular-nums;opacity:.8}
 .duty-scale-key-dot{width:7px;height:7px;border-radius:2px;background:var(--ui-text-tertiary)}
@@ -2930,7 +2941,8 @@ function callOf(scale, callId) {
 }
 
 /** Панель шкалы времени: подписанная ось, дорожка на этап, полосы и маркеры. */
-function ScalePanel({ scale, callSel, onSelectCall }) {
+function ScalePanel({ scale, callSel, onSelectCall, toolFilter, onToggleTool }) {
+  const active = Array.isArray(toolFilter) ? toolFilter : []
   const head = h(
     'div',
     { className: 'duty-group-h' },
@@ -2998,6 +3010,7 @@ function ScalePanel({ scale, callSel, onSelectCall }) {
                 scale,
                 callSel,
                 onSelectCall,
+                toolFilter: active,
               }),
             ),
           ),
@@ -3012,7 +3025,20 @@ function ScalePanel({ scale, callSel, onSelectCall }) {
         ...scale.tools.map((item) =>
           h(
             'span',
-            { className: 'duty-scale-key', key: `key-${item.tone}` },
+            {
+              className: `duty-scale-key${active.includes(item.tone) ? ' on' : ''}`,
+              key: `key-${item.tone}`,
+              role: 'button',
+              tabIndex: 0,
+              'aria-pressed': active.includes(item.tone) ? 'true' : 'false',
+              'aria-label': `${item.label}: ${item.count}. Клик — подсветить вызовы этого семейства на дорожках`,
+              onClick: () => onToggleTool && onToggleTool(item.tone),
+              onKeyDown: (event) => {
+                if (!onToggleTool || (event.key !== 'Enter' && event.key !== ' ')) return
+                event.preventDefault()
+                onToggleTool(item.tone)
+              },
+            },
             h('span', { className: `duty-scale-key-dot duty-t-${item.tone}` }),
             h('span', { className: 'duty-scale-key-l' }, item.label),
             h('span', { className: 'duty-scale-key-n' }, String(item.count)),
@@ -3429,6 +3455,12 @@ function DealScreen({ sel, onBack }) {
   const selectCall = React.useCallback((id) => {
     setCallSel((prev) => (prev === id ? '' : id))
   }, [])
+  // Подсветка семейства инструментов: набор тонов из легенды. Клик по семейству
+  // гасит остальные вызовы, повторный — снимает подсветку.
+  const [toolFilter, setToolFilter] = React.useState([])
+  const toggleTool = React.useCallback((tone) => {
+    setToolFilter((prev) => (prev.includes(tone) ? prev.filter((item) => item !== tone) : [...prev, tone]))
+  }, [])
 
   const head = h(
     'div',
@@ -3484,7 +3516,7 @@ function DealScreen({ sel, onBack }) {
       // Шкала — первой и во всю ширину: это главный факт дела, а спецификация и
       // лента — пояснение к нему.
       h(KpiStrip, { scale }),
-      h(ScalePanel, { scale, callSel, onSelectCall: selectCall }),
+      h(ScalePanel, { scale, callSel, onSelectCall: selectCall, toolFilter, onToggleTool: toggleTool }),
       h(
         'div',
         { className: 'duty-deal-spec' },

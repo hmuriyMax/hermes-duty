@@ -198,6 +198,26 @@ test('разворот строки и правки экрана дела: пр�
   assert.match(app, /class: 'scale-side'/, 'веб: нет правой колонки легенды')
   assert.match(plugin, /className: 'duty-scale-side'/, 'десктоп: нет правой колонки легенды')
 
+  // Легенда семейств — переключатель: клик подсвечивает семейство на дорожках.
+  for (const [name, text] of [['веб', css], ['десктоп', plugin]]) {
+    assert.match(text, /scale-key\.on[^{]*\{[^}]*background/, `${name}: выбранное семейство не отмечено`)
+  }
+  assert.match(css, /^\.tl-call\.tl-dim \{[^}]*opacity:\s*\.18/m, 'веб: чужие вызовы не гаснут')
+  assert.match(plugin, /\.duty-tl-call\.duty-tl-dim\{[^}]*opacity:\.18/, 'десктоп: чужие вызовы не гаснут')
+  assert.match(app, /'data-tone':\s*chip\.tone/, 'веб: чип не знает своего семейства')
+  assert.match(plugin, /active\.includes\(chip\.tone\)[^}]*duty-tl-dim/, 'десктоп: чип не гаснет по фильтру')
+  // Фильтр применяется к нарисованной панели и переключается кликом/Enter.
+  assert.match(app, /\n  applyToolFilter\(panel\)\n/, 'веб: фильтр не применяется при отрисовке')
+  assert.match(
+    app,
+    /panel\.addEventListener\('click',\s*\(event\)\s*=>\s*\{\s*const key = event\.target\.closest[\s\S]{0,180}toggleTool\(key\)/,
+    'веб: клик по легенде не подключён',
+  )
+  assert.match(app, /event\.key !== 'Enter'[\s\S]{0,220}toggleTool\(key\)/, 'веб: клавиатура не переключает семейство')
+  assert.match(app, /'aria-pressed':\s*'false'/, 'веб: ключ легенды не кнопка')
+  assert.match(plugin, /'aria-pressed':\s*active\.includes\(item\.tone\)/, 'десктоп: ключ легенды не кнопка')
+  assert.match(plugin, /onClick:\s*\(\)\s*=>\s*onToggleTool/, 'десктоп: клик по легенде не подключён')
+
   // Провал попытки отмечается на узле графа.
   assert.match(css, /\.spec-node\.has-fail rect\s*\{[^}]*var\(--danger\)/, 'веб: провал не отмечен')
   assert.match(plugin, /\.duty-spec-node\.has-fail rect\{[^}]*var\(--ui-red\)/, 'десктоп: провал не отмечен')

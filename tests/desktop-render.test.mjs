@@ -162,6 +162,19 @@ test('десктоп: DutyLane рисует svg-значок, который л�
     )
   }
 
+  // Легенда — переключатель: клик по семейству гасит чужие вызовы на дорожках.
+  const legendHtml = renderToStaticMarkup(
+    React.createElement(mod.ScalePanel, { scale: scaleModel, toolFilter: ['read'], onToggleTool: () => {} }),
+  )
+  const pressed = (legendHtml.match(/aria-pressed="true"/g) || []).length
+  assert.equal(pressed, 1, `выбранных семейств в легенде ${pressed}, ожидалось 1`)
+  const tones = new Set(scaleModel.bars.flatMap((bar) => modelMod.attemptView(bar, scaleModel).chips.map((chip) => chip.tone)))
+  const dimmed = (legendHtml.match(/duty-tl-dim/g) || []).length
+  const shown = scaleModel.bars.reduce((sum, bar) => sum + modelMod.attemptView(bar, scaleModel).chips.length, 0)
+  assert.ok(dimmed > 0 && dimmed < shown, `погашено ${dimmed} из ${shown} при семействах ${[...tones].join(',')}`)
+  // Без фильтра ничего не гаснет: подсветка — состояние экрана, а не разметки.
+  assert.doesNotMatch(keysHtml, /duty-tl-dim/, 'без фильтра часть вызовов погашена')
+
   // Ряды маркеров: вердикты/вопросы/публикация/засечки — отдельными строками.
   // Маркеры живут внутри строки попытки, фон показывает её длительность,
   // пауза вопроса подсвечена — отдельных рядов под шкалой больше нет.

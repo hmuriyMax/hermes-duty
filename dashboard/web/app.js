@@ -1194,6 +1194,7 @@ function attemptRowNode(view) {
       h('span', {
         class: `tl-call${chip.unfinished ? ' tl-unfinished' : ''}`,
         'data-level': String(chip.level || 0),
+        'data-tone': chip.tone,
         style: chip.unfinished
           ? `left:${chip.leftPct}%;top:${chip.top}px;width:${chip.widthPct}%;color:${toneVar(chip.tone)}`
           : `left:${chip.leftPct}%;top:${chip.top}px;width:${chip.widthPct}%;background:${toneVar(chip.tone)}`,
@@ -1266,6 +1267,29 @@ function laneNode(lane, bars, scale) {
       ? h('div', { class: 'tl-row-empty' }, 'попыток не было')
       : h('div', { class: 'tl-rows' }, ...view.rows.map((row) => attemptRowNode(row.view))),
   )
+}
+
+// Подсветка семейства инструментов: набор тонов, выбранных в легенде. Клик по
+// семейству гасит всё остальное, повторный — снимает подсветку. Состояние
+// принадлежит экрану (как выбор вызова), а цвета и подписи даёт шейпер.
+const dutyToolFilter = new Set()
+
+// Применить фильтр к уже нарисованной панели: чипы чужих семейств гаснут,
+// легенда показывает, какие семейства выбраны.
+function applyToolFilter(panel) {
+  const active = dutyToolFilter.size > 0
+  for (const key of panel.querySelectorAll('.scale-key')) {
+    const on = dutyToolFilter.has(key.getAttribute('data-tone'))
+    key.classList.toggle('on', on)
+    key.setAttribute('aria-pressed', on ? 'true' : 'false')
+  }
+  for (const chip of panel.querySelectorAll('.tl-call')) {
+    const dim = active && !dutyToolFilter.has(chip.getAttribute('data-tone'))
+    chip.classList.toggle('tl-dim', dim)
+    // Погашенный чип не должен ловить клик и подсказку: он «не участвует».
+    if (dim) chip.setAttribute('aria-hidden', 'true')
+    else chip.removeAttribute('aria-hidden')
+  }
 }
 
 // Выбранный вызов и его данные: выбор живёт на экране «Дело» и переживает
@@ -1458,7 +1482,14 @@ function scalePanel(scale) {
           ...scale.tools.map((item) =>
             h(
               'span',
-              { class: 'scale-key' },
+              {
+                class: 'scale-key',
+                'data-tone': item.tone,
+                role: 'button',
+                tabindex: '0',
+                'aria-pressed': 'false',
+                'aria-label': `${item.label}: ${item.count}. Клик — подсветить вызовы этого семейства на дорожках`,
+              },
               h('span', { class: `scale-key-dot t-${item.tone}` }),
               h('span', { class: 'scale-key-l' }, item.label),
               h('span', { class: 'scale-key-n' }, String(item.count)),
@@ -1472,12 +1503,38 @@ function scalePanel(scale) {
       scale.facts.attempts.journal ? h('div', { class: 'muted' }, 'полосы собраны из журнала: ответ попыток пуст') : null,
     ),
   )
+  // Фильтр, выбранный в легенде, переживает перерисовку данных: экран
+  // пересобирается по новому кадру, а подсветка остаётся там, где её оставили.
+  applyToolFilter(panel)
+
+  // Легенда семейств — переключатели: клик подсвечивает семейство на дорожках,
+  // повторный снимает. Клавиатура ходит теми же шагами (Enter/Space).
+  const toggleTool = (key) => {
+    const tone = key.getAttribute('data-tone') || ''
+    if (!tone) return
+    if (dutyToolFilter.has(tone)) dutyToolFilter.delete(tone)
+    else dutyToolFilter.add(tone)
+    applyToolFilter(panel)
+  }
+  panel.addEventListener('click', (event) => {
+    const key = event.target.closest && event.target.closest('.scale-key')
+    if (!key) return
+    event.preventDefault()
+    toggleTool(key)
+  })
+  panel.addEventListener('keydown', (event) => {
+    const key = event.target.closest && event.target.closest('.scale-key')
+    if (!key || (event.key !== 'Enter' && event.key !== ' ')) return
+    event.preventDefault()
+    toggleTool(key)
+  })
+
   // Клик по вызову выбирает его, но не разворачивает строку попытки: развёртка
   // живёт под указателем, а выбор — в инспекторе под шкалой.
   panel.addEventListener('click', (event) => {
     const chip = event.target.closest && event.target.closest('.tl-call')
     const host = panel.querySelector('.tl-insp-host')
-    if (!chip || !host) return
+    if (!chip || !host || chip.classList.contains('tl-dim')) return
     const id = chip.getAttribute('data-call-id') || ''
     dutySelectedCallId = dutySelectedCallId === id ? '' : id
     for (const el of panel.querySelectorAll('.tl-call.tl-sel')) el.classList.remove('tl-sel')

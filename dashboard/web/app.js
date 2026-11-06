@@ -1,7 +1,8 @@
-/* Hermes Duty — веб-версия (0.0.6).
+/* Hermes Duty — веб-версия (0.0.7).
  *
- * Четыре экрана поверх двух API-ответов плагина:
+ * Пять экранов поверх трёх API-ответов плагина:
  *   #/now             «Сейчас»            — GET /now
+ *   #/deals           «Завершённые»       — GET /deals
  *   #/why             «Почему стоит»      — GET /now (группировка + evidence)
  *   #/health          «Здоровье»          — GET /stats
  *   #/deal/<deal_id>  «Дело»              — GET /deal/{deal_id} + /duty/{deal_id}/attempts
@@ -32,6 +33,7 @@ import {
   shapeAttempts,
   shapeDeal,
   shapeDealTime,
+  shapeFinished,
   shapeNow,
   shapeStages,
   stateLabel,
@@ -116,6 +118,7 @@ let ticker = null
 const snap = { data: null, error: null, loading: false }
 const filter = { repo: ALL_REPOS, states: new Set(), query: '', effQuery: '' }
 const health = { data: null, error: null, loading: false }
+const finished = { data: null, error: null, loading: false }
 const dealSnap = { key: '', data: null, attempts: null, error: null, loading: false }
 
 function setStamp(at) {
@@ -374,6 +377,158 @@ function viewNow() {
   } else {
     parts.push(...view.groups.map(groupBlock))
   }
+  return h('div', null, ...parts)
+}
+
+/* ----------------------------------------------------- экран «Завершённые» */
+
+// Список закрытых дел — единственное место, где видно, что уже сделано: `/now`
+// отвечает только про активные. Данные — `GET /deals` дословно: причина, этапы,
+// попытки, вопросы, длительность и публикация приходят с бэкенда, страница их не
+// пересчитывает (`shapeFinished`, `desktop/model.js`).
+
+async function loadFinished() {
+  finished.loading = true
+  try {
+    finished.data = await api('/deals')
+    finished.error = null
+    setStamp(Date.now())
+  } catch (err) {
+    finished.error = err.message
+  } finally {
+    finished.loading = false
+    render()
+  }
+}
+
+/** Бейдж терминального статуса: у закрытого дела нет состояния ожидания. */
+function finishedBadge(deal) {
+  return h('span', { class: `badge t-${deal.tone}`, title: deal.status }, h('i'), deal.statusLabel)
+}
+
+function finishedRow(deal) {
+  const open = () => {
+    location.hash = `#/deal/${encodeURIComponent(deal.id)}`
+  }
+  const pubTitle = deal.published ? deal.published.mrUrl || deal.published.ref || 'факт журнала' : 'публикации нет'
+  return h(
+    'tr',
+    {
+      class: 'row',
+      tabindex: '0',
+      title: `${deal.repoLabel} · ${deal.causeText}`,
+      onclick: open,
+      onkeydown: (e) => (e.key === 'Enter' ? open() : null),
+    },
+    h('td', { class: 'mono' }, deal.finishedText),
+    h('td', { class: 'mono', title: deal.id }, deal.id),
+    h('td', { class: 'ttl', title: deal.titleFull }, deal.title),
+    h('td', null, finishedBadge(deal)),
+    h('td', { class: 'n', title: 'попыток в журнале' }, `${deal.attempts}`),
+    h('td', { class: 'n', title: 'вопросы человеку по журналу' }, deal.questions.text),
+    h('td', { class: 'n', title: 'длительность дела: события журнала и попытки' }, deal.durationText),
+    h('td', { title: deal.causeText }, deal.causeText),
+    h('td', { class: 'muted', title: deal.stagesText }, deal.stagesText),
+    h('td', { class: 'muted', title: pubTitle }, deal.published ? deal.published.text : '—'),
+  )
+}
+
+/** Группа «Завершённых» — репозиторий: самый свежий закрытый первым. */
+function finishedGroupBlock(group) {
+  return h(
+    'section',
+    { class: 'grp' },
+    h(
+      'div',
+      { class: 'grp-h' },
+      h('span', { class: group.repo ? 'grp-k mono' : 'grp-k mono muted', title: group.repo || 'репозиторий не назван' }, group.label),
+      h('span', { class: 'n' }, `${group.count}`),
+      h('span', { class: 'grp-s muted' }, `свежее закрытие: ${group.deals[0].finishedText}`),
+    ),
+    h(
+      'table',
+      null,
+      h(
+        'thead',
+        null,
+        h(
+          'tr',
+          null,
+          h('th', null, 'закрыто'),
+          h('th', null, 'дело'),
+          h('th', null, 'заголовок'),
+          h('th', null, 'статус'),
+          h('th', null, 'попыток'),
+          h('th', null, 'вопросов'),
+          h('th', null, 'длительность'),
+          h('th', null, 'причина'),
+          h('th', null, 'этапы'),
+          h('th', null, 'публикация'),
+        ),
+      ),
+      h('tbody', null, ...group.deals.map(finishedRow)),
+    ),
+  )
+}
+
+function viewFinished() {
+  if (!finished.data && finished.error) {
+    return errorBanner(`ошибка запроса /deals: ${finished.error}`, loadFinished)
+  }
+  if (!finished.data) {
+    return h(
+      'div',
+      { class: 'grp' },
+      h(
+        'div',
+        { class: 'panel-b' },
+        ...[0, 1, 2, 3].map((i) => h('div', { class: 'skel', style: `width:${92 - i * 10}%` })),
+      ),
+    )
+  }
+  const model = shapeFinished(finished.data)
+  const parts = []
+  if (finished.error) {
+    parts.push(
+      errorBanner(`снимок от ${fmtClock(model.now)} — обновление не удалось: ${finished.error}`, loadFinished),
+    )
+  }
+  if (model.errors.length) {
+    parts.push(noticesBlock(model.errors.map((err) => `источник ${err.source} недоступен: ${err.reason}`)))
+  }
+  parts.push(
+    h(
+      'div',
+      { class: 'note' },
+      h(
+        'div',
+        null,
+        'Здесь только завершённые дела — закрытые и архивные. Числа строки (попытки, вопросы, длительность) — те же факты журнала, что в карточке дела: открыть её можно по id. Карточки kanban — отдельное наблюдение, не дела.',
+      ),
+    ),
+  )
+  parts.push(
+    h(
+      'div',
+      { class: 'muted' },
+      `дел: ${model.count} из ${model.total} · статусы: ${model.statuses.join(', ') || '—'}`,
+    ),
+  )
+  if (model.truncated) {
+    parts.push(noticesBlock([`показаны не все: лимит ${model.limit}, всего ${model.total} — список режется лимитом /deals`]))
+  }
+  if (!model.count) {
+    parts.push(
+      h(
+        'div',
+        { class: 'empty' },
+        h('b', null, 'завершённых дел нет'),
+        h('span', { class: 'muted' }, model.note || 'в store нет ни одного закрытого дела'),
+      ),
+    )
+    return h('div', null, ...parts)
+  }
+  parts.push(...model.groups.map(finishedGroupBlock))
   return h('div', null, ...parts)
 }
 
@@ -1150,6 +1305,8 @@ function parseRoute() {
   }
   if (parts[0] === 'why') return { name: 'why' }
   if (parts[0] === 'health') return { name: 'health' }
+  // «Завершённые» — отдельный экран списка: `#/deals` (0.0.7).
+  if (parts[0] === 'deals') return { name: 'deals' }
   return { name: 'now' }
 }
 
@@ -1158,6 +1315,7 @@ function render() {
   if (route.name === 'now') body.append(viewNow())
   else if (route.name === 'why') body.append(viewWhy())
   else if (route.name === 'health') body.append(viewHealth())
+  else if (route.name === 'deals') body.append(viewFinished())
   else if (route.bad) body.append(viewDealBadAddress(route.board, route.id))
   else body.append(route.id ? viewDeal(route.id) : viewDealPicker())
 
@@ -1171,7 +1329,10 @@ function render() {
 
 function schedule() {
   clearTimeout(timer)
-  const ms = route.name === 'health' ? HEALTH_REFRESH_MS : REFRESH_MS
+  // «Здоровье» и «Завершённые» — по журналу за всю историю: они не меняются за
+  // секунды, и опрашивать их так же часто, как срез «сейчас», незачем.
+  const slow = route.name === 'health' || route.name === 'deals'
+  const ms = slow ? HEALTH_REFRESH_MS : REFRESH_MS
   timer = setTimeout(run, ms)
 }
 
@@ -1179,6 +1340,7 @@ function run() {
   if (route.name === 'now') void loadNow()
   else if (route.name === 'why') void loadNow()
   else if (route.name === 'health') void loadHealth()
+  else if (route.name === 'deals') void loadFinished()
   else if (route.bad) void loadNow()
   else if (route.id) void loadDeal(route.id)
   else void loadNow()
@@ -1187,8 +1349,9 @@ function run() {
 function onRoute() {
   route = parseRoute()
   // Данные, которых нет для нового экрана, не переиспользуем: иначе «Здоровье»
-  // покажет старый снимок «сейчас» под своими KPI.
-  if (route.name === 'health' && !health.data) {
+  // покажет старый снимок «сейчас» под своими KPI, а «Завершённые» — вчерашний
+  // список под новым заголовком.
+  if ((route.name === 'health' && !health.data) || (route.name === 'deals' && !finished.data)) {
     stampAt = null
     tickStamp()
   }

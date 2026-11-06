@@ -250,6 +250,43 @@ CARD_KEYS = {
 }
 
 
+# `/deals` (0.0.7): список закрытых дел. Форма одна на веб, десктоп и CLI.
+DEALS_KEYS = {
+    "now",
+    "statuses",
+    "count",
+    "total",
+    "limit",
+    "truncated",
+    "note",
+    "errors",
+    "deals",
+    "deals[].id",
+    "deals[].repo",
+    "deals[].title",
+    "deals[].assignee",
+    "deals[].status",
+    "deals[].created_at",
+    "deals[].finished_at",
+    "deals[].duration_sec",
+    "deals[].cause",
+    "deals[].stages",
+    "deals[].attempts",
+    "deals[].questions",
+    "deals[].questions.asked",
+    "deals[].questions.answered",
+    "deals[].questions.waiting",
+    "deals[].published",
+    "deals[].published.stage",
+    "deals[].published.attempt",
+    "deals[].published.sha",
+    "deals[].published.branch",
+    "deals[].published.mr_url",
+    "deals[].published.ref",
+    "deals[].published.verified_by",
+}
+
+
 def shape(obj: Any, prefix: str = "") -> set[str]:
     """Пути ключей ответа: значение не важно, важна форма контракта."""
     paths: set[str] = set()
@@ -427,6 +464,33 @@ def test_cards_shape_matches_baseline(client: TestClient) -> None:
     assert keys == CARD_KEYS
 
 
+def test_deals_shape_matches_baseline(client: TestClient, home: Path) -> None:
+    """`/deals` — список закрытых дел: форма строки, по которой рисуют все три поверхности.
+
+    Экран веба, экран десктопа и `bin/duty deals` читают ровно эти ключи, поэтому
+    форма закреплена здесь: строка несёт записанный факт закрытия (`finished_at`,
+    `cause`, `stages`) и числа журнала (`attempts`, `questions`, `duration_sec`,
+    `published`), а не пересказ статуса.
+    """
+    conn = deals.open_store(home)
+    assert conn is not None
+    try:
+        active = deals.deal_rows(conn)[0]
+        deals.close_stages_done(conn, str(active["id"]), stages=["impl"], now=NOW - 50)
+    finally:
+        conn.close()
+
+    response = client.get("/deals")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["count"] == 1
+    assert body["deals"][0]["status"] == "done"
+    keys = shape(body)
+    assert len(keys) == len(DEALS_KEYS)
+    assert keys == DEALS_KEYS
+
+
 def test_board_route_is_gone(client: TestClient) -> None:
     """`/board/{slug}/tasks` удалён целиком: доски больше не адрес.
 
@@ -438,8 +502,8 @@ def test_board_route_is_gone(client: TestClient) -> None:
 
 
 def test_board_query_filter_is_refused_with_a_hint(client: TestClient) -> None:
-    """`?board=` на `/now` и `/stats` — отказ словами, а не молчаливый полный срез."""
-    for path in ("/now", "/stats"):
+    """`?board=` на `/now`, `/stats` и `/deals` — отказ словами, а не молчаливый полный срез."""
+    for path in ("/now", "/stats", "/deals"):
         response = client.get(path, params={"board": "stack"})
         assert response.status_code == 400, path
         assert "repo" in response.json()["detail"], path
@@ -453,7 +517,16 @@ def test_all_responses_are_not_cacheable(client: TestClient) -> None:
     экране. Удалённой ручки в списке нет: 404 без `cache-control` отдаёт уже
     FastAPI, а не плагин.
     """
-    paths = ("/health", "/sources", "/now", "/cards", "/deal/d_ffffffff", "/now?board=stack")
+    paths = (
+        "/health",
+        "/sources",
+        "/now",
+        "/cards",
+        "/deals",
+        "/deal/d_ffffffff",
+        "/now?board=stack",
+        "/deals?status=running",
+    )
     for path in paths:
         response = client.get(path)
         assert response.headers.get("cache-control") == "no-store, no-cache, must-revalidate", path

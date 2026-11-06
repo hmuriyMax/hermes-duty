@@ -9,6 +9,17 @@
   про **дела** — ни блока `cards`, ни строки «КАРТОЧКИ КАНБАНА · баз: … · карточек: …».
   Наблюдение за карточками осталось одним роутом `GET /cards`; `?board=` по-прежнему
   `400` с подсказкой про `?repo=`.
+- Экран «Завершённые»: `GET /deals?status=done,archived&repo=&limit=`, `bin/duty deals` и
+  пятый экран в вебе (`#/deals`) и десктопе. Строка списка несёт `finished_at`, `cause`,
+  `stages`, `attempts`, `questions`, `published`, `duration_sec` — числа считаются теми же
+  функциями, что у `GET /deal/{deal_id}` (`stagefeed.attempts`, `journal.closed_fact`,
+  `publish.published_of`), поэтому строка списка и карточка дела об одном деле не спорят.
+  Группировка по `repo`, свежие сверху, `total`/`truncated` называют обрезку лимитом
+  (`DEFAULT_DEALS_LIMIT = 50`, `MAX_DEALS_LIMIT = 500`); пусто — словами (`note`), а не
+  пустым экраном. `?status=running` отказывает: активные дела показывает `/now`.
+- `duty spec check` в профильной оболочке больше не отказывает «профиля нет в Hermes»:
+  когда `HERMES_HOME` — сам профиль (`<root>/profiles/<role>`), каталог профилей читается
+  на уровень выше (`dashboard/spec.py`, `profiles_dir`).
 
 ## [0.0.6] — в разработке
 

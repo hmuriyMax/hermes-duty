@@ -460,6 +460,136 @@ function filterNow(model, filter) {
   }
 }
 
+/* ------------------------------------------- экран «Завершённые» (0.0.7) */
+
+// Подписи терминальных статусов: у закрытого дела нет состояния ожидания, и
+// бейдж рисуется по статусу строки store (`done`/`archived`). Тон — тот же набор,
+// что у остальных бейджей (`TONE_COLOR`).
+const FINISHED_STATUS_META = {
+  done: { label: 'завершено', tone: 'green' },
+  archived: { label: 'в архиве', tone: 'gray' },
+}
+
+/** Мета терминального статуса; неизвестный — своим именем серым. */
+function finishedStatusMeta(status) {
+  const key = String(status || '')
+  return FINISHED_STATUS_META[key] || { label: key || '—', tone: 'gray' }
+}
+
+/** Вопросы человеку одной строкой: `2 вопроса · 1 ждёт ответа`. */
+function questionsText(questions) {
+  const block = questions && typeof questions === 'object' ? questions : {}
+  const asked = Number(block.asked) || 0
+  const waiting = Number(block.waiting) || 0
+  const tail = waiting ? ` · ${waiting} ${plural(waiting, 'ждёт', 'ждут', 'ждут')} ответа` : ''
+  return `${asked} ${plural(asked, 'вопрос', 'вопроса', 'вопросов')}${tail}`
+}
+
+/**
+ * Публикация словами: `{sha, shaShort, branch, ref, mrUrl, verifiedBy, text}`.
+ *
+ * Один формат на карточку дела (`shapeDealTime`) и на строку «Завершённых»:
+ * sha подтверждён `git ls-remote` движка (`dashboard/publish.py`), а не заявкой
+ * исполнителя. Нет факта — `null`, а не «опубликовано ничего».
+ */
+function fmtPublication(raw) {
+  const pub = raw && typeof raw === 'object' ? raw : null
+  if (!pub || !Object.keys(pub).length) return null
+  const sha = String(pub.sha || '')
+  return {
+    sha,
+    shaShort: sha.slice(0, 8),
+    branch: String(pub.branch || ''),
+    ref: String(pub.ref || ''),
+    mrUrl: String(pub.mr_url || ''),
+    verifiedBy: String(pub.verified_by || ''),
+    text: [sha.slice(0, 8), String(pub.branch || pub.ref || ''), String(pub.verified_by || '')]
+      .filter(Boolean)
+      .join(' · '),
+  }
+}
+
+/**
+ * Строка экрана «Завершённые» из строки ответа `/deals`.
+ *
+ * Все числа — поля ответа: `attempts`, `questions`, `duration_sec`, `published`,
+ * `cause`, `stages`. Экран ничего не пересчитывает: строка списка и карточка
+ * того же дела (`bin/duty deal <id>`) обязаны называть одни числа, а второй
+ * расчёт разошёлся бы с первым на первой же нестандартной попытке.
+ */
+function shapeFinishedRow(raw) {
+  const row = raw && typeof raw === 'object' ? raw : {}
+  const questions = row.questions && typeof row.questions === 'object' ? row.questions : {}
+  const askCount = Number(questions.asked) || 0
+  const waitCount = Number(questions.waiting) || 0
+  const meta = finishedStatusMeta(row.status)
+  const finishedAt = numOrNull(row.finished_at)
+  const duration = numOrNull(row.duration_sec)
+  const stages = (Array.isArray(row.stages) ? row.stages : []).map(String)
+  const repo = String(row.repo || '')
+  return {
+    id: String(row.id || ''),
+    repo,
+    repoLabel: repoLabel(repo),
+    title: fmtTitle(row.title, 90),
+    titleFull: String(row.title || ''),
+    assignee: String(row.assignee || '—'),
+    status: String(row.status || ''),
+    statusLabel: meta.label,
+    tone: meta.tone,
+    createdAt: numOrNull(row.created_at),
+    createdText: fmtClock(row.created_at),
+    finishedAt,
+    finishedText: fmtClock(finishedAt),
+    // `null` — факта закрытия в журнале нет: «время не записано» честнее нуля.
+    duration,
+    durationText: duration === null ? '—' : fmtAge(duration),
+    cause: String(row.cause || ''),
+    causeText: String(row.cause || '') || 'причина не записана',
+    stages,
+    stagesText: stages.join(' → ') || '—',
+    attempts: Number(row.attempts) || 0,
+    questions: {
+      asked: askCount,
+      answered: Number(questions.answered) || 0,
+      waiting: waitCount,
+      text: questionsText(questions),
+    },
+    published: fmtPublication(row.published),
+    search: `${repo} ${row.id || ''} ${row.title || ''} ${row.assignee || ''} ${row.status || ''}`.toLowerCase(),
+  }
+}
+
+/**
+ * Модель экрана «Завершённые» из ответа `/deals`.
+ *
+ * Порядок — ответа бэкенда (свежие сверху), группы — по `repo` тем же
+ * `groupDeals`, что у «Сейчас»: внутри группы строки остаются свежими, а имена
+ * групп совпадают с `bin/duty deals`. `note` — причина пустоты словами бэкенда
+ * («закрытых дел нет» / «store не прочитался» / «в этом репозитории нет»),
+ * экран её печатает, а не выдумывает свою.
+ */
+function shapeFinished(payload) {
+  const data = payload && typeof payload === 'object' ? payload : {}
+  const deals = (Array.isArray(data.deals) ? data.deals : []).map(shapeFinishedRow)
+  const errors = (Array.isArray(data.errors) ? data.errors : []).map((error) => ({
+    source: String((error && error.source) || 'источник'),
+    reason: String((error && error.reason) || 'причина не записана'),
+  }))
+  return {
+    now: numOrNull(data.now),
+    deals,
+    groups: groupDeals(deals),
+    count: deals.length,
+    total: Number(data.total) || 0,
+    limit: Number(data.limit) || 0,
+    truncated: data.truncated === true,
+    statuses: (Array.isArray(data.statuses) ? data.statuses : []).map(String),
+    note: String(data.note || ''),
+    errors,
+  }
+}
+
 /** Тон исхода попытки: «падение» — по набору бэкенда, дальше успех/отложено. */
 function outcomeTone(outcome, status, crashOutcomes) {
   const key = String(outcome || '')
@@ -1173,20 +1303,8 @@ function shapeDealTime(detail, attemptsPayload) {
   const pubRaw = d.published && typeof d.published === 'object'
     ? d.published
     : summaryFields(pubEvent && pubEvent.summary, ['sha', 'branch', 'ref', 'verified_by', 'mr_url'])
-  const pub = Object.keys(pubRaw).length ? pubRaw : null
-  const published = pub
-    ? {
-        sha: String(pub.sha || ''),
-        shaShort: String(pub.sha || '').slice(0, 8),
-        branch: String(pub.branch || ''),
-        ref: String(pub.ref || ''),
-        mrUrl: String(pub.mr_url || ''),
-        verifiedBy: String(pub.verified_by || ''),
-        text: [String(pub.sha || '').slice(0, 8), String(pub.branch || pub.ref || ''), String(pub.verified_by || '')]
-          .filter(Boolean)
-          .join(' · '),
-      }
-    : null
+  // Форма публикации одна с экраном «Завершённые»: `fmtPublication`.
+  const published = fmtPublication(pubRaw)
   // Закрытие: поле ответа, иначе событие журнала (`completed`/`blocked`/`failed`
   // с `cause`) — тот же факт, что рисует маркер `closed`.
   const closedEvent = [...events].reverse().find((event) => markerType(event.kind, event.summary) === 'closed')
@@ -1264,17 +1382,21 @@ export {
   WAIT_HUMAN_LABEL,
   TONE_COLOR,
   STAGE_META,
+  FINISHED_STATUS_META,
   WITHOUT_REPO_LABEL,
   ALL_REPOS,
   repoLabel,
   stateMeta,
   stageMeta,
+  finishedStatusMeta,
   humanCounts,
   humanLine,
   fmtAge,
   fmtTitle,
   fmtClock,
   shapeDeal,
+  shapeFinished,
+  questionsText,
   stateCounts,
   stateLabel,
   groupDeals,

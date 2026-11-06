@@ -391,6 +391,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="граница окна (по умолчанию — сутки): unix, YYYY-MM-DD или YYYY-MM-DDTHH:MM",
     )
 
+    # Завершённые дела (0.0.7): тот же список, что у `GET /deals`. Отдельная
+    # команда, потому что `now` — про активные: смешать их значило бы назвать
+    # «сейчас» то, что уже сделано.
+    deals_cmd = command(
+        "deals",
+        "завершённые дела (done/archived): причина, этапы, попытки, вопросы, публикация",
+    )
+    deals_cmd.add_argument(
+        "--status",
+        help="какие статусы показать: done,archived (по умолчанию оба)",
+    )
+    deals_cmd.add_argument("--repo", help="только один репозиторий; пустая строка — дела без репозитория")
+    deals_cmd.add_argument(
+        "--limit",
+        type=int,
+        help="сколько строк показать (по умолчанию 50, не больше 500)",
+    )
+
     why = command("why", "доказательство словами бэкенда; с этапом — приговор его последней попытки")
     why.add_argument("deal_id", help="id дела (d_<hex>)")
     why.add_argument(
@@ -785,6 +803,90 @@ STATS_COLUMNS = (
 # Подпись группы «репозиторий не назван»: NULL в `repo` — законное состояние, и в
 # таблице оно выглядит словами, а не пустой клеткой.
 WITHOUT_REPO_LABEL = "без репозитория"
+
+DEALS_COLUMNS = (
+    ("ЗАКРЫТО", 19),
+    ("СТАТУС", 8),
+    ("ID", 14),
+    ("ЗАГОЛОВОК", 34),
+    ("ПОПЫТОК", 7),
+    ("ВОПРОСОВ", 12),
+    ("ДЛИТЕЛЬНОСТЬ", 13),
+    ("ПРИЧИНА", 22),
+    ("ЭТАПЫ", 20),
+    ("ПУБЛИКАЦИЯ", 24),
+)
+
+
+def _questions_cell(questions: Any) -> str:
+    """Колонка «вопросов»: `2 · 1 ждёт` — числа ответа `/deals`, не новый счёт.
+
+    `waiting` печатается только когда он есть: «2 · 0 ждёт» на закрытом деле
+    читалось бы как незакрытый вопрос, которого нет.
+    """
+    block = questions or {}
+    asked = int(block.get("asked") or 0)
+    waiting = int(block.get("waiting") or 0)
+    if not asked:
+        return "—"
+    return f"{asked}" + (f" · {waiting} ждёт" if waiting else "")
+
+
+def _finished_cells(deal: dict[str, Any]) -> list[Any]:
+    """Строка таблицы «Завершённые»: поля ответа `/deals` как есть.
+
+    Ни одного нового правила: причина, этапы, попытки, вопросы, длительность и
+    публикация — ровно те факты журнала, что называет `bin/duty deal <id>`
+    (`closed`, `published`, таймлайн попыток). Пустая причина у архивного дела
+    печатается словами «не записана»: это честнее пустой клетки.
+    """
+    return [
+        _fmt_stamp(deal.get("finished_at")),
+        deal.get("status") or "—",
+        deal.get("id"),
+        deal.get("title"),
+        deal.get("attempts", 0),
+        _questions_cell(deal.get("questions")),
+        _fmt_age(deal.get("duration_sec")),
+        deal.get("cause") or "не записана",
+        ", ".join(deal.get("stages") or []) or "—",
+        _published_cell(deal.get("published")),
+    ]
+
+
+def render_deals(payload: dict[str, Any]) -> str:
+    """Завершённые дела группами по репозиториям: свежие сверху.
+
+    Сортировка и числа — из ответа `/deals`: строки приходят по убыванию
+    `finished_at`, группы сортируются по имени репозитория (`_repo_groups`), как в
+    `now` и `stats`, а внутри группы порядок ответа не пересортировывается.
+    Пустой список называет причину словами (`note`): «закрытых дел нет» и
+    «store не прочитался» — разные факты.
+    """
+    total = payload.get("total", 0)
+    statuses = ", ".join(payload.get("statuses") or [])
+    lines = [
+        "ЗАВЕРШЁННЫЕ ДЕЛА · {} · дел: {} из {} · статусы: {}".format(
+            _fmt_stamp(payload.get("now")), payload.get("count", 0), total, statuses or "—"
+        )
+    ]
+    if payload.get("truncated"):
+        lines.append(
+            f"показаны не все: лимит {payload.get('limit')}, всего {total} — подними --limit"
+        )
+    lines.extend(_notice_lines(payload))
+    deals = payload.get("deals") or []
+    if not deals:
+        lines.append("")
+        lines.append(payload.get("note") or "завершённых дел нет")
+        return "\n".join(lines)
+    for repo, group in _repo_groups(deals):
+        lines.append("")
+        lines.append(f"{repo} · дел: {len(group)}")
+        lines.append(_table(DEALS_COLUMNS, [_finished_cells(deal) for deal in group]))
+    lines.append("")
+    lines.append("карточка дела: duty deal <id> · доказательство: duty why <id>")
+    return "\n".join(lines)
 
 
 def _now_row(deal: dict[str, Any], now: Any) -> list[Any]:
@@ -2012,6 +2114,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.command == "stats":
             payload = _route(api().stats, repo=args.repo, since=args.since)
             _emit_json(payload, out) if args.json else print(render_stats(payload), file=out)
+            return _payload_code(payload)
+        if args.command == "deals":
+            # Завершённые дела: тот же роут, что у экрана «Завершённые», — второй
+            # выборки по store у терминала нет.
+            payload = _route(
+                api().deals_list, status=args.status, repo=args.repo, limit=args.limit
+            )
+            _emit_json(payload, out) if args.json else print(render_deals(payload), file=out)
             return _payload_code(payload)
         if args.command == "spec":
             if getattr(args, "spec_command", None) != "check":

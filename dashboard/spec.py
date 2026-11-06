@@ -114,9 +114,16 @@ def profiles_dir() -> Path:
     Корень берётся из `HERMES_HOME`, а не из домашней папки: на Windows home
     Hermes живёт в `%LOCALAPPDATA%\\hermes`, и жёсткий `~/.hermes` давал валидатору
     пустой снимок — спека с ролью `implementer` отказывала «профиля нет».
+
+    `HERMES_HOME` бывает и профилем (`<root>/profiles/<role>`): в профильной
+    оболочке `$HERMES_HOME/profiles` не существует, и валидатор видел один
+    `default` — любая спека с ролями отказывала «профиля нет в Hermes», хотя
+    профили есть. Тогда каталог профилей лежит на уровень выше.
     """
     env = os.environ.get("HERMES_HOME")
     root = Path(env).expanduser() if env else Path.home() / ".hermes"
+    if root.parent.name == "profiles" and root.parent.is_dir() and not (root / "profiles").is_dir():
+        return root.parent
     return root / "profiles"
 
 ERROR = "error"

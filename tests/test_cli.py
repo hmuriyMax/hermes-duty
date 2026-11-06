@@ -1584,3 +1584,125 @@ def test_deal_of_unblocked_own_deal_does_not_contradict_its_attempt_timeline(
     assert code == cli.EXIT_OK
     assert row["waiting"]["evidence"] in why_out
     assert "состояние ожидания: wait_slot" in why_out
+
+
+# ------------------------------------------------- завершённые дела (0.0.7)
+#
+# `now` отвечает про активные, и до 0.0.7 законченную работу из терминала не
+# показывала ни одна команда. `deals` — тот же роут, что у экрана «Завершённые»:
+# группы по `repo`, свежие сверху, числа строки из журнала.
+
+
+def finish_deal(home: Path, deal_id: str, *, stages=("impl",), ts: int = NOW - 120) -> None:
+    """Закрыть дело движком: `completed` с причиной и пройденным графом."""
+    conn = open_store(home)
+    try:
+        cli.api().deals.close_stages_done(conn, deal_id, stages=list(stages), now=ts)
+    finally:
+        conn.close()
+
+
+def test_deals_json_is_exactly_the_route_payload(home, client, frozen_now, capsys):
+    deal_id = make_deal(home, title="закрытое дело")
+    finish_deal(home, deal_id)
+
+    code, out, _ = run(["deals", "--json"], capsys)
+
+    assert code == cli.EXIT_OK
+    payload = json.loads(out)
+    assert payload == client.get("/deals").json()
+    assert [row["id"] for row in payload["deals"]] == [deal_id]
+    # Активное дело фикстуры (`blocked`) в список не попало: `/now` — про сейчас.
+    assert payload["total"] == 1
+
+
+def test_deals_prints_groups_by_repo_fresh_first(home, frozen_now, capsys):
+    older = make_deal(home, title="старое", created_at=NOW - 3000)
+    finish_deal(home, older, ts=NOW - 2000)
+    fresh = make_deal(home, title="свежее", created_at=NOW - 1500)
+    finish_deal(home, fresh, stages=("impl", "verify"), ts=NOW - 900)
+    orphan = make_deal(home, repo=None, title="без репозитория", created_at=NOW - 1200)
+    finish_deal(home, orphan, ts=NOW - 500)
+
+    code, out, _ = run(["deals"], capsys)
+
+    assert code == cli.EXIT_OK
+    lines = out.splitlines()
+    assert lines[0].startswith("ЗАВЕРШЁННЫЕ ДЕЛА")
+    assert "дел: 3 из 3" in lines[0]
+    assert "статусы: done, archived" in lines[0]
+    # Группы — как в `now`/`stats`: названный репозиторий, «без репозитория» — последней.
+    repo_head = f"{REPO} · дел: 2"
+    orphan_head = f"{cli.WITHOUT_REPO_LABEL} · дел: 1"
+    assert repo_head in lines and orphan_head in lines
+    assert lines.index(repo_head) < lines.index(orphan_head)
+    # Внутри группы — свежие сверху: свежее закрытое выше старого.
+    assert next(i for i, line in enumerate(lines) if fresh in line) < next(
+        i for i, line in enumerate(lines) if older in line
+    )
+
+
+def test_deals_row_shows_journal_numbers(home, capsys):
+    """Строка печатает числа ответа, а не свой счёт по журналу."""
+    payload = {
+        "now": NOW,
+        "statuses": ["done", "archived"],
+        "count": 1,
+        "total": 1,
+        "limit": 50,
+        "truncated": False,
+        "note": "",
+        "errors": [],
+        "deals": [
+            {
+                "id": "d_a7040118",
+                "repo": REPO,
+                "title": "дело",
+                "assignee": "implementer",
+                "status": "done",
+                "created_at": NOW - 1000,
+                "finished_at": NOW - 200,
+                "duration_sec": 800,
+                "cause": "all_stages_done",
+                "stages": ["impl", "verify"],
+                "attempts": 3,
+                "questions": {"asked": 2, "answered": 1, "waiting": 1},
+                "published": {
+                    "sha": "f750c7850a706b089ff3ea783c86cc9f8d0a791a",
+                    "branch": "release/v0.0.7",
+                    "verified_by": "git ls-remote",
+                },
+            }
+        ],
+    }
+
+    text = cli.render_deals(payload)
+    row = next(line for line in text.splitlines() if "d_a7040118" in line)
+
+    assert "13 мин" in row  # 800 с — длительность из ответа
+    assert "3" in row.split()  # попытки
+    assert "2 · 1 ждёт" in row  # вопросы — пары, а не разность
+    assert "all_stages_done" in row
+    assert "impl, verify" in row
+    assert "f750c78" in row  # короткий sha публикации
+    assert cli._fmt_stamp(NOW - 200) in row
+
+
+def test_deals_empty_says_words_and_exits_zero(home, frozen_now, capsys):
+    """Пусто — словами: причина приходит с бэкенда (`note`), код возврата 0."""
+    code, out, _ = run(["deals"], capsys)
+
+    assert code == cli.EXIT_OK
+    assert "завершённых дел нет" in out
+    assert "ни одного дела в статусе done, archived" in out
+
+
+def test_deals_bad_status_is_a_source_error(home, frozen_now, capsys):
+    deal_id = make_deal(home, title="закрытое")
+    finish_deal(home, deal_id)
+
+    code, out, err = run(["deals", "--status", "running"], capsys)
+
+    assert code == cli.EXIT_SOURCE
+    assert out == ""
+    assert "/now" in err

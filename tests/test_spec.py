@@ -273,6 +273,44 @@ def test_known_profiles_without_hermes_home_uses_home_dir(tmp_path: Path, monkey
     assert spec_module.profiles_dir() == tmp_path / ".hermes" / "profiles"
 
 
+def test_profiles_dir_of_a_profile_home_is_one_level_up(tmp_path: Path, monkeypatch):
+    """`HERMES_HOME` профиля (`<root>/profiles/<role>`) — профили на уровень выше.
+
+    В профильной оболочке `$HERMES_HOME/profiles` не существует, и валидатор видел
+    один `default`: любая спека с ролями отказывала «профиля нет в Hermes», хотя
+    профили есть. Красная проба: убрать переход на уровень выше — падает этот тест
+    и приёмки `duty spec check` в профильной оболочке.
+    """
+    role_home = tmp_path / "profiles" / "implementer"
+    role_home.mkdir(parents=True)
+    (tmp_path / "profiles" / "tester").mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(role_home))
+    monkeypatch.setattr(spec_module, "_profiles_cache", None)
+
+    assert spec_module.profiles_dir() == tmp_path / "profiles"
+    assert spec_module.known_profiles() == frozenset({"default", "implementer", "tester"})
+    found = issues(
+        tmp_path,
+        """
+        duty: probe
+        stages:
+          - id: impl
+            role: implementer
+        """,
+    )
+    assert "role" not in rules(found)
+
+
+def test_profile_home_without_parent_profiles_dir_keeps_its_own(tmp_path: Path, monkeypatch):
+    """Одноимённый каталог рядом — ещё не каталог профилей: свой важнее."""
+    home = tmp_path / "profiles" / "role"
+    (home / "profiles" / "default").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(spec_module, "_profiles_cache", None)
+
+    assert spec_module.profiles_dir() == home / "profiles"
+
+
 # ------------------------------------------------------------------- граф этапов
 
 

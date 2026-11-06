@@ -32,6 +32,7 @@ import {
   shapeAttempts,
   shapeDeal,
   shapeDealTime,
+  shapeFinished,
   shapeNow,
   shapeRepos,
   shapeStages,
@@ -919,6 +920,158 @@ test('/now: этап и номер попытки видны в строке, б
   assert.equal(withStage.stageAttempt, 2)
   // без попыток строки нет: «этап 0» был бы выдуманным графом
   assert.equal(shapeDeal({ repo: 'r', id: 'd_2' }).stageText, '')
+})
+
+/* ----------------------------------- экран «Завершённые» (0.0.7) ---------- */
+
+// Ответ `/deals` по одному закрытому делу: те же факты, что в
+// `tests/test_finished.py::test_finished_row_numbers_match_the_deal_card` —
+// создано 1000, закрыто 1700, попытка `verify` дожила до 1800.
+const FINISHED_ROW = {
+  id: 'd_a7040118',
+  repo: '~/.hermes/plugins/hermes-duty',
+  title: 'карточки вон из /stats и экран завершённых',
+  assignee: 'implementer',
+  status: 'done',
+  created_at: 1000,
+  finished_at: 1700,
+  duration_sec: 800,
+  cause: 'all_stages_done',
+  stages: ['impl', 'verify'],
+  attempts: 2,
+  questions: { asked: 2, answered: 1, waiting: 1 },
+  published: {
+    sha: 'f750c7850a706b089ff3ea783c86cc9f8d0a791a',
+    branch: 'release/v0.0.7',
+    verified_by: 'git ls-remote',
+    mr_url: 'https://gitlab.example/mr/7',
+  },
+}
+
+// Карточка того же дела: `/deal` + `/duty/{id}/attempts`. Шкала считает ось
+// `1000 … 1800` (конец попытки позже закрытия), то есть 800 с — как строка.
+const FINISHED_DETAIL = {
+  now: 1900,
+  status: 'done',
+  terminal: true,
+  timeline: [
+    { kind: 'created', at: 1000, summary: 'ready' },
+    { kind: 'attempt_started', at: 1100, summary: '{"run_id": "impl#1", "stage": "impl", "attempt": 1}' },
+    { kind: 'attempt_ended', at: 1200, summary: 'impl: готово' },
+    { kind: 'attempt_started', at: 1300, summary: '{"run_id": "verify#1", "stage": "verify", "attempt": 1}' },
+    { kind: 'question_asked', at: 1350, summary: '{"question_id": 7}' },
+    { kind: 'question_answered', at: 1360, summary: '{"question_id": 7, "answer_len": 2}' },
+    { kind: 'question_asked', at: 1370, summary: '{"question_id": 8}' },
+    { kind: 'published', at: 1500, summary: '{"sha": "f750c7850a706b089ff3ea783c86cc9f8d0a791a"}' },
+    { kind: 'completed', at: 1700, summary: '{"cause": "all_stages_done"}' },
+  ],
+  closed: { at: 1700, cause: 'all_stages_done', stages: ['impl', 'verify'], status: 'done' },
+  published: { sha: 'f750c7850a706b089ff3ea783c86cc9f8d0a791a', branch: 'release/v0.0.7', verified_by: 'git ls-remote' },
+}
+
+const FINISHED_ATTEMPTS = {
+  attempts: [
+    { run_id: 'impl#1', stage: 'impl', attempt: 1, status: 'completed', start: 1100, end: 1200, duration_sec: 100, outcome: 'done' },
+    { run_id: 'verify#1', stage: 'verify', attempt: 1, status: 'failed', start: 1300, end: 1800, duration_sec: 500, outcome: 'crashed' },
+  ],
+}
+
+test('завершённые: числа строки — те же, что у шкалы карточки дела', () => {
+  // Красная проба: подставить в строку свой расчёт (длительность
+  // `created_at → finished_at` = 700, вопросы разностью, «попыток» числом
+  // событий) — числа разъедутся с карточкой того же дела, и тест упадёт.
+  const row = shapeFinished({ deals: [FINISHED_ROW], total: 1, limit: 50 }).deals[0]
+  const scale = shapeDealTime(FINISHED_DETAIL, FINISHED_ATTEMPTS)
+
+  assert.equal(row.duration, scale.facts.duration.sec)
+  assert.equal(row.duration, 800)
+  assert.notEqual(row.duration, row.finishedAt - row.createdAt)
+  assert.equal(row.attempts, scale.facts.attempts.total)
+  assert.deepEqual(row.questions, scale.facts.questions)
+  assert.equal(row.questions.text, '2 вопроса · 1 ждёт ответа')
+  assert.equal(row.published.text, scale.facts.published.text)
+  assert.equal(row.causeText, 'all_stages_done')
+  assert.equal(row.stagesText, 'impl → verify')
+  assert.equal(row.finishedText, scale.facts.closed.clock)
+  assert.equal(row.statusLabel, 'завершено')
+  assert.equal(row.tone, 'green')
+})
+
+test('завершённые: группы по repo — свежие внутри, «без репозитория» последней', () => {
+  const modelFinished = shapeFinished({
+    deals: [
+      { ...FINISHED_ROW, id: 'd_1', repo: 'b-repo', finished_at: 1700 },
+      { ...FINISHED_ROW, id: 'd_2', repo: 'a-repo', finished_at: 1600 },
+      { ...FINISHED_ROW, id: 'd_3', repo: 'b-repo', finished_at: 1500 },
+      { ...FINISHED_ROW, id: 'd_4', repo: null, finished_at: 1400 },
+    ],
+    count: 4,
+    total: 4,
+    limit: 50,
+    statuses: ['done', 'archived'],
+    note: '',
+  })
+
+  // Группы — как в CLI (`_repo_groups`): названные по имени, без репозитория —
+  // последней. Внутри группы порядок ответа (свежие сверху) не пересортировывается.
+  assert.deepEqual(
+    modelFinished.groups.map((group) => [group.label, group.deals.map((deal) => deal.id)]),
+    [
+      ['a-repo', ['d_2']],
+      ['b-repo', ['d_1', 'd_3']],
+      [WITHOUT_REPO_LABEL, ['d_4']],
+    ],
+  )
+  assert.equal(modelFinished.groups[2].repo, '')
+  assert.equal(modelFinished.count, 4)
+})
+
+test('завершённые: пусто — словами бэкенда, архивное дело — без выдуманной причины', () => {
+  const empty = shapeFinished({ deals: [], total: 0, limit: 50, note: 'завершённых дел нет: в store ни одного дела в статусе done, archived' })
+  assert.equal(empty.count, 0)
+  assert.deepEqual(empty.groups, [])
+  // Причина пустоты — с бэкенда: «дел нет» и «store не прочитался» разные факты.
+  assert.match(empty.note, /завершённых дел нет/)
+  assert.deepEqual(shapeFinished(null), {
+    now: null,
+    deals: [],
+    groups: [],
+    count: 0,
+    total: 0,
+    limit: 0,
+    truncated: false,
+    statuses: [],
+    note: '',
+    errors: [],
+  })
+
+  const archived = shapeFinished({
+    deals: [{ ...FINISHED_ROW, status: 'archived', cause: '', stages: [], finished_at: null, duration_sec: null, published: null, questions: { asked: 0, answered: 0, waiting: 0 } }],
+  }).deals[0]
+  assert.equal(archived.statusLabel, 'в архиве')
+  assert.equal(archived.tone, 'gray')
+  assert.equal(archived.causeText, 'причина не записана')
+  assert.equal(archived.stagesText, '—')
+  assert.equal(archived.finishedText, '—')
+  assert.equal(archived.durationText, '—')
+  assert.equal(archived.published, null)
+  assert.equal(archived.questions.text, '0 вопросов')
+})
+
+test('завершённые: лимит и обрезка — из ответа, а не из своего счёта', () => {
+  const modelFinished = shapeFinished({
+    deals: [FINISHED_ROW],
+    count: 1,
+    total: 36,
+    limit: 1,
+    truncated: true,
+    statuses: ['done', 'archived'],
+  })
+  assert.equal(modelFinished.count, 1)
+  assert.equal(modelFinished.total, 36)
+  assert.equal(modelFinished.limit, 1)
+  assert.equal(modelFinished.truncated, true)
+  assert.deepEqual(modelFinished.statuses, ['done', 'archived'])
 })
 
 test('вшитый в plugin.js шейпер дословно совпадает с desktop/model.js', () => {

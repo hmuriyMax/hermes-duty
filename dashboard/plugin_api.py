@@ -1495,6 +1495,195 @@ def collect_now(
     }
 
 
+# ------------------------------------------------- завершённые дела (0.0.7)
+#
+# Экран «Завершённые» отвечает на вопрос «что уже сделано». Это не второй срез
+# «сейчас»: список закрытых дел (`done`/`archived`) без состояний ожидания.
+# Источник тот же, что у карточки дела, — store плюс журнал, и числа строки
+# считаются теми же функциями (`stagefeed.attempts`, `journal.closed_fact`,
+# `publish.published_of`), иначе строка списка спорила бы с `bin/duty deal <id>`.
+
+# Статусы списка — ровно терминальные (`done`, `archived`): активные дела живут в
+# `/now`, и второй список активных дел дал бы две правды о «сейчас».
+FINISHED_STATUSES = tuple(TERMINAL_STATUSES)
+
+# Сколько строк отдаём по умолчанию и сколько разрешаем попросить. Список — не
+# выгрузка всей истории: `total` называет, сколько закрытых дел есть на самом
+# деле, а `truncated` — что показаны не все.
+DEFAULT_DEALS_LIMIT = 50
+MAX_DEALS_LIMIT = 500
+
+
+def _finished_questions(events: list[dict[str, Any]]) -> dict[str, int]:
+    """Вопросы человеку по журналу: `asked`, `answered` и `waiting`.
+
+    Пары считаются тем же порядком, что рисует шкала дела (`desktop/model.js`,
+    `shapeDealTime`): `question_answered` закрывает первый неотвеченный
+    `question_asked`. Поэтому `waiting` — остаток пар, а не разность чисел:
+    ответ на чужой вопрос (или ответ без вопроса) не должен показывать «ждёт»
+    на закрытом деле.
+    """
+    asked = 0
+    answered = 0
+    pending = 0
+    for event in events:
+        kind = str(event.get("kind") or "")
+        if kind == "question_asked":
+            asked += 1
+            pending += 1
+        elif kind == "question_answered":
+            answered += 1
+            if pending:
+                pending -= 1
+    return {"asked": asked, "answered": answered, "waiting": pending}
+
+
+def _finished_span(events: list[dict[str, Any]], attempts: list[dict[str, Any]]) -> Optional[int]:
+    """Длительность дела — та же ось, что у шкалы времени в карточке дела.
+
+    Начало — минимум из времён событий журнала и стартов попыток, конец —
+    максимум из них же и концов попыток (у закрытой попытки без `finished_at`
+    конец считается по `duration_sec`). Это ровно `shapeDealTime`
+    (`desktop/model.js`): другая формула — «`created_at` → `finished_at`» — дала
+    бы в строке списка число, которого на карточке того же дела нет.
+
+    `None` — в журнале нет ни одного времени: рисовать нечего, и ноль здесь был
+    бы выдумкой.
+    """
+    stamps = [int(event.get("ts") or 0) for event in events if int(event.get("ts") or 0) > 0]
+    for attempt in attempts:
+        if attempt["started_at"] is not None:
+            stamps.append(int(attempt["started_at"]))
+    if not stamps:
+        return None
+    start = min(stamps)
+    end = max(stamps)
+    for attempt in attempts:
+        if attempt["started_at"] is None:
+            continue
+        stop = attempt["finished_at"]
+        if stop is None:
+            stop = int(attempt["started_at"]) + int(attempt["duration_sec"] or 0)
+        end = max(end, int(stop))
+    return max(0, end - start)
+
+
+def _finished_row(
+    row: dict[str, Any],
+    events: list[dict[str, Any]],
+    now: int,
+    leases: dict[tuple[str, int], int],
+) -> dict[str, Any]:
+    """Строка «Завершённых» из строки store и журнала.
+
+    `finished_at`/`cause`/`stages` — записанный факт закрытия
+    (`journal.closed_fact`), а не пересказ статуса: у дела, закрытого архивацией,
+    причины нет вовсе, и пустая строка здесь честнее придуманной. `attempts`,
+    `questions` и `duration_sec` считаются по тем же событиям, что отдают
+    `GET /deal/{deal_id}` и `GET /duty/{deal_id}/attempts`, поэтому строка и
+    карточка одного дела называют одни числа.
+    """
+    closed = journal.closed_fact(events)
+    payload = (closed or {}).get("payload") or {}
+    attempts = stagefeed.attempts(events, now, leases=leases)
+    return {
+        "id": str(row["id"]),
+        "repo": row.get("repo"),
+        "title": row.get("title"),
+        "assignee": row.get("assignee"),
+        "status": str(row["status"]),
+        "created_at": row.get("created_at"),
+        "finished_at": None if closed is None else int(closed.get("at") or 0),
+        "duration_sec": _finished_span(events, attempts),
+        "cause": str(payload.get("cause") or ""),
+        "stages": [str(stage) for stage in payload.get("stages") or ()],
+        "attempts": len(attempts),
+        "questions": _finished_questions(events),
+        "published": publish.published_of(events),
+    }
+
+
+def _finished_note(
+    rows: list[dict[str, Any]],
+    statuses: tuple[str, ...],
+    repo: Optional[str],
+    errors: list[dict[str, str]],
+) -> str:
+    """Почему список пуст — словами, а не пустым экраном.
+
+    Пустой ответ законен (закрытых дел может не быть), но причин у него три
+    разных, и «нет дел» вместо каждой было бы враньём: нечитаемый store,
+    пустой фильтр по репозиторию и store без закрытых дел — разные факты.
+    Бэкенд называет их строкой `note`, а страница её печатает как есть.
+    """
+    if rows:
+        return ""
+    if errors:
+        return f"завершённые дела не прочитаны: {errors[0]['reason']}"
+    where = "store" if repo is None else ("репозитории " + repo if repo else "группе без репозитория")
+    return f"завершённых дел нет: в {where} ни одного дела в статусе {', '.join(statuses)}"
+
+
+def collect_deals(
+    home: Path,
+    now: int,
+    *,
+    statuses: tuple[str, ...] = FINISHED_STATUSES,
+    repo: Optional[str] = None,
+    limit: int = DEFAULT_DEALS_LIMIT,
+) -> dict[str, Any]:
+    """Список завершённых дел: закрытые и архивные, свежие сверху.
+
+    `repo` — фильтр группировки (`None` — все репозитории, `""` — ровно дела
+    **без** репозитория), как у `/now` и `/stats`. `limit` режет список после
+    сортировки, а `total` называет, сколько дел подошло под фильтр целиком:
+    иначе «50 строк» читалось бы как «50 закрытых дел».
+
+    Ошибка store не валит ответ — она в `errors[]`, а причина пустоты — в
+    `note`: «дел нет» и «store не прочитался» разные факты.
+    """
+    errors: list[dict[str, str]] = []
+    rows: list[dict[str, Any]] = []
+    total = 0
+    try:
+        conn = deals.open_store(home, create=False, readonly=True)
+    except Exception as exc:  # noqa: BLE001 - свой store не открылся
+        conn = None
+        errors.append({"source": DEALS_SOURCE, "reason": f"{type(exc).__name__}: {exc}"})
+    if conn is not None:
+        try:
+            if deals.has_store(conn):
+                for row in deals.deal_rows(conn, open_only=False):
+                    if str(row["status"]) not in statuses:
+                        continue
+                    if repo is not None and (row.get("repo") or "") != repo:
+                        continue
+                    events = journal.read_events(conn, str(row["id"]))
+                    rows.append(
+                        _finished_row(row, events, now, _own_leases(conn, str(row["id"])))
+                    )
+        except Exception as exc:  # noqa: BLE001 - битый store/журнал
+            errors.append({"source": DEALS_SOURCE, "reason": f"store: {type(exc).__name__}: {exc}"})
+        finally:
+            conn.close()
+    # Свежие сверху: закрытие — то, чем дело попадает в список. Дело без факта
+    # закрытия (`finished_at: null`) уходит в конец, а не притворяется свежим.
+    rows.sort(key=lambda item: (-(item["finished_at"] or 0), item["id"]))
+    total = len(rows)
+    shown = rows[:limit]
+    return {
+        "now": now,
+        "statuses": list(statuses),
+        "count": len(shown),
+        "total": total,
+        "limit": limit,
+        "truncated": total > len(shown),
+        "deals": shown,
+        "note": _finished_note(shown, statuses, repo, errors),
+        "errors": errors,
+    }
+
+
 # --------------------------------------------------- «дело» и «здоровье» (0.0.2)
 #
 # Экран «Дело» — одна карточка: чем дело занято сейчас (тот же факт-набор, что в
@@ -2624,6 +2813,74 @@ def _refuse_board_filter(board: Optional[str]) -> None:
         headers=NO_STORE_HEADERS,
         detail=f"?board={board!r}: {BOARD_FILTER_HINT}",
     )
+
+
+def _finished_statuses(status: Optional[str]) -> tuple[str, ...]:
+    """`?status=done,archived` → кортеж терминальных статусов.
+
+    Незнакомый статус — отказ (400), а не пустой список: `?status=blocked`
+    выглядел бы как «завершённых дел нет», хотя такие дела есть — они просто не
+    завершены. Активные дела показывает `/now`, и второй список для них здесь не
+    заводится (`docs/DESIGN.md`, «Экраны»).
+    """
+    if status is None:
+        return FINISHED_STATUSES
+    names = tuple(part.strip() for part in status.split(",") if part.strip())
+    if not names:
+        raise HTTPException(
+            status_code=400,
+            headers=NO_STORE_HEADERS,
+            detail=f"?status={status!r}: пустой список — ожидалось {list(FINISHED_STATUSES)}",
+        )
+    unknown = [name for name in names if name not in FINISHED_STATUSES]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            headers=NO_STORE_HEADERS,
+            detail=(
+                f"?status={status!r}: {', '.join(unknown)} — не завершённые статусы. "
+                f"Список отвечает про {list(FINISHED_STATUSES)}; активные дела — GET /now"
+            ),
+        )
+    return names
+
+
+@router.get("/deals")
+def deals_list(
+    status: Optional[str] = None,
+    repo: Optional[str] = None,
+    limit: Optional[int] = None,
+    board: Optional[str] = None,
+) -> dict[str, Any]:
+    """Завершённые дела: списком, группа — `repo`, свежие сверху.
+
+    `?status=done,archived` — какие терминальные статусы показать (по умолчанию
+    оба): это весь набор состояний, в которых дело уже сделано. `?repo=<путь>` —
+    только один репозиторий; `?repo=` (пустая строка) — ровно дела **без**
+    репозитория; неизвестный `repo` — пустой список, а не 404 (репозиторий —
+    свойство дела, а не адрес). `?limit=N` — сколько строк отдать (по умолчанию
+    50, не больше 500): `total` и `truncated` называют, сколько дел подошло под
+    фильтр целиком. `?board=` — отказ (400) с подсказкой: доск нет.
+
+    Строка несёт `finished_at`, `cause`, `stages`, `attempts`, `questions`,
+    `published` и `duration_sec` — те же факты журнала, что у
+    `GET /deal/{deal_id}` и `GET /duty/{deal_id}/attempts`, поэтому числа строки и
+    карточки одного дела совпадают. Создаётся этим списком ничего: чтение идёт
+    `?mode=ro`, файла store роут не создаёт.
+    """
+    _refuse_board_filter(board)
+    statuses = _finished_statuses(status)
+    shown = DEFAULT_DEALS_LIMIT if limit is None else int(limit)
+    if shown <= 0 or shown > MAX_DEALS_LIMIT:
+        raise HTTPException(
+            status_code=400,
+            headers=NO_STORE_HEADERS,
+            detail=(
+                f"?limit={shown}: ожидалось 1..{MAX_DEALS_LIMIT} — список завершённых "
+                "дел не выгружается целиком"
+            ),
+        )
+    return collect_deals(_hermes_home(), _now_sec(), statuses=statuses, repo=repo, limit=shown)
 
 
 @router.get("/now")

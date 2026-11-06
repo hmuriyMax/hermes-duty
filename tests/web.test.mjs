@@ -1,11 +1,11 @@
 /**
- * Регрессия веб-сборки плагина: четыре экрана и одна копия шейпера.
+ * Регрессия веб-сборки плагина: пять экранов и одна копия шейпера.
  *
  *   node --test tests/web.test.mjs
  *
  * Проверяется ровно то, что ломается тихо: страница остаётся на месте, шейпер
  * импортируется (а не копируется в веб — иначе бейджи разъезжаются с десктопом),
- * маршруты четырёх экранов существуют, токен вшивается маркером, а порт backend
+ * маршруты пяти экранов существуют, токен вшивается маркером, а порт backend
  * в файлах не захардкожен (страница обязана ходить по относительным путям).
  */
 
@@ -49,16 +49,31 @@ test('бейдж дела в вебе подписывается по human_kind
   )
 })
 
-test('четыре экрана маршрутизируются', () => {
+test('пять экранов маршрутизируются', () => {
   assert.match(app, /parts\[0\] === 'deal'/)
   assert.match(app, /parts\[0\] === 'why'/)
   assert.match(app, /parts\[0\] === 'health'/)
+  assert.match(app, /parts\[0\] === 'deals'/)
   assert.match(app, /return \{ name: 'now' \}/)
   // «Дело» — таб, а не только следствие клика по строке: экран, до которого
   // нельзя дойти из навигации, на своём месте не читается.
-  for (const tab of ['now', 'deal', 'why', 'health']) {
+  for (const tab of ['now', 'deals', 'deal', 'why', 'health']) {
     assert.match(html, new RegExp(`data-tab="${tab}"`), `нет вкладки ${tab}`)
   }
+})
+
+test('«Завершённые» — список из `/deals`, числа берутся у бэкенда', () => {
+  // страница ходит в тот же роут, что `bin/duty deals`, и группирует тем же шейпером
+  assert.match(app, /api\('\/deals'\)/)
+  assert.match(app, /shapeFinished\(finished\.data\)/)
+  assert.match(pluginSource, /rest\('\/deals'/)
+  assert.match(pluginSource, /shapeFinished\(finished\.data\)/)
+  // второго счёта в строках нет: вопросы/попытки/длительность — поля ответа
+  assert.match(app, /deal\.questions\.text/)
+  assert.match(pluginSource, /deal\.questions\.text/)
+  assert.ok(!/question_asked/.test(app), 'в app.js появился свой счёт вопросов')
+  // пусто — словами бэкенда (`note`), а не пустым квадратом
+  assert.match(app, /model\.note \|\| 'в store нет ни одного закрытого дела'/)
 })
 
 test('«Дело» без выбранного дела показывает выбор, а не пустоту', () => {

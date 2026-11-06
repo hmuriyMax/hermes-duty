@@ -3,7 +3,7 @@
  *
  * Форма — как у hermes-tickets: `export default { id, name, register(ctx) }`,
  * страница в `area: 'routes'`, пункт в `area: 'sidebar.nav'`. Данные — ТОЛЬКО
- * через `ctx.rest('/now')`, `ctx.rest('/deal/{deal_id}')` и
+ * через `ctx.rest('/now')`, `ctx.rest('/deals')`, `ctx.rest('/deal/{deal_id}')` и
  * `ctx.rest('/duty/{deal_id}/attempts')`: прямого fetch и шелла из UI нет, ядро не
  * импортируется, файлы плагин не читает.
  *
@@ -27,12 +27,14 @@ const STATS_REFRESH_MS = 30_000
 const SEARCH_DEBOUNCE_MS = 240
 const REQUEST_TIMEOUT_MS = 20_000
 
-// Экраны страницы, в порядке спеки: «Сейчас» — срез, «Дело» — спецификация и
-// таймлайн попыток, «Почему стоит» — тот же срез с объяснением, «Здоровье» —
-// агрегат по ранам. «Дело» открывается из любой строки, но и сам по себе таб:
-// экран, достижимый только кликом по строке, на своём месте не читается.
+// Экраны страницы, в порядке спеки: «Сейчас» — срез, «Завершённые» — список
+// закрытых дел, «Дело» — спецификация и таймлайн попыток, «Почему стоит» — тот
+// же срез с объяснением, «Здоровье» — агрегат по ранам. «Дело» открывается из
+// любой строки, но и сам по себе таб: экран, достижимый только кликом по строке,
+// на своём месте не читается.
 const TABS = [
   ['now', 'Сейчас'],
+  ['deals', 'Завершённые'],
   ['deal', 'Дело'],
   ['why', 'Почему стоит'],
   ['health', 'Здоровье'],
@@ -504,6 +506,136 @@ function filterNow(model, filter) {
     count: deals.length,
     byState: stateCounts(deals),
     humanCounts: humanCounts(deals),
+  }
+}
+
+/* ------------------------------------------- экран «Завершённые» (0.0.7) */
+
+// Подписи терминальных статусов: у закрытого дела нет состояния ожидания, и
+// бейдж рисуется по статусу строки store (`done`/`archived`). Тон — тот же набор,
+// что у остальных бейджей (`TONE_COLOR`).
+const FINISHED_STATUS_META = {
+  done: { label: 'завершено', tone: 'green' },
+  archived: { label: 'в архиве', tone: 'gray' },
+}
+
+/** Мета терминального статуса; неизвестный — своим именем серым. */
+function finishedStatusMeta(status) {
+  const key = String(status || '')
+  return FINISHED_STATUS_META[key] || { label: key || '—', tone: 'gray' }
+}
+
+/** Вопросы человеку одной строкой: `2 вопроса · 1 ждёт ответа`. */
+function questionsText(questions) {
+  const block = questions && typeof questions === 'object' ? questions : {}
+  const asked = Number(block.asked) || 0
+  const waiting = Number(block.waiting) || 0
+  const tail = waiting ? ` · ${waiting} ${plural(waiting, 'ждёт', 'ждут', 'ждут')} ответа` : ''
+  return `${asked} ${plural(asked, 'вопрос', 'вопроса', 'вопросов')}${tail}`
+}
+
+/**
+ * Публикация словами: `{sha, shaShort, branch, ref, mrUrl, verifiedBy, text}`.
+ *
+ * Один формат на карточку дела (`shapeDealTime`) и на строку «Завершённых»:
+ * sha подтверждён `git ls-remote` движка (`dashboard/publish.py`), а не заявкой
+ * исполнителя. Нет факта — `null`, а не «опубликовано ничего».
+ */
+function fmtPublication(raw) {
+  const pub = raw && typeof raw === 'object' ? raw : null
+  if (!pub || !Object.keys(pub).length) return null
+  const sha = String(pub.sha || '')
+  return {
+    sha,
+    shaShort: sha.slice(0, 8),
+    branch: String(pub.branch || ''),
+    ref: String(pub.ref || ''),
+    mrUrl: String(pub.mr_url || ''),
+    verifiedBy: String(pub.verified_by || ''),
+    text: [sha.slice(0, 8), String(pub.branch || pub.ref || ''), String(pub.verified_by || '')]
+      .filter(Boolean)
+      .join(' · '),
+  }
+}
+
+/**
+ * Строка экрана «Завершённые» из строки ответа `/deals`.
+ *
+ * Все числа — поля ответа: `attempts`, `questions`, `duration_sec`, `published`,
+ * `cause`, `stages`. Экран ничего не пересчитывает: строка списка и карточка
+ * того же дела (`bin/duty deal <id>`) обязаны называть одни числа, а второй
+ * расчёт разошёлся бы с первым на первой же нестандартной попытке.
+ */
+function shapeFinishedRow(raw) {
+  const row = raw && typeof raw === 'object' ? raw : {}
+  const questions = row.questions && typeof row.questions === 'object' ? row.questions : {}
+  const askCount = Number(questions.asked) || 0
+  const waitCount = Number(questions.waiting) || 0
+  const meta = finishedStatusMeta(row.status)
+  const finishedAt = numOrNull(row.finished_at)
+  const duration = numOrNull(row.duration_sec)
+  const stages = (Array.isArray(row.stages) ? row.stages : []).map(String)
+  const repo = String(row.repo || '')
+  return {
+    id: String(row.id || ''),
+    repo,
+    repoLabel: repoLabel(repo),
+    title: fmtTitle(row.title, 90),
+    titleFull: String(row.title || ''),
+    assignee: String(row.assignee || '—'),
+    status: String(row.status || ''),
+    statusLabel: meta.label,
+    tone: meta.tone,
+    createdAt: numOrNull(row.created_at),
+    createdText: fmtClock(row.created_at),
+    finishedAt,
+    finishedText: fmtClock(finishedAt),
+    // `null` — факта закрытия в журнале нет: «время не записано» честнее нуля.
+    duration,
+    durationText: duration === null ? '—' : fmtAge(duration),
+    cause: String(row.cause || ''),
+    causeText: String(row.cause || '') || 'причина не записана',
+    stages,
+    stagesText: stages.join(' → ') || '—',
+    attempts: Number(row.attempts) || 0,
+    questions: {
+      asked: askCount,
+      answered: Number(questions.answered) || 0,
+      waiting: waitCount,
+      text: questionsText(questions),
+    },
+    published: fmtPublication(row.published),
+    search: `${repo} ${row.id || ''} ${row.title || ''} ${row.assignee || ''} ${row.status || ''}`.toLowerCase(),
+  }
+}
+
+/**
+ * Модель экрана «Завершённые» из ответа `/deals`.
+ *
+ * Порядок — ответа бэкенда (свежие сверху), группы — по `repo` тем же
+ * `groupDeals`, что у «Сейчас»: внутри группы строки остаются свежими, а имена
+ * групп совпадают с `bin/duty deals`. `note` — причина пустоты словами бэкенда
+ * («закрытых дел нет» / «store не прочитался» / «в этом репозитории нет»),
+ * экран её печатает, а не выдумывает свою.
+ */
+function shapeFinished(payload) {
+  const data = payload && typeof payload === 'object' ? payload : {}
+  const deals = (Array.isArray(data.deals) ? data.deals : []).map(shapeFinishedRow)
+  const errors = (Array.isArray(data.errors) ? data.errors : []).map((error) => ({
+    source: String((error && error.source) || 'источник'),
+    reason: String((error && error.reason) || 'причина не записана'),
+  }))
+  return {
+    now: numOrNull(data.now),
+    deals,
+    groups: groupDeals(deals),
+    count: deals.length,
+    total: Number(data.total) || 0,
+    limit: Number(data.limit) || 0,
+    truncated: data.truncated === true,
+    statuses: (Array.isArray(data.statuses) ? data.statuses : []).map(String),
+    note: String(data.note || ''),
+    errors,
   }
 }
 
@@ -1220,20 +1352,8 @@ function shapeDealTime(detail, attemptsPayload) {
   const pubRaw = d.published && typeof d.published === 'object'
     ? d.published
     : summaryFields(pubEvent && pubEvent.summary, ['sha', 'branch', 'ref', 'verified_by', 'mr_url'])
-  const pub = Object.keys(pubRaw).length ? pubRaw : null
-  const published = pub
-    ? {
-        sha: String(pub.sha || ''),
-        shaShort: String(pub.sha || '').slice(0, 8),
-        branch: String(pub.branch || ''),
-        ref: String(pub.ref || ''),
-        mrUrl: String(pub.mr_url || ''),
-        verifiedBy: String(pub.verified_by || ''),
-        text: [String(pub.sha || '').slice(0, 8), String(pub.branch || pub.ref || ''), String(pub.verified_by || '')]
-          .filter(Boolean)
-          .join(' · '),
-      }
-    : null
+  // Форма публикации одна с экраном «Завершённые»: `fmtPublication`.
+  const published = fmtPublication(pubRaw)
   // Закрытие: поле ответа, иначе событие журнала (`completed`/`blocked`/`failed`
   // с `cause`) — тот же факт, что рисует маркер `closed`.
   const closedEvent = [...events].reverse().find((event) => markerType(event.kind, event.summary) === 'closed')
@@ -1381,6 +1501,7 @@ const CSS = `
 .duty-tax-track{height:7px;border-radius:4px;background:var(--ui-bg-quaternary);overflow:hidden}
 .duty-tax-fill{height:7px;border-radius:4px}
 .duty-health-table td{white-space:nowrap;text-overflow:ellipsis}
+.duty-finished-table td{white-space:nowrap;text-overflow:ellipsis}
 .duty-deal-head{display:flex;flex-direction:column;gap:6px;border:1px solid var(--ui-stroke-tertiary);border-radius:8px;padding:10px 12px;margin-bottom:12px}
 .duty-deal-title{font-size:13px;font-weight:600;word-break:break-word}
 .duty-deal-facts{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--ui-text-secondary)}
@@ -1501,6 +1622,43 @@ function useStats(enabled) {
       if (alive.current) setSnap({ data, error: null, loading: false })
     } catch (error) {
       // Прошлый снимок не затираем: экран не мигает пустотой при обрыве.
+      if (alive.current) setSnap((prev) => ({ data: prev.data, error: errText(error), loading: false }))
+    }
+  }, [])
+
+  useEffect(() => {
+    alive.current = true
+    if (!enabled) return () => { alive.current = false }
+    void load()
+    const timer = setInterval(() => void load(), STATS_REFRESH_MS)
+    return () => {
+      alive.current = false
+      clearInterval(timer)
+    }
+  }, [enabled, load])
+
+  return { ...snap, reload: load }
+}
+
+/* ---------------- данные: «завершённые» (0.0.7) ---------------- */
+
+/**
+ * Экран «Завершённые»: `GET /deals` — список закрытых дел.
+ *
+ * Запрашивается только когда экран открыт: это чтение всей истории закрытых
+ * дел, и держать его в памяти «Сейчас» незачем. Прошлый снимок не затирается
+ * ошибкой — экран не мигает пустотой при обрыве.
+ */
+function useFinishedFeeds(enabled) {
+  const [snap, setSnap] = useState({ data: null, error: null, loading: false })
+  const alive = useRef(true)
+
+  const load = useCallback(async () => {
+    setSnap((prev) => ({ ...prev, loading: true }))
+    try {
+      const data = await rest('/deals', { timeoutMs: REQUEST_TIMEOUT_MS })
+      if (alive.current) setSnap({ data, error: null, loading: false })
+    } catch (error) {
       if (alive.current) setSnap((prev) => ({ data: prev.data, error: errText(error), loading: false }))
     }
   }, [])
@@ -2232,6 +2390,163 @@ function HealthScreen({ stats }) {
   )
 }
 
+/* ---------------- экран «завершённые» (0.0.7) ---------------- */
+
+/**
+ * Список закрытых дел: причина, этапы, попытки, вопросы, длительность, публикация.
+ *
+ * Числа — поля ответа `/deals` (`shapeFinished`, шейпер общий с вебом): ни
+ * страница, ни шейпер их не пересчитывают, иначе строка списка спорила бы с
+ * карточкой того же дела (`bin/duty deal <id>`).
+ */
+function FinishedTable({ group, onPick }) {
+  return h(
+    'table',
+    { className: 'duty-table duty-finished-table' },
+    h(
+      'thead',
+      null,
+      h(
+        'tr',
+        null,
+        h('th', null, 'закрыто'),
+        h('th', null, 'дело'),
+        h('th', null, 'заголовок'),
+        h('th', null, 'статус'),
+        h('th', null, 'попыток'),
+        h('th', null, 'вопросов'),
+        h('th', null, 'длительность'),
+        h('th', null, 'причина'),
+        h('th', null, 'этапы'),
+        h('th', null, 'публикация'),
+      ),
+    ),
+    h(
+      'tbody',
+      null,
+      ...group.deals.map((deal) =>
+        h(
+          'tr',
+          {
+            key: deal.id,
+            className: 'duty-row',
+            title: [deal.repoLabel, deal.causeText].filter(Boolean).join(' · '),
+            onClick: () => onPick(deal),
+          },
+          h('td', { className: 'duty-mono' }, deal.finishedText),
+          h('td', { className: 'duty-mono', title: deal.id }, deal.id),
+          h('td', { title: deal.titleFull }, deal.title),
+          h('td', null, h(StateBadge, { label: deal.statusLabel, tone: deal.tone, title: deal.status })),
+          h('td', { className: 'duty-num', title: 'попыток в журнале' }, `${deal.attempts}`),
+          h('td', { className: 'duty-num', title: 'вопросы человеку по журналу' }, deal.questions.text),
+          h('td', { className: 'duty-num', title: 'длительность дела: события журнала и попытки' }, deal.durationText),
+          h('td', { title: deal.causeText }, deal.causeText),
+          h('td', { className: 'duty-muted', title: deal.stagesText }, deal.stagesText),
+          h(
+            'td',
+            {
+              className: 'duty-muted',
+              title: deal.published ? deal.published.mrUrl || deal.published.ref || 'факт журнала' : 'публикации нет',
+            },
+            deal.published ? deal.published.text : '—',
+          ),
+        ),
+      ),
+    ),
+  )
+}
+
+function FinishedScreen({ finished, onPick }) {
+  if (finished.error && !finished.data) {
+    return h(
+      'div',
+      { className: 'duty-scroll' },
+      h(
+        'div',
+        { className: 'duty-banner', style: { margin: 0 } },
+        h('span', null, finished.error),
+        h(Button, { size: 'xs', variant: 'secondary', onClick: () => void finished.reload() }, 'повторить'),
+      ),
+    )
+  }
+  if (!finished.data) {
+    return h(
+      'div',
+      { className: 'duty-scroll' },
+      h(
+        'div',
+        { className: 'duty-skel-row' },
+        ...Array.from({ length: 5 }, (_, i) => h('div', { className: 'duty-skel', key: `fs-${i}`, style: { width: `${92 - i * 10}%` } })),
+      ),
+    )
+  }
+  const model = shapeFinished(finished.data)
+  return h(
+    'div',
+    { className: 'duty-scroll' },
+    finished.error
+      ? h(
+          'div',
+          { className: 'duty-banner', style: { margin: '0 0 10px' } },
+          h('span', null, `снимок не обновлён: ${finished.error}`),
+          h(Button, { size: 'xs', variant: 'secondary', onClick: () => void finished.reload() }, 'повторить'),
+        )
+      : null,
+    model.errors.length
+      ? h(
+          'div',
+          { className: 'duty-note', style: { margin: '0 0 10px' } },
+          ...model.errors.map((err, i) => h('div', { key: `fe-${i}` }, `источник ${err.source} недоступен: ${err.reason}`)),
+        )
+      : null,
+    // Что это за список — словами: `/now` про активные, здесь — про сделанное.
+    h(
+      'div',
+      { className: 'duty-muted', style: { margin: '0 0 10px' } },
+      'здесь только завершённые дела — закрытые и архивные: причина закрытия, этапы, попытки, вопросы и длительность из журнала; карточки kanban — отдельное наблюдение, не дела',
+    ),
+    h(
+      'div',
+      { className: 'duty-muted duty-num', style: { margin: '0 0 10px' } },
+      `дел: ${model.count} из ${model.total} · статусы: ${model.statuses.join(', ') || '—'}`,
+    ),
+    model.truncated
+      ? h(
+          'div',
+          { className: 'duty-note', style: { margin: '0 0 10px' } },
+          h('div', null, `показаны не все: лимит ${model.limit}, всего ${model.total} — список режется лимитом /deals`),
+        )
+      : null,
+    model.count
+      ? h(
+          'div',
+          { className: 'duty-list' },
+          ...model.groups.map((group) =>
+            h(
+              'section',
+              { className: 'duty-group', key: `fd-${group.repo || 'without'}` },
+              h(
+                'div',
+                { className: 'duty-group-h' },
+                h('span', { className: group.repo ? 'duty-mono' : 'duty-mono duty-muted', title: group.repo || 'репозиторий не назван' }, group.label),
+                h('span', { className: 'duty-num' }, `${group.count}`),
+                h('span', { className: 'duty-spacer' }),
+                h('span', { className: 'duty-muted' }, `свежее закрытие: ${group.deals[0].finishedText}`),
+              ),
+              h(FinishedTable, { group, onPick }),
+            ),
+          ),
+        )
+      : h(
+          'div',
+          { className: 'duty-empty' },
+          h('b', null, 'завершённых дел нет'),
+          // Причина пустоты — словами бэкенда (`note`), а не своя догадка.
+          h('span', { className: 'duty-muted' }, model.note || 'в store нет ни одного закрытого дела'),
+        ),
+  )
+}
+
 /* ---------------- экран «дело» ---------------- */
 
 function DealScreen({ sel, onBack }) {
@@ -2350,6 +2665,8 @@ function DutyPage() {
   const [tick, setTick] = useState(() => Date.now())
   // «Здоровье» запрашивается только когда экран открыт: это скан всех досок.
   const stats = useStats(screen === 'health')
+  // «Завершённые» — тоже по требованию: список закрытых дел не нужен «Сейчас».
+  const finished = useFinishedFeeds(screen === 'deals')
 
   // Поиск — локальный и с задержкой: данные не перезапрашиваются на каждый символ.
   useEffect(() => {
@@ -2588,6 +2905,8 @@ function DutyPage() {
       : h('div', { className: 'duty-scroll' }, h('div', { className: 'duty-skel-row' }, ...Array.from({ length: 6 }, (_, i) => h('div', { className: 'duty-skel', key: `ws-${i}`, style: { width: `${95 - i * 8}%` } }))))
   } else if (screen === 'health') {
     content = h(HealthScreen, { stats })
+  } else if (screen === 'deals') {
+    content = h(FinishedScreen, { finished, onPick: pick })
   } else {
     content = h('div', { className: 'duty-body' }, list)
   }

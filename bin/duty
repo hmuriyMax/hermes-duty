@@ -5,6 +5,8 @@
     bin/duty deal <deal_id>
     bin/duty attempts <deal_id>
     bin/duty stats [--repo R] [--since D]
+    bin/duty deals [--status done,archived] [--repo R] [--limit N]
+                                       (завершённые дела: причина, этапы, числа журнала)
     bin/duty why <deal_id>
     bin/duty why <deal_id> <этап>   (плюс приговор последней попытки этапа)
     bin/duty watch [--interval 10]

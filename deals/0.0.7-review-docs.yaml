@@ -55,6 +55,11 @@ stages:
     role: tester
     needs: [review]
     workspace: worktree
+    # Приговор — не только у ревьюера: проверка тоже судит («сошлось / не сошлось»),
+    # а `commit|artifacts` у неё нет по природе — она ничего не производит. Без
+    # приговора гейт ждал бы от тестировщика новый коммит и отвергал базу как
+    # «чужое готовое» (`commit.foreign`).
+    verdict: {approve: next, changes: check, max_rounds: 1}
     evidence:
       # `HERMES_HOME` задан явно: у профиля воркера (`profiles/tester`) своего store и пула
       # нет, и `bin/duty now`/`deals` там честно деградируют кодом 2 — это окружение

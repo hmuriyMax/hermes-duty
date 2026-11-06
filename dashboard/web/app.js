@@ -1126,7 +1126,9 @@ function markerLegend(scale) {
     ...seen.map((marker) =>
       h('span', { class: `t-${marker.tone}` }, `${MARKER_GLYPH[marker.type] || '•'} ${marker.label}`),
     ),
-    h('span', { class: 'muted' }, '· засечки — старт и конец попыток'),
+    // Про засечки старта/конца здесь молчим: их больше нет, длительность
+    // показывает фон попытки, а факты — палки-маркеры.
+
   )
 }
 

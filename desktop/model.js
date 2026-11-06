@@ -1103,7 +1103,7 @@ function layoutCalls(calls, options) {
 const SPEC_NODE = { w: 76, h: 18, gapX: 14, gapY: 6 }
 
 // Геометрия строки попытки: полоса фона, уровни чипов и строка маркеров.
-const TL = { collapsed: 20, levelH: 12, top: 6, maxLevels: 5, pad: 8, marksH: 12 }
+const TL = { collapsed: 20, levelH: 12, top: 6, maxLevels: 5, pad: 8 }
 
 // Узлы графа спеки — мелкие: это схема зависимостей, а не главный объект экрана.
 
@@ -1253,8 +1253,11 @@ function attemptView(bar, scale) {
   // Свёрнутая строка показывает первый уровень вызовов и маркеры; остальные
   // уровни раскрываются по наведению. Высоту считает шейпер — иначе две
   // поверхности разойдутся в том, «сколько строки видно без наведения».
-  const full = Math.max(TL.collapsed, layout.height + TL.pad + (marks.length ? TL.marksH : 0))
-  const collapsed = Math.min(full, TL.collapsed + (marks.length ? TL.marksH : 0))
+  // Маркеры журнала рисуются вертикальными палками на всю высоту строки, поэтому
+  // отдельной полосы под чипами больше нет: высота строки не зависит от того,
+  // случился ли в ней вердикт, — иначе соседние попытки разъезжались по высоте.
+  const full = Math.max(TL.collapsed, layout.height + TL.pad)
+  const collapsed = Math.min(full, TL.collapsed)
   return {
     full,
     collapsed,

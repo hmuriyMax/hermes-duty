@@ -600,8 +600,9 @@ test('разворот строки: свёрнутая высота меньш�
   assert.ok(view.collapsed > 0 && view.collapsed < view.full, `свёрнутая ${view.collapsed}, полная ${view.full}`)
   // Свёрнутая высота — первый уровень плюс строка маркеров, иначе точки фактов
   // исчезали бы вместе с глубокими чипами.
-  // 20 px — свёрнутая строка из `TL.collapsed`, 12 px — строка маркеров (`TL.marksH`).
-  assert.equal(view.collapsed, 20 + (view.marks.length ? 12 : 0))
+  // 20 px — свёрнутая строка (`TL.collapsed`): маркеры рисуются палками поверх
+  // строки, отдельной полосы под чипами больше нет, высота от них не зависит.
+  assert.equal(view.collapsed, 20)
   // Уровень приходит в вид: поверхности прячут глубокие чипы, не считая сами.
   assert.deepEqual([...new Set(view.chips.map((chip) => chip.level))].sort(), [...levels].sort())
 })

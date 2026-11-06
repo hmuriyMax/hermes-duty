@@ -1152,7 +1152,7 @@ function layoutCalls(calls, options) {
 const SPEC_NODE = { w: 76, h: 18, gapX: 14, gapY: 6 }
 
 // Геометрия строки попытки: полоса фона, уровни чипов и строка маркеров.
-const TL = { collapsed: 20, levelH: 12, top: 6, maxLevels: 5, pad: 8, marksH: 12 }
+const TL = { collapsed: 20, levelH: 12, top: 6, maxLevels: 5, pad: 8 }
 
 // Узлы графа спеки — мелкие: это схема зависимостей, а не главный объект экрана.
 
@@ -1302,8 +1302,11 @@ function attemptView(bar, scale) {
   // Свёрнутая строка показывает первый уровень вызовов и маркеры; остальные
   // уровни раскрываются по наведению. Высоту считает шейпер — иначе две
   // поверхности разойдутся в том, «сколько строки видно без наведения».
-  const full = Math.max(TL.collapsed, layout.height + TL.pad + (marks.length ? TL.marksH : 0))
-  const collapsed = Math.min(full, TL.collapsed + (marks.length ? TL.marksH : 0))
+  // Маркеры журнала рисуются вертикальными палками на всю высоту строки, поэтому
+  // отдельной полосы под чипами больше нет: высота строки не зависит от того,
+  // случился ли в ней вердикт, — иначе соседние попытки разъезжались по высоте.
+  const full = Math.max(TL.collapsed, layout.height + TL.pad)
+  const collapsed = Math.min(full, TL.collapsed)
   return {
     full,
     collapsed,
@@ -2229,9 +2232,11 @@ const CSS = `
 /* Пауза «вопрос → ответ»: время, которое дело стояло на человеке. */
 .duty-tl-wait{position:absolute;top:1px;bottom:1px;border-radius:3px;background:color-mix(in srgb, var(--ui-yellow) 26%, transparent);border-left:1.5px solid var(--ui-yellow);border-right:1.5px solid var(--ui-yellow)}
 /* Маркеры событий — внутри строки той попытки, где событие произошло. */
-.duty-tl-marks{position:absolute;left:0;right:0;bottom:-1px;height:11px}
-.duty-tl-mark{position:absolute;bottom:0;transform:translateX(-50%);line-height:0}
-.duty-tl-mark i{display:block;width:6px;height:6px;border-radius:50%;background:currentColor}
+/* Маркеры журнала — вертикальные палки на всю высоту строки: точка на нижней кромке
+ * убегала при разворачивании, а палка стоит на своём времени всегда. */
+.duty-tl-marks{position:absolute;inset:0;pointer-events:none}
+.duty-tl-mark{position:absolute;top:-3px;bottom:-3px;width:3px;transform:translateX(-50%);pointer-events:auto}
+.duty-tl-mark i{display:block;width:100%;height:100%;border-radius:2px;background:currentColor;opacity:.9}
 .duty-tl-mark.t-green{color:var(--ui-green)}
 .duty-tl-mark.t-red{color:var(--ui-red)}
 .duty-tl-mark.t-yellow{color:var(--ui-yellow)}

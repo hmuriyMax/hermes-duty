@@ -173,6 +173,14 @@ test('разворот строки и правки экрана дела: пр�
   assert.match(app, /--tl-collapsed:\$\{view\.collapsed\}px;--tl-full:\$\{view\.full\}px/, 'веб не передаёт высоты из шейпера')
   assert.match(plugin, /'--duty-tl-collapsed':\s*`\$\{view\.collapsed\}px`/, 'десктоп не передаёт высоты из шейпера')
 
+  // Маркеры — палки на всю высоту строки, а не точки на нижней кромке: точка
+  // уезжала при разворачивании, потому что жила в отдельной полосе под чипами.
+  for (const [name, text] of [['веб', css], ['десктоп', plugin]]) {
+    assert.match(text, /tl-marks?\s*\{[^}]*inset:\s*0/, `${name}: контейнер маркеров не на всю строку`)
+    assert.match(text, /tl-mark\s*\{[^}]*top:\s*-3px[^}]*bottom:\s*-3px/, `${name}: маркер не тянется по высоте`)
+    assert.doesNotMatch(text, /tl-mark i\s*\{[^}]*border-radius:\s*50%/, `${name}: маркер снова точка`)
+  }
+
   // Подсказки переносятся по словам, а не висят одной строкой.
   for (const [name, text] of [['веб', css], ['десктоп', plugin]]) {
     const rule = text.slice(text.indexOf('content:attr(data-tip)') >= 0 ? text.indexOf('content:attr(data-tip)') - 400 : text.indexOf('content: attr(data-tip)') - 400)

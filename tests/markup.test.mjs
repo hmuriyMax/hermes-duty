@@ -79,3 +79,35 @@ test('веб создаёт svg в SVG-namespace, а не через createEleme
   // и роняет всю отрисовку, поэтому класс ставится только атрибутом.
   assert.doesNotMatch(app, /el\.className\s*=/, 'класс у svg ставится setAttribute, а не className')
 })
+
+/**
+ * Каждый тег, который разметка создаёт через `h('<tag>')`, обязан быть
+ * классифицирован: либо он в `SVG_TAGS` (тогда namespace правильный), либо в
+ * HTML-списке ниже. Новый элемент (`polygon`, `text`, `tspan`) без классификации
+ * снова даст «класс есть, правило есть, элемента не видно» — этот тест требует
+ * принять решение при добавлении, а не после жалобы.
+ */
+const HTML_TAGS = [
+  'a', 'article', 'b', 'br', 'button', 'code', 'div', 'em', 'h1', 'h2', 'h3', 'h4', 'hr', 'i',
+  'input', 'label', 'li', 'ol', 'option', 'p', 'pre', 'section', 'select', 'small',
+  'span', 'strong', 'table', 'tbody', 'td', 'textarea', 'th', 'thead', 'tr', 'ul',
+]
+
+test('веб: каждый тег разметки классифицирован (svg-namespace либо HTML)', () => {
+  const app = read('../dashboard/web/app.js')
+  const svgTags = new Set((/SVG_TAGS\s*=\s*new Set\(\[([^\]]*)\]\)/.exec(app)?.[1] || '')
+    .split(',')
+    .map((part) => part.trim().replace(/^['"]|['"]$/g, ''))
+    .filter(Boolean))
+  assert.ok(svgTags.size > 0, 'SVG_TAGS не разобран — проверка потеряла предмет')
+
+  const used = new Set([...app.matchAll(/(?<![\w.$])h\(\s*'([a-z][a-z0-9]*)'/g)].map((hit) => hit[1]))
+  assert.ok(used.size > 5, 'в разметке мало тегов — регулярка не совпала с кодом')
+
+  const unknown = [...used].filter((tag) => !svgTags.has(tag) && !HTML_TAGS.includes(tag))
+  assert.deepEqual(
+    unknown,
+    [],
+    `не классифицированы: ${unknown.join(', ')} — добавить в SVG_TAGS (если это svg-элемент) или в HTML_TAGS теста`,
+  )
+})

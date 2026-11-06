@@ -808,6 +808,26 @@ test('шкала времени: маркеры — только факты жу
   assert.equal(scale.counts.lanes, 2)
 })
 
+test('ось: метка, попадающая под подпись края, не рисуется', () => {
+  // Дело на 30 минут: шаг 5 минут, первая метка пришлась на 7.8 % — её линия
+  // перечёркивала бы «нач. 13:37:35», поэтому в резерве края метки нет вовсе.
+  const start = 1793957855
+  const end = 1793959708
+  const scale = shapeDealTime(
+    { terminal: true, closed: { at: end, cause: 'all_stages_done' }, timeline: [] },
+    { attempts: [{ n: 1, attempt: 1, stage: 'verify', start, end, outcome: 'done', status: 'completed', calls: [] }] },
+  )
+  const centers = scale.axis.ticks.filter((tick) => tick.align === 'center')
+  const edge = scale.axis.ticks.filter((tick) => tick.align !== 'center')
+  assert.equal(edge.length, 2, 'подписи краёв на месте')
+  // Резерв края — 12 %: первая метка сетки (7.8 % от начала) не рисуется, и ни
+  // одна подпись метки не заходит на подписи «нач./кон.».
+  assert.ok(centers.length >= 2, 'сетка не опустела')
+  for (const tick of centers) {
+    assert.ok(tick.pct >= 12 && tick.pct <= 88, `метка ${tick.clock} в резерве края (${tick.pct} %)`)
+  }
+})
+
 test('провал называет причину и класс отказа в подсказке попытки', () => {
   const attempts = {
     attempts: [

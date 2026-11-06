@@ -1212,6 +1212,12 @@ function layoutCalls(calls, options) {
 const SPEC_NODE = { w: 76, h: 18, gapX: 14, gapY: 6 }
 
 // Геометрия строки попытки: полоса фона, уровни чипов и строка маркеров.
+// Резерв оси под подписи краёв («нач. 13:37:35», «кон. 14:08:28»): метка
+// центрируется на своей вертикали, поэтому линия метки проходит через текст
+// подписи края. Доля считается от ширины графика в 900 px: подпись края там
+// занимает 8 %, половина подписи метки — ещё 2.7 %.
+const TICK_EDGE_RESERVE_PCT = 12
+
 const TL = { collapsed: 20, levelH: 12, top: 6, maxLevels: 5, pad: 8 }
 
 // Узлы графа спеки — мелкие: это схема зависимостей, а не главный объект экрана.
@@ -1943,8 +1949,12 @@ function shapeDealTime(detail, attemptsPayload) {
     axisTicks.push({ pct: 0, edge: 'нач.', align: 'start', clock: fmtClock(axisStart) })
     for (let at = Math.ceil(axisStart / step) * step; at < axisEnd; at += step) {
       const pct = Math.round(((at - axisStart) / durationSec) * 1000) / 10
-      // Метка впритык к краю наезжает на подписи начала/конца — её не рисуем.
-      if (pct < 6 || pct > 94) continue
+      // Подписи краёв широкие («нач. 13:37:35» — двенадцать знаков), а метка
+      // центрируется на своей линии: её текст и вертикаль заходят на подпись
+      // края. Резерв — ширина подписи края (8 % при графике в 900 px) плюс
+      // половина подписи метки, итого 12 %; внутри него метку не рисуем вовсе,
+      // чтобы её линия не перечёркивала слово.
+      if (pct < TICK_EDGE_RESERVE_PCT || pct > 100 - TICK_EDGE_RESERVE_PCT) continue
       axisTicks.push({ pct, edge: '', align: 'center', clock: fmtClock(at) })
     }
     axisTicks.push({ pct: 100, edge: 'кон.', align: 'end', clock: fmtClock(axisEnd) })

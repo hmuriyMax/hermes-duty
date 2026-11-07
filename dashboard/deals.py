@@ -1317,6 +1317,56 @@ def _last_completion(events: Iterable[dict[str, Any]]) -> Optional[dict[str, Any
     return None
 
 
+# Источник фактов движка, когда модуль не назвал его сам (`runner.ENGINE_SOURCE`).
+# Своё `deals.py` не грузит `runner` — тот грузит `deals`, и обратный импорт замкнул
+# бы модули друг на друга. Значение одно на плагин: строка ниже — то же слово.
+ENGINE_SOURCE = "engine"
+
+
+def release_deal(
+    conn: sqlite3.Connection,
+    deal_id: str,
+    *,
+    payload: dict[str, Any],
+    after: int,
+    source: str = ENGINE_SOURCE,
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Отпустить дело: событие `released` и строка `ready`/`todo` одной транзакцией.
+
+    Это недостающий факт «движок отпустил дело», а не второе мнение о состоянии:
+    писателя у решения `transit` до 0.0.8 не было, и дело, чья попытка закончилась
+    при ушедшем движке, висело `running`, пока его не заметит человек (живое дело
+    `d_eb4ad2bb`: 7.5 часа `running` при записанном `attempt_ended failed/infra`).
+
+    Отпущенное дело возвращается **в очередь**, а не в новое состояние: `ready`,
+    если гейт по родителям открыт, иначе `todo` — то же правило и тот же источник,
+    что у `set_unblocked`. «Почему стоит» называет журнал: `fold` после `released`
+    даёт `no_live_fact`, и поверхность говорит `wait_slot` с доказательством.
+
+    `from`/`to` дописываются здесь, а не вызывающим: их знает только строка store.
+    Остальной `payload` приходит готовым (`run_id`, `stage`, `attempt`, `decision`,
+    `wait`, `idle_sec`, `reason`) — пересказывать решение второй раз не нужно.
+
+    Идемпотентность — ключом события от `after` (id последнего state-changing
+    факта **до** отпускания, не считая сам `released`): повторный проход даёт тот же
+    ключ, `INSERT OR IGNORE` его отбрасывает, и `updated_at` не двигается. `after`
+    в payload не едет: это основание ключа, а не факт дела.
+    """
+    now = _now_sec() if now is None else int(now)
+    deal = _require_row(conn, deal_id)
+    _reject_archived(deal, "release")
+    if str(deal["status"]) != "running":
+        raise DealError(
+            f"release: дело {deal['id']} не в работе (status={deal['status']}) — "
+            "отпускать нечего: строку ставит только прерванный движок"
+        )
+    target = "ready" if gate_open(conn, str(deal["id"])) else "todo"
+    body = {**payload, "from": str(deal["status"]), "to": target}
+    event = _event(deal, "released", body, source, {"after": int(after)}, now)
+    return _apply(conn, deal, [event], target, now)
+
+
 def live_lease_of(
     conn: sqlite3.Connection, deal_id: str, *, now: Optional[int] = None
 ) -> Optional[dict[str, Any]]:

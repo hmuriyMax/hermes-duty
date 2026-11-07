@@ -88,6 +88,9 @@ CAPABILITY_WORDS = (
 # `attempt_progress` — шаг попытки движка (вызов инструмента или его результат):
 # состояние дела он не меняет, но без него «что делает прямо сейчас» не видно в
 # журнале и разбор зависаний снова требует ps и хвостов логов.
+# `released` — движок отпустил дело, оставив его `running`: попытка закончилась,
+# а продолжения не было (`dashboard/release.py`). Факт меняет строку store
+# (`running` → `ready`/`todo`), поэтому в `NON_STATE_KINDS` его нет.
 EVENT_KINDS = (
     "created",
     "claimed",
@@ -95,6 +98,7 @@ EVENT_KINDS = (
     "attempt_started",
     "attempt_progress",
     "attempt_ended",
+    "released",
     "blocked",
     "unblocked",
     "completed",
@@ -209,6 +213,10 @@ INGEST_EVENT_KINDS = ("created", "claimed", "blocked", "unblocked", "completed",
 # одобрение одного дела не должны читаться как «ревью пройдено» в обратном
 # порядке. `gate_opened`/`gate_closed` — раньше `completed`, чтобы гейт не
 # перечитал закрытие как открытие.
+#
+# `released` — между `lease_lost` и `completed`: отпускание и закрытие одного
+# дела в одну секунду обязаны примениться в этом порядке, иначе `_last_state_event`
+# прочитал бы закрытое дело как отпущенное (а `released` — state-changing вид).
 KIND_ORDER = (
     "created",
     "patched",
@@ -231,6 +239,7 @@ KIND_ORDER = (
     "gate_closed",
     "published",
     "lease_lost",
+    "released",
     "completed",
 )
 

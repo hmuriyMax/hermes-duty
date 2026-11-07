@@ -1558,6 +1558,13 @@ test('журнал попытки — сводкой по видам, а не с
   assert.equal(eventsSummary(null), '')
 })
 
+test('отпускание дела — своим словом в сводке журнала', () => {
+  // `released` (0.0.8) — факт движка, а не служебное имя: в столбце 320 px он
+  // обязан читаться словом, как соседние виды событий.
+  assert.equal(eventsSummary([{ kind: 'released' }]), '1 отпускание')
+  assert.equal(eventsSummary(Array.from({ length: 5 }, () => ({ kind: 'released' }))), '5 отпусканий')
+})
+
 test('сводка журнала доезжает до строки попытки, а не остаётся в шейпере', () => {
   const timeline = shapeAttempts({
     attempts: [

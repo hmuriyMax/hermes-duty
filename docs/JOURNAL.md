@@ -53,6 +53,7 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 | `attempt_started` | открылся ран в `task_runs` (движок: попытка заспавнена) | `run_id`, `pid`, `stage`, `attempt`, `cmd`, `stage_kind` (только у `kind: shell` — `shell`; отсутствие ключа читается как `agent`), `shell_cmd` (у `shell` — строка `cmd` из спеки), `cwd`, `workdir`, `tree`, `base` (фактическая база дерева — коммит, от которого этап отведён), `lease_expires`, `contract` — фактическая команда и вход целиком |
 | `attempt_progress` | шаг попытки движка: вызов инструмента или его результат (телеметрия, состояние дела не меняет) | `stage`, `attempt`, `seq`, `phase` (`tool_use`/`tool_result`), `name`, `duration_ms` (только у результата), `ts` |
 | `attempt_ended` | ран закрыт (движок: попытка отчиталась, не отчиталась или упала; `done` — только при принятом evidence-пакете; `reaped: true` — попытку закрыл `reaper.sweep`, отчёта от неё не было; `refused: true` в `details` — попытку не поднимали вовсе: потолок дела исчерпан (`details.budget`: `{kind, used, limit}`) или нет «ок» человека на это дерево (`details.publish`); у `shell`-попытки в `details` — `exit_code`, `duration_sec`, `must`, `timed_out`, хвосты `stdout_tail`/`stderr_tail`; у гейта — `stage_kind: gate`, `question_id`, `answer`, `allow`) | `run_id`, `stage`, `attempt`, `outcome` (`done`/`failed`), `kind` (`infra`/`contract`/`capability`/`null`), `reason`, `base` (база дерева попытки), `commit` (что произвела принятая попытка — коммит движка в её дереве или коммит исполнителя; от него отводится дерево следующего этапа; `null` — произвести было нечего), `details` (в том числе `witness` — принятый свидетель пакета: `commit\|artifacts` / `verdict` / `published`; `verdict`: вердикт гейта с `details`), `result` (если отчёт разобран), `reaped` (только у убранных), `pid` (у убранных — из `attempt_started`) |
+| `released` | движок отпустил дело, оставившееся `running`: попытка закончилась, а продолжения не было (таймаут, `--once`, предел шагов, Ctrl-C, прогон, убитый между шагом и решением). Пишет `dashboard/release.py` — проход, материализующий ответ `transit`: `run`/`wait(retry)` → этот факт и строка `ready`/`todo`; `done`/`failed`/`park` пишутся своими фактами (`completed`, `blocked`), а не `released` | `run_id`, `stage`, `attempt`, `decision` (`run`/`wait`), `wait` (`retry` или `null`), `idle_sec` (сколько журнал молчал), `from`/`to` (строка до и после), `reason` |
 | `blocked` | `status=blocked` | `block_kind`, `reason` |
 | `unblocked` | был `blocked`, стал иной статус | `previous_kind` |
 | `completed` | `status=done` (или `archived` как отдельный факт: переносится тем же `completed` со `status="archived"`) | `status` |
@@ -89,6 +90,15 @@ fold (14), а не второй вид на каждое событие попы
 публикация это факт о дереве. Пишет его только движок и только после сверки с origin:
 исполнитель заявляет `published` в `result.json`, но заявка без подтверждения даёт
 отказ класса `contract` («публикация заявлена, но не найдена»), а не факт журнала.
+
+`released` заведён движком 0.0.8 (`dashboard/release.py`) и, наоборот, **state-changing**:
+он ставит строке дела `ready`/`todo` и потому в `NON_STATE_KINDS` не входит. Дело он при
+этом не закрывает: `completed` — единственный факт закрытия (`_closed_kind`), поэтому
+после `released` `fold` честно отвечает `no_live_fact`, а поверхность показывает
+`wait_slot` («идущей попытки нет, следующего шага движка не было»), а не `no_signal`.
+Пишется он ровно там, где ответ `transit` — `run` или `wait(retry)`: если журнал говорит
+`done`, `failed` или `park`, факт называется своим словом (`completed`, `blocked`), и
+`released` вместо них был бы вторым мнением о том, что решил граф.
 
 ### Вид этапа и расход попытки: поля 0.0.5
 

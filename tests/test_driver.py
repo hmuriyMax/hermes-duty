@@ -630,6 +630,11 @@ def test_sigint_terminates_child_and_exits_130(tmp_path: Path) -> None:
     assert fake.stopped == 1, "долгожитель получил terminate, а не остался сиротой"
     assert leases(conn, deal) == []
     assert cli.render_run_final(report).startswith("итог: прервано")
+    # Ctrl-C — тот же уход движка: прерванная попытка записана, продолжения не
+    # было, и строка не смеет остаться `running` (правило 11).
+    assert report["released"] == 1
+    assert deals.deal_row(conn, deal["id"])["status"] == "ready"
+    assert "released" in [str(event["kind"]) for event in journal.read_events(conn, str(deal["id"]))]
 
 
 def test_leases_released_after_done(tmp_path: Path) -> None:
@@ -694,6 +699,8 @@ def test_json_report_schema(tmp_path: Path) -> None:
         "decision",
         "closed",
         "parked",
+        "released",
+        "release_errors",
         "exit_code",
     }
     assert restored["deal"] == deal["id"]
@@ -706,6 +713,10 @@ def test_json_report_schema(tmp_path: Path) -> None:
     # и «синк не звали» читатель `--json` обязан различать.
     assert restored["answers"] == {"appended": 0}
     assert restored["answers_errors"] == []
+    # Отпусканий в успешном прогоне нет: дело закрыто фактом `completed`, а не
+    # брошено движком. Число и список ошибок есть всегда — по той же причине.
+    assert restored["released"] == 0
+    assert restored["release_errors"] == []
     # Закрытие — не строка вывода, а факт: в отчёте он назван той же формой, что
     # читает консоль, и `--json` не отличается от человеческой строки.
     assert set(restored["closed"]) == {

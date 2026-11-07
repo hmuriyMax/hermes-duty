@@ -70,6 +70,15 @@ Python — то есть гейт «дело проходит impl → verify �
    бы вечно, хотя места в бюджете уже нет. Никакого счётчика расхода драйвер не
    держит: расход — сумма фактов журнала (`dashboard/budget.py`), и он переживает
    рестарт.
+11. **Движок ушёл — дело не остаётся `running`.** Перед каждым решением (после
+   `reaper.sweep` и `ask.sync_answers`) и в `finally` для своего дела драйвер
+   зовёт `release.sweep`: если журнал говорит, что попытки не идут, а строка всё
+   ещё «в работе», недостающий факт материализуется тем писателем, который у
+   ответа `transit` есть (`released`, `completed`, парковка, блок). Без этого
+   дело, чья попытка закончилась при ушедшем движке, висело `running`, пока его
+   не заметит человек (живое дело `d_eb4ad2bb`: 7.5 часа). Ошибки прохода
+   (дело решить нечем: спеки нет, правила разошлись) не глотаются — они в
+   `release_errors` отчёта.
 
 ## Коды возврата — контракт `bin/duty run`
 
@@ -81,9 +90,10 @@ Python — то есть гейт «дело проходит impl → verify �
 
 Сам не пишет факты попыток: факт попытки — дело `runner` (одна транзакция на
 факт), а закрытие осиротевшей попытки — `reaper` (тоже один факт и одна
-транзакция); драйвер их только зовёт. Единственная его запись — закрытие дела
-(правило 8), и она идёт через `deals` (`close_stages_done`), а не своим INSERT:
-второго пути записи `completed` в плагине нет. Не задаёт вопросов (только
+транзакция); драйвер их только зовёт. Своими записями драйвер не обзаводится:
+закрытие дела идёт через `deals` (`close_stages_done`), отпускание — через
+`release.sweep`, который зовёт писателей store, а не пишет сам. Второго пути
+записи `completed` или `released` в плагине нет. Не задаёт вопросов (только
 `ask()`), не классифицирует отказы (только `failures.py`), не проверяет пакет
 (только `evidence.py`), не запускает модель сам (только `runner.spawn_process`),
 не открывает чужие БД.
@@ -111,6 +121,7 @@ RUNNER_MODULE_NAME = "hermes_duty_runner"
 STAGEFEED_MODULE_NAME = "hermes_duty_stagefeed"
 REAPER_MODULE_NAME = "hermes_duty_reaper"
 ASK_MODULE_NAME = "hermes_duty_ask"
+RELEASE_MODULE_NAME = "hermes_duty_release"
 
 
 def _load(name: str, filename: str) -> Any:
@@ -144,6 +155,10 @@ reaper = _load(REAPER_MODULE_NAME, "reaper.py")
 # задаёт вопросы: второй канал вопросов не заводится, и «прочитать ответ» обязан
 # тот же код, что «записал вопрос».
 ask = _load(ASK_MODULE_NAME, "ask.py")
+# Отпускание дела, которое осталось `running` при ушедшем движке
+# (`dashboard/release.py`) грузится после уборки: открытую попытку отпускание не
+# трогает, а предикат «попытка без конца» берёт у `reaper`.
+release = _load(RELEASE_MODULE_NAME, "release.py")
 
 # Коды возврата драйвера. Первые три совпадают с кодами остального CLI: дело
 # закрыто / отказ / припарковано. Остальные — только у прогона: ожидание, предел
@@ -351,6 +366,8 @@ def _report(
     answers_errors: Optional[list[dict[str, Any]]] = None,
     closed: Optional[dict[str, Any]] = None,
     parked: Optional[dict[str, Any]] = None,
+    released: int = 0,
+    release_errors: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """Отчёт прогона: шаги, уборка, ответы пула, финальное решение, исход и код.
 
@@ -369,6 +386,10 @@ def _report(
     `parked` — факт парковки гейта (`_gate_park`): записан ли `blocked` с причиной
     «гейт: человек не ответил за N» или он уже был. `None` — прогон не парковал
     гейт (парковку исчерпанных попыток пишет `runner.park_exhausted`).
+    `released` — сколько фактов отпускания легло за прогон (`release.sweep`), а
+    `release_errors` — дела, которые проход решить не смог (спеки нет, правила
+    разошлись): пустой список вместо тишины, иначе «дело не отпущено» читалось бы
+    как «отпускать было нечего».
     """
     return {
         "deal": str(deal.get("id") or ""),
@@ -382,6 +403,8 @@ def _report(
         "decision": _decision_dict(decision),
         "closed": None if closed is None else dict(closed),
         "parked": None if parked is None else dict(parked),
+        "released": int(released or 0),
+        "release_errors": list(release_errors or ()),
         "exit_code": EXIT_CODES[outcome],
     }
 
@@ -509,15 +532,19 @@ def run(
     on_step: Optional[Callable[[dict[str, Any]], None]] = None,
     on_reap: Optional[Callable[[dict[str, Any]], None]] = None,
     on_answer_error: Optional[Callable[[dict[str, Any]], None]] = None,
+    on_release: Optional[Callable[[dict[str, Any]], None]] = None,
+    on_release_error: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> dict[str, Any]:
     """Довести дело до терминального исхода: решение → шаг → перечитать журнал.
 
     Возвращает отчёт (`_report`): шаги попыток, уборка осиротевших попыток,
-    дочитанные ответы пула, финальное решение, исход и код возврата. `on_step`
-    зовётся на каждую строку сразу после шага, `on_reap` — на каждую попытку,
-    закрытую движком, `on_answer_error` — на каждый закрытый вопрос пула, который
-    журнал не узнал; консоль может печатать по строке, не дожидаясь конца прогона,
-    а форматирования здесь нет, потому что оформление живёт в CLI.
+    дочитанные ответы пула, отпускания, финальное решение, исход и код возврата.
+    `on_step` зовётся на каждую строку сразу после шага, `on_reap` — на каждую
+    попытку, закрытую движком, `on_answer_error` — на каждый закрытый вопрос пула,
+    который журнал не узнал, `on_release`/`on_release_error` — на каждый факт
+    отпускания и на дело, которое отпустить нечем; консоль может печатать по
+    строке, не дожидаясь конца прогона, а форматирования здесь нет, потому что
+    оформление живёт в CLI.
 
     `spawn`, `clock`, `monotonic` — те же швы, что у `runner.step`: тесты
     подменяют спавн фейком, а живые часы — неподвижными.
@@ -531,11 +558,36 @@ def run(
     reaped: list[dict[str, Any]] = []
     answers: dict[str, Any] = {"appended": 0}
     answers_errors: list[dict[str, Any]] = []
+    released: list[dict[str, Any]] = []
+    release_errors: list[dict[str, Any]] = []
     made = 0
     outcome = ""
     note = ""
     closed: Optional[dict[str, Any]] = None
     parked: Optional[dict[str, Any]] = None
+
+    def release_pass(*, only: Any = None, grace_sec: int = release.RELEASE_GRACE_SEC) -> None:
+        """Отпустить дела, которые журнал уже отпустил, а строка — нет (правило 11).
+
+        Зовётся там, где движок уже есть: перед решением (с паузой — чужой прогон
+        мог только что записать свой факт) и в `finally` для своего дела (без
+        паузы: этот движок уходит сам). Ошибки прохода не глотаются: они копятся
+        в `release_errors` и отдаются вызывающему по одной строке.
+        """
+        for row in release.sweep(
+            conn, int(tick()), home=home, spec=spec, only=only, grace_sec=grace_sec
+        ):
+            if row.get("error"):
+                if row not in release_errors:
+                    release_errors.append(row)
+                    if on_release_error is not None:
+                        on_release_error(row)
+                continue
+            if not row.get("written"):
+                continue
+            released.append(row)
+            if on_release is not None:
+                on_release(row)
 
     def decide() -> Any:
         """Уборка осиротевших попыток, дочитывание ответов пула, решение по журналу.
@@ -551,6 +603,10 @@ def run(
         порядок оставил бы дело в `wait_human` ещё на один шаг, хотя человек уже
         ответил. Ошибки разбора (`errors[]`) не глотаются: они копятся в отчёте и
         отдаются вызывающему по одной строке.
+
+        Отпускание идёт последним и **до** решения (правило 11): строка `running`
+        без живого факта — это тот же недостающий факт, что и осиротевшая
+        попытка, и решение по журналу обязано читаться уже по полному журналу.
         """
         for row in reaper.sweep(conn, int(tick()), spec=spec):
             reaped.append(row)
@@ -565,6 +621,7 @@ def run(
             answers_errors.append(row)
             if on_answer_error is not None:
                 on_answer_error(row)
+        release_pass()
         return _decide(conn, deal, spec, tick)
 
     decision = decide()
@@ -662,6 +719,10 @@ def run(
     finally:
         children.stop()
         _release_mine(conn, deal, spec)
+        # Этот движок уходит сам: своё дело он отпускает без паузы — свежий
+        # `attempt_ended` того же прогона иначе выглядел бы «движок только что был»
+        # (правило 11). Чужие дела проход уже посмотрел перед последним решением.
+        release_pass(only=[str(deal["id"])], grace_sec=0)
     return _report(
         deal,
         spec,
@@ -674,6 +735,8 @@ def run(
         answers_errors,
         closed=closed,
         parked=parked,
+        released=len(released),
+        release_errors=release_errors,
     )
 
 
@@ -722,6 +785,8 @@ def drive(
     on_step: Optional[Callable[[dict[str, Any]], None]] = None,
     on_reap: Optional[Callable[[dict[str, Any]], None]] = None,
     on_answer_error: Optional[Callable[[dict[str, Any]], None]] = None,
+    on_release: Optional[Callable[[dict[str, Any]], None]] = None,
+    on_release_error: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> dict[str, Any]:
     """Вход `bin/duty run`: открыть store, найти спеку, проверить её и довести дело.
 
@@ -757,6 +822,8 @@ def drive(
             on_step=on_step,
             on_reap=on_reap,
             on_answer_error=on_answer_error,
+            on_release=on_release,
+            on_release_error=on_release_error,
         )
     finally:
         conn.close()

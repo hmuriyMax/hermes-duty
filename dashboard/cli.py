@@ -115,6 +115,9 @@ FAILURES_MODULE_NAME = "hermes_duty_failures"
 # Драйвер дела: `run` зовёт его, а не собирает цикл «решение → шаг» в терминале.
 DRIVER_MODULE_NAME = "hermes_duty_driver"
 REAPER_MODULE_NAME = "hermes_duty_reaper"
+# Отпускание дел, оставшихся `running` при ушедшем движке: `reap` зовёт проход,
+# а не решает у себя, что считать отпущенным.
+RELEASE_MODULE_NAME = "hermes_duty_release"
 
 
 def _load_demo() -> Any:
@@ -225,6 +228,26 @@ def _load_reaper() -> Any:
         raise SourceFailure(f"reaper module not found: {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[REAPER_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_release() -> Any:
+    """Загрузить `dashboard/release.py` — отпускание дел, оставшихся `running`.
+
+    `reap` не решает у себя, что считать брошенным делом: условия, пауза и
+    писатели факта живут в проходе, а терминал только показывает, что он
+    отпустил.
+    """
+    loaded = sys.modules.get(RELEASE_MODULE_NAME)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / "release.py"
+    spec = importlib.util.spec_from_file_location(RELEASE_MODULE_NAME, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise SourceFailure(f"release module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[RELEASE_MODULE_NAME] = module
     spec.loader.exec_module(module)
     return module
 
@@ -1926,7 +1949,10 @@ def render_reap(report: dict[str, Any]) -> str:
     """Итог `bin/duty reap`: сколько закрыто (или было бы) и что именно.
 
     Пустой проход называется словами, а не пустотой: «осиротевших нет» и «не
-    посчитали» — разные ответы, и второй обязан быть виден.
+    посчитали» — разные ответы, и второй обязан быть виден. Второй блок — дела,
+    которые уборка только что отпустила (`release.sweep`): закрытая попытка без
+    решения `transit` оставляла строку `running`, и отпускание называется тем же
+    проходом, чтобы `reap` не обещал «попытки закрыты» при живой строке.
     """
     dry = bool(report.get("dry_run"))
     lines = [
@@ -1943,7 +1969,55 @@ def render_reap(report: dict[str, Any]) -> str:
     if not rows:
         lines.append("  осиротевших попыток нет")
     lines.extend(f"  {render_reap_row(row)}" for row in rows)
+    released = report.get("released") or []
+    if released:
+        lines.append(f"  отпущено дел: {len(released)}")
+        lines.extend(f"  {render_release_row(row)}" for row in released)
+    lines.extend(f"  {render_release_error(row)}" for row in report.get("release_errors") or ())
     return "\n".join(lines)
+
+
+def render_release_row(row: dict[str, Any]) -> str:
+    """Строка отпускания: какое дело, куда и по какому решению журнала.
+
+    Дело и переход названы первыми: проход идёт по всему store, и строка без
+    адреса не сказала бы, о чём речь. `--dry-run` меняет только начало строки:
+    набор кандидатов считается тем же кодом, что и настоящий проход.
+    """
+    head = "было бы отпущено" if row.get("dry_run") else "отпущено движком"
+    action = str(row.get("action") or "")
+    if action == "released":
+        decision = row.get("decision") or "—"
+        if row.get("wait"):
+            decision += f"/{row['wait']}"
+        tail = f"решение {decision}"
+    elif action == "closed":
+        tail = "все этапы пройдены: completed"
+    elif action == "parked":
+        tail = "попытки исчерпаны: парковка"
+    elif action == "blocked":
+        tail = "отказ движка: блок классом отказа"
+    else:
+        tail = action or "—"
+    return "{}: {} · {} → {} · {} · {}".format(
+        head,
+        row.get("deal") or "—",
+        row.get("from") or "—",
+        row.get("to") or "—",
+        tail,
+        row.get("reason") or "причина не записана",
+    )
+
+
+def render_release_error(row: dict[str, Any]) -> str:
+    """Строка о деле, которое проход отпустить не смог, — с причиной словами.
+
+    «Не отпущено» и «отпускать было нечего» — разные ответы: без этой строки
+    дело осталось бы `running` молча, и `reap` сказал бы «убрано».
+    """
+    return "! отпускание {}: {}".format(
+        row.get("deal") or "—", row.get("error") or "причина не записана"
+    )
 
 
 def _decision_text(decision: dict[str, Any]) -> str:
@@ -1994,15 +2068,28 @@ def render_run_final(report: dict[str, Any]) -> str:
     закрыто» — второй `completed` он не писал, и выдавать это за свою работу
     нельзя. Прогон, которому закрыть не дали (дело держит человек), говорит об
     этом прямо: «все этапы закрыты», но «дело не закрыто» — это два разных факта.
+
+    Отпущенные дела называются числом, а дела, которые отпустить нечем, —
+    отдельными строками: «дел отпущено: 1» без них читалось бы как «всё решено».
     """
-    outcome = str(report.get("outcome") or "")
     decision = report.get("decision") or {}
     steps = report.get("steps") or []
     made = len({row.get("n") for row in steps})
     note = str(report.get("note") or decision.get("reason") or "")
     answers = int((report.get("answers") or {}).get("appended") or 0)
     picked = f" · ответов пула дочитано: {answers}" if answers else ""
+    released = int(report.get("released") or 0)
+    if released:
+        picked += f" · дел отпущено: {released}"
     closed = report.get("closed")
+    line = _run_final_line(report, note, made, picked, closed)
+    return "\n".join([line, *(render_release_error(row) for row in report.get("release_errors") or ())])
+
+
+def _run_final_line(report: dict[str, Any], note: str, made: int, picked: str, closed: Any) -> str:
+    """Строка итога прогона без строк об отпускании: одна форма на исход."""
+    outcome = str(report.get("outcome") or "")
+    decision = report.get("decision") or {}
     if outcome == "done":
         if isinstance(closed, dict) and closed.get("refused"):
             # Этапы пройдены, а дело не закрыто: закрытие перебило бы решение
@@ -2080,6 +2167,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                     on_step=None if args.json else (lambda row: print(render_run_step(row), file=out)),
                     on_reap=None if args.json else (lambda row: print(render_reap_row(row), file=out)),
                     on_answer_error=None if args.json else (lambda row: print(render_answer_error(row), file=out)),
+                    on_release=None if args.json else (lambda row: print(render_release_row(row), file=out)),
+                    on_release_error=None if args.json else (lambda row: print(render_release_error(row), file=out)),
                 )
             except SourceFailure as exc:
                 if not args.json:
@@ -2099,6 +2188,23 @@ def main(argv: Optional[list[str]] = None) -> int:
             # здесь только argv и вывод. Код возврата — «посчитано» (0):
             # «нечего убирать» — это ответ, а не ошибка.
             report = _route(_load_reaper().reap, api().hermes_home(), dry_run=bool(args.dry_run))
+            if not report.get("dry_run"):
+                # Уборка закрыла попытку — но строка дела от этого не перестала
+                # быть `running`: недостающий факт отпускания материализует
+                # `release.sweep` по делам самой уборки, без паузы (свежий
+                # `attempt_ended` репера — факт этого же прохода). `--dry-run`
+                # остаётся уборкой: отпускание — запись, и в пробном проходе её нет.
+                released = _route(
+                    _load_release().release,
+                    api().hermes_home(),
+                    only=[row.get("deal") for row in report.get("reaped") or ()],
+                    grace_sec=0,
+                )
+                report = {
+                    **report,
+                    "released": released.get("released") or [],
+                    "release_errors": released.get("errors") or [],
+                }
             _emit_json(report, out) if args.json else print(render_reap(report), file=out)
             return EXIT_OK
         if args.command == "demo":

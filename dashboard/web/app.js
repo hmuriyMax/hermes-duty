@@ -43,6 +43,8 @@ import {
   shapeFinished,
   shapeNow,
   shapeStages,
+  compactStageView,
+  compactAttemptView,
   stateLabel,
   stateMeta,
   TOOL_LEGEND,
@@ -931,114 +933,162 @@ function viewDealBadAddress(board, dealId) {
   )
 }
 
-/* ------------------------------------------------- лента этапов и попыток */
+/* ------------------------------- столбец этапов и попыток (0.0.8) */
 
-// Попытка этапа — процесс. Печатается одной строкой фактов: номер, pid, начало,
-// длительность, код выхода, токены, инструменты, класс отказа. Прогресс-баров
-// здесь нет: «сколько прошло» никто не мерил, а полоса обещала бы измерение.
-function stageAttemptRow(attempt) {
-  const facts = [
-    attempt.number,
-    attempt.pidText,
-    attempt.clock,
-    attempt.durationText,
-    `exit ${attempt.exitText}`,
-    `токенов ${attempt.tokensText}`,
-    `инструментов ${attempt.toolsText}`,
-    attempt.kind ? `класс ${attempt.kind}` : '',
-  ].filter((part) => part && part !== '')
-  return h(
-    'div',
-    { class: 'stage-att' },
-    h(
-      'div',
-      { class: 'stage-att-h' },
-      h('span', { class: 'mono' }, facts.join(' · ')),
-      h('span', { class: 'sp' }),
-      h('span', { class: `badge t-${attempt.tone}`, title: `state=${attempt.lease}` }, h('i'), attempt.liveText),
-    ),
-    attempt.reason ? h('div', { class: 'stage-reason' }, attempt.reason) : null,
-    attempt.hasEvidence
-      ? h(
-          'ul',
-          { class: 'stage-ev' },
-          ...attempt.evidence.map((record) =>
-            h(
-              'li',
-              null,
-              h('span', { class: 'mono' }, record.cmd),
-              ` · exit ${record.exitText}`,
-              record.clock !== '—' ? ` · ${record.clock}` : '',
-            ),
-          ),
-        )
-      : null,
-  )
+// Раскрытие строк — состояние поверхности, а не факт дела: шейпер отдаёт только
+// умолчание (`openByDefault` — провал и живая попытка раскрыты без клика), а что
+// человек открыл или свернул руками, помнит экран. Ключи включают id дела: имена
+// этапов у двух дел совпадают, а раскрытия — нет.
+const stageOpen = new Map()
+const attOpen = new Map()
+
+/** Раскрыта ли строка: ручное решение поверх умолчания шейпера. */
+const openNow = (overrides, key, byDefault) => (overrides.has(key) ? overrides.get(key) : byDefault)
+
+/**
+ * Попытки этапа для столбца.
+ *
+ * Факты процесса (`live`/`dead`, лизинг, код выхода) знает только лента `/deal`,
+ * журнал попытки — только ручка `/duty/{id}/attempts`. Своих номеров и исходов
+ * экран не считает: попытка ленты ищется в ответе ручки по `runId` (оба зовут
+ * одну попытку одним именем), и ей подмешивается один факт — `events`.
+ */
+function stageColumnBars(stage, timeline) {
+  const rows = Array.isArray(stage.attempts) ? stage.attempts : []
+  const extra = timeline && Array.isArray(timeline.attempts) ? timeline.attempts : []
+  if (!rows.length) return extra.filter((attempt) => attempt.stage === stage.id)
+  return rows.map((row) => {
+    if (row.runId === null || row.runId === undefined) return row
+    const found = extra.find((attempt) => String(attempt.runId) === String(row.runId))
+    return found ? { ...row, events: found.events } : row
+  })
 }
 
-// Этап ленты: имя, роль, номер попытки, состояние; ожидание — отдельной строкой.
-// Вопрос ведёт на панель пула (`/imsg`), потому что отвечают там; кнопок экран
-// не заводит — он read-only по спеке, а не «пока не сделали».
-function stageRow(stage) {
+/** Доказательство строкой: код выхода тоном, обрезанная команда, время. */
+function attEvNode(row) {
   return h(
     'div',
-    { class: 'stage' },
-    h(
-      'div',
-      { class: 'stage-h' },
-      h('span', { class: 'mono stage-id' }, stage.id),
-      h('span', { class: 'muted' }, stage.role),
-      h('span', { class: 'tnum' }, stage.attemptText),
-      stage.rounds > 1 ? h('span', { class: 'muted' }, `раунд ${stage.rounds}`) : null,
-      h('span', { class: 'sp' }),
-      h('span', { class: `badge t-${stage.tone}`, title: stage.state }, h('i'), stage.stateLabel),
-    ),
-    stage.needsText ? h('div', { class: 'muted' }, stage.needsText) : null,
-    stage.waitText
-      ? h(
-          'div',
-          { class: 'stage-wait' },
-          stage.questionHref ? h('a', { href: stage.questionHref }, stage.waitText) : stage.waitText,
-        )
-      : null,
-    stage.hasAttempts
-      ? h('div', { class: 'stage-atts' }, ...stage.attempts.map(stageAttemptRow))
-      : h('div', { class: 'stage-atts' }, h('div', { class: 'muted' }, 'попыток нет')),
-    stage.hasEvidence
-      ? h(
-          'ul',
-          { class: 'stage-ev' },
-          ...stage.evidence.map((entry) => h('li', null, h('span', { class: 'mono' }, entry.cmd), ` · ${entry.label}`)),
-        )
-      : null,
+    { class: 'att-ev' },
+    // Полная команда — в подсказке: обрезка сделана в шейпере, а не CSS-эллипсисом.
+    h('span', { class: `badge t-${row.tone}` }, `exit ${row.exitText}`),
+    h('span', { class: 'mono att-ev-cmd', title: row.cmdTitle }, row.cmdShort),
+    h('span', { class: 'muted' }, row.clock),
   )
 }
 
 /**
- * Панель ленты этапов в карточке дела.
+ * Попытка столбца: число, длительность, исход словами, глиф раскрытия.
  *
- * Пустой список печатает причину (`stages_note` бэкенда: нет спеки, спека не
- * читается) — «этапов нет» и «спеки нет» разные факты, и разница видна, только
- * если её назвать.
+ * Раскрытая показывает доказательства, потом `summary` и `error`, потом журнал —
+ * сводкой по видам (`5 прогрессов · 1 старт · 1 конец`), а не списком событий:
+ * у одной попытки их бывает триста, и в столбце 320 px это лог, а не строка.
  */
-function stageFeedPanel(data) {
+function attRowNodes(stage, bar, key, open, rebuild) {
+  const view = compactAttemptView(stage, bar)
+  const nodes = [
+    h(
+      'div',
+      {
+        class: open ? 'att-row open' : 'att-row',
+        title: view.outcomeText,
+        'aria-expanded': open ? 'true' : 'false',
+        onclick: () => {
+          attOpen.set(key, !open)
+          rebuild()
+        },
+      },
+      h('span', { class: 'mono att-row-n' }, view.label),
+      h('span', { class: 'att-row-dur' }, view.durationText),
+      h('span', { class: `att-row-out t-${view.tone}` }, view.outcomeText),
+      h('span', { class: 'sp' }),
+      h('span', { class: 'att-row-tog' }, open ? '▾' : '▸'),
+    ),
+  ]
+  if (!open) return nodes
+  for (const row of view.evidenceRows) nodes.push(attEvNode(row))
+  if (view.summary) nodes.push(h('div', { class: 'att-summary' }, view.summary))
+  if (view.error) nodes.push(h('div', { class: 'att-error' }, view.error))
+  if (view.eventsText) nodes.push(h('div', { class: 'att-log' }, view.eventsText))
+  return nodes
+}
+
+/**
+ * Этап столбца: одна строка (~26 px) плюс попытки, если раскрыт.
+ *
+ * Служебное (`needs`) живёт в подсказке строки: отдельной строкой «после: …» оно
+ * съедало высоту, которую занимают попытки. Ожидание вопроса — наоборот, видимой
+ * строкой: дело может стоять на человеке, и это не деталь для подсказки.
+ */
+function stageBlockNode(dealId, stage, timeline, rebuild) {
+  const view = compactStageView(stage)
+  const stageKey = `${dealId}:${view.id}`
+  const open = openNow(stageOpen, stageKey, view.openByDefault)
+  const bars = stageColumnBars(stage, timeline)
+  const nodes = [
+    h(
+      'div',
+      {
+        class: open ? 'stage-row open' : 'stage-row',
+        title: view.needsText || view.toggleTitle,
+        'aria-expanded': open ? 'true' : 'false',
+        onclick: () => {
+          stageOpen.set(stageKey, !open)
+          rebuild()
+        },
+      },
+      h('span', { class: 'mono stage-row-id' }, view.id),
+      h('span', { class: 'stage-row-kind muted' }, view.kindText),
+      h('span', { class: 'stage-row-att' }, view.attemptsText),
+      h('span', { class: 'sp' }),
+      h('span', { class: `badge t-${view.tone}`, title: view.stateLabel }, h('i'), view.stateLabel),
+      h('span', { class: 'stage-row-tog' }, open ? '▾' : '▸'),
+    ),
+  ]
+  if (view.waitText) {
+    nodes.push(
+      h(
+        'div',
+        { class: 'stage-wait' },
+        view.waitHref ? h('a', { href: view.waitHref }, view.waitText) : view.waitText,
+      ),
+    )
+  }
+  if (!open) return h('div', { class: 'stage-block' }, ...nodes)
+  if (!bars.length) nodes.push(h('div', { class: 'att-none muted' }, 'попыток нет'))
+  bars.forEach((bar, index) => {
+    const attKey = `${stageKey}#${index}`
+    nodes.push(...attRowNodes(stage, bar, attKey, openNow(attOpen, attKey, compactAttemptView(stage, bar).openByDefault), rebuild))
+  })
+  return h('div', { class: 'stage-block' }, ...nodes)
+}
+
+/**
+ * Столбец этапов и попыток в карточке дела.
+ *
+ * Одна панель вместо двух (широкой ленты этапов и отдельной панели попыток):
+ * шапка попытки повторялась в обеих, и страница росла на три с половиной экрана.
+ * Пустой граф печатает причину (`stages_note` бэкенда: нет спеки, спека не
+ * читается) — «этапов нет» и «спеки нет» разные факты.
+ */
+function stagesColumn(dealId, data, timeline) {
   const feed = shapeStages(data)
-  const title = feed.empty ? 'этапы' : `этапы · ${feed.count}`
-  const body = feed.empty
-    ? h('div', { class: 'panel-b muted' }, feed.note || 'этапов нет')
-    : h('div', null, ...feed.stages.map(stageRow))
+  const host = h('div', { class: 'stages-list' })
+  const rebuild = () => {
+    clear(host)
+    if (feed.empty) {
+      host.append(h('div', { class: 'panel-b muted' }, feed.note || 'этапов нет'))
+      return
+    }
+    host.append(...feed.stages.map((stage) => stageBlockNode(dealId, stage, timeline, rebuild)))
+  }
+  rebuild()
   return h(
     'div',
-    { class: 'panel', style: 'margin-bottom:14px' },
-    h('div', { class: 'panel-h' }, title),
-    feed.spec
-      ? h(
-          'div',
-          { class: 'panel-b mono muted', style: 'padding-bottom:0', title: feed.spec },
-          fileLabel(feed.spec),
-        )
-      : null,
-    body,
+    { class: 'panel deal-stages' },
+    h('div', { class: 'panel-h' }, feed.empty ? 'этапы' : `этапы · ${feed.count}`),
+    // Путь к спеке — именем файла, полный путь в подсказке.
+    feed.spec ? h('div', { class: 'stages-spec mono muted', title: feed.spec }, fileLabel(feed.spec)) : null,
+    host,
   )
 }
 
@@ -1547,39 +1597,6 @@ function scalePanel(scale) {
   return panel
 }
 
-function attemptCard(attempt) {
-  const facts = [attempt.stage ? `этап ${attempt.stage}` : '', attempt.progressText, attempt.toolsText]
-    .filter(Boolean)
-    .join(' · ')
-  return h(
-    'div',
-    { class: 'att' },
-    h(
-      'div',
-      { class: 'att-h' },
-      h('span', { class: 'mono' }, `#${attempt.runId ?? '—'}`),
-      h('span', { class: 'muted' }, attempt.profile),
-      h('span', { class: 'tnum' }, attempt.durationText),
-      h('span', { class: 'sp' }),
-      h('span', { class: `badge t-${attempt.outcomeTone}`, title: `status=${attempt.status}${attempt.outcome ? `, outcome=${attempt.outcome}` : ''}` }, attempt.outcome || attempt.status),
-    ),
-    // Сегментов вызовов внутри полосы нет: их нет и в данных — только числа
-    // `progress`/`tools`, если бэкенд их прислал.
-    facts ? h('div', { class: 'att-facts muted' }, facts) : null,
-    attempt.summary ? h('div', { class: 'att-summary' }, attempt.summary) : null,
-    attempt.error ? h('div', { class: 'att-error' }, attempt.error) : null,
-    attempt.events.length
-      ? h(
-          'ul',
-          { class: 'events' },
-          ...attempt.events.map((event) =>
-            h('li', null, h('span', { class: 'mono' }, event.clock), ' · ', event.kind, event.summary ? ` — ${event.summary}` : ''),
-          ),
-        )
-      : null,
-  )
-}
-
 function viewDeal(dealId) {
   if (dealSnap.error && !dealSnap.data) {
     return h(
@@ -1644,7 +1661,8 @@ function viewDeal(dealId) {
 
   // Документы дела: тело из store и спека — разные вещи, и рисовать вместо одной
   // другую нельзя (у дел из `bin/duty create` описания в store нет вовсе).
-  // Нет документов — нет колонки: панель «пусто» отбирает место у попыток.
+  // Нет документов — нет колонки: описание забирает ширину, а столбец этапов
+  // остаётся один и на всю ширину.
   const docs = docBlocks(data)
   const left = docs.length
     ? h(
@@ -1668,12 +1686,10 @@ function viewDeal(dealId) {
       )
     : null
 
-  let attemptsBody
-  if (!timeline) attemptsBody = h('div', { class: 'panel-b' }, h('div', { class: 'skel', style: 'width:70%' }))
-  else if (!timeline.count) attemptsBody = h('div', { class: 'panel-b muted' }, 'попыток нет: у дела ещё не было ранов')
-  else attemptsBody = h('div', null, ...timeline.attempts.map(attemptCard))
-
-  const right = h('div', { class: 'panel' }, h('div', { class: 'panel-h' }, `попытки · ${timeline ? timeline.count : '…'}`), attemptsBody)
+  // Этапы и попытки — одним тонким столбцом (320 px) рядом с описанием: шапка
+  // попытки раньше повторялась в широкой ленте этапов и в отдельной панели
+  // попыток, и страница дела росла на три с половиной экрана.
+  const stages = stagesColumn(data.id, data, timeline)
 
   return h(
     'div',
@@ -1682,8 +1698,7 @@ function viewDeal(dealId) {
     head,
     kpiStrip(scale),
     scalePanel(scale),
-    stageFeedPanel(data),
-    left ? h('div', { class: 'two-col' }, left, right) : right,
+    left ? h('div', { class: 'deal-cols' }, left, stages) : stages,
   )
 }
 

@@ -2545,13 +2545,37 @@ const CSS = `
 .duty-panel-h .duty-mono{color:var(--ui-text-primary)}
 .duty-panel-title{font-size:12px;font-weight:600;word-break:break-word}
 .duty-evidence{margin:6px 0 12px;font-size:11px;color:var(--ui-text-secondary);background:var(--ui-bg-quaternary);border-radius:6px;padding:6px 8px;word-break:break-word}
-.duty-att{border:1px solid var(--ui-stroke-tertiary);border-radius:6px;padding:8px;margin-bottom:8px}
 .duty-att-h{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--ui-text-secondary)}
 .duty-att-h .duty-num{color:var(--ui-text-primary)}
-.duty-events{margin:6px 0 0;padding-left:14px;font-size:11px;color:var(--ui-text-secondary)}
-.duty-events li{margin:1px 0}
 .duty-error{color:var(--ui-red);font-size:11px;white-space:pre-wrap;word-break:break-word;margin-top:4px}
 .duty-summary{font-size:11px;color:var(--ui-text-tertiary);margin-top:4px;word-break:break-word}
+/* ------------------------- столбец этапов и попыток (0.0.8)
+   Одна панель на две бывшие: строки этапов (~26 px) и попытки внутри них
+   (~24 px, отступ 12 px). Провал и живая попытка раскрыты без клика — это
+   решение прошлого круга; остальные свёрнуты, иначе столбец снова простыня. */
+.duty-deal-stages{display:flex;flex-direction:column;gap:2px}
+.duty-stage-block{display:flex;flex-direction:column;min-width:0}
+.duty-stage-row{display:flex;align-items:center;gap:6px;height:26px;padding:0 2px;font-size:12px;white-space:nowrap;overflow:hidden;cursor:pointer}
+.duty-stage-block + .duty-stage-block .duty-stage-row{border-top:1px solid var(--ui-stroke-tertiary)}
+.duty-stage-row:hover{background:color-mix(in srgb, var(--ui-text-primary) 6%, transparent)}
+.duty-stage-row:focus-visible{outline:2px solid var(--ui-accent);outline-offset:-2px}
+.duty-stage-row-id{color:var(--ui-text-primary);font-weight:600;overflow:hidden;text-overflow:ellipsis}
+.duty-stage-row-kind{overflow:hidden;text-overflow:ellipsis}
+.duty-stage-row-att{color:var(--ui-text-tertiary)}
+.duty-stage-row-tog,.duty-att-row-tog{color:var(--ui-text-tertiary);font-size:10px}
+.duty-att-item{display:flex;flex-direction:column;min-width:0}
+.duty-att-row{display:flex;align-items:center;gap:6px;height:24px;margin-left:12px;padding:0 2px 0 0;font-size:12px;white-space:nowrap;overflow:hidden;cursor:pointer;color:var(--ui-text-secondary)}
+.duty-att-row:hover{background:color-mix(in srgb, var(--ui-text-primary) 6%, transparent)}
+.duty-att-row:focus-visible{outline:2px solid var(--ui-accent);outline-offset:-2px}
+.duty-att-row-n{color:var(--ui-text-primary)}
+.duty-att-row-tog{margin-left:auto}
+.duty-att-ev{display:flex;align-items:baseline;gap:6px;margin-left:12px;padding:2px 2px 2px 0;font-size:11px;color:var(--ui-text-tertiary)}
+.duty-att-ev-cmd{color:var(--ui-text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.duty-att-log{margin-left:12px;padding:2px 2px 2px 0;font-size:11px;color:var(--ui-text-tertiary)}
+.duty-att-none{margin-left:12px;padding:2px 2px 2px 0;font-size:11px}
+/* Ожидание человека — видимой строкой под этапом: дело может стоять на нём. */
+.duty-stage-wait{margin-left:0;padding:2px 2px 4px 12px;font-size:11px;color:var(--ui-yellow);word-break:break-word}
+.duty-stage-wait a{color:var(--ui-yellow);text-decoration:underline}
 .duty-tabs{display:flex;gap:2px;margin-left:6px}
 .duty-tab{height:22px;padding:0 9px;border-radius:999px;border:1px solid transparent;background:transparent;color:var(--ui-text-tertiary);font:inherit;font-size:11px;cursor:pointer;white-space:nowrap}
 .duty-tab:hover{background:color-mix(in srgb, var(--ui-text-primary) 8%, transparent);color:var(--ui-text-primary)}
@@ -2579,9 +2603,13 @@ const CSS = `
 .duty-deal-title{font-size:13px;font-weight:600;word-break:break-word}
 .duty-deal-facts{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--ui-text-secondary)}
 .duty-deal-facts b{color:var(--ui-text-primary);font-weight:600}
-.duty-deal-body{display:grid;grid-template-columns:minmax(280px,1fr) minmax(320px,1fr);gap:12px;align-items:start}
-@media (max-width:1080px){.duty-deal-body{grid-template-columns:1fr}}
-.duty-deal-spec,.duty-deal-attempts{min-width:0}
+.duty-deal-body{display:flex;flex-direction:column;gap:12px;min-width:0}
+/* Две колонки карточки дела: документы (растут) и тонкий столбец этапов — ровно
+   320 px, не растёт: в нём строки этапов и попыток, а не абзацы. */
+.duty-deal-cols{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:14px;align-items:start;min-width:0}
+/* Узкое окно: колонки друг под другом, документы — первыми, этапы — следом. */
+@media (max-width:1100px){.duty-deal-cols{grid-template-columns:1fr}}
+.duty-deal-spec,.duty-deal-docs,.duty-deal-stages{min-width:0}
 .duty-deal-scale{grid-column:1/-1;min-width:0}
 .duty-spec{margin:0;white-space:pre-wrap;word-break:break-word;font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:11px;line-height:1.5;color:var(--ui-text-secondary);max-height:60vh;overflow:auto;border:1px solid var(--ui-stroke-tertiary);border-radius:6px;padding:8px}
 /* Спецификация дела — markdown, а не дамп: pre-блок переносил строки так, что
@@ -3018,201 +3046,155 @@ function DealGroup({ group, selectedKey, onPick }) {
   )
 }
 
-/** Скелетон таймлайна: пока грузится, экран не пустой. */
-function TimelineSkeleton() {
-  return h(
-    'div',
-    null,
-    ...Array.from({ length: 3 }, (_, i) =>
+/* ---------------- столбец этапов и попыток дела (0.0.8) ---------------- */
+
+/**
+ * Попытки этапа для столбца.
+ *
+ * Факты процесса (`live`/`dead`, лизинг, код выхода) знает только лента `/deal`,
+ * журнал попытки — только ручка `/duty/{id}/attempts`. Своих номеров и исходов
+ * экран не считает: попытка ленты ищется в ответе ручки по `runId` (оба зовут
+ * одну попытку одним именем), и ей подмешивается один факт — `events`.
+ */
+function stageColumnBars(stage, timeline) {
+  const rows = Array.isArray(stage.attempts) ? stage.attempts : []
+  const extra = timeline && Array.isArray(timeline.attempts) ? timeline.attempts : []
+  if (!rows.length) return extra.filter((attempt) => attempt.stage === stage.id)
+  return rows.map((row) => {
+    if (row.runId === null || row.runId === undefined) return row
+    const found = extra.find((attempt) => String(attempt.runId) === String(row.runId))
+    return found ? { ...row, events: found.events } : row
+  })
+}
+
+/**
+ * Строка попытки: `#n`, длительность, исход словами, глиф раскрытия.
+ *
+ * Раскрытая показывает доказательства, потом `summary` и `error`, потом журнал —
+ * сводкой по видам (`5 прогрессов · 1 старт · 1 конец`), а не списком событий:
+ * у одной попытки их бывает триста, и в столбце 320 px это лог, а не строка.
+ */
+function CompactAttemptRow({ stage, attempt, open, onToggle }) {
+  const view = compactAttemptView(stage, attempt)
+  const children = [
+    h(
+      'div',
+      {
+        key: 'row',
+        className: open ? 'duty-att-row open' : 'duty-att-row',
+        title: view.outcomeText,
+        'aria-expanded': open ? 'true' : 'false',
+        onClick: onToggle,
+      },
+      h('span', { className: 'duty-mono duty-att-row-n' }, view.label),
+      h('span', { className: 'duty-num duty-att-row-dur' }, view.durationText),
+      h(StateBadge, { label: view.outcomeText, tone: view.tone, title: view.outcomeText }),
+      h('span', { className: 'duty-spacer' }),
+      h('span', { className: 'duty-att-row-tog' }, open ? '▾' : '▸'),
+    ),
+  ]
+  if (!open) return h('div', { className: 'duty-att-item' }, ...children)
+  view.evidenceRows.forEach((row, i) => {
+    children.push(
       h(
         'div',
-        { className: 'duty-att duty-skel-row', key: `skel-${i}` },
-        h('div', { className: 'duty-skel', style: { width: '52%' } }),
-        h('div', { className: 'duty-skel', style: { width: '100%', height: '6px' } }),
-        h('div', { className: 'duty-skel', style: { width: '78%' } }),
+        { key: `ev-${i}`, className: 'duty-att-ev' },
+        // Полная команда — в подсказке: обрезка сделана в шейпере, а не CSS-эллипсисом.
+        h(StateBadge, { label: `exit ${row.exitText}`, tone: row.tone, title: row.cmdTitle }),
+        h('span', { className: 'duty-mono duty-att-ev-cmd', title: row.cmdTitle }, row.cmdShort),
+        h('span', { className: 'duty-muted' }, row.clock),
       ),
-    ),
+    )
+  })
+  if (view.summary) children.push(h('div', { key: 'summary', className: 'duty-summary' }, view.summary))
+  if (view.error) children.push(h('div', { key: 'error', className: 'duty-error' }, view.error))
+  if (view.eventsText) children.push(h('div', { key: 'log', className: 'duty-att-log duty-muted' }, view.eventsText))
+  return h('div', { className: 'duty-att-item' }, ...children)
+}
+
+/**
+ * Столбец этапов и попыток в карточке дела.
+ *
+ * Одна панель вместо двух (широкой ленты этапов и отдельной панели попыток):
+ * шапка попытки повторялась в обеих, и страница росла на три с половиной экрана.
+ * Раскрытие строк — состояние экрана (`useState`): шейпер отдаёт только умолчание
+ * (`openByDefault` — провал и живая попытка раскрыты без клика).
+ * Пустой граф печатает причину (`note` бэкенда: нет спеки, спека не читается).
+ */
+function CompactStages({ feed, timeline }) {
+  const [openStages, setOpenStages] = useState({})
+  const [openAtts, setOpenAtts] = useState({})
+  const head = h('div', { className: 'duty-group-h' }, h('span', null, feed.empty ? 'этапы' : `этапы · ${feed.count}`))
+  if (feed.empty) {
+    return h('div', { className: 'duty-deal-stages' }, head, h('div', { className: 'duty-muted' }, feed.note || 'этапов нет'))
+  }
+  const blocks = feed.stages.map((stage) => {
+    const view = compactStageView(stage)
+    const open = openStages[view.id] === undefined ? view.openByDefault : openStages[view.id]
+    const bars = stageColumnBars(stage, timeline)
+    const children = [
+      h(
+        'div',
+        {
+          key: 'row',
+          className: open ? 'duty-stage-row open' : 'duty-stage-row',
+          // Служебное (`needs`) — в подсказке строки: отдельной строкой оно
+          // съедало высоту, которую занимают попытки.
+          title: view.needsText || view.toggleTitle,
+          'aria-expanded': open ? 'true' : 'false',
+          onClick: () => setOpenStages((prev) => ({ ...prev, [view.id]: !open })),
+        },
+        h('span', { className: 'duty-mono duty-stage-row-id' }, view.id),
+        h('span', { className: 'duty-muted duty-stage-row-kind' }, view.kindText),
+        h('span', { className: 'duty-num duty-stage-row-att' }, view.attemptsText),
+        h('span', { className: 'duty-spacer' }),
+        h(StateBadge, { label: view.stateLabel, tone: view.tone, title: view.stateLabel }),
+        h('span', { className: 'duty-stage-row-tog' }, open ? '▾' : '▸'),
+      ),
+    ]
+    // Ожидание человека остаётся видимой строкой: дело может стоять на нём.
+    if (view.waitText) {
+      children.push(
+        h(
+          'div',
+          { key: 'wait', className: 'duty-stage-wait' },
+          view.waitHref ? h('a', { href: view.waitHref }, view.waitText) : view.waitText,
+        ),
+      )
+    }
+    if (!bars.length && open) children.push(h('div', { key: 'none', className: 'duty-muted duty-att-none' }, 'попыток нет'))
+    if (open) {
+      bars.forEach((attempt, index) => {
+        const key = `${stage.id}#${index}`
+        const attOpen = openAtts[key] === undefined ? compactAttemptView(stage, attempt).openByDefault : openAtts[key]
+        children.push(
+          h(CompactAttemptRow, {
+            key: `att-${key}`,
+            stage,
+            attempt,
+            open: attOpen,
+            onToggle: () => setOpenAtts((prev) => ({ ...prev, [key]: !attOpen })),
+          }),
+        )
+      })
+    }
+    return h('div', { className: 'duty-stage-block', key: `st-${stage.id}` }, ...children)
+  })
+  return h(
+    'div',
+    { className: 'duty-deal-stages' },
+    head,
+    // Путь к спеке — именем файла, полный путь в подсказке.
+    feed.spec ? h('div', { className: 'duty-mono duty-muted', title: feed.spec }, fileLabel(feed.spec)) : null,
+    ...blocks,
   )
 }
 
-function AttemptCard({ attempt }) {
-  const tone = TONE_COLOR[attempt.outcomeTone] || TONE_COLOR.gray
-  const facts = [attempt.stage ? `этап ${attempt.stage}` : '', attempt.progressText, attempt.toolsText].filter(Boolean).join(' · ')
-  return h(
-    'div',
-    { className: 'duty-att' },
-    h(
-      'div',
-      { className: 'duty-att-h' },
-      h('span', { className: 'duty-mono' }, `#${attempt.runId ?? '—'}`),
-      h('span', null, attempt.profile),
-      h('span', { className: 'duty-num' }, attempt.durationText),
-      h('span', { className: 'duty-spacer' }),
-      h('span', {
-        className: 'duty-badge',
-        style: { color: tone },
-        title: `status=${attempt.status}${attempt.outcome ? `, outcome=${attempt.outcome}` : ''}`,
-      }, attempt.outcome || attempt.status),
-    ),
-    // Относительной полосы здесь нет: длительность видна на общей оси дела, и
-    // сегментов вызовов внутри полосы тоже нет — их нет в данных, только числа.
-    facts ? h('div', { className: 'duty-muted', style: { marginTop: '4px' } }, facts) : null,
-    attempt.summary ? h('div', { className: 'duty-summary' }, attempt.summary) : null,
-    attempt.error ? h('div', { className: 'duty-error' }, attempt.error) : null,
-    attempt.events.length
-      ? h(
-          'ul',
-          { className: 'duty-events' },
-          ...attempt.events.map((event, i) =>
-            h(
-              'li',
-              { key: `ev-${i}` },
-              h('span', { className: 'duty-mono' }, event.clock),
-              ' · ',
-              event.kind,
-              event.summary ? ` — ${event.summary}` : '',
-            ),
-          ),
-        )
-      : null,
-  )
-}
 
 // Неполнота ответа /now одной строкой — общая для жёлтой полосы над списком и
 // для пустого состояния, иначе «досок 19/19» врёт про полноту среза. Собирает её
 // модель (`noticeLines`), потому что правило «устаревший снимок замечаний не
 // имеет» проверяется тестом, а не глазами при ревью рендера.
-
-/* ---------------- лента этапов и попыток дела (W6) ---------------- */
-
-/**
- * Попытка этапа — процесс: время, длительность, код выхода, токены,
- * инструменты, причина отказа и живость.
- *
- * Живость печатается словом модели (`liveText`): «идёт», «процесс мёртв: лизинг
- * истёк», «закрыта без исхода». Экран не решает, жив ли процесс, — он это читает
- * из журнала, поэтому здесь нет ни `pid`-проверок, ни часов.
- */
-function StageAttempt({ attempt }) {
-  const facts = [
-    attempt.number,
-    attempt.pidText,
-    attempt.clock,
-    attempt.durationText,
-    `exit ${attempt.exitText}`,
-    `токенов ${attempt.tokensText}`,
-    `инструментов ${attempt.toolsText}`,
-    attempt.kind ? `класс ${attempt.kind}` : '',
-  ].filter((part) => part && part !== '')
-  return h(
-    'div',
-    { className: 'duty-att' },
-    h(
-      'div',
-      { className: 'duty-att-h' },
-      h('span', { className: 'duty-mono' }, facts.join(' · ')),
-      h('span', { className: 'duty-spacer' }),
-      h(StateBadge, { label: attempt.liveText, tone: attempt.tone, title: `state=${attempt.lease}` }),
-    ),
-    attempt.reason ? h('div', { className: 'duty-error' }, attempt.reason) : null,
-    attempt.hasEvidence
-      ? h(
-          'ul',
-          { className: 'duty-events' },
-          ...attempt.evidence.map((record, i) =>
-            h(
-              'li',
-              { key: `saev-${i}` },
-              h('span', { className: 'duty-mono' }, record.cmd),
-              ` · exit ${record.exitText}`,
-              record.clock !== '—' ? ` · ${record.clock}` : '',
-            ),
-          ),
-        )
-      : null,
-  )
-}
-
-/**
- * Один этап ленты: имя, роль, номер попытки, состояние и — отдельной строкой —
- * ожидание. Вопрос ведёт в панель пула (`/imsg`): отвечать на него здесь нельзя,
- * экран ничего не решает.
- */
-function StageRow({ stage }) {
-  return h(
-    'div',
-    { className: 'duty-stage' },
-    h(
-      'div',
-      { className: 'duty-att-h' },
-      h('span', { className: 'duty-mono' }, stage.id),
-      h('span', { className: 'duty-muted' }, stage.role),
-      h('span', { className: 'duty-num' }, stage.attemptText),
-      stage.rounds > 1 ? h('span', { className: 'duty-muted' }, `раунд ${stage.rounds}`) : null,
-      h('span', { className: 'duty-spacer' }),
-      h(StateBadge, { label: stage.stateLabel, tone: stage.tone, title: stage.state }),
-    ),
-    stage.needsText ? h('div', { className: 'duty-muted' }, stage.needsText) : null,
-    stage.waitText
-      ? h(
-          'div',
-          { className: 'duty-evidence' },
-          stage.questionHref
-            ? h('a', { href: stage.questionHref }, stage.waitText)
-            : stage.waitText,
-        )
-      : null,
-    stage.hasAttempts
-      ? h(
-          'div',
-          null,
-          ...stage.attempts.map((attempt, i) =>
-            h(StageAttempt, { key: `sa-${stage.id}-${attempt.runId ?? i}`, attempt }),
-          ),
-        )
-      : h('div', { className: 'duty-muted' }, 'попыток нет'),
-    stage.hasEvidence
-      ? h(
-          'ul',
-          { className: 'duty-events' },
-          ...stage.evidence.map((entry, i) =>
-            h(
-              'li',
-              { key: `sev-${i}` },
-              h('span', { className: 'duty-mono' }, entry.cmd),
-              ` · ${entry.label}`,
-            ),
-          ),
-        )
-      : null,
-  )
-}
-
-/**
- * Лента этапов целиком: вертикальный список в порядке объявления графа.
- *
- * Пустой список печатает причину (`note` бэкенда: нет спеки, спека не читается),
- * а не «этапов нет»: это разные факты, и разница видна только если её назвать.
- * Прогресс-баров здесь нет — «сколько прошло» никто не мерил.
- */
-function StageFeed({ feed }) {
-  const head = h(
-    'div',
-    { className: 'duty-group-h' },
-    h('span', null, 'этапы'),
-    h('span', { className: 'duty-num' }, feed.empty ? '—' : `${feed.count}`),
-  )
-  if (feed.empty) {
-    return h('div', { className: 'duty-deal-stages' }, head, h('div', { className: 'duty-muted' }, feed.note || 'этапов нет'))
-  }
-  return h(
-    'div',
-    { className: 'duty-deal-stages' },
-    head,
-    feed.spec ? h('div', { className: 'duty-mono duty-muted', title: feed.spec }, fileLabel(feed.spec)) : null,
-    h('div', null, ...feed.stages.map((stage) => h(StageRow, { key: `st-${stage.id}`, stage }))),
-  )
-}
 
 /* ---------------- шкала времени дела (E2) ---------------- */
 
@@ -3941,44 +3923,44 @@ function DealScreen({ sel, onBack }) {
   } else if (!detail.data) {
     body = h('div', { className: 'duty-skel-row' }, ...Array.from({ length: 4 }, (_, i) => h('div', { className: 'duty-skel', key: `ds-${i}`, style: { width: `${90 - i * 12}%` } })))
   } else {
+    const docs = docBlocks(detail.data)
+    // Документы дела: тело из store и спека — разные документы, подменять один
+    // другим нельзя (у дел из `bin/duty create` описания в store нет вовсе).
+    // Нет документов — нет колонки: столбец этапов остаётся один на всю ширину.
+    const stages = h(CompactStages, { feed, timeline })
     body = h(
       'div',
       { className: 'duty-deal-body' },
       // Шкала — первой и во всю ширину: это главный факт дела, а спецификация и
-      // лента — пояснение к нему.
+      // столбец этапов — пояснение к нему.
       h(KpiStrip, { scale }),
       h(ScalePanel, { scale, callSel, onSelectCall: selectCall, toolFilter, onToggleTool: toggleTool }),
-      // Документы дела: тело из store и спека — разные документы, подменять один
-      // другим нельзя (у дел из `bin/duty create` описания в store нет вовсе).
-      // Нет документов — нет панели: она отбирала бы место у попыток.
-      ...docBlocks(detail.data).map((doc) =>
-        h(
-          'div',
-          { className: 'duty-deal-spec', key: `doc-${doc.kind}` },
-          h(
+      docs.length
+        ? h(
             'div',
-            { className: 'duty-group-h', title: doc.path || '' },
-            h('span', null, doc.name ? `${doc.label} · ${doc.name}` : doc.label),
-            doc.truncated ? h('span', { className: 'duty-mono' }, 'обрезана лимитом') : null,
-          ),
-          doc.kind === 'spec'
-            ? h('pre', { className: 'duty-spec duty-doc-src duty-mono' }, doc.text)
-            : h('div', { className: 'duty-spec duty-md' }, h(Streamdown, null, doc.text)),
-        ),
-      ),
-      h(StageFeed, { feed }),
-      h(
-        'div',
-        { className: 'duty-deal-attempts' },
-        h('div', { className: 'duty-group-h' }, h('span', null, 'попытки'), h('span', { className: 'duty-num' }, `${timeline ? timeline.count : '…'}`)),
-        query.error
-          ? h('div', { className: 'duty-banner', style: { margin: 0 } }, h('span', null, query.error), h(Button, { size: 'xs', variant: 'secondary', onClick: () => void query.reload() }, 'повторить'))
-          : !timeline
-            ? h(TimelineSkeleton, null)
-            : !timeline.count
-              ? h('div', { className: 'duty-muted' }, 'попыток нет: у дела ещё не было ранов')
-              : h('div', null, ...timeline.attempts.map((attempt, i) => h(AttemptCard, { key: `att-${attempt.runId ?? i}`, attempt }))),
-      ),
+            { className: 'duty-deal-cols' },
+            h(
+              'div',
+              { className: 'duty-deal-docs' },
+              ...docs.map((doc) =>
+                h(
+                  'div',
+                  { className: 'duty-deal-spec', key: `doc-${doc.kind}` },
+                  h(
+                    'div',
+                    { className: 'duty-group-h', title: doc.path || '' },
+                    h('span', null, doc.name ? `${doc.label} · ${doc.name}` : doc.label),
+                    doc.truncated ? h('span', { className: 'duty-mono' }, 'обрезана лимитом') : null,
+                  ),
+                  doc.kind === 'spec'
+                    ? h('pre', { className: 'duty-spec duty-doc-src duty-mono' }, doc.text)
+                    : h('div', { className: 'duty-spec duty-md' }, h(Streamdown, null, doc.text)),
+                ),
+              ),
+            ),
+            stages,
+          )
+        : stages,
     )
   }
 

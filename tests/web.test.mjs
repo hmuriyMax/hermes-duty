@@ -119,38 +119,44 @@ test('порт и хост backend не захардкожены в веб-сб�
   }
 })
 
-test('карточка дела рисует ленту этапов из ответа /deal, а не из своего расчёта', () => {
+test('карточка дела рисует столбец этапов из ответа /deal, а не из своего расчёта', () => {
   // один шейпер на обе поверхности: правила состояний этапа живут в model.js
   assert.match(app, /shapeStages/)
   assert.ok(!/STAGE_META\s*=\s*\{/.test(app), 'в app.js появилась своя таблица состояний этапа')
-  // лента встроена в карточку дела
-  assert.match(app, /function stageFeedPanel\(data\)/)
-  assert.match(app, /stageFeedPanel\(data\)/)
+  // столбец встроен в карточку дела и собран компактным видом шейпера
+  assert.match(app, /function stagesColumn\(dealId, data, timeline\)/)
+  assert.match(app, /stagesColumn\(data\.id, data, timeline\)/)
+  assert.match(app, /compactStageView\(stage\)/)
+  assert.match(app, /compactAttemptView\(stage, bar\)/)
   // причина пустоты приходит с бэкенда (`stages_note`), а не выдумывается экраном
   assert.match(app, /feed\.note/)
-  // вопрос ведёт в панель пула: отвечают там, а лента — read-only
-  assert.match(app, /questionHref/)
+  // вопрос ведёт в панель пула: отвечают там, а столбец — read-only по делу
+  assert.match(app, /waitHref/)
 })
 
-test('лента этапов без прогресс-баров: «сколько прошло» никто не мерил', () => {
-  const start = app.indexOf('function stageFeedPanel(')
-  const end = app.indexOf('function attemptCard(')
-  assert.ok(start > 0 && end > start, 'не найден блок ленты этапов в app.js')
+test('столбец этапов без прогресс-баров: «сколько прошло» никто не мерил', () => {
+  const start = app.indexOf('function stagesColumn(')
+  const end = app.indexOf('function viewDeal(')
+  assert.ok(start > 0 && end > start, 'не найден блок столбца этапов в app.js')
   const feedSource = app.slice(start, end)
-  assert.ok(!feedSource.includes("class: 'track'"), 'в ленте этапов появился прогресс-бар')
-  assert.ok(!feedSource.includes('barPct'), 'в ленте этапов появился процент прогресса')
+  assert.ok(!feedSource.includes("class: 'track'"), 'в столбце этапов появился прогресс-бар')
+  assert.ok(!feedSource.includes('barPct'), 'в столбце этапов появился процент прогресса')
   // и ни одной кнопки, двигающей дело: экран не решает
-  assert.ok(!/<button/i.test(feedSource), 'в ленте этапов появилась кнопка')
-  assert.ok(!/onclick|onClick/.test(feedSource), 'лента этапов обрабатывает клики')
+  assert.ok(!/<button/i.test(feedSource), 'в столбце этапов появилась кнопка')
+  assert.ok(!/fetch\(/.test(feedSource), 'столбец этапов ходит в сеть сам')
+  // клик только раскрывает строку: состояние раскрытия — поверхности, не делу
+  for (const match of feedSource.matchAll(/onclick: \(\) => \{([\s\S]*?)\}/g)) {
+    assert.match(match[1], /(stageOpen|attOpen)\.set\(/, `клик по строке делает не только раскрытие: ${match[1].trim()}`)
+  }
 })
 
-test('десктопная лента берёт те же `stages` из ctx.rest(/deal/…)', () => {
+test('десктопный столбец берёт те же `stages` из ctx.rest(/deal/…)', () => {
   // данные — только через ctx.rest, ни одного прямого fetch
   assert.match(pluginSource, /shapeStages\(detail\.data\)/)
-  assert.match(pluginSource, /h\(StageFeed, \{ feed \}\)/)
+  assert.match(pluginSource, /h\(CompactStages, \{ feed, timeline \}\)/)
   assert.ok(!pluginSource.includes('fetch('), 'plugin.js: прямой fetch запрещён')
   // ожидание вопроса — ссылкой на пул, как и в вебе
-  assert.match(pluginSource, /href: stage\.questionHref/)
+  assert.match(pluginSource, /href: view\.waitHref/)
 })
 
 test('разворот строки и правки экрана дела: правила есть на обеих поверхностях', () => {
@@ -256,10 +262,11 @@ test('карточка дела не повторяет числа и не по�
   const facts = app.slice(app.indexOf('function dealFactSpans'), app.indexOf('function kpiStrip'))
   assert.doesNotMatch(facts, /'длительность: '/, 'длительность повторяется в фактах и в KPI')
   assert.doesNotMatch(facts, /'попыток: '/, 'попытки повторяются в фактах и в KPI')
-  // Документы дела строятся шейпером; панели нет только когда нет ни тела, ни спеки.
+  // Документы дела строятся шейпером; колонки нет только когда нет ни тела, ни спеки.
   assert.match(app, /const docs = docBlocks\(data\)/, 'документы дела решает поверхность, а не шейпер')
   assert.match(app, /const left = docs\.length/, 'панель документов рисуется всегда, даже пустая')
-  assert.match(app, /left \? h\('div', \{ class: 'two-col' \}, left, right\) : right/, 'без документов попытки остаются в узкой колонке')
+  // Без документов столбец этапов один и на всю ширину.
+  assert.match(app, /left \? h\('div', \{ class: 'deal-cols' \}, left, stages\) : stages/, 'без документов этапы уезжают в узкую колонку')
   // Заголовок этапов не повторяет счёт попыток из KPI.
   assert.doesNotMatch(app, /этапы · \$\{feed\.count\}, попыток/, 'счёт попыток дублируется в заголовке этапов')
   // Пути — именами, полный путь в подсказке.
@@ -269,11 +276,87 @@ test('карточка дела не повторяет числа и не по�
 
 test('десктопная карточка дела: те же правила, что в вебе', () => {
   const plugin = read('desktop/plugin.js')
-  const facts = plugin.slice(plugin.indexOf('function DealFactSpans'), plugin.indexOf('function StageFeed'))
+  const facts = plugin.slice(plugin.indexOf('function DealFactSpans'), plugin.indexOf('function CompactStages'))
   assert.doesNotMatch(facts, /'длительность: '/, 'десктоп: длительность дублируется')
   assert.doesNotMatch(facts, /'попыток: '/, 'десктоп: попытки дублируются')
-  assert.match(plugin, /\.\.\.docBlocks\(detail\.data\)/, 'десктоп: документы дела решает поверхность')
+  assert.match(plugin, /const docs = docBlocks\(detail\.data\)/, 'десктоп: документы дела решает поверхность')
+  // Без документов столбец этапов один и на всю ширину.
+  assert.match(plugin, /docs\.length/, 'десктоп: столбец этапов рисуется мимо развилки документов')
+  assert.match(plugin, /className: 'duty-deal-cols'/, 'десктоп: нет контейнера двух колонок')
   assert.match(plugin, /fileLabel\(feed\.spec\)/, 'десктоп: путь к спеке печатается целиком')
   assert.match(plugin, /repoShort\(/, 'десктоп: шапка печатает полный путь репозитория')
   assert.doesNotMatch(plugin, /попыток \$\{feed\.attempts\}/, 'десктоп: счёт попыток дублируется в заголовке этапов')
 })
+
+/* --------------------------------- столбец этапов и попыток (0.0.8) */
+
+test('две колонки дела: документы растут, этапы — ровно 320 px на обеих поверхностях', () => {
+  const css = read('dashboard/web/styles.css').replace(/\/\*[\s\S]*?\*\//g, '')
+  const rule = /\.deal-cols\s*\{([^}]*)\}/.exec(css)
+  assert.ok(rule, 'в styles.css нет правила .deal-cols')
+  assert.match(rule[1], /display:\s*grid/, 'колонки собраны не гридом')
+  assert.match(rule[1], /grid-template-columns:\s*minmax\(0, 1fr\) 320px/, 'правая колонка не 320 px или растёт')
+  assert.match(rule[1], /gap:\s*14px/, 'зазор между колонками не 14 px')
+  assert.match(rule[1], /align-items:\s*start/, 'колонки тянутся друг под друга')
+  assert.match(css, /@media \(max-width: 1100px\) \{[\s\S]{0,120}\.deal-cols \{ grid-template-columns: 1fr; \}/, 'узкое окно не складывает колонки в одну')
+
+  const plugin = read('desktop/plugin.js')
+  const dutyRule = /\.duty-deal-cols\{([^}]*)\}/.exec(plugin)
+  assert.ok(dutyRule, 'в CSS плагина нет правила .duty-deal-cols')
+  assert.match(dutyRule[1], /grid-template-columns:minmax\(0,1fr\) 320px/, 'десктоп: правая колонка не 320 px или растёт')
+  assert.match(dutyRule[1], /gap:14px/, 'десктоп: зазор не 14 px')
+  assert.match(dutyRule[1], /align-items:start/, 'десктоп: колонки тянутся')
+  assert.match(plugin, /@media \(max-width:1100px\)\{\.duty-deal-cols\{grid-template-columns:1fr\}\}/, 'десктоп: узкое окно не складывает колонки')
+})
+
+test('панели попыток больше нет ни в вебе, ни на десктопе', () => {
+  const plugin = read('desktop/plugin.js')
+  for (const [name, text] of [['веб', read('dashboard/web/app.js')], ['десктоп', plugin]]) {
+    assert.ok(!/function attemptCard\(/.test(text), `${name}: остался attemptCard`)
+    assert.ok(!/function AttemptCard\(/.test(text), `${name}: остался AttemptCard`)
+    assert.ok(!text.includes('duty-deal-attempts'), `${name}: осталась панель «попытки»`)
+    assert.ok(!text.includes('stageFeedPanel'), `${name}: осталась широкая лента этапов`)
+    assert.ok(!/function StageFeed\(/.test(text), `${name}: остался StageFeed`)
+    assert.ok(!/'попытки · '/.test(text) && !/`попытки · /.test(text), `${name}: заголовок панели «попытки» вернулся`)
+  }
+})
+
+test('обе поверхности рисуют одни и те же классы строк и раскрытий', () => {
+  const plugin = read('desktop/plugin.js')
+  const app = read('dashboard/web/app.js')
+  const css = read('dashboard/web/styles.css')
+  // Имена общие, префиксы свои: `stage-row`/`att-row` в вебе, `duty-…` на десктопе.
+  for (const cls of ['stage-row', 'att-row', 'att-ev', 'att-log']) {
+    const duty = `duty-${cls}`
+    assert.ok(app.includes(cls), `веб: нет класса ${cls}`)
+    assert.ok(plugin.includes(duty), `десктоп: нет класса ${duty}`)
+    assert.ok(css.includes(`.${cls}`), `styles.css: нет правила .${cls}`)
+    assert.ok(plugin.includes(`.${duty}{`), `CSS плагина: нет правила .${duty}`)
+  }
+  // Раскрытая строка попытки помечена классом `open` на обеих поверхностях.
+  for (const [name, text, row] of [
+    ['веб', app, "'att-row open' : 'att-row'"],
+    ['десктоп', plugin, "'duty-att-row open' : 'duty-att-row'"],
+  ]) {
+    assert.ok(text.includes(row), `${name}: строка попытки не помечает раскрытие`)
+  }
+  // Строка этапа — одна линия ~26 px, попытка ~24 px с отступом 12 px.
+  assert.match(css, /\.stage-row \{[^}]*height: 26px/, 'веб: строка этапа не 26 px')
+  assert.match(css, /\.att-row \{[^}]*height: 24px[^}]*margin-left: 12px/s, 'веб: строка попытки не 24 px с отступом')
+  assert.match(plugin, /\.duty-stage-row\{[^}]*height:26px/, 'десктоп: строка этапа не 26 px')
+  assert.match(plugin, /\.duty-att-row\{[^}]*height:24px[^}]*margin-left:12px/, 'десктоп: строка попытки не 24 px с отступом')
+})
+
+test('обрезанная команда доказательства несёт полную строку в подсказке', () => {
+  const plugin = read('desktop/plugin.js')
+  const app = read('dashboard/web/app.js')
+  // Обрезка — в шейпере (`cmdShort`), подсказка — полная команда (`cmdTitle`).
+  for (const [name, text] of [['веб', app], ['десктоп', plugin]]) {
+    assert.match(text, /title: row\.cmdTitle/, `${name}: у обрезанной команды нет подсказки`)
+    assert.match(text, /row\.cmdShort/, `${name}: команда доказательства печатается целиком`)
+  }
+  // и это именно `title` на строке команды, а не подсказка в другом месте
+  assert.match(app, /class: 'mono att-ev-cmd', title: row\.cmdTitle \}, row\.cmdShort\)/, 'веб: title не на самой команде')
+  assert.match(plugin, /className: 'duty-mono duty-att-ev-cmd', title: row\.cmdTitle \}, row\.cmdShort\)/, 'десктоп: title не на самой команде')
+})
+

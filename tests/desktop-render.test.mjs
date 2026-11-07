@@ -359,3 +359,154 @@ test('десктоп: экран «Дело» монтируется и рису
     keepWindow = dom.window
   }
 })
+
+/**
+ * Строки столбца этапов: провал раскрыт без клика, обычная попытка — нет, а клик
+ * по строке этапа и по строке попытки раскрывает их. Подсказка обрезанной
+ * команды несёт полную строку: обрезка идёт в шейпере, CSS-эллипсис её не хранит.
+ */
+test('десктоп: строки этапов раскрываются кликом, провал виден без клика', async (t) => {
+  const reactModules = reactRoot()
+  if (!reactModules) return t.skip('нет React в ~/.hermes/hermes-agent/node_modules')
+  if (!existsSync(join(reactModules, 'jsdom', 'package.json'))) return t.skip('нет jsdom')
+
+  const dir = mkdtempSync(join(tmpdir(), 'duty-rows-'))
+  mkdirSync(join(dir, 'node_modules'))
+  for (const name of ['react', 'react-dom', 'scheduler', 'jsdom']) {
+    const target = join(reactModules, name)
+    if (existsSync(target)) symlinkSync(target, join(dir, 'node_modules', name), 'dir')
+  }
+  writeFileSync(
+    join(dir, 'sdk.mjs'),
+    ['Button', 'Input', 'Codicon', 'Streamdown'].map((name) => `export const ${name} = (props) => null`).join('\n'),
+  )
+  writeFileSync(
+    join(dir, 'plugin.mjs'),
+    pluginSource()
+      .replace(/from '@hermes\/plugin-sdk'/, "from './sdk.mjs'")
+      .concat("\nexport function __setRest(fn) { rest = fn }\nexport { DealScreen }\n"),
+  )
+
+  const { JSDOM } = await import(pathToFileURL(join(reactModules, 'jsdom', 'lib', 'api.js')).href)
+  const dom = new JSDOM('<!doctype html><div id="root"></div>', { url: 'http://localhost/' })
+  globalThis.window = dom.window
+  globalThis.document = dom.window.document
+  Object.defineProperty(globalThis, 'navigator', { value: dom.window.navigator, configurable: true })
+  globalThis.HTMLElement = dom.window.HTMLElement
+  globalThis.Element = dom.window.Element
+  globalThis.Node = dom.window.Node
+  globalThis.requestAnimationFrame = (cb) => setTimeout(() => cb(Date.now()), 0)
+  globalThis.cancelAnimationFrame = (id) => clearTimeout(id)
+
+  // Длинная команда с абсолютным путём: шейпер режет её до 46 знаков, подсказка
+  // обязана нести строку целиком.
+  const fullCmd = '/Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python3 -m pytest tests/ -q -p no:randomly'
+
+  let mounted = null
+  const failures = []
+  const origError = console.error
+  console.error = (...args) => {
+    const text = args.map((item) => (item && item.stack) || String(item)).join(' ')
+    if (!/not wrapped in act/.test(text)) failures.push(text)
+  }
+
+  const settle = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  try {
+    const mod = await import(pathToFileURL(join(dir, 'plugin.mjs')).href)
+    mod.__setRest(async (path) => {
+      if (path.startsWith('/deal/')) {
+        return {
+          repo: 'hermes-duty',
+          title: 'дело со столбцом этапов',
+          status: 'running',
+          // Документов нет: столбец этапов один на всю ширину.
+          body: '',
+          spec_text: '',
+          stages: [
+            {
+              id: 'check',
+              needs: [],
+              kind: 'shell',
+              state: 'done',
+              attempts: [
+                {
+                  n: 1, run_id: 'check#1', outcome: 'done', started_at: 1_000, finished_at: 1_300, duration_sec: 300,
+                  evidence: [{ cmd: fullCmd, exit: 0, started_at: 1_000 }],
+                },
+              ],
+            },
+            {
+              id: 'verify',
+              needs: ['check'],
+              state: 'failed',
+              attempts: [
+                {
+                  n: 1, run_id: 'verify#1', outcome: 'failed', kind: 'contract', started_at: 1_600,
+                  finished_at: 2_000, duration_sec: 400, reason: 'commit.foreign: чужое готовое',
+                  evidence: [{ cmd: 'npm test', exit: 1, started_at: 1_600 }],
+                },
+              ],
+            },
+          ],
+          timeline: [{ kind: 'created', at: 900, summary: '' }],
+        }
+      }
+      if (path.includes('/attempts')) return { attempts: [] }
+      return {}
+    })
+
+    const React = (await import(pathToFileURL(join(reactModules, 'react', 'index.js')).href)).default
+    const { createRoot } = await import(pathToFileURL(join(reactModules, 'react-dom', 'client.js')).href)
+    const container = dom.window.document.getElementById('root')
+    mounted = createRoot(container)
+    mounted.render(
+      React.createElement(mod.DealScreen, {
+        sel: { id: 'd_fixture', titleFull: 'дело со столбцом этапов', repo: 'hermes-duty' },
+        onBack: () => {},
+      }),
+    )
+    await settle(800)
+
+    assert.equal(failures.length, 0, `экран дела упал: ${failures[0] || ''}`.slice(0, 600))
+    const blocks = [...container.querySelectorAll('.duty-stage-block')]
+    assert.equal(blocks.length, 2, `строк этапов ${blocks.length}, а не 2: столбец не нарисован`)
+    // Провал раскрыт без клика: в этапе `verify` видно и попытку, и доказательство.
+    assert.equal(blocks[0].querySelectorAll('.duty-att-row').length, 0, 'обычная попытка раскрыта без клика')
+    assert.equal(blocks[1].querySelectorAll('.duty-att-row').length, 1, 'провал свёрнут: его не видно без клика')
+    assert.equal(blocks[1].querySelectorAll('.duty-att-ev').length, 1, 'доказательство провала не показано')
+
+    // Клик по строке этапа раскрывает его попытки, повторный — сворачивает.
+    const stageRow = blocks[0].querySelector('.duty-stage-row')
+    assert.ok(stageRow, 'в этапе нет строки .duty-stage-row')
+    stageRow.click()
+    await settle(60)
+    assert.equal(blocks[0].querySelectorAll('.duty-att-row').length, 1, 'клик по этапу не раскрыл попытки')
+    assert.equal(blocks[0].querySelector('.duty-stage-row').getAttribute('aria-expanded'), 'true', 'строка этапа не пометила раскрытие')
+
+    // Клик по строке попытки раскрывает доказательства; команда обрезана, полная — в title.
+    blocks[0].querySelector('.duty-att-row').click()
+    await settle(60)
+    const ev = blocks[0].querySelector('.duty-att-ev')
+    assert.ok(ev, 'клик по попытке не показал доказательства')
+    const cmd = ev.querySelector('.duty-att-ev-cmd')
+    assert.ok(cmd, 'в доказательстве нет строки команды')
+    assert.equal(cmd.getAttribute('title'), fullCmd, 'подсказка не несёт полную команду')
+    assert.ok(cmd.textContent.length < fullCmd.length, 'команда не обрезана')
+    assert.ok(cmd.textContent.includes('python3 -m pytest'), `в обрезанной команде нет хвоста: ${cmd.textContent}`)
+    assert.ok(!cmd.textContent.includes('/Users/'), `в обрезанной команде остался абсолютный путь: ${cmd.textContent}`)
+
+    stageRow.click()
+    await settle(60)
+    assert.equal(blocks[0].querySelectorAll('.duty-att-row').length, 0, 'повторный клик не свернул этап')
+  } finally {
+    console.error = origError
+    try {
+      if (mounted) mounted.unmount()
+    } catch {
+      /* не смонтировалось — размонтировать нечего */
+    }
+    keepWindow = dom.window
+  }
+})
+

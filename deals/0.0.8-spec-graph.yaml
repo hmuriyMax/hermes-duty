@@ -1,0 +1,52 @@
+# Дело: граф спеки — красный только за последнюю попытку, живой этап дышит
+#
+# Тело (`BODY-spec-graph.md`) — что считается в шейпере и как это рисуют обе
+# поверхности. Здесь только граф этапов: шейпер → две поверхности → проверки →
+# приговор. Бэкенд и API не трогаются, новых полей в ответе не появляется.
+#
+# ПОЧЕМУ ТРИ ЭТАПА. Правка визуальная и узкая: один исполняющий этап правит
+# шейпер, поверхности, CSS и тесты; проверка гоняет набор; ревью читает дифф.
+# Резать на `shape`/`impl` было бы дроблением ради дробления — решение уже
+# описано телом, отдельный документ ничего не добавил бы.
+#
+# base приколот к e902d08 (голова release/v0.0.8 после фикса висящих дел):
+# новое дерево — новое дело.
+#
+# Адреса приговора: `next` (дальше) и `impl` (вернуть реализацию на доработку).
+# Чужих имён этапов в этой спеке нет: ревьюер адресует приговор тому, что видит
+# в графе.
+#
+# Свидетель этапа-проверки — приговор: `check` ничего не производит, а без
+# коммита, артефактов и приговора этап не закрывается. Поэтому `verdict` висит
+# на `review`, а `check` закрывается кодом возврата.
+
+duty: 0.0.8-spec-graph
+repo: ~/.hermes/plugins/hermes-duty
+base: e902d08
+
+budget: {minutes: 190}
+
+stages:
+  - id: impl
+    role: implementer
+    workspace: worktree
+    budget: {minutes: 85}
+    evidence:
+      - {cmd: "node --test tests/*.test.mjs", must: 0, timeout_sec: 600}
+      - {cmd: "env -u PYTHONPATH bin/duty-model-sync --check", must: 0, timeout_sec: 120}
+
+  - id: check
+    kind: shell
+    needs: [impl]
+    workspace: worktree
+    cmd: "node --test tests/*.test.mjs && env -u PYTHONPATH bin/duty-model-sync --check && env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q -p no:randomly"
+    must: 0
+    budget: {minutes: 25}
+
+  - id: review
+    role: reviewer
+    needs: [check]
+    workspace: worktree
+    verdict: {approve: next, changes: impl, max_rounds: 2}
+    retry: {max: 1, on: [contract]}
+    budget: {minutes: 45}

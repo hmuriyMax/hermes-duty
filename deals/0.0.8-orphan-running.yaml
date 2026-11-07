@@ -1,0 +1,60 @@
+# Дело: дело не должно висеть `running`, когда движка уже нет
+#
+# Класс, а не случай. Живое дело `d_eb4ad2bb` осталось `status='running'` с 07.11 04:22
+# (попытка снята таймаутом, `attempt_ended failed/infra`) и висело до ручного закрытия:
+# журнал знал, что попытки не идут, а строка дела говорила «в работе», и спросить решение
+# было некому. Такие дела копятся и глазами не отличимы от живых.
+#
+# Тело дела (`BODY-orphan-running.md`) — факты по `d_eb4ad2bb`, что уже есть в движке и
+# почему это не лечится уборкой `reaper`, требования к решению, ограничения этапов.
+#
+# ПОЧЕМУ ЭТАПОВ ЧЕТЫРЕ. Диагностическое решение здесь дороже кода: «какой факт недостаёт»
+# решается по таблице исходов прогона, и ошибка в нём стоит дороже, чем сам фикс. Поэтому
+# `shape` пишет решение документом и не трогает код, `impl` реализует ровно его, `check`
+# гоняет полный набор, `review` смотрит дифф. Прошлое дело этой правки (`d_eb4ad2bb`) шло
+# одним 90-минутным этапом и сгорело целиком без коммита — отсюда мелкие бюджеты.
+#
+# base приколот к `055e741` (голова `release/v0.0.8` после сводки журнала попытки): новое
+# дерево — новое дело.
+#
+# Адреса приговора: `next` (дальше) и `impl` (вернуть реализацию на доработку). Чужих имён
+# в этой спеке нет: ревьюер адресует приговор тому, что видит в графе.
+
+duty: 0.0.8-orphan-running
+repo: ~/.hermes/plugins/hermes-duty
+base: 055e741
+
+budget: {minutes: 200}
+
+stages:
+  - id: shape
+    role: implementer
+    workspace: worktree
+    budget: {minutes: 45}
+    evidence:
+      - {cmd: "test -f /Users/mshchemilkin/.hermes/tasks/hermes-duty/v0.0.8/ORPHAN-RUNNING.md", must: 0, timeout_sec: 60}
+
+  - id: impl
+    role: implementer
+    needs: [shape]
+    workspace: worktree
+    budget: {minutes: 70}
+    evidence:
+      - {cmd: "env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q -p no:randomly", must: 0, timeout_sec: 600}
+      - {cmd: "env -u PYTHONPATH bin/duty-model-sync --check", must: 0, timeout_sec: 120}
+
+  - id: check
+    kind: shell
+    needs: [impl]
+    workspace: worktree
+    cmd: "node --test tests/*.test.mjs && env -u PYTHONPATH bin/duty-model-sync --check && env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q -p no:randomly && env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/hermes plugins validate ."
+    must: 0
+    budget: {minutes: 25}
+
+  - id: review
+    role: reviewer
+    needs: [check]
+    workspace: worktree
+    verdict: {approve: next, changes: impl, max_rounds: 2}
+    retry: {max: 1, on: [contract]}
+    budget: {minutes: 45}

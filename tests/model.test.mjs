@@ -48,6 +48,10 @@ import {
   stageMeta,
   stateLabel,
   stateMeta,
+  compactStageView,
+  compactAttemptView,
+  cmdShort,
+  eventsSummary,
 } from '../desktop/model.js'
 
 // Ожидаемый порядок приоритета — это ожидание теста к ответу бэкенда
@@ -1295,6 +1299,247 @@ test('/now: этап и номер попытки видны в строке, б
   assert.equal(withStage.stageAttempt, 2)
   // без попыток строки нет: «этап 0» был бы выдуманным графом
   assert.equal(shapeDeal({ repo: 'r', id: 'd_2' }).stageText, '')
+})
+
+/* ------------------- компактный столбец этапов и попыток (0.0.8) ---------- */
+
+const implStage = feed.stages[0]
+
+test('строка этапа: имя, вид, попытки и состояние — одним рядом слов', () => {
+  const agent = compactStageView(implStage)
+  assert.equal(agent.id, 'impl')
+  // у агентского этапа вид называет роль — та же подпись, что у дорожки шкалы
+  assert.equal(agent.kindText, 'implementer')
+  assert.equal(agent.attemptsText, '2 попытки')
+  assert.equal(agent.stateLabel, 'идёт')
+  assert.equal(agent.tone, 'blue')
+  assert.equal(agent.waitText, '')
+  assert.equal(agent.waitHref, '')
+
+  // вид этапа из спеки не подменяется ролью: `shell` так и называется
+  assert.equal(compactStageView({ ...implStage, kind: 'shell' }).kindText, 'shell')
+
+  // `needs` — служебное: отдельным полем для подсказки строки, не строкой
+  const review = compactStageView(feed.stages[1])
+  assert.equal(review.needsText, 'после: impl')
+  assert.equal(review.stateLabel, 'ждёт гейт')
+
+  // вопрос человеку остаётся видимой строкой со ссылкой на пул
+  const ask = compactStageView(feed.stages[2])
+  assert.match(ask.waitText, /#284/)
+  assert.equal(ask.waitHref, '/imsg')
+})
+
+test('счётчик попыток этапа склоняется и не выдумывает ноль', () => {
+  const stage = (attempts) => shapeStages({ stages: [{ id: 'x', state: 'done', attempts }] }).stages[0]
+  assert.equal(compactStageView(stage([])).attemptsText, 'попыток нет')
+  assert.equal(compactStageView(stage([{ n: 1, outcome: 'done' }])).attemptsText, '1 попытка')
+  assert.equal(compactStageView(stage([{ n: 1 }, { n: 2 }, { n: 3 }])).attemptsText, '3 попытки')
+  assert.equal(compactStageView(stage(Array.from({ length: 5 }, (_, i) => ({ n: i + 1 })))).attemptsText, '5 попыток')
+})
+
+test('этап раскрыт там, где дело стоит, и там, где падало, — не весь список', () => {
+  // где дело стоит сейчас: running / wait_gate / wait_human
+  assert.equal(compactStageView(implStage).openByDefault, true)
+  assert.equal(compactStageView(feed.stages[1]).openByDefault, true)
+  assert.equal(compactStageView(feed.stages[2]).openByDefault, true)
+  assert.equal(compactStageView(implStage).toggleTitle, 'свернуть попытки этапа impl')
+
+  const done = (attempts) => shapeStages({ stages: [{ id: 'verify', state: 'done', attempts }] }).stages[0]
+  // пройденный этап без провалов свёрнут: иначе вернулась бы простыня
+  const ok = compactStageView(done([{ n: 1, outcome: 'done' }]))
+  assert.equal(ok.openByDefault, false)
+  assert.equal(ok.toggleTitle, 'развернуть попытки этапа verify')
+  // а провал в пройденном этапе виден без клика
+  assert.equal(compactStageView(done([{ n: 1, outcome: 'failed' }])).openByDefault, true)
+})
+
+test('строка попытки: исход словами, провал и живая раскрыты без клика', () => {
+  const failed = compactAttemptView(implStage, implStage.attempts[0])
+  assert.equal(failed.label, '#1')
+  assert.equal(failed.durationText, '5 мин')
+  // слова, а не телеметрия: `провал`, а не `failed`
+  assert.equal(failed.outcomeText, 'провал')
+  assert.equal(failed.tone, 'red')
+  assert.equal(failed.openByDefault, true)
+
+  const live = compactAttemptView(implStage, implStage.attempts[1])
+  assert.equal(live.outcomeText, 'идёт')
+  assert.equal(live.tone, 'blue')
+  assert.equal(live.durationText, 'идёт')
+  assert.equal(live.openByDefault, true)
+
+  // обычная закрытая попытка свёрнута
+  const stage = shapeStages({
+    stages: [{ id: 'verify', state: 'done', attempts: [{ n: 1, outcome: 'done', duration_sec: 30 }] }],
+  }).stages[0]
+  const ok = compactAttemptView(stage, stage.attempts[0])
+  assert.equal(ok.outcomeText, 'готово')
+  assert.equal(ok.tone, 'green')
+  assert.equal(ok.durationText, '30 с')
+  assert.equal(ok.openByDefault, false)
+})
+
+test('мёртвая попытка не выдаётся за идущую и не меряет себя', () => {
+  const stage = shapeStages({
+    stages: [{ id: 'impl', state: 'running', attempts: [{ n: 1, live: false, dead: true, lease: 'dead' }] }],
+  }).stages[0]
+  const dead = compactAttemptView(stage, stage.attempts[0])
+  assert.equal(dead.outcomeText, 'процесс мёртв')
+  assert.equal(dead.tone, 'red')
+  assert.equal(dead.durationText, '—')
+  assert.equal(dead.openByDefault, true)
+})
+
+test('строка попытки понимает оба источника: полосу шкалы и ручку /attempts', () => {
+  const timeline = shapeAttempts({
+    attempts: [
+      {
+        run_id: 'd_abcdef12:impl#1',
+        stage: 'impl',
+        status: 'failed',
+        start: 1799999600,
+        end: 1799999900,
+        duration_sec: 300,
+        outcome: 'failed',
+        summary: 'нет evidence по go build ./...',
+        error: 'exit 1',
+        events: [],
+      },
+    ],
+  })
+  const view = compactAttemptView(implStage, timeline.attempts[0])
+  // номера в ответе `/attempts` нет — он берётся из хвоста `runId`
+  assert.equal(view.label, '#1')
+  assert.equal(view.outcomeText, 'провал')
+  assert.equal(view.durationText, '5 мин')
+  assert.equal(view.summary, 'нет evidence по go build ./...')
+  assert.equal(view.error, 'exit 1')
+  // доказательства живут в ленте этапа, а не в ручке попыток
+  assert.equal(view.evidenceRows.length, 1)
+  assert.equal(view.evidenceRows[0].cmdTitle, 'go build ./...')
+
+  // без попытки в этапе номер не выдумывается нулём
+  assert.equal(compactAttemptView(implStage, {}).label, '—')
+})
+
+test('cmdShort: без обёртки env, без абсолютного пути, обрезка до 46 знаков', () => {
+  assert.equal(
+    cmdShort('env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q'),
+    'python -m pytest tests/ -q',
+  )
+  assert.equal(
+    cmdShort('/Users/mshchemilkin/venv/bin/python3 -m pytest tests/ -q'),
+    'python3 -m pytest tests/ -q',
+  )
+  // относительные пути — часть команды, их не трогаем
+  assert.equal(cmdShort('go build ./...'), 'go build ./...')
+  assert.equal(cmdShort('   '), '—')
+
+  const cmd = '/Users/mshchemilkin/venv/bin/python3 -m pytest tests/test_plugin_api.py tests/test_stagefeed.py -q'
+  const short = cmdShort(cmd)
+  assert.equal(short.length, 46)
+  assert.ok(short.endsWith('…'))
+  assert.doesNotMatch(short, /Users/)
+  // обрезка идёт после чистки путей — иначе хвост был бы из середины пути
+  assert.ok(short.startsWith('python3 -m pytest tests/'))
+})
+
+test('обрезанная команда доказательства несёт полную строку в подсказке', () => {
+  const cmd = '/Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python -m pytest tests/test_stagefeed.py tests/test_plugin_api.py -q'
+  const stage = shapeStages({
+    stages: [
+      {
+        id: 'verify',
+        kind: 'shell',
+        state: 'failed',
+        attempts: [
+          { n: 1, outcome: 'failed', duration_sec: 12, evidence: [{ cmd, exit: 0, started_at: 1799999800 }] },
+          { n: 2, outcome: 'failed', duration_sec: 9, evidence: [{ cmd: 'go vet ./...', exit: 1, started_at: 1799999900 }] },
+        ],
+      },
+    ],
+  }).stages[0]
+  const row = compactAttemptView(stage, stage.attempts[0]).evidenceRows[0]
+  assert.equal(row.cmdTitle, cmd)
+  assert.ok(row.cmdShort.length <= 46)
+  assert.ok(row.cmdShort.endsWith('…'))
+  assert.doesNotMatch(row.cmdShort, /Users/)
+  assert.equal(row.exitText, '0')
+  assert.equal(row.tone, 'green')
+  assert.match(row.clock, /^\d\d:\d\d:\d\d$/)
+  // иное, чем ноль, — красный: провал команды не выглядит доказательством
+  const red = compactAttemptView(stage, stage.attempts[1]).evidenceRows[0]
+  assert.equal(red.exitText, '1')
+  assert.equal(red.tone, 'red')
+})
+
+test('доказательства этапа показываются один раз — у последней попытки', () => {
+  const stage = shapeStages({
+    stages: [
+      {
+        id: 'check',
+        kind: 'shell',
+        state: 'failed',
+        evidence: [{ cmd: 'go vet ./...', must: 0, got: 2, ok: false, at: 1799999800 }],
+        attempts: [{ n: 1, outcome: 'failed' }, { n: 2, outcome: 'failed' }],
+      },
+    ],
+  }).stages[0]
+  assert.deepEqual(compactAttemptView(stage, stage.attempts[0]).evidenceRows, [])
+  const last = compactAttemptView(stage, stage.attempts[1]).evidenceRows[0]
+  // у объявленной команды `got` — это и есть код выхода
+  assert.equal(last.exitText, '2')
+  assert.equal(last.tone, 'red')
+  assert.equal(last.cmdTitle, 'go vet ./...')
+})
+
+test('журнал попытки — сводкой по видам, а не списком из трёхсот строк', () => {
+  const events = [{ kind: 'attempt_started' }]
+  for (let index = 0; index < 5; index += 1) events.push({ kind: 'attempt_progress' })
+  events.push({ kind: 'attempt_ended' })
+  assert.equal(eventsSummary(events), '5 прогрессов · 1 старт · 1 конец')
+
+  // длиннее трёх видов хвост не печатается: столбец не место для телеметрии
+  const many = eventsSummary([
+    { kind: 'attempt_progress' },
+    { kind: 'attempt_progress' },
+    { kind: 'attempt_started' },
+    { kind: 'attempt_ended' },
+    { kind: 'question_asked' },
+    { kind: 'question_answered' },
+  ])
+  assert.equal(many, '2 прогресса · 1 старт · 1 конец')
+
+  // склонения — общим `plural`, а не своим правилом
+  assert.equal(eventsSummary(Array.from({ length: 21 }, () => ({ kind: 'attempt_progress' }))), '21 прогресс')
+  assert.equal(eventsSummary(Array.from({ length: 3 }, () => ({ kind: 'attempt_started' }))), '3 старта')
+  // незнакомый вид называется как есть, пустой журнал — пустой строкой
+  assert.equal(eventsSummary([{ kind: 'своё' }]), '1 своё')
+  assert.equal(eventsSummary([]), '')
+  assert.equal(eventsSummary(null), '')
+})
+
+test('сводка журнала доезжает до строки попытки, а не остаётся в шейпере', () => {
+  const timeline = shapeAttempts({
+    attempts: [
+      {
+        run_id: 'd_abcdef12:impl#1',
+        stage: 'impl',
+        status: 'failed',
+        start: 1799999600,
+        end: 1799999900,
+        outcome: 'failed',
+        events: [
+          { kind: 'attempt_started', at: 1799999600 },
+          { kind: 'attempt_progress', at: 1799999610 },
+          { kind: 'attempt_progress', at: 1799999620 },
+          { kind: 'attempt_ended', at: 1799999900 },
+        ],
+      },
+    ],
+  })
+  assert.equal(compactAttemptView(implStage, timeline.attempts[0]).eventsText, '2 прогресса · 1 старт · 1 конец')
 })
 
 /* ----------------------------------- экран «Завершённые» (0.0.7) ---------- */

@@ -922,6 +922,9 @@ function shapeStage(stage) {
   const attempt = Number(s.attempt) || 0
   return {
     id: String(s.id || '—'),
+    // Вид этапа (`agent`/`shell`/`gate`) из спеки: подпись строки столбца и
+    // значок графа берут его отсюда, а не угадывают по имени этапа.
+    kind: String(s.kind || 'agent'),
     role: String(s.role || '—'),
     state: String(s.state || ''),
     stateLabel: meta.label,
@@ -963,6 +966,231 @@ function shapeStages(payload) {
     count: stages.length,
     attempts,
     empty: stages.length === 0,
+  }
+}
+
+/* ------------- компактный столбец этапов и попыток (0.0.8) ------------- */
+
+// Слова видов событий журнала: сводка журнала говорит «5 прогрессов», а не
+// «5 attempt_progress». Незнакомый вид печатается как есть — новый класс
+// события на экране остаётся фактом, а не прячется за «—».
+const EVENT_WORD = {
+  attempt_progress: ['прогресс', 'прогресса', 'прогрессов'],
+  attempt_started: ['старт', 'старта', 'стартов'],
+  attempt_ended: ['конец', 'конца', 'концов'],
+  question_asked: ['вопрос', 'вопроса', 'вопросов'],
+  question_answered: ['ответ', 'ответа', 'ответов'],
+  published: ['публикация', 'публикации', 'публикаций'],
+  completed: ['закрытие', 'закрытия', 'закрытий'],
+  collected: ['вердикт', 'вердикта', 'вердиктов'],
+  changes_requested: ['правки', 'правки', 'правок'],
+}
+
+// Предел строки команды в сводке доказательств: столбец 320 px, длинная команда
+// в нём — абзац. Полная строка живёт в подсказке (`cmdTitle`).
+const CMD_SHORT_LIMIT = 46
+
+// Обёртка запуска, которая не является частью команды: `env -u PYTHONPATH`
+// повторяется в каждой строке и не говорит ничего о том, что запускали.
+const CMD_ENV_WRAPPER = /^env\s+(-u\s+\S+\s+)+/
+
+/** Слова вида события: тройка для `plural`; незнакомый — как есть. */
+function eventWord(kind) {
+  return EVENT_WORD[String(kind || '')] || [String(kind || ''), String(kind || ''), String(kind || '')]
+}
+
+/**
+ * Журнал попытки сводкой по видам: `5 прогрессов · 1 старт · 1 конец`.
+ *
+ * У одной попытки бывает 374 события `attempt_progress`, и в столбце 320 px они
+ * превращают страницу в лог. Порядок постоянный — по убыванию числа, равные — по
+ * первому появлению в журнале: иначе сводка прыгала бы между опросами одного и
+ * того же дела. Длиннее трёх видов хвост не печатается вовсе (без «и ещё…»):
+ * столбец не место для перечня телеметрии.
+ */
+function eventsSummary(events) {
+  const counts = new Map()
+  for (const event of Array.isArray(events) ? events : []) {
+    const kind = String((event && event.kind) || '').trim()
+    if (!kind) continue
+    counts.set(kind, (counts.get(kind) || 0) + 1)
+  }
+  const rows = [...counts.entries()].map(([kind, count], index) => ({ kind, count, index }))
+  rows.sort((left, right) => right.count - left.count || left.index - right.index)
+  return rows
+    .slice(0, 3)
+    .map((row) => `${row.count} ${plural(row.count, ...eventWord(row.kind))}`)
+    .join(' · ')
+}
+
+/**
+ * Хвост команды для узкого столбца: без обёртки `env -u PYTHONPATH`, без
+ * абсолютных путей, не длиннее 46 знаков.
+ *
+ * `python3 -m pytest tests/ -q` вместо `/Users/…/venv/bin/python3 -m pytest
+ * tests/ -q`: абсолютный путь в строке команды — машинная подробность, и под
+ * подсказкой она не нужна. Обрезка здесь, а не CSS-эллипсисом: подсказка обязана
+ * нести полную команду, а `text-overflow` её не сохраняет.
+ */
+function cmdShort(cmd) {
+  let text = String(cmd ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  text = text.replace(CMD_ENV_WRAPPER, '')
+  text = text
+    .split(' ')
+    .map((token) =>
+      token.startsWith('/')
+        ? token.replace(/\/+$/, '').split('/').filter(Boolean).pop() || token
+        : token,
+    )
+    .join(' ')
+  if (!text) return '—'
+  if (text.length <= CMD_SHORT_LIMIT) return text
+  return `${text.slice(0, CMD_SHORT_LIMIT - 1).trimEnd()}…`
+}
+
+/**
+ * Строка этапа в компактном столбце: имя, вид, попытки, состояние словами.
+ *
+ * Служебное (`needs`) отдаётся отдельным полем, а не строкой: в столбце 320 px
+ * строка «после: …» съедает высоту, которую занимают попытки, — поверхность
+ * кладёт её в `title` строки.
+ *
+ * Раскрыт по умолчанию этап, где дело стоит сейчас (`running`/`wait_human`/
+ * `wait_gate`/`parked`, а также `failed` — это тоже «здесь падало»), и этап с
+ * проваленной попыткой: решение прошлого круга «провал виден без клика» не
+ * отменяется компактностью.
+ */
+function compactStageView(stage) {
+  const s = stage && typeof stage === 'object' ? stage : {}
+  const state = String(s.state || '')
+  const meta = s.stateLabel ? { label: String(s.stateLabel), tone: String(s.tone || 'gray') } : stageMeta(state)
+  const attempts = Array.isArray(s.attempts) ? s.attempts : []
+  const count = Number(s.attemptsCount) || attempts.length
+  const failed = attempts.some((attempt) => attempt && attempt.tone === 'red')
+  const standing = ['running', 'wait_human', 'wait_gate', 'parked', 'failed'].includes(state)
+  const open = standing || failed
+  const id = String(s.id || '—')
+  const kind = String(s.kind || 'agent')
+  return {
+    id,
+    // Вид этапа: у агентских — роль (`implementer`), у остальных — сам вид
+    // (`shell`, `gate`) из спеки. Та же подпись, что у дорожки шкалы.
+    kindText: kind === 'agent' ? String(s.role || 'профиль') : kind,
+    attemptsText: count ? `${count} ${plural(count, 'попытка', 'попытки', 'попыток')}` : 'попыток нет',
+    stateLabel: meta.label,
+    tone: meta.tone,
+    needsText: String(s.needsText || ''),
+    // Вопрос человеку остаётся видимой строкой под этапом, а не подсказкой:
+    // дело может стоять на человеке, и это не деталь.
+    waitText: String(s.waitText || ''),
+    waitHref: String(s.questionHref || ''),
+    openByDefault: open,
+    toggleTitle: `${open ? 'свернуть' : 'развернуть'} попытки этапа ${id}`,
+  }
+}
+
+/** Запись доказательства строкой столбца: код выхода, команда, время. */
+function compactEvidenceRow(record) {
+  const r = record && typeof record === 'object' ? record : {}
+  // Две формы записи: отчёт попытки (`exit`) и объявленная команда спеки
+  // (`got` — что реально получили). Подпись одна: код выхода.
+  const exit = r.exit === undefined || r.exit === null ? numOrNull(r.got) : numOrNull(r.exit)
+  const cmd = String(r.cmd || '—')
+  return {
+    exitText: exit === null ? '—' : String(exit),
+    // Ноль — доказано, иное — нет; «записи нет» остаётся серой, это не провал.
+    tone: exit === null ? 'gray' : exit === 0 ? 'green' : 'red',
+    cmdShort: cmdShort(cmd),
+    cmdTitle: cmd,
+    clock: String(r.clock || fmtClock(r.at ?? r.started_at)),
+  }
+}
+
+/**
+ * Строка попытки в компактном столбце: номер, длительность, исход словами.
+ *
+ * `stage` — этап из ленты (`shapeStage`), `bar` — попытка с фактами процесса:
+ * полоса шкалы (`shapeDealTime`) или попытка ручки `/attempts` (`shapeAttempts`).
+ * Доказательства живут только в ленте этапа, поэтому `stage.attempts` ищется по
+ * `runId`, а при его отсутствии — по номеру: у двух источников одна попытка
+ * называется по-разному.
+ *
+ * Раскрыта по умолчанию проваленная и живая попытка: провал обязан быть виден
+ * без клика.
+ */
+function compactAttemptView(stage, bar) {
+  const s = stage && typeof stage === 'object' ? stage : {}
+  const b = bar && typeof bar === 'object' ? bar : {}
+  const rows = Array.isArray(s.attempts) ? s.attempts : []
+  const runId = b.runId === undefined || b.runId === null ? null : String(b.runId)
+  const number = String(b.number || '')
+  const n = numOrNull(b.n)
+  const own =
+    rows.find((row) => {
+      if (!row || typeof row !== 'object') return false
+      if (runId !== null && row.runId !== undefined && row.runId !== null && String(row.runId) === runId) return true
+      if (n !== null && Number(row.n) === n) return true
+      return Boolean(number) && String(row.number || '') === number
+    }) || null
+
+  // Номер попытки: `#1` из полосы, из записи этапа или из хвоста `runId`
+  // (`d_abcdef12:impl#2`). Нет ни одного факта — «—», а не выдуманный ноль.
+  let label = number
+  if (!label && n !== null) label = `#${n}`
+  if (!label) {
+    const tail = /#(\d+)$/.exec(runId || '')
+    label = tail ? `#${tail[1]}` : '—'
+  }
+
+  const open =
+    b.open === true || b.live === true || (own !== null && (own.live === true || own.open === true))
+  const dead = b.dead === true || (own !== null && own.dead === true)
+  const tone = dead
+    ? 'red'
+    : open
+      ? 'blue'
+      : String(b.tone || b.outcomeTone || (own && own.tone) || 'gray')
+
+  const outcome = String(b.outcome || (own && own.outcome) || '')
+  let outcomeText = 'закрыта без исхода'
+  if (dead) outcomeText = 'процесс мёртв'
+  else if (open) outcomeText = 'идёт'
+  else if (outcome) outcomeText = outcomeWord(outcome)
+
+  // Длительность есть только у закрытой попытки: у идущей её никто не мерил, а
+  // у мёртвой нет и конца.
+  const durationText = dead
+    ? '—'
+    : open
+      ? 'идёт'
+      : String(b.durationText || (own && own.durationText) || '—')
+
+  // Доказательства: свои у попытки, а если их нет — объявленные команды этапа,
+  // и только у последней попытки (иначе один и тот же список повторился бы под
+  // каждой строкой этапа).
+  const ownRecords = own && Array.isArray(own.evidence) ? own.evidence : []
+  const stageRecords = Array.isArray(s.evidence) ? s.evidence : []
+  const mine = ownRecords.length
+    ? ownRecords
+    : !rows.length || own === rows[rows.length - 1]
+      ? stageRecords
+      : []
+  const evidenceRows = mine.map(compactEvidenceRow)
+
+  return {
+    label,
+    durationText,
+    outcomeText,
+    tone,
+    openByDefault: tone === 'red' || open,
+    evidenceRows,
+    summary: String(b.summary || ''),
+    // `error` — как есть; у ленты этапа вместо него `reason` (один факт, два
+    // имени в двух ручках), и подписи «ошибка» здесь не выдумывается.
+    error: String(b.error || (own && own.reason) || b.reason || ''),
+    eventsText: eventsSummary(b.events),
   }
 }
 
@@ -2126,5 +2354,9 @@ export {
   shapeCalls,
   shapeDealTime,
   shapeStages,
+  compactStageView,
+  compactAttemptView,
+  cmdShort,
+  eventsSummary,
   noticeLines,
 }

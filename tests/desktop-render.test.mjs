@@ -195,12 +195,19 @@ test('десктоп: DutyLane рисует svg-значок, который л�
   for (const item of scaleModel.kpi) assert.ok(kpiHtml.includes(item.value), `в KPI нет значения ${item.value}`)
 
   // Граф спеки: узлы на месте, рёбра — из `needs`.
-  // Граф — компактной полосой: мелкие узлы (76×18), а не прямоугольники на пол-экрана.
+  // Граф — компактной полосой: узлы 96×30 (две строки текста), а не
+  // прямоугольники на пол-экрана. Геометрию задаёт шейпер (`SPEC_NODE`).
   const specHtml = renderToStaticMarkup(React.createElement(mod.SpecStrip, { spec: scaleModel.spec }))
   if (scaleModel.spec) {
     assert.equal((specHtml.match(/duty-spec-node/g) || []).length, scaleModel.spec.nodes.length, 'узлов графа не столько, сколько этапов')
     assert.match(specHtml, /duty-spec-strip/, 'граф не в компактной полосе')
-    assert.ok(scaleModel.spec.nodeW <= 90 && scaleModel.spec.nodeH <= 24, `узел графа крупный: ${scaleModel.spec.nodeW}×${scaleModel.spec.nodeH}`)
+    assert.ok(scaleModel.spec.nodeW <= 96 && scaleModel.spec.nodeH <= 30, `узел графа крупный: ${scaleModel.spec.nodeW}×${scaleModel.spec.nodeH}`)
+    // Ребро рисуется кривой из вида и заканчивается острием-стрелкой.
+    const edges = scaleModel.spec.edges.length
+    assert.equal((specHtml.match(/duty-spec-edge/g) || []).length, edges, 'рёбер графа не столько, сколько зависимостей')
+    assert.equal((specHtml.match(/duty-spec-arrow/g) || []).length, edges, 'у рёбер нет стрелок')
+    // В узле две строки текста: id и слово состояния.
+    assert.match(specHtml, /duty-spec-id[^<]*<\/text>[\s\S]{0,160}duty-spec-state/, 'в узле нет второй строки с состоянием')
   }
 
   // Инспектор: пустой зовёт выбрать вызов, с вызовом называет инструмент и время.

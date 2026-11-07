@@ -1512,8 +1512,18 @@ function layoutCalls(calls, options) {
 
 // Геометрия строки: свёрнутая полоса, шаг уровня, отступ сверху, потолок уровней
 // и запас под раскрытую карту. Числа живут здесь, а не в двух файлах.
-/** Геометрия узла графа спеки: одна на обе поверхности. */
-const SPEC_NODE = { w: 76, h: 18, gapX: 14, gapY: 6 }
+/**
+ * Геометрия узла графа спеки: одна на обе поверхности.
+ *
+ * В узле две строки текста (id 9.5 px и слово состояния 8.5 px), поэтому высота
+ * выросла с 18; `gapX` оставляет место хвосту стрелки между колонками — при
+ * прежних 14 px он наезжал на соседний узел.
+ */
+const SPEC_NODE = { w: 96, h: 30, gapX: 34, gapY: 12 }
+
+// Отступ по краям картинки: обводка узла и острие стрелки рисуются поверх
+// координат, и без запаса `viewBox` их обрезал бы.
+const SPEC_PAD = 2
 
 // Геометрия строки попытки: полоса фона, уровни чипов и строка маркеров.
 // Резерв оси под подписи краёв («нач. 13:37:35», «кон. 14:08:28»): метка
@@ -1523,9 +1533,6 @@ const SPEC_NODE = { w: 76, h: 18, gapX: 14, gapY: 6 }
 const TICK_EDGE_RESERVE_PCT = 12
 
 const TL = { collapsed: 20, levelH: 12, top: 6, maxLevels: 5, pad: 8 }
-
-// Узлы графа спеки — мелкие: это схема зависимостей, а не главный объект экрана.
-
 
 // Тон вызова — семантический ключ («чтение», «правка», «запуск», «внешнее»), а не
 // CSS-цвет: палитры у поверхностей разные, а вид работы — общий факт.
@@ -1996,6 +2003,13 @@ function journalBars(events, crashes) {
  * поверхностях: обе рисуют одни и те же координаты, поэтому картинка не может
  * «поехать» на одной из них. Глубина узла — самый длинный путь от корня, так что
  * этап встаёт правее всех, после кого он ждёт.
+ *
+ * Красный — про ПОСЛЕДНЮЮ попытку, а не про память о провале: этап, упавший в
+ * середине истории и повторённый успешно, красным не остаётся. Число провалов
+ * живёт в подсказке (`title`) — память есть, но она не красит узел.
+ *
+ * Живой этап помечается `live`, и поверхности анимируют обводку: граф не должен
+ * выглядеть застывшей картинкой, пока попытка идёт.
  */
 function specView(rawStages) {
   const stages = (Array.isArray(rawStages) ? rawStages : []).map(shapeStage)
@@ -2019,33 +2033,63 @@ function specView(rawStages) {
     const depth = depthOf(stage.id, new Set())
     const row = columns[depth] === undefined ? 0 : columns[depth]
     columns[depth] = row + 1
-    // Провал попытки — факт этапа, даже если сейчас он пройден: раньше схема
-    // показывала только текущее состояние, и «здесь падало» исчезало из памяти.
-    const fails = stage.attempts.filter((attempt) => attempt.tone === 'red').length
+    const attempts = Array.isArray(stage.attempts) ? stage.attempts : []
+    const last = attempts[attempts.length - 1]
+    const fails = attempts.filter((attempt) => attempt.tone === 'red').length
+    // Тон: провал последней попытки — красный; отказ этапа без попыток вовсе —
+    // тоже красный (иначе «упало» выглядело бы серым «ждёт хода»); остальное —
+    // состояние этапа.
+    let tone = stage.tone
+    if (last && last.tone === 'red') tone = 'red'
+    else if (!attempts.length && stage.state === 'failed') tone = 'red'
     return {
       id: stage.id,
       role: stage.role,
       label: stage.stateLabel,
-      tone: stage.tone,
-      fails,
-      failsText: fails ? `провалов ${fails}` : '',
+      tone,
+      live: stage.state === 'running',
       kind: stage.kind || 'agent',
       needsText: stage.needsText,
+      // Подсказка одной строкой: подпись узла, память о провалах и ожидание.
+      title: [
+        `${stage.id} · ${stage.stateLabel}`,
+        fails ? `провалов ${fails}` : '',
+        stage.needsText,
+      ]
+        .filter(Boolean)
+        .join(' · '),
       depth,
       row,
-      x: depth * (SPEC_NODE.w + SPEC_NODE.gapX),
-      y: row * (SPEC_NODE.h + SPEC_NODE.gapY),
+      x: SPEC_PAD + depth * (SPEC_NODE.w + SPEC_NODE.gapX),
+      y: SPEC_PAD + row * (SPEC_NODE.h + SPEC_NODE.gapY),
     }
   })
+  const pos = new Map(nodes.map((node) => [node.id, node]))
   const edges = []
   for (const stage of stages) {
+    const to = pos.get(stage.id)
     for (const need of stage.needs) {
       if (!byId.has(need)) continue
-      edges.push({ from: need, to: stage.id })
+      const from = pos.get(need)
+      const x1 = from.x + SPEC_NODE.w
+      const y1 = from.y + SPEC_NODE.h / 2
+      const x2 = to.x
+      const y2 = to.y + SPEC_NODE.h / 2
+      // Прямая линия между колонками читалась как «здесь ничего не течёт»:
+      // кубическая кривая даёт ребро, у которого видно направление, а стрелка
+      // называет его точкой. Вся геометрия — здесь, поверхность её не считает.
+      const dx = Math.max(12, (x2 - x1) * 0.45)
+      edges.push({
+        from: need,
+        to: stage.id,
+        d: `M${x1},${y1} C${x1 + dx},${y1} ${x2 - dx},${y2} ${x2},${y2}`,
+        // Треугольник острием в цель: длина 6, полувысота 3.
+        arrow: { points: `${x2 - 6},${y2 - 3} ${x2},${y2} ${x2 - 6},${y2 + 3}` },
+      })
     }
   }
-  const width = Math.max(...nodes.map((node) => node.x + SPEC_NODE.w))
-  const height = Math.max(...nodes.map((node) => node.y + SPEC_NODE.h))
+  const width = Math.max(...nodes.map((node) => node.x + SPEC_NODE.w)) + SPEC_PAD
+  const height = Math.max(...nodes.map((node) => node.y + SPEC_NODE.h)) + SPEC_PAD
   return { nodes, edges, width, height, nodeW: SPEC_NODE.w, nodeH: SPEC_NODE.h }
 }
 
@@ -2793,25 +2837,31 @@ const CSS = `
 .duty-scale-key-dot.duty-t-write{background:var(--ui-green)}
 .duty-scale-key-dot.duty-t-run{background:var(--ui-yellow)}
 .duty-scale-key-dot.duty-t-net{background:var(--ui-red)}
-/* Граф — полосой: мелкие узлы, а не главный объект экрана. */
-.duty-spec-strip{display:flex;align-items:center;gap:8px;margin-top:4px}
-.duty-spec-node.has-fail rect{stroke:var(--ui-red);stroke-width:1.4;stroke-dasharray:3 2}
-.duty-spec-node.has-fail .duty-spec-id{fill:var(--ui-red)}
+/* Граф — полосой: мелкие узлы, а не главный объект экрана. Подпись стоит ПОД
+   картинкой мелким шрифтом слева: сбоку она спорила с узлами. */
+.duty-spec-strip{display:flex;flex-direction:column;align-items:flex-start;gap:4px;margin-top:4px}
 .duty-deal-head-top{align-items:flex-start}
 .duty-deal-head-side{display:flex;align-items:center;gap:8px;flex:none}
 .duty-scale-wrap{display:grid;grid-template-columns:minmax(0, 1fr) auto;gap:14px;align-items:start}
 .duty-scale-main{min-width:0}
 .duty-scale-side{display:flex;flex-direction:column;gap:1px;min-width:104px;padding-left:10px;border-left:1px solid var(--ui-stroke-tertiary);font-size:10px;color:var(--ui-text-tertiary);line-height:1.45}
-.duty-spec-strip-name{font-size:10.5px;color:var(--ui-text-tertiary);text-align:right;white-space:nowrap}
+.duty-spec-strip-name{font-size:10px;color:var(--ui-text-tertiary);text-align:left;white-space:nowrap}
 .duty-spec-graph{display:block;width:auto;height:auto;max-width:100%;overflow:visible;fill:none;stroke:none}
-.duty-spec-edge{fill:none;stroke:var(--ui-stroke-tertiary);stroke-width:1}
-.duty-spec-node rect{fill:var(--ui-surface-raised, var(--ui-surface-background));stroke:var(--ui-stroke-tertiary);stroke-width:1}
-.duty-spec-node .duty-spec-id{fill:var(--ui-text-secondary);font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:9px}
+/* Ребро — плавная кривая со стрелкой: кривую и острие считает шейпер. */
+.duty-spec-edge{fill:none;stroke:var(--ui-stroke-tertiary);stroke-width:1.1}
+.duty-spec-arrow{fill:var(--ui-stroke-tertiary);stroke:none}
+.duty-spec-node rect{fill:var(--ui-surface-raised, var(--ui-surface-background));stroke:var(--ui-stroke-tertiary);stroke-width:1.1;rx:6}
+.duty-spec-node .duty-spec-id{fill:var(--ui-text-secondary);font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:9.5px}
+.duty-spec-node .duty-spec-state{fill:var(--ui-text-tertiary);font-size:8.5px}
 .duty-spec-node.t-green rect{stroke:var(--ui-green)}
 .duty-spec-node.t-red rect{stroke:var(--ui-red)}
 .duty-spec-node.t-yellow rect{stroke:var(--ui-yellow)}
 .duty-spec-node.t-blue rect{stroke:var(--ui-accent)}
-@media (prefers-reduced-motion: reduce){.duty-tl-row,.duty-tl-mini,.duty-tl-stack,.duty-tl-call{transition:none}}
+/* Живой этап дышит: пока попытка идёт, граф не должен выглядеть застывшим. */
+.duty-spec-node.is-live rect{animation:duty-spec-breath 1.6s ease-in-out infinite}
+.duty-spec-node.is-live .duty-spec-state{fill:var(--ui-accent)}
+@keyframes duty-spec-breath{0%,100%{stroke-opacity:.45}50%{stroke-opacity:1}}
+@media (prefers-reduced-motion: reduce){.duty-tl-row,.duty-tl-mini,.duty-tl-stack,.duty-tl-call{transition:none}.duty-spec-node.is-live rect{animation:none}}
 
 .duty-scale-lanes{display:flex;flex-direction:column;gap:5px}
 .duty-scale-lane{display:grid;grid-template-columns:92px 1fr;gap:8px;align-items:center}
@@ -3328,30 +3378,17 @@ function KpiStrip({ scale }) {
 }
 
 /**
- * Граф спеки компактной полосой: мелкие узлы и рёбра `needs`.
+ * Граф спеки компактной полосой: узлы и рёбра `needs` со стрелками.
  *
- * Схема зависимостей — не главный объект экрана: крупные прямоугольники
- * занимали пол-экрана и ничего не сообщали. Координаты считает шейпер.
+ * Схема зависимостей — не главный объект экрана. Координаты, кривую ребра, острие
+ * стрелки и признаки узла (тон, `live`) считает шейпер; здесь только DOM. Подпись
+ * «граф спеки» стоит под картинкой мелким шрифтом.
  */
 function SpecStrip({ spec }) {
   if (!spec) return null
-  const pos = new Map(spec.nodes.map((node) => [node.id, node]))
-  const edges = spec.edges
-    .map((edge) => {
-      const from = pos.get(edge.from)
-      const to = pos.get(edge.to)
-      if (!from || !to) return null
-      return h('path', {
-        key: `e-${edge.from}-${edge.to}`,
-        className: 'duty-spec-edge',
-        d: `M${from.x + spec.nodeW},${from.y + spec.nodeH / 2} L${to.x},${to.y + spec.nodeH / 2}`,
-      })
-    })
-    .filter(Boolean)
   return h(
     'div',
     { className: 'duty-spec-strip' },
-    h('span', { className: 'duty-spec-strip-name' }, 'граф спеки'),
     h(
       'svg',
       {
@@ -3362,26 +3399,44 @@ function SpecStrip({ spec }) {
         role: 'img',
         'aria-label': `граф этапов: ${spec.nodes.map((node) => node.id).join(' → ')}`,
       },
-      ...edges,
+      ...spec.edges.map((edge) =>
+        h(
+          'g',
+          { key: `e-${edge.from}-${edge.to}` },
+          h('path', { className: 'duty-spec-edge', d: edge.d }),
+          h('polygon', { className: 'duty-spec-arrow', points: edge.arrow.points }),
+        ),
+      ),
       ...spec.nodes.map((node) =>
         h(
           'g',
-          { key: `n-${node.id}`, className: `duty-spec-node t-${node.tone}${node.fails ? ' has-fail' : ''}` },
+          { key: `n-${node.id}`, className: `duty-spec-node t-${node.tone}${node.live ? ' is-live' : ''}` },
+          h('title', null, node.title),
+          h('rect', { x: node.x, y: node.y, width: spec.nodeW, height: spec.nodeH, rx: 6 }),
           h(
-            'title',
-            null,
-            `${node.id} · ${node.label}${node.failsText ? ` · ${node.failsText}` : ''}${node.needsText ? ` · ${node.needsText}` : ''}`,
+            'text',
+            {
+              x: node.x + spec.nodeW / 2,
+              y: node.y + 12,
+              className: 'duty-spec-id',
+              textAnchor: 'middle',
+            },
+            node.id,
           ),
-          h('rect', { x: node.x, y: node.y, width: spec.nodeW, height: spec.nodeH, rx: 4 }),
-          h('text', {
-            x: node.x + spec.nodeW / 2,
-            y: node.y + spec.nodeH / 2 + 3,
-            className: 'duty-spec-id',
-            textAnchor: 'middle',
-          }, node.id),
+          h(
+            'text',
+            {
+              x: node.x + spec.nodeW / 2,
+              y: node.y + 23,
+              className: 'duty-spec-state',
+              textAnchor: 'middle',
+            },
+            node.label,
+          ),
         ),
       ),
     ),
+    h('span', { className: 'duty-spec-strip-name' }, 'граф спеки'),
   )
 }
 

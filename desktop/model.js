@@ -1463,8 +1463,18 @@ function layoutCalls(calls, options) {
 
 // Геометрия строки: свёрнутая полоса, шаг уровня, отступ сверху, потолок уровней
 // и запас под раскрытую карту. Числа живут здесь, а не в двух файлах.
-/** Геометрия узла графа спеки: одна на обе поверхности. */
-const SPEC_NODE = { w: 76, h: 18, gapX: 14, gapY: 6 }
+/**
+ * Геометрия узла графа спеки: одна на обе поверхности.
+ *
+ * В узле две строки текста (id 9.5 px и слово состояния 8.5 px), поэтому высота
+ * выросла с 18; `gapX` оставляет место хвосту стрелки между колонками — при
+ * прежних 14 px он наезжал на соседний узел.
+ */
+const SPEC_NODE = { w: 96, h: 30, gapX: 34, gapY: 12 }
+
+// Отступ по краям картинки: обводка узла и острие стрелки рисуются поверх
+// координат, и без запаса `viewBox` их обрезал бы.
+const SPEC_PAD = 2
 
 // Геометрия строки попытки: полоса фона, уровни чипов и строка маркеров.
 // Резерв оси под подписи краёв («нач. 13:37:35», «кон. 14:08:28»): метка
@@ -1474,9 +1484,6 @@ const SPEC_NODE = { w: 76, h: 18, gapX: 14, gapY: 6 }
 const TICK_EDGE_RESERVE_PCT = 12
 
 const TL = { collapsed: 20, levelH: 12, top: 6, maxLevels: 5, pad: 8 }
-
-// Узлы графа спеки — мелкие: это схема зависимостей, а не главный объект экрана.
-
 
 // Тон вызова — семантический ключ («чтение», «правка», «запуск», «внешнее»), а не
 // CSS-цвет: палитры у поверхностей разные, а вид работы — общий факт.
@@ -1947,6 +1954,13 @@ function journalBars(events, crashes) {
  * поверхностях: обе рисуют одни и те же координаты, поэтому картинка не может
  * «поехать» на одной из них. Глубина узла — самый длинный путь от корня, так что
  * этап встаёт правее всех, после кого он ждёт.
+ *
+ * Красный — про ПОСЛЕДНЮЮ попытку, а не про память о провале: этап, упавший в
+ * середине истории и повторённый успешно, красным не остаётся. Число провалов
+ * живёт в подсказке (`title`) — память есть, но она не красит узел.
+ *
+ * Живой этап помечается `live`, и поверхности анимируют обводку: граф не должен
+ * выглядеть застывшей картинкой, пока попытка идёт.
  */
 function specView(rawStages) {
   const stages = (Array.isArray(rawStages) ? rawStages : []).map(shapeStage)
@@ -1970,33 +1984,63 @@ function specView(rawStages) {
     const depth = depthOf(stage.id, new Set())
     const row = columns[depth] === undefined ? 0 : columns[depth]
     columns[depth] = row + 1
-    // Провал попытки — факт этапа, даже если сейчас он пройден: раньше схема
-    // показывала только текущее состояние, и «здесь падало» исчезало из памяти.
-    const fails = stage.attempts.filter((attempt) => attempt.tone === 'red').length
+    const attempts = Array.isArray(stage.attempts) ? stage.attempts : []
+    const last = attempts[attempts.length - 1]
+    const fails = attempts.filter((attempt) => attempt.tone === 'red').length
+    // Тон: провал последней попытки — красный; отказ этапа без попыток вовсе —
+    // тоже красный (иначе «упало» выглядело бы серым «ждёт хода»); остальное —
+    // состояние этапа.
+    let tone = stage.tone
+    if (last && last.tone === 'red') tone = 'red'
+    else if (!attempts.length && stage.state === 'failed') tone = 'red'
     return {
       id: stage.id,
       role: stage.role,
       label: stage.stateLabel,
-      tone: stage.tone,
-      fails,
-      failsText: fails ? `провалов ${fails}` : '',
+      tone,
+      live: stage.state === 'running',
       kind: stage.kind || 'agent',
       needsText: stage.needsText,
+      // Подсказка одной строкой: подпись узла, память о провалах и ожидание.
+      title: [
+        `${stage.id} · ${stage.stateLabel}`,
+        fails ? `провалов ${fails}` : '',
+        stage.needsText,
+      ]
+        .filter(Boolean)
+        .join(' · '),
       depth,
       row,
-      x: depth * (SPEC_NODE.w + SPEC_NODE.gapX),
-      y: row * (SPEC_NODE.h + SPEC_NODE.gapY),
+      x: SPEC_PAD + depth * (SPEC_NODE.w + SPEC_NODE.gapX),
+      y: SPEC_PAD + row * (SPEC_NODE.h + SPEC_NODE.gapY),
     }
   })
+  const pos = new Map(nodes.map((node) => [node.id, node]))
   const edges = []
   for (const stage of stages) {
+    const to = pos.get(stage.id)
     for (const need of stage.needs) {
       if (!byId.has(need)) continue
-      edges.push({ from: need, to: stage.id })
+      const from = pos.get(need)
+      const x1 = from.x + SPEC_NODE.w
+      const y1 = from.y + SPEC_NODE.h / 2
+      const x2 = to.x
+      const y2 = to.y + SPEC_NODE.h / 2
+      // Прямая линия между колонками читалась как «здесь ничего не течёт»:
+      // кубическая кривая даёт ребро, у которого видно направление, а стрелка
+      // называет его точкой. Вся геометрия — здесь, поверхность её не считает.
+      const dx = Math.max(12, (x2 - x1) * 0.45)
+      edges.push({
+        from: need,
+        to: stage.id,
+        d: `M${x1},${y1} C${x1 + dx},${y1} ${x2 - dx},${y2} ${x2},${y2}`,
+        // Треугольник острием в цель: длина 6, полувысота 3.
+        arrow: { points: `${x2 - 6},${y2 - 3} ${x2},${y2} ${x2 - 6},${y2 + 3}` },
+      })
     }
   }
-  const width = Math.max(...nodes.map((node) => node.x + SPEC_NODE.w))
-  const height = Math.max(...nodes.map((node) => node.y + SPEC_NODE.h))
+  const width = Math.max(...nodes.map((node) => node.x + SPEC_NODE.w)) + SPEC_PAD
+  const height = Math.max(...nodes.map((node) => node.y + SPEC_NODE.h)) + SPEC_PAD
   return { nodes, edges, width, height, nodeW: SPEC_NODE.w, nodeH: SPEC_NODE.h }
 }
 

@@ -69,7 +69,7 @@ const humanEl = document.getElementById('human')
 // HTML-namespace, и браузер его не рисует вовсе. Ошибка не видна в разметке, и
 // именно поэтому список назван явно, а не выводится из имени тега.
 const SVG_NS = 'http://www.w3.org/2000/svg'
-const SVG_TAGS = new Set(['svg', 'path', 'circle', 'rect', 'line', 'polyline', 'g', 'use', 'text', 'title'])
+const SVG_TAGS = new Set(['svg', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'g', 'use', 'text', 'title'])
 
 function h(tag, props, ...children) {
   const el = SVG_TAGS.has(tag) ? document.createElementNS(SVG_NS, tag) : document.createElement(tag)
@@ -1394,31 +1394,18 @@ function inspectorNode(call) {
 }
 
 /**
- * Граф спеки компактной полосой: мелкие узлы и рёбра `needs`.
+ * Граф спеки компактной полосой: узлы и рёбра `needs` со стрелками.
  *
- * Это схема зависимостей, а не главный объект экрана: крупные прямоугольники
- * занимали пол-экрана и ничего не сообщали. Координаты считает шейпер
- * (`scale.spec`), поверхности только рисуют.
+ * Это схема зависимостей, а не главный объект экрана. Координаты, кривую ребра,
+ * острие стрелки и признаки узла (тон, `live`) считает шейпер (`scale.spec`),
+ * поверхность только перекладывает вид в SVG. Подпись «граф спеки» стоит под
+ * картинкой: сбоку она спорила с узлами.
  */
 function specStrip(spec) {
   if (!spec) return null
-  const pos = new Map(spec.nodes.map((node) => [node.id, node]))
-  const edges = spec.edges
-    .map((edge) => {
-      const from = pos.get(edge.from)
-      const to = pos.get(edge.to)
-      if (!from || !to) return null
-      const x1 = from.x + spec.nodeW
-      const y1 = from.y + spec.nodeH / 2
-      const x2 = to.x
-      const y2 = to.y + spec.nodeH / 2
-      return h('path', { class: 'spec-edge', d: `M${x1},${y1} L${x2},${y2}` })
-    })
-    .filter(Boolean)
   return h(
     'div',
     { class: 'spec-strip' },
-    h('span', { class: 'spec-strip-name' }, 'граф спеки'),
     h(
       'svg',
       {
@@ -1429,21 +1416,22 @@ function specStrip(spec) {
         role: 'img',
         'aria-label': `граф этапов: ${spec.nodes.map((node) => node.id).join(' → ')}`,
       },
-      ...edges,
+      ...spec.edges.map((edge) => [
+        h('path', { class: 'spec-edge', d: edge.d }),
+        h('polygon', { class: 'spec-arrow', points: edge.arrow.points }),
+      ]),
       ...spec.nodes.map((node) =>
         h(
           'g',
-          { class: `spec-node t-${node.tone}${node.fails ? ' has-fail' : ''}` },
-          h(
-            'title',
-            null,
-            `${node.id} · ${node.label}${node.failsText ? ` · ${node.failsText}` : ''}${node.needsText ? ` · ${node.needsText}` : ''}`,
-          ),
-          h('rect', { x: node.x, y: node.y, width: spec.nodeW, height: spec.nodeH, rx: 4 }),
-          h('text', { x: node.x + spec.nodeW / 2, y: node.y + spec.nodeH / 2 + 3, class: 'spec-id', 'text-anchor': 'middle' }, node.id),
+          { class: `spec-node t-${node.tone}${node.live ? ' is-live' : ''}` },
+          h('title', null, node.title),
+          h('rect', { x: node.x, y: node.y, width: spec.nodeW, height: spec.nodeH, rx: 6 }),
+          h('text', { x: node.x + spec.nodeW / 2, y: node.y + 12, class: 'spec-id', 'text-anchor': 'middle' }, node.id),
+          h('text', { x: node.x + spec.nodeW / 2, y: node.y + 23, class: 'spec-state', 'text-anchor': 'middle' }, node.label),
         ),
       ),
     ),
+    h('span', { class: 'spec-strip-name' }, 'граф спеки'),
   )
 }
 

@@ -251,9 +251,92 @@ test('разворот строки и правки экрана дела: пр�
   assert.match(plugin, /'aria-pressed':\s*active\.includes\(item\.tone\)/, 'десктоп: ключ легенды не кнопка')
   assert.match(plugin, /onClick:\s*\(\)\s*=>\s*onToggleTool/, 'десктоп: клик по легенде не подключён')
 
-  // Провал попытки отмечается на узле графа.
-  assert.match(css, /\.spec-node\.has-fail rect\s*\{[^}]*var\(--danger\)/, 'веб: провал не отмечен')
-  assert.match(plugin, /\.duty-spec-node\.has-fail rect\{[^}]*var\(--ui-red\)/, 'десктоп: провал не отмечен')
+  // Граф спеки: красный — про последнюю попытку, а не про память о провале.
+  // Класса `has-fail` не существует ни в разметке, ни в правилах: узел, упавший
+  // в середине истории и повторённый, больше не краснеет.
+  assert.doesNotMatch(css, /has-fail/, 'веб: осталось правило провала-в-памяти')
+  assert.doesNotMatch(app, /has-fail/, 'веб: узел красится по любому провалу')
+  assert.doesNotMatch(plugin, /has-fail/, 'десктоп: узел красится по любому провалу')
+
+  // Живой этап: признак `live` читается разметкой, обводка дышит, подпись состояния
+  // в цвете акцента — иначе идущая попытка выглядит застывшей картинкой.
+  for (const [name, text, breath, accent] of [
+    ['веб', css, '@keyframes spec-breath', '.spec-node.is-live .spec-state'],
+    ['десктоп', plugin, '@keyframes duty-spec-breath', '.duty-spec-node.is-live .duty-spec-state'],
+  ]) {
+    assert.ok(text.includes(breath), `${name}: нет анимации живого этапа`)
+    assert.match(text, /(?:^|[\s}])\.(?:duty-)?spec-node\.is-live rect\s*\{[^}]*animation:/m, `${name}: живой узел не анимируется`)
+    assert.ok(text.includes(accent), `${name}: подпись живого этапа не в цвете акцента`)
+  }
+
+  // Ребро — плавная кривая без штриха и со стрелкой: штрих читался как «ещё не готово».
+  assert.doesNotMatch(css, /\.spec-edge\s*\{[^}]*stroke-dasharray/, 'веб: ребро снова штриховое')
+  assert.match(css, /\.spec-arrow\s*\{[^}]*fill:\s*var\(--border\)/, 'веб: у ребра нет заливки стрелки')
+  assert.match(plugin, /\.duty-spec-arrow\{[^}]*fill:var\(--ui-stroke-tertiary\)/, 'десктоп: у ребра нет заливки стрелки')
+})
+
+test('граф спеки: узел читает вид, ребро получает кривую и стрелку', () => {
+  const app = read('dashboard/web/app.js')
+  const css = read('dashboard/web/styles.css')
+  // Вшитая копия шейпера вырезана: проверяем разметку плагина, а не тело модели.
+  const plugin = read('desktop/plugin.js').replace(/\/\/ duty:model-start[\s\S]*?\/\/ duty:model-end/, '')
+
+  /** Тело функции верхнего уровня: от заголовка до следующего `function `. */
+  const fnBody = (source, head) => {
+    const start = source.indexOf(head)
+    assert.ok(start >= 0, `не найдена функция ${head}`)
+    const next = source.indexOf('\nfunction ', start + head.length)
+    return source.slice(start, next < 0 ? undefined : next)
+  }
+
+  for (const [name, source, head, cls, id, state, edge, arrow, live] of [
+    [
+      'веб',
+      app,
+      'function specStrip(',
+      'spec-node',
+      'spec-id',
+      'spec-state',
+      /class: 'spec-edge', d: edge\.d/,
+      /h\('polygon', \{ class: 'spec-arrow', points: edge\.arrow\.points \}\)/,
+      /node\.live \? ' is-live' : ''/,
+    ],
+    [
+      'десктоп',
+      plugin,
+      'function SpecStrip(',
+      'duty-spec-node',
+      'duty-spec-id',
+      'duty-spec-state',
+      /className: 'duty-spec-edge', d: edge\.d/,
+      /h\('polygon', \{ className: 'duty-spec-arrow', points: edge\.arrow\.points \}\)/,
+      /node\.live \? ' is-live' : ''/,
+    ],
+  ]) {
+    const body = fnBody(source, head)
+    // Признак живого этапа ставится из вида, а не угадывается поверхностью.
+    assert.match(body, live, `${name}: узел не помечает идущий этап`)
+    assert.match(body, new RegExp('class(?:Name)?: `' + cls + ' t-\\$\\{node\\.tone\\}'), `${name}: узел не знает тона`)
+    assert.doesNotMatch(body, /has-fail/, `${name}: вернулся класс провала-в-памяти`)
+    // Подсказка — готовая строка шейпера.
+    assert.match(body, /h\('title', null, node\.title\)/, `${name}: подсказка не из вида`)
+    // Ребро: кривая из вида + треугольник острия. Координат ребра на поверхности нет.
+    assert.match(body, edge, `${name}: ребро не берёт кривую из вида`)
+    assert.match(body, arrow, `${name}: у ребра нет стрелки`)
+    assert.doesNotMatch(body, /from\.x|from\.y|to\.x|to\.y/, `${name}: поверхность считает геометрию ребра`)
+    // Две строки текста: id и слово состояния.
+    assert.match(body, new RegExp(`class(?:Name)?: '${id}'[\\s\\S]{0,320}class(?:Name)?: '${state}'`), `${name}: в узле нет второй строки`)
+    assert.match(body, /rx: 6/, `${name}: у узла нет скругления 6`)
+  }
+
+  // Подпись «граф спеки» — под картинкой: полоса стала колонкой, текст слева.
+  for (const [name, text, strip, label] of [
+    ['веб', css, /\.spec-strip\s*\{[^}]*flex-direction:\s*column/, /\.spec-strip-name\s*\{[^}]*text-align:\s*left/],
+    ['десктоп', plugin, /\.duty-spec-strip\{[^}]*flex-direction:column/, /\.duty-spec-strip-name\{[^}]*text-align:left/],
+  ]) {
+    assert.match(text, strip, `${name}: подпись висит сбоку от графа`)
+    assert.match(text, label, `${name}: подпись не прижата влево`)
+  }
 })
 
 test('карточка дела не повторяет числа и не подменяет спеку телом', () => {

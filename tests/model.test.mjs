@@ -638,7 +638,7 @@ test('разворот строки: свёрнутая высота меньш�
   assert.deepEqual([...new Set(view.chips.map((chip) => chip.level))].sort(), [...levels].sort())
 })
 
-test('граф спеки: провал попытки этапа виден, даже если этап потом прошли', () => {
+test('граф спеки: красный — про последнюю попытку, а не про память о провале', () => {
   const scale = shapeDealTime(
     {
       now: 1_600,
@@ -646,6 +646,7 @@ test('граф спеки: провал попытки этапа виден, д
       timeline: [{ kind: 'created', at: 1_000, summary: '' }],
       stages: [
         { id: 'impl', role: 'implementer', state: 'done', needs: [], attempts: [{ attempt: 1, outcome: 'done' }] },
+        // Провал в середине истории и успешный повтор: этап пройден, красить нечего.
         { id: 'check', role: 'reviewer', state: 'done', needs: ['impl'], attempts: [{ attempt: 1, outcome: 'failed' }, { attempt: 2, outcome: 'done' }] },
       ],
     },
@@ -653,11 +654,81 @@ test('граф спеки: провал попытки этапа виден, д
   )
   const check = scale.spec.nodes.find((node) => node.id === 'check')
   const impl = scale.spec.nodes.find((node) => node.id === 'impl')
-  assert.equal(check.fails, 1, 'провал не посчитан')
-  assert.equal(check.failsText, 'провалов 1')
-  assert.equal(impl.fails, 0)
-  // Тон узла остаётся состоянием этапа: провал — отдельная отметка, а не подмена.
-  assert.equal(check.tone, 'green')
+  assert.equal(check.tone, 'green', 'узел красный из-за провала, который уже повторён')
+  // Память о провале остаётся в подсказке, но не в краске.
+  assert.match(check.title, /провалов 1/, 'в подсказке нет памяти о провале')
+  // Поля `fails`/`failsText` из вида убраны: их читал только класс `has-fail`.
+  assert.equal('fails' in check, false, 'в виде узла осталось поле fails')
+  assert.equal('failsText' in check, false, 'в виде узла осталось поле failsText')
+  assert.doesNotMatch(impl.title, /провалов/, 'у этапа без провалов подсказка врёт')
+})
+
+test('граф спеки: провал последней попытки и отказ этапа без попыток — красные', () => {
+  const scale = shapeDealTime(
+    {
+      now: 1_600,
+      terminal: true,
+      timeline: [{ kind: 'created', at: 1_000, summary: '' }],
+      stages: [
+        { id: 'impl', role: 'implementer', state: 'done', needs: [], attempts: [{ attempt: 1, outcome: 'done' }, { attempt: 2, outcome: 'failed' }] },
+        // Попыток нет, но движок отказал этапу: «упало» не становится серым.
+        { id: 'check', role: 'reviewer', state: 'failed', needs: ['impl'], attempts: [] },
+      ],
+    },
+    {},
+  )
+  const impl = scale.spec.nodes.find((node) => node.id === 'impl')
+  const check = scale.spec.nodes.find((node) => node.id === 'check')
+  assert.equal(impl.tone, 'red', 'последняя попытка провалилась, а узел не красный')
+  assert.equal(check.tone, 'red', 'отказ этапа без попыток не покрашен')
+})
+
+test('граф спеки: идущий этап живой, пройденный — нет', () => {
+  const scale = shapeDealTime(
+    {
+      now: 1_600,
+      timeline: [{ kind: 'created', at: 1_000, summary: '' }],
+      stages: [
+        { id: 'impl', role: 'implementer', state: 'running', needs: [], attempts: [{ attempt: 1 }] },
+        { id: 'check', role: 'reviewer', state: 'done', needs: ['impl'], attempts: [{ attempt: 1, outcome: 'done' }] },
+      ],
+    },
+    {},
+  )
+  const impl = scale.spec.nodes.find((node) => node.id === 'impl')
+  const check = scale.spec.nodes.find((node) => node.id === 'check')
+  assert.equal(impl.live, true, 'идущий этап не помечен живым')
+  assert.equal(check.live, false, 'пройденный этап помечен живым')
+})
+
+test('граф спеки: ребро — кривая со стрелкой, геометрия в шейпере', () => {
+  const scale = shapeDealTime(
+    {
+      now: 1_600,
+      terminal: true,
+      timeline: [{ kind: 'created', at: 1_000, summary: '' }],
+      stages: [
+        { id: 'impl', role: 'implementer', state: 'done', needs: [], attempts: [] },
+        { id: 'check', role: 'reviewer', state: 'done', needs: ['impl'], attempts: [] },
+        { id: 'review', role: 'reviewer', state: 'pending', needs: ['impl'], attempts: [] },
+      ],
+    },
+    {},
+  )
+  assert.equal(scale.spec.edges.length, 2, 'рёбер не столько, сколько зависимостей')
+  for (const edge of scale.spec.edges) {
+    assert.match(edge.d, /^M[-\d.]+,[-\d.]+ C/, `ребро прямой линией: ${edge.d}`)
+    // Острие: треугольник из трёх пар координат — его рисует поверхность как polygon.
+    const pairs = edge.arrow.points.trim().split(/\s+/)
+    assert.equal(pairs.length, 3, `в стрелке ${pairs.length} точек`)
+    for (const pair of pairs) assert.match(pair, /^[-\d.]+,[-\d.]+$/, `точка стрелки не пара координат: ${pair}`)
+  }
+  // Узлы внутри картинки: отступ по краям, иначе обводку и стрелку режет viewBox.
+  for (const node of scale.spec.nodes) {
+    assert.ok(node.x > 0 && node.y > 0, `узел ${node.id} приклеен к краю картинки`)
+    assert.ok(node.x + scale.spec.nodeW < scale.spec.width, `узел ${node.id} вылез за правый край`)
+    assert.ok(node.y + scale.spec.nodeH < scale.spec.height, `узел ${node.id} вылез за нижний край`)
+  }
 })
 
 test('легенда инструментов: семейства с числами вызовов, порядок постоянный', () => {

@@ -971,19 +971,35 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 .smk-wait.t-yellow { color: var(--warn); }
 
 /* ------------------------------------------------------------- граф спеки */
-/* Граф — полосой: мелкие узлы, а не главный объект экрана. */
-.spec-strip { display: flex; align-items: center; gap: 8px; margin: 2px 0 0; }
-/* Узел с провалом: штриховая красная обводка поверх состояния этапа — «здесь
- * падало» остаётся видно и после того, как этап прошли. */
-.spec-node.has-fail rect { stroke: var(--danger); stroke-width: 1.4; stroke-dasharray: 3 2; }
-.spec-node.has-fail .spec-id { fill: var(--danger); }
+/* Граф — полосой: узлы компактные, а не главный объект экрана. Подпись стоит
+ * ПОД картинкой мелким шрифтом: сбоку она спорила с узлами. */
+.spec-strip { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; margin: 4px 0 0; }
 .spec-strip-name { font-size: 10px; color: var(--text-3); text-align: left; white-space: nowrap; }
 svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; overflow: visible; fill: none; stroke: none; }
-.spec-edge { fill: none; stroke: var(--border); stroke-width: 1.2; stroke-dasharray: 4 3; }
-.spec-node rect { fill: var(--card); stroke: var(--border); stroke-width: 1; }
-.spec-node .spec-id { fill: var(--text-2); font-family: var(--mono); font-size: 9px; }
+/* Ребро — плавная кривая без штриха: штрих читался как «ещё не готово»; кривую и
+ * острие считает шейпер, здесь только цвет пера. */
+.spec-edge { fill: none; stroke: var(--border); stroke-width: 1.1; }
+.spec-arrow { fill: var(--border); stroke: none; }
+.spec-node rect { fill: var(--card); stroke: var(--border); stroke-width: 1.1; rx: 6; }
+.spec-node .spec-id { fill: var(--text-2); font-family: var(--mono); font-size: 9.5px; }
+/* Вторая строка узла — состояние словами: цвет состояния и есть подпись. */
+.spec-node .spec-state { fill: var(--text-3); font-size: 8.5px; }
 
 .spec-node.t-green rect { stroke: var(--ok); }
 .spec-node.t-red rect { stroke: var(--danger); }
 .spec-node.t-yellow rect { stroke: var(--warn); }
 .spec-node.t-blue rect { stroke: var(--accent); }
+
+/* Живой этап дышит: пока попытка идёт, граф не должен выглядеть застывшим. */
+.spec-node.is-live rect { animation: spec-breath 1.6s ease-in-out infinite; }
+.spec-node.is-live .spec-state { fill: var(--accent); }
+@keyframes spec-breath {
+  0%, 100% { stroke-opacity: .45; }
+  50% { stroke-opacity: 1; }
+}
+/* Дыхание — украшение: при отключённой анимации состояние остаётся цветом
+ * обводки и подписи. Медиа-блок стоит после правил узла, иначе он проиграл бы
+ * каскадом. */
+@media (prefers-reduced-motion: reduce) {
+  .spec-node.is-live rect { animation: none; }
+}

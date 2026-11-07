@@ -879,8 +879,11 @@ function shapeStageEvidence(entry) {
  * Живость — отдельный факт от журнала: `live` (лизинг действует), `dead`
  * (лизинг истёк, завершения нет), `unknown` (срок лизинга не записан).
  */
-function shapeStageAttempt(attempt) {
+function shapeStageAttempt(attempt, events) {
   const a = attempt && typeof attempt === 'object' ? attempt : {}
+  // События приходят отдельно: в записи этапа их нет (`events` собирает
+  // `shapeStages` из журнала дела и раскладывает по номеру попытки).
+  const ownEvents = Array.isArray(events) ? events : []
   const outcome = String(a.outcome || '')
   const live = a.live === true
   const dead = a.dead === true
@@ -925,6 +928,7 @@ function shapeStageAttempt(attempt) {
     tools: a.tools ?? null,
     toolsText: fmtCount(a.tools),
     reason: String(a.reason || ''),
+    events: ownEvents,
     live,
     dead,
     lease,
@@ -942,12 +946,17 @@ function shapeStageAttempt(attempt) {
  * панель пула (`/imsg`): вопрос живёт там, где на него отвечают, а лента — нет.
  * Своей кнопки «ответить»/«перезапустить» экран не заводит: он ничего не решает.
  */
-function shapeStage(stage) {
+function shapeStage(stage, journal) {
   const s = stage && typeof stage === 'object' ? stage : {}
+  const byAttempt = journal && typeof journal.get === 'function' ? journal : null
   const meta = stageMeta(s.state)
   const waits = s.waits && typeof s.waits === 'object' ? s.waits : null
   const needs = (Array.isArray(s.needs) ? s.needs : []).map(String)
-  const attempts = (Array.isArray(s.attempts) ? s.attempts : []).map(shapeStageAttempt)
+  const attempts = (Array.isArray(s.attempts) ? s.attempts : []).map((item) => {
+    const n = item && typeof item === 'object' ? Number(item.n) || null : null
+    const key = byAttempt && n !== null ? `${String(s.id || '')}#${n}` : ''
+    return shapeStageAttempt(item, key ? byAttempt.get(key) : null)
+  })
   const evidence = (Array.isArray(s.evidence) ? s.evidence : []).map(shapeStageEvidence)
   const kind = waits ? String(waits.kind || '') : ''
   const questionId =
@@ -1004,9 +1013,44 @@ function shapeStage(stage) {
  * попыток. Причину пустоты называет `note` бэкенда, поэтому экран не гадает.
  * Своих правил «готово/не готово» здесь нет: состояние приходит посчитанным.
  */
+/**
+ * События журнала по попыткам: `Map<"этап#номер", [{kind, clock, summary}]>`.
+ *
+ * `summary` события — JSON движка (`{stage, attempt, phase, name}`), и только в
+ * нём есть привязка к попытке: ключей `stage`/`attempt` на верхнем уровне нет.
+ * Событие без разбираемой привязки пропускается — приписать его первой попытке
+ * значило бы выдумать факт.
+ */
+function stageJournal(timeline) {
+  const map = new Map()
+  for (const event of Array.isArray(timeline) ? timeline : []) {
+    const e = event && typeof event === 'object' ? event : {}
+    let payload = null
+    try {
+      payload = JSON.parse(String(e.summary || ''))
+    } catch {
+      payload = null
+    }
+    if (!payload || typeof payload !== 'object') continue
+    const stage = String(payload.stage || '')
+    const attempt = Number(payload.attempt) || null
+    if (!stage || attempt === null) continue
+    const key = `${stage}#${attempt}`
+    const list = map.get(key) || []
+    list.push({ kind: String(e.kind || ''), clock: fmtClock(e.at), summary: String(e.summary || '') })
+    map.set(key, list)
+  }
+  return map
+}
+
 function shapeStages(payload) {
   const data = payload && typeof payload === 'object' ? payload : {}
-  const stages = (Array.isArray(data.stages) ? data.stages : []).map(shapeStage)
+  // Журнал дела лежит рядом с этапами, а не внутри них: `stages[].attempts[]`
+  // знает вызовы и доказательства, события `attempt_progress` — только в
+  // `timeline`. Раскладываем их по номеру попытки здесь, чтобы поверхность не
+  // склеивала два источника сама.
+  const journal = stageJournal(data.timeline)
+  const stages = (Array.isArray(data.stages) ? data.stages : []).map((stage) => shapeStage(stage, journal))
   const attempts = stages.reduce((sum, stage) => sum + stage.attemptsCount, 0)
   return {
     spec: String(data.spec || ''),
@@ -1226,6 +1270,11 @@ function compactAttemptView(stage, bar) {
     : !rows.length || own === rows[rows.length - 1]
       ? stageRecords
       : []
+  // Два источника журнала: полоса шкалы (лента дела) и запись этапа (журнал).
+  // Порядок предпочтения — по непустоте, а не по «первому присвоенному».
+  const barEvents = Array.isArray(b.events) ? b.events : []
+  const ownEvents = own && Array.isArray(own.events) ? own.events : []
+
   const evidenceRows = mine.map(compactEvidenceRow)
 
   return {
@@ -1239,7 +1288,11 @@ function compactAttemptView(stage, bar) {
     // `error` — как есть; у ленты этапа вместо него `reason` (один факт, два
     // имени в двух ручках), и подписи «ошибка» здесь не выдумывается.
     error: String(b.error || (own && own.reason) || b.reason || ''),
-    eventsText: eventsSummary(b.events),
+    // Журнал: полоса несёт события из ленты дела, запись этапа — из журнала.
+    // Пустой список в полосе не значит «событий нет»: ручка попыток отдаёт их
+    // отдельно, и наложение пустого массива поверх непустого молча съедало
+    // сводку на живых данных (`[]` в JS — правда).
+    eventsText: eventsSummary(barEvents.length ? barEvents : ownEvents),
   }
 }
 

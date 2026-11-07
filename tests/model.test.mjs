@@ -870,6 +870,44 @@ test('документы дела: спека — файл, тело — отд�
   assert.equal(docBlocks({ spec: '/x/y.yaml', spec_text: 'duty: y', spec_text_truncated: true })[0].truncated, true)
 })
 
+test('сводка журнала: события берутся из журнала дела и раскладываются по попыткам', () => {
+  // Живая форма ответа: этапы знают попытки и доказательства, а события журнала
+  // лежат рядом — в `timeline`, с привязкой внутри `summary`.
+  const progress = (stage, attempt, seq, at) => ({
+    kind: 'attempt_progress',
+    at,
+    summary: JSON.stringify({ stage, attempt, seq, phase: 'tool_use', name: 'read_file', ts: at }),
+  })
+  const feed = shapeStages({
+    stages: [{ id: 'verify', state: 'done', attempts: [{ n: 1, attempt: 1, started_at: 1000, finished_at: 1200, outcome: 'failed' }] }],
+    timeline: [
+      { kind: 'attempt_started', at: 1000, summary: JSON.stringify({ stage: 'verify', attempt: 1 }) },
+      progress('verify', 1, 1, 1010),
+      progress('verify', 1, 2, 1020),
+      { kind: 'attempt_ended', at: 1200, summary: JSON.stringify({ stage: 'verify', attempt: 1 }) },
+      // Чужая попытка того же этапа в эту не попадает.
+      progress('verify', 2, 1, 1300),
+      // Событие без привязки не приписывается первой попытке наугад.
+      { kind: 'attempt_progress', at: 1400, summary: 'не json' },
+    ],
+  })
+  const stage = feed.stages[0]
+  assert.equal(stage.attempts[0].events.length, 4, 'события попытки не собрались из журнала')
+
+  const view = compactAttemptView(stage, { number: '#1', n: 1 })
+  assert.equal(view.eventsText, '2 прогресса · 1 старт · 1 конец')
+  assert.ok(view.eventsText.split(' · ').length <= 3, 'сводка длиннее трёх видов')
+
+  // Пустой список в полосе не отменяет журнал попытки: `[]` правдив в JS, и
+  // именно на этом сводка пропадала на живой странице.
+  const emptyBar = compactAttemptView(stage, { number: '#1', n: 1, events: [] })
+  assert.equal(emptyBar.eventsText, '2 прогресса · 1 старт · 1 конец', 'пустая полоса съела журнал')
+
+  // Событий нет вовсе — строки журнала нет, а не «0 событий».
+  const bare = compactAttemptView(shapeStages({ stages: [{ id: 'impl', state: 'done', attempts: [{ n: 1 }] }] }).stages[0], { n: 1 })
+  assert.equal(bare.eventsText, '')
+})
+
 test('короткие имена: репозиторий и файл спеки без каталогов', () => {
   assert.equal(repoShort('/Users/x/.hermes/plugins/hermes-duty'), 'hermes-duty')
   assert.equal(repoShort('hermes-duty/'), 'hermes-duty')

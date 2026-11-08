@@ -1420,6 +1420,15 @@ function layoutCalls(calls, options) {
   const maxLevels = Math.max(1, Number(opts.maxLevels) || 5)
   const gap = Number(opts.gap) || 2
   const span = from === null || to === null ? 0 : to - from
+  // Позиция вызова — та же карта оси, что у полос и маркеров (`pctOf` из
+  // `shapeDealTime`): сжатие простоя меняет масштаб, и вторая линейная формула
+  // развела бы чип и маркер одного и того же мгновения. Ширины чипов и уровни
+  // остаются в виртуальных пикселях — их задаёт логарифм длительности.
+  const toPct = typeof opts.toPct === 'function' ? opts.toPct : null
+  const pxOf = (at) => {
+    const pct = toPct ? Math.max(0, Math.min(100, Number(toPct(at)) || 0)) : ((at - from) / span) * 100
+    return (pct / 100) * width
+  }
   const list = Array.isArray(calls) ? calls : []
   if (!list.length || width <= 0 || span <= 0) {
     return { chips: [], levels: 0, height: top + levelH, clipped: 0 }
@@ -1436,7 +1445,7 @@ function layoutCalls(calls, options) {
   const chips = []
   let clipped = 0
   for (const call of list) {
-    const px = Math.max(0, Math.min(width, ((call.at - from) / span) * width))
+    const px = Math.max(0, Math.min(width, pxOf(call.at)))
     const unfinished = call.ms === null || call.ms === undefined
     const size = unfinished ? UNFINISHED_W : chipWidth(call.ms)
     let level = lastEnd.findIndex((end) => px - end >= gap)
@@ -1552,6 +1561,10 @@ function attemptView(bar, scale) {
     ? layoutCalls(calls, {
         from: axis.start,
         to: axis.end,
+        // Чип встаёт на ту же кусочную карту оси, что полосы и маркеры: на
+        // сжатом простое линейная пропорция сдвинула бы вызов относительно
+        // маркера того же мгновения на четверть ширины.
+        toPct: scale && typeof scale.pctOf === 'function' ? scale.pctOf : null,
         levelH: TL.levelH,
         top: TL.top,
         maxLevels: TL.maxLevels,
@@ -2470,6 +2483,11 @@ function shapeDealTime(detail, attemptsPayload) {
     now,
     live,
     empty: bars.length === 0 && markers.length === 0,
+    // Карта оси — единственная формула координат: полосы, маркеры, засечки,
+    // пауза вопроса и чипы вызовов (`attemptView` → `layoutCalls`) берут время
+    // отсюда. Второй формулы нет: иначе сжатый простой развёл бы чип и маркер
+    // одного и того же мгновения.
+    pctOf,
     axis: {
       start: axisStart,
       end: axisEnd,

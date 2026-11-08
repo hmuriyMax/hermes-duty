@@ -561,6 +561,18 @@ test('десктоп: сжатый простой подписан на оси, 
   const css = pluginSource().replace(/\/\*[\s\S]*?\*\//g, '')
   assert.match(css, /\.duty-tl-idle\{[^}]*stroke-dasharray:2 3/, 'нет пунктира у .duty-tl-idle')
   assert.match(css, /\.duty-tl-idle-label\{[^}]*fill:var\(--ui-text-tertiary\)/, 'нет цвета у подписи сжатия')
+  // Слой сжатия и сетка оси начинаются там же, где дорожка строки: после
+  // колонки подписей (gutter + gap). При left:0 пунктир и подпись встают на
+  // ~194 px левее промежутка и мерят проценты по ширине плагина, а не дорожки —
+  // то есть подпись опровергает то, что нарисовано.
+  const track = 'left:calc\\(var\\(--duty-tl-gutter, 186px\\) \\+ var\\(--duty-tl-gap, 8px\\)\\)'
+  assert.match(css, new RegExp(`\\.duty-tl-idle-layer\\{[^}]*${track}`), 'слой сжатия не сдвинут на колонку подписей')
+  assert.match(
+    css,
+    /\.duty-tl-idle-layer\{[^}]*width:calc\(100% - var\(--duty-tl-gutter, 186px\) - var\(--duty-tl-gap, 8px\)\)/,
+    'ширина слоя сжатия — не ширина дорожки',
+  )
+  assert.match(css, new RegExp(`\\.duty-scale-grid\\{[^}]*${track}`), 'линии сетки оси сдвинуты относительно подписей')
 
   // Пауза в три минуты не сжимается — ни одного элемента сжатия на панели.
   const plain = dealWithIdle(3 * 60)

@@ -1469,6 +1469,15 @@ function layoutCalls(calls, options) {
   const maxLevels = Math.max(1, Number(opts.maxLevels) || 5)
   const gap = Number(opts.gap) || 2
   const span = from === null || to === null ? 0 : to - from
+  // Позиция вызова — та же карта оси, что у полос и маркеров (`pctOf` из
+  // `shapeDealTime`): сжатие простоя меняет масштаб, и вторая линейная формула
+  // развела бы чип и маркер одного и того же мгновения. Ширины чипов и уровни
+  // остаются в виртуальных пикселях — их задаёт логарифм длительности.
+  const toPct = typeof opts.toPct === 'function' ? opts.toPct : null
+  const pxOf = (at) => {
+    const pct = toPct ? Math.max(0, Math.min(100, Number(toPct(at)) || 0)) : ((at - from) / span) * 100
+    return (pct / 100) * width
+  }
   const list = Array.isArray(calls) ? calls : []
   if (!list.length || width <= 0 || span <= 0) {
     return { chips: [], levels: 0, height: top + levelH, clipped: 0 }
@@ -1485,7 +1494,7 @@ function layoutCalls(calls, options) {
   const chips = []
   let clipped = 0
   for (const call of list) {
-    const px = Math.max(0, Math.min(width, ((call.at - from) / span) * width))
+    const px = Math.max(0, Math.min(width, pxOf(call.at)))
     const unfinished = call.ms === null || call.ms === undefined
     const size = unfinished ? UNFINISHED_W : chipWidth(call.ms)
     let level = lastEnd.findIndex((end) => px - end >= gap)
@@ -1601,6 +1610,10 @@ function attemptView(bar, scale) {
     ? layoutCalls(calls, {
         from: axis.start,
         to: axis.end,
+        // Чип встаёт на ту же кусочную карту оси, что полосы и маркеры: на
+        // сжатом простое линейная пропорция сдвинула бы вызов относительно
+        // маркера того же мгновения на четверть ширины.
+        toPct: scale && typeof scale.pctOf === 'function' ? scale.pctOf : null,
         levelH: TL.levelH,
         top: TL.top,
         maxLevels: TL.maxLevels,
@@ -2519,6 +2532,11 @@ function shapeDealTime(detail, attemptsPayload) {
     now,
     live,
     empty: bars.length === 0 && markers.length === 0,
+    // Карта оси — единственная формула координат: полосы, маркеры, засечки,
+    // пауза вопроса и чипы вызовов (`attemptView` → `layoutCalls`) берут время
+    // отсюда. Второй формулы нет: иначе сжатый простой развёл бы чип и маркер
+    // одного и того же мгновения.
+    pctOf,
     axis: {
       start: axisStart,
       end: axisEnd,
@@ -2853,11 +2871,14 @@ const CSS = `
  * переменной --duty-tl-full со строки, переход делает CSS. */
 
 .duty-scale-plot{position:relative}
-.duty-scale-grid{position:absolute;top:-2px;bottom:0;left:0;right:0;pointer-events:none;z-index:0}
+/* Ось, сетка и слой сжатий начинаются там же, где дорожка строки, — после
+ * колонки подписей. Без этого сдвига пунктир и подпись сжатия встают на 194 px
+ * левее промежутка и меряют проценты по ширине плагина, а не дорожки. */
+.duty-scale-grid{position:absolute;top:-2px;bottom:0;left:calc(var(--duty-tl-gutter, 186px) + var(--duty-tl-gap, 8px));right:0;pointer-events:none;z-index:0}
 .duty-scale-grid-line{position:absolute;top:0;bottom:0;border-left:1px dashed color-mix(in srgb, var(--ui-text-tertiary) 34%, transparent)}
 /* Сжатый промежуток оси: два пунктира по краям и подпись посередине — иначе
  * смена масштаба читается как ошибка данных. */
-.duty-tl-idle-layer{position:absolute;top:-2px;left:0;width:100%;height:calc(100% + 2px);z-index:0;overflow:visible;fill:none;stroke:none}
+.duty-tl-idle-layer{position:absolute;top:-2px;left:calc(var(--duty-tl-gutter, 186px) + var(--duty-tl-gap, 8px));width:calc(100% - var(--duty-tl-gutter, 186px) - var(--duty-tl-gap, 8px));height:calc(100% + 2px);z-index:0;overflow:visible;fill:none;stroke:none}
 .duty-tl-idle{stroke:var(--ui-border-primary, rgba(127,127,127,.3));stroke-dasharray:2 3;stroke-width:1}
 .duty-tl-idle-label{fill:var(--ui-text-tertiary);font-size:9px;letter-spacing:.02em;pointer-events:none}
 .duty-tl-lanes{position:relative;z-index:1;display:flex;flex-direction:column;gap:10px}

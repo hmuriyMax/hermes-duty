@@ -1041,6 +1041,80 @@ test('сжатие простоя: маркер внутри промежутк�
   assert.ok(asked.pct < gap.rightPct, `вопрос ${asked.pct} справа от промежутка ${gap.rightPct}`)
 })
 
+test('сжатие простоя: чипы вызовов идут по той же карте оси, что полосы и маркеры', () => {
+  // Вызовы второй попытки: первый — в самое её начало, второй — на 4000. Линейная
+  // пропорция поставила бы их на 51 % и 55 %, а полоса начинается на 24.6 %:
+  // чип и маркер одного мгновения показывали бы разное время, то есть на экране
+  // жили бы две шкалы. Позиция чипа обязана приходить из `pctOf`.
+  const scale = shapeDealTime(
+    {
+      now: 7200,
+      terminal: true,
+      timeline: [
+        { kind: 'created', at: 1, summary: '' },
+        { kind: 'published', at: 4000, summary: '{"sha": "f750"}' },
+      ],
+      stages: [{ id: 'impl', needs: [] }],
+    },
+    {
+      attempts: [
+        {
+          stage: 'impl',
+          attempt: 1,
+          start: 1,
+          end: 1001,
+          status: 'done',
+          outcome: 'done',
+          calls: [{ seq: 1, name: 'read_file', at: 500, ms: 120 }],
+        },
+        {
+          stage: 'impl',
+          attempt: 2,
+          start: 3701,
+          end: 7200,
+          status: 'done',
+          outcome: 'done',
+          calls: [
+            { seq: 2, name: 'patch', at: 3701, ms: 300 },
+            { seq: 3, name: 'terminal', at: 4000, ms: 900 },
+          ],
+        },
+      ],
+    },
+  )
+  assert.equal(scale.idle.gaps.length, 1, 'фикстура без сжатия — проверка потеряла предмет')
+  const second = scale.bars[1]
+  const view = attemptView(second, scale)
+  assert.equal(view.chips.length, 2, `чипов ${view.chips.length}`)
+  const placed = [[3701, view.chips[0]], [4000, view.chips[1]]]
+  for (const [at, chip] of placed) {
+    assert.ok(
+      Math.abs(chip.leftPct - scale.pctOf(at)) < 0.05,
+      `чип в ${at} стоит на ${chip.leftPct} %, а карта оси даёт ${scale.pctOf(at)} %`,
+    )
+    // Чип не уезжает из полосы своей попытки: он — часть этой работы.
+    assert.ok(
+      chip.leftPct >= second.leftPct && chip.leftPct <= second.endPct,
+      `чип ${chip.leftPct} % вне полосы ${second.leftPct}–${second.endPct} %`,
+    )
+  }
+  // Линейная координата того же мгновения: расхождение с ней и есть та самая
+  // вторая формула, которую тест обязан ловить.
+  const linear = Math.round(((3701 - 1) / 7199) * 1000) / 10
+  assert.ok(Math.abs(view.chips[0].leftPct - linear) > 5, `чип остался на линейной координате ${linear} %`)
+  // Маркер публикации — то же мгновение, что второй чип: одна координата.
+  const published = scale.markers.find((marker) => marker.type === 'published')
+  assert.ok(published, 'маркер публикации не собрался')
+  assert.ok(
+    Math.abs(published.pct - view.chips[1].leftPct) < 0.05,
+    `маркер ${published.pct} % и чип ${view.chips[1].leftPct} % одного времени разошлись`,
+  )
+  // Первая попытка — до сжатия: её чип тоже на карте, а не на линейной доле.
+  const first = attemptView(scale.bars[0], scale)
+  assert.equal(first.chips.length, 1)
+  assert.ok(Math.abs(first.chips[0].leftPct - scale.pctOf(500)) < 0.05, `чип первой попытки ${first.chips[0].leftPct} %`)
+})
+
 test('сжатие простоя: дело без полос (только события) не сжимает ось', () => {
   // Занятого времени не знаем — сжимать нечего, ось остаётся линейной.
   const scale = shapeDealTime(

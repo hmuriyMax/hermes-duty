@@ -1514,9 +1514,9 @@ function scalePanel(scale) {
                   'text',
                   {
                     class: 'tl-idle-label',
-                    x: `${(gap.leftPct + gap.rightPct) / 2}%`,
+                    x: `${gap.labelPct}%`,
                     y: '50%',
-                    'text-anchor': 'middle',
+                    'text-anchor': gap.labelAnchor,
                     'dominant-baseline': 'middle',
                   },
                   h('title', null, gap.title),

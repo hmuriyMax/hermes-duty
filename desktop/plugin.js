@@ -1314,6 +1314,9 @@ const IDLE_MIN_SHARE = 0.08
 // больше суммы: иначе ось врала бы про доли работы.
 const IDLE_GAP_PCT = 3
 const IDLE_TOTAL_PCT = 20
+// Подпись простоя ближе этого к краю шкалы переезжает внутрь: у правой границы
+// текст по центру уезжал за поле графика.
+const IDLE_LABEL_EDGE_PCT = 12
 
 // Подпись и тон маркера: журнал назвал событие — экран назвал его тем же словом.
 // `tick` — тонкая засечка старта/закрытия попытки (их на оси много); остальные
@@ -2253,13 +2256,27 @@ function shapeDealTime(detail, attemptsPayload) {
       const minutes = Math.floor((gap.to - gap.from) / 60) % 60
       const sec = gap.to - gap.from
       const text = `простой ${fmtDuration(sec)}${sec >= 3600 && minutes ? ` ${minutes} м` : ''}`
+      const leftPct = pctOf(gap.from)
+      const rightPct = pctOf(gap.to)
+      const center = (leftPct + rightPct) / 2
+      // Подпись у самого края шкалы вылезала за панель: промежуток в 3 % у правой
+      // границы ставил текст по центру, и половина его уходила наружу. У краёв
+      // якорь переезжает внутрь — `end` у правого, `start` у левого, — поэтому
+      // подпись всегда стоит над своей «дырой», но целиком в поле графика.
+      const edge = center <= IDLE_LABEL_EDGE_PCT
+        ? { anchor: 'start', at: leftPct }
+        : center >= 100 - IDLE_LABEL_EDGE_PCT
+          ? { anchor: 'end', at: rightPct }
+          : { anchor: 'middle', at: center }
       return {
         from: gap.from,
         to: gap.to,
         sec,
         text,
-        leftPct: pctOf(gap.from),
-        rightPct: pctOf(gap.to),
+        leftPct,
+        rightPct,
+        labelPct: Math.round(edge.at * 10) / 10,
+        labelAnchor: edge.anchor,
         title: `${fmtClock(gap.from)}–${fmtClock(gap.to)}: ${text} · время на шкале сжато`,
       }
     }),
@@ -3681,9 +3698,9 @@ function ScalePanel({ scale, callSel, onSelectCall, toolFilter, onToggleTool }) 
                     {
                       key: `idle-t-${gap.from}`,
                       className: 'duty-tl-idle-label',
-                      x: `${(gap.leftPct + gap.rightPct) / 2}%`,
+                      x: `${gap.labelPct}%`,
                       y: '50%',
-                      textAnchor: 'middle',
+                      textAnchor: gap.labelAnchor,
                       dominantBaseline: 'middle',
                     },
                     h('title', null, gap.title),

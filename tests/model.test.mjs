@@ -939,6 +939,41 @@ test('сжатие простоя: 45 минут в двухчасовом де�
   assert.ok(scale.bars[1].widthPct > 70, `правая полоса сузилась до ${scale.bars[1].widthPct} %`)
 })
 
+test('подпись простоя у края шкалы переезжает внутрь, а не висит за панелью', () => {
+  // Простой 4 ч 25 м стоит в конце оси: подпись по центру уезжала за поле
+  // графика (на живой странице — на 38 px правее панели).
+  // Ось тянется до события закрытия, а последняя полоса кончилась раньше —
+  // это и есть простой у правого края.
+  const right = idleScale([[1, 1000]], {
+    timeline: [
+      { kind: 'created', at: 1, summary: '' },
+      { kind: 'completed', at: 20001, summary: '' },
+    ],
+  }).idle.gaps
+  assert.equal(right.length, 1, 'простой в конце оси не сжат')
+  assert.equal(right[0].labelAnchor, 'end', 'у правого края подпись не переехала внутрь')
+  assert.equal(right[0].labelPct, right[0].rightPct, 'якорь стоит не у правой границы простоя')
+  assert.ok(right[0].labelPct <= 100, `подпись за осью: ${right[0].labelPct} %`)
+
+  // Простой в начале оси — зеркально: подпись растёт вправо от левой границы.
+  const left = idleScale([[1 + 9000, 1000 + 9000]], {
+    timeline: [
+      { kind: 'created', at: 1, summary: '' },
+      { kind: 'completed', at: 9901, summary: '' },
+    ],
+  }).idle.gaps
+  assert.equal(left.length, 1, 'простой в начале оси не сжат')
+  assert.equal(left[0].labelAnchor, 'start', 'у левого края подпись не переехала внутрь')
+  assert.equal(left[0].labelPct, left[0].leftPct)
+})
+
+test('подпись простоя в середине оси остаётся по центру', () => {
+  const scale = idleScale([[1, 1001], [3701, 7200]])
+  const gap = scale.idle.gaps[0]
+  assert.equal(gap.labelAnchor, 'middle')
+  assert.equal(gap.labelPct, Math.round(((gap.leftPct + gap.rightPct) / 2) * 10) / 10)
+})
+
 test('сжатие простоя: короткая пауза не сжимается, координаты прежние линейные', () => {
   // Три минуты между попытками: такой простой глазом не мешает.
   const scale = idleScale([[1, 1001], [1181, 7200]])

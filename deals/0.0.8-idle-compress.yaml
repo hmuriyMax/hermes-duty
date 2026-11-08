@@ -1,0 +1,54 @@
+# Дело: долгий простой на шкале сжимается, ось остаётся честной
+#
+# Тело (`BODY-idle-compress.md`) задаёт правила: что считается простоем, какой
+# простой «слишком долгий», насколько он сжимается, как считается кусочная ось и
+# как это подписывается на обеих поверхностях. Здесь только граф этапов.
+#
+# ПОЧЕМУ ЧЕТЫРЕ ЭТАПА, А НЕ ТРИ. Прошлое дело запарковалось на одном командном
+# этапе, где четыре проверки шли одной строкой: отказ назвал этап целиком, и
+# виновника пришлось искать в логе. У `kind: shell` список `evidence` не
+# проверяется (договор — `must` и артефакты), поэтому проверки разделены на два
+# командных этапа: `check-js` и `check-py`. Отказ сразу называет половину, а
+# `review` ждёт оба.
+#
+# base приколот к d32c316 (голова release/v0.0.8 после графа спеки).
+#
+# Приговор: `next` — дальше, `impl` — вернуть реализацию.
+
+duty: 0.0.8-idle-compress
+repo: ~/.hermes/plugins/hermes-duty
+base: d32c316
+
+budget: {minutes: 200}
+
+stages:
+  - id: impl
+    role: implementer
+    workspace: worktree
+    budget: {minutes: 90}
+    evidence:
+      - {cmd: "node --test tests/*.test.mjs", must: 0, timeout_sec: 600}
+
+  - id: check-js
+    kind: shell
+    needs: [impl]
+    workspace: worktree
+    cmd: "node --test tests/*.test.mjs && env -u PYTHONPATH bin/duty-model-sync --check"
+    must: 0
+    budget: {minutes: 20}
+
+  - id: check-py
+    kind: shell
+    needs: [impl]
+    workspace: worktree
+    cmd: "env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q -p no:randomly && env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/hermes plugins validate ."
+    must: 0
+    budget: {minutes: 30}
+
+  - id: review
+    role: reviewer
+    needs: [check-js, check-py]
+    workspace: worktree
+    verdict: {approve: next, changes: impl, max_rounds: 2}
+    retry: {max: 1, on: [contract]}
+    budget: {minutes: 45}

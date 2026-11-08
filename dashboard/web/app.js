@@ -1500,6 +1500,31 @@ function scalePanel(scale) {
             h('span', { class: 'scale-grid-line', style: `left:${tick.pct}%` }),
           ),
         ),
+        // Сжатые промежутки оси: пара пунктиров по краям и подпись посередине.
+        // Ось сжимает пустое время — это должно быть видно, а не угадываться по
+        // «дыре» между полосами (`idle.gaps` считает шейпер, здесь только DOM).
+        scale.idle.gaps.length
+          ? h(
+              'svg',
+              { class: 'tl-idle-layer' },
+              ...scale.idle.gaps.flatMap((gap) => [
+                h('line', { class: 'tl-idle', x1: `${gap.leftPct}%`, y1: '0', x2: `${gap.leftPct}%`, y2: '100%' }),
+                h('line', { class: 'tl-idle', x1: `${gap.rightPct}%`, y1: '0', x2: `${gap.rightPct}%`, y2: '100%' }),
+                h(
+                  'text',
+                  {
+                    class: 'tl-idle-label',
+                    x: `${(gap.leftPct + gap.rightPct) / 2}%`,
+                    y: '50%',
+                    'text-anchor': 'middle',
+                    'dominant-baseline': 'middle',
+                  },
+                  h('title', null, gap.title),
+                  gap.text,
+                ),
+              ]),
+            )
+          : null,
         h(
         'div',
         { class: 'tl-lanes' },

@@ -1255,6 +1255,17 @@ function compactAttemptView(stage, bar) {
 // честная — `<1с`, иначе две ширины в процентах читались бы как две секунды.
 const BAR_MIN_PCT = 2
 
+// Пустое ожидание на шкале сжимается: дело, где между этапами был простой в час
+// сорок минут, иначе показывает работу двумя тонкими полосками по краям. Порог —
+// и по длительности, и по доле оси: короткая пауза в долгом деле и так не мешает,
+// а длинная пауза в очень долгом деле не искажает вид.
+const IDLE_MIN_SEC = 600
+const IDLE_MIN_SHARE = 0.08
+// Сжатый промежуток занимает столько процентов оси, но все сжатия вместе — не
+// больше суммы: иначе ось врала бы про доли работы.
+const IDLE_GAP_PCT = 3
+const IDLE_TOTAL_PCT = 20
+
 // Подпись и тон маркера: журнал назвал событие — экран назвал его тем же словом.
 // `tick` — тонкая засечка старта/закрытия попытки (их на оси много); остальные
 // виды — то, что случилось с делом, и они рисуются заметно.
@@ -2088,10 +2099,110 @@ function shapeDealTime(detail, attemptsPayload) {
     if (stop > (axisEnd === null ? 0 : axisEnd) && !live) axisEnd = stop
   }
   const span = axisStart === null || axisEnd === null ? 0 : Math.max(1, axisEnd - axisStart)
+
+  // Конец полосы — один расчёт на весь шейпер: `open` тянется до `now` (живая
+  // работа простоем не бывает), закрытая без `end` — до `start + duration`.
+  for (const bar of bars) {
+    bar.endAt = bar.open
+      ? (now !== null ? now : bar.start)
+      : bar.end !== null
+        ? bar.end
+        : bar.start === null
+          ? null
+          : bar.start + (bar.duration || 0)
+  }
+
+  // Простой — промежутки между занятым временем, включая края оси: дело, которое
+  // стоит в ожидании движка, тоже простой. Сличаются только интервалы с обеими
+  // границами; пересекающиеся и касающиеся сливаются — паузы между ними нет.
+  const idleGaps = []
+  const idleSegments = []
+  let idleTotalSec = 0
+  let idleCompressedPct = 0
+  let axisVirtual = 0
+  if (axisStart !== null && axisEnd !== null) {
+    const busy = bars
+      .filter((bar) => bar.start !== null && bar.endAt !== null)
+      .map((bar) => [
+        Math.max(axisStart, Math.min(bar.start, bar.endAt)),
+        Math.min(axisEnd, Math.max(bar.start, bar.endAt)),
+      ])
+      .filter(([from, to]) => to > from)
+      .sort((left, right) => left[0] - right[0])
+    const merged = []
+    for (const [from, to] of busy) {
+      const last = merged[merged.length - 1]
+      if (last && from <= last[1]) last[1] = Math.max(last[1], to)
+      else merged.push([from, to])
+    }
+    const regions = []
+    let cursor = axisStart
+    for (const [from, to] of merged) {
+      if (from > cursor) regions.push({ from: cursor, to: from, busy: false })
+      regions.push({ from, to, busy: true })
+      cursor = to
+    }
+    if (merged.length && axisEnd > cursor) regions.push({ from: cursor, to: axisEnd, busy: false })
+    // Полос нет вовсе (только события): занятого времени не знаем, сжимать
+    // нечего — ось остаётся линейной. Нулевая ось (всё в одну секунду) тоже:
+    // растягивать её нечем.
+    if (!merged.length) {
+      axisVirtual = span
+      idleSegments.push({ from: axisStart, to: axisEnd, virt: axisEnd > axisStart ? span : 0 })
+    } else {
+      const tight = regions.filter((region) => !region.busy && region.to - region.from > IDLE_MIN_SEC && region.to - region.from >= span * IDLE_MIN_SHARE)
+      const width = tight.length ? Math.min(IDLE_GAP_PCT, IDLE_TOTAL_PCT / tight.length) : 0
+      // Сжатие — смена масштаба, а не выкинутое время: внутри промежутка
+      // координата линейна по сжатой ширине, занятое время идёт один к одному.
+      // Сжатая ширина — доля оси, поэтому виртуальная длина оси растягивает
+      // занятое время так, чтобы сжатия заняли ровно свои проценты.
+      const busySec = span - tight.reduce((sum, region) => sum + (region.to - region.from), 0)
+      axisVirtual = busySec / (1 - (width * tight.length) / 100)
+      for (const region of regions) {
+        const squeeze = !region.busy && tight.includes(region)
+        idleSegments.push({ from: region.from, to: region.to, virt: squeeze ? (width / 100) * axisVirtual : region.to - region.from })
+        if (!squeeze) continue
+        idleTotalSec += region.to - region.from
+        idleCompressedPct += width
+        idleGaps.push({ from: region.from, to: region.to })
+      }
+    }
+  }
   const pctOf = (at) => {
-    if (axisStart === null || !(at > 0) || span === 0) return 0
-    const value = ((at - axisStart) / span) * 100
+    if (axisStart === null || !(at > 0) || !(axisVirtual > 0)) return 0
+    // Промежуток ищется по времени: внутри сжатого координата линейна по сжатой
+    // ширине, занятое время — один к одному. Второй формулы координат нет.
+    let virt = 0
+    for (const segment of idleSegments) {
+      if (at >= segment.to) {
+        virt += segment.virt
+        continue
+      }
+      if (at > segment.from) virt += ((at - segment.from) / (segment.to - segment.from)) * segment.virt
+      break
+    }
+    const value = (virt / axisVirtual) * 100
     return Math.round(Math.max(0, Math.min(100, value)) * 10) / 10
+  }
+  // Сжатый промежуток подписан: молча сжатая ось читается как ошибка данных.
+  // `text` — само время простоя, `title` — то же плюс пояснение про сжатие.
+  const idle = {
+    gaps: idleGaps.map((gap) => {
+      const minutes = Math.floor((gap.to - gap.from) / 60) % 60
+      const sec = gap.to - gap.from
+      const text = `простой ${fmtDuration(sec)}${sec >= 3600 && minutes ? ` ${minutes} м` : ''}`
+      return {
+        from: gap.from,
+        to: gap.to,
+        sec,
+        text,
+        leftPct: pctOf(gap.from),
+        rightPct: pctOf(gap.to),
+        title: `${fmtClock(gap.from)}–${fmtClock(gap.to)}: ${text} · время на шкале сжато`,
+      }
+    }),
+    totalSec: idleTotalSec,
+    compressedPct: Math.round(idleCompressedPct * 10) / 10,
   }
 
   // Дорожки: сначала этапы графа в его порядке (`stages[]` ответа `/deal`) —
@@ -2114,14 +2225,8 @@ function shapeDealTime(detail, attemptsPayload) {
   if (!lanes.length) bars.forEach((bar) => { bar.lane = 0 })
 
   for (const bar of bars) {
-    const stop = bar.open
-      ? (now !== null ? now : bar.start)
-      : bar.end !== null
-        ? bar.end
-        : bar.start === null
-          ? null
-          : bar.start + (bar.duration || 0)
-    bar.endAt = stop
+    // Конец полосы посчитан выше — тем же расчётом, по которому сжимается ось.
+    const stop = bar.endAt
     bar.leftPct = pctOf(bar.start)
     bar.endPct = pctOf(stop)
     bar.widthPct = bar.start === null ? 0 : Math.max(BAR_MIN_PCT, Math.round((bar.endPct - bar.leftPct) * 10) / 10)
@@ -2303,7 +2408,12 @@ function shapeDealTime(detail, attemptsPayload) {
       .find((candidate) => durationSec / candidate <= 8) || 86400
     axisTicks.push({ pct: 0, edge: 'нач.', align: 'start', clock: fmtClock(axisStart) })
     for (let at = Math.ceil(axisStart / step) * step; at < axisEnd; at += step) {
-      const pct = Math.round(((at - axisStart) / durationSec) * 1000) / 10
+      // Метка на оси — той же координатой, что полосы и маркеры: внутри сжатого
+      // промежутка она встаёт на его сжатую ширину, а не на реальное время.
+      const pct = pctOf(at)
+      // Внутри сжатого промежутка деление встало бы вплотную к соседям: время
+      // там называет подпись сжатия, а не три наложенные друг на друга метки.
+      if (idle.gaps.some((gap) => at > gap.from && at < gap.to)) continue
       // Подписи краёв широкие («нач. 13:37:35» — двенадцать знаков), а метка
       // центрируется на своей линии: её текст и вертикаль заходят на подпись
       // края. Резерв — ширина подписи края (8 % при графике в 900 px) плюс
@@ -2372,6 +2482,8 @@ function shapeDealTime(detail, attemptsPayload) {
     bars,
     markers,
     waitSpans,
+    // Сжатые промежутки оси — уже с координатами: поверхность ничего не считает.
+    idle,
     tools,
     kpi,
     // Граф спеки — из `stages[]` ответа `/deal`; нет этапов — нет и графа.

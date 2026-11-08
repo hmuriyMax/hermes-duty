@@ -887,6 +887,181 @@ test('шкала времени: маркеры — только факты жу
   assert.equal(scale.counts.lanes, 2)
 })
 
+/* -------------------- сжатие долгого простоя на шкале (0.0.8) ------------- */
+
+// Дело из полос по краям оси: время относительное, важны длительности и
+// промежутки между ними. `now` задаёт правый край живого дела, у закрытого ось
+// кончается на последней записанной полосе.
+function idleScale(bars, options) {
+  const o = options || {}
+  return shapeDealTime(
+    {
+      now: o.now,
+      terminal: o.live !== true,
+      timeline: o.timeline || [{ kind: 'created', at: 1, summary: '' }],
+      stages: [{ id: 'impl', needs: [] }],
+    },
+    {
+      attempts: bars.map((bar, index) => ({
+        stage: 'impl',
+        attempt: index + 1,
+        start: bar[0],
+        end: bar[1],
+        status: 'done',
+        outcome: 'done',
+      })),
+    },
+  )
+}
+
+test('сжатие простоя: 45 минут в двухчасовом деле занимают 3 %, работа — остальное', () => {
+  // Две попытки по ~17 минут, между ними 45 минут пустоты: раньше середина
+  // выглядела как «дело стояло», теперь пустота сжата, а работа читается.
+  const scale = idleScale([[1, 1001], [3701, 7200]])
+  assert.equal(scale.idle.gaps.length, 1, 'простой не сжат')
+  const gap = scale.idle.gaps[0]
+  assert.equal(gap.sec, 2700)
+  assert.equal(gap.from, 1001)
+  assert.equal(gap.to, 3701)
+  assert.ok(Math.abs(gap.rightPct - gap.leftPct - 3) < 0.11, `сжатие шириной ${gap.rightPct - gap.leftPct} %`)
+  assert.equal(scale.idle.totalSec, 2700)
+  assert.equal(scale.idle.compressedPct, 3)
+  assert.match(gap.text, /простой/)
+  // Подпись говорит, что время сжато: молча сжатая ось читается как ошибка.
+  assert.match(gap.title, /сжато/)
+  // Занятое время осталось на своих местах: левая полоса у нуля, правая — у ста,
+  // и обе выросли, потому что пустота больше не занимает пол-оси.
+  assert.equal(scale.bars[0].leftPct, 0)
+  assert.equal(scale.bars[0].endPct, gap.leftPct)
+  assert.equal(scale.bars[1].leftPct, gap.rightPct)
+  assert.equal(scale.bars[1].endPct, 100)
+  assert.ok(scale.bars[0].widthPct > 20, `левая полоса сузилась до ${scale.bars[0].widthPct} %`)
+  assert.ok(scale.bars[1].widthPct > 70, `правая полоса сузилась до ${scale.bars[1].widthPct} %`)
+})
+
+test('сжатие простоя: короткая пауза не сжимается, координаты прежние линейные', () => {
+  // Три минуты между попытками: такой простой глазом не мешает.
+  const scale = idleScale([[1, 1001], [1181, 7200]])
+  assert.deepEqual(scale.idle.gaps, [])
+  assert.equal(scale.idle.totalSec, 0)
+  assert.equal(scale.idle.compressedPct, 0)
+  // Координаты — та же линейная пропорция оси, что была до сжатия.
+  assert.equal(scale.bars[0].leftPct, 0)
+  assert.equal(scale.bars[1].leftPct, Math.round(((1181 - 1) / 7199) * 1000) / 10)
+  assert.equal(scale.bars[1].endPct, 100)
+})
+
+test('сжатие простоя: пауза, незаметная на оси (меньше 8 %), не сжимается', () => {
+  // Восемь минут в деле на три часа — 4.4 % оси: длинная пауза в долгом деле
+  // вида не искажает, сжимать её значило бы врать про доли.
+  const short = idleScale([[1, 1001], [1481, 10800]])
+  assert.deepEqual(short.idle.gaps, [])
+  assert.equal(short.bars[1].leftPct, Math.round(((1481 - 1) / 10799) * 1000) / 10)
+  // Порог по доле работает и без порога по длительности: 15 минут в четырёх
+  // часах — это 6.25 % оси, хотя секунд больше десяти минут.
+  const quarter = idleScale([[1, 1001], [1901, 14400]])
+  assert.deepEqual(quarter.idle.gaps, [], 'сжатие по одной длительности, без доли оси')
+  assert.equal(quarter.bars[1].leftPct, Math.round(((1901 - 1) / 14399) * 1000) / 10)
+})
+
+test('сжатие простоя: много простоев — по 3 % и не больше 20 % на все', () => {
+  // Восемь коротких полос через 20 минут простоя: семь промежутков, и сумма
+  // сжатий упирается в потолок (3 % на каждый дало бы 21 %).
+  const bars = []
+  let at = 1
+  for (let i = 0; i < 8; i += 1) {
+    bars.push([at, at + 400])
+    at += 400 + 1200
+  }
+  const scale = idleScale(bars)
+  assert.equal(scale.idle.gaps.length, 7, 'не все промежутки сжаты')
+  const widths = scale.idle.gaps.map((gap) => gap.rightPct - gap.leftPct)
+  for (const width of widths) assert.ok(width <= 3.1, `сжатие шириной ${width} % больше трёх`)
+  const total = widths.reduce((sum, width) => sum + width, 0)
+  assert.ok(total <= 20, `все сжатия вместе ${total} % — потолок в 20 % не держится`)
+  assert.ok(scale.idle.compressedPct <= 20, `шейпер отдал ${scale.idle.compressedPct} % сжатия`)
+  assert.equal(scale.idle.totalSec, 7 * 1200)
+})
+
+test('сжатие простоя: простой вокруг всей оси не сжимается больше правила', () => {
+  // Одна попытка в середине живого дела: пустота и слева, и справа. Каждый
+  // промежуток получает свои 3 %, а не «всё, что осталось».
+  const scale = idleScale([[3600, 3700]], { now: 7200, live: true })
+  assert.equal(scale.idle.gaps.length, 2)
+  for (const gap of scale.idle.gaps) {
+    assert.ok(gap.rightPct - gap.leftPct <= 3.1, `сжатие шириной ${gap.rightPct - gap.leftPct} %`)
+  }
+  assert.ok(scale.idle.compressedPct <= 20)
+  // Единственная полоса не растянута на всю ось: оси осталось место на края.
+  assert.ok(scale.bars[0].leftPct >= 3 && scale.bars[0].endPct <= 97, `полоса ${scale.bars[0].leftPct}–${scale.bars[0].endPct}`)
+})
+
+test('сжатие простоя: координаты монотонны и не выходят за ось', () => {
+  const scale = idleScale([[1, 1001], [3701, 7200]], {
+    timeline: [
+      { kind: 'created', at: 1, summary: '' },
+      { kind: 'question_asked', at: 2000, summary: 'нужно ок' },
+      { kind: 'question_answered', at: 2500, summary: 'ок' },
+      { kind: 'published', at: 5000, summary: '{"sha": "f750"}' },
+    ],
+  })
+  assert.equal(scale.idle.gaps.length, 1)
+  const marks = [
+    ...scale.bars.map((bar) => ({ at: bar.start, pct: bar.leftPct })),
+    ...scale.bars.filter((bar) => bar.endAt !== null).map((bar) => ({ at: bar.endAt, pct: bar.endPct })),
+    ...scale.markers.map((marker) => ({ at: marker.at, pct: marker.pct })),
+  ].sort((left, right) => left.at - right.at)
+  for (const mark of marks) assert.ok(mark.pct >= 0 && mark.pct <= 100, `координата ${mark.pct} вне оси`)
+  for (let i = 1; i < marks.length; i += 1) {
+    assert.ok(marks[i].pct >= marks[i - 1].pct, `координата упала на ${marks[i].at}: ${marks[i - 1].pct} → ${marks[i].pct}`)
+  }
+  const ticks = scale.axis.ticks.map((tick) => tick.pct)
+  for (let i = 1; i < ticks.length; i += 1) assert.ok(ticks[i] >= ticks[i - 1], `засечки убывают: ${ticks[i - 1]} → ${ticks[i]}`)
+  assert.equal(ticks[0], 0)
+  assert.equal(ticks[ticks.length - 1], 100)
+  // Внутри сжатого промежутка делений нет: три метки на трёх процентах — это
+  // наложенные друг на друга подписи, а время там называет подпись сжатия.
+  const inside = scale.axis.ticks.filter((tick) => tick.edge === '' && scale.idle.gaps.some((gap) => tick.pct > gap.leftPct && tick.pct < gap.rightPct))
+  assert.deepEqual(inside, [], 'метки налезли друг на друга внутри сжатия')
+})
+
+test('сжатие простоя: маркер внутри промежутка попадает внутрь его координат', () => {
+  // Вопрос человеку задан в простое: его точка обязана остаться в сжатом
+  // промежутке, а не уехать за его край.
+  const scale = idleScale([[1, 1001], [3701, 7200]], {
+    timeline: [
+      { kind: 'created', at: 1, summary: '' },
+      { kind: 'question_asked', at: 2000, summary: 'нужно ок' },
+    ],
+  })
+  const gap = scale.idle.gaps[0]
+  const asked = scale.markers.find((marker) => marker.type === 'question')
+  assert.ok(asked, 'вопрос не попал в маркеры')
+  assert.ok(asked.pct > gap.leftPct, `вопрос ${asked.pct} слева от промежутка ${gap.leftPct}`)
+  assert.ok(asked.pct < gap.rightPct, `вопрос ${asked.pct} справа от промежутка ${gap.rightPct}`)
+})
+
+test('сжатие простоя: дело без полос (только события) не сжимает ось', () => {
+  // Занятого времени не знаем — сжимать нечего, ось остаётся линейной.
+  const scale = shapeDealTime(
+    {
+      now: 7200,
+      terminal: false,
+      timeline: [
+        { kind: 'created', at: 1, summary: '' },
+        { kind: 'published', at: 4000, summary: '{"sha": "f750"}' },
+      ],
+      stages: [],
+    },
+    {},
+  )
+  assert.deepEqual(scale.idle.gaps, [])
+  assert.equal(scale.idle.totalSec, 0)
+  assert.equal(scale.idle.compressedPct, 0)
+  const published = scale.markers.find((marker) => marker.type === 'published')
+  assert.equal(published.pct, Math.round(((4000 - 1) / 7199) * 1000) / 10, 'ось без полос перестала быть линейной')
+})
+
 test('слова вместо машинных значений: исход попытки, причина закрытия, статус дела', () => {
   // Исход попытки в ленте этапа — словом, а не значением store.
   const detail = {

@@ -778,6 +778,11 @@ pre.body {
 /* Сетка под дорожками: линии по меткам оси, чтобы время читалось поперёк дорожек. */
 .scale-grid { position: absolute; top: -2px; bottom: 0; left: calc(var(--tl-gutter) + var(--tl-gap)); right: 0; pointer-events: none; z-index: 0; }
 .scale-grid-line { position: absolute; top: 0; bottom: 0; border-left: 1px dashed color-mix(in srgb, var(--text-3) 34%, transparent); }
+/* Сжатый промежуток оси: два пунктира по краям и подпись посередине — иначе
+ * смена масштаба читается как ошибка данных. */
+svg.tl-idle-layer { position: absolute; top: -2px; left: calc(var(--tl-gutter) + var(--tl-gap)); width: calc(100% - var(--tl-gutter) - var(--tl-gap)); height: calc(100% + 2px); z-index: 0; overflow: visible; fill: none; stroke: none }
+.tl-idle { stroke: var(--border); stroke-dasharray: 2 3; stroke-width: 1 }
+.tl-idle-label { fill: var(--text-3); font-size: 9px; letter-spacing: .02em; pointer-events: none }
 .tl-lanes { position: relative; z-index: 1; display: flex; flex-direction: column; gap: 10px; }
 .tl-lane { display: flex; flex-direction: column; gap: 4px; }
 .tl-lane + .tl-lane { border-top: 1px solid var(--border); padding-top: 10px; }

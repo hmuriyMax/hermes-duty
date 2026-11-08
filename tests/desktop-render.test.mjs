@@ -517,3 +517,55 @@ test('десктоп: строки этапов раскрываются кли�
   }
 })
 
+/**
+ * Сжатый простой на оси: пара пунктиров по краям промежутка и подпись с его
+ * временем. Без сжатия таких элементов нет вовсе — иначе «пустая» ось врала бы
+ * про сжатие, которого не было.
+ */
+test('десктоп: сжатый простой подписан на оси, без сжатия — ни одного элемента', async (t) => {
+  const root = reactRoot()
+  if (!root) return t.skip('нет React в ~/.hermes/hermes-agent/node_modules')
+
+  const mod = await import(pathToFileURL(moduleForRender(root)).href)
+  const React = (await import(pathToFileURL(join(root, 'react', 'index.js')).href)).default
+  const { renderToStaticMarkup } = await import(
+    pathToFileURL(join(root, 'react-dom', 'server.node.js')).href
+  )
+  const modelMod = await import(pathToFileURL(join(pluginRoot, 'desktop/model.js')).href)
+
+  /** Дело из двух попыток с паузой между ними; длительность паузы — в секундах. */
+  const dealWithIdle = (idleSec) => {
+    const second = 1 + 1_000 + idleSec
+    return modelMod.shapeDealTime(
+      { now: second + 3_000, terminal: true, timeline: [{ kind: 'created', at: 1, summary: '' }], stages: [{ id: 'impl', needs: [] }] },
+      {
+        attempts: [
+          { stage: 'impl', attempt: 1, start: 1, end: 1_001, status: 'done', outcome: 'done' },
+          { stage: 'impl', attempt: 2, start: second, end: second + 3_000, status: 'done', outcome: 'done' },
+        ],
+      },
+    )
+  }
+
+  // Простой 45 минут: ось сжимается, промежуток подписан.
+  const squeezed = dealWithIdle(45 * 60)
+  assert.equal(squeezed.idle.gaps.length, 1, 'фикстура без сжатия — проверка потеряла предмет')
+  const panel = renderToStaticMarkup(React.createElement(mod.ScalePanel, { scale: squeezed }))
+  assert.match(panel, /<svg[^>]*class="duty-tl-idle-layer"/, 'сжатие рисуется не отдельным слоем оси')
+  assert.equal((panel.match(/class="duty-tl-idle"/g) || []).length, 2, 'пунктиров не пара на промежуток')
+  assert.match(panel, /class="duty-tl-idle-label"[^>]*text-anchor="middle"/, 'подпись не по центру промежутка')
+  assert.ok(panel.includes('простой 45 мин'), `подписи простоя нет на оси: ${squeezed.idle.gaps[0].text}`)
+  assert.match(panel, /<title>[^<]*сжато/, 'в подписи нет пояснения, что время сжато')
+  // CSS плагина рисует пунктир, а не сплошную линию: иначе пара читается как
+  // границы полосы, а не как «здесь время сжато».
+  const css = pluginSource().replace(/\/\*[\s\S]*?\*\//g, '')
+  assert.match(css, /\.duty-tl-idle\{[^}]*stroke-dasharray:2 3/, 'нет пунктира у .duty-tl-idle')
+  assert.match(css, /\.duty-tl-idle-label\{[^}]*fill:var\(--ui-text-tertiary\)/, 'нет цвета у подписи сжатия')
+
+  // Пауза в три минуты не сжимается — ни одного элемента сжатия на панели.
+  const plain = dealWithIdle(3 * 60)
+  assert.deepEqual(plain.idle.gaps, [], 'короткая пауза сжата')
+  const plainPanel = renderToStaticMarkup(React.createElement(mod.ScalePanel, { scale: plain }))
+  assert.doesNotMatch(plainPanel, /duty-tl-idle/, 'сжатие нарисовано там, где его нет')
+})
+

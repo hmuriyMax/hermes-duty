@@ -10,10 +10,14 @@
  */
 
 import assert from 'node:assert/strict'
-import { readFileSync, existsSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
+import { pathToFileURL } from 'node:url'
 
 const root = new URL('..', import.meta.url)
+const tree = root.pathname
 const read = (path) => readFileSync(new URL(path, root), 'utf8')
 
 const html = read('dashboard/web/index.html')
@@ -441,5 +445,113 @@ test('обрезанная команда доказательства несё�
   // и это именно `title` на строке команды, а не подсказка в другом месте
   assert.match(app, /class: 'mono att-ev-cmd', title: row\.cmdTitle \}, row\.cmdShort\)/, 'веб: title не на самой команде')
   assert.match(plugin, /className: 'duty-mono duty-att-ev-cmd', title: row\.cmdTitle \}, row\.cmdShort\)/, 'десктоп: title не на самой команде')
+})
+
+/* -------------------- сжатый простой на оси: настоящий DOM ------------- */
+
+// jsdom берётся из окружения Hermes: своих зависимостей у плагина нет, а тянуть
+// node_modules в репозиторий ради одного теста незачем. Нет jsdom — тест честно
+// пропускается, а не зеленеет.
+function jsdomRoot() {
+  const candidates = [process.env.HERMES_REACT_ROOT, join(homedir(), '.hermes', 'hermes-agent', 'node_modules')]
+    .filter(Boolean)
+  return candidates.find((dir) => existsSync(join(dir, 'jsdom', 'package.json'))) || ''
+}
+
+/**
+ * Страница дела в jsdom: свежий модуль на каждый вызов, поэтому вторая съёмка
+ * (дело без сжатия) не делит состояние с первой. `./model.js` в вебе — тот же
+ * шейпер, что вшит в десктоп (бэкенд отдаёт его своим роутом), в Node он
+ * подкладывается файлом рядом с копией `app.js`.
+ */
+async function renderDealPanel(detail, attempts) {
+  const root = jsdomRoot()
+  const { JSDOM } = await import(pathToFileURL(join(root, 'jsdom', 'lib', 'api.js')).href)
+  const dir = mkdtempSync(join(tmpdir(), 'duty-web-panel-'))
+  writeFileSync(join(dir, 'app.js'), app)
+  writeFileSync(join(dir, 'model.js'), read('desktop/model.js'))
+  const dom = new JSDOM(
+    '<!doctype html><div id="app"></div><span id="stamp"></span><span id="ver"></span><span id="human"></span><div id="tabs"></div><button id="refresh"></button>',
+    { url: 'http://localhost/#/deal/d_0123456789abcdef' },
+  )
+  globalThis.window = dom.window
+  globalThis.document = dom.window.document
+  globalThis.Node = dom.window.Node
+  globalThis.localStorage = dom.window.localStorage
+  globalThis.location = dom.window.location
+  // Страница сама просит данные и сама ставит таймер обновления: тесту нужен
+  // один кадр, поэтому на время импорта сеть и таймеры подменены. Глобалы
+  // возвращаются на место — иначе таймеры переживут тест и удержат процесс.
+  const saved = {
+    fetch: globalThis.fetch,
+    setTimeout: globalThis.setTimeout,
+    setInterval: globalThis.setInterval,
+    clearTimeout: globalThis.clearTimeout,
+    clearInterval: globalThis.clearInterval,
+  }
+  globalThis.fetch = async (url) => ({
+    ok: true,
+    status: 200,
+    json: async () => (String(url).includes('/attempts') ? attempts : detail),
+  })
+  globalThis.setTimeout = () => 0
+  globalThis.setInterval = () => 0
+  globalThis.clearTimeout = () => {}
+  globalThis.clearInterval = () => {}
+  try {
+    await import(pathToFileURL(join(dir, 'app.js')).href)
+    for (let i = 0; i < 50 && !dom.window.document.querySelector('.scale-plot'); i += 1) {
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+  } finally {
+    Object.assign(globalThis, saved)
+  }
+  return dom.window.document
+}
+
+test('веб: сжатый простой подписан на оси, без сжатия — ни одного элемента', async (t) => {
+  if (!jsdomRoot()) return t.skip('нет jsdom в ~/.hermes/hermes-agent/node_modules')
+
+  // Дело из двух попыток: пауза между ними — тот самый простой.
+  const detail = (idleSec) => ({
+    id: 'd_0123456789abcdef',
+    title: 'дело с простоем',
+    repo: '/x/hermes-duty',
+    status: 'done',
+    terminal: true,
+    timeline: [{ kind: 'created', at: 1, summary: '' }],
+    stages: [{ id: 'impl', needs: [] }],
+  })
+  const attempts = (idleSec) => {
+    const second = 1 + 1_000 + idleSec
+    return {
+      attempts: [
+        { stage: 'impl', attempt: 1, start: 1, end: 1_001, status: 'done', outcome: 'done' },
+        { stage: 'impl', attempt: 2, start: second, end: second + 3_000, status: 'done', outcome: 'done' },
+      ],
+    }
+  }
+
+  // Простой 45 минут: пара пунктиров по краям и подпись с его временем.
+  const squeezed = await renderDealPanel(detail(45 * 60), attempts(45 * 60))
+  const lines = squeezed.querySelectorAll('line.tl-idle')
+  assert.equal(lines.length, 2, `пунктиров ${lines.length}, а не пара на промежуток`)
+  const label = squeezed.querySelector('text.tl-idle-label')
+  assert.ok(label, 'подписи сжатого промежутка нет')
+  assert.equal(label.getAttribute('text-anchor'), 'middle', 'подпись не по центру промежутка')
+  assert.ok(label.textContent.includes('простой 45 мин'), `подпись простоя: ${label.textContent}`)
+  const tip = label.querySelector('title')
+  assert.ok(tip && tip.textContent.includes('сжато'), 'в подсказке нет пояснения, что время сжато')
+
+  // Пунктир и цвет подписи — из styles.css: класс есть, правило есть, вместе
+  // они дают не сплошную линию, а «здесь время сжато».
+  const css = read('dashboard/web/styles.css')
+  assert.match(css, /\.tl-idle \{[^}]*stroke-dasharray: 2 3/, 'нет пунктира у .tl-idle')
+  assert.match(css, /\.tl-idle-label \{[^}]*fill: var\(--text-3\)/, 'нет цвета у подписи сжатия')
+
+  // Пауза в три минуты не сжимается — ни одного элемента сжатия на странице.
+  const plain = await renderDealPanel(detail(3 * 60), attempts(3 * 60))
+  assert.equal(plain.querySelectorAll('line.tl-idle').length, 0, 'пунктир нарисован там, где сжатия нет')
+  assert.equal(plain.querySelectorAll('text.tl-idle-label').length, 0, 'подпись нарисована там, где сжатия нет')
 })
 

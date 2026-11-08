@@ -1,0 +1,52 @@
+# Дело: страница дела обновляется сама, тихо и без рывков
+#
+# Тело (`BODY-live-page-refresh.md`) задаёт правила: когда опрос стоит, с каким
+# периодом идёт, что именно патчится на месте, как выглядит тихий индикатор и
+# какая функция считает числа. Здесь только граф этапов.
+#
+# ПОЧЕМУ ЧЕТЫРЕ ЭТАПА. Правка в одном файле поверхности плюс общая функция в
+# шейпере: `impl` пишет, `check-js` и `check-py` проверяют каждая свою половину
+# (так отказ называет виновника, а не этап целиком), `review` судит патч по
+# сохранению раскрытия и фокуса — это главный риск правки.
+#
+# base приколот к 1a1dcc7 (голова release/v0.0.8 после подписи простоя).
+#
+# Приговор: `next` — дальше, `impl` — вернуть реализацию.
+
+duty: 0.0.8-live-page-refresh
+repo: ~/.hermes/plugins/hermes-duty
+base: 1a1dcc7
+
+budget: {minutes: 210}
+
+stages:
+  - id: impl
+    role: implementer
+    workspace: worktree
+    budget: {minutes: 95}
+    evidence:
+      - {cmd: "node --test tests/*.test.mjs", must: 0, timeout_sec: 600}
+
+  - id: check-js
+    kind: shell
+    needs: [impl]
+    workspace: worktree
+    cmd: "node --test tests/*.test.mjs && env -u PYTHONPATH bin/duty-model-sync --check"
+    must: 0
+    budget: {minutes: 20}
+
+  - id: check-py
+    kind: shell
+    needs: [impl]
+    workspace: worktree
+    cmd: "env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q -p no:randomly && env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/hermes plugins validate ."
+    must: 0
+    budget: {minutes: 30}
+
+  - id: review
+    role: reviewer
+    needs: [check-js, check-py]
+    workspace: worktree
+    verdict: {approve: next, changes: impl, max_rounds: 2}
+    retry: {max: 1, on: [contract]}
+    budget: {minutes: 50}

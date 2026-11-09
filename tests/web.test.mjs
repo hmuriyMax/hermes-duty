@@ -899,6 +899,10 @@ test('веб: завершённые — шапка-переключатель, 
   assert.match(app, /class: 'finished-chev'/, 'веб: у шапки нет шеврона')
   assert.doesNotMatch(app, /finished-toggle'[\s\S]{0,200}icon-btn/, 'веб: осталась прежняя кнопка в шапке')
 
+  // Кнопка подгрузки — по центру под таблицей и заметная (акцентная рамка).
+  assert.match(css, /\.grp-more \{\s*display: flex;\s*justify-content: center;/s, 'веб: кнопка группы не по центру')
+  assert.match(css, /\.grp-more \.more-btn \{[^}]*border-color: color-mix\(in srgb, var\(--accent\)/s, 'веб: кнопка подгрузки не выделена')
+
   // Кнопка подгрузки группы — после таблицы, в футере группы.
   const group = app.slice(app.indexOf('function finishedGroupSection'))
   const tableAt = group.indexOf("h(\n      'table'")

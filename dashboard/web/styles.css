@@ -1270,13 +1270,33 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
 }
 .finished-group:first-child { border-top: none; }
 .finished-group .grp-h { display: flex; align-items: center; gap: 10px; }
+/* Кнопка подгрузки — по центру списка и заметная: это единственный способ
+   получить следующие строки, и искать её в углу не надо (09.11, Макс). */
 .finished-group .grp-more {
   display: flex;
+  justify-content: center;
   align-items: center;
-  gap: 10px;
-  padding: 8px 0 12px;
+  padding: 10px 0 14px;
 }
-.finished-group .grp-more .more-btn { font-size: 11.5px; }
+.finished-group .grp-more .more-btn {
+  font-size: 12px;
+  padding: 5px 20px;
+  border-radius: 999px;
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: color-mix(in srgb, var(--accent) 10%, var(--card));
+  color: var(--text);
+}
+.finished-group .grp-more .more-btn:hover:not([disabled]) {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 18%, var(--card));
+}
+/* «Это все закрытые дела» — не кнопка: строке нечего делать яркой. */
+.finished-group .grp-more .more-btn[disabled] {
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-3);
+  opacity: 1;
+}
 /* Новая строка въезжает на своём месте; уже показанные не переигрывают вход,
    поэтому morph переиспользует их по `data-key`. */
 .finished-group tbody tr.row { animation: finished-row-in .24s ease both; }
@@ -1305,9 +1325,17 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
 .more-btn.busy { color: var(--text-3); }
 .more-btn[disabled] { opacity: .5; cursor: default; }
 
-.pager { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-top: 1px solid var(--border); }
+.pager {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 14px;
+  border-top: 1px solid var(--border);
+}
+.pager .chip { font-size: 12px; padding: 5px 20px; }
 .pager .chip[disabled] { opacity: .45; cursor: default; }
-.pager .muted { margin-left: auto; font-size: 11px; }
+.pager .muted { font-size: 11px; }
 
 /* Скелетоны: та же геометрия, что у настоящих строк, — иначе ответ «дёргает»
    вёрстку. */

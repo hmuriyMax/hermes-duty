@@ -334,6 +334,7 @@ const TL_TICKS = [
   [20 * 60, 5 * 60],
   [60 * 60, 10 * 60],
   [2 * 3600, 20 * 60],
+  [6 * 3600, 30 * 60],
   // Дальше — по часам: на суточном окне час читается, а три часа давали редкую
   // шкалу, по которой нельзя оценить, когда что было (09.11, Макс).
   [TL_WINDOW_SEC, 3600],
@@ -1034,7 +1035,7 @@ function barReasonText(bar) {
   const b = bar && typeof bar === 'object' ? bar : {}
   const reason = String(b.reason || '').trim()
   if (!reason) return ''
-  const kind = String(b.failureKind || '').trim()
+  const kind = String(b.failureKindText || b.failureKind || '').trim()
   return `${kind ? `отказ ${kind}` : 'причина'}: ${fmtTitle(reason, 140)}`
 }
 
@@ -2146,6 +2147,10 @@ function attemptBar(attempt, crashes) {
     // объясняет, а лезть за ней в журнал руками человек не должен.
     reason: String(a.reason || '').trim(),
     failureKind: String(a.kind || '').trim(),
+    // Имя класса словами приходит из шейпера сервера (`failure_kind` там — слаг):
+    // слаг в подсказке человеку ничего не объясняет, а собственный перевод в
+    // каждой поверхности разъехался бы между вебом и десктопом.
+    failureKindText: String(a.kind_text || '').trim(),
     tone: open ? (dead ? 'red' : 'blue') : outcomeTone(a.outcome, a.status, crashes),
     leftPct: 0,
     endPct: 0,

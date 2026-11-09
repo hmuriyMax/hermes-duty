@@ -61,7 +61,9 @@ function moduleForRender(root) {
   )
   const source = read('desktop/plugin.js')
     .replace(/from '@hermes\/plugin-sdk'/, "from './sdk.mjs'")
-    .concat('\nexport { DutyLane, DutyAttemptRow, ScalePanel, KpiStrip, SpecStrip, CallInspector }\n')
+    .concat(
+      '\nexport { DutyLane, DutyAttemptRow, ScalePanel, KpiStrip, SpecStrip, CallInspector, DutyMiniTimeline, FinishedScreen, shapeFinishedRow, dealTimeline, DutyPage }\n',
+    )
   const file = join(dir, 'plugin.mjs')
   writeFileSync(file, source)
   return file
@@ -583,3 +585,287 @@ test('десктоп: сжатый простой подписан на оси, 
   assert.doesNotMatch(plainPanel, /duty-tl-idle/, 'сжатие нарисовано там, где его нет')
 })
 
+
+
+/* ---------------- мини-таймлайн и завершённые (0.0.9) ---------------- */
+
+const sampleNow = Date.parse('2026-11-09T15:00:00Z') / 1000
+
+function sampleTimelineView(mod) {
+  const deals = [
+    {
+      id: 'd_aaaaaaaa',
+      title: 'собрать релиз',
+      titleFull: 'собрать релиз',
+      repo: '/Users/x/GolandProjects/hermes-duty',
+      repoShort: 'hermes-duty',
+      state: 'working',
+      stateLabel: 'работает',
+      tone: 'blue',
+      createdAt: sampleNow - 5400,
+      updatedAt: sampleNow - 60,
+    },
+  ]
+  const spans = {
+    // Форма `/spans`: пара start/end по попытке, живая — с end: null.
+    d_aaaaaaaa: [
+      { start: sampleNow - 5400, end: sampleNow - 3600, stage: 'plan', outcome: 'ok' },
+      { start: sampleNow - 3600, end: null, stage: 'impl', outcome: null },
+    ],
+  }
+  return mod.dealTimeline(deals, [], sampleNow, spans)
+}
+
+test('десктоп: мини-таймлайн — сосиска на общей сетке, кликабельны дело и название', async (t) => {
+  const root = reactRoot()
+  if (!root) return t.skip('нет React в ~/.hermes/hermes-agent/node_modules')
+
+  const mod = await import(pathToFileURL(moduleForRender(root)).href)
+  const React = (await import(pathToFileURL(join(root, 'react', 'index.js')).href)).default
+  const { renderToStaticMarkup } = await import(pathToFileURL(join(root, 'react-dom', 'server.node.js')).href)
+
+  const view = sampleTimelineView(mod)
+  assert.equal(view.rows.length, 1)
+  const html = renderToStaticMarkup(React.createElement(mod.DutyMiniTimeline, { view, onOpen: () => {} }))
+
+  // Сетка — отдельный слой под всеми дорожками, а не рисунок строки.
+  assert.match(html, /class="duty-mtl-grid"/, 'нет слоя сетки')
+  assert.match(html, /class="duty-mtl-grid-track"/, 'нет дорожки сетки')
+  assert.match(html, /--duty-mtl-step:/, 'шаг сетки не передан')
+  // Сосиска — одно тело дела; этапы внутри без своих скруглений.
+  assert.match(html, /class="duty-mtl-sausage/, 'нет сосиски')
+  assert.match(html, /class="duty-mtl-seg t-/, 'нет полос этапов')
+  assert.ok(!/duty-mtl-seg[^"]*" style="[^"]*border-radius/.test(html), 'у полосы этапа своё скругление')
+  // Кликабельны дело и название: строка — только раскладка.
+  const rowTag = html.slice(html.indexOf('<div class="duty-mtl-row'), html.indexOf('>', html.indexOf('<div class="duty-mtl-row')) + 1)
+  assert.ok(!/role=|tabindex=/.test(rowTag), 'строка сама стала кликабельной')
+  assert.match(html, /class="duty-mtl-title"[^>]*role="link"/, 'название не ссылка')
+  assert.match(html, /class="duty-mtl-sausage[^"]*"[^>]*role="link"/, 'сосиска не ссылка')
+  // Две ссылки на строку — название и сосиска, и больше ничего.
+  assert.equal((html.match(/role="link"/g) || []).length, 2, 'в строке больше двух кликабельных мест')
+  // Шкала: подписи стоят в тех же колонках, что дорожки.
+  assert.match(html, /class="duty-mtl-axis-track"/, 'нет полотна шкалы')
+  assert.match(html, /class="duty-mtl-tick"[^>]*style="left:/, 'нет подписей делений')
+  // Легенда называет состояния, а не имена этапов.
+  assert.match(html, /class="duty-mtl-legend"/, 'нет легенды')
+
+  const css = read('desktop/plugin.js').replace(/\/\*[\s\S]*?\*\//g, '')
+  const at = css.indexOf('.duty-mtl-sausage{')
+  assert.ok(at > 0, 'нет правила .duty-mtl-sausage')
+  const rule = css.slice(at, css.indexOf('}', at))
+  assert.ok(rule.includes('border-radius:3px'), 'у сосиски не то скругление')
+  assert.ok(!/999px/.test(rule), 'сосиска снова таблетка')
+  // Подпись деления центрируется на своей линии — иначе время съезжает.
+  const tickAt = css.indexOf('.duty-mtl-tick{')
+  const tickRule = css.slice(tickAt, css.indexOf('}', tickAt))
+  assert.ok(tickRule.includes('translateX(-50%)'), 'подпись деления не центрируется')
+})
+
+test('десктоп: завершённые — «ещё» по центру под списком и скелетоны при подгрузке', async (t) => {
+  const root = reactRoot()
+  if (!root) return t.skip('нет React в ~/.hermes/hermes-agent/node_modules')
+
+  const mod = await import(pathToFileURL(moduleForRender(root)).href)
+  const React = (await import(pathToFileURL(join(root, 'react', 'index.js')).href)).default
+  const { renderToStaticMarkup } = await import(pathToFileURL(join(root, 'react-dom', 'server.node.js')).href)
+
+  const row = mod.shapeFinishedRow({
+    id: 'd_bbbbbbbb',
+    repo: '/Users/x/GolandProjects/hermes-duty',
+    status: 'completed',
+    finished_at: sampleNow - 600,
+    title: 'закрыть сделку',
+  })
+  const render = (groups) =>
+    renderToStaticMarkup(
+      React.createElement(mod.FinishedScreen, {
+        onPick: () => {},
+        finished: {
+          index: {
+            repos: [{ repo: '/Users/x/GolandProjects/hermes-duty', short: 'hermes-duty', label: 'hermes-duty', total: 12 }],
+            total: 12,
+            errors: [],
+            note: '',
+          },
+          groups: { '/Users/x/GolandProjects/hermes-duty': groups },
+          error: null,
+          reload: () => {},
+          loadGroup: () => {},
+        },
+      }),
+    )
+
+  const loaded = render({ rows: [row], total: 12, next: 'cur', done: false, loading: false, error: null })
+  // Кнопка — под таблицей и с курсом на остаток, а не общий сдвиг списка.
+  const tableEnd = loaded.indexOf('</table>')
+  const moreAt = loaded.indexOf('duty-more-row')
+  assert.ok(tableEnd > 0 && moreAt > tableEnd, 'кнопка «ещё» стоит не под таблицей')
+  assert.match(loaded, /class="duty-more-btn"[^>]*>ещё 5 · осталось 11</, 'кнопка не называет остаток')
+  assert.match(loaded, /1 из 12/, 'нет счётчика группы')
+
+  // Пока грузится — скелетоны на месте будущих строк, таблица не пропадает.
+  const loading = render({ rows: [row], total: 12, next: 'cur', done: false, loading: true, error: null })
+  assert.match(loading, /class="duty-skel-tr"/, 'нет скелетонов подгрузки')
+  assert.match(loading, /class="duty-row duty-row-in"/, 'показанные строки пропали при подгрузке')
+  assert.match(loading, /загружаю…/, 'кнопка не говорит о подгрузке')
+
+  // Всё загружено — кнопка гаснет и говорит словами, а не остаётся яркой.
+  const done = render({ rows: [row], total: 1, next: null, done: true, loading: false, error: null })
+  assert.match(done, /duty-more-btn is-done/, 'состояние «всё» не отличается от кнопки')
+})
+
+
+/**
+ * Страница целиком: таймлайн на «Сейчас» и листание «Завершённых» — те же данные,
+ * что у веба, и те же правила. Монтаж в jsdom нужен потому, что здесь работают
+ * эффекты и состояние: без них не видно ни подгрузки по курсору, ни того, что
+ * скелетоны появляются до ответа.
+ */
+test('десктоп: страница — таймлайн на «Сейчас» и «ещё» по проектам в завершённых', async (t) => {
+  const reactModules = reactRoot()
+  if (!reactModules) return t.skip('нет React в ~/.hermes/hermes-agent/node_modules')
+  if (!existsSync(join(reactModules, 'jsdom', 'package.json'))) return t.skip('нет jsdom')
+
+  const dir = mkdtempSync(join(tmpdir(), 'duty-page-'))
+  mkdirSync(join(dir, 'node_modules'))
+  for (const name of ['react', 'react-dom', 'scheduler', 'jsdom']) {
+    const target = join(reactModules, name)
+    if (existsSync(target)) symlinkSync(target, join(dir, 'node_modules', name), 'dir')
+  }
+  writeFileSync(
+    join(dir, 'sdk.mjs'),
+    ['Button', 'Input', 'Codicon', 'Streamdown']
+      .map((name) => `export const ${name} = (props) => null`)
+      .join('\n'),
+  )
+  writeFileSync(
+    join(dir, 'plugin.mjs'),
+    pluginSource()
+      .replace(/from '@hermes\/plugin-sdk'/, "from './sdk.mjs'")
+      .concat('\nexport function __setRest(fn) { rest = fn }\nexport { DutyPage }\n'),
+  )
+
+  const { JSDOM } = await import(pathToFileURL(join(reactModules, 'jsdom', 'lib', 'api.js')).href)
+  const dom = new JSDOM('<!doctype html><div id="root"></div>', { url: 'http://localhost/' })
+  globalThis.window = dom.window
+  globalThis.document = dom.window.document
+  Object.defineProperty(globalThis, 'navigator', { value: dom.window.navigator, configurable: true })
+  globalThis.HTMLElement = dom.window.HTMLElement
+  globalThis.Element = dom.window.Element
+  globalThis.Node = dom.window.Node
+  globalThis.requestAnimationFrame = (cb) => setTimeout(() => cb(Date.now()), 0)
+  globalThis.cancelAnimationFrame = (id) => clearTimeout(id)
+
+  let mounted = null
+  const failures = []
+  const origError = console.error
+  console.error = (...args) => {
+    const text = args.map((item) => (item && item.stack) || String(item)).join(' ')
+    if (!/not wrapped in act/.test(text)) failures.push(text)
+  }
+
+  const nowFixture = JSON.parse(read('tests/fixtures/now.json'))
+  const repo = '~/go/src/gitlab.ozon.ru/sx/sx-widgets-api'
+  const finishedRow = (index) => ({
+    id: `d_f000000${index}`,
+    repo,
+    title: `закрытое дело ${index}`,
+    status: 'completed',
+    created_at: nowFixture.now - 7200,
+    finished_at: nowFixture.now - 600 - index * 60,
+    cause: 'all_stages_done',
+    attempts: 1,
+    questions: { asked: 0, answered: 0, waiting: 0 },
+  })
+  const courses = []
+
+  try {
+    const mod = await import(pathToFileURL(join(dir, 'plugin.mjs')).href)
+    mod.__setRest(async (path) => {
+      if (path === '/now') return nowFixture
+      if (path.startsWith('/deals?limit=1')) {
+        return {
+          now: nowFixture.now,
+          total: 12,
+          limit: 1,
+          deals: [finishedRow(1)],
+          repos: [{ repo, total: 12 }],
+          statuses: ['completed'],
+          note: '',
+          errors: [],
+        }
+      }
+      if (path.startsWith('/deals?limit=5')) {
+        courses.push(path)
+        const more = path.includes('cursor=c2')
+        return {
+          now: nowFixture.now,
+          total: 12,
+          limit: 5,
+          deals: Array.from({ length: 5 }, (_, i) => finishedRow((more ? 6 : 1) + i)),
+          next_cursor: more ? null : 'c2',
+          errors: [],
+        }
+      }
+      if (path.startsWith('/spans')) {
+        return {
+          spans: {
+            d_a1b2c3d4: [
+              { start: nowFixture.now - 3400, end: nowFixture.now - 2000, stage: 'impl', outcome: 'ok' },
+              { start: nowFixture.now - 2000, end: null, stage: 'verify', outcome: null },
+            ],
+          },
+        }
+      }
+      return {}
+    })
+
+    const React = (await import(pathToFileURL(join(reactModules, 'react', 'index.js')).href)).default
+    const { createRoot } = await import(pathToFileURL(join(reactModules, 'react-dom', 'client.js')).href)
+    const container = dom.window.document.getElementById('root')
+    mounted = createRoot(container)
+    mounted.render(React.createElement(mod.DutyPage))
+    await new Promise((resolve) => setTimeout(resolve, 700))
+
+    // «Сейчас»: таймлайн нарисован, сосиски лежат на общей сетке.
+    assert.equal(failures.length, 0, `страница упала: ${failures[0] || ''}`.slice(0, 600))
+    assert.ok(container.querySelector('.duty-mtl'), 'на «Сейчас» нет таймлайна')
+    assert.ok(container.querySelectorAll('.duty-mtl-sausage').length >= 1, 'нет сосисок')
+    assert.ok(container.querySelectorAll('.duty-mtl-seg').length >= 1, 'полосы этапов не пришли из /spans')
+    assert.ok(container.querySelectorAll('.duty-mtl-tick').length >= 5, 'шкала без делений')
+
+    // «Завершённые»: пятёрка на проект и своя кнопка под таблицей.
+    const tab = [...container.querySelectorAll('.duty-tab')].find((node) => node.textContent === 'Завершённые')
+    assert.ok(tab, 'нет вкладки «Завершённые»')
+    tab.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }))
+    await new Promise((resolve) => setTimeout(resolve, 500))
+
+    const group = container.querySelector('.duty-group')
+    assert.ok(group, 'группа завершённых не нарисована')
+    assert.equal(group.querySelectorAll('tbody tr.duty-row').length, 5, 'на проект показано не пять строк')
+    const more = group.querySelector('.duty-more-btn')
+    assert.ok(more && more.textContent.includes('ещё 5'), 'нет кнопки «ещё 5» под списком')
+    assert.ok(
+      group.querySelector('table').compareDocumentPosition(more) & dom.window.Node.DOCUMENT_POSITION_FOLLOWING,
+      'кнопка стоит не после таблицы',
+    )
+
+    // Подгрузка: скелетоны встают сразу, строки добавляются по курсору.
+    more.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }))
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    assert.ok(group.querySelectorAll('tr.duty-skel-tr').length > 0, 'нет скелетонов подгрузки')
+    await new Promise((resolve) => setTimeout(resolve, 700))
+    assert.equal(group.querySelectorAll('tbody tr.duty-row').length, 10, 'вторая пятёрка не приехала')
+    assert.equal(group.querySelectorAll('tr.duty-skel-tr').length, 0, 'скелетоны остались после ответа')
+    assert.ok(courses.some((path) => path.includes('cursor=c2')), 'вторая страница запрошена без курсора')
+    assert.equal(failures.length, 0, `страница ругалась: ${failures[0] || ''}`.slice(0, 600))
+  } finally {
+    console.error = origError
+    try {
+      if (mounted) mounted.unmount()
+    } catch {
+      /* не смонтировалось — размонтировать нечего */
+    }
+    keepWindow = dom.window
+  }
+})

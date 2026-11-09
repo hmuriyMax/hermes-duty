@@ -3,9 +3,9 @@
  *
  * Форма — как у hermes-tickets: `export default { id, name, register(ctx) }`,
  * страница в `area: 'routes'`, пункт в `area: 'sidebar.nav'`. Данные — ТОЛЬКО
- * через `ctx.rest('/now')`, `ctx.rest('/deals')`, `ctx.rest('/deal/{deal_id}')` и
- * `ctx.rest('/duty/{deal_id}/attempts')`: прямого fetch и шелла из UI нет, ядро не
- * импортируется, файлы плагин не читает.
+ * через `ctx.rest('/now')`, `ctx.rest('/deals')`, `ctx.rest('/spans')`,
+ * `ctx.rest('/deal/{deal_id}')` и `ctx.rest('/duty/{deal_id}/attempts')`: прямого
+ * fetch и шелла из UI нет, ядро не импортируется, файлы плагин не читает.
  *
  * Дело адресуется только своим id `d_<hex>` (0.0.6: доски нет). Классификация
  * состояний — не здесь: страница рисует `waiting.state` и `waiting.evidence` ровно
@@ -383,6 +383,7 @@ const TL_TICKS = [
   [20 * 60, 5 * 60],
   [60 * 60, 10 * 60],
   [2 * 3600, 20 * 60],
+  [6 * 3600, 30 * 60],
   // Дальше — по часам: на суточном окне час читается, а три часа давали редкую
   // шкалу, по которой нельзя оценить, когда что было (09.11, Макс).
   [TL_WINDOW_SEC, 3600],
@@ -3544,6 +3545,71 @@ const CSS = `
 .duty-scale-wait{position:absolute;bottom:0;height:0;border-top:2px dashed currentColor;transform:translateY(-4px);color:var(--ui-yellow)}
 .duty-scale-wait-k{position:absolute;left:4px;top:-14px;font-size:10.5px;white-space:nowrap}
 .duty-scale-legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px;font-size:11.5px}
+/* ------------------------- мини-таймлайн и листание завершённых (0.0.9)
+ *
+ * Геометрия приходит из шейпера: здесь только раскладка. Сетка — один слой под
+ * всеми делами (--duty-mtl-step / --duty-mtl-first), строки своих клеток не
+ * рисуют; сосиска — одно тело с небольшим скруглением, этапы внутри стыкуются
+ * вплотную, и границей служит только цвет.
+ */
+.duty-mtl{margin:2px 0 14px;border:1px solid var(--ui-stroke-tertiary);border-radius:8px;background:color-mix(in srgb, var(--ui-text-primary) 2%, transparent);overflow:hidden}
+.duty-mtl-h{display:flex;align-items:baseline;gap:10px;padding:8px 12px 6px;font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--ui-text-tertiary)}
+.duty-mtl-omitted{margin-left:auto}
+.duty-mtl-body{padding:0 12px 2px}
+.duty-mtl-rows{position:relative;display:flex;flex-direction:column;--duty-mtl-cols:minmax(180px,26%) 1fr 74px 108px}
+.duty-mtl-grid{position:absolute;inset:0;display:grid;grid-template-columns:var(--duty-mtl-cols);gap:12px;pointer-events:none}
+.duty-mtl-grid-track{grid-column:2;background-image:repeating-linear-gradient(to right,color-mix(in srgb,var(--ui-text-tertiary) 30%,transparent) 0 1px,transparent 1px var(--duty-mtl-step,25%));background-position:var(--duty-mtl-first,0) 0;background-repeat:repeat-y;border-right:1px solid var(--ui-accent)}
+.duty-mtl-row{display:grid;grid-template-columns:var(--duty-mtl-cols);gap:12px;align-items:center;padding:4px 0;font-size:12px}
+.duty-mtl-lbl{display:flex;flex-direction:column;gap:1px;overflow:hidden}
+.duty-mtl-repo{font-size:10px;letter-spacing:.04em;color:var(--ui-text-tertiary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.duty-mtl-title{font-size:12.5px;color:var(--ui-text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}
+.duty-mtl-title:hover{color:var(--ui-accent);text-decoration:underline;text-underline-offset:2px}
+.duty-mtl-title:focus-visible{outline:2px solid var(--ui-accent);outline-offset:2px;border-radius:3px}
+.duty-mtl-row.is-done .duty-mtl-title{color:var(--ui-text-secondary)}
+.duty-mtl-track{position:relative;height:16px}
+.duty-mtl-sausage{position:absolute;top:0;bottom:0;overflow:hidden;border-radius:3px;background:color-mix(in srgb,var(--ui-text-tertiary) 22%,transparent);cursor:pointer}
+.duty-mtl-sausage:hover{filter:brightness(1.08)}
+.duty-mtl-sausage:focus-visible{outline:2px solid var(--ui-accent);outline-offset:2px}
+.duty-mtl-sausage.is-clipped{border-top-left-radius:0;border-bottom-left-radius:0}
+.duty-mtl-sausage.inexact{opacity:.45}
+.duty-mtl-seg{position:absolute;top:0;bottom:0;min-width:2px;background:var(--seg,var(--ui-stroke-secondary))}
+.duty-mtl-seg.t-green{--seg:var(--ui-green)}
+.duty-mtl-seg.t-blue{--seg:var(--ui-blue)}
+.duty-mtl-seg.t-yellow{--seg:var(--ui-yellow)}
+.duty-mtl-seg.t-red{--seg:var(--ui-red)}
+.duty-mtl-seg.t-gray{--seg:var(--ui-stroke-secondary)}
+.duty-mtl-seg.is-running{animation:duty-mtl-breathe 2.6s ease-in-out infinite}
+.duty-mtl-seg.clipped{border-left:1px solid var(--ui-surface-background)}
+@keyframes duty-mtl-breathe{0%,100%{filter:brightness(1)}50%{filter:brightness(1.3)}}
+.duty-mtl-age{color:var(--ui-text-secondary);text-align:right;font-size:11.5px}
+.duty-mtl-state{color:var(--ui-text-tertiary);text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11.5px}
+.duty-mtl-axis{display:grid;grid-template-columns:var(--duty-mtl-cols);gap:12px;height:15px;margin-top:4px}
+.duty-mtl-axis-track{position:relative;height:15px}
+.duty-mtl-tick{position:absolute;transform:translateX(-50%);font-size:10px;font-variant-numeric:tabular-nums;color:var(--ui-text-tertiary);white-space:nowrap}
+.duty-mtl-legend{display:flex;flex-wrap:wrap;gap:4px 14px;padding:8px 12px 10px;border-top:1px solid var(--ui-stroke-tertiary);font-size:11.5px}
+.duty-mtl-legend-item{display:inline-flex;align-items:center;gap:6px;color:var(--ui-text-secondary)}
+.duty-mtl-dot{width:9px;height:9px;border-radius:2px;background:var(--ui-stroke-secondary)}
+.duty-mtl-dot.t-green{background:var(--ui-green)}
+.duty-mtl-dot.t-blue{background:var(--ui-blue)}
+.duty-mtl-dot.t-yellow{background:var(--ui-yellow)}
+.duty-mtl-dot.t-red{background:var(--ui-red)}
+.duty-mtl-dot.t-gray{background:var(--ui-stroke-secondary)}
+.duty-mtl-legend-item.is-running{color:var(--ui-text-primary)}
+@media (prefers-reduced-motion: reduce){.duty-mtl-seg.is-running{animation:none}}
+
+/* Кнопка подгрузки под списком проекта: по центру и заметная — единственный
+ * способ получить следующие строки, искать её в углу не надо. */
+.duty-more-row{display:flex;justify-content:center;padding:10px 0 14px}
+.duty-more-btn{font-family:inherit;font-size:12px;padding:5px 20px;border-radius:999px;cursor:pointer;color:var(--ui-text-primary);border:1px solid color-mix(in srgb,var(--ui-accent) 45%,var(--ui-stroke-secondary));background:color-mix(in srgb,var(--ui-accent) 10%,transparent)}
+.duty-more-btn:hover:not([disabled]){border-color:var(--ui-accent);background:color-mix(in srgb,var(--ui-accent) 18%,transparent)}
+.duty-more-btn[disabled]{cursor:default}
+.duty-more-btn.is-done{border-color:transparent;background:transparent;color:var(--ui-text-tertiary)}
+.duty-skel-tr td{padding:6px}
+.duty-skel-tr .duty-skel{height:9px;border-radius:4px}
+.duty-row-in{animation:duty-row-in .24s ease both}
+@keyframes duty-row-in{from{opacity:0;transform:translateY(-2px)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion: reduce){.duty-row-in{animation:none}}
+
 `
 
 /* ---------------- данные ---------------- */
@@ -3653,38 +3719,138 @@ function useStats(enabled) {
 /* ---------------- данные: «завершённые» (0.0.7) ---------------- */
 
 /**
- * Экран «Завершённые»: `GET /deals` — список закрытых дел.
+ * Экран «Завершённые»: индекс проектов и своя страница у каждого.
  *
- * Запрашивается только когда экран открыт: это чтение всей истории закрытых
- * дел, и держать его в памяти «Сейчас» незачем. Прошлый снимок не затирается
- * ошибкой — экран не мигает пустотой при обрыве.
+ * `GET /deals?limit=1` называет, сколько закрытых дел у каждого репозитория
+ * (`repos[].total`) — из него строится индекс. Дальше каждая группа листается
+ * сама (`?repo=…&limit=5&cursor=…`): своя пятёрка и свой курсор, поэтому «ещё»
+ * под одним списком не сдвигает соседние и не повторяет строки. Курсор — ключ
+ * `finished_at:id` с бэкенда, а не смещение.
+ *
+ * Запрашивается только когда экран открыт: это чтение всей истории закрытых дел,
+ * и держать его в памяти «Сейчас» незачем. Прошлый снимок не затирается ошибкой —
+ * экран не мигает пустотой при обрыве.
  */
-function useFinishedFeeds(enabled) {
-  const [snap, setSnap] = useState({ data: null, error: null, loading: false })
-  const alive = useRef(true)
+const FINISHED_PER_REPO = 5
+// Сколько скелетоны держатся как минимум: ответ с локального бэкенда приходит
+// быстрее глаза, и без этого «разворачивание» не увидеть — строки просто прыгали.
+const SKELETON_MIN_MS = 260
 
-  const load = useCallback(async () => {
-    setSnap((prev) => ({ ...prev, loading: true }))
-    try {
-      const data = await rest('/deals', { timeoutMs: REQUEST_TIMEOUT_MS })
-      if (alive.current) setSnap({ data, error: null, loading: false })
-    } catch (error) {
-      if (alive.current) setSnap((prev) => ({ data: prev.data, error: errText(error), loading: false }))
-    }
+const EMPTY_FINISHED_GROUP = { rows: [], total: 0, next: null, done: false, loading: false, error: null }
+
+function useFinishedPages(enabled) {
+  const [index, setIndex] = useState(null)
+  const [groups, setGroups] = useState({})
+  const [error, setError] = useState(null)
+  const alive = useRef(true)
+  // Курсоры живут в ref: два «ещё» подряд не должны прочитать один и тот же
+  // `next` из ещё не перерисованного состояния.
+  const groupsRef = useRef({})
+
+  const patchGroup = useCallback((repo, patch) => {
+    const prev = groupsRef.current[repo] || EMPTY_FINISHED_GROUP
+    const next = { ...prev, ...patch }
+    groupsRef.current = { ...groupsRef.current, [repo]: next }
+    if (alive.current) setGroups(groupsRef.current)
+    return next
   }, [])
+
+  const loadGroup = useCallback(
+    async (repo, dir = 'more') => {
+      const group = groupsRef.current[repo] || EMPTY_FINISHED_GROUP
+      if (group.loading) return
+      if (dir === 'more' && (group.done || group.next === null)) return
+      const cursor = dir === 'more' ? group.next : null
+      patchGroup(repo, { loading: true, error: null })
+      const startedAt = Date.now()
+      try {
+        const query =
+          `/deals?limit=${FINISHED_PER_REPO}&repo=${encodeURIComponent(repo)}` +
+          (cursor ? `&cursor=${encodeURIComponent(cursor)}` : '')
+        const page = shapeFinishedPage(await rest(query, { timeoutMs: REQUEST_TIMEOUT_MS }))
+        const shown = dir === 'more' ? (groupsRef.current[repo] || EMPTY_FINISHED_GROUP).rows : []
+        patchGroup(repo, {
+          rows: shown.concat(page.rows),
+          next: page.next,
+          done: page.next === null,
+          total: page.total || shown.length + page.rows.length,
+        })
+      } catch (err) {
+        patchGroup(repo, { error: errText(err) })
+      } finally {
+        // Скелетоны успевают показаться: локальный ответ быстрее глаза.
+        const wait = SKELETON_MIN_MS - (Date.now() - startedAt)
+        if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait))
+        patchGroup(repo, { loading: false })
+      }
+    },
+    [patchGroup],
+  )
+
+  const loadIndex = useCallback(async () => {
+    setError(null)
+    try {
+      const page = shapeFinished(await rest('/deals?limit=1', { timeoutMs: REQUEST_TIMEOUT_MS }))
+      if (!alive.current) return
+      setIndex({ repos: page.repos, total: page.total, errors: page.errors, note: page.note })
+      for (const item of page.repos) patchGroup(item.repo, { total: item.total })
+      await Promise.all(page.repos.map((item) => loadGroup(item.repo, 'reset')))
+    } catch (err) {
+      if (alive.current) setError(errText(err))
+    }
+  }, [patchGroup, loadGroup])
 
   useEffect(() => {
     alive.current = true
     if (!enabled) return () => { alive.current = false }
-    void load()
-    const timer = setInterval(() => void load(), STATS_REFRESH_MS)
-    return () => {
-      alive.current = false
-      clearInterval(timer)
-    }
-  }, [enabled, load])
+    void loadIndex()
+    return () => { alive.current = false }
+  }, [enabled, loadIndex])
 
-  return { ...snap, reload: load }
+  /** «Загрузить ещё» — по следующей пятёрке в каждом проекте, где есть что. */
+  const loadMoreAll = useCallback(() => {
+    const pending = Object.keys(groupsRef.current).filter((repo) => !groupsRef.current[repo].done)
+    return Promise.all(pending.map((repo) => loadGroup(repo, 'more')))
+  }, [loadGroup])
+
+  return { index, groups, error, reload: loadIndex, loadGroup, loadMoreAll }
+}
+
+/**
+ * Границы этапов для дорожек таймлайна: один запрос на все показанные дела.
+ *
+ * Ошибка не глушит таймлайн — дорожки рисуются одним тоном состояния, без
+ * разбивки на этапы.
+ */
+function useSpans(ids) {
+  const key = useMemo(
+    () => [...new Set((ids || []).filter(Boolean))].sort().join(','),
+    [ids],
+  )
+  const [map, setMap] = useState({})
+  const alive = useRef(true)
+  const known = useRef({})
+
+  useEffect(() => {
+    alive.current = true
+    if (!key) return () => { alive.current = false }
+    const wanted = key.split(',')
+    if (wanted.every((id) => known.current[id] !== undefined)) return () => { alive.current = false }
+    void (async () => {
+      try {
+        const payload = await rest(`/spans?ids=${encodeURIComponent(key)}`, { timeoutMs: REQUEST_TIMEOUT_MS })
+        const spans = payload && typeof payload.spans === 'object' && payload.spans ? payload.spans : {}
+        if (!alive.current) return
+        known.current = { ...known.current, ...spans }
+        setMap((prev) => ({ ...prev, ...spans }))
+      } catch {
+        // Молча: разбивка на этапы — украшение, а не факт, на котором стоит экран.
+      }
+    })()
+    return () => { alive.current = false }
+  }, [key])
+
+  return map
 }
 
 /** Экран «Дело»: спецификация + тот же факт-набор, что в `/now`. */
@@ -4513,26 +4679,15 @@ function HealthScreen({ stats }) {
  * страница, ни шейпер их не пересчитывают, иначе строка списка спорила бы с
  * карточкой того же дела (`bin/duty deal <id>`).
  */
-function FinishedTable({ group, onPick }) {
+const FINISHED_COLUMNS = ['8%', '9%', '23%', '8%', '6%', '6%', '8%', '13%', '10%', '9%']
+
+function FinishedTable({ rows, pending, onPick }) {
   return h(
     'table',
     { className: 'duty-table duty-finished-table' },
     // Колонки заданы явно: у каждого репозитория своя таблица, и без ширин
     // браузер считает их по содержимому — колонки групп разъезжались (09.11).
-    h(
-      'colgroup',
-      null,
-      h('col', { style: { width: '8%' } }),
-      h('col', { style: { width: '9%' } }),
-      h('col', { style: { width: '23%' } }),
-      h('col', { style: { width: '8%' } }),
-      h('col', { style: { width: '6%' } }),
-      h('col', { style: { width: '6%' } }),
-      h('col', { style: { width: '8%' } }),
-      h('col', { style: { width: '13%' } }),
-      h('col', { style: { width: '10%' } }),
-      h('col', { style: { width: '9%' } }),
-    ),
+    h('colgroup', null, ...FINISHED_COLUMNS.map((width, i) => h('col', { key: `col-${i}`, style: { width } }))),
     h(
       'thead',
       null,
@@ -4554,12 +4709,12 @@ function FinishedTable({ group, onPick }) {
     h(
       'tbody',
       null,
-      ...group.deals.map((deal) =>
+      ...rows.map((deal) =>
         h(
           'tr',
           {
             key: deal.id,
-            className: 'duty-row',
+            className: 'duty-row duty-row-in',
             title: [deal.repoLabel, deal.causeText].filter(Boolean).join(' · '),
             onClick: () => onPick(deal),
           },
@@ -4582,12 +4737,21 @@ function FinishedTable({ group, onPick }) {
           ),
         ),
       ),
+      // Скелетоны встают на место будущих строк: список не мигает и не прыгает,
+      // а показывает, где окажутся данные.
+      ...Array.from({ length: pending }, (_, i) =>
+        h(
+          'tr',
+          { key: `skel-${i}`, className: 'duty-skel-tr' },
+          h('td', { colSpan: FINISHED_COLUMNS.length }, h('div', { className: 'duty-skel' })),
+        ),
+      ),
     ),
   )
 }
 
 function FinishedScreen({ finished, onPick }) {
-  if (finished.error && !finished.data) {
+  if (finished.error && !finished.index) {
     return h(
       'div',
       { className: 'duty-scroll' },
@@ -4599,7 +4763,7 @@ function FinishedScreen({ finished, onPick }) {
       ),
     )
   }
-  if (!finished.data) {
+  if (!finished.index) {
     return h(
       'div',
       { className: 'duty-scroll' },
@@ -4610,26 +4774,19 @@ function FinishedScreen({ finished, onPick }) {
       ),
     )
   }
-  const model = shapeFinished(finished.data)
+  const repos = finished.index.repos || []
+  const shownRows = Object.values(finished.groups).reduce((sum, group) => sum + group.rows.length, 0)
+  const shownTotal = repos.reduce((sum, item) => sum + item.total, 0)
   return h(
     'div',
     { className: 'duty-scroll' },
-    finished.error
-      ? h(
-          'div',
-          { className: 'duty-banner', style: { margin: '0 0 10px' } },
-          h('span', null, `снимок не обновлён: ${finished.error}`),
-          h(Button, { size: 'xs', variant: 'secondary', onClick: () => void finished.reload() }, 'повторить'),
-        )
-      : null,
-    model.errors.length
+    finished.index.errors && finished.index.errors.length
       ? h(
           'div',
           { className: 'duty-note', style: { margin: '0 0 10px' } },
-          ...model.errors.map((err, i) => h('div', { key: `fe-${i}` }, `источник ${err.source} недоступен: ${err.reason}`)),
+          ...finished.index.errors.map((err, i) => h('div', { key: `fe-${i}` }, `источник ${err.source} недоступен: ${err.reason}`)),
         )
       : null,
-    // Что это за список — словами: `/now` про активные, здесь — про сделанное.
     h(
       'div',
       { className: 'duty-muted', style: { margin: '0 0 10px' } },
@@ -4638,42 +4795,208 @@ function FinishedScreen({ finished, onPick }) {
     h(
       'div',
       { className: 'duty-muted duty-num', style: { margin: '0 0 10px' } },
-      `дел: ${model.count} из ${model.total} · статусы: ${model.statuses.join(', ') || '—'}`,
+      `проектов: ${repos.length} · показано ${shownRows} из ${shownTotal}${finished.index.note ? ` · ${finished.index.note}` : ''}`,
     ),
-    model.truncated
+    repos.length
       ? h(
           'div',
-          { className: 'duty-note', style: { margin: '0 0 10px' } },
-          h('div', null, `показаны не все: лимит ${model.limit}, всего ${model.total} — список режется лимитом /deals`),
-        )
-      : null,
-    model.count
-      ? h(
-          'div',
-          { className: 'duty-list' },
-          ...model.groups.map((group) =>
-            h(
+          { className: 'duty-list duty-finished-list' },
+          ...repos.map((item) => {
+            const group = finished.groups[item.repo] || { ...EMPTY_FINISHED_GROUP, total: item.total }
+            const left = Math.max(0, group.total - group.rows.length)
+            const pending = group.loading ? Math.min(FINISHED_PER_REPO, Math.max(1, left)) : 0
+            const moreText = group.done
+              ? 'это все закрытые дела'
+              : group.loading
+                ? 'загружаю…'
+                : `ещё ${Math.min(FINISHED_PER_REPO, Math.max(1, left))}${left > FINISHED_PER_REPO ? ` · осталось ${left}` : ''}`
+            return h(
               'section',
-              { className: 'duty-group', key: `fd-${group.repo || 'without'}` },
+              { className: 'duty-group', key: `fd-${item.repo || 'without'}` },
               h(
                 'div',
                 { className: 'duty-group-h' },
-                h('span', { className: group.repo ? 'duty-mono' : 'duty-mono duty-muted', title: group.repo || 'репозиторий не назван' }, group.label),
-                h('span', { className: 'duty-num' }, `${group.count}`),
+                h(
+                  'span',
+                  { className: item.repo ? 'duty-mono' : 'duty-mono duty-muted', title: item.repo || 'репозиторий не назван' },
+                  item.label,
+                ),
+                h('span', { className: 'duty-num' }, `${group.rows.length} из ${item.total}`),
                 h('span', { className: 'duty-spacer' }),
-                h('span', { className: 'duty-muted' }, `свежее закрытие: ${group.deals[0].finishedText}`),
+                group.error ? h('span', { style: { color: 'var(--ui-red)' } }, `ошибка: ${group.error}`) : null,
               ),
-              h(FinishedTable, { group, onPick }),
-            ),
-          ),
+              h(FinishedTable, { rows: group.rows, pending, onPick }),
+              // Кнопка стоит по центру под списком — там, где появятся новые
+              // строки, и выделена акцентом: это единственный способ их получить.
+              h(
+                'div',
+                { className: 'duty-more-row' },
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: group.done ? 'duty-more-btn is-done' : 'duty-more-btn',
+                    disabled: group.loading || group.done,
+                    onClick: () => void finished.loadGroup(item.repo, 'more'),
+                  },
+                  moreText,
+                ),
+              ),
+            )
+          }),
         )
       : h(
           'div',
           { className: 'duty-empty' },
           h('b', null, 'завершённых дел нет'),
           // Причина пустоты — словами бэкенда (`note`), а не своя догадка.
-          h('span', { className: 'duty-muted' }, model.note || 'в store нет ни одного закрытого дела'),
+          h('span', { className: 'duty-muted' }, finished.index.note || 'в store нет ни одного закрытого дела'),
         ),
+  )
+}
+
+/* ---------------- мини-таймлайн «Сейчас» ---------------- */
+
+/**
+ * Мини-таймлайн дел: дорожка на дело, полосы этапов внутри.
+ *
+ * Геометрия целиком в шейпере (`dealTimeline`) — здесь только раскладка, чтобы
+ * веб и десктоп не считали оси по-своему. Сверху шкала с делениями, под ней
+ * дорожки: сетка и правый край «сейчас» принадлежат полотну, а не каждой строке,
+ * иначе картинка рассыпается на набор серых полосок. Цвет полосы — состояние
+ * этапа (`stageMeta`), пустое место — пауза между попытками.
+ *
+ * Кликабельны дело и его название, а не вся строка: длительность и состояние —
+ * показания, а не ссылки (09.11, Макс).
+ */
+function DutyMiniTimeline({ view, onOpen }) {
+  if (!view) return null
+  if (view.empty) {
+    return h(
+      'div',
+      { className: 'duty-mtl' },
+      h('div', { className: 'duty-mtl-h' }, h('span', null, 'таймлайн дел')),
+      h('div', { className: 'duty-muted', style: { padding: '0 12px 10px' } }, 'за сутки дел не было'),
+    )
+  }
+  const ticks = view.ticks || []
+  const cols = {
+    '--duty-mtl-step': `${view.grid.stepPct}%`,
+    '--duty-mtl-first': `${view.grid.firstPct}%`,
+  }
+  const open = (row) => () => onOpen(row)
+  return h(
+    'div',
+    { className: 'duty-mtl' },
+    h(
+      'div',
+      { className: 'duty-mtl-h' },
+      h('span', null, 'таймлайн дел'),
+      view.windowText ? h('span', { className: 'duty-muted' }, view.windowText) : null,
+      view.omitted ? h('span', { className: 'duty-muted duty-mtl-omitted' }, `ещё ${view.omitted} не показано`) : null,
+    ),
+    h(
+      'div',
+      { className: 'duty-mtl-body' },
+      h(
+        'div',
+        { className: 'duty-mtl-rows', style: cols },
+        // Сетка — один слой под всеми делами: вертикали общие, строки своих
+        // клеток не рисуют.
+        h(
+          'div',
+          { className: 'duty-mtl-grid', 'aria-hidden': 'true' },
+          h('span', { className: 'duty-mtl-gap' }),
+          h('span', { className: 'duty-mtl-grid-track' }),
+        ),
+        ...view.rows.map((row) =>
+          h(
+            'div',
+            { className: row.open ? 'duty-mtl-row' : 'duty-mtl-row is-done', key: `mtl-${row.key}` },
+            h(
+              'span',
+              { className: 'duty-mtl-lbl' },
+              h('span', { className: 'duty-mtl-repo' }, row.repo),
+              h(
+                'span',
+                {
+                  className: 'duty-mtl-title',
+                  role: 'link',
+                  tabIndex: 0,
+                  title: row.hint,
+                  onClick: open(row),
+                  onKeyDown: (e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault()
+                      open(row)()
+                    }
+                  },
+                },
+                row.title || row.id,
+              ),
+            ),
+            h(
+              'span',
+              { className: 'duty-mtl-track' },
+              h(
+                'span',
+                {
+                  className: `duty-mtl-sausage${row.exact ? '' : ' inexact'}${row.clipped ? ' is-clipped' : ''}`,
+                  style: { left: `${row.bar.leftPct}%`, width: `${row.bar.widthPct}%` },
+                  role: 'link',
+                  tabIndex: 0,
+                  title: row.hint,
+                  'aria-label': `открыть дело ${row.id}`,
+                  onClick: open(row),
+                  onKeyDown: (e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault()
+                      open(row)()
+                    }
+                  },
+                },
+                (row.segments || []).map((segment) =>
+                  h('i', {
+                    key: `seg-${segment.stage}-${segment.leftPct}`,
+                    className: `duty-mtl-seg t-${segment.tone} is-${segment.state}${segment.clipped ? ' clipped' : ''}`,
+                    style: { left: `${segment.leftPct}%`, width: `${segment.widthPct}%` },
+                    title: segment.title,
+                  }),
+                ),
+              ),
+            ),
+            h('span', { className: 'duty-mtl-age duty-num' }, row.durationText),
+            h('span', { className: 'duty-mtl-state' }, row.stateLabel),
+          ),
+        ),
+      ),
+      // Шкала — в тех же колонках, что дорожки: подпись стоит под своим делением.
+      h(
+        'div',
+        { className: 'duty-mtl-axis' },
+        h('span', { className: 'duty-mtl-gap' }),
+        h(
+          'span',
+          { className: 'duty-mtl-axis-track' },
+          ...ticks.map((tick) => h('span', { className: 'duty-mtl-tick', key: `tick-${tick.at}`, style: { left: `${tick.leftPct}%` } }, tick.label)),
+        ),
+      ),
+    ),
+    view.legend && view.legend.length
+      ? h(
+          'div',
+          { className: 'duty-mtl-legend' },
+          ...view.legend.map((item) =>
+            h(
+              'span',
+              { className: item.state === 'running' ? 'duty-mtl-legend-item is-running' : 'duty-mtl-legend-item', key: `lg-${item.state}` },
+              h('i', { className: `duty-mtl-dot t-${item.tone}` }),
+              item.label,
+              h('span', { className: 'duty-muted' }, item.durationText),
+            ),
+          ),
+        )
+      : null,
   )
 }
 
@@ -4837,7 +5160,7 @@ function DutyPage() {
   // «Здоровье» запрашивается только когда экран открыт: это скан всех досок.
   const stats = useStats(screen === 'health')
   // «Завершённые» — тоже по требованию: список закрытых дел не нужен «Сейчас».
-  const finished = useFinishedFeeds(screen === 'deals')
+  const finished = useFinishedPages(screen === 'deals')
 
   // Поиск — локальный и с задержкой: данные не перезапрашиваются на каждый символ.
   useEffect(() => {
@@ -4857,6 +5180,22 @@ function DutyPage() {
     [model, repo, states, effQuery],
   )
 
+  // Мини-таймлайн: активные дела плюс те закрытые, что уже загружены списком.
+  // Цвет и границы этапов считает шейпер — здесь только данные для него.
+  const finishedRows = useMemo(
+    () => Object.values(finished.groups).flatMap((group) => group.rows || []),
+    [finished.groups],
+  )
+  const timelineIds = useMemo(
+    () => [...(model ? model.deals.map((deal) => deal.id) : []), ...finishedRows.map((row) => row.id)],
+    [model, finishedRows],
+  )
+  const spans = useSpans(timelineIds)
+  const timeline = useMemo(
+    () => (model ? dealTimeline(model.deals, finishedRows, model.now, spans) : null),
+    [model, finishedRows, spans],
+  )
+
   if (!rest) {
     return h('div', { className: 'duty-page' }, h('div', { className: 'duty-banner' }, 'плагин не зарегистрирован'))
   }
@@ -4869,6 +5208,14 @@ function DutyPage() {
     lastDeal = deal
     setSel(deal)
     setScreen('deal')
+  }
+  // Клик по дорожке открывает дело тем же экраном, что и строка списка.
+  const openTimelineRow = (row) => {
+    const deal =
+      (model && model.deals.find((item) => item.id === row.id)) ||
+      (finishedRows.find((item) => item.id === row.id)) ||
+      { id: row.id, repo: row.repoFull, titleFull: row.title }
+    pick(deal)
   }
   const toggleState = (state) =>
     setStates((prev) => {
@@ -5043,6 +5390,8 @@ function DutyPage() {
     list = h(
       'div',
       { className: 'duty-list' },
+      // Таймлайн — над списком: «что шло и когда» отвечает раньше, чем строки.
+      h(DutyMiniTimeline, { view: timeline, onOpen: openTimelineRow }),
       ...view.groups.map((group) => h(DealGroup, { key: `grp-${group.repo || 'without'}`, group, selectedKey, onPick: pick })),
     )
   }

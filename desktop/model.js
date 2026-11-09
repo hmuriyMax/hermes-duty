@@ -336,6 +336,9 @@ const TL_WINDOWS = [
   { key: '7d', sec: 7 * 86400, label: '7 дней' },
 ]
 /** Пределы ручного окна: меньше пяти минут шкала пустая, больше месяца — шум. */
+/** Сколько оттенков у одной роли внутри дела: чистый и два сдвинутых. */
+const TL_ROLE_SHADES = 3
+
 const TL_WINDOW_MIN = 5 * 60
 /** Ключ, под которым выбранное окно живёт в localStorage. */
 const TL_WINDOW_KEY = 'duty:tlWindow'
@@ -486,6 +489,11 @@ function timelineSegments(spans, barFrom, barTo) {
   const width = Math.max(1, b - a)
   const segments = []
   const sec = { done: 0, running: 0, failed: 0 }
+  // Счётчик вхождений роли внутри дела: один имплементер в деле — чистый цвет
+  // роли, второй — оттенок, третий — другой оттенок. Порядок повторов берём
+  // нарастающим, а не случайным: одинаковая картина должна давать одинаковый
+  // рисунок, иначе шкала «прыгает» при каждом обновлении.
+  const roleSeen = {}
   for (const item of Array.isArray(spans) ? spans : []) {
     const from = numOrNull(item && item.start)
     const end = numOrNull(item && item.end)
@@ -501,11 +509,16 @@ function timelineSegments(spans, barFrom, barTo) {
     const meta = stageMeta(state)
     const duration = Math.max(0, to - from)
     sec[state] += duration
+    const role = stageRole(item && item.stage)
+    roleSeen[role] = (roleSeen[role] || 0) + 1
     segments.push({
       stage: String((item && item.stage) || ''),
       state,
       // Заливка — роль этапа (кто работает), свечение краёв — состояние.
-      role: stageRole(item && item.stage),
+      role,
+      // Оттенок различает повторы одной роли внутри дела (`impl` → `fix` →
+      // `impl` — это три разных шага, а не один длинный).
+      shade: (roleSeen[role] - 1) % TL_ROLE_SHADES,
       tone: meta.tone,
       // Доли сосиски: экран не пересчитывает координаты, он их только ставит.
       leftPct: Number((((left - a) / width) * 100).toFixed(2)),
@@ -3132,6 +3145,7 @@ export {
   stageRole,
   TL_WINDOWS,
   TL_WINDOW_KEY,
+  TL_ROLE_SHADES,
   TL_WINDOW_SEC,
   TL_WINDOW_MIN,
   TL_WINDOW_MAX,

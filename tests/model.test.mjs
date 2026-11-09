@@ -51,6 +51,7 @@ import {
   parseWindow,
   windowLabel,
   stageRole,
+  TL_ROLE_SHADES,
   shapeStages,
   stageMeta,
   stateLabel,
@@ -2656,6 +2657,34 @@ test('мини-таймлайн: окно выбирается — пресет�
   const oldDone = tlDeal('d_done', { finishedAt: TL_NOW - 2 * 86400, status: 'completed', statusLabel: 'закрыто' })
   assert.equal(dealTimeline([], [oldDone], TL_NOW, {}, 86400).rows.length, 0, 'дело вне окна всё равно нарисовано')
   assert.equal(dealTimeline([], [oldDone], TL_NOW, {}, 7 * 86400).rows.length, 1, 'недельное окно потеряло закрытое дело')
+})
+
+test('повторы одной роли внутри дела различаются оттенком', () => {
+  const deal = tlDeal('d_shade', { createdAt: TL_NOW - 6 * 3600, state: 'working', stateLabel: 'работает', tone: 'blue' })
+  const spans = {
+    d_shade: [
+      { stage: 'impl_core', start: TL_NOW - 6 * 3600, end: TL_NOW - 5 * 3600, outcome: 'ok' },
+      { stage: 'fix', start: TL_NOW - 5 * 3600, end: TL_NOW - 4 * 3600, outcome: 'ok' },
+      { stage: 'impl_core', start: TL_NOW - 4 * 3600, end: TL_NOW - 3 * 3600, outcome: 'ok' },
+      { stage: 'review', start: TL_NOW - 3 * 3600, end: null },
+    ],
+  }
+  const segments = dealTimeline([deal], [], TL_NOW, spans).rows[0].segments
+  // Первый заход каждой роли — чистый цвет роли, второй и третий — оттенки.
+  assert.deepEqual(segments.map((segment) => segment.role), ['implementer', 'implementer', 'implementer', 'reviewer'])
+  assert.deepEqual(segments.map((segment) => segment.shade), [0, 1, 2, 0])
+  // Оттенков конечное число: четвёртый заход снова чистый, рисунок не «уплывает».
+  assert.equal(TL_ROLE_SHADES, 3)
+  const many = {
+    d_shade: [
+      { stage: 'impl', start: TL_NOW - 6 * 3600, end: TL_NOW - 5 * 3600, outcome: 'ok' },
+      { stage: 'impl', start: TL_NOW - 5 * 3600, end: TL_NOW - 4 * 3600, outcome: 'ok' },
+      { stage: 'impl', start: TL_NOW - 4 * 3600, end: TL_NOW - 3 * 3600, outcome: 'ok' },
+      { stage: 'impl', start: TL_NOW - 3 * 3600, end: null },
+    ],
+  }
+  const shades = dealTimeline([deal], [], TL_NOW, many).rows[0].segments.map((segment) => segment.shade)
+  assert.deepEqual(shades, [0, 1, 2, 0], 'оттенки повторов ушли за пределы палитры')
 })
 
 test('деления: короткие окна дробятся, длинные подписаны датами', () => {

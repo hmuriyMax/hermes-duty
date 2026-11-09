@@ -385,6 +385,9 @@ const TL_WINDOWS = [
   { key: '7d', sec: 7 * 86400, label: '7 дней' },
 ]
 /** Пределы ручного окна: меньше пяти минут шкала пустая, больше месяца — шум. */
+/** Сколько оттенков у одной роли внутри дела: чистый и два сдвинутых. */
+const TL_ROLE_SHADES = 3
+
 const TL_WINDOW_MIN = 5 * 60
 /** Ключ, под которым выбранное окно живёт в localStorage. */
 const TL_WINDOW_KEY = 'duty:tlWindow'
@@ -535,6 +538,11 @@ function timelineSegments(spans, barFrom, barTo) {
   const width = Math.max(1, b - a)
   const segments = []
   const sec = { done: 0, running: 0, failed: 0 }
+  // Счётчик вхождений роли внутри дела: один имплементер в деле — чистый цвет
+  // роли, второй — оттенок, третий — другой оттенок. Порядок повторов берём
+  // нарастающим, а не случайным: одинаковая картина должна давать одинаковый
+  // рисунок, иначе шкала «прыгает» при каждом обновлении.
+  const roleSeen = {}
   for (const item of Array.isArray(spans) ? spans : []) {
     const from = numOrNull(item && item.start)
     const end = numOrNull(item && item.end)
@@ -550,11 +558,16 @@ function timelineSegments(spans, barFrom, barTo) {
     const meta = stageMeta(state)
     const duration = Math.max(0, to - from)
     sec[state] += duration
+    const role = stageRole(item && item.stage)
+    roleSeen[role] = (roleSeen[role] || 0) + 1
     segments.push({
       stage: String((item && item.stage) || ''),
       state,
       // Заливка — роль этапа (кто работает), свечение краёв — состояние.
-      role: stageRole(item && item.stage),
+      role,
+      // Оттенок различает повторы одной роли внутри дела (`impl` → `fix` →
+      // `impl` — это три разных шага, а не один длинный).
+      shade: (roleSeen[role] - 1) % TL_ROLE_SHADES,
       tone: meta.tone,
       // Доли сосиски: экран не пересчитывает координаты, он их только ставит.
       leftPct: Number((((left - a) / width) * 100).toFixed(2)),
@@ -3729,13 +3742,17 @@ const CSS = `
 .duty-mtl-sausage.inexact{opacity:.45}
 /* Роли этапов: цвет — кто работает (имплементер всегда один, ревьюер другой). */
 .duty-mtl-seg{position:absolute;top:0;bottom:0;min-width:2px;background:var(--role-fill,var(--role-other))}
-.duty-mtl-seg.r-planner{--role-fill:var(--role-planner)}
-.duty-mtl-seg.r-implementer{--role-fill:var(--role-implementer)}
-.duty-mtl-seg.r-documenter{--role-fill:var(--role-documenter)}
-.duty-mtl-seg.r-tester{--role-fill:var(--role-tester)}
-.duty-mtl-seg.r-reviewer{--role-fill:var(--role-reviewer)}
-.duty-mtl-seg.r-publisher{--role-fill:var(--role-publisher)}
-.duty-mtl-seg.r-other{--role-fill:var(--role-other)}
+.duty-mtl-seg.r-planner{--role-base:var(--role-planner)}
+.duty-mtl-seg.r-implementer{--role-base:var(--role-implementer)}
+.duty-mtl-seg.r-documenter{--role-base:var(--role-documenter)}
+.duty-mtl-seg.r-tester{--role-base:var(--role-tester)}
+.duty-mtl-seg.r-reviewer{--role-base:var(--role-reviewer)}
+.duty-mtl-seg.r-publisher{--role-base:var(--role-publisher)}
+.duty-mtl-seg.r-other{--role-base:var(--role-other)}
+.duty-mtl-seg{--role-fill:var(--role-base,var(--role-other))}
+/* Повторы одной роли внутри дела различаются оттенком. */
+.duty-mtl-seg.shade-1{--role-fill:color-mix(in srgb,var(--role-base,var(--role-other)) 68%,var(--ui-surface-background))}
+.duty-mtl-seg.shade-2{--role-fill:color-mix(in srgb,var(--role-base,var(--role-other)) 88%,var(--ui-text-primary))}
 .duty-mtl-seg.t-green{--glow:var(--ui-green)}
 .duty-mtl-seg.t-blue{--glow:var(--ui-blue)}
 .duty-mtl-seg.t-yellow{--glow:var(--ui-yellow)}
@@ -3743,13 +3760,21 @@ const CSS = `
 .duty-mtl-seg.t-gray{--glow:var(--ui-stroke-tertiary)}
 /* Свечение краёв вместо рамки: градиент гаснет к середине, поэтому цвета соседних
    этапов не перебиваются, а геометрия полосы не меняется. */
-.duty-mtl-seg:after{content:'';position:absolute;inset:0;pointer-events:none;border-radius:inherit;box-shadow:0 -2px 5px -1px color-mix(in srgb,var(--glow,var(--ui-stroke-secondary)) 70%,transparent),0 2px 5px -1px color-mix(in srgb,var(--glow,var(--ui-stroke-secondary)) 70%,transparent);opacity:.85}
+/* Ореол — две полосы света над и под этапом, шириной ровно в этап: box-shadow
+   лез бы влево-вправо, и на стыке двух этапов ореолы складывались бы в пятно. */
+.duty-mtl-seg:before,.duty-mtl-seg:after{content:'';position:absolute;left:0;right:0;height:var(--glow-size,5px);pointer-events:none;opacity:.85;-webkit-mask-image:linear-gradient(to right,transparent,#000 3px,#000 calc(100% - 3px),transparent);mask-image:linear-gradient(to right,transparent,#000 3px,#000 calc(100% - 3px),transparent)}
+.duty-mtl-seg:before{bottom:100%;background:linear-gradient(to top,color-mix(in srgb,var(--glow,var(--ui-stroke-secondary)) 78%,transparent),transparent)}
+.duty-mtl-seg:after{top:100%;background:linear-gradient(to bottom,color-mix(in srgb,var(--glow,var(--ui-stroke-secondary)) 78%,transparent),transparent)}
 .duty-mtl-sausage .duty-mtl-seg:first-child{border-top-left-radius:3px;border-bottom-left-radius:3px}
 .duty-mtl-sausage .duty-mtl-seg:last-child{border-top-right-radius:3px;border-bottom-right-radius:3px}
 .duty-mtl-sausage.is-clipped .duty-mtl-seg:first-child{border-top-left-radius:0;border-bottom-left-radius:0}
-.duty-mtl-seg.is-running:after{animation:duty-mtl-breathe 2.6s ease-in-out infinite}
+.duty-mtl-seg.is-running{--glow-size:6px}
+.duty-mtl-seg.is-running:before,.duty-mtl-seg.is-running:after{animation:duty-mtl-breathe 2.6s ease-in-out infinite}
 /* Отказ горит ярче и чаще: единственное состояние, которое просит действия. */
-.duty-mtl-seg.is-failed:after{box-shadow:0 -3px 8px -1px color-mix(in srgb,var(--ui-red) 92%,transparent),0 3px 8px -1px color-mix(in srgb,var(--ui-red) 92%,transparent);animation:duty-mtl-fail 1.4s ease-in-out infinite}
+.duty-mtl-seg.is-failed{--glow-size:8px}
+.duty-mtl-seg.is-failed:before,.duty-mtl-seg.is-failed:after{animation:duty-mtl-fail 1.4s ease-in-out infinite}
+.duty-mtl-seg.is-failed:before{background:linear-gradient(to top,var(--ui-red),transparent)}
+.duty-mtl-seg.is-failed:after{background:linear-gradient(to bottom,var(--ui-red),transparent)}
 .duty-mtl-seg.clipped{border-left:1px solid var(--ui-surface-background)}
 @keyframes duty-mtl-breathe{0%,100%{opacity:.5}50%{opacity:1}}
 @keyframes duty-mtl-fail{0%,100%{opacity:.65;filter:brightness(1)}50%{opacity:1;filter:brightness(1.4)}}
@@ -3768,14 +3793,17 @@ const CSS = `
 .duty-mtl-window-input.is-bad{border-color:var(--ui-red);background:color-mix(in srgb,var(--ui-red) 14%,transparent)}
 .duty-mtl-legend{display:flex;flex-wrap:wrap;gap:4px 14px;padding:8px 12px 10px;border-top:1px solid var(--ui-stroke-tertiary);font-size:11.5px}
 .duty-mtl-legend-item{display:inline-flex;align-items:center;gap:6px;color:var(--ui-text-secondary)}
-.duty-mtl-dot{width:14px;height:9px;border-radius:2px;background:var(--role-implementer);box-shadow:0 -1px 4px -1px var(--ui-stroke-secondary),0 1px 4px -1px var(--ui-stroke-secondary)}
-.duty-mtl-dot.t-green{box-shadow:0 -1px 4px -1px var(--ui-green),0 1px 4px -1px var(--ui-green)}
-.duty-mtl-dot.t-blue{box-shadow:0 -1px 4px -1px var(--ui-blue),0 1px 4px -1px var(--ui-blue)}
-.duty-mtl-dot.t-yellow{box-shadow:0 -1px 4px -1px var(--ui-yellow),0 1px 4px -1px var(--ui-yellow)}
-.duty-mtl-dot.t-red{box-shadow:0 -1px 4px -1px var(--ui-red),0 1px 4px -1px var(--ui-red)}
-.duty-mtl-dot.t-gray{box-shadow:0 -1px 4px -1px var(--ui-stroke-tertiary),0 1px 4px -1px var(--ui-stroke-tertiary)}
+.duty-mtl-dot{position:relative;width:14px;height:9px;border-radius:2px;background:var(--role-implementer);--glow:var(--ui-stroke-secondary)}
+.duty-mtl-dot.t-green{--glow:var(--ui-green)}
+.duty-mtl-dot.t-blue{--glow:var(--ui-blue)}
+.duty-mtl-dot.t-yellow{--glow:var(--ui-yellow)}
+.duty-mtl-dot.t-red{--glow:var(--ui-red)}
+.duty-mtl-dot.t-gray{--glow:var(--ui-stroke-tertiary)}
+.duty-mtl-dot:before,.duty-mtl-dot:after{content:'';position:absolute;left:0;right:0;height:3px}
+.duty-mtl-dot:before{bottom:100%;background:linear-gradient(to top,var(--glow),transparent)}
+.duty-mtl-dot:after{top:100%;background:linear-gradient(to bottom,var(--glow),transparent)}
 .duty-mtl-legend-item.is-running{color:var(--ui-text-primary)}
-@media (prefers-reduced-motion: reduce){.duty-mtl-seg.is-running:after,.duty-mtl-seg.is-failed:after{animation:none}}
+@media (prefers-reduced-motion: reduce){.duty-mtl-seg.is-running:before,.duty-mtl-seg.is-running:after,.duty-mtl-seg.is-failed:before,.duty-mtl-seg.is-failed:after{animation:none}}
 
 /* Кнопка подгрузки под списком проекта: по центру и заметная — единственный
  * способ получить следующие строки, искать её в углу не надо. */
@@ -5258,7 +5286,7 @@ function DutyMiniTimeline({ view, onOpen, windowSec, onWindow }) {
                 (row.segments || []).map((segment) =>
                   h('i', {
                     key: `seg-${segment.stage}-${segment.leftPct}`,
-                    className: `duty-mtl-seg r-${segment.role} t-${segment.tone} is-${segment.state}${segment.clipped ? ' clipped' : ''}`,
+                    className: `duty-mtl-seg r-${segment.role} shade-${segment.shade} t-${segment.tone} is-${segment.state}${segment.clipped ? ' clipped' : ''}`,
                     style: { left: `${segment.leftPct}%`, width: `${segment.widthPct}%` },
                     title: segment.title,
                   }),

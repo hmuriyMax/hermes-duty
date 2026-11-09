@@ -749,7 +749,7 @@ function timelineBlock(model) {
                 row.segments.length
                   ? row.segments.map((segment) =>
                       h('i', {
-                        class: `tl-seg r-${segment.role} t-${segment.tone} is-${segment.state}${segment.clipped ? ' clipped' : ''}`,
+                        class: `tl-seg r-${segment.role} shade-${segment.shade} t-${segment.tone} is-${segment.state}${segment.clipped ? ' clipped' : ''}`,
                         style: `left:${segment.leftPct}%;width:${segment.widthPct}%`,
                         title: segment.title,
                       }),

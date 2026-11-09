@@ -888,20 +888,25 @@ test('веб: таймлайн — сосиски на общей сетке, к
 
   // Заливка — профиль этапа (соседние этапы различаются цветом), состояние —
   // подсветка верхнего и нижнего краёв (09.11, Макс).
-  assert.match(app, /class: `tl-seg r-\$\{segment\.role\} t-\$\{segment\.tone\}/, 'веб: роль этапа не приходит из шейпера')
+  assert.match(app, /class: `tl-seg r-\$\{segment\.role\} shade-\$\{segment\.shade\} t-\$\{segment\.tone\}/, 'веб: роль этапа не приходит из шейпера')
   assert.doesNotMatch(css, /--st-[1-8]/, 'веб: палитра «свой цвет на этап» осталась')
   // Роль → цвет: постоянное соответствие, у каждой роли своя краска.
   for (const role of ['planner', 'implementer', 'documenter', 'tester', 'reviewer', 'publisher']) {
-    assert.match(css, new RegExp(`\\.tl-seg\\.r-${role} \\{ --role-fill: var\\(--role-${role}\\); \\}`), `веб: у роли ${role} нет своей краски`)
+    assert.match(css, new RegExp(`\\.tl-seg\\.r-${role} \\{ --role-base: var\\(--role-${role}\\); \\}`), `веб: у роли ${role} нет своей краски`)
   }
   assert.match(css, /\.tl-seg\.t-green \{ --glow: var\(--ok\); \}/, 'веб: пройден не зелёный страницы дела')
   assert.match(css, /\.tl-seg\.t-red \{ --glow: var\(--danger\); \}/, 'веб: отказ не красный страницы дела')
   assert.match(css, /\.tl-seg\.t-blue \{ --glow: var\(--accent\); \}/, 'веб: идущий не акцент страницы дела')
   // Состояние — ореол снаружи полосы, а не рамка и не внутренняя заливка: тело
   // дела целиком остаётся цветом роли, а свет ложится вокруг него.
-  assert.match(css, /\.tl-seg::after \{[^}]*box-shadow:\s*\n\s*0 -2px/s, 'веб: свечение не уходит наружу')
+  // Ореол — полосы света над и под этапом, шириной в сам этап: box-shadow
+  // размывался бы влево-вправо и складывался с соседним ореолом в пятно.
+  assert.match(css, /\.tl-seg::before \{[^}]*bottom: 100%/s, 'веб: свет не стоит над этапом')
+  assert.match(css, /\.tl-seg::after \{[^}]*top: 100%/s, 'веб: свет не стоит под этапом')
+  assert.match(css, /\.tl-seg::before \{[^}]*linear-gradient\(to top/s, 'веб: свет над этапом не гаснет вверх')
+  assert.match(css, /\.tl-seg::before,\n\.tl-seg::after \{[^}]*mask-image/s, 'веб: свет не гаснет на стыке этапов')
   assert.doesNotMatch(css, /\.tl-seg::after \{[^}]*inset 0 0/s, 'веб: свечение всё ещё светит внутрь полосы')
-  assert.doesNotMatch(css, /\.tl-seg::after \{[^}]*linear-gradient/s, 'веб: внутренняя заливка краёв осталась')
+  assert.doesNotMatch(css, /\.tl-seg::after \{[^}]*inset: 0/s, 'веб: ореол всё ещё лежит на самой полосе')
   // Внешний свет требует не обрезать тело дела: иначе ореол срежется по краю.
   assert.match(css, /\.tl-sausage \{[^}]*overflow: visible/s, 'веб: сосиска обрезает свечение')
   assert.match(css, /\.tl-sausage \.tl-seg:first-child \{[^}]*border-top-left-radius: 3px/s, 'веб: скругление не переехало на крайние этапы')

@@ -92,6 +92,7 @@ JOURNAL_MODULE_NAME = "hermes_duty_journal"
 DEALS_MODULE_NAME = "hermes_duty_deals"
 ASK_MODULE_NAME = "hermes_duty_ask"
 SPEC_MODULE_NAME = "hermes_duty_spec"
+TRANSIT_MODULE_NAME = "hermes_duty_transit"
 EVIDENCE_MODULE_NAME = "hermes_duty_evidence"
 ROUTING_MODULE_NAME = "hermes_duty_routing"
 FAILURES_MODULE_NAME = "hermes_duty_failures"
@@ -131,6 +132,10 @@ budget = _load(BUDGET_MODULE_NAME, "budget.py")
 # отчёта. Правило живёт отдельно от исполнения — движок только спрашивает его и
 # записывает факт (`dashboard/publish.py`).
 publish = _load(PUBLISH_MODULE_NAME, "publish.py")
+# Граф дела (`dashboard/transit.py`): принятый план живёт фактами журнала, и
+# попытке нужен этап из графа, а не из файла. Обратной загрузки нет — `transit`
+# не знает про `runner`, поэтому цикл модулей не замыкается.
+transit = _load(TRANSIT_MODULE_NAME, "transit.py")
 
 # Источник событий движка в журнале: `engine`, а не `cli`/`api`/`ingest` — по нему
 # видно, что факт записал движок, а не человек и не проход по чужой доске.
@@ -889,6 +894,152 @@ def report_verdict(
     )
 
 
+def is_plan_stage(stage: Any) -> bool:
+    """Это этап плана? Только он обязан предложить план своим отчётом.
+
+    id и вид, а не роль: роль лида бывает и у `close`, а «предложи план» — работа
+    одного этапа (`docs/ENGINE-1.0.md`, раздел 4). Слово берётся у `transit`, чтобы
+    писатель (`report_plan`) и читатель графа (`transit.graph`) не разошлись в том,
+    чей это план.
+    """
+    return (
+        str(getattr(stage, "id", "") or "") == transit.PLAN_STAGE
+        and str(getattr(stage, "kind", STAGE_KIND_AGENT)) == STAGE_KIND_AGENT
+    )
+
+
+def _plan_issues(issues: Iterable[Any]) -> list[str]:
+    """Отказы плана словами: `правило: текст` без псевдопути `<plan>:1`.
+
+    Путь предложения не файловый (`spec.PLAN_PATH`), и в списке отказов он только
+    мешает: лид видит, какое правило нарушено, а не строку несуществующего файла.
+    """
+    out: list[str] = []
+    for issue in issues:
+        rule = str(getattr(issue, "rule", "") or "")
+        message = str(getattr(issue, "message", "") or "")
+        out.append(f"{rule}: {message}" if rule else (message or str(issue)))
+    return out
+
+
+def plan_gate_reason(spec: Any, stages: Iterable[Any], graph: Iterable[Any]) -> str:
+    """Почему план обязан спросить человека; пустая строка — порог не пройден.
+
+    Порог объявлен хартией (`charter.plan_gate`, `docs/ENGINE-1.0.md`, раздел 5):
+    число этапов **всего** графа и доля бюджета дела, которую забирают этапные
+    бюджеты предложения. Ноль в поле — гейт по этому признаку выключен, поэтому
+    спека без `plan_gate` вопросов человеку не задаёт.
+    """
+    gate = getattr(getattr(spec, "charter", None), "plan_gate", None)
+    if gate is None:
+        return ""
+    total = len(tuple(graph))
+    reasons: list[str] = []
+    if int(getattr(gate, "min_stages", 0) or 0) > 0 and total > int(gate.min_stages):
+        reasons.append(f"этапов в графе {total} больше порога {int(gate.min_stages)}")
+    share = float(getattr(gate, "budget_share", 0.0) or 0.0)
+    limit = getattr(getattr(spec, "budget", None), "tokens", None)
+    if share > 0 and isinstance(limit, int) and limit > 0:
+        asked = sum(int(getattr(getattr(stage, "budget", None), "tokens", 0) or 0) for stage in stages)
+        if asked / limit > share:
+            reasons.append(
+                f"этапные бюджеты плана просят {asked} из {limit} токенов дела "
+                f"({asked / limit:.0%}) — больше доли {share:.0%}"
+            )
+    return "; ".join(reasons)
+
+
+def report_plan(
+    deal: Any,
+    spec: Any,
+    stage: Any,
+    result: dict[str, Any],
+    attempt: int,
+    *,
+    events: Iterable[Any],
+    now: int,
+) -> tuple[list[dict[str, Any]], str]:
+    """Факты плана из отчёта этапа плана: (события, причина отказа).
+
+    Образец — `report_verdict`: структурное поле отчёта (`plan: {stages, reason}`)
+    становится фактом журнала в той же транзакции, что и `attempt_ended`, потому
+    что граф дела — это факт, а не слово в `summary` (`docs/ENGINE-1.0.md`,
+    раздел 4).
+
+    Три исхода, и все три — факты, а не догадки:
+
+    - этап плана отчитался без `plan` → `([], причина)`, и попытка становится
+      отказом `contract`: этап, который должен планировать, не вправе «просто
+      закончиться»;
+    - предложение не прошло `spec.parse_plan` → `plan_proposed` +
+      `plan_rejected(issues[])`: лид видит, какое правило нарушено, а граф не
+      растёт;
+    - предложение прошло и порог `plan_gate` не пройден → `plan_proposed` +
+      `plan_accepted(by: engine)`. Пройден → только `plan_proposed`: решение
+      принимает человек (`runner.plan_gate`).
+
+    Валидация — `spec.parse_plan`, а не собственные проверки: «принять план на
+    глаз» значит завести второй валидатор, который разойдётся с `spec check` на
+    первом же новом поле.
+    """
+    if not is_plan_stage(stage):
+        return [], ""
+    events = list(events or ())
+    where = f"{getattr(spec, 'path', '')}:{getattr(stage, 'line', 0)}"
+    raw = result.get("plan")
+    if not isinstance(raw, dict):
+        return [], (
+            f"{where}: этап плана обязан вернуть plan: {{stages, reason}}: "
+            "без плана следующие этапы не знают, что делать"
+        )
+    graph = transit.graph(spec, events)
+    base_ids = [item.id for item in graph]
+    proposals = [
+        journal.payload_of(event)
+        for event in events
+        if str(event.get("kind") or "") == transit.PLAN_PROPOSED
+        and str(journal.payload_of(event).get("stage") or "") == ""
+    ]
+    rev = 1 + max((int(_int(item.get("rev")) or 0) for item in proposals), default=0)
+    raw_stages = raw.get("stages")
+    charter = getattr(spec, "charter", None) or spec_module.Charter()
+    stages, issues = spec_module.parse_plan(raw_stages, charter=charter, base_ids=base_ids)
+    proposed = _event(
+        deal,
+        transit.PLAN_PROPOSED,
+        {
+            "rev": rev,
+            "stages": raw_stages if isinstance(raw_stages, list) else [],
+            "reason": str(raw.get("reason") or "").strip(),
+            "source_stage": stage.id,
+            "attempt": int(attempt),
+        },
+        {"stage": stage.id, "attempt": int(attempt), "rev": rev},
+        now,
+    )
+    if issues:
+        why = f"план ревизии {rev} отклонён: отказов {len(issues)}"
+        rejected = _event(
+            deal,
+            transit.PLAN_REJECTED,
+            {"rev": rev, "why": why, "issues": _plan_issues(issues), "source_stage": stage.id},
+            {"stage": stage.id, "attempt": int(attempt), "rev": rev},
+            now,
+        )
+        return [proposed, rejected], ""
+    asked = plan_gate_reason(spec, stages, graph + tuple(stages))
+    if asked:
+        return [proposed], ""  # порог пройден: решает человек, граф пока не растёт
+    accepted = _event(
+        deal,
+        transit.PLAN_ACCEPTED,
+        {"rev": rev, "by": ENGINE_SOURCE},
+        {"stage": stage.id, "attempt": int(attempt), "rev": rev},
+        now,
+    )
+    return [proposed, accepted], ""
+
+
 def last_session(conn: sqlite3.Connection, deal: Any, stage_id: str) -> str:
     """`session_id` последней попытки этапа — точка возврата для резюма.
 
@@ -916,6 +1067,50 @@ def last_session(conn: sqlite3.Connection, deal: Any, stage_id: str) -> str:
     return ""
 
 
+def charter_payload(spec: Any) -> dict[str, Any]:
+    """Хартия дела для контракта этапа плана: чем граф вправе расти.
+
+    Тот же набор полей, что в `duty.yaml: charter`, — лид видит границы числами, а
+    не узнаёт о них из отказа (`docs/ENGINE-1.0.md`, раздел 5).
+    """
+    charter = getattr(spec, "charter", None) or spec_module.Charter()
+    gate = getattr(charter, "plan_gate", None) or spec_module.PlanGate()
+    return {
+        "max_stages": int(getattr(charter, "max_stages", 0) or 0),
+        "max_rounds_replan": int(getattr(charter, "max_rounds_replan", 0) or 0),
+        "allowed_roles": [str(role) for role in getattr(charter, "allowed_roles", ()) or ()],
+        "allowed_kinds": [str(kind) for kind in getattr(charter, "allowed_kinds", ()) or ()],
+        "plan_gate": {
+            "min_stages": int(getattr(gate, "min_stages", 0) or 0),
+            "budget_share": float(getattr(gate, "budget_share", 0.0) or 0.0),
+        },
+    }
+
+
+def plan_payload(spec: Any, events: Iterable[Any]) -> dict[str, Any]:
+    """Что этап плана знает о деле: существующий граф и остаток бюджета.
+
+    План рисуется поверх графа, а не с нуля: `base_ids` — id, на которые можно
+    ссылаться в `needs` (переопределять их планом нельзя), `remaining` — расход и
+    потолок дела (если потолка нет, поля просто нет: «0 из 0» было бы выдумкой).
+    """
+    graph = transit.graph(spec, events)
+    return {
+        "graph": [
+            {
+                "id": stage.id,
+                "role": getattr(stage, "role", ""),
+                "kind": getattr(stage, "kind", STAGE_KIND_AGENT),
+                "needs": [str(need) for need in getattr(stage, "needs", ()) or ()],
+            }
+            for stage in graph
+        ],
+        "base_ids": [stage.id for stage in graph],
+        "remaining": budget.describe(spec, events),
+        "report": "plan: {stages: [{id, role, kind, needs, evidence, budget}], reason}",
+    }
+
+
 def build_contract(
     spec: Any,
     deal: Any,
@@ -930,6 +1125,7 @@ def build_contract(
     answer: Optional[str] = None,
     session_id: str = "",
     approved: Optional[dict[str, Any]] = None,
+    events: Optional[Iterable[Any]] = None,
 ) -> dict[str, Any]:
     """Входной контракт попытки: файл, а не проза в командной строке.
 
@@ -991,6 +1187,13 @@ def build_contract(
         contract["approved"] = approved
     if session_id:
         contract["session_id"] = session_id
+    # Этап плана получает в контракте то, без чего план не нарисовать: хартию
+    # (границы роста графа), уже существующий граф и остаток бюджета дела.
+    # «Не влез в хартию» и «не знал потолка» — разные отказы, и второй из них
+    # узнавался бы только из `plan_rejected` (`docs/ENGINE-1.0.md`, раздел 4).
+    if is_plan_stage(stage):
+        contract["charter"] = charter_payload(spec)
+        contract["plan"] = plan_payload(spec, events or ())
     contract["report_to"] = str(report_to)
     contract["deadline_sec"] = int(deadline_sec)
     return contract
@@ -1676,6 +1879,9 @@ def run_shell_stage(
     spawner = spawn or spawn_process
     clock = clock or time.time
     monotonic = monotonic or time.monotonic
+    # Этап ищется в графе дела, а не в файле: этап, добавленный принятым планом,
+    # в `duty.yaml` не объявлен (`docs/ENGINE-1.0.md`, раздел 3).
+    spec = transit.graph_spec(spec, journal.read_events(conn, str(deal["id"])))
     stage = next((item for item in spec.stages if item.id == stage_id), None)
     if stage is None:
         raise RunnerError(f"этапа {stage_id!r} нет в спеке {getattr(spec, 'path', '')}")
@@ -2388,6 +2594,9 @@ def run_gate_stage(
     закрыла бы ждущий человека гейт как мёртвый.
     """
     clock = clock or time.time
+    # Гейт планом тоже добавляется (`charter.allowed_kinds`), поэтому этап ищется
+    # в графе журнала, а не в файле.
+    spec = transit.graph_spec(spec, journal.read_events(conn, str(deal["id"])))
     stage = next((item for item in spec.stages if item.id == stage_id), None)
     if stage is None:
         raise RunnerError(f"этапа {stage_id!r} нет в спеке {getattr(spec, 'path', '')}")
@@ -2538,6 +2747,262 @@ def _ask_gate(
         },
     )
     return int(asked.question_id)
+
+
+# Варианты ответа на гейт плана (`docs/ENGINE-1.0.md`, раздел 5): «принять» —
+# предложение становится графом; «урезать» и «остановить» — отказ с причиной,
+# после которого лид перепланирует (раунд реплана считает хартия).
+PLAN_GATE_OPTIONS = ("принять", "урезать", "остановить")
+PLAN_GATE_ACCEPT = PLAN_GATE_OPTIONS[0]
+
+
+def _ordered_events(events: Iterable[Any]) -> list[dict[str, Any]]:
+    """События по номеру журнала: порядок решает журнал, а не порядок входа."""
+    return sorted(
+        (event for event in events or () if isinstance(event, dict)),
+        key=lambda item: int(_int(item.get("id")) or 0),
+    )
+
+
+def _pending_plan(events: Iterable[Any]) -> Optional[tuple[int, str, list[Any]]]:
+    """Предложение, которое ещё не решено: `(rev, source_stage, stages)`.
+
+    Читается по журналу, а не по памяти прогона: гейт плана может ставить другой
+    процесс, а «что решено» — факт, а не состояние в памяти.
+    """
+    proposals: dict[int, dict[str, Any]] = {}
+    decided: set[int] = set()
+    for event in _ordered_events(events):
+        payload = journal.payload_of(event)
+        if str(payload.get("stage") or ""):
+            continue  # факт этапа, а не факт плана
+        kind = str(event.get("kind") or "")
+        rev = int(_int(payload.get("rev")) or 0)
+        if kind == transit.PLAN_PROPOSED and rev > 0 and isinstance(payload.get("stages"), list):
+            proposals[rev] = payload
+        elif kind in (transit.PLAN_ACCEPTED, transit.PLAN_REJECTED) and rev > 0:
+            decided.add(rev)
+    for rev in sorted(proposals, reverse=True):
+        if rev in decided:
+            continue
+        payload = proposals[rev]
+        return rev, str(payload.get("source_stage") or ""), list(payload.get("stages") or [])
+    return None
+
+
+def _plan_gate_fact(events: Iterable[Any], rev: int) -> Optional[dict[str, Any]]:
+    """Открытый гейт этой ревизии: последний `plan_gate` с тем же `rev`."""
+    found: Optional[dict[str, Any]] = None
+    for event in _ordered_events(events):
+        if str(event.get("kind") or "") != transit.PLAN_GATE:
+            continue
+        if int(_int(journal.payload_of(event).get("rev")) or 0) != rev:
+            continue
+        found = event
+    return found
+
+
+def _plan_gate_answer(events: Iterable[Any], question_id: Any, home: Path) -> Optional[tuple[bool, str]]:
+    """Ответ человека на вопрос гейта: `(согласие, слово)`; `None` — ответа нет.
+
+    Журнал хранит только длину ответа, а «принять» отличается от «урезать»
+    текстом, поэтому слово читается из пула (`ask.answer_of`) — тем же путём,
+    которым его увидел человек. Срок без ответа и ответ без текста согласием не
+    считаются: тишина — не решение.
+    """
+    if question_id is None:
+        return None
+    asked = str(question_id)
+    for event in reversed(_ordered_events(events)):
+        if str(event.get("kind") or "") != "question_answered":
+            continue
+        payload = journal.payload_of(event)
+        if str(_question_id(payload) or "") != asked:
+            continue
+        if str(payload.get("answered_via") or "").strip().lower() == "expired":
+            return False, ""
+        if int(_int(payload.get("answer_len")) or 0) <= 0:
+            return False, ""
+        word = str(ask.answer_of(Path(home), question_id) or "").strip()
+        return word.strip().lower().startswith(PLAN_GATE_ACCEPT), word
+    return None
+
+
+def _last_plan_attempt(events: Iterable[Any], stage_id: str) -> int:
+    """Номер попытки этапа плана: по ней вопрос адресуется тому, кто спросил."""
+    attempt = 0
+    for event in _ordered_events(events):
+        payload = journal.payload_of(event)
+        if str(payload.get("stage") or "") != stage_id:
+            continue
+        if str(event.get("kind") or "") not in ("attempt_started", "attempt_ended", transit.PLAN_PROPOSED):
+            continue
+        attempt = max(attempt, int(_int(payload.get("attempt")) or 0))
+    return attempt
+
+
+def _ask_plan_gate(
+    conn: sqlite3.Connection,
+    deal: Any,
+    stage_id: str,
+    attempt: int,
+    rev: int,
+    why: str,
+    *,
+    home: Path,
+    now: int,
+) -> dict[str, Any]:
+    """Вопрос гейта плана в пул (`ask()`) — единственным каналом вопросов.
+
+    Адрес — властный (`authority`): принять граф — решение, а не справка. В
+    `routing` едут этап и попытка плана, иначе ответ без адреса transit отнёс бы
+    последней попытке журнала, а это может быть не план.
+    """
+    question = f"План дела (ревизия {rev}) больше порога хартии: принять?"
+    lines = [
+        question,
+        "",
+        f"порог: {why}",
+        f"Варианты ответа: {', '.join(PLAN_GATE_OPTIONS)}.",
+        f"«{PLAN_GATE_ACCEPT}» — предложение станет графом дела; остальные ответы —",
+        "отказ с причиной, и лид перепланирует (раунд реплана считает хартия).",
+    ]
+    address = routing.route(None, {"kind": "authority"}, 0)
+    asked = ask.ask(
+        conn,
+        {**deal, "home": Path(home)},
+        question,
+        "\n".join(lines),
+        list(PLAN_GATE_OPTIONS),
+        critical=False,
+        routing={**address.as_payload(), "stage": stage_id, "attempt": int(attempt), "plan_rev": rev},
+    )
+    question_id = int(asked.question_id)
+    return _event(
+        deal,
+        transit.PLAN_GATE,
+        {"rev": rev, "reason": why, "question_id": question_id},
+        {"stage": stage_id, "attempt": int(attempt), "rev": rev, "question_id": question_id},
+        now,
+    )
+
+
+def plan_gate(
+    conn: sqlite3.Connection,
+    spec: Any,
+    deal: Any,
+    *,
+    events: Iterable[Any],
+    home: Path,
+    clock: Optional[Callable[[], float]] = None,
+) -> dict[str, Any]:
+    """Гейт плана: предложение дороже порога — вопрос человеку и решение по ответу.
+
+    Образец — гейт-этап (`_gate_ask`/`_gate_exchange`): вопрос задаётся один раз
+    через `ask()`, а ответ приходит тем же `ask.sync_answers`, что и ответы
+    гейтов. Разница одна: у гейта плана нет своего этапа с `ask` — спрашивать
+    нечем, кроме хартии, поэтому вопрос собирается здесь
+    (`docs/ENGINE-1.0.md`, раздел 5).
+
+    «Принять» пишет `plan_accepted` с `by: human` — движок этого решения не
+    принимал. Любой другой ответ и молчание по сроку пишут `plan_rejected` с
+    причиной: лид видит, что именно человек не принял, а раунд реплана считается
+    тем же правилом, что и у валидатора.
+
+    Возвращает строку шага: `rev`, `question_id`, `asked` (вопрос задан этим
+    вызовом), `answered`, `accepted`, `rejected` и `reason`.
+    """
+    clock = clock or time.time
+    listed = [event for event in events or () if isinstance(event, dict)]
+    row: dict[str, Any] = {
+        "rev": 0,
+        "stage": "",
+        "attempt": 0,
+        "question_id": None,
+        "asked": False,
+        "answered": False,
+        "accepted": False,
+        "rejected": False,
+        "reason": "",
+    }
+    pending = _pending_plan(listed)
+    if pending is None:
+        row["reason"] = "предложения плана нет: гейту плана нечего решать"
+        return row
+    rev, stage_id, raw_stages = pending
+    row["rev"] = rev
+    attempt = _last_plan_attempt(listed, stage_id)
+    row.update(stage=stage_id, attempt=int(attempt))
+    gate = _plan_gate_fact(listed, rev)
+    if gate is None:
+        parsed = _parsed_plan(spec, raw_stages, listed)
+        why = plan_gate_reason(spec, parsed, transit.graph(spec, listed) + parsed)
+        now = _now_sec(int(clock()))
+        gate = _ask_plan_gate(
+            conn,
+            deal,
+            stage_id or transit.PLAN_STAGE,
+            attempt,
+            rev,
+            why or "план дороже порога хартии",
+            home=home,
+            now=now,
+        )
+        _append_plan_facts(conn, [gate])
+        question_id = _question_id(journal.payload_of(gate))
+        row.update(
+            asked=True,
+            question_id=question_id,
+            reason=f"план ревизии {rev}: вопрос #{question_id} человеку — ждём ответа",
+        )
+        return row
+    question_id = _question_id(journal.payload_of(gate))
+    row["question_id"] = question_id
+    answer = _plan_gate_answer(listed, question_id, Path(home))
+    if answer is None:
+        row["reason"] = f"план ревизии {rev}: вопрос #{question_id} человеку — ответа нет"
+        return row
+    row["answered"] = True
+    accepted, word = answer
+    now = _now_sec(int(clock()))
+    if accepted:
+        row.update(accepted=True, reason=f"план ревизии {rev} принят человеком")
+        fact = _event(
+            deal,
+            transit.PLAN_ACCEPTED,
+            {"rev": rev, "by": "human"},
+            {"stage": stage_id, "attempt": int(attempt), "rev": rev, "by": "human"},
+            now,
+        )
+    else:
+        why = f"человек: {word}" if word else "человек не ответил на гейт плана"
+        row.update(rejected=True, reason=f"план ревизии {rev} отклонён: {why}")
+        fact = _event(
+            deal,
+            transit.PLAN_REJECTED,
+            {"rev": rev, "why": why, "issues": [], "source_stage": stage_id},
+            {"stage": stage_id, "attempt": int(attempt), "rev": rev},
+            now,
+        )
+    _append_plan_facts(conn, [fact])
+    return row
+
+
+def _append_plan_facts(conn: sqlite3.Connection, facts: list[dict[str, Any]]) -> None:
+    """Дописать факты плана одной транзакцией: журнал — единственная запись."""
+    if not facts:
+        return
+    with conn:
+        journal.append_in_tx(conn, facts)
+
+
+def _parsed_plan(spec: Any, raw_stages: list[Any], events: Iterable[Any]) -> tuple[Any, ...]:
+    """Этапы предложения тем же разбором, что у движка: порог считается по ним."""
+    charter = getattr(spec, "charter", None) or spec_module.Charter()
+    stages, _issues = spec_module.parse_plan(
+        raw_stages, charter=charter, base_ids=[stage.id for stage in transit.graph(spec, events)]
+    )
+    return tuple(stages)
 
 
 def _gate_judge(
@@ -2712,6 +3177,9 @@ def run_stage(
     spawner = spawn or spawn_process
     clock = clock or time.time
     monotonic = monotonic or time.monotonic
+    # Этап ищется в графе дела, а не в файле: этап, добавленный принятым планом,
+    # в `duty.yaml` не объявлен (`docs/ENGINE-1.0.md`, раздел 3).
+    spec = transit.graph_spec(spec, journal.read_events(conn, str(deal["id"])))
     stage = next((item for item in spec.stages if item.id == stage_id), None)
     if stage is None:
         raise RunnerError(f"этапа {stage_id!r} нет в спеке {getattr(spec, 'path', '')}")
@@ -2852,6 +3320,7 @@ def run_stage(
             "question_id": approval.question_id,
             "answer": approval.answer,
         },
+        events=events,
     )
     contract_file = write_contract(contract_path(workdir, stage_id, attempt), contract)
     query_file = contract_file
@@ -3004,6 +3473,16 @@ def run_stage(
         if verdict_fact is None and why:
             outcome, kind, reason = OUTCOME_FAILED, FAIL_CONTRACT, why
 
+    # Предложение плана — такой же факт графа, как приговор: отчёт
+    # `plan: {stages, reason}` становится `plan_proposed` (и решением по нему) в
+    # той же транзакции, что и `attempt_ended`. Отказ — `contract`: этап, который
+    # должен планировать, не вправе закончиться без плана.
+    plan_facts: list[dict[str, Any]] = []
+    if outcome == OUTCOME_DONE and not parked and result is not None:
+        plan_facts, why = report_plan(deal, spec, stage, result, attempt, events=events, now=now)
+        if why:
+            outcome, kind, reason = OUTCOME_FAILED, FAIL_CONTRACT, why
+
     # Работа принята — движок фиксирует её коммитом **в дереве попытки**: только
     # так следующему этапу есть от чего отвести дерево (W14). `dir`/`none` не
     # коммитятся: у первого дерево чужое (каталог дела), у второго его нет.
@@ -3093,6 +3572,10 @@ def run_stage(
     # попытки не пропускал бы работу, которой никто не принимал.
     if verdict_fact is not None and outcome == OUTCOME_DONE:
         facts_out.append(verdict_fact)
+    # Факты плана — рядом с `attempt_ended` и только у принятой попытки: отказ
+    # коммита или гейта пакета закрыл её `failed`, и граф по такой попытке не растёт.
+    if outcome == OUTCOME_DONE:
+        facts_out.extend(plan_facts)
     with conn:
         journal.append_in_tx(conn, facts_out)
         conn.execute(

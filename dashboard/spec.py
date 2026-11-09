@@ -36,13 +36,13 @@ import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import yaml
 
 # --------------------------------------------------------------- ключи формата
 
-TOP_KEYS = ("duty", "repo", "base", "budget", "stages")
+TOP_KEYS = ("duty", "repo", "base", "budget", "charter", "stages")
 STAGE_KEYS = (
     "id",
     "kind",
@@ -65,6 +65,12 @@ RETRY_KEYS = ("max", "on")
 BUDGET_KEYS = ("tokens", "minutes")
 ASK_KEYS = ("allowed", "to_human", "max_hops", "q", "options", "risky")
 VERDICT_KEYS = ("approve", "changes", "max_rounds")
+# Хартия (1.0, `docs/ENGINE-1.0.md`): неизменяемые границы дела — потолок числа
+# этапов, сколько раз план может быть возвращён на реплан, кем и какими видами
+# этапов план вправе расти, когда план спрашивает человека. Спека без блока
+# годна: дефолты — это поведение 0.0.8, где план никто не предлагает.
+CHARTER_KEYS = ("max_stages", "max_rounds_replan", "allowed_roles", "allowed_kinds", "plan_gate")
+PLAN_GATE_KEYS = ("min_stages", "budget_share")
 
 WORKSPACES = ("worktree", "dir", "none")
 TO_HUMAN = ("decisions_only", "never")
@@ -77,6 +83,19 @@ STAGE_KINDS = ("agent", "shell", "gate")
 DEFAULT_STAGE_KIND = "agent"
 SHELL_KIND = "shell"
 GATE_KIND = "gate"
+
+# Этап, чей отчёт — предложение плана (1.0, `docs/ENGINE-1.0.md`, раздел 3): в
+# seed-графе он называется `plan`. Слово одно на плагин — по нему `runner`
+# требует план отчётом, `transit` читает факты плана, а `evidence` принимает
+# предложение свидетелем: три копии строки разошлись бы на первом переименовании.
+PLAN_STAGE = "plan"
+
+# Дефолты хартии (`docs/ENGINE-1.0.md`, раздел 5): без блока `charter` дело
+# живёт по ним, и это ровно поведение 0.0.8 — план никто не предлагает, граф не
+# растёт. `max_stages = 12` — потолок графа, `max_rounds_replan = 3` — сколько раз
+# этап плана может быть переоткрыт отказом, прежде чем дело получит `failed(contract)`.
+DEFAULT_MAX_STAGES = 12
+DEFAULT_MAX_ROUNDS_REPLAN = 3
 
 # Код возврата shell-этапа по умолчанию: «команда сходилась» — это 0.
 DEFAULT_SHELL_MUST = 0
@@ -232,6 +251,44 @@ class Verdict:
 
 
 @dataclass(frozen=True)
+class PlanGate:
+    """Порог, после которого план обязан спросить человека (`ask()`).
+
+    Зеро в любом поле — гейт по этому признаку выключен: спека без `plan_gate`
+    ведёт себя как 0.0.8, а вопрос человеку не появляется из ниоткуда.
+    `min_stages` считает **весь** граф (seed плюс принятый план), `budget_share` —
+    долю бюджета дела, которую план забирает этапными бюджетами.
+    """
+
+    min_stages: int = 0
+    budget_share: float = 0.0
+    line: int = 0
+
+
+@dataclass(frozen=True)
+class Charter:
+    """Хартия дела: границы, в которых лид вправе растить граф (`parse_plan`).
+
+    Спека без блока `charter` получает эти значения — то есть ведёт себя как
+    спека 0.0.8: граф задан файлом и не растёт.
+
+    - `max_stages` — потолок числа этапов дела (seed плюс добавленные планом);
+    - `max_rounds_replan` — сколько отказов плана этап `plan` переживает до
+      `failed(contract)`;
+    - `allowed_roles` — роли, которыми плану разрешено добавлять этапы; пусто —
+      хартия роль не ограничивает (действует обычная проверка профиля);
+    - `allowed_kinds` — виды этапов, которые план вправе добавить;
+    - `plan_gate` — когда план уходит вопросом человеку.
+    """
+
+    max_stages: int = DEFAULT_MAX_STAGES
+    max_rounds_replan: int = DEFAULT_MAX_ROUNDS_REPLAN
+    allowed_roles: tuple[str, ...] = ()
+    allowed_kinds: tuple[str, ...] = STAGE_KINDS
+    plan_gate: PlanGate = PlanGate()
+
+
+@dataclass(frozen=True)
 class Stage:
     """Этап дела. `workspace: none` — этап только читает и выносит приговор.
 
@@ -280,6 +337,10 @@ class Spec:
     `budget` — потолок на дело целиком (рядом с `repo`/`base`), `None` — потолка
     нет и дело ограничено только этапными бюджетами: спеки 0.0.4 читаются без
     правок и ведут себя как раньше.
+
+    `charter` — границы роста графа (1.0). Спека без блока получает дефолты
+    (`Charter()`), поэтому старые спеки читаются без правок файла, а `stages`
+    остаётся seed-ом: принятый план живёт фактами журнала, а не этим полем.
     """
 
     path: Path
@@ -288,6 +349,7 @@ class Spec:
     base: Optional[str]
     stages: tuple[Stage, ...]
     budget: Optional[Budget] = None
+    charter: Charter = Charter()
     lines: dict[str, int] = field(default_factory=dict)
     parse_issues: tuple[Issue, ...] = ()
 
@@ -595,6 +657,125 @@ def _parse_verdict(
     )
 
 
+def _parse_plan_gate(
+    data: dict[str, Any],
+    path: Path,
+    lines: dict[tuple[Any, ...], int],
+    prefix: tuple[Any, ...],
+    issues: list[Issue],
+) -> PlanGate:
+    """Порог гейта плана: `{min_stages, budget_share}`, отсутствие — гейт выключен."""
+    raw = data.get("plan_gate")
+    line = lines.get(prefix + ("plan_gate",), lines.get(prefix, 1))
+    if raw is None:
+        return PlanGate(line=line)
+    mapping = _mapping(raw)
+    if mapping is None:
+        issues.append(Issue(path, line, "charter.plan_gate", "plan_gate — словарь {min_stages, budget_share}"))
+        return PlanGate(line=line)
+    _unknown_keys(mapping, PLAN_GATE_KEYS, path, lines, prefix + ("plan_gate",), issues)
+    stages = _int_or_none(mapping.get("min_stages", 0))
+    if stages is None:
+        issues.append(
+            Issue(
+                path,
+                lines.get(prefix + ("plan_gate", "min_stages"), line),
+                "charter.plan_gate",
+                f"min_stages={mapping.get('min_stages')!r}: порог числа этапов — целое число",
+            )
+        )
+        stages = 0
+    share = mapping.get("budget_share", 0.0)
+    if isinstance(share, bool) or not isinstance(share, (int, float)):
+        issues.append(
+            Issue(
+                path,
+                lines.get(prefix + ("plan_gate", "budget_share"), line),
+                "charter.plan_gate",
+                f"budget_share={share!r}: доля бюджета дела — число от 0 до 1",
+            )
+        )
+        share = 0.0
+    return PlanGate(min_stages=stages, budget_share=float(share), line=line)
+
+
+def _parse_charter(
+    data: dict[str, Any],
+    path: Path,
+    lines: dict[tuple[Any, ...], int],
+    prefix: tuple[Any, ...],
+    issues: list[Issue],
+) -> Charter:
+    """Хартия дела: отсутствие блока — дефолты, неизвестный ключ внутри — отказ.
+
+    Форма разбора та же, что у `verdict` (`_parse_verdict`): типы собираются
+    здесь, диапазоны — в `_check_charter`. Спека 0.0.8 без `charter` читается
+    как `Charter()`: иначе старые дела потребовали бы правки файла.
+    """
+    raw = data.get("charter")
+    if raw is None:
+        return Charter()
+    line = lines.get(prefix + ("charter",), lines.get(prefix, 1))
+    mapping = _mapping(raw)
+    if mapping is None:
+        issues.append(
+            Issue(path, line, "charter", f"charter — словарь {{{', '.join(CHARTER_KEYS)}}}")
+        )
+        return Charter()
+    _unknown_keys(mapping, CHARTER_KEYS, path, lines, prefix + ("charter",), issues)
+    max_stages = mapping.get("max_stages", DEFAULT_MAX_STAGES)
+    if _int_or_none(max_stages) is None:
+        issues.append(
+            Issue(
+                path,
+                lines.get(prefix + ("charter", "max_stages"), line),
+                "charter.max_stages",
+                f"max_stages={max_stages!r}: потолок числа этапов — целое число",
+            )
+        )
+        max_stages = DEFAULT_MAX_STAGES
+    rounds = mapping.get("max_rounds_replan", DEFAULT_MAX_ROUNDS_REPLAN)
+    if _int_or_none(rounds) is None:
+        issues.append(
+            Issue(
+                path,
+                lines.get(prefix + ("charter", "max_rounds_replan"), line),
+                "charter.max_rounds_replan",
+                f"max_rounds_replan={rounds!r}: число раундов реплана — целое число",
+            )
+        )
+        rounds = DEFAULT_MAX_ROUNDS_REPLAN
+    roles = _str_tuple(mapping.get("allowed_roles", []))
+    if roles is None:
+        issues.append(
+            Issue(
+                path,
+                lines.get(prefix + ("charter", "allowed_roles"), line),
+                "charter.allowed_roles",
+                "allowed_roles — список профилей-ролей, которыми план вправе добавлять этапы",
+            )
+        )
+        roles = ()
+    kinds = _str_tuple(mapping.get("allowed_kinds", list(STAGE_KINDS)))
+    if kinds is None:
+        issues.append(
+            Issue(
+                path,
+                lines.get(prefix + ("charter", "allowed_kinds"), line),
+                "charter.allowed_kinds",
+                f"allowed_kinds — список видов этапа ({', '.join(STAGE_KINDS)})",
+            )
+        )
+        kinds = STAGE_KINDS
+    return Charter(
+        max_stages=int(max_stages),
+        max_rounds_replan=int(rounds),
+        allowed_roles=roles,
+        allowed_kinds=kinds,
+        plan_gate=_parse_plan_gate(mapping, path, lines, prefix + ("charter",), issues),
+    )
+
+
 def _parse_stage(
     raw: Any,
     index: int,
@@ -770,6 +951,7 @@ def load_spec(path: str | Path) -> Spec:
         # Верхний `budget` — потолок на дело целиком, а не на попытку: тот же
         # разбор `{tokens, minutes}`, что у этапа, и те же отказы на мусор.
         budget=_parse_budget(data, spec_path, lines, (), issues),
+        charter=_parse_charter(data, spec_path, lines, (), issues),
         lines=_top_lines(lines),
         parse_issues=tuple(issues),
     )
@@ -781,11 +963,19 @@ def _top_lines(lines: dict[tuple[Any, ...], int]) -> dict[str, int]:
     Ключи верхнего уровня нужны отказам про `repo`/`base`/`stages`, а
     `budget.tokens`/`budget.minutes` — отказам про потолок дела: без них отказ
     указывал бы на первую строку файла, и человек искал бы число не там.
+    Тем же способом названы строки хартии (`charter.max_stages`, …): отказ про
+    потолок этапов обязан указывать на объявленное число, а не на блок.
     """
     found = {key: lines[(key,)] for key in TOP_KEYS if (key,) in lines}
     for name in BUDGET_KEYS:
         if ("budget", name) in lines:
             found[f"budget.{name}"] = lines[("budget", name)]
+    for name in CHARTER_KEYS:
+        if ("charter", name) in lines:
+            found[f"charter.{name}"] = lines[("charter", name)]
+    for name in PLAN_GATE_KEYS:
+        if ("charter", "plan_gate", name) in lines:
+            found[f"charter.plan_gate.{name}"] = lines[("charter", "plan_gate", name)]
     return found
 
 
@@ -1161,6 +1351,94 @@ def _check_verdicts(spec: Spec) -> list[Issue]:
                     f"{', '.join(sorted(ancestors.get(stage.id, set()))) or 'нет'})",
                 )
             )
+    return issues
+
+
+def _check_charter(spec: Spec, profiles: frozenset[str]) -> list[Issue]:
+    """Хартия: потолки положительны, разрешённое существует, порог гейта достижим.
+
+    Проверка необязательного блока того же вида, что `_check_verdicts`: спека без
+    `charter` проходит её всегда (дефолты годны), а объявленное обязано быть
+    исполнимым — иначе «плану разрешено» осталось бы обещанием, которого движок
+    не выполнит: роль, которой нет в Hermes, вид, которого нет у этапа, или
+    порог гейта выше потолка графа (вопрос человеку не встал бы никогда).
+    """
+    charter = spec.charter
+    issues: list[Issue] = []
+
+    def line_of(key: str) -> int:
+        return spec.lines.get(key, spec.line_of("charter"))
+
+    if charter.max_stages < 1:
+        issues.append(
+            Issue(
+                spec.path,
+                line_of("charter.max_stages"),
+                "charter.max_stages",
+                f"max_stages={charter.max_stages}: потолок графа — не меньше одного этапа",
+            )
+        )
+    if charter.max_rounds_replan < 0:
+        issues.append(
+            Issue(
+                spec.path,
+                line_of("charter.max_rounds_replan"),
+                "charter.max_rounds_replan",
+                f"max_rounds_replan={charter.max_rounds_replan}: раундов реплана не может быть меньше нуля",
+            )
+        )
+    for kind in charter.allowed_kinds:
+        if kind in STAGE_KINDS:
+            continue
+        issues.append(
+            Issue(
+                spec.path,
+                line_of("charter.allowed_kinds"),
+                "charter.allowed_kinds",
+                f"allowed_kinds: вида {kind!r} нет среди {', '.join(STAGE_KINDS)}",
+            )
+        )
+    for role in charter.allowed_roles:
+        if role in profiles:
+            continue
+        issues.append(
+            Issue(
+                spec.path,
+                line_of("charter.allowed_roles"),
+                "charter.allowed_roles",
+                f"профиля {role!r} нет в Hermes (есть: {', '.join(sorted(profiles))}): "
+                "такой ролью план не сможет добавить этап",
+            )
+        )
+    gate = charter.plan_gate
+    if gate.min_stages < 0:
+        issues.append(
+            Issue(
+                spec.path,
+                line_of("charter.plan_gate.min_stages"),
+                "charter.plan_gate",
+                f"min_stages={gate.min_stages}: порог числа этапов не может быть меньше нуля",
+            )
+        )
+    elif gate.min_stages > charter.max_stages:
+        issues.append(
+            Issue(
+                spec.path,
+                line_of("charter.plan_gate.min_stages"),
+                "charter.plan_gate",
+                f"min_stages={gate.min_stages} больше max_stages={charter.max_stages}: "
+                "такой план отклоняется раньше, чем дойдёт до вопроса человеку",
+            )
+        )
+    if gate.budget_share < 0 or gate.budget_share > 1:
+        issues.append(
+            Issue(
+                spec.path,
+                line_of("charter.plan_gate.budget_share"),
+                "charter.plan_gate",
+                f"budget_share={gate.budget_share}: доля бюджета дела — число от 0 до 1",
+            )
+        )
     return issues
 
 
@@ -1747,9 +2025,11 @@ def validate_spec(spec: Spec, *, profiles: Optional[frozenset[str]] = None) -> l
     отдельно — `check_base()`: ей нужен git, а не только спека.
     """
     issues: list[Issue] = list(spec.parse_issues)
+    known = profiles if profiles is not None else known_profiles()
     issues += _check_stage_ids(spec)
-    issues += _check_roles(spec, profiles if profiles is not None else known_profiles())
+    issues += _check_roles(spec, known)
     issues += _check_refs(spec)
+    issues += _check_charter(spec, known)
     issues += _check_cycle(spec)
     issues += _check_entry(spec)
     issues += _check_reachable(spec)
@@ -1764,6 +2044,231 @@ def validate_spec(spec: Spec, *, profiles: Optional[frozenset[str]] = None) -> l
     issues += _check_retry(spec)
     issues += _check_kind(spec)
     return issues
+
+
+# ------------------------------------------------------------------- план дела
+
+# Адрес отказа в предложении плана. План приходит отчётом попытки
+# (`result.json:plan.stages`), а не файлом спеки: сверять его с строками
+# `duty.yaml` не с чем. Поэтому отказ называет этап по `id`, а путь — этим
+# псевдонимом: `<plan>:1` читается как «в предложении», а не как строка чужого
+# файла. Вызывающий может назвать настоящий путь (файл отчёта), передав `path`.
+PLAN_PATH = "<plan>"
+
+
+def parse_plan(
+    raw_stages: Any,
+    *,
+    charter: Charter,
+    base_ids: Iterable[str],
+    path: Optional[Path] = None,
+) -> tuple[tuple[Stage, ...], list[Issue]]:
+    """Предложение плана → этапы и отказы; непустые отказы — план не принимается.
+
+    Разбор этапа тот же, что у спеки (`_parse_stage`, та же `STAGE_KEYS`), потому
+    что второй разбор разошёлся бы с первым на первом же новом поле. Поверх —
+    правила хартии (`docs/ENGINE-1.0.md`, раздел 5), которых у спеки нет:
+
+    - роль и вид этапа — из `charter.allowed_roles`/`allowed_kinds` (пустой
+      `allowed_roles` роль не ограничивает: хартия молчит — действует проверка
+      профиля у самой спеки);
+    - публикацию план не добавляет: этап с ролью из `PUBLISHING_ROLES`
+      объявляется в seed-спеке, а `git push` в команде отказывает тем же
+      правилом, что у спеки (`_forbidden_hit`);
+    - этап, который что-то производит (его свидетель — работа: не `gate`, без
+      `verdict`, не публикующий), обязан объявить `evidence` с командой: план не
+      вправе добавить этап, который закроется без доказательств;
+    - `id` не переопределяет уже существующий этап, `needs` ведёт только на
+      известный этап, граф плана ацикличен;
+    - `len(seed ∪ план) <= charter.max_stages`;
+    - `parallel_with` планом не объявляется: параллельные добавленные этапы — не
+      этот срез.
+
+    `base_ids` — id уже существующего графа (seed плюс принятые ревизии): на них
+    плану ссылаться можно, переопределять — нет.
+    """
+    where = Path(path) if path is not None else Path(PLAN_PATH)
+    issues: list[Issue] = []
+    if not isinstance(raw_stages, list) or not raw_stages:
+        issues.append(Issue(where, 1, "plan.stages", "план — непустой список этапов {id, role, …}"))
+        return (), issues
+    # Строк в предложении нет: `lines` пуст, и `_parse_stage` берёт номер 1 —
+    # отказ называет этап по `id`, а не по строке отчёта.
+    lines: dict[tuple[Any, ...], int] = {}
+    stages: list[Stage] = []
+    for index, raw in enumerate(raw_stages):
+        try:
+            stages.append(_parse_stage(raw, index, where, lines, issues))
+        except SpecError as exc:
+            # Этап без `id` или не словарь — не повод бросать исключение: отказ
+            # уезжает в `plan_rejected.issues[]`, и лид видит, что не так.
+            issues.append(exc.issue())
+    base = {str(stage_id) for stage_id in base_ids}
+    known = base | {stage.id for stage in stages}
+    seen: set[str] = set()
+    for stage in stages:
+        if stage.id in base:
+            issues.append(
+                Issue(
+                    where,
+                    stage.line,
+                    "plan.id",
+                    f"id {stage.id!r} уже есть в графе: план добавляет этапы, а не переопределяет их",
+                )
+            )
+        elif stage.id in seen:
+            issues.append(Issue(where, stage.line, "plan.id", f"id {stage.id!r} повторяется в предложении"))
+        seen.add(stage.id)
+        if stage.kind not in charter.allowed_kinds:
+            issues.append(
+                Issue(
+                    where,
+                    stage.line,
+                    "charter.allowed_kinds",
+                    f"этап {stage.id!r}: вид {stage.kind!r} планом не добавляется — "
+                    f"хартия разрешает {', '.join(charter.allowed_kinds) or 'ничего'}",
+                )
+            )
+        if stage.kind == DEFAULT_STAGE_KIND and charter.allowed_roles and stage.role not in charter.allowed_roles:
+            issues.append(
+                Issue(
+                    where,
+                    stage.line,
+                    "charter.allowed_roles",
+                    f"этап {stage.id!r}: роль {stage.role!r} планом не добавляется — "
+                    f"хартия разрешает {', '.join(charter.allowed_roles)}",
+                )
+            )
+        if stage.role in PUBLISHING_ROLES:
+            issues.append(
+                Issue(
+                    where,
+                    stage.line,
+                    "plan.publish",
+                    f"этап {stage.id!r} публикует (role: {stage.role}): публикация объявляется "
+                    "в seed-спеке и требует ревью в предках — планом она не добавляется",
+                )
+            )
+        if stage.parallel_with:
+            issues.append(
+                Issue(
+                    where,
+                    stage.line,
+                    "plan.parallel_with",
+                    f"этап {stage.id!r} объявляет parallel_with: параллельные добавленные этапы "
+                    "планом не поддерживаются",
+                )
+            )
+        if stage.kind == SHELL_KIND and not stage.cmd.strip():
+            issues.append(
+                Issue(
+                    where,
+                    stage.line,
+                    "kind.cmd",
+                    f"этап {stage.id!r} с kind: shell без cmd: команде этапа нечего запускать",
+                )
+            )
+        hit = _forbidden_hit(stage.cmd) if stage.kind == SHELL_KIND else None
+        if hit is not None:
+            issues.append(
+                Issue(
+                    where,
+                    stage.line,
+                    "cmd.forbidden",
+                    f"cmd этапа {stage.id!r} начинается с {hit!r}: публикация — дело роли "
+                    f"{PUBLISHING_ROLES[0]}, а не этапа плана",
+                )
+            )
+        for need in stage.needs:
+            if need == stage.id:
+                issues.append(
+                    Issue(where, stage.line, "plan.needs", f"needs этапа {stage.id!r} ссылается на себя")
+                )
+            elif need not in known:
+                issues.append(
+                    Issue(
+                        where,
+                        stage.line,
+                        "plan.needs",
+                        f"needs этапа {stage.id!r} ссылается на несуществующий этап {need!r}",
+                    )
+                )
+        for evidence in stage.evidence:
+            if not evidence.cmd.strip():
+                issues.append(
+                    Issue(where, stage.line, "evidence.cmd", f"у этапа {stage.id!r} доказательство с пустым cmd")
+                )
+                continue
+            hit = _forbidden_hit(evidence.cmd)
+            if hit is None:
+                continue
+            issues.append(
+                Issue(
+                    where,
+                    stage.line,
+                    "evidence.forbidden",
+                    f"evidence этапа {stage.id!r} начинается с {hit!r}: это действие, а не доказательство",
+                )
+            )
+        # «Что-то производит» — тот же признак, по которому `evidence.witness`
+        # выбирает свидетеля: этап-агент без приговора и не публикующий. Приговор —
+        # не работа в дереве, у гейта работы нет вовсе, а команда доказывает себя
+        # кодом возврата `must`.
+        produces = (
+            stage.kind == DEFAULT_STAGE_KIND and stage.verdict is None and stage.role not in PUBLISHING_ROLES
+        )
+        if produces and not any(evidence.cmd.strip() for evidence in stage.evidence):
+            issues.append(
+                Issue(
+                    where,
+                    stage.line,
+                    "plan.evidence",
+                    f"этап {stage.id!r} что-то производит, а evidence пуст: планом добавляется "
+                    "только этап, чью работу можно проверить — объяви evidence {cmd, must}",
+                )
+            )
+    added = {stage.id: stage for stage in stages if stage.id not in base}
+    trail: list[str] = []
+    state: dict[str, int] = {}  # 1 — в обходе, 2 — обойдён
+
+    def cycle(stage_id: str) -> Optional[list[str]]:
+        state[stage_id] = 1
+        trail.append(stage_id)
+        for need in added[stage_id].needs:
+            if need not in added:
+                continue
+            if state.get(need) == 1:
+                return trail[trail.index(need):] + [need]
+            if state.get(need) == 2:
+                continue
+            found = cycle(need)
+            if found is not None:
+                return found
+        trail.pop()
+        state[stage_id] = 2
+        return None
+
+    for stage in added.values():
+        if state.get(stage.id):
+            continue
+        found = cycle(stage.id)
+        if found is None:
+            continue
+        issues.append(
+            Issue(where, added[found[0]].line, "plan.cycle", f"граф плана цикличен: {' → '.join(found)}")
+        )
+        break
+    if len(known) > charter.max_stages:
+        issues.append(
+            Issue(
+                where,
+                1,
+                "charter.max_stages",
+                f"план растит граф до {len(known)} этапов, а хартия держит не больше "
+                f"{charter.max_stages}: дело не растёт",
+            )
+        )
+    return tuple(stages), issues
 
 
 # ------------------------------------------------------- база как существующий rev

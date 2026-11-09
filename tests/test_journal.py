@@ -476,8 +476,9 @@ def test_fold_closed_deal_is_not_reopened_by_non_state_kinds() -> None:
     # решением о закрытости и есть правило 2.
     assert folded["last_kind"] == "patched"
     # Набор «не открывающих живое ожидание» видов назван в одном месте и ровно этими
-    # шестью: ответ на вопрос — закрывающий факт, телеметрия попытки — не факт о деле,
-    # публикация — факт о дереве (этап закрыт своим `attempt_ended`).
+    # семью: ответ на вопрос — закрывающий факт, телеметрия попытки — не факт о деле,
+    # публикация — факт о дереве (этап закрыт своим `attempt_ended`), предложение
+    # плана — факт о графе, а не о состоянии (в граф оно не входит).
     assert journal.NON_STATE_KINDS == (
         "commented",
         "attached",
@@ -485,6 +486,7 @@ def test_fold_closed_deal_is_not_reopened_by_non_state_kinds() -> None:
         "question_answered",
         "attempt_progress",
         "published",
+        "plan_proposed",
     )
 
 
@@ -552,6 +554,35 @@ def test_attempt_progress_is_the_only_new_kind(home: Path) -> None:
     # Порядок применения: прогресс раньше конца попытки при том же `ts`.
     assert journal.KIND_ORDER.index("attempt_progress") < journal.KIND_ORDER.index("attempt_ended")
     conn.close()
+
+
+def test_plan_facts_are_a_closed_set_and_ordered_before_stage_facts(home: Path) -> None:
+    """Четыре события плана: закрытый набор, `plan_proposed` не меняет состояние.
+
+    План дела растёт из журнала (`docs/ENGINE-1.0.md`), поэтому виды плана — часть
+    того же закрытого набора, что и остальные: предложение пишется фактом, а
+    принятие — вторым, и граф читается по ним, а не по файлу спеки. Предложение
+    состояния не меняет (правило 12): этап плана закрыт своим `attempt_ended`.
+    """
+    conn = journal.open_journal(home)
+    batch = events(
+        ("created", {"title": "дело"}),
+        ("plan_proposed", {"rev": 1, "stages": [{"id": "research"}], "reason": "скоуп", "source_stage": "plan"}),
+    )
+    assert journal.append(conn, batch) == 2
+    folded = journal.fold(journal.read_events(conn), now=NOW)
+    assert "plan_proposed" in journal.NON_STATE_KINDS
+    assert folded["last_kind"] == "plan_proposed"
+    # Последний state-changing факт — `created`: предложение его не перебивает.
+    assert folded["reason"] == "no_live_fact"
+    conn.close()
+
+    for kind in ("plan_proposed", "plan_accepted", "plan_rejected", "plan_gate"):
+        assert kind in journal.EVENT_KINDS
+    # Граф обязан существовать раньше, чем по нему пойдёт срез: при равном `ts`
+    # факты плана применяются до фактов этапа.
+    for kind in ("plan_proposed", "plan_accepted", "plan_rejected", "plan_gate"):
+        assert journal.KIND_ORDER.index(kind) < journal.KIND_ORDER.index("attempt_started")
 
 
 def test_state_changing_kind_after_completed_reopens_honestly() -> None:

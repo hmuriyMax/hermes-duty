@@ -535,23 +535,40 @@ def _waits(
     return None
 
 
+def graph_of(spec: Any, events: Iterable[Any]) -> Any:
+    """Граф дела для поверхностей: seed спеки плюс принятый план из журнала.
+
+    Один вход на весь плагин: `stagefeed` не считает граф сам, а спрашивает
+    `transit.graph_spec` — того же, по которому принимает решения движок. Иначе
+    экран показал бы три этапа из файла, а движок шёл бы по пяти из журнала
+    (`docs/ENGINE-1.0.md`, раздел 7).
+    """
+    return transit.graph_spec(spec, events)
+
+
 def stages(spec: Any, events: Iterable[Any], now: Any) -> list[dict[str, Any]]:
-    """Этапы спеки со срезом, попытками и доказательствами — в порядке объявления.
+    """Этапы дела со срезом, попытками и доказательствами — в порядке графа.
 
     Состояние и номер попытки — из `transit.stage_states` (единый предикат «готов»
     для консоли и движка). Попытки — из журнала. Ни одного процесса, ни одной
     карточки: этапы, до которых дело не дошло, видны как `pending`/`wait_gate`
     именно потому, что спека их объявляет, а не потому, что кто-то их запускал.
 
+    Граф — из журнала (`graph_of`): этап, добавленный принятым планом, обязан
+    появиться на экране без перечитывания файла (`docs/ENGINE-1.0.md`, раздел 7).
+    Спека на диске остаётся seed-ом, и экран с движком видят один граф.
+
     Парковка читается из журнала (`journal.parked_of`): у неё нет состояния этапа,
     потому что исчерпанный этап в графе `failed`, — а ждёт он человека.
     """
     moment = _int(now)
+    events = list(events or ())
+    graph = graph_of(spec, events)
     states = transit.stage_states(spec, events)
     rows = [_public(row, moment) for row in _attempts(events)]
     parked = journal.parked_of(events)
     out: list[dict[str, Any]] = []
-    for stage in spec.stages:
+    for stage in graph.stages:
         state = states[stage.id]
         mine = [row for row in rows if row["stage"] == stage.id]
         last_with_records = next((row for row in reversed(mine) if row["evidence"]), None)
@@ -618,6 +635,8 @@ def snapshot(events: Iterable[Any], now: Any, *, spec_path: Optional[str] = None
     `spec_path` — путь, названный вызывающим (событие `created` или `?spec=`);
     приоритет решает роут, а не этот слой. Путь принимается только абсолютный:
     относительный не восстановить из журнала (`docs/SPEC.md`, «Путь к спеке»).
+    Граф — из журнала (`graph_of`): принятый план добавляет этапы на экран, файл
+    спеки при этом не меняется (`docs/ENGINE-1.0.md`, раздел 3).
     """
     events = list(events or ())
     if not spec_path:
@@ -630,7 +649,7 @@ def snapshot(events: Iterable[Any], now: Any, *, spec_path: Optional[str] = None
     except Exception as exc:  # noqa: BLE001 - спека не читается: это ответ, а не падение
         reason = str(exc) or type(exc).__name__
         return {"spec": str(path), "stages": [], "note": f"спека не читается: {reason}"}
-    if not spec.stages:
+    if not graph_of(spec, events).stages:
         return {"spec": str(path), "stages": [], "note": NO_STAGES}
     try:
         return {"spec": str(path), "stages": stages(spec, events, now), "note": ""}

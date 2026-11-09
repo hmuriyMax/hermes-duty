@@ -1746,3 +1746,300 @@ def test_cli_check_gate_with_role_names_line(capsys, tmp_path: Path):
     code, out = run_cli(["spec", "check", str(path)], capsys)
     assert code == 1
     assert f"{path}:6: kind.role:" in out
+
+
+# ----------------------------------------------------------------------- хартия
+
+
+def charter_spec(charter: str = "charter: {max_stages: 6}") -> str:
+    """Спека с хартией: вход `impl` и ревью за ним — форма из `two_stages`."""
+    return f"""
+    duty: probe
+    {charter}
+    stages:
+      - id: plan
+        role: planner
+      - id: impl
+        role: implementer
+        needs: [plan]
+        workspace: none
+      - id: review
+        role: reviewer
+        needs: [impl]
+        workspace: none
+        verdict: {{approve: next, changes: impl, max_rounds: 1}}
+    """
+
+
+def test_charter_defaults_when_block_absent(tmp_path: Path):
+    """Спека без `charter` годна и получает дефолты: 12 этапов, 3 реплана, гейт выключен."""
+    loaded = spec_module.load_spec(write(tmp_path, charter_spec("")))
+    charter = loaded.charter
+    assert charter.max_stages == 12
+    assert charter.max_rounds_replan == 3
+    assert charter.allowed_roles == ()
+    assert charter.allowed_kinds == ("agent", "shell", "gate")
+    assert (charter.plan_gate.min_stages, charter.plan_gate.budget_share) == (0, 0.0)
+    assert spec_module.validate_spec(loaded, profiles=PROFILES) == []
+
+
+def test_charter_is_parsed_as_declared(tmp_path: Path):
+    """Объявленная хартия читается целиком — и строками, и числами гейта."""
+    loaded = spec_module.load_spec(
+        write(
+            tmp_path,
+            charter_spec(
+                "charter: {max_stages: 6, max_rounds_replan: 1, allowed_roles: [implementer, tester], "
+                "allowed_kinds: [agent, shell], plan_gate: {min_stages: 4, budget_share: 0.5}}"
+            ),
+        )
+    )
+    charter = loaded.charter
+    assert (charter.max_stages, charter.max_rounds_replan) == (6, 1)
+    assert charter.allowed_roles == ("implementer", "tester")
+    assert charter.allowed_kinds == ("agent", "shell")
+    assert (charter.plan_gate.min_stages, charter.plan_gate.budget_share) == (4, 0.5)
+    assert spec_module.validate_spec(loaded, profiles=PROFILES) == []
+
+
+def test_charter_unknown_key_is_refused(tmp_path: Path):
+    """Неизвестный ключ внутри `charter` — отказ: опечатка иначе была бы дефолтом."""
+    found = issues(tmp_path, charter_spec("charter: {max_stage: 6}"))
+    assert "unknown-key" in rules(found)
+    assert any("max_stage" in issue.message for issue in found)
+
+
+def test_charter_max_stages_must_be_positive(tmp_path: Path):
+    """`max_stages: 0` — граф не из чего собрать: отказ с `file:line` числа."""
+    path = write(tmp_path, charter_spec("charter: {max_stages: 0}"))
+    found = spec_module.validate_spec(spec_module.load_spec(path), profiles=PROFILES)
+    offending = [issue for issue in found if issue.rule == "charter.max_stages"]
+    assert offending and offending[0].line == 3
+    assert "не меньше одного этапа" in offending[0].message
+
+
+def test_charter_max_rounds_replan_not_negative(tmp_path: Path):
+    found = issues(tmp_path, charter_spec("charter: {max_rounds_replan: -1}"))
+    assert "charter.max_rounds_replan" in rules(found)
+
+
+def test_charter_unknown_kind_is_refused(tmp_path: Path):
+    """Вид этапа, которого нет (`daemon`), плану разрешить нельзя."""
+    found = issues(tmp_path, charter_spec("charter: {allowed_kinds: [agent, daemon]}"))
+    assert "charter.allowed_kinds" in rules(found)
+
+
+def test_charter_unknown_role_is_refused(tmp_path: Path):
+    """Роль, которой нет в Hermes, — обещание, которого движок не выполнит."""
+    found = issues(tmp_path, charter_spec("charter: {allowed_roles: [implementer, architector]}"))
+    assert "charter.allowed_roles" in rules(found)
+    assert any("architector" in issue.message for issue in found)
+
+
+@pytest.mark.parametrize(
+    "charter, rule",
+    [
+        ("charter: [max_stages]", "charter"),
+        ("charter: {max_stages: много}", "charter.max_stages"),
+        ("charter: {max_rounds_replan: много}", "charter.max_rounds_replan"),
+        ("charter: {allowed_roles: implementer}", "charter.allowed_roles"),
+        ("charter: {allowed_kinds: agent}", "charter.allowed_kinds"),
+        ("charter: {plan_gate: много}", "charter.plan_gate"),
+        ("charter: {plan_gate: {budget_share: половина}}", "charter.plan_gate"),
+        ("charter: {plan_gate: {share: 0.5}}", "unknown-key"),
+    ],
+)
+def test_charter_nested_type_errors(tmp_path: Path, charter: str, rule: str):
+    found = issues(tmp_path, charter_spec(charter))
+    assert rule in rules(found)
+
+
+@pytest.mark.parametrize(
+    "charter",
+    [
+        "charter: {max_stages: 6, plan_gate: {min_stages: -1}}",
+        "charter: {max_stages: 6, plan_gate: {min_stages: 9}}",
+        "charter: {max_stages: 6, plan_gate: {budget_share: 1.5}}",
+        "charter: {max_stages: 6, plan_gate: {budget_share: -0.1}}",
+    ],
+)
+def test_charter_plan_gate_thresholds(tmp_path: Path, charter: str):
+    """Гейт плана: порог не отрицательный и не выше потолка графа, доля — от 0 до 1."""
+    found = issues(tmp_path, charter_spec(charter))
+    assert "charter.plan_gate" in rules(found)
+
+
+# ------------------------------------------------------------------- план дела
+
+# Граф-заготовка: seed из спеки плюс принятые раньше этапы.
+BASE_IDS = ("plan", "close")
+
+
+def plan(raw: list, charter: Any = None) -> tuple:
+    """`spec.parse_plan` с хартией по умолчанию и seed-графом `BASE_IDS`."""
+    return spec_module.parse_plan(raw, charter=charter or spec_module.Charter(), base_ids=BASE_IDS)
+
+
+def plan_rules(raw: list, charter: Any = None) -> set[str]:
+    return {issue.rule for issue in plan(raw, charter)[1]}
+
+
+def good_plan() -> list:
+    """Годное предложение: исследование, реализация и проверка за ней."""
+    return [
+        {"id": "research", "role": "researcher", "workspace": "none", "needs": ["plan"],
+         "evidence": [{"cmd": "ls docs", "must": 0}]},
+        {"id": "impl", "role": "implementer", "needs": ["research"],
+         "evidence": [{"cmd": "go build ./...", "must": 0}]},
+        {"id": "check", "kind": "shell", "cmd": "go test ./...", "needs": ["impl"]},
+    ]
+
+
+def test_parse_plan_accepts_a_plain_growth():
+    """Годное предложение: этапы разобраны, отказов нет, `needs` видит seed."""
+    stages, found = plan(good_plan())
+    assert [stage.id for stage in stages] == ["research", "impl", "check"]
+    assert found == []
+    assert stages[1].needs == ("research",)
+
+
+def test_parse_plan_needs_may_point_at_the_seed():
+    """Ссылка на этап, который уже есть в графе, законна — это и есть рост."""
+    _, found = plan([{"id": "research", "role": "researcher", "workspace": "none",
+                      "needs": ["plan"], "evidence": [{"cmd": "ls", "must": 0}]}])
+    assert found == []
+
+
+def test_parse_plan_does_not_redefine_existing_id():
+    """`id` из seed планом не переопределяется: иначе публикация правила бы себя."""
+    _, found = plan([{"id": "close", "role": "researcher", "workspace": "none",
+                      "evidence": [{"cmd": "ls", "must": 0}]}])
+    assert "plan.id" in {issue.rule for issue in found}
+
+
+def test_parse_plan_duplicate_id_inside_proposal():
+    _, found = plan([
+        {"id": "research", "role": "researcher", "workspace": "none", "evidence": [{"cmd": "ls", "must": 0}]},
+        {"id": "research", "role": "researcher", "workspace": "none", "evidence": [{"cmd": "ls", "must": 0}]},
+    ])
+    assert "plan.id" in {issue.rule for issue in found}
+
+
+def test_parse_plan_needs_unknown_id():
+    _, found = plan([{"id": "impl", "role": "implementer", "needs": ["nowhere"],
+                      "evidence": [{"cmd": "go build ./...", "must": 0}]}])
+    assert "plan.needs" in {issue.rule for issue in found}
+    assert any("nowhere" in issue.message for issue in found)
+
+
+def test_parse_plan_refuses_self_reference():
+    _, found = plan([{"id": "impl", "role": "implementer", "needs": ["impl"],
+                      "evidence": [{"cmd": "go build ./...", "must": 0}]}])
+    assert "plan.needs" in {issue.rule for issue in found}
+
+
+def test_parse_plan_refuses_a_cycle_inside_the_proposal():
+    """Цикл плана — граф, по которому дело не пойдёт никогда: отказ до принятия."""
+    _, found = plan([
+        {"id": "a", "role": "implementer", "needs": ["b"], "workspace": "none",
+         "evidence": [{"cmd": "ls", "must": 0}]},
+        {"id": "b", "role": "implementer", "needs": ["a"], "workspace": "none",
+         "evidence": [{"cmd": "ls", "must": 0}]},
+    ])
+    assert "plan.cycle" in {issue.rule for issue in found}
+
+
+def test_parse_plan_stage_kind_must_be_allowed_by_charter():
+    charter = spec_module.Charter(allowed_kinds=("agent",))
+    _, found = plan([{"id": "check", "kind": "shell", "cmd": "go build ./..."}], charter)
+    assert "charter.allowed_kinds" in {issue.rule for issue in found}
+
+
+def test_parse_plan_stage_role_must_be_allowed_by_charter():
+    charter = spec_module.Charter(allowed_roles=("implementer", "tester"))
+    _, found = plan([{"id": "research", "role": "researcher", "workspace": "none",
+                      "evidence": [{"cmd": "ls", "must": 0}]}], charter)
+    assert "charter.allowed_roles" in {issue.rule for issue in found}
+
+
+def test_parse_plan_empty_allowed_roles_does_not_restrict():
+    """Пустой `allowed_roles` — хартия молчит: роль проверяет спека, а не план."""
+    _, found = plan([{"id": "research", "role": "researcher", "workspace": "none",
+                      "evidence": [{"cmd": "ls", "must": 0}]}], spec_module.Charter())
+    assert found == []
+
+
+def test_parse_plan_cannot_add_publishing_stage():
+    """`publish` планом не добавляется: публикация объявляется в seed-спеке."""
+    _, found = plan([{"id": "publish", "role": "publisher", "workspace": "none"}])
+    assert "plan.publish" in {issue.rule for issue in found}
+
+
+def test_parse_plan_cannot_add_a_publishing_command():
+    """`git push` в команде плана — тот же запрет, что у спеки: действие, не работа."""
+    _, found = plan([{"id": "check", "kind": "shell", "cmd": "git push origin HEAD"}])
+    assert "cmd.forbidden" in {issue.rule for issue in found}
+
+
+def test_parse_plan_evidence_command_cannot_publish():
+    _, found = plan([{"id": "impl", "role": "implementer",
+                      "evidence": [{"cmd": "git push", "must": 0}]}])
+    assert "evidence.forbidden" in {issue.rule for issue in found}
+
+
+def test_parse_plan_producing_stage_needs_evidence():
+    """Этап, который что-то производит, без evidence — не план, а надежда."""
+    _, found = plan([{"id": "impl", "role": "implementer", "workspace": "worktree"}])
+    assert "plan.evidence" in {issue.rule for issue in found}
+
+
+def test_parse_plan_reviewer_and_gate_need_no_evidence():
+    """Ревьюер предъявляет приговор, гейт — ответ человека: evidence им не нужен."""
+    _, found = plan([
+        {"id": "check", "role": "reviewer", "workspace": "none", "needs": ["plan"],
+         "verdict": {"approve": "next", "changes": "plan", "max_rounds": 1}},
+        {"id": "gate", "kind": "gate", "needs": ["check"],
+         "ask": {"q": "Продолжаем?", "options": ["да", "нет"]}},
+    ])
+    assert found == []
+
+
+def test_parse_plan_shell_stage_needs_cmd():
+    _, found = plan([{"id": "check", "kind": "shell", "needs": ["plan"]}])
+    assert "kind.cmd" in {issue.rule for issue in found}
+
+
+def test_parse_plan_refuses_parallel_with():
+    """Параллельные добавленные этапы — не этот срез: план их не объявляет."""
+    _, found = plan([{"id": "impl", "role": "implementer", "parallel_with": ["research"],
+                      "evidence": [{"cmd": "ls", "must": 0}]}])
+    assert "plan.parallel_with" in {issue.rule for issue in found}
+
+
+def test_parse_plan_over_max_stages_is_refused():
+    """Потолок хартии считает весь граф: seed плюс предложение."""
+    charter = spec_module.Charter(max_stages=4)
+    _, found = plan(good_plan(), charter)
+    assert "charter.max_stages" in {issue.rule for issue in found}
+    assert any("дело не растёт" in issue.message for issue in found)
+
+
+def test_parse_plan_stage_without_id_is_an_issue_not_an_exception():
+    """Этап без `id` — отказ в списке (лид увидит причину), а не падение разбора."""
+    stages, found = plan([{"role": "researcher"}, {"id": "impl", "role": "implementer",
+                                                  "evidence": [{"cmd": "ls", "must": 0}]}])
+    assert [stage.id for stage in stages] == ["impl"]
+    assert "stage.id" in {issue.rule for issue in found}
+
+
+def test_parse_plan_unknown_stage_key_is_refused():
+    """Разбор этапа тот же, что у спеки: `evidance` не станет «evidence пуст»."""
+    _, found = plan([{"id": "impl", "role": "implementer",
+                      "evidance": [{"cmd": "ls", "must": 0}]}])
+    assert "unknown-key" in {issue.rule for issue in found}
+
+
+def test_parse_plan_empty_or_not_a_list():
+    for raw in ([], None, "impl"):
+        _, found = plan(raw)
+        assert "plan.stages" in {issue.rule for issue in found}

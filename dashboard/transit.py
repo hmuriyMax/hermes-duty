@@ -89,7 +89,8 @@ payload: события дел его не пишут.
 `wait` называет, чего ждёт: `attempt` (попытка идёт), `question` (ответ
 человека), `verdict` (приговор ревьюера), `gate` (нужный этап/гейт),
 `retry` (пауза перед повтором — с моментом `retry_at`), `parked` (дело
-запарковано, ждёт решения человека).
+запарковано, ждёт решения человека), `plan` (решается план дела: этап плана в
+работе, предложение ждёт проверки или гейта плана — `docs/ENGINE-1.0.md`).
 
 **Несколько этапов сразу — это `run` с кортежем `stages`, а не отдельный
 `run_many`:** форма одна, значит и обрабатывать её в движке один раз.
@@ -100,6 +101,7 @@ payload: события дел его не пишут.
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
 import sys
@@ -112,6 +114,7 @@ from typing import Any, Iterable, Optional
 # загрузки (и второго набора `NON_STATE_KINDS`) в процессе быть не должно.
 JOURNAL_MODULE_NAME = "hermes_duty_journal"
 FAILURES_MODULE_NAME = "hermes_duty_failures"
+SPEC_MODULE_NAME = "hermes_duty_spec"
 
 
 def _load(name: str, filename: str) -> Any:
@@ -134,6 +137,10 @@ journal = _load(JOURNAL_MODULE_NAME, "journal.py")
 # Политика ретраев и словарь классов живут в одном месте (`dashboard/failures.py`):
 # слой перехода читает их оттуда, а не держит вторую копию правил.
 failures = _load(FAILURES_MODULE_NAME, "failures.py")
+
+# Спека — ради одного: этапы плана разбираются её же разбором (`spec.parse_plan`).
+# Второй разбор предложения разошёлся бы с `spec check` на первом же новом поле.
+spec_module = _load(SPEC_MODULE_NAME, "spec.py")
 
 # ------------------------------------------------------------- состояния и виды
 
@@ -175,7 +182,12 @@ WAIT_RETRY = "retry"
 # Парковка: попытки исчерпаны, дело ждёт решения человека (`blocked` с
 # `block_kind='parked'`). Подъёма автоматически нет — только `unblocked`.
 WAIT_PARKED = "parked"
-WAIT_KINDS = (WAIT_ATTEMPT, WAIT_QUESTION, WAIT_VERDICT, WAIT_FOR_GATE, WAIT_RETRY, WAIT_PARKED)
+# План дела: этап плана в работе, предложение ждёт проверки или гейта плана.
+# Отдельное слово, а не `attempt`/`gate`: «дело стоит, потому что решается план»
+# — это факт о графе, и склеивание его с ожиданием попытки спрятало бы, что
+# графа ещё нет (`docs/ENGINE-1.0.md`, раздел 3).
+WAIT_PLAN = "plan"
+WAIT_KINDS = (WAIT_ATTEMPT, WAIT_QUESTION, WAIT_VERDICT, WAIT_FOR_GATE, WAIT_RETRY, WAIT_PARKED, WAIT_PLAN)
 
 # Исходы попытки, которые считаются успехом. Набор объявлен, а не угадан по
 # подстроке: `contract_refused` тоже содержит «contract», и «похоже на успех»
@@ -223,6 +235,20 @@ VERDICT_KINDS = (journal.VERDICT_APPROVE, journal.VERDICT_CHANGES)
 # вопрос человеку. Слою вид нужен только для текста ожидания и причины парковки —
 # переходы у гейта те же, что у любого этапа.
 GATE_KIND = "gate"
+
+# Факты плана (`docs/ENGINE-1.0.md`, раздел 3). Виды журнальные
+# (`journal.EVENT_KINDS`): слой не заводит своих, он их читает.
+PLAN_PROPOSED = "plan_proposed"
+PLAN_ACCEPTED = "plan_accepted"
+PLAN_REJECTED = "plan_rejected"
+PLAN_GATE = "plan_gate"
+PLAN_KINDS = (PLAN_PROPOSED, PLAN_ACCEPTED, PLAN_REJECTED, PLAN_GATE)
+
+# id этапа, чей отчёт — предложение плана: так он назван в seed-графе 1.0
+# (`docs/ENGINE-1.0.md`, раздел 3, `stages: - id: plan`). Слово берётся у спеки:
+# писатель (`runner.report_plan`) и читатель (`graph`) не должны разойтись в том,
+# чей это план.
+PLAN_STAGE = spec_module.PLAN_STAGE
 
 APPROVE = "approve"
 CHANGES = "changes"
@@ -388,6 +414,18 @@ class _Board:
     stages: dict[str, _Stage] = field(default_factory=dict)
     closed: bool = False
     closed_reason: str = ""
+    # Граф дела этой свёртки: спека плюс этапы принятого плана (`graph`). Срез и
+    # решение считаются по нему, а не по файлу: иначе добавленный этап был бы в
+    # журнале, но не в графе (`docs/ENGINE-1.0.md`, раздел 3).
+    spec: Any = None
+    # Предложение плана, которое ещё не решено: `{rev, stage, stages}`. Пока оно
+    # ждёт решения, дело не идёт дальше по seed-графу — иначе `close` с
+    # `needs: [plan]` закрыл бы дело, план которого ещё не решён.
+    plan_pending: Optional[dict[str, Any]] = None
+    # Открытый гейт плана: `{rev, stage, question_id, reason}` — ждём человека.
+    plan_gate: Optional[dict[str, Any]] = None
+    # id этапа плана из последнего предложения (а не догадка по имени файла).
+    plan_stage: str = ""
     # Последняя попытка, о которой журнал сказал фактом: (этап, номер). Нужна для
     # вопроса без `stage` — адресовать его больше некому (смотри `_deal_question`).
     last_attempt: tuple[str, int] = ("", 0)
@@ -900,6 +938,226 @@ def _parked_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ------------------------------------------------------------------ граф дела
+
+
+class _Graph:
+    """Спека плюс этапы принятого плана: тот же набор полей, другой граф.
+
+    Заменяет спеку в свёртке и проекциях: слой не должен знать, пришёл этап из
+    файла или из `plan_accepted` — правила перехода у него одни. Всё, чего у
+    графа нет (`charter`, `path`, `base`, `budget`), делегируется спеке.
+    """
+
+    def __init__(self, spec: Any, stages: Iterable[Any]) -> None:
+        self.spec = spec
+        self.stages = tuple(stages)
+        self.by_id = {stage.id: stage for stage in self.stages}
+
+    @property
+    def ids(self) -> tuple[str, ...]:
+        return tuple(stage.id for stage in self.stages)
+
+    def stage(self, stage_id: str) -> Any:
+        return self.by_id.get(stage_id)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.spec, name)
+
+
+def graph_spec(spec: Any, events: Iterable[Any]) -> Any:
+    """Спека как граф дела: без плана — сама спека, с планом — `_Graph` над ней.
+
+    Один вход для движка (`runner`) и поверхностей (`stagefeed`): попытка этапа,
+    добавленного планом, обязана найти свой этап тем же графом, которым его
+    запустило решение, — `spec.stage(id)` из файла его не знает.
+    """
+    stages = graph(spec, events)
+    if tuple(getattr(spec, "stages", ()) or ()) == stages:
+        return spec
+    return _Graph(spec, stages)
+
+
+def graph(spec: Any, events: Iterable[Any]) -> tuple[Any, ...]:
+    """Граф дела: seed спеки плюс этапы последней принятой ревизии плана.
+
+    Файл спеки — seed, а не весь граф (`docs/ENGINE-1.0.md`, раздел 3): принятый
+    план живёт фактами журнала, поэтому граф — чистая функция тех же событий, что
+    и состояние. Журнал без фактов плана даёт ровно `spec.stages` — поведение
+    0.0.8 не меняется ни на факт.
+
+    Этапы берутся из `plan_proposed` той ревизии, которую назвал `plan_accepted`:
+    отдельной копии плана в событии принятия нет — иначе две копии одного графа
+    разошлись бы. Разбор — тем же `spec.parse_plan` по хартии: граф, который
+    валидатор отверг бы, не становится графом и при чтении (мусорный журнал не
+    роняет дело, правило 8 — граф остаётся seed-ом).
+    """
+    seed = tuple(getattr(spec, "stages", ()) or ())
+    proposals: dict[int, Any] = {}
+    accepted = 0
+    for event in _ordered(events):
+        kind = str(event.get("kind") or "")
+        if kind not in (PLAN_PROPOSED, PLAN_ACCEPTED):
+            continue
+        payload = _payload(event)
+        stage_id = payload.get("stage")
+        if isinstance(stage_id, str) and stage_id:
+            continue  # факт этапа, а не факт плана (смотри `_fold`)
+        rev = _int(payload.get("rev"))
+        if rev <= 0:
+            continue
+        if kind == PLAN_PROPOSED:
+            stages = payload.get("stages")
+            if isinstance(stages, list):
+                proposals[rev] = payload
+        elif rev > accepted:
+            accepted = rev
+    if accepted <= 0 or accepted not in proposals:
+        return seed
+    payload = proposals[accepted]
+    charter = getattr(spec, "charter", None) or spec_module.Charter()
+    stages, issues = spec_module.parse_plan(
+        payload.get("stages"),
+        charter=charter,
+        base_ids=[stage.id for stage in seed],
+    )
+    if issues:
+        return seed
+    plan_stage = str(payload.get("source_stage") or "") or PLAN_STAGE
+    return _relinked(seed, tuple(stages), plan_stage)
+
+
+def _relinked(seed: tuple[Any, ...], added: tuple[Any, ...], plan_stage: str) -> tuple[Any, ...]:
+    """Seed плюс план: этапы seed, ждавшие план, ждут и то, что план произвёл.
+
+    Без этой правки `close` с `needs: [plan]` стал бы готов сразу после
+    принятия плана и закрыл бы дело до работы, которую план объявил
+    (`docs/ENGINE-1.0.md`, раздел 9: plan → research → … → close). Рёбра не
+    додумываются: этап seed получает ровно те добавленные этапы, от которых
+    никто из добавленных не зависит, — «последние из плана».
+    """
+    if not added:
+        return seed
+    needed = {need for stage in added for need in stage.needs}
+    tail = tuple(stage.id for stage in added if stage.id not in needed)
+    out: list[Any] = []
+    for stage in seed:
+        if plan_stage not in tuple(getattr(stage, "needs", ()) or ()):
+            out.append(stage)
+            continue
+        out.append(dataclasses.replace(stage, needs=tuple(dict.fromkeys((*stage.needs, *tail)))))
+    return tuple(out) + added
+
+
+def _plan_stage_of(board: _Board) -> str:
+    """id этапа плана: названный предложением, иначе `plan` из seed-графа."""
+    if board.plan_stage:
+        return board.plan_stage
+    return PLAN_STAGE if PLAN_STAGE in board.stages else ""
+
+
+def _plan_wait(board: _Board) -> str:
+    """Почему дело ждёт решения по плану; пустая строка — не ждёт.
+
+    Три состояния, и все три — про граф, а не про попытку: гейт плана ждёт
+    человека, решённое предложение ждёт проверки (пишет движок), а идущая
+    попытка этапа плана ещё ничего не предложила. Пока это так, по seed-графу
+    идти нельзя: следующий этап получил бы граф, которого ещё нет.
+    """
+    gate = board.plan_gate
+    if gate is not None:
+        return (
+            "план ревизии {} ждёт человека: вопрос #{}".format(
+                gate.get("rev") or "—", gate.get("question_id") or "—"
+            )
+        )
+    pending = board.plan_pending
+    if pending is not None:
+        stages = pending.get("stages") or []
+        named = ", ".join(str(item.get("id") or "—") for item in stages if isinstance(item, dict))
+        return "план ревизии {} предложен и ждёт решения: этапы {}".format(
+            pending.get("rev") or "—", named or "—"
+        )
+    stage_id = _plan_stage_of(board)
+    node = board.stages.get(stage_id) if stage_id else None
+    if node is None or node.state != RUNNING:
+        return ""
+    return f"этап плана {stage_id!r}: попытка {node.attempt} идёт — план ещё не предложен"
+
+
+def _plan_fact(board: _Board, spec: Any, kind: str, payload: dict[str, Any], at: int) -> None:
+    """Факт плана дела: предложение, решение по нему и гейт плана.
+
+    `plan_proposed` граф не меняет (`journal.NON_STATE_KINDS`) — граф уже собран
+    `graph()` по последней принятой ревизии. Меняют его `plan_accepted` (граф) и
+    `plan_rejected` (раунд реплана этапа плана); `plan_gate` ставит этап плана в
+    `wait_human` тем же фактом, что и вопрос гейт-этапа, — переходы у гейта плана
+    те же, что у гейта графа.
+    """
+    if kind == PLAN_PROPOSED:
+        rev = _int(payload.get("rev"))
+        stages = payload.get("stages") if isinstance(payload.get("stages"), list) else []
+        if rev <= 0 or not stages:
+            return  # мусор в журнале не держит дело: предложения без ревизии нет
+        board.plan_pending = {"rev": rev, "stage": str(payload.get("source_stage") or ""), "stages": stages}
+        if board.plan_pending["stage"]:
+            board.plan_stage = board.plan_pending["stage"]
+        return
+    rev = _int(payload.get("rev"))
+    node = board.stages.get(_plan_stage_of(board))
+    pending = board.plan_pending
+    if pending is not None and (not rev or rev == pending.get("rev")):
+        board.plan_pending = None
+    if kind == PLAN_ACCEPTED:
+        # Принятие закрывает этап плана: он «предложил план и закрылся им». Ждать
+        # больше нечего (гейт снят), а `question_answered` до этого мог вернуть
+        # этап в `pending` — вторая попытка плана при принятой ревизии не нужна.
+        board.plan_gate = None
+        if node is not None and node.state in (WAIT_HUMAN, PENDING):
+            node.state = DONE
+            node.question_id = None
+            node.reason = f"план ревизии {rev or '—'} принят"
+        return
+    if kind == PLAN_GATE:
+        question_id = _question_id(payload)
+        board.plan_gate = {
+            "rev": rev,
+            "stage": _plan_stage_of(board),
+            "question_id": question_id,
+            "reason": str(payload.get("reason") or ""),
+        }
+        if node is not None and node.state not in TERMINAL_STATES:
+            node.question_id = question_id
+            node.state = WAIT_HUMAN
+            node.since = at or node.since
+            node.reason = f"план ревизии {rev or '—'} ждёт человека" + (
+                f": вопрос #{question_id}" if question_id else ""
+            )
+        return
+    # `plan_rejected`: этап плана возвращается в работу с причиной и отказами, и
+    # сверх `max_rounds_replan` дело останавливается — как у `verdict.max_rounds`,
+    # иначе реплан превратился бы в бесконечный генератор бюджета.
+    board.plan_gate = None
+    if node is None:
+        return
+    node.rounds += 1
+    charter = getattr(spec, "charter", None)
+    max_rounds = _int(getattr(charter, "max_rounds_replan", 0))
+    why = str(payload.get("why") or "").strip() or "план отклонён"
+    issues = [str(item).strip() for item in payload.get("issues") or () if str(item).strip()]
+    text = why + (f": {'; '.join(issues)}" if issues else "")
+    if max_rounds and node.rounds > max_rounds:
+        node.state = FAILED
+        node.fail_kind = "contract"
+        node.reason = f"репланов {node.rounds} больше max_rounds_replan={max_rounds}: {text}"
+        return
+    node.state = PENDING
+    node.question_id = None
+    node.fail_kind = ""
+    node.failed_at = 0
+    node.reason = text if not max_rounds else f"{text} — реплан {node.rounds} из {max_rounds}"
+
+
 def _fold(spec: Any, events: Iterable[Any]) -> _Board:
     """Свернуть события в состояние этапов и закрытость дела.
 
@@ -909,14 +1167,28 @@ def _fold(spec: Any, events: Iterable[Any]) -> _Board:
     (`journal.read_events(conn, deal_id)`), а признак принадлежности этапу —
     `stage` в `payload`, и второй фильтр здесь молча выкинул бы факт, если бы
     вызывающий передал события шире.
+
+    Граф берётся из `graph(spec, events)`, а не из `spec.stages`: принятый план
+    живёт фактами журнала, и свёртка обязана видеть те же этапы, что и решение.
     """
-    board = _Board(stages={stage.id: _Stage(id=stage.id) for stage in spec.stages})
+    listed = [event for event in events or () if isinstance(event, dict)]
+    view = graph_spec(spec, listed)
+    board = _Board(stages={stage.id: _Stage(id=stage.id) for stage in view.stages}, spec=view)
     known = set(board.stages)
-    for event in _ordered(events):
+    for event in _ordered(listed):
         kind = str(event.get("kind") or "")
         payload = _payload(event)
         if not board.deal_id:
             board.deal_id = str(event.get("deal_id") or "")
+        stage_id = payload.get("stage")
+        scoped = isinstance(stage_id, str) and bool(stage_id)
+        # Факт плана — факт **дела**: `stage` в его payload не пишется (адрес
+        # предложения — `source_stage`). Событие с `stage` — факт этапа, даже если
+        # вид назван плановым: чужой/мусорный журнал не должен держать дело
+        # ожиданием плана (правило 8).
+        if kind in PLAN_KINDS and not scoped:
+            _plan_fact(board, view, kind, payload, _int(event.get("ts")))
+            continue
         if kind == "question_answered":
             _park_answered(board, payload)
         if kind in ("blocked", "unblocked"):
@@ -925,19 +1197,18 @@ def _fold(spec: Any, events: Iterable[Any]) -> _Board:
             # адрес отказа, а не принадлежность событию).
             _park_fact(board, kind, payload)
             continue
-        stage_id = payload.get("stage")
-        if not isinstance(stage_id, str) or not stage_id:
+        if not scoped:
             if kind == "completed":
                 board.closed = True
                 board.closed_reason = "журнал: дело закрыто событием completed"
             elif kind == "question_asked":
-                _deal_question(board, spec, payload)
+                _deal_question(board, view, payload)
             elif kind == "question_answered":
-                _deal_answer(board, spec, payload)
+                _deal_answer(board, view, payload)
             continue
         if stage_id not in known or kind not in STAGE_KINDS:
             continue
-        _stage_event(spec, board, board.stages[stage_id], kind, payload, _int(event.get("ts")))
+        _stage_event(view, board, board.stages[stage_id], kind, payload, _int(event.get("ts")))
     return board
 
 
@@ -1053,19 +1324,22 @@ def _batch(spec: Any, runnable: list[Any]) -> tuple[str, ...]:
 
 
 def stage_states(spec: Any, events: Iterable[Any]) -> dict[str, StageState]:
-    """Срез этапов: что с каждым прямо сейчас. Порядок — объявления в спеке.
+    """Срез этапов: что с каждым прямо сейчас. Порядок — граф дела.
 
     Состояние, номер попытки, раунды возвратов, открытый вопрос, класс последнего
-    отказа и причина. Источник — только события; ни БД, ни процессов.
+    отказа и причина. Источник — только события; ни БД, ни процессов. Граф —
+    из журнала (`graph`): этапы, добавленные принятым планом, в срезе есть, и
+    реплей на том же журнале даёт тот же срез целиком, а не по полям.
     """
     board = _fold(spec, events)
-    states = _slice(spec, board)
+    view = board.spec
+    states = _slice(view, board)
     result: dict[str, StageState] = {}
-    for stage in spec.stages:
+    for stage in view.stages:
         node = board.stages[stage.id]
         state = states[stage.id]
         reason = (
-            node.reason if state == node.state else _gate_reason(spec, board, stage) or node.reason
+            node.reason if state == node.state else _gate_reason(view, board, stage) or node.reason
         )
         result[stage.id] = StageState(
             id=stage.id,
@@ -1113,14 +1387,19 @@ def next_stage(spec: Any, events: Iterable[Any], now: Any) -> Decision:
     9. все этапы `done` → `done`;
     10. иначе граф стоит → `wait(gate)`.
 
+    Перед пунктом 5 стоит один: пока решается план дела (`wait(plan)`), по
+    seed-графу идти нельзя — иначе следующий этап получил бы граф, которого ещё
+    нет (`docs/ENGINE-1.0.md`, раздел 3).
+
     `now` нужен тексту причины («попытка идёт 12мин») и решению о паузе перед
     повтором: до `retry_at` повтор не выдаётся. Часов модуль не читает.
     """
     board = _fold(spec, events)
+    view = board.spec
     seconds = _int(now)
     if board.closed:
         return done(board.closed_reason)
-    if not spec.stages:
+    if not view.stages:
         return done("в спеке нет этапов: решать нечего")
 
     if board.parked is not None:
@@ -1170,13 +1449,19 @@ def next_stage(spec: Any, events: Iterable[Any], now: Any) -> Decision:
     if board.question[1] and not board.question[0]:
         return wait(WAIT_QUESTION, f"вопрос #{board.question[1]} без адресата в спеке: ответа нет")
 
-    runnable = _runnable(spec, board, seconds)
+    # План дела решается — по seed-графу идти рано: «готов» этап, чей граф ещё
+    # не принят (`docs/ENGINE-1.0.md`, раздел 4).
+    plan_why = _plan_wait(board)
+    if plan_why:
+        return wait(WAIT_PLAN, plan_why)
+
+    runnable = _runnable(view, board, seconds)
     if runnable:
-        batch = _batch(spec, runnable)
+        batch = _batch(view, runnable)
         numbers = tuple(board.stages[stage_id].attempt + 1 for stage_id in batch)
         return run(batch, numbers, f"готовы: {', '.join(batch)}")
 
-    running = _first(spec, states, RUNNING)
+    running = _first(view, states, RUNNING)
     if running is not None:
         node = board.stages[running.id]
         return wait(
@@ -1184,13 +1469,13 @@ def next_stage(spec: Any, events: Iterable[Any], now: Any) -> Decision:
             f"этап {running.id!r}: попытка {node.attempt} идёт, {_age(node.since, seconds)}",
         )
 
-    question = _first(spec, states, WAIT_HUMAN)
+    question = _first(view, states, WAIT_HUMAN)
     if question is not None:
         node = board.stages[question.id]
-        if _is_gate(spec, question.id):
+        if _is_gate(view, question.id):
             # Гейт: у ожидания есть варианты ответа, и они объявлены спекой —
             # человеку не нужно открывать панель, чтобы вспомнить, из чего выбирать.
-            stage = _stage_spec(spec, question.id)
+            stage = _stage_spec(view, question.id)
             options = ", ".join(getattr(getattr(stage, "ask", None), "options", ()) or ()) or "—"
             return wait(
                 WAIT_QUESTION,
@@ -1203,7 +1488,7 @@ def next_stage(spec: Any, events: Iterable[Any], now: Any) -> Decision:
             f"{_age(node.since, seconds)}",
         )
 
-    waiting_retry = _waiting_retry(spec, board, seconds)
+    waiting_retry = _waiting_retry(view, board, seconds)
     if waiting_retry is not None:
         stage, until = waiting_retry
         node = board.stages[stage.id]
@@ -1220,8 +1505,8 @@ def next_stage(spec: Any, events: Iterable[Any], now: Any) -> Decision:
     if all(state == DONE for state in states.values()):
         return done("все этапы закрыты")
 
-    gated = next(stage for stage in spec.stages if states[stage.id] != DONE)
-    what, why = _gate(spec, board, gated)
+    gated = next(stage for stage in view.stages if states[stage.id] != DONE)
+    what, why = _gate(view, board, gated)
     return wait(what or WAIT_FOR_GATE, f"этап {gated.id!r}: {why or 'граф стоит'}")
 
 
@@ -1244,25 +1529,33 @@ def deal_state(spec: Any, events: Iterable[Any]) -> str:
     парковка ждёт **человека**, и отдельного состояния для неё нет
     (`docs/DESIGN.md`). `pending` — есть что запускать; `wait_gate` — запускать
     нечего, а дело не закрыто (граф стоит).
+
+    Решаемый план — это ожидание, а не работа: гейт плана ждёт человека
+    (`wait_human`), нерешённое предложение — графа (`wait_gate`). Без этих двух
+    веток дело с предложенным, но не принятым планом выглядело бы `pending`,
+    хотя запускать по seed-графу нельзя.
     """
     board = _fold(spec, events)
+    view = board.spec
     if board.closed:
         return DONE
-    if not spec.stages:
+    if not view.stages:
         return DONE
     if board.parked is not None:
         return WAIT_HUMAN
-    states = _slice(spec, board)
+    states = _slice(view, board)
     for wanted in (FAILED, PARKED):
-        if _first(spec, states, wanted) is not None:
+        if _first(view, states, wanted) is not None:
             return wanted
     if board.question[1] and not board.question[0]:
         return WAIT_HUMAN  # вопрос дела без адресата: человек всё равно решает
     for wanted in (WAIT_HUMAN, RUNNING):
-        if _first(spec, states, wanted) is not None:
+        if _first(view, states, wanted) is not None:
             return wanted
+    if board.plan_pending is not None:
+        return WAIT_GATE
     if all(state == DONE for state in states.values()):
         return DONE
-    if _first(spec, states, PENDING) is not None:
+    if _first(view, states, PENDING) is not None:
         return PENDING
     return WAIT_GATE

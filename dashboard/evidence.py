@@ -108,6 +108,10 @@ REPORT_KEYS = (
     # (`runner.report_verdict`) и пишет фактом графа; гейт пакета проверяет
     # только то, что отчёт — объект нужной формы, а не смысл приговора.
     "verdict",
+    # План дела (1.0): {stages, reason}. Читает и проверяет его движок
+    # (`runner.report_plan` по `spec.parse_plan`); гейт пакета проверяет форму —
+    # этап плана не предъявляет работу в дереве (`docs/ENGINE-1.0.md`, раздел 4).
+    "plan",
 )
 
 # Имена правил: ими отказ называется в `details` и в `duty why`, чтобы человек
@@ -136,6 +140,11 @@ RULE_BUDGET = "budget.tokens"
 WITNESS_WORK = "commit|artifacts"
 WITNESS_VERDICT = "verdict"
 WITNESS_PUBLISHED = "published"
+# Этап плана (1.0) предъявляет не работу в дереве, а граф: `plan: {stages,
+# reason}`. Требовать от него коммит значило бы требовать ложь — план ещё не
+# работа (`docs/ENGINE-1.0.md`, раздел 4). Смысл предложения проверяет не гейт
+# пакета, а `spec.parse_plan` в движке (`runner.report_plan`).
+WITNESS_PLAN = "plan"
 
 # Имя отчёта в тексте отказа: `result.json:evidence[0].exit` читается как
 # `file:line` спеки, только «строка» здесь — путь внутри отчёта.
@@ -339,6 +348,11 @@ def witness(stage: Any) -> str:
         return WITNESS_VERDICT
     if str(getattr(stage, "role", "") or "") in spec_module.PUBLISHING_ROLES:
         return WITNESS_PUBLISHED
+    if (
+        str(getattr(stage, "id", "") or "") == spec_module.PLAN_STAGE
+        and str(getattr(stage, "kind", spec_module.DEFAULT_STAGE_KIND)) == spec_module.DEFAULT_STAGE_KIND
+    ):
+        return WITNESS_PLAN
     return WITNESS_WORK
 
 
@@ -366,6 +380,17 @@ def _witness_problem(kind: str, result: dict[str, Any]) -> Optional[Issue]:
             _where(WITNESS_PUBLISHED),
             RULE_REQUIRED,
             "этап публикации: нужен published {sha, branch}; commit/artifacts не требуются",
+        )
+    if kind == WITNESS_PLAN:
+        plan = result.get(WITNESS_PLAN)
+        stages = plan.get("stages") if isinstance(plan, dict) else None
+        if isinstance(stages, list) and stages:
+            return None
+        return Issue(
+            _where(WITNESS_PLAN),
+            RULE_REQUIRED,
+            "этап плана: нужен plan {stages: [...], reason}; commit/artifacts не требуются — "
+            "предложение проверяет движок (spec.parse_plan), а не гейт пакета",
         )
     commit = result.get("commit")
     claimed_commit = commit.strip() if isinstance(commit, str) else ""
@@ -802,6 +827,12 @@ def report_schema(stage: Any) -> dict[str, Any]:
             "branch": "ветка, в которую опубликовано, или пустая строка",
             "mr_url": "ссылка на MR — заявка, не проверяется движком",
         }
+    plan: dict[str, Any] = {}
+    if wanted == WITNESS_PLAN:
+        plan = {
+            "stages": "непустой список этапов плана {id, role, kind, needs, evidence, budget}",
+            "reason": "одна строка: почему граф именно такой",
+        }
     schema: dict[str, Any] = {
         "status": list(STATUSES),
         "required_for_done": required,
@@ -813,4 +844,6 @@ def report_schema(stage: Any) -> dict[str, Any]:
         schema["verdict"] = verdict
     if published:
         schema["published"] = published
+    if plan:
+        schema["plan"] = plan
     return schema

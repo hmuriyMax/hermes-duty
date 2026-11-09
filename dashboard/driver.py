@@ -443,7 +443,7 @@ def _closure(conn: sqlite3.Connection, deal: Any, spec: Any, now: float) -> dict
             "status": str(payload.get("status") or "done"),
             "refused": "",
         }
-    stages = [str(stage.id) for stage in getattr(spec, "stages", ())]
+    stages = [str(stage.id) for stage in transit.graph(spec, events)]
     try:
         result = deals.close_stages_done(
             conn,
@@ -506,6 +506,65 @@ def _gate_park(conn: sqlite3.Connection, deal: Any, spec: Any, decision: Any, no
     return {"written": True, "already": False, **fact}
 
 
+def _is_plan_wait(decision: Any) -> bool:
+    """Это ожидание решения по плану (`wait(plan)`)? Тогда шаг — гейт плана.
+
+    Одно слово на плагин: вид ожидания объявлен в `transit` (`WAIT_PLAN`), и
+    драйвер не заводит своего написания.
+    """
+    return (
+        str(getattr(decision, "kind", "") or "") == transit.WAIT
+        and str(getattr(decision, "what", "") or "") == transit.WAIT_PLAN
+    )
+
+
+def _plan_step(conn: sqlite3.Connection, deal: Any, spec: Any, home: Path, now: float) -> Optional[dict[str, Any]]:
+    """Шаг гейта плана: задать вопрос человеку или записать его решение.
+
+    `wait(plan)` — ожидание решения о графе, а не попытка, поэтому шаг не запускает
+    процесса: он либо ставит вопрос в пул (`runner.plan_gate` через `ask()`), либо
+    превращает уже пришедший ответ в `plan_accepted`/`plan_rejected`
+    (`docs/ENGINE-1.0.md`, раздел 5). Строка та же, что у шага попытки: прогон
+    печатает её своим рендером, и второго формата отчёта не заводится.
+
+    `None` — решать нечего (предложения плана в журнале нет): тогда драйвер не
+    выдумывает шаг, а выходит ожиданием с причиной решения `transit`.
+    """
+    events = journal.read_events(conn, str(deal["id"]))
+    plan = runner.plan_gate(conn, spec, deal, events=events, home=Path(home), clock=lambda: float(now))
+    if not plan.get("rev"):
+        return None
+    answered = bool(plan.get("answered"))
+    return {
+        "n": 0,  # номер шага проставит цикл: у гейта плана своя строка, не попытка
+        "stage": str(plan.get("stage") or "") or transit.PLAN_STAGE,
+        "attempt": int(plan.get("attempt") or 0),
+        "started": True,
+        # Отвеченный гейт — исход `done`: человек ответил, и это записано фактом.
+        "outcome": "done" if answered else "",
+        "kind": None,
+        "reason": str(plan.get("reason") or ""),
+        # Номер вопроса печатается только пока ответа нет: у отвеченного гейта
+        # «ждёт ответа» читалось бы наоборот.
+        "question_id": None if answered else plan.get("question_id"),
+        "stage_kind": None,
+        "refused": False,
+        "closed": False,
+        "base": None,
+        "commit": None,
+        "plan": {
+            "rev": int(plan.get("rev") or 0),
+            # `asked` строки шага — «вопрос открыт», а не «поставлен этим вызовом»:
+            # гейт, открытый шагом раньше, всё ещё ждёт того же ответа.
+            "asked": bool(plan.get("question_id")) and not answered,
+            "answered": answered,
+            "accepted": bool(plan.get("accepted")),
+            "rejected": bool(plan.get("rejected")),
+        },
+        "duration_sec": 0.0,
+    }
+
+
 def _release_mine(conn: sqlite3.Connection, deal: Any, spec: Any) -> None:
     """Отпустить лизинг, взятый самим драйвером, — в любом исходе прогона.
 
@@ -514,7 +573,8 @@ def _release_mine(conn: sqlite3.Connection, deal: Any, spec: Any) -> None:
     (другой pid) не трогается: `runner.release` удаляет строку только свою.
     """
     pid = os.getpid()
-    for stage in getattr(spec, "stages", ()):
+    # Этапы — из графа журнала: лизинг бывает и у этапа, добавленного планом.
+    for stage in transit.graph(spec, journal.read_events(conn, str(deal["id"]))):
         runner.release(conn, deal=deal, stage=stage.id, pid=pid)
 
 
@@ -643,6 +703,29 @@ def run(
                     decision = decide()
                     break
                 if decision.kind != transit.RUN:
+                    if _is_plan_wait(decision):
+                        planned = _plan_step(conn, deal, spec, Path(home), tick())
+                        if planned is not None:
+                            made += 1
+                            planned["n"] = made
+                            steps.append(planned)
+                            if on_step is not None:
+                                on_step(planned)
+                            fact = planned.get("plan") or {}
+                            if fact.get("accepted") or fact.get("rejected"):
+                                # Решение по плану записано: граф вырос или этап
+                                # плана вернулся в работу — считать заново по журналу.
+                                decision = decide()
+                                if decision.kind == transit.RUN:
+                                    continue
+                                outcome = _outcome_of(decision)
+                                note = str(decision.reason or "")
+                                break
+                        outcome = OUTCOME_WAIT
+                        note = str(
+                            (planned or {}).get("reason") or getattr(decision, "reason", "") or ""
+                        )
+                        break
                     outcome = _outcome_of(decision)
                     note = str(decision.reason or "")
                     break

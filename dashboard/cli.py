@@ -1905,6 +1905,19 @@ def render_run_step(row: dict[str, Any]) -> str:
     """
     stage = str(row.get("stage") or "—")
     attempt = row.get("attempt") or 0
+    plan = row.get("plan")
+    if isinstance(plan, dict):
+        # Шаг гейта плана — не попытка этапа: у него нет ни исхода, ни длительности,
+        # зато есть ревизия и решение. Читать его как «не поднята» было бы враньём:
+        # попытку никто не поднимал, решался план.
+        rev = plan.get("rev") or 0
+        if plan.get("accepted"):
+            return f"план · ревизия {rev} · принят"
+        if plan.get("rejected"):
+            return f"план · ревизия {rev} · отклонён: {row.get('reason') or 'причина не записана'}"
+        if plan.get("asked"):
+            return f"план · ревизия {rev} · ждёт ответа: вопрос #{row.get('question_id')}"
+        return f"план · ревизия {rev} · {row.get('reason') or 'решения нет'}"
     if not row.get("started"):
         return f"{stage} · попытка {attempt} · не поднята: {row.get('reason') or 'причина не записана'}"
     outcome = str(row.get("outcome") or "")

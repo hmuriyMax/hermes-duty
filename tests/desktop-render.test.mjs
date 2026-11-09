@@ -843,6 +843,8 @@ test('десктоп: страница — таймлайн и развёрну�
     // Отдельной страницы «Завершённые» больше нет — блок живёт на «Сейчас».
     const tabs = [...container.querySelectorAll('.duty-tab')].map((node) => node.textContent)
     assert.ok(!tabs.includes('Завершённые'), `вкладка «Завершённые» вернулась: ${tabs.join(', ')}`)
+    // «Дело» — экран по клику, а не вкладка (как на вебе).
+    assert.ok(!tabs.includes('Дело'), `вкладка «Дело» вернулась: ${tabs.join(', ')}`)
     await new Promise((resolve) => setTimeout(resolve, 600))
 
     assert.ok(container.querySelector('.duty-finished-block'), 'блока завершённых нет на «Сейчас»')

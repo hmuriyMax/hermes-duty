@@ -32,14 +32,15 @@ const REQUEST_TIMEOUT_MS = 20_000
 // же срез с объяснением, «Здоровье» — агрегат по ранам. «Дело» открывается из
 // любой строки, но и сам по себе таб: экран, достижимый только кликом по строке,
 // на своём месте не читается.
+// Вкладки — как на вебе: «Дело» не таб, а экран, который открывается кликом по
+// делу (09.11, Макс: «есть вкладка "Дело", которую мы убирали с веба»).
 const TABS = [
   ['now', 'Сейчас'],
-  ['deal', 'Дело'],
   ['why', 'Почему стоит'],
   ['health', 'Здоровье'],
 ]
 
-// Последнее открытое дело: таб «Дело» возвращает к нему, а не к пустоте.
+// Последнее открытое дело: возврат с экрана дела ведёт к нему, а не к пустоте.
 let lastDeal = null
 
 // ctx.rest, забинденный в register().
@@ -5416,22 +5417,16 @@ function DutyPage() {
         ...Array.from({ length: 6 }, (_, i) => h('div', { className: 'duty-skel', key: `boot-${i}`, style: { width: `${95 - i * 8}%` } })),
       ),
     )
-  } else if (!view.count) {
-    list = h(
-      'div',
-      { className: 'duty-list' },
-      h(EmptyState, { view, model, onReset: resetFilters, stale }),
-      // Закрытые дела видны и тогда, когда активных нет: пустой экран — не повод
-      // прятать историю.
-      h(FinishedBlock, { finished, onPick: pick }),
-    )
   } else {
+    // Таймлайн и завершённые видны и при пустом списке активных: «за сутки дел не
+    // было» — это тоже ответ, а история закрытых дел от фильтров не зависит.
     list = h(
       'div',
       { className: 'duty-list' },
-      // Таймлайн — над списком: «что шло и когда» отвечает раньше, чем строки.
       h(DutyMiniTimeline, { view: timeline, onOpen: openTimelineRow }),
-      ...view.groups.map((group) => h(DealGroup, { key: `grp-${group.repo || 'without'}`, group, selectedKey, onPick: pick })),
+      view.count
+        ? view.groups.map((group) => h(DealGroup, { key: `grp-${group.repo || 'without'}`, group, selectedKey, onPick: pick }))
+        : h(EmptyState, { view, model, onReset: resetFilters, stale }),
       // Завершённые — тем же экраном, ниже активных: отдельной страницы нет
       // (09.11, Макс: «так же как и на вебе убираем отдельную страницу»).
       h(FinishedBlock, { finished, onPick: pick }),

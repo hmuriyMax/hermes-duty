@@ -895,14 +895,15 @@ test('веб: таймлайн — сосиски на общей сетке, к
 })
 
 
-test('веб: завершённые — шапка-переключатель, «ещё» под списком, скелетоны без моргания', () => {
+test('веб: завершённые — без сворачивания, «ещё» под списком, скелетоны без моргания', () => {
   const app = read('dashboard/web/app.js')
   const css = read('dashboard/web/styles.css').replace(/\/\*[\s\S]*?\*\//g, '')
 
-  // Переключатель — шапка, а не отдельная кнопка: шеврон и роль кнопки на всей строке.
-  assert.match(app, /class: `panel-h finished-head/, 'веб: шапка завершённых не переключатель')
-  assert.match(app, /class: 'finished-chev'/, 'веб: у шапки нет шеврона')
-  assert.doesNotMatch(app, /finished-toggle'[\s\S]{0,200}icon-btn/, 'веб: осталась прежняя кнопка в шапке')
+  // Сворачивания нет: шапка — заголовок панели, тела блок не прячет.
+  assert.match(app, /class: 'panel-h finished-head'/, 'веб: шапка завершённых не заголовок')
+  assert.doesNotMatch(app, /finished\.open/, 'веб: вернулось сворачивание блока')
+  assert.doesNotMatch(app, /finished-chev/, 'веб: вернулся шеврон-переключатель')
+  assert.doesNotMatch(css, /\.finished-head:hover/, 'веб: шапка снова выглядит кликабельной')
 
   // Кнопка подгрузки — по центру под таблицей и заметная (акцентная рамка).
   assert.match(css, /\.grp-more \{\s*display: flex;\s*justify-content: center;/s, 'веб: кнопка группы не по центру')

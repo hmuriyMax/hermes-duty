@@ -294,6 +294,8 @@ const finished = {
   // Первый кадр с данными отыгран: входные анимации групп больше не повторяются,
   // иначе каждое нажатие «ещё» моргало всем блоком (09.11, Макс).
   painted: false,
+  // Сворачивания нет: по умолчанию в списках по пятёрке на проект, и блок
+  // занимает мало места (09.11, Макс: «будем сразу развернуто отображать»).
 }
 
 /** Группа по репозиторию: строка состояния заводится один раз. */
@@ -891,14 +893,8 @@ async function loadFinishedMore() {
   await Promise.all(pending.map((group) => loadFinishedGroup(group.repo, 'more')))
 }
 
-/** Свернуть/развернуть блок: свёрнут он до первого запроса. */
-function toggleFinished() {
-  finished.open = !finished.open
-  if (finished.open && !finished.index) void loadFinishedIndex()
-  else render()
-}
-
-
+/* Сворачивания нет: блок «завершённые» всегда раскрыт — по пятёрке на проект он
+ * занимает пол-экрана и не мешает списку активных дел (09.11, Макс). */
 
 /** Бейдж терминального статуса: у закрытого дела нет состояния ожидания. */
 function finishedBadge(deal) {
@@ -959,25 +955,10 @@ function finishedSection() {
   const groups = [...finished.groups.values()]
   const shown = groups.reduce((sum, group) => sum + group.rows.length, 0)
   const total = index ? index.total : 0
-  // Шапка целиком — переключатель: отдельная мелкая кнопка справа читалась как
-  // случайный элемент, а не как «этот блок раскрывается» (09.11, Макс).
+  // Шапка — заголовок панели, без переключателя: блок всегда раскрыт.
   const head = h(
     'div',
-    {
-      class: `panel-h finished-head${finished.open ? ' is-open' : ''}`,
-      role: 'button',
-      tabindex: '0',
-      'aria-expanded': finished.open ? 'true' : 'false',
-      onclick: toggleFinished,
-      onkeydown: (e) => {
-        if (e.key !== 'Enter' && e.key !== ' ') return
-        e.preventDefault()
-        toggleFinished()
-      },
-      'data-key': 'finished-toggle',
-      title: finished.open ? 'свернуть' : 'развернуть',
-    },
-    h('span', { class: 'finished-chev', 'aria-hidden': 'true' }, '⌄'),
+    { class: 'panel-h finished-head' },
     'завершённые',
     index ? h('span', { class: 'muted finished-count' }, `${shown} из ${total}`) : null,
     h('span', { class: 'muted finished-hint' }, `по ${finished.perRepo} на проект`),
@@ -986,57 +967,51 @@ function finishedSection() {
   // Первый кадр с настоящими строками: вход групп играет один раз. Дальше блок
   // меняется на месте — иначе каждое «ещё» моргало всем списком.
   const enter = !finished.painted && groups.some((group) => group.rows.length)
-  if (finished.open) {
-    if (finished.error && !index) {
-      body.push(errorBanner(`ошибка запроса /deals: ${finished.error}`, () => void loadFinishedIndex()))
-    } else if (!index) {
-      body.push(finishedSkeleton())
+  if (finished.error && !index) {
+    body.push(errorBanner(`ошибка запроса /deals: ${finished.error}`, () => void loadFinishedIndex()))
+  } else if (!index) {
+    body.push(finishedSkeleton())
+  } else {
+    if (index.errors.length) {
+      body.push(noticesBlock(index.errors.map((err) => `источник ${err.source} недоступен: ${err.reason}`)))
+    }
+    if (!groups.length) {
+      body.push(h('div', { class: 'panel-b muted' }, index.note || 'в store нет ни одного закрытого дела'))
     } else {
-      if (index.errors.length) {
-        body.push(noticesBlock(index.errors.map((err) => `источник ${err.source} недоступен: ${err.reason}`)))
-      }
-      if (!groups.length) {
-        body.push(h('div', { class: 'panel-b muted' }, index.note || 'в store нет ни одного закрытого дела'))
-      } else {
-        body.push(
+      body.push(
+        h(
+          'div',
+          { class: `finished-body${enter ? ' is-enter' : ''}` },
+          ...groups.map((group, position) => finishedGroupSection(group, position, enter)),
+        ),
+      )
+      // Общая кнопка — по пятёрке во всех проектах сразу; своя у каждой группы.
+      const pending = groups.some((group) => !group.done || group.loading)
+      body.push(
+        h(
+          'div',
+          { class: 'pager' },
           h(
-            'div',
-            { class: `finished-body${enter ? ' is-enter' : ''}` },
-            ...groups.map((group, position) => finishedGroupSection(group, position, enter)),
+            'button',
+            {
+              class: `chip more-btn${groups.some((group) => group.loading) ? ' busy' : ''}`,
+              disabled: !pending,
+              onclick: () => void loadFinishedMore(),
+              'data-key': 'finished-more',
+            },
+            pending ? `загрузить ещё по ${finished.perRepo}` : 'всё загружено',
           ),
-        )
-        const pending = groups.some((group) => !group.done || group.loading)
-        body.push(
           h(
-            'div',
-            { class: 'pager' },
-            h(
-              'button',
-              {
-                class: `chip more-btn${groups.some((group) => group.loading) ? ' busy' : ''}`,
-                disabled: !pending,
-                onclick: () => void loadFinishedMore(),
-                'data-key': 'finished-more',
-              },
-              pending ? `загрузить ещё по ${finished.perRepo}` : 'всё загружено',
-            ),
-            h(
-              'span',
-              { class: 'muted' },
-              `проектов: ${groups.length} · по ${finished.perRepo} на проект${finished.pages ? ` · ещё ${finished.pages}` : ''}`,
-            ),
+            'span',
+            { class: 'muted' },
+            `проектов: ${groups.length} · по ${finished.perRepo} на проект${finished.pages ? ` · ещё ${finished.pages}` : ''}`,
           ),
-        )
-      }
+        ),
+      )
     }
   }
   if (enter) finished.painted = true
-  return h(
-    'div',
-    { class: `panel finished-panel${finished.open ? ' is-open' : ''}`, 'data-key': 'finished' },
-    head,
-    ...body,
-  )
+  return h('div', { class: 'panel finished-panel', 'data-key': 'finished' }, head, ...body)
 }
 
 /**
@@ -2724,7 +2699,6 @@ function onRoute() {
   // адрес открывает ту же страницу с развёрнутым блоком завершённых.
   if (route.name === 'deals') {
     route = { name: 'now' }
-    finished.open = true
   }
   if (route.name !== 'deal') dealPoll.failures = 0
   // Данные, которых нет для нового экрана, не переиспользуем: иначе «Здоровье»

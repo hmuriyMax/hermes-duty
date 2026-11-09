@@ -1228,33 +1228,15 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
  */
 .finished-panel { margin-top: 14px; }
 
-/* Шапка — сам переключатель: шеврон, название, числа. Отдельная мелкая кнопка
-   справа читалась как случайный элемент (09.11, Макс: «кнопка кривая»). */
+/* Шапка — обычный заголовок панели: блок всегда раскрыт, переключателя нет
+   (09.11, Макс: по пятёрке на проект он и так занимает немного места). */
 .finished-head {
   display: flex;
   align-items: center;
   gap: 8px;
-  /* Без отрицательных отступов: они расширяли панель и давали горизонтальный
-     выход за её край. */
   margin: 0;
   padding: 4px 0;
-  border-radius: 6px;
-  cursor: pointer;
-  user-select: none;
-  transition: background .12s ease;
 }
-.finished-head:hover { background: var(--bg-hover); }
-.finished-head:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.finished-chev {
-  display: inline-block;
-  width: 14px;
-  color: var(--text-3);
-  font-size: 12px;
-  line-height: 1;
-  transition: transform .16s ease, color .12s ease;
-}
-.finished-head:hover .finished-chev { color: var(--text); }
-.finished-head.is-open .finished-chev { transform: rotate(180deg); }
 .finished-count { font-size: 11.5px; }
 .finished-hint { font-size: 11px; margin-left: auto; }
 
@@ -1363,7 +1345,6 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
   .finished-group tbody tr,
   .skel,
   .skel-cell,
-  .skel-tr,
-  .finished-chev { animation: none; transition: none; }
+  .skel-tr { animation: none; transition: none; }
   .more-btn:hover:not([disabled]) { transform: none; }
 }

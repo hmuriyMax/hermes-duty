@@ -34,7 +34,6 @@ const REQUEST_TIMEOUT_MS = 20_000
 // на своём месте не читается.
 const TABS = [
   ['now', 'Сейчас'],
-  ['deals', 'Завершённые'],
   ['deal', 'Дело'],
   ['why', 'Почему стоит'],
   ['health', 'Здоровье'],
@@ -3603,6 +3602,8 @@ const CSS = `
 
 /* Кнопка подгрузки под списком проекта: по центру и заметная — единственный
  * способ получить следующие строки, искать её в углу не надо. */
+.duty-finished-block{margin:18px 0 0;border-top:1px solid var(--ui-stroke-tertiary);padding-top:10px}
+.duty-finished-head{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--ui-text-tertiary)}
 .duty-more-row{display:flex;justify-content:center;padding:10px 0 14px}
 .duty-more-btn{font-family:inherit;font-size:12px;padding:5px 20px;border-radius:999px;cursor:pointer;color:var(--ui-text-primary);border:1px solid color-mix(in srgb,var(--ui-accent) 45%,var(--ui-stroke-secondary));background:color-mix(in srgb,var(--ui-accent) 10%,transparent)}
 .duty-more-btn:hover:not([disabled]){border-color:var(--ui-accent);background:color-mix(in srgb,var(--ui-accent) 18%,transparent)}
@@ -4754,11 +4755,19 @@ function FinishedTable({ rows, pending, onPick }) {
   )
 }
 
-function FinishedScreen({ finished, onPick }) {
+/**
+ * Блок «завершённые» на экране «Сейчас»: по пятёрке на проект, свой курсор у
+ * каждой группы, кнопка «ещё» под списком.
+ *
+ * Сворачивания нет: блок всегда раскрыт (09.11, Макс) — по пятёрке на проект он
+ * занимает пол-экрана и не мешает списку активных дел. Общая кнопка поднимает по
+ * пятёрке сразу во всех проектах, своя — только в одном.
+ */
+function FinishedBlock({ finished, onPick }) {
   if (finished.error && !finished.index) {
     return h(
       'div',
-      { className: 'duty-scroll' },
+      { className: 'duty-panel duty-finished-block', style: { margin: '10px 0 0' } },
       h(
         'div',
         { className: 'duty-banner', style: { margin: 0 } },
@@ -4770,41 +4779,44 @@ function FinishedScreen({ finished, onPick }) {
   if (!finished.index) {
     return h(
       'div',
-      { className: 'duty-scroll' },
+      { className: 'duty-panel duty-finished-block' },
+      h('div', { className: 'duty-group-h' }, h('span', null, 'завершённые')),
       h(
         'div',
         { className: 'duty-skel-row' },
-        ...Array.from({ length: 5 }, (_, i) => h('div', { className: 'duty-skel', key: `fs-${i}`, style: { width: `${92 - i * 10}%` } })),
+        ...Array.from({ length: 4 }, (_, i) => h('div', { className: 'duty-skel', key: `fs-${i}`, style: { width: `${88 - i * 9}%` } })),
       ),
     )
   }
   const repos = finished.index.repos || []
   const shownRows = Object.values(finished.groups).reduce((sum, group) => sum + group.rows.length, 0)
   const shownTotal = repos.reduce((sum, item) => sum + item.total, 0)
+  const anyPending = repos.some((item) => {
+    const group = finished.groups[item.repo]
+    return !group || !group.done || group.loading
+  })
   return h(
     'div',
-    { className: 'duty-scroll' },
+    { className: 'duty-panel duty-finished-block' },
+    h(
+      'div',
+      { className: 'duty-group-h duty-finished-head' },
+      h('span', null, 'завершённые'),
+      h('span', { className: 'duty-num' }, `${shownRows} из ${shownTotal}`),
+      h('span', { className: 'duty-spacer' }),
+      h('span', { className: 'duty-muted' }, `по ${FINISHED_PER_REPO} на проект`),
+    ),
     finished.index.errors && finished.index.errors.length
       ? h(
           'div',
-          { className: 'duty-note', style: { margin: '0 0 10px' } },
+          { className: 'duty-note', style: { margin: '0 0 8px' } },
           ...finished.index.errors.map((err, i) => h('div', { key: `fe-${i}` }, `источник ${err.source} недоступен: ${err.reason}`)),
         )
       : null,
-    h(
-      'div',
-      { className: 'duty-muted', style: { margin: '0 0 10px' } },
-      'здесь только завершённые дела — закрытые и архивные: причина закрытия, этапы, попытки, вопросы и длительность из журнала; карточки kanban — отдельное наблюдение, не дела',
-    ),
-    h(
-      'div',
-      { className: 'duty-muted duty-num', style: { margin: '0 0 10px' } },
-      `проектов: ${repos.length} · показано ${shownRows} из ${shownTotal}${finished.index.note ? ` · ${finished.index.note}` : ''}`,
-    ),
     repos.length
       ? h(
           'div',
-          { className: 'duty-list duty-finished-list' },
+          null,
           ...repos.map((item) => {
             const group = finished.groups[item.repo] || { ...EMPTY_FINISHED_GROUP, total: item.total }
             const left = Math.max(0, group.total - group.rows.length)
@@ -4848,6 +4860,21 @@ function FinishedScreen({ finished, onPick }) {
               ),
             )
           }),
+          // Общая кнопка — по пятёрке во всех проектах сразу.
+          h(
+            'div',
+            { className: 'duty-more-row duty-more-all' },
+            h(
+              'button',
+              {
+                type: 'button',
+                className: anyPending ? 'duty-more-btn' : 'duty-more-btn is-done',
+                disabled: !anyPending,
+                onClick: () => void finished.loadMoreAll(),
+              },
+              anyPending ? `загрузить ещё по ${FINISHED_PER_REPO}` : 'всё загружено',
+            ),
+          ),
         )
       : h(
           'div',
@@ -5163,8 +5190,9 @@ function DutyPage() {
   const [tick, setTick] = useState(() => Date.now())
   // «Здоровье» запрашивается только когда экран открыт: это скан всех досок.
   const stats = useStats(screen === 'health')
-  // «Завершённые» — тоже по требованию: список закрытых дел не нужен «Сейчас».
-  const finished = useFinishedPages(screen === 'deals')
+  // «Завершённые» — часть экрана «Сейчас» (как на вебе): блок стоит под списком
+  // активных дел, по пятёрке на проект, и сворачивать его больше нечем.
+  const finished = useFinishedPages(true)
 
   // Поиск — локальный и с задержкой: данные не перезапрашиваются на каждый символ.
   useEffect(() => {
@@ -5389,7 +5417,14 @@ function DutyPage() {
       ),
     )
   } else if (!view.count) {
-    list = h('div', { className: 'duty-list' }, h(EmptyState, { view, model, onReset: resetFilters, stale }))
+    list = h(
+      'div',
+      { className: 'duty-list' },
+      h(EmptyState, { view, model, onReset: resetFilters, stale }),
+      // Закрытые дела видны и тогда, когда активных нет: пустой экран — не повод
+      // прятать историю.
+      h(FinishedBlock, { finished, onPick: pick }),
+    )
   } else {
     list = h(
       'div',
@@ -5397,6 +5432,9 @@ function DutyPage() {
       // Таймлайн — над списком: «что шло и когда» отвечает раньше, чем строки.
       h(DutyMiniTimeline, { view: timeline, onOpen: openTimelineRow }),
       ...view.groups.map((group) => h(DealGroup, { key: `grp-${group.repo || 'without'}`, group, selectedKey, onPick: pick })),
+      // Завершённые — тем же экраном, ниже активных: отдельной страницы нет
+      // (09.11, Макс: «так же как и на вебе убираем отдельную страницу»).
+      h(FinishedBlock, { finished, onPick: pick }),
     )
   }
 
@@ -5429,8 +5467,6 @@ function DutyPage() {
       : h('div', { className: 'duty-scroll' }, h('div', { className: 'duty-skel-row' }, ...Array.from({ length: 6 }, (_, i) => h('div', { className: 'duty-skel', key: `ws-${i}`, style: { width: `${95 - i * 8}%` } }))))
   } else if (screen === 'health') {
     content = h(HealthScreen, { stats })
-  } else if (screen === 'deals') {
-    content = h(FinishedScreen, { finished, onPick: pick })
   } else {
     content = h('div', { className: 'duty-body' }, list)
   }

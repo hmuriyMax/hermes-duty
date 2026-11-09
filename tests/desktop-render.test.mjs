@@ -62,7 +62,7 @@ function moduleForRender(root) {
   const source = read('desktop/plugin.js')
     .replace(/from '@hermes\/plugin-sdk'/, "from './sdk.mjs'")
     .concat(
-      '\nexport { DutyLane, DutyAttemptRow, ScalePanel, KpiStrip, SpecStrip, CallInspector, DutyMiniTimeline, FinishedScreen, shapeFinishedRow, dealTimeline, DutyPage }\n',
+      '\nexport { DutyLane, DutyAttemptRow, ScalePanel, KpiStrip, SpecStrip, CallInspector, DutyMiniTimeline, FinishedBlock, shapeFinishedRow, dealTimeline, DutyPage }\n',
     )
   const file = join(dir, 'plugin.mjs')
   writeFileSync(file, source)
@@ -661,7 +661,7 @@ test('десктоп: мини-таймлайн — сосиска на обще
   assert.ok(tickRule.includes('translateX(-50%)'), 'подпись деления не центрируется')
 })
 
-test('десктоп: завершённые — «ещё» по центру под списком и скелетоны при подгрузке', async (t) => {
+test('десктоп: блок завершённых — без сворачивания, «ещё» по центру под списком', async (t) => {
   const root = reactRoot()
   if (!root) return t.skip('нет React в ~/.hermes/hermes-agent/node_modules')
 
@@ -678,7 +678,7 @@ test('десктоп: завершённые — «ещё» по центру п
   })
   const render = (groups) =>
     renderToStaticMarkup(
-      React.createElement(mod.FinishedScreen, {
+      React.createElement(mod.FinishedBlock, {
         onPick: () => {},
         finished: {
           index: {
@@ -691,6 +691,7 @@ test('десктоп: завершённые — «ещё» по центру п
           error: null,
           reload: () => {},
           loadGroup: () => {},
+          loadMoreAll: () => {},
         },
       }),
     )
@@ -712,6 +713,11 @@ test('десктоп: завершённые — «ещё» по центру п
   // Всё загружено — кнопка гаснет и говорит словами, а не остаётся яркой.
   const done = render({ rows: [row], total: 1, next: null, done: true, loading: false, error: null })
   assert.match(done, /duty-more-btn is-done/, 'состояние «всё» не отличается от кнопки')
+
+  // Сворачивания нет: блок не прячет тело под переключателем.
+  assert.ok(!/duty-finished-toggle|aria-expanded/.test(loaded), 'вернулось сворачивание блока')
+  // Общая кнопка поднимает по пятёрке сразу во всех проектах.
+  assert.match(loaded, /duty-more-all/, 'нет общей кнопки «загрузить ещё по 5»')
 })
 
 
@@ -721,7 +727,7 @@ test('десктоп: завершённые — «ещё» по центру п
  * эффекты и состояние: без них не видно ни подгрузки по курсору, ни того, что
  * скелетоны появляются до ответа.
  */
-test('десктоп: страница — таймлайн на «Сейчас» и «ещё» по проектам в завершённых', async (t) => {
+test('десктоп: страница — таймлайн и развёрнутый блок завершённых на «Сейчас»', async (t) => {
   const reactModules = reactRoot()
   if (!reactModules) return t.skip('нет React в ~/.hermes/hermes-agent/node_modules')
   if (!existsSync(join(reactModules, 'jsdom', 'package.json'))) return t.skip('нет jsdom')
@@ -834,13 +840,13 @@ test('десктоп: страница — таймлайн на «Сейчас�
     assert.ok(container.querySelectorAll('.duty-mtl-seg').length >= 1, 'полосы этапов не пришли из /spans')
     assert.ok(container.querySelectorAll('.duty-mtl-tick').length >= 5, 'шкала без делений')
 
-    // «Завершённые»: пятёрка на проект и своя кнопка под таблицей.
-    const tab = [...container.querySelectorAll('.duty-tab')].find((node) => node.textContent === 'Завершённые')
-    assert.ok(tab, 'нет вкладки «Завершённые»')
-    tab.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }))
-    await new Promise((resolve) => setTimeout(resolve, 500))
+    // Отдельной страницы «Завершённые» больше нет — блок живёт на «Сейчас».
+    const tabs = [...container.querySelectorAll('.duty-tab')].map((node) => node.textContent)
+    assert.ok(!tabs.includes('Завершённые'), `вкладка «Завершённые» вернулась: ${tabs.join(', ')}`)
+    await new Promise((resolve) => setTimeout(resolve, 600))
 
-    const group = container.querySelector('.duty-group')
+    assert.ok(container.querySelector('.duty-finished-block'), 'блока завершённых нет на «Сейчас»')
+    const group = container.querySelector('.duty-finished-block .duty-group')
     assert.ok(group, 'группа завершённых не нарисована')
     assert.equal(group.querySelectorAll('tbody tr.duty-row').length, 5, 'на проект показано не пять строк')
     const more = group.querySelector('.duty-more-btn')

@@ -2652,3 +2652,18 @@ test('мини-таймлайн: легенда называет состоян�
   assert.deepEqual(view.legend.map((item) => item.tone), ['green', 'blue'])
   assert.ok(!view.legend.some((item) => /impl|check/.test(item.label)), 'в легенде имена этапов')
 })
+
+
+test('мини-таймлайн: на суточном окне деления по часам, и каждое на своей линии', () => {
+  const from = TL_NOW - 15 * 3600
+  const deal = tlDeal('d_h', { createdAt: from, state: 'working', stateLabel: 'работает', tone: 'blue' })
+  const view = dealTimeline([deal], [], TL_NOW, {})
+  assert.equal(view.grid.stepSec, 3600, 'шаг делений на суточном окне не часовой')
+  assert.ok(view.ticks.length >= 10, `делений слишком мало: ${view.ticks.length}`)
+  // Подпись — время без секунд; позиция каждого деления совпадает с началом шага.
+  for (const tick of view.ticks) {
+    assert.match(tick.label, /^\d\d:\d\d$/, `подпись деления не время: ${tick.label}`)
+    const expected = ((tick.at - from) / (TL_NOW - from)) * 100
+    assert.ok(Math.abs(tick.leftPct - expected) < 0.05, `деление смещено: ${tick.leftPct} vs ${expected}`)
+  }
+})

@@ -1146,7 +1146,8 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
   top: 0;
   bottom: 0;
   overflow: hidden;
-  border-radius: 999px;
+  /* Скругление маленькое: дело — полоса на шкале времени, а не таблетка. */
+  border-radius: 3px;
   background: color-mix(in srgb, var(--text-3) 20%, transparent);
   cursor: pointer;
 }
@@ -1199,7 +1200,8 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
   color: var(--text-3);
   white-space: nowrap;
 }
-.tl-tick:first-child { transform: none; }
+/* Подпись центрируется на своём делении, включая первую: раньше она стояла от
+   линии вправо, и время выглядело сдвинутым относительно сетки. */
 
 /* Легенда: цвет ↔ состояние этапа — тот же словарь, что на странице дела. */
 .tl-legend {
@@ -1225,32 +1227,64 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
  * группы и строки въезжают по очереди, скелетоны занимают место чисел до ответа.
  */
 .finished-panel { margin-top: 14px; }
-.finished-panel .panel-h { display: flex; align-items: center; gap: 10px; }
-.finished-count { font-size: 11.5px; }
 
-.finished-panel .panel-h .icon-btn {
-  font-size: 11px;
-  text-transform: none;
-  letter-spacing: 0;
-  color: var(--text-2);
-  border: 1px solid var(--border);
+/* Шапка — сам переключатель: шеврон, название, числа. Отдельная мелкая кнопка
+   справа читалась как случайный элемент (09.11, Макс: «кнопка кривая»). */
+.finished-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  /* Без отрицательных отступов: они расширяли панель и давали горизонтальный
+     выход за её край. */
+  margin: 0;
+  padding: 4px 0;
   border-radius: 6px;
-  padding: 2px 8px;
-  background: var(--card);
   cursor: pointer;
-  transition: background .12s ease, color .12s ease;
+  user-select: none;
+  transition: background .12s ease;
 }
-.finished-panel .panel-h .icon-btn:hover { background: var(--bg-hover); color: var(--text); }
+.finished-head:hover { background: var(--bg-hover); }
+.finished-head:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.finished-chev {
+  display: inline-block;
+  width: 14px;
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 1;
+  transition: transform .16s ease, color .12s ease;
+}
+.finished-head:hover .finished-chev { color: var(--text); }
+.finished-head.is-open .finished-chev { transform: rotate(180deg); }
+.finished-count { font-size: 11.5px; }
+.finished-hint { font-size: 11px; margin-left: auto; }
 
-.finished-body { animation: finished-in .22s ease both; }
+/* Вход играет один раз — на первом кадре с данными. Дальше блок обновляется на
+   месте: подгрузка показывает скелетоны, а не перерисовывает весь список. */
+.finished-body.is-enter { animation: finished-in .22s ease both; }
 
 .finished-group {
-  animation: finished-in .28s cubic-bezier(.22, .75, .3, 1) both;
   border-top: 1px solid var(--border);
+}
+.finished-body.is-enter .finished-group {
+  animation: finished-in .28s cubic-bezier(.22, .75, .3, 1) both;
 }
 .finished-group:first-child { border-top: none; }
 .finished-group .grp-h { display: flex; align-items: center; gap: 10px; }
-.finished-group tbody tr { animation: finished-row-in .26s ease both; }
+.finished-group .grp-more {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0 12px;
+}
+.finished-group .grp-more .more-btn { font-size: 11.5px; }
+/* Новая строка въезжает на своём месте; уже показанные не переигрывают вход,
+   поэтому morph переиспользует их по `data-key`. */
+.finished-group tbody tr.row { animation: finished-row-in .24s ease both; }
+.finished-group tbody tr.skel-tr { animation: skel-appear .2s ease both; }
+@keyframes skel-appear {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
 
 @keyframes finished-in {
   from { opacity: 0; transform: translateY(-4px); }
@@ -1301,6 +1335,7 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
   .finished-group tbody tr,
   .skel,
   .skel-cell,
-  .skel-tr { animation: none; }
+  .skel-tr,
+  .finished-chev { animation: none; transition: none; }
   .more-btn:hover:not([disabled]) { transform: none; }
 }

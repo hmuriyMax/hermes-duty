@@ -279,6 +279,10 @@ const dealSnap = { key: '', data: null, attempts: null, error: null, loading: fa
  * повторяя строк (курсор — ключ `finished_at:id`, а не смещение).
  */
 const FINISHED_PER_REPO = 5
+// Сколько скелетоны держатся как минимум: локальный ответ приходит за десятки
+// миллисекунд, и без этого «разворачивание» не увидеть — строки просто прыгали
+// (09.11, Макс: «ожидал, что будут разворачиваться скелетоны»).
+const SKELETON_MIN_MS = 260
 const finished = {
   open: false,
   perRepo: FINISHED_PER_REPO,
@@ -287,6 +291,9 @@ const finished = {
   error: null,
   loading: false,
   pages: 0, // сколько раз нажимали «загрузить ещё» — для счётчика «показано N»
+  // Первый кадр с данными отыгран: входные анимации групп больше не повторяются,
+  // иначе каждое нажатие «ещё» моргало всем блоком (09.11, Макс).
+  painted: false,
 }
 
 /** Группа по репозиторию: строка состояния заводится один раз. */
@@ -852,6 +859,7 @@ async function loadFinishedGroup(repo, dir = 'more') {
   group.loading = true
   group.error = null
   render()
+  const startedAt = Date.now()
   try {
     const query =
       `/deals?limit=${finished.perRepo}&repo=${encodeURIComponent(repo)}` +
@@ -867,6 +875,9 @@ async function loadFinishedGroup(repo, dir = 'more') {
   } catch (err) {
     group.error = err.message
   } finally {
+    // Скелетоны успевают показаться: ответ с локального бэкенда быстрее глаза.
+    const wait = SKELETON_MIN_MS - (Date.now() - startedAt)
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait))
     group.loading = false
     render()
   }
@@ -903,6 +914,9 @@ function finishedRow(deal) {
     'tr',
     {
       class: 'row',
+      // Ключ — id дела: при подгрузке morph переиспользует строки, и входная
+      // анимация играет только у новых (иначе блок моргал целиком).
+      'data-key': `finished-row:${deal.id}`,
       tabindex: '0',
       title: `${deal.repoLabel} · ${deal.causeText}`,
       onclick: open,
@@ -945,24 +959,33 @@ function finishedSection() {
   const groups = [...finished.groups.values()]
   const shown = groups.reduce((sum, group) => sum + group.rows.length, 0)
   const total = index ? index.total : 0
+  // Шапка целиком — переключатель: отдельная мелкая кнопка справа читалась как
+  // случайный элемент, а не как «этот блок раскрывается» (09.11, Макс).
   const head = h(
     'div',
-    { class: 'panel-h' },
+    {
+      class: `panel-h finished-head${finished.open ? ' is-open' : ''}`,
+      role: 'button',
+      tabindex: '0',
+      'aria-expanded': finished.open ? 'true' : 'false',
+      onclick: toggleFinished,
+      onkeydown: (e) => {
+        if (e.key !== 'Enter' && e.key !== ' ') return
+        e.preventDefault()
+        toggleFinished()
+      },
+      'data-key': 'finished-toggle',
+      title: finished.open ? 'свернуть' : 'развернуть',
+    },
+    h('span', { class: 'finished-chev', 'aria-hidden': 'true' }, '⌄'),
     'завершённые',
     index ? h('span', { class: 'muted finished-count' }, `${shown} из ${total}`) : null,
-    h(
-      'button',
-      {
-        class: 'icon-btn',
-        style: 'margin-left:auto',
-        onclick: toggleFinished,
-        'data-key': 'finished-toggle',
-        title: finished.open ? 'свернуть' : 'развернуть',
-      },
-      finished.open ? 'свернуть ⌃' : 'показать ⌄',
-    ),
+    h('span', { class: 'muted finished-hint' }, `по ${finished.perRepo} на проект`),
   )
   const body = []
+  // Первый кадр с настоящими строками: вход групп играет один раз. Дальше блок
+  // меняется на месте — иначе каждое «ещё» моргало всем списком.
+  const enter = !finished.painted && groups.some((group) => group.rows.length)
   if (finished.open) {
     if (finished.error && !index) {
       body.push(errorBanner(`ошибка запроса /deals: ${finished.error}`, () => void loadFinishedIndex()))
@@ -978,10 +1001,8 @@ function finishedSection() {
         body.push(
           h(
             'div',
-            { class: 'finished-body' },
-            ...groups.map((group, position) =>
-              finishedGroupSection(group, position),
-            ),
+            { class: `finished-body${enter ? ' is-enter' : ''}` },
+            ...groups.map((group, position) => finishedGroupSection(group, position, enter)),
           ),
         )
         const pending = groups.some((group) => !group.done || group.loading)
@@ -1009,6 +1030,7 @@ function finishedSection() {
       }
     }
   }
+  if (enter) finished.painted = true
   return h(
     'div',
     { class: `panel finished-panel${finished.open ? ' is-open' : ''}`, 'data-key': 'finished' },
@@ -1017,39 +1039,41 @@ function finishedSection() {
   )
 }
 
-/** Группа завершённых: имя проекта, «5 из 23» и своя кнопка «+5». */
-function finishedGroupSection(group, position) {
+/**
+ * Группа завершённых: имя проекта, «5 из 23» и своя кнопка под списком.
+ *
+ * Кнопка стоит **под** таблицей, а не в шапке: новые строки появляются внизу, и
+ * ожидание «нажму и увижу здесь» совпадает с тем, что происходит (09.11, Макс).
+ * Пока идёт подгрузка, на месте будущих строк стоят скелетоны той же геометрии —
+ * страница не мигает и не прыгает, а показывает, где окажутся данные.
+ */
+function finishedGroupSection(group, position, enter) {
   const label = repoLabelOf(group.repo)
   const left = Math.max(0, group.total - group.rows.length)
   const rows = group.rows.length
     ? group.rows.map((deal) => finishedRow(deal))
-    : [0, 1, 2].map((index) =>
-        h(
-          'tr',
-          { class: 'skel-tr', style: `animation-delay:${index * 70}ms` },
-          h('td', { colspan: '10' }, h('span', { class: 'skel skel-cell' })),
-        ),
-      )
+    : [0, 1, 2].map((index) => skelRow(index))
+  // Подгрузка: пятёрка скелетонов встаёт после показанных строк.
+  const pending = group.loading && !group.done ? Math.min(finished.perRepo, Math.max(1, left)) : 0
+  for (let index = 0; index < pending; index += 1) rows.push(skelRow(index, 'pending'))
+  const moreText = group.done
+    ? 'это все закрытые дела'
+    : group.loading
+      ? 'загружаю…'
+      : `ещё ${Math.min(finished.perRepo, Math.max(1, left))}${left > finished.perRepo ? ` · осталось ${left}` : ''}`
   return h(
     'section',
-    { class: 'finished-group', style: `animation-delay:${Math.min(position * 60, 300)}ms` },
+    {
+      class: 'finished-group',
+      'data-key': `finished-group:${group.repo}`,
+      style: enter ? `animation-delay:${Math.min(position * 60, 300)}ms` : 'animation:none',
+    },
     h(
       'div',
       { class: 'grp-h' },
       h('span', { class: 'grp-k mono', title: group.repo || 'репозиторий не назван' }, label),
-      h('span', { class: 'n' }, `${rows.length ? group.rows.length : 0} из ${group.total}`),
+      h('span', { class: 'n' }, `${group.rows.length} из ${group.total}`),
       group.error ? h('span', { class: 'grp-s danger' }, `ошибка: ${group.error}`) : null,
-      h(
-        'button',
-        {
-          class: `chip more-btn${group.loading ? ' busy' : ''}`,
-          style: 'margin-left:auto',
-          disabled: group.loading || group.done,
-          onclick: () => void loadFinishedGroup(group.repo, 'more'),
-          'data-key': `finished-more:${group.repo}`,
-        },
-        group.done ? 'всё' : group.loading ? 'загрузка…' : `+${finished.perRepo}${left ? ` · осталось ${left}` : ''}`,
-      ),
     ),
     h(
       'table',
@@ -1075,6 +1099,34 @@ function finishedGroupSection(group, position) {
       ),
       h('tbody', null, ...rows),
     ),
+    // Под списком — там, где появятся новые строки.
+    h(
+      'div',
+      { class: 'grp-more' },
+      h(
+        'button',
+        {
+          class: `chip more-btn${group.loading ? ' busy' : ''}`,
+          disabled: group.loading || group.done,
+          onclick: () => void loadFinishedGroup(group.repo, 'more'),
+          'data-key': `finished-more:${group.repo}`,
+        },
+        moreText,
+      ),
+    ),
+  )
+}
+
+/** Строка-скелетон: держит геометрию настоящей строки, пока данных нет. */
+function skelRow(index, kind = 'first') {
+  return h(
+    'tr',
+    {
+      class: `skel-tr is-${kind}`,
+      'data-key': `skel:${kind}:${index}`,
+      style: `animation-delay:${index * 70}ms`,
+    },
+    h('td', { colspan: '10' }, h('span', { class: 'skel skel-cell' })),
   )
 }
 

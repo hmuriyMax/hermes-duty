@@ -876,7 +876,9 @@ test('веб: таймлайн — сосиски на общей сетке, к
   assert.doesNotMatch(css, /\.tl-mini-row:hover/s, 'веб: строка подсвечивается на наведении')
 
   // Скругление одно — у сосиски; этапы стыкуются без скруглений.
-  assert.match(css, /\.tl-sausage \{[^}]*border-radius: 999px/s, 'веб: у сосиски нет единой формы')
+  // Скругление маленькое и одно на всю фигуру: дело — полоса на шкале, а не
+  // таблетка (09.11, Макс: «сосиску ты конечно слишком закруглил»).
+  assert.match(css, /\.tl-sausage \{[^}]*border-radius: 3px/s, 'веб: у сосиски нет единой формы')
   assert.doesNotMatch(css, /\.tl-seg \{[^}]*border-radius/s, 'веб: у этапа своё скругление')
 
   // Цвет — состояние этапа из словаря страницы дела, а не своя палитра имён.
@@ -885,4 +887,35 @@ test('веб: таймлайн — сосиски на общей сетке, к
   assert.match(css, /\.tl-seg\.t-green \{ --seg: var\(--ok\); \}/, 'веб: пройден не зелёный страницы дела')
   assert.match(css, /\.tl-seg\.t-red \{ --seg: var\(--danger\); \}/, 'веб: отказ не красный страницы дела')
   assert.match(css, /\.tl-seg\.t-blue \{ --seg: var\(--accent\); \}/, 'веб: идущий не акцент страницы дела')
+})
+
+
+test('веб: завершённые — шапка-переключатель, «ещё» под списком, скелетоны без моргания', () => {
+  const app = read('dashboard/web/app.js')
+  const css = read('dashboard/web/styles.css').replace(/\/\*[\s\S]*?\*\//g, '')
+
+  // Переключатель — шапка, а не отдельная кнопка: шеврон и роль кнопки на всей строке.
+  assert.match(app, /class: `panel-h finished-head/, 'веб: шапка завершённых не переключатель')
+  assert.match(app, /class: 'finished-chev'/, 'веб: у шапки нет шеврона')
+  assert.doesNotMatch(app, /finished-toggle'[\s\S]{0,200}icon-btn/, 'веб: осталась прежняя кнопка в шапке')
+
+  // Кнопка подгрузки группы — после таблицы, в футере группы.
+  const group = app.slice(app.indexOf('function finishedGroupSection'))
+  const tableAt = group.indexOf("h(\n      'table'")
+  const moreAt = group.indexOf("class: 'grp-more'")
+  assert.ok(tableAt > -1 && moreAt > tableAt, 'веб: кнопка группы стоит не под таблицей')
+
+  // Подгрузка рисует скелетоны и держит их минимум SKELETON_MIN_MS.
+  assert.match(app, /const SKELETON_MIN_MS = 260/, 'веб: скелетоны не держатся минимальное время')
+  assert.match(app, /const pending = group\.loading && !group\.done/, 'веб: скелетоны подгрузки не считаются')
+  assert.match(app, /skelRow\(index, 'pending'\)/, 'веб: скелетоны подгрузки не рисуются')
+
+  // Вход играет один раз: у блока и групп анимация только под `.is-enter`.
+  assert.match(css, /\.finished-body\.is-enter \{ animation: finished-in/, 'веб: вход блока играет всегда')
+  assert.match(css, /\.finished-body\.is-enter \.finished-group \{\s*animation: finished-in/, 'веб: вход группы играет всегда')
+  assert.doesNotMatch(css, /^\.finished-body \{[^}]*animation/sm, 'веб: у блока входная анимация вне is-enter')
+
+  // Строки переиспользуются по ключу — иначе блок моргает на каждой подгрузке.
+  assert.match(app, /'data-key': `finished-row:\$\{deal\.id\}`/, 'веб: строки без ключа для morph')
+  assert.match(app, /'data-key': `finished-group:\$\{group\.repo\}`/, 'веб: группы без ключа для morph')
 })

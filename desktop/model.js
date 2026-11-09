@@ -319,15 +319,16 @@ const TL_WINDOW_SEC = 24 * 3600
 const TL_MAX_ROWS = 14
 
 /**
- * Палитра этапов: цвет — свойство этапа, а не дела.
+ * Тон полосы — состояние этапа, и только оно.
  *
- * Восьми слотов хватает плану любой длины: девятый этап получает первый цвет, и
- * это читается лучше, чем двадцать почти одинаковых оттенков (в живом store на
- * 09.11 — семь разных имён этапов). Слот выдаётся по первому появлению имени
- * этапа сверху вниз, поэтому `impl` во всех дорожках одного цвета и легенда
- * сходится с картинкой.
+ * Цвета берутся из той же таблицы, что у строк этапов и узлов графа на странице
+ * дела (`stageMeta`): пройден — зелёный, идёт — акцент, отказ — красный. Свой
+ * цвет на каждое имя этапа читался бы как легенда без подписи: на странице дела
+ * такого словаря нет, и таймлайн спорил бы с ней (09.11, Макс: «цвета этапов
+ * должны соответствовать принятым цветам на странице дела»).
  */
-const TL_STAGE_TONES = ['s1', 's2', 's3', 's4', 's5', 's6', 's7', 's8']
+const TL_SEG_STATES = ['done', 'running', 'failed']
+
 /** Шаг сетки: чем короче окно, тем мельче деления. */
 const TL_TICKS = [
   [20 * 60, 5 * 60],
@@ -337,27 +338,21 @@ const TL_TICKS = [
   [TL_WINDOW_SEC, 3 * 3600],
 ]
 
-/** Слот палитры для имени этапа: выдаётся один раз на всю картинку. */
-function stageTone(stage, slots) {
-  const name = String(stage || '')
-  if (!name) return 'gray'
-  if (!slots.has(name)) slots.set(name, TL_STAGE_TONES[slots.size % TL_STAGE_TONES.length])
-  return slots.get(name)
-}
-
 /**
- * Границы этапов на дорожке: полосы из журнала, обрезанные окном оси.
+ * Полосы этапов внутри «сосиски» дела.
  *
- * Дело идёт не сплошняком: между попытками оно ждёт диспетчера, и пустое место на
- * дорожке — это факт, а не дефект рисунка. Поэтому полоса этапа рисуется там, где
- * он работал, и не растягивается на паузу.
+ * Границы считаются в долях самой сосиски, а не оси: дело — единая фигура на
+ * общей сетке (09.11, Макс), поэтому этап не может вылезти за её край и не
+ * требует обрезки по форме. Пауза между попытками остаётся пустым местом внутри
+ * сосиски — это факт («дело ждало диспетчера»), а не дефект рисунка.
  */
-function timelineSegments(spans, axisFrom, axisTo, slots) {
-  const a = numOrNull(axisFrom)
-  const b = numOrNull(axisTo)
-  if (a === null || b === null) return []
-  const span = Math.max(1, b - a)
-  const out = []
+function timelineSegments(spans, barFrom, barTo) {
+  const a = numOrNull(barFrom)
+  const b = numOrNull(barTo)
+  if (a === null || b === null) return { segments: [], sec: {} }
+  const width = Math.max(1, b - a)
+  const segments = []
+  const sec = { done: 0, running: 0, failed: 0 }
   for (const item of Array.isArray(spans) ? spans : []) {
     const from = numOrNull(item && item.start)
     const end = numOrNull(item && item.end)
@@ -367,33 +362,36 @@ function timelineSegments(spans, axisFrom, axisTo, slots) {
     const right = Math.min(b, to)
     if (right <= left) continue
     const outcome = String((item && item.outcome) || '')
-    out.push({
+    // Провал и инфраструктурный отказ дают один цвет: он говорит «этап не
+    // дошёл», а какой именно отказ — в подсказке.
+    const state = outcome === 'failed' ? 'failed' : end === null ? 'running' : 'done'
+    const meta = stageMeta(state)
+    const duration = Math.max(0, to - from)
+    sec[state] += duration
+    segments.push({
       stage: String((item && item.stage) || ''),
-      // Провал и инфраструктурный отказ дают один цвет: он говорит «этап не
-      // дошёл», а какой именно отказ — в подсказке.
-      state: outcome === 'failed' ? 'failed' : end === null ? 'running' : 'done',
-      tone: stageTone(item && item.stage, slots),
-      leftPct: Number((((left - a) / span) * 100).toFixed(2)),
-      widthPct: Number(Math.max(0.4, ((right - left) / span) * 100).toFixed(2)),
+      state,
+      tone: meta.tone,
+      // Доли сосиски: экран не пересчитывает координаты, он их только ставит.
+      leftPct: Number((((left - a) / width) * 100).toFixed(2)),
+      widthPct: Number(Math.max(0.6, ((right - left) / width) * 100).toFixed(2)),
       clipped: from < a,
-      open: end === null,
-      durationText: fmtAge(Math.max(0, to - from)),
+      durationText: fmtAge(duration),
       title:
         `${String((item && item.stage) || 'этап')}` +
         (Number.isInteger(item && item.attempt) ? ` · попытка ${item.attempt}` : '') +
-        (end === null ? ' · идёт' : outcome === 'failed' ? ' · провал' : ' · готово') +
-        ` · ${fmtAge(Math.max(0, to - from))}`,
+        ` · ${meta.label} · ${fmtAge(duration)}`,
     })
   }
-  return out
+  return { segments, sec }
 }
 
 /**
  * Деления оси: ровные шаги от круглого времени, а не от начала дел.
  *
- * `gridStepPct`/`gridFirstPct` — те же деления как фон дорожки: сетка рисуется
- * градиентом, поэтому каждая дорожка несёт один и тот же рисунок, и вертикали
- * сходятся от строки к строке без отдельных элементов на каждую линию.
+ * `stepPct`/`firstPct` — те же деления как фон полотна: сетка рисуется
+ * градиентом, поэтому все сосиски лежат на одной решётке, и вертикали сходятся
+ * от строки к строке без отдельных элементов на каждую линию.
  */
 function timelineTicks(axisFrom, axisTo) {
   const a = numOrNull(axisFrom)
@@ -416,21 +414,22 @@ function timelineTicks(axisFrom, axisTo) {
 }
 
 /**
- * Мини-таймлайн дел: одна дорожка на дело, полосы этапов внутри неё.
+ * Мини-таймлайн дел: одна «сосиска» на дело на общей сетке.
  *
  * Верхушка страницы отвечает на «что происходило и сколько это длится» одним
  * взглядом: активные дела тянутся до `now`, завершённые — до своего `finishedAt`
- * (09.11, Макс: «показывать и завершённые»). Цвет внутри дорожки — этап, пустое
- * место — пауза между попытками, красный — этап не дошёл. Геометрия считается
- * здесь, а не на поверхности: веб и десктоп обязаны рисовать одну картину.
+ * (09.11, Макс: «показывать и завершённые»). Внутри сосиски — полосы этапов,
+ * цвет которых говорит состояние (см. `TL_SEG_STATES`), пустое место — пауза
+ * между попытками. Геометрия считается здесь, а не на поверхности: веб и
+ * десктоп обязаны рисовать одну картину.
  *
- * `spansById` — границы этапов из журнала (`GET /spans`): без них дорожка
- * рисуется одним тоном состояния, как до 0.0.9.
+ * `spansById` — границы этапов из журнала (`GET /spans`): без них сосиска
+ * заливается тоном состояния целиком, как до 0.0.9.
  *
  * Окно — не длиннее суток (`TL_WINDOW_SEC`). Дело, начавшееся раньше окна, не
- * пропадает: его полоса начинается у левого края и помечена `clipped` — рисунок
+ * пропадает: его сосиска начинается у левого края и помечена `clipped` — рисунок
  * говорит «началось раньше», а не выдумывает начало. Дело без записанного начала
- * рисуется штрихованной полосой от края (`exact: false`).
+ * рисуется полупрозрачной сосиской от края (`exact: false`).
  */
 function dealTimeline(activeDeals, finishedDeals, now, spansById) {
   const moment = numOrNull(now)
@@ -447,7 +446,7 @@ function dealTimeline(activeDeals, finishedDeals, now, spansById) {
   for (const deal of Array.isArray(finishedDeals) ? finishedDeals : []) {
     if (!deal) continue
     const end = numOrNull(deal.finishedAt)
-    // Завершённое дело вне окна не рисуем вовсе: его полоса была бы нулевой
+    // Завершённое дело вне окна не рисуем вовсе: его сосиска была бы нулевой
     // длины у левого края и только шумела бы.
     if (end !== null && windowFrom !== null && end < windowFrom) continue
     rows.push({
@@ -470,29 +469,25 @@ function dealTimeline(activeDeals, finishedDeals, now, spansById) {
   }
   const starts = visible.map(startOf).filter((value) => value !== null)
   // Ось — по фактическим делам, но не длиннее суток: пустые часы слева
-  // (когда дела начались час назад) растянули бы полосы в нитки.
+  // (когда дела начались час назад) растянули бы сосиски в нитки.
   const earliest = starts.length ? Math.min(...starts) : null
   const axisFrom = windowFrom !== null ? (earliest === null ? windowFrom : Math.max(windowFrom, earliest)) : earliest
   const span = axisFrom === null || axisTo === null ? 0 : Math.max(1, axisTo - axisFrom)
   const pct = (at) => Math.max(0, Math.min(100, ((at - axisFrom) / span) * 100))
-  const slots = new Map()
-  const legend = new Map()
+  const legendSec = { done: 0, running: 0, failed: 0 }
   const outRows = visible.map((row) => {
     const from = startOf(row)
     const to = row.open ? axisTo : row.end
-    const left = from === null ? 0 : pct(from)
-    const right = to === null ? 100 : pct(to)
     const duration = from === null || to === null ? null : Math.max(0, to - from)
     const clipped = row.from !== null && windowFrom !== null && row.from < windowFrom
     const deal = row.deal
-    const segments = timelineSegments(spans[String(deal.id || '')], axisFrom, axisTo, slots)
-    for (const segment of segments) {
-      const seen = legend.get(segment.stage) || { stage: segment.stage, tone: segment.tone, sec: 0, failed: false, running: false }
-      seen.sec += Math.round((segment.widthPct / 100) * span)
-      seen.failed = seen.failed || segment.state === 'failed'
-      seen.running = seen.running || segment.state === 'running'
-      legend.set(segment.stage, seen)
-    }
+    // Сосиска занимает ровно время дела на оси; всё внутри считается её долями.
+    const barLeft = from === null ? 0 : pct(from)
+    const barRight = to === null ? 100 : pct(to)
+    const barFrom = from === null ? axisFrom : Math.max(axisFrom, from)
+    const barTo = to === null ? axisTo : Math.min(axisTo, to)
+    const { segments, sec } = timelineSegments(spans[String(deal.id || '')], barFrom, barTo)
+    for (const state of TL_SEG_STATES) legendSec[state] += sec[state]
     const title = String(deal.titleFull || deal.title || '')
     const repoFull = deal.repoLabel || String(deal.repo || '')
     return {
@@ -510,8 +505,10 @@ function dealTimeline(activeDeals, finishedDeals, now, spansById) {
       performer: deal.assignee || '',
       segments,
       durationText: duration === null ? 'начало неизвестно' : fmtAge(duration),
-      leftPct: Number(left.toFixed(1)),
-      widthPct: Number(Math.max(1.5, right - left).toFixed(1)),
+      bar: {
+        leftPct: Number(barLeft.toFixed(2)),
+        widthPct: Number(Math.max(1.5, barRight - barLeft).toFixed(2)),
+      },
       // Начало раньше окна или неизвестно вовсе: рисунок помечает это, а не
       // выдаёт догадку за факт.
       clipped,
@@ -533,13 +530,11 @@ function dealTimeline(activeDeals, finishedDeals, now, spansById) {
     windowText: axisFrom === null || axisTo === null ? '' : `${fmtSpan(axisFrom, axisTo)} · окно до суток`,
     ticks: axis.ticks,
     grid: { stepPct: axis.stepPct, firstPct: axis.firstPct, stepSec: axis.stepSec },
-    legend: [...legend.values()].map((item) => ({
-      stage: item.stage,
-      tone: item.tone,
-      durationText: fmtAge(item.sec),
-      failed: item.failed,
-      running: item.running,
-    })),
+    // Легенда называет состояния, а не этапы: цвет в сосиске — это состояние.
+    legend: TL_SEG_STATES.filter((state) => legendSec[state] > 0).map((state) => {
+      const meta = stageMeta(state)
+      return { state, tone: meta.tone, label: meta.label, durationText: fmtAge(legendSec[state]) }
+    }),
     omitted,
     rows: outRows,
   }

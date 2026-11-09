@@ -850,3 +850,39 @@ test('веб: отказы опроса молчат до третьего и т
     page.restore()
   }
 })
+
+
+test('веб: таймлайн — сосиски на общей сетке, кликабельны только дело и название', () => {
+  const app = read('dashboard/web/app.js')
+  const css = read('dashboard/web/styles.css').replace(/\/\*[\s\S]*?\*\//g, '')
+
+  // Строка — раскладка, а не ссылка: обработчика на ней нет.
+  assert.match(app, /class: `tl-mini-row\$\{row\.open \? '' : ' is-done'\}`, 'data-key': `tl:\$\{row\.key\}` \}/,
+    'веб: на строке таймлайна появился обработчик клика')
+  // Дело и его название — ссылки.
+  assert.match(app, /class: `tl-sausage\$\{row\.exact/, 'веб: сосиска не рисуется')
+  assert.match(app, /onclick: open\(row\.id\)/, 'веб: сосиска не открывает дело')
+  assert.match(app, /class: 'tl-title',\s+href: `#\/deal\/\$\{encodeURIComponent\(row\.id\)\}`/,
+    'веб: название дела не ссылка')
+
+  // Одна сетка на все строки: слой `.tl-grid` с треком, без сетки внутри дорожки.
+  assert.match(app, /class: 'tl-grid'/, 'веб: нет общего слоя сетки')
+  assert.match(css, /\.tl-grid-track \{[^}]*repeating-linear-gradient/s, 'веб: сетка не общая')
+  assert.doesNotMatch(css, /\.tl-mini-track \{[^}]*background-image/s, 'веб: дорожка снова рисует свою сетку')
+
+  // Строка не выделяется: ни фона, ни рамки, ни курсора.
+  assert.doesNotMatch(css, /\.tl-mini-row \{[^}]*background/s, 'веб: у строки свой фон')
+  assert.doesNotMatch(css, /\.tl-mini-row \{[^}]*cursor/s, 'веб: строка выглядит кликабельной')
+  assert.doesNotMatch(css, /\.tl-mini-row:hover/s, 'веб: строка подсвечивается на наведении')
+
+  // Скругление одно — у сосиски; этапы стыкуются без скруглений.
+  assert.match(css, /\.tl-sausage \{[^}]*border-radius: 999px/s, 'веб: у сосиски нет единой формы')
+  assert.doesNotMatch(css, /\.tl-seg \{[^}]*border-radius/s, 'веб: у этапа своё скругление')
+
+  // Цвет — состояние этапа из словаря страницы дела, а не своя палитра имён.
+  assert.match(app, /class: `tl-seg t-\$\{segment\.tone\}/, 'веб: тоны этапов не приходят из шейпера')
+  assert.doesNotMatch(css, /--st-[1-8]/, 'веб: палитра «свой цвет на этап» осталась')
+  assert.match(css, /\.tl-seg\.t-green \{ --seg: var\(--ok\); \}/, 'веб: пройден не зелёный страницы дела')
+  assert.match(css, /\.tl-seg\.t-red \{ --seg: var\(--danger\); \}/, 'веб: отказ не красный страницы дела')
+  assert.match(css, /\.tl-seg\.t-blue \{ --seg: var\(--accent\); \}/, 'веб: идущий не акцент страницы дела')
+})

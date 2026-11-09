@@ -588,6 +588,10 @@ function timelineBlock(model) {
     )
   }
   const ticks = view.ticks || []
+  const gridStyle = `--grid-step:${view.grid.stepPct}%;--grid-first:${view.grid.firstPct}%`
+  const open = (id) => () => {
+    location.hash = `#/deal/${encodeURIComponent(id)}`
+  }
   return h(
     'div',
     { class: 'panel tl-mini' },
@@ -603,67 +607,76 @@ function timelineBlock(model) {
       { class: 'tl-body' },
       h(
         'div',
-        { class: 'tl-rows' },
-        // Сетка и «сейчас» — на полотне под дорожками: одна вертикаль на все
-        // строки, а не своя в каждой.
+        { class: 'tl-rows', style: gridStyle },
+        // Сетка — один слой под всеми делами: вертикали общие, строки своих
+        // клеток не рисуют. Сосиски лежат на этой решётке, а не в рамках.
         h(
           'div',
-          { class: 'tl-grid' },
-          ...ticks.map((tick) => h('span', { class: 'tl-gridline', style: `left:${tick.leftPct}%` })),
-          h('span', { class: 'tl-now-line' }),
+          { class: 'tl-grid', 'aria-hidden': 'true' },
+          h('span', { class: 'tl-grid-gap' }),
+          h('span', { class: 'tl-grid-track' }),
         ),
         ...view.rows.map((row) =>
           h(
             'div',
-            {
-              class: `tl-mini-row${row.open ? '' : ' is-done'}`,
-              tabindex: '0',
-              title: row.hint,
-              'data-key': `tl:${row.key}`,
-              onclick: () => {
-                location.hash = `#/deal/${encodeURIComponent(row.id)}`
-              },
-              onkeydown: (e) => {
-                if (e.key === 'Enter') location.hash = `#/deal/${encodeURIComponent(row.id)}`
-              },
-            },
+            { class: `tl-mini-row${row.open ? '' : ' is-done'}`, 'data-key': `tl:${row.key}` },
             h(
               'span',
               { class: 'tl-mini-lbl' },
               h('span', { class: 'tl-repo' }, row.repo),
-              h('span', { class: 'tl-title' }, row.title || row.id),
+              // Кликабельны дело и его название, а не строка: длительность и
+              // состояние — показания, а не ссылки (09.11, Макс).
+              h(
+                'a',
+                {
+                  class: 'tl-title',
+                  href: `#/deal/${encodeURIComponent(row.id)}`,
+                  title: row.hint,
+                  'data-key': `tl-title:${row.key}`,
+                },
+                row.title || row.id,
+              ),
             ),
             h(
               'span',
-              {
-                class: 'tl-mini-track',
-                // Сетка — фоном дорожки: каждая строка несёт один и тот же
-                // рисунок делений, и вертикали сходятся без элементов на линию.
-                style: `--grid-step:${view.grid.stepPct}%;--grid-first:${view.grid.firstPct}%`,
-              },
-              row.segments.length
-                ? row.segments.map((segment) =>
-                    h('span', {
-                      class: `tl-seg t-${segment.tone} is-${segment.state}${segment.clipped ? ' clipped' : ''}`,
-                      style: `left:${segment.leftPct}%;width:${segment.widthPct}%`,
-                      title: segment.title,
-                    }),
-                  )
-                : h('span', {
-                    class: `tl-mini-bar t-${row.tone}${row.exact ? '' : ' inexact'}${row.clipped ? ' clipped' : ''}`,
-                    style: `left:${row.leftPct}%;width:${row.widthPct}%`,
-                  }),
-              row.stageLive && row.open
-                ? h('span', { class: 'tl-mini-now', style: `left:${row.leftPct + row.widthPct}%` })
-                : null,
+              { class: 'tl-mini-track' },
+              // Сосиска — одно тело дела: этапы стыкуются без скруглений, форму
+              // задаёт она сама. Начало раньше окна срезано её левым краем.
+              h(
+                'span',
+                {
+                  class: `tl-sausage${row.exact ? '' : ' inexact'}${row.clipped ? ' is-clipped' : ''}`,
+                  style: `left:${row.bar.leftPct}%;width:${row.bar.widthPct}%`,
+                  role: 'link',
+                  tabindex: '0',
+                  title: row.hint,
+                  'aria-label': `открыть дело ${row.id}`,
+                  'data-key': `tl-bar:${row.key}`,
+                  onclick: open(row.id),
+                  onkeydown: (e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault()
+                      open(row.id)()
+                    }
+                  },
+                },
+                row.segments.length
+                  ? row.segments.map((segment) =>
+                      h('i', {
+                        class: `tl-seg t-${segment.tone} is-${segment.state}${segment.clipped ? ' clipped' : ''}`,
+                        style: `left:${segment.leftPct}%;width:${segment.widthPct}%`,
+                        title: segment.title,
+                      }),
+                    )
+                  : null,
+              ),
             ),
             h('span', { class: 'tl-mini-age mono' }, row.durationText),
             h('span', { class: 'tl-mini-state' }, row.stateLabel),
           ),
         ),
       ),
-      // Шкала сидит в той же сетке колонок, что дорожки: подписи делений стоят
-      // ровно под своими линиями.
+      // Шкала — в тех же колонках, что дорожки: подпись стоит под своим делением.
       h(
         'div',
         { class: 'tl-axis' },
@@ -682,9 +695,9 @@ function timelineBlock(model) {
           ...view.legend.map((item) =>
             h(
               'span',
-              { class: `tl-legend-item${item.failed ? ' is-failed' : ''}${item.running ? ' is-running' : ''}` },
+              { class: `tl-legend-item${item.state === 'running' ? ' is-running' : ''}` },
               h('i', { class: `tl-legend-dot t-${item.tone}` }),
-              item.stage,
+              item.label,
               h('span', { class: 'muted' }, item.durationText),
             ),
           ),

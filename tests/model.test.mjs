@@ -44,6 +44,7 @@ import {
   shapeFinished,
   shapeNow,
   shapeRepos,
+  dealTimeline,
   shapeStages,
   stageMeta,
   stateLabel,
@@ -2543,4 +2544,111 @@ test('палка маркера несёт тот же якорь, что и м�
   const verdictMark = (view.marks || []).find((m) => m.type === 'verdict')
   assert.ok(verdictMark, 'вердикта нет в палках попытки')
   assert.equal(verdictMark.anchor, 'end', 'палка вердикта центрируется вместо привязки к концу')
+})
+
+
+/* ------------------------------------------------------------ мини-таймлайн */
+
+const TL_NOW = 1_792_500_000
+
+function tlDeal(id, extra) {
+  return {
+    id,
+    repo: '/Users/x/GolandProjects/' + id,
+    repoShort: id,
+    title: `дело ${id}`,
+    createdAt: TL_NOW - 3 * 3600,
+    ...extra,
+  }
+}
+
+test('мини-таймлайн: дело — одна сосиска, этапы делят её доли, а не ось', () => {
+  const deal = tlDeal('d_a', { state: 'working', stateLabel: 'работает', tone: 'blue' })
+  const spans = {
+    d_a: [
+      { stage: 'impl', attempt: 1, start: TL_NOW - 3 * 3600, end: TL_NOW - 2 * 3600, outcome: 'done' },
+      { stage: 'check', attempt: 1, start: TL_NOW - 2 * 3600, end: null, outcome: null },
+    ],
+  }
+  const view = dealTimeline([deal], [], TL_NOW, spans)
+  const row = view.rows[0]
+  // Сосиска начинается там, где дело началось: ось равна времени дела.
+  assert.equal(row.bar.leftPct, 0)
+  assert.equal(row.bar.widthPct, 100)
+  // Доли этапов считаются внутри сосиски и стыкуются без зазора и наложения.
+  assert.equal(row.segments.length, 2)
+  assert.equal(row.segments[0].leftPct, 0)
+  assert.equal(row.segments[0].widthPct, 33.33)
+  assert.equal(row.segments[1].leftPct, 33.33)
+  assert.equal(row.segments[1].widthPct, 66.67)
+  // Этапы стыкуются вплотную: конец одного — начало другого.
+  assert.equal(row.segments[0].leftPct + row.segments[0].widthPct, row.segments[1].leftPct)
+})
+
+test('мини-таймлайн: цвет полосы — состояние этапа, как на странице дела', () => {
+  const deal = tlDeal('d_b', { state: 'working', stateLabel: 'работает', tone: 'blue' })
+  const spans = {
+    d_b: [
+      { stage: 'impl', attempt: 1, start: TL_NOW - 3 * 3600, end: TL_NOW - 2.4 * 3600, outcome: 'done' },
+      { stage: 'check', attempt: 1, start: TL_NOW - 2.4 * 3600, end: TL_NOW - 2 * 3600, outcome: 'failed' },
+      { stage: 'review', attempt: 1, start: TL_NOW - 2 * 3600, end: null, outcome: null },
+    ],
+  }
+  const row = dealTimeline([deal], [], TL_NOW, spans).rows[0]
+  assert.deepEqual(row.segments.map((s) => s.state), ['done', 'failed', 'running'])
+  // Тоны — из словаря `stageMeta`: пройден зелёный, отказ красный, идёт акцент.
+  assert.deepEqual(row.segments.map((s) => s.tone), ['green', 'red', 'blue'])
+  // Никакой палитры по именам этапов: `impl` и `review` не получают своих цветов.
+  assert.equal(new Set(row.segments.map((s) => s.tone)).size, 3)
+})
+
+test('мини-таймлайн: пауза между попытками остаётся пустым местом в сосиске', () => {
+  const deal = tlDeal('d_c', { state: 'working', stateLabel: 'работает', tone: 'blue' })
+  const spans = {
+    d_c: [
+      { stage: 'impl', attempt: 1, start: TL_NOW - 3 * 3600, end: TL_NOW - 2.5 * 3600, outcome: 'done' },
+      { stage: 'impl', attempt: 2, start: TL_NOW - 1.5 * 3600, end: null, outcome: null },
+    ],
+  }
+  const row = dealTimeline([deal], [], TL_NOW, spans).rows[0]
+  const first = row.segments[0]
+  const second = row.segments[1]
+  // Между концом первой попытки и началом второй — дыра: её не закрашивают.
+  assert.ok(first.leftPct + first.widthPct < second.leftPct - 1, 'пауза закрашена')
+})
+
+test('мини-таймлайн: окно не длиннее суток, начало раньше окна помечено', () => {
+  const old = tlDeal('d_old', {
+    createdAt: TL_NOW - 40 * 3600,
+    state: 'working',
+    stateLabel: 'работает',
+    tone: 'blue',
+  })
+  const view = dealTimeline([old], [], TL_NOW, {})
+  const row = view.rows[0]
+  assert.equal(row.clipped, true, 'дело старше суток не помечено')
+  assert.equal(row.bar.leftPct, 0, 'сосиска не прижата к левому краю')
+  assert.match(view.windowText, /окно до суток/)
+})
+
+test('мини-таймлайн: без границ этапов сосиска заливается тоном состояния', () => {
+  const deal = tlDeal('d_d', { state: 'working', stateLabel: 'работает', tone: 'blue' })
+  const row = dealTimeline([deal], [], TL_NOW, {}).rows[0]
+  assert.deepEqual(row.segments, [])
+  assert.equal(row.tone, 'blue')
+  assert.equal(row.exact, true)
+})
+
+test('мини-таймлайн: легенда называет состояния, а не имена этапов', () => {
+  const deal = tlDeal('d_e', { state: 'working', stateLabel: 'работает', tone: 'blue' })
+  const spans = {
+    d_e: [
+      { stage: 'impl_core', attempt: 1, start: TL_NOW - 3 * 3600, end: TL_NOW - 1.5 * 3600, outcome: 'done' },
+      { stage: 'check-js', attempt: 1, start: TL_NOW - 1.5 * 3600, end: null, outcome: null },
+    ],
+  }
+  const view = dealTimeline([deal], [], TL_NOW, spans)
+  assert.deepEqual(view.legend.map((item) => item.state), ['done', 'running'])
+  assert.deepEqual(view.legend.map((item) => item.tone), ['green', 'blue'])
+  assert.ok(!view.legend.some((item) => /impl|check/.test(item.label)), 'в легенде имена этапов')
 })

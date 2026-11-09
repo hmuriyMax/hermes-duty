@@ -1061,38 +1061,18 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
 /* ======================================================= мини-таймлайн (0.0.9)
  *
  * Полотно отвечает на «что происходило и сколько это длится», поэтому рисуется
- * как один прибор, а не как список строк: общая шкала с делениями, непрерывная
- * сетка (фон дорожки), полосы этапов внутри дорожки и легенда цветов.
+ * как один прибор: общая шкала с делениями, одна сетка на все дела и «сосиски» на
+ * этой сетке. Своей рамки, своего фона и своей сетки у строки нет — иначе верхушка
+ * страницы читается как таблица, а не как шкала времени (09.11, Макс).
  *
- * Цвет — свойство этапа (`--st-1…--st-6`), поэтому один и тот же этап во всех
- * дорожках одного цвета. Провал этапа — красный, идущий — с пульсацией.
+ * Цвет внутри сосиски — состояние этапа, тот же словарь, что на странице дела
+ * (`stageMeta`): пройден — зелёный, идёт — акцент, ждёт — янтарный, отказ —
+ * красный. Своего цвета на каждое имя этапа нет: на странице дела такого словаря
+ * не существует, и таймлайн спорил бы с ней.
  */
-:root {
-  --st-1: #2563eb;
-  --st-2: #7c3aed;
-  --st-3: #0d9488;
-  --st-4: #b45309;
-  --st-5: #db2777;
-  --st-6: #64748b;
-  --st-7: #0e7490;
-  --st-8: #4d7c0f;
-}
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --st-1: #5b8def;
-    --st-2: #a78bfa;
-    --st-3: #2dd4bf;
-    --st-4: #e0a458;
-    --st-5: #f472b6;
-    --st-6: #94a3b8;
-    --st-7: #38bdf8;
-    --st-8: #a3e635;
-  }
-}
-
-/* Колонки дорожки: подпись, полотно, длительность, состояние. Ширины — доли, а
-   не пиксели: подпись и состояние не должны съедать полотно на узком окне. */
+/* Колонки полотна: подпись, шкала, длительность, состояние. Ширины — доли, а не
+   пиксели: подпись и состояние не должны съедать шкалу на узком окне. */
 .tl-mini { --tl-cols: minmax(180px, 26%) 1fr 74px 108px; margin-bottom: 14px; overflow: hidden; }
 
 .tl-mini .panel-h { display: flex; align-items: baseline; gap: 10px; padding-bottom: 6px; }
@@ -1100,21 +1080,39 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
 .tl-omitted { font-size: 11px; margin-left: auto; }
 
 .tl-body { padding: 2px 14px 4px; }
-.tl-rows { display: flex; flex-direction: column; gap: 2px; }
+.tl-rows { position: relative; display: flex; flex-direction: column; }
 
+/* Сетка: один слой под всеми делами. Вертикали общие, поэтому строки не рисуют
+   своих клеток, а «сейчас» — правый край полотна, а не второй рисунок. */
+.tl-grid {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  grid-template-columns: var(--tl-cols);
+  gap: 12px;
+  pointer-events: none;
+}
+.tl-grid-track {
+  grid-column: 2;
+  background-image: repeating-linear-gradient(
+    to right,
+    color-mix(in srgb, var(--text-3) 26%, transparent) 0 1px,
+    transparent 1px var(--grid-step, 25%)
+  );
+  background-position: var(--grid-first, 0) 0;
+  background-repeat: repeat-y;
+  border-right: 1px solid var(--accent);
+}
+
+/* Строка — только раскладка: ни фона, ни рамки, ни курсора. */
 .tl-mini-row {
   display: grid;
   grid-template-columns: var(--tl-cols);
   gap: 12px;
   align-items: center;
-  padding: 5px 6px;
-  border-radius: 8px;
-  cursor: pointer;
+  padding: 4px 0;
   font-size: 12px;
-  transition: background .12s ease;
 }
-.tl-mini-row:hover { background: var(--bg-hover); }
-.tl-mini-row:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* Подпись: проект мелко и тихо, заголовок дела — то, по чему строку узнают. */
 .tl-mini-lbl { display: flex; flex-direction: column; gap: 1px; overflow: hidden; }
@@ -1129,90 +1127,56 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
 .tl-title {
   font-size: 12.5px;
   color: var(--text);
+  text-decoration: none;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.tl-title:hover { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.tl-title:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
 .tl-mini-row.is-done .tl-title { color: var(--text-2); }
 
-/* Полотно дорожки: подложка, сетка делений фоном и линия «сейчас» справа.
-   Рисунок одинаков на всех строках, поэтому вертикали сходятся. */
-.tl-mini-track {
-  position: relative;
-  height: 18px;
-  border-radius: 5px;
-  background-color: var(--bg-soft);
-  background-image:
-    linear-gradient(to right, transparent calc(100% - 2px), var(--accent) calc(100% - 2px)),
-    repeating-linear-gradient(to right, var(--border) 0 1px, transparent 1px var(--grid-step, 25%));
-  background-position: 0 0, var(--grid-first, 0) 0;
-  background-repeat: no-repeat, repeat-x;
-  box-shadow: inset 0 0 0 1px var(--border);
-}
+/* Полотно строки: прозрачное — сетка уже нарисована под ним. */
+.tl-mini-track { position: relative; height: 16px; }
 
-/* Полоса этапа: цвет — этап, форма — исход. Пауза между попытками остаётся
-   пустой подложкой, и это видно. */
+/* Сосиска — одно тело дела на общей сетке. Скругление одно, на всю фигуру:
+   этапы внутри стыкуются вплотную, и границей этапа служит только цвет. */
+.tl-sausage {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text-3) 20%, transparent);
+  cursor: pointer;
+}
+.tl-sausage:hover { filter: brightness(1.08); }
+.tl-sausage:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* Начало раньше окна: левый край срезан — рисунок говорит «началось раньше», а
+   не выдумывает начало. Неизвестное начало — полупрозрачная сосиска. */
+.tl-sausage.is-clipped { border-top-left-radius: 0; border-bottom-left-radius: 0; }
+.tl-sausage.inexact { opacity: .45; }
+
+/* Полоса этапа: без своих скруглений — она часть тела дела. */
 .tl-seg {
   position: absolute;
-  top: 2px;
-  bottom: 2px;
-  border-radius: 3px;
-  background: var(--seg);
+  top: 0;
+  bottom: 0;
   min-width: 2px;
-  transition: filter .12s ease;
+  background: var(--seg, var(--border-strong));
 }
-.tl-seg:hover { filter: brightness(1.12); }
-.tl-seg.t-s1 { --seg: var(--st-1); }
-.tl-seg.t-s2 { --seg: var(--st-2); }
-.tl-seg.t-s3 { --seg: var(--st-3); }
-.tl-seg.t-s4 { --seg: var(--st-4); }
-.tl-seg.t-s5 { --seg: var(--st-5); }
-.tl-seg.t-s6 { --seg: var(--st-6); }
-.tl-seg.t-s7 { --seg: var(--st-7); }
-.tl-seg.t-s8 { --seg: var(--st-8); }
+.tl-seg.t-green { --seg: var(--ok); }
+.tl-seg.t-blue { --seg: var(--accent); }
+.tl-seg.t-yellow { --seg: var(--warn); }
+.tl-seg.t-red { --seg: var(--danger); }
 .tl-seg.t-gray { --seg: var(--border-strong); }
-
 /* Идущий этап: тот же цвет, но полоса дышит — «здесь работают сейчас». */
-.tl-seg.is-running { opacity: .95; animation: tl-breathe 2.6s ease-in-out infinite; }
-/* Провал: красная штриховка поверх цвета этапа — факт важнее принадлежности. */
-.tl-seg.is-failed {
-  background: repeating-linear-gradient(
-    135deg,
-    var(--danger) 0 4px,
-    color-mix(in srgb, var(--danger) 55%, transparent) 4px 8px
-  );
-}
-.tl-seg.clipped { border-left: 2px solid var(--card); }
+.tl-seg.is-running { animation: tl-breathe 2.6s ease-in-out infinite; }
+.tl-seg.clipped { border-left: 1px solid var(--card); }
 
 @keyframes tl-breathe {
   0%, 100% { filter: brightness(1); }
-  50% { filter: brightness(1.35); }
-}
-
-/* Дорожка без границ этапов (журнал ещё не ответил): одна полоса тона дела. */
-.tl-mini-bar {
-  position: absolute;
-  top: 2px;
-  bottom: 2px;
-  border-radius: 3px;
-  background: var(--border-strong);
-  opacity: .6;
-}
-.tl-mini-bar.t-green { background: var(--ok); }
-.tl-mini-bar.t-yellow { background: var(--warn); }
-.tl-mini-bar.t-red { background: var(--danger); }
-.tl-mini-bar.t-purple { background: var(--purple); }
-.tl-mini-bar.t-blue { background: var(--accent); }
-.tl-mini-bar.inexact { opacity: .3; }
-
-.tl-mini-now {
-  position: absolute;
-  top: -3px;
-  bottom: -3px;
-  width: 2px;
-  background: var(--accent);
-  border-radius: 1px;
-  transform: translateX(-1px);
+  50% { filter: brightness(1.3); }
 }
 
 .tl-mini-age { color: var(--text-2); font-variant-numeric: tabular-nums; text-align: right; font-size: 11.5px; }
@@ -1223,11 +1187,10 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
   display: grid;
   grid-template-columns: var(--tl-cols);
   gap: 12px;
-  height: 16px;
+  height: 15px;
   margin-top: 4px;
-  padding: 0 6px;
 }
-.tl-axis-track { position: relative; height: 16px; }
+.tl-axis-track { position: relative; height: 15px; }
 .tl-tick {
   position: absolute;
   transform: translateX(-50%);
@@ -1238,7 +1201,7 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
 }
 .tl-tick:first-child { transform: none; }
 
-/* Легенда: цвет ↔ этап. Без неё цвета в дорожках — украшение. */
+/* Легенда: цвет ↔ состояние этапа — тот же словарь, что на странице дела. */
 .tl-legend {
   display: flex;
   flex-wrap: wrap;
@@ -1249,18 +1212,11 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
 }
 .tl-legend-item { display: inline-flex; align-items: center; gap: 6px; color: var(--text-2); }
 .tl-legend-dot { width: 9px; height: 9px; border-radius: 2px; background: var(--border-strong); }
-.tl-legend-dot.t-s1 { background: var(--st-1); }
-.tl-legend-dot.t-s2 { background: var(--st-2); }
-.tl-legend-dot.t-s3 { background: var(--st-3); }
-.tl-legend-dot.t-s4 { background: var(--st-4); }
-.tl-legend-dot.t-s5 { background: var(--st-5); }
-.tl-legend-dot.t-s6 { background: var(--st-6); }
-.tl-legend-dot.t-s7 { background: var(--st-7); }
-.tl-legend-dot.t-s8 { background: var(--st-8); }
-.tl-legend-item.is-failed .tl-legend-dot {
-  background: repeating-linear-gradient(135deg, var(--danger) 0 3px, transparent 3px 6px);
-  box-shadow: inset 0 0 0 1px var(--danger);
-}
+.tl-legend-dot.t-green { background: var(--ok); }
+.tl-legend-dot.t-blue { background: var(--accent); }
+.tl-legend-dot.t-yellow { background: var(--warn); }
+.tl-legend-dot.t-red { background: var(--danger); }
+.tl-legend-dot.t-gray { background: var(--border-strong); }
 .tl-legend-item.is-running { color: var(--text); }
 
 /* ==================================================== завершённые (0.0.9)

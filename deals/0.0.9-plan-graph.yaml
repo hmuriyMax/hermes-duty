@@ -1,0 +1,58 @@
+# Дело: план растёт из журнала (тонкий срез движка 1.0, раздел 8)
+#
+# Тело (`BODY-plan-graph.md` в заметке версии 0.0.9) описывает контракт: хартия
+# отделена от плана, граф = seed + fold(событий), валидация предложения теми же
+# правилами `spec.py`, кэпы и гейт плана.
+#
+# ПОЧЕМУ ТРИ ЭТАПА, А НЕ ПЯТЬ. Это правка одного слоя (движок + валидатор +
+# срез), поэтому: `impl` пишет код и тесты, `check` гоняет оба набора и валидатор
+# спек, `review` читает дифф и выносит приговор. Дробить `spec`/`transit`/
+# `runner` на отдельные этапы значило бы ловить конфликты в одном дереве ради
+# красоты графа.
+#
+# base приколот к 9107aa0 (голова release/v0.0.9 после дизайн-дока): новое
+# дерево — новое дело.
+#
+# Адреса приговора: `next` и `impl` (вернуть реализацию на доработку). Больше
+# имён этапов в этой спеке нет — ревьюер адресует приговор тому, что видит.
+#
+# Свидетель этапа-проверки — код возврата: `check` ничего не производит, а без
+# коммита, артефактов и приговора этап не закрывается. Поэтому `verdict` висит на
+# `review`, а `check` закрывается `must: 0`.
+
+duty: 0.0.9-plan-graph
+repo: ~/.hermes/plugins/hermes-duty
+base: 9107aa0
+
+budget: {minutes: 240}
+
+stages:
+  - id: impl
+    role: implementer
+    workspace: worktree
+    budget: {minutes: 110}
+    evidence:
+      - {cmd: "env -u PYTHONPATH ~/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q -p no:randomly", must: 0, timeout_sec: 900}
+      - {cmd: "node --test tests/*.test.mjs", must: 0, timeout_sec: 600}
+      - {cmd: "env -u PYTHONPATH bin/duty-model-sync --check", must: 0, timeout_sec: 120}
+
+  # У shell-этапа договор один: команда и её код возврата (evidence у shell не
+  # проверяется — это отказ валидатора, и правильно). Цепочка через && держит
+  # порядок «быстрое → долгое», а адрес отказа называет сама команда в выводе.
+  - id: check
+    kind: shell
+    needs: [impl]
+    budget: {minutes: 40}
+    workspace: worktree
+    cmd: "env -u PYTHONPATH bin/duty-model-sync --check && env -u PYTHONPATH bin/duty spec check examples/duty.yaml && env -u PYTHONPATH bin/duty spec check examples/duty-minimal.yaml && node --test tests/*.test.mjs && env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q -p no:randomly && HERMES_HOME=$HOME/.hermes env -u PYTHONPATH bin/duty demo"
+    must: 0
+
+  - id: review
+    role: reviewer
+    needs: [check]
+    workspace: none
+    budget: {minutes: 60}
+    verdict:
+      approve: next
+      changes: impl
+      max_rounds: 3

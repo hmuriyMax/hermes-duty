@@ -3741,10 +3741,13 @@ const FINISHED_PER_REPO = 5
 // Сколько скелетоны держатся как минимум: ответ с локального бэкенда приходит
 // быстрее глаза, и без этого «разворачивание» не увидеть — строки просто прыгали.
 const SKELETON_MIN_MS = 260
-
-const EMPTY_FINISHED_GROUP = { rows: [], total: 0, next: null, done: false, loading: false, error: null }
-// Сколько раз пробуем список закрытых дел: первый запрос может совпасть с подъёмом
-// бэкенда, и пустой ответ нельзя показывать как «завершённых дел нет».
+// История закрытых дел читается ОДНИМ запросом, а по проектам режется в памяти:
+// у старого бэкенда (без `repos`) постраничный список по репозиториям не собрать,
+// да и группировка по `repo` — чистая функция. 200 строк с запасом покрывают
+// реальный store; если он больше, честно пишем, что список усечён.
+const FINISHED_FETCH_LIMIT = 200
+// Сколько раз пробуем список закрытых дел: первый запрос может совпасть с
+// подъёмом бэкенда, и пустой ответ нельзя показывать как «завершённых дел нет».
 const DEALS_ATTEMPTS = 3
 
 /** Ответ `/deals` со своим путём в тексте ошибки: путь — половина диагноза. */
@@ -3757,81 +3760,43 @@ async function dealsPayload(path) {
 }
 
 function useFinishedPages(enabled) {
-  const [index, setIndex] = useState(null)
-  const [groups, setGroups] = useState({})
+  const [snapshot, setSnapshot] = useState(null)
+  // Сколько строк проекта показано: листание в памяти, без сети.
+  const [shown, setShown] = useState({})
   const [error, setError] = useState(null)
   const alive = useRef(true)
-  // Курсоры живут в ref: два «ещё» подряд не должны прочитать один и тот же
-  // `next` из ещё не перерисованного состояния.
-  const groupsRef = useRef({})
 
-  const patchGroup = useCallback((repo, patch) => {
-    const prev = groupsRef.current[repo] || EMPTY_FINISHED_GROUP
-    const next = { ...prev, ...patch }
-    groupsRef.current = { ...groupsRef.current, [repo]: next }
-    if (alive.current) setGroups(groupsRef.current)
-    return next
-  }, [])
-
-  const loadGroup = useCallback(
-    async (repo, dir = 'more') => {
-      const group = groupsRef.current[repo] || EMPTY_FINISHED_GROUP
-      if (group.loading) return
-      if (dir === 'more' && (group.done || group.next === null)) return
-      const cursor = dir === 'more' ? group.next : null
-      patchGroup(repo, { loading: true, error: null })
-      const startedAt = Date.now()
-      try {
-        const query =
-          `/deals?limit=${FINISHED_PER_REPO}&repo=${encodeURIComponent(repo)}` +
-          (cursor ? `&cursor=${encodeURIComponent(cursor)}` : '')
-        const raw = await dealsPayload(query)
-        if (!raw || typeof raw !== 'object' || !Array.isArray(raw.deals)) {
-          throw new Error('ответ /deals без списка дел')
-        }
-        const page = shapeFinishedPage(raw)
-        const shown = dir === 'more' ? (groupsRef.current[repo] || EMPTY_FINISHED_GROUP).rows : []
-        patchGroup(repo, {
-          rows: shown.concat(page.rows),
-          next: page.next,
-          done: page.next === null,
-          total: page.total || shown.length + page.rows.length,
-        })
-      } catch (err) {
-        patchGroup(repo, { error: errText(err) })
-      } finally {
-        // Скелетоны успевают показаться: локальный ответ быстрее глаза.
-        const wait = SKELETON_MIN_MS - (Date.now() - startedAt)
-        if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait))
-        patchGroup(repo, { loading: false })
-      }
-    },
-    [patchGroup],
-  )
-
-  const loadIndex = useCallback(async () => {
+  const load = useCallback(async () => {
     setError(null)
     let lastError = ''
-    // Ответ без `repos` — не «завершённых нет», а «ответа ещё нет»: первый запрос
-    // может прийти в момент подъёма бэкенда. Три попытки и честная причина в
-    // баннере вместо пустого «0 из 0» (09.11, кейс «дела не прогрузились»).
+    const startedAt = Date.now()
+    // Ответ без `deals` — не «завершённых нет», а «ответа ещё нет»: три попытки
+    // и честная причина в баннере вместо пустого «0 из 0» (09.11).
     for (let attempt = 1; attempt <= DEALS_ATTEMPTS; attempt += 1) {
       try {
-        const raw = await dealsPayload('/deals?limit=1')
-        if (!raw || typeof raw !== 'object' || !Array.isArray(raw.repos)) {
+        const raw = await dealsPayload(`/deals?limit=${FINISHED_FETCH_LIMIT}`)
+        if (!raw || typeof raw !== 'object' || !Array.isArray(raw.deals)) {
           const keys = raw && typeof raw === 'object' ? Object.keys(raw).join(', ') || 'пусто' : typeof raw
-          throw new Error(`ответ /deals без списка репозиториев (ключи: ${keys})`)
+          throw new Error(`ответ /deals без списка дел (ключи: ${keys})`)
         }
         const page = shapeFinished(raw)
         // Store не прочитался (частый случай — писатель держит базу): это не факт
         // «завершённых дел нет», а неудачное чтение. Пробуем ещё раз.
-        if (!page.repos.length && page.errors.length) {
+        if (!page.deals.length && page.errors.length) {
           throw new Error(`store: ${page.errors[0].reason}`)
         }
+        // Скелетоны успевают показаться: локальный ответ быстрее глаза.
+        const wait = SKELETON_MIN_MS - (Date.now() - startedAt)
+        if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait))
         if (!alive.current) return
-        setIndex({ repos: page.repos, total: page.total, errors: page.errors, note: page.note })
-        for (const item of page.repos) patchGroup(item.repo, { total: item.total })
-        await Promise.all(page.repos.map((item) => loadGroup(item.repo, 'reset')))
+        setSnapshot({
+          repos: page.groups,
+          total: page.total || page.deals.length,
+          truncated: Boolean(raw.truncated),
+          errors: page.errors,
+          note: page.note,
+        })
+        setShown({})
         return
       } catch (err) {
         lastError = errText(err)
@@ -3839,22 +3804,30 @@ function useFinishedPages(enabled) {
       }
     }
     if (alive.current) setError(lastError)
-  }, [patchGroup, loadGroup])
+  }, [])
 
   useEffect(() => {
     alive.current = true
     if (!enabled) return () => { alive.current = false }
-    void loadIndex()
+    void load()
     return () => { alive.current = false }
-  }, [enabled, loadIndex])
+  }, [enabled, load])
 
-  /** «Загрузить ещё» — по следующей пятёрке в каждом проекте, где есть что. */
-  const loadMoreAll = useCallback(() => {
-    const pending = Object.keys(groupsRef.current).filter((repo) => !groupsRef.current[repo].done)
-    return Promise.all(pending.map((repo) => loadGroup(repo, 'more')))
-  }, [loadGroup])
+  const reveal = useCallback((repo) => {
+    setShown((prev) => ({ ...prev, [repo]: (prev[repo] ?? FINISHED_PER_REPO) + FINISHED_PER_REPO }))
+  }, [])
 
-  return { index, groups, error, reload: loadIndex, loadGroup, loadMoreAll }
+  const revealAll = useCallback((repos) => {
+    setShown((prev) => {
+      const next = { ...prev }
+      for (const group of repos) {
+        next[group.repo] = (prev[group.repo] ?? FINISHED_PER_REPO) + FINISHED_PER_REPO
+      }
+      return next
+    })
+  }, [])
+
+  return { snapshot, shown, error, reload: load, reveal, revealAll }
 }
 
 /**
@@ -4800,7 +4773,8 @@ function FinishedTable({ rows, pending, onPick }) {
  * пятёрке сразу во всех проектах, своя — только в одном.
  */
 function FinishedBlock({ finished, onPick }) {
-  if (finished.error && !finished.index) {
+  const { snapshot, shown } = finished
+  if (finished.error && !snapshot) {
     return h(
       'div',
       { className: 'duty-panel duty-finished-block', style: { margin: '10px 0 0' } },
@@ -4812,7 +4786,7 @@ function FinishedBlock({ finished, onPick }) {
       ),
     )
   }
-  if (!finished.index) {
+  if (!snapshot) {
     return h(
       'div',
       { className: 'duty-panel duty-finished-block' },
@@ -4824,13 +4798,10 @@ function FinishedBlock({ finished, onPick }) {
       ),
     )
   }
-  const repos = finished.index.repos || []
-  const shownRows = Object.values(finished.groups).reduce((sum, group) => sum + group.rows.length, 0)
-  const shownTotal = repos.reduce((sum, item) => sum + item.total, 0)
-  const anyPending = repos.some((item) => {
-    const group = finished.groups[item.repo]
-    return !group || !group.done || group.loading
-  })
+  const groups = snapshot.repos || []
+  const visible = (group) => Math.min(group.deals.length, shown[group.repo] ?? FINISHED_PER_REPO)
+  const shownRows = groups.reduce((sum, group) => sum + visible(group), 0)
+  const anyPending = groups.some((group) => visible(group) < group.deals.length)
   return h(
     'div',
     { className: 'duty-panel duty-finished-block' },
@@ -4838,7 +4809,7 @@ function FinishedBlock({ finished, onPick }) {
       'div',
       { className: 'duty-group-h duty-finished-head' },
       h('span', null, 'завершённые'),
-      h('span', { className: 'duty-num' }, `${shownRows} из ${shownTotal}`),
+      h('span', { className: 'duty-num' }, `${shownRows} из ${snapshot.total}`),
       h('span', { className: 'duty-spacer' }),
       h('span', { className: 'duty-muted' }, `по ${FINISHED_PER_REPO} на проект`),
     ),
@@ -4850,42 +4821,49 @@ function FinishedBlock({ finished, onPick }) {
           h(Button, { size: 'xs', variant: 'secondary', onClick: () => void finished.reload() }, 'повторить'),
         )
       : null,
-    finished.index.errors && finished.index.errors.length
+    snapshot.errors.length
       ? h(
           'div',
           { className: 'duty-note', style: { margin: '0 0 8px' } },
-          ...finished.index.errors.map((err, i) => h('div', { key: `fe-${i}` }, `источник ${err.source} недоступен: ${err.reason}`)),
+          ...snapshot.errors.map((err, i) => h('div', { key: `fe-${i}` }, `источник ${err.source} недоступен: ${err.reason}`)),
         )
       : null,
-    repos.length
+    // Список усечён — это факт о выборке, а не о store: пишем его прямо в шапке
+    // блока, чтобы счётчики проектов не выглядели полными.
+    snapshot.truncated
+      ? h(
+          'div',
+          { className: 'duty-note', style: { margin: '0 0 8px' } },
+          `в store больше ${FINISHED_FETCH_LIMIT} закрытых дел — показаны последние`,
+        )
+      : null,
+    groups.length
       ? h(
           'div',
           null,
-          ...repos.map((item) => {
-            const group = finished.groups[item.repo] || { ...EMPTY_FINISHED_GROUP, total: item.total }
-            const left = Math.max(0, group.total - group.rows.length)
-            const pending = group.loading ? Math.min(FINISHED_PER_REPO, Math.max(1, left)) : 0
-            const moreText = group.done
-              ? 'это все закрытые дела'
-              : group.loading
-                ? 'загружаю…'
-                : `ещё ${Math.min(FINISHED_PER_REPO, Math.max(1, left))}${left > FINISHED_PER_REPO ? ` · осталось ${left}` : ''}`
+          ...groups.map((group) => {
+            const rows = group.deals.slice(0, visible(group))
+            const left = group.deals.length - rows.length
+            const done = left === 0
+            const more =
+              done
+                ? 'это все закрытые дела'
+                : `ещё ${Math.min(FINISHED_PER_REPO, left)}${left > FINISHED_PER_REPO ? ` · осталось ${left}` : ''}`
             return h(
               'section',
-              { className: 'duty-group', key: `fd-${item.repo || 'without'}` },
+              { className: 'duty-group', key: `fd-${group.repo || 'without'}` },
               h(
                 'div',
                 { className: 'duty-group-h' },
                 h(
                   'span',
-                  { className: item.repo ? 'duty-mono' : 'duty-mono duty-muted', title: item.repo || 'репозиторий не назван' },
-                  item.label,
+                  { className: group.repo ? 'duty-mono' : 'duty-mono duty-muted', title: group.repo || 'репозиторий не назван' },
+                  group.label,
                 ),
-                h('span', { className: 'duty-num' }, `${group.rows.length} из ${item.total}`),
+                h('span', { className: 'duty-num' }, `${rows.length} из ${group.count}`),
                 h('span', { className: 'duty-spacer' }),
-                group.error ? h('span', { style: { color: 'var(--ui-red)' } }, `ошибка: ${group.error}`) : null,
               ),
-              h(FinishedTable, { rows: group.rows, pending, onPick }),
+              h(FinishedTable, { rows, pending: 0, onPick }),
               // Кнопка стоит по центру под списком — там, где появятся новые
               // строки, и выделена акцентом: это единственный способ их получить.
               h(
@@ -4895,11 +4873,11 @@ function FinishedBlock({ finished, onPick }) {
                   'button',
                   {
                     type: 'button',
-                    className: group.done ? 'duty-more-btn is-done' : 'duty-more-btn',
-                    disabled: group.loading || group.done,
-                    onClick: () => void finished.loadGroup(item.repo, 'more'),
+                    className: done ? 'duty-more-btn is-done' : 'duty-more-btn',
+                    disabled: done,
+                    onClick: () => finished.reveal(group.repo),
                   },
-                  moreText,
+                  more,
                 ),
               ),
             )
@@ -4914,23 +4892,23 @@ function FinishedBlock({ finished, onPick }) {
                 type: 'button',
                 className: anyPending ? 'duty-more-btn' : 'duty-more-btn is-done',
                 disabled: !anyPending,
-                onClick: () => void finished.loadMoreAll(),
+                onClick: () => finished.revealAll(groups),
               },
-              anyPending ? `загрузить ещё по ${FINISHED_PER_REPO}` : 'всё загружено',
+              anyPending ? `показать ещё по ${FINISHED_PER_REPO}` : 'всё загружено',
             ),
           ),
         )
       : h(
           'div',
           { className: 'duty-empty' },
-          h('b', null, finished.index.errors.length ? 'завершённые не прочитались' : 'завершённых дел нет'),
+          h('b', null, snapshot.errors.length ? 'завершённые не прочитались' : 'завершённых дел нет'),
           // Причина пустоты — словами бэкенда (`note`/`errors`), а не своя догадка.
           h(
             'span',
             { className: 'duty-muted' },
-            finished.index.errors.length
-              ? `store: ${finished.index.errors[0].reason}`
-              : finished.index.note || 'в store нет ни одного закрытого дела',
+            snapshot.errors.length
+              ? `store: ${snapshot.errors[0].reason}`
+              : snapshot.note || 'в store нет ни одного закрытого дела',
           ),
         ),
   )
@@ -5265,8 +5243,8 @@ function DutyPage() {
   // Мини-таймлайн: активные дела плюс те закрытые, что уже загружены списком.
   // Цвет и границы этапов считает шейпер — здесь только данные для него.
   const finishedRows = useMemo(
-    () => Object.values(finished.groups).flatMap((group) => group.rows || []),
-    [finished.groups],
+    () => (finished.snapshot ? finished.snapshot.repos : []).flatMap((group) => group.deals || []),
+    [finished.snapshot],
   )
   const timelineIds = useMemo(
     () => [...(model ? model.deals.map((deal) => deal.id) : []), ...finishedRows.map((row) => row.id)],

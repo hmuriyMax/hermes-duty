@@ -676,50 +676,62 @@ test('десктоп: блок завершённых — без сворачи�
     finished_at: sampleNow - 600,
     title: 'закрыть сделку',
   })
-  const render = (groups) =>
+  const repo = '/Users/x/GolandProjects/hermes-duty'
+  // Контракт блока: снимок (`snapshot`) + карта показанных строк (`shown`).
+  // Запросов у блока нет — листание в памяти, поэтому и мок без сети.
+  const render = ({ count = 12, shown = {}, rows = [row], errors = [], truncated = false } = {}) =>
     renderToStaticMarkup(
       React.createElement(mod.FinishedBlock, {
         onPick: () => {},
         finished: {
-          index: {
-            repos: [{ repo: '/Users/x/GolandProjects/hermes-duty', short: 'hermes-duty', label: 'hermes-duty', total: 12 }],
-            total: 12,
-            errors: [],
+          snapshot: {
+            repos:
+              count === 0
+                ? []
+                : [{ key: repo, repo, label: 'hermes-duty', count, deals: Array.from({ length: count }, () => row) }],
+            total: count,
+            truncated,
+            errors,
             note: '',
           },
-          groups: { '/Users/x/GolandProjects/hermes-duty': groups },
+          shown,
           error: null,
           reload: () => {},
-          loadGroup: () => {},
-          loadMoreAll: () => {},
+          reveal: () => {},
+          revealAll: () => {},
         },
       }),
     )
 
-  const loaded = render({ rows: [row], total: 12, next: 'cur', done: false, loading: false, error: null })
+  const loaded = render()
   // Кнопка — под таблицей и с курсом на остаток, а не общий сдвиг списка.
   const tableEnd = loaded.indexOf('</table>')
   const moreAt = loaded.indexOf('duty-more-row')
   assert.ok(tableEnd > 0 && moreAt > tableEnd, 'кнопка «ещё» стоит не под таблицей')
-  assert.match(loaded, /class="duty-more-btn"[^>]*>ещё 5 · осталось 11</, 'кнопка не называет остаток')
-  assert.match(loaded, /1 из 12/, 'нет счётчика группы')
+  assert.match(loaded, /class="duty-more-btn"[^>]*>ещё 5 · осталось 7</, 'кнопка не называет остаток')
+  assert.match(loaded, /5 из 12/, 'нет счётчика группы')
+  // Показано ровно пять строк, хотя в снимке двенадцать.
+  assert.equal((loaded.match(/class="duty-row/g) || []).length, 5, 'на проект показано не пять строк')
 
-  // Пока грузится — скелетоны на месте будущих строк, таблица не пропадает.
-  const loading = render({ rows: [row], total: 12, next: 'cur', done: false, loading: true, error: null })
-  assert.match(loading, /class="duty-skel-tr"/, 'нет скелетонов подгрузки')
-  assert.match(loading, /class="duty-row duty-row-in"/, 'показанные строки пропали при подгрузке')
-  assert.match(loading, /загружаю…/, 'кнопка не говорит о подгрузке')
+  // Развернули на десяток — кнопка говорит о хвосте.
+  const revealed = render({ shown: { [repo]: 10 } })
+  assert.equal((revealed.match(/class="duty-row/g) || []).length, 10, 'раскрытие не добавило строк')
+  assert.match(revealed, /ещё 2</, 'кнопка не называет остаток в две строки')
 
-  // Всё загружено — кнопка гаснет и говорит словами, а не остаётся яркой.
-  const done = render({ rows: [row], total: 1, next: null, done: true, loading: false, error: null })
+  // Всё показано — кнопка гаснет и говорит словами, а не остаётся яркой.
+  const done = render({ count: 5 })
   assert.match(done, /duty-more-btn is-done/, 'состояние «всё» не отличается от кнопки')
 
   // Сворачивания нет: блок не прячет тело под переключателем.
   assert.ok(!/duty-finished-toggle|aria-expanded/.test(loaded), 'вернулось сворачивание блока')
   // Общая кнопка поднимает по пятёрке сразу во всех проектах.
-  assert.match(loaded, /duty-more-all/, 'нет общей кнопки «загрузить ещё по 5»')
-})
+  assert.match(loaded, /duty-more-all/, 'нет общей кнопки «показать ещё по 5»')
 
+  // Усечённая выборка и непрочитанный store — разные факты, оба видны словами.
+  assert.match(render({ truncated: true }), /показаны последние/, 'усечение списка не сказано')
+  const failed = render({ count: 0, rows: [], errors: [{ source: 'deals', reason: 'database is locked' }] })
+  assert.match(failed, /завершённые не прочитались/, 'ошибка чтения выдана за «дел нет»')
+})
 
 /**
  * Страница целиком: таймлайн на «Сейчас» и листание «Завершённых» — те же данные,
@@ -783,33 +795,24 @@ test('десктоп: страница — таймлайн и развёрну�
     attempts: 1,
     questions: { asked: 0, answered: 0, waiting: 0 },
   })
-  const courses = []
+  const dealsCalls = []
 
   try {
     const mod = await import(pathToFileURL(join(dir, 'plugin.mjs')).href)
+    // Ответ СТАРОГО бэкенда: без `repos` — ровно то, на чём блок показывал
+    // «0 из 0» (09.11). Группы считаются на клиенте, поэтому список работает.
     mod.__setRest(async (path) => {
       if (path === '/now') return nowFixture
-      if (path.startsWith('/deals?limit=1')) {
+      if (path.startsWith('/deals')) {
+        dealsCalls.push(path)
         return {
           now: nowFixture.now,
           total: 12,
-          limit: 1,
-          deals: [finishedRow(1)],
-          repos: [{ repo, total: 12 }],
+          limit: 200,
+          truncated: false,
+          deals: Array.from({ length: 12 }, (_, i) => finishedRow(i + 1)),
           statuses: ['completed'],
           note: '',
-          errors: [],
-        }
-      }
-      if (path.startsWith('/deals?limit=5')) {
-        courses.push(path)
-        const more = path.includes('cursor=c2')
-        return {
-          now: nowFixture.now,
-          total: 12,
-          limit: 5,
-          deals: Array.from({ length: 5 }, (_, i) => finishedRow((more ? 6 : 1) + i)),
-          next_cursor: more ? null : 'c2',
           errors: [],
         }
       }
@@ -858,14 +861,17 @@ test('десктоп: страница — таймлайн и развёрну�
       'кнопка стоит не после таблицы',
     )
 
-    // Подгрузка: скелетоны встают сразу, строки добавляются по курсору.
+    // Листание в памяти: вторая пятёрка появляется сразу и без нового запроса.
+    const before = dealsCalls.length
     more.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }))
-    await new Promise((resolve) => setTimeout(resolve, 60))
-    assert.ok(group.querySelectorAll('tr.duty-skel-tr').length > 0, 'нет скелетонов подгрузки')
-    await new Promise((resolve) => setTimeout(resolve, 700))
-    assert.equal(group.querySelectorAll('tbody tr.duty-row').length, 10, 'вторая пятёрка не приехала')
-    assert.equal(group.querySelectorAll('tr.duty-skel-tr').length, 0, 'скелетоны остались после ответа')
-    assert.ok(courses.some((path) => path.includes('cursor=c2')), 'вторая страница запрошена без курсора')
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    assert.equal(group.querySelectorAll('tbody tr.duty-row').length, 10, 'вторая пятёрка не показалась')
+    assert.equal(dealsCalls.length, before, 'листание сходило в сеть за пятёркой')
+    more.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }))
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    assert.equal(group.querySelectorAll('tbody tr.duty-row').length, 12, 'хвост не показался')
+    assert.ok(group.querySelector('.duty-more-btn.is-done'), 'кнопка не погасла на последней строке')
+    assert.match(dealsCalls[0], /limit=200/, 'история читается не одним запросом')
     assert.equal(failures.length, 0, `страница ругалась: ${failures[0] || ''}`.slice(0, 600))
   } finally {
     console.error = origError

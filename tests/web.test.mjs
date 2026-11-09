@@ -80,13 +80,13 @@ test('«Завершённые» листаются по проектам: пя�
   assert.match(app, /group\.cursor = page\.next/)
   // Потолок «по 5 на проект» — константа, а не магия в трёх местах.
   assert.match(app, /const FINISHED_PER_REPO = 5/)
-  // Десктоп листает те же группы тем же шейпером: индекс — `/deals?limit=1`,
-  // страница проекта — `shapeFinishedPage`, свой курсор у каждого.
-  assert.match(pluginSource, /dealsPayload\('\/deals\?limit=1'\)/)
-  assert.match(pluginSource, /shapeFinishedPage\(raw\)/)
+  // Десктоп читает историю ОДНИМ запросом и режет по проектам в памяти: у
+  // старого бэкенда ключа `repos` нет, и постраничный список проектов не собрать.
+  assert.match(pluginSource, /dealsPayload\(`\/deals\?limit=\$\{FINISHED_FETCH_LIMIT\}`\)/)
+  assert.match(pluginSource, /const FINISHED_FETCH_LIMIT = 200/)
   assert.match(pluginSource, /const DEALS_ATTEMPTS = 3/)
   assert.match(pluginSource, /const FINISHED_PER_REPO = 5/)
-  assert.match(pluginSource, /cursor=\$\{encodeURIComponent\(cursor\)\}/)
+  assert.ok(!/limit=\$\{FINISHED_PER_REPO\}&repo=/.test(pluginSource), 'десктоп снова листает проекты по сети')
   // второго счёта в строках нет: вопросы/попытки/длительность — поля ответа
   assert.match(app, /deal\.questions\.text/)
   assert.match(pluginSource, /deal\.questions\.text/)

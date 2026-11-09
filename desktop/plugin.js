@@ -1084,7 +1084,7 @@ function barReasonText(bar) {
   const b = bar && typeof bar === 'object' ? bar : {}
   const reason = String(b.reason || '').trim()
   if (!reason) return ''
-  const kind = String(b.failureKind || '').trim()
+  const kind = String(b.failureKindText || b.failureKind || '').trim()
   return `${kind ? `отказ ${kind}` : 'причина'}: ${fmtTitle(reason, 140)}`
 }
 
@@ -2196,6 +2196,10 @@ function attemptBar(attempt, crashes) {
     // объясняет, а лезть за ней в журнал руками человек не должен.
     reason: String(a.reason || '').trim(),
     failureKind: String(a.kind || '').trim(),
+    // Имя класса словами приходит из шейпера сервера (`failure_kind` там — слаг):
+    // слаг в подсказке человеку ничего не объясняет, а собственный перевод в
+    // каждой поверхности разъехался бы между вебом и десктопом.
+    failureKindText: String(a.kind_text || '').trim(),
     tone: open ? (dead ? 'red' : 'blue') : outcomeTone(a.outcome, a.status, crashes),
     leftPct: 0,
     endPct: 0,

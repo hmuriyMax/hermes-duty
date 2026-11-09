@@ -712,6 +712,41 @@ def test_crash_outcomes_come_from_the_backend_constant(
     assert attempts["attempts"][0]["outcome"] == "crashed"
 
 
+def test_attempts_route_reports_tokens_from_the_journal(home: Path, client: TestClient) -> None:
+    """Ручка попыток отдаёт израсходованные токены, а не молчание.
+
+    Экран дела считает сумму токенов по этому ответу и без поля печатал «—» с
+    подписью «телеметрия не писала» — на деле с 12M и 32M токенов в журнале
+    (`details.usage_tokens`). Отсутствие поля читается как «не считали», а это
+    другой факт: у shell-этапа телеметрии нет правда, у агентской попытки — есть.
+    """
+    deal_id = make_deal(home, status="ready", created_at=NOW - 100)
+    attempt_started(home, deal_id, started_at=NOW - 90)
+    # Тело события пишется дословно: `attempt_ended` фабрики не знает `details`,
+    # а проверяется именно то, что движок кладёт в `details.usage_tokens`.
+    append(
+        home,
+        deal_id,
+        "attempt_ended",
+        {
+            "run_id": f"{deal_id}:impl#1",
+            "stage": "impl",
+            "attempt": 1,
+            "outcome": "done",
+            "kind": None,
+            "reason": "",
+            "base": None,
+            "commit": None,
+            "details": {"usage_tokens": 12_067_302},
+        },
+        ts=NOW - 60,
+    )
+
+    attempt = client.get(f"/duty/{deal_id}/attempts").json()["attempts"][0]
+
+    assert attempt["tokens"] == 12_067_302
+
+
 def test_running_without_any_live_signal_is_no_signal(home: Path, client: TestClient) -> None:
     """`status=running` без попытки и лизинга — не «работает», а «нет сигнала»."""
     deal_id = make_deal(home, status="running", created_at=NOW - 400)

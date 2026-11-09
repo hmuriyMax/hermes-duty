@@ -37,7 +37,6 @@ import {
   fileLabel,
   docBlocks,
   finishedStatusMeta,
-  shapeAttempts,
   shapeDeal,
   shapeDealTime,
   shapeFinished,
@@ -48,6 +47,9 @@ import {
   stateLabel,
   stateMeta,
   TOOL_LEGEND,
+  REFRESH_FAIL_SILENT,
+  refreshPlan,
+  freshKeys,
 } from './model.js'
 
 const TOKEN = window.__HERMES_SESSION_TOKEN__ || ''
@@ -57,6 +59,8 @@ const REFRESH_MS = 10000
 const HEALTH_REFRESH_MS = 30000
 const TIMEOUT_MS = 15000
 const SEARCH_DEBOUNCE_MS = 240
+// Сколько живёт подсветка изменившегося значения (только цвет, без движения).
+const FRESH_HIGHLIGHT_MS = 600
 
 /* ---------------------------------------------------------------- утилиты */
 
@@ -124,6 +128,89 @@ const clear = (node) => {
 
 const pct = (share) => (share === null || share === undefined ? '—' : `${Math.round(share * 100)}%`)
 
+/* --------------------------------------------- патч вместо перерисовки (0.0.8)
+ *
+ * Дело меняется минутами, а страница — снимок. Обновлять её заменой `innerHTML`
+ * нельзя: заменённый узел теряет раскрытие, фокус и прокрутку, и человек видит
+ * мигание там, где поменялась одна цифра. Поэтому тик сверяет новое дерево с уже
+ * нарисованным и правит узлы на месте: то, что не изменилось, остаётся тем же
+ * элементом (его и прокрутка, и обработчики), а вставляется или удаляется только
+ * то, что появилось или пропало.
+ *
+ * Ключ узла — `data-key` (id этапа, номер попытки, ключ маркера), а без ключа
+ * узлы сверяются по месту в списке. Ключами служат значения, которые уже есть в
+ * виде: `stage.id`, `attempt.number`, `marker.key`, `gap.from`.
+ */
+
+/** Ключ узла дерева; пусто — сверка пойдёт по месту в списке. */
+const treeKey = (node) => (node && node.nodeType === 1 ? node.getAttribute('data-key') || '' : '')
+
+/** Свести новые атрибуты со старым узлом: лишние снять, недостающие поставить. */
+function syncAttrs(oldEl, newEl) {
+  for (const attr of [...newEl.attributes]) {
+    if (oldEl.getAttribute(attr.name) !== attr.value) oldEl.setAttribute(attr.name, attr.value)
+  }
+  for (const attr of [...oldEl.attributes]) {
+    if (!newEl.hasAttribute(attr.name)) oldEl.removeAttribute(attr.name)
+  }
+}
+
+/** Слить детей: вернуть узлы, которые остались в родителе, в новом порядке. */
+function morphChildren(oldParent, newParent) {
+  const olds = [...oldParent.childNodes]
+  const byKey = new Map()
+  for (const node of olds) {
+    const key = treeKey(node)
+    if (key) byKey.set(key, node)
+  }
+  const wanted = [...newParent.childNodes]
+  const used = new Set()
+  const placed = wanted.map(() => null)
+  // Первый проход — по ключам: узел с тем же ключом правится там, где он стоял,
+  // даже если соседи поменялись местами или появились новые.
+  wanted.forEach((next, index) => {
+    const key = treeKey(next)
+    if (!key) return
+    const found = byKey.get(key)
+    if (!found || used.has(found)) return
+    used.add(found)
+    placed[index] = morph(found, next)
+  })
+  const free = olds.filter((node) => !used.has(node))
+  // Второй проход — по месту: узел без ключа берёт первый свободный старый узел.
+  // Узел с ключом позиционного «двойника» не получает: его либо нашли по ключу,
+  // либо это новый факт, который надо вставить.
+  wanted.forEach((next, index) => {
+    if (placed[index]) return
+    if (treeKey(next) || !free.length) {
+      placed[index] = next
+      return
+    }
+    placed[index] = morph(free.shift(), next)
+  })
+  placed.forEach((node, index) => {
+    if (oldParent.childNodes[index] !== node) oldParent.insertBefore(node, oldParent.childNodes[index] || null)
+  })
+  // Всё, что осталось за пределами нового списка, — пропало из ответа. Так
+  // удаляется одна закрытая попытка или целый этап, а не вся панель.
+  while (oldParent.childNodes.length > placed.length) oldParent.removeChild(oldParent.lastChild)
+}
+
+/** Свести новое поддерево со старым; вернуть узел, который остался в DOM. */
+function morph(oldNode, newNode) {
+  if (!oldNode || oldNode.nodeType !== newNode.nodeType || oldNode.nodeName !== newNode.nodeName) {
+    if (oldNode && oldNode.parentNode) oldNode.parentNode.replaceChild(newNode, oldNode)
+    return newNode
+  }
+  if (oldNode.nodeType !== 1) {
+    if (oldNode.nodeValue !== newNode.nodeValue) oldNode.nodeValue = newNode.nodeValue
+    return oldNode
+  }
+  syncAttrs(oldNode, newNode)
+  morphChildren(oldNode, newNode)
+  return oldNode
+}
+
 async function api(path) {
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS)
@@ -163,7 +250,7 @@ const snap = { data: null, error: null, loading: false }
 const filter = { repo: ALL_REPOS, states: new Set(), query: '', effQuery: '' }
 const health = { data: null, error: null, loading: false }
 const finished = { data: null, error: null, loading: false }
-const dealSnap = { key: '', data: null, attempts: null, error: null, loading: false }
+const dealSnap = { key: '', data: null, attempts: null, error: null, loading: false, refreshedAt: 0, refreshError: '', spots: [] }
 
 function setStamp(at) {
   stampAt = at
@@ -857,6 +944,15 @@ async function loadDeal(dealId) {
     dealSnap.data = null
     dealSnap.attempts = null
     dealSnap.error = null
+    dealSnap.refreshedAt = 0
+    dealSnap.refreshError = ''
+    dealSnap.spots = []
+    // Раскрытия принадлежат прошлому делу: ключи включают его id, и помнить чужие
+    // незачем — новое дело начинается с умолчаний вида.
+    stageOpen.clear()
+    attOpen.clear()
+    stageShown.clear()
+    attShown.clear()
   }
   dealSnap.loading = true
   try {
@@ -868,13 +964,19 @@ async function loadDeal(dealId) {
       dealSnap.data = detail
       dealSnap.attempts = attempts
       dealSnap.error = null
+      dealSnap.refreshError = ''
+      dealSnap.refreshedAt = Math.floor(Date.now() / 1000)
+      dealSnap.spots = dealSpots(detail, attempts)
       setStamp(Date.now())
     }
   } catch (err) {
     if (dealSnap.key === key) dealSnap.error = err.message
   } finally {
     dealSnap.loading = false
-    render()
+    // Полная перерисовка — только когда страницы дела ещё нет. Дальше правка на
+    // месте: ручное обновление не должно отбирать прокрутку и раскрытия.
+    if (dealOn(key) && dealSnap.data && app.querySelector('[data-key="scale"]')) patchDeal(key)
+    else render()
   }
 }
 
@@ -941,9 +1043,24 @@ function viewDealBadAddress(board, dealId) {
 // этапов у двух дел совпадают, а раскрытия — нет.
 const stageOpen = new Map()
 const attOpen = new Map()
+// Умолчание раскрытия на последнем нарисованном кадре вида. Клик читает его
+// отсюда: тихое обновление правит узлы на месте, и замыкание отрисовки иначе
+// держало бы раскрытие по устаревшему виду.
+const stageDefaults = new Map()
+const attDefaults = new Map()
 
-/** Раскрыта ли строка: ручное решение поверх умолчания шейпера. */
-const openNow = (overrides, key, byDefault) => (overrides.has(key) ? overrides.get(key) : byDefault)
+// Строки, которые экран уже показывал раскрытыми: живая попытка, только что
+// закончившаяся, не должна схлопываться под руками у человека, который на неё
+// смотрел. Раскрытое остаётся раскрытым, пока его не свернут руками.
+const stageShown = new Set()
+const attShown = new Set()
+
+/**
+ * Раскрытие строки с учётом показанного: ручное решение важнее всего, иначе —
+ * умолчание вида, иначе — «её уже видели раскрытой».
+ */
+const rowOpen = (overrides, shown, key, byDefault) =>
+  overrides.has(key) ? overrides.get(key) === true : byDefault === true || shown.has(key)
 
 /**
  * Попытки этапа для столбца.
@@ -992,13 +1109,19 @@ function attRowNodes(stage, bar, key, open, rebuild) {
         class: open ? 'att-row open' : 'att-row',
         title: view.outcomeText,
         'aria-expanded': open ? 'true' : 'false',
+        'data-key': key,
         onclick: () => {
-          attOpen.set(key, !open)
+          // Текущее состояние читается здесь, а не из замыкания отрисовки: после
+          // тихого обновления умолчание вида могло смениться.
+          const current = rowOpen(attOpen, attShown, key, attDefaults.get(key) === true)
+          attOpen.set(key, !current)
+          if (current) attShown.delete(key)
+          else attShown.add(key)
           rebuild()
         },
       },
       h('span', { class: 'mono att-row-n' }, view.label),
-      h('span', { class: 'att-row-dur' }, view.durationText),
+      h('span', { class: 'att-row-dur fresh', 'data-fresh': `att:${key}` }, view.durationText),
       h('span', { class: `att-row-out t-${view.tone}` }, view.outcomeText),
       h('span', { class: 'sp' }),
       h('span', { class: 'att-row-tog' }, open ? '▾' : '▸'),
@@ -1022,7 +1145,11 @@ function attRowNodes(stage, bar, key, open, rebuild) {
 function stageBlockNode(dealId, stage, timeline, rebuild) {
   const view = compactStageView(stage)
   const stageKey = `${dealId}:${view.id}`
-  const open = openNow(stageOpen, stageKey, view.openByDefault)
+  const open = rowOpen(stageOpen, stageShown, stageKey, view.openByDefault)
+  if (open) stageShown.add(stageKey)
+  // Умолчание раскрытия на текущем кадре: клик читает его отсюда, чтобы после
+  // тихого обновления не спорить с устаревшим замыканием.
+  stageDefaults.set(stageKey, view.openByDefault)
   const bars = stageColumnBars(stage, timeline)
   const nodes = [
     h(
@@ -1032,13 +1159,16 @@ function stageBlockNode(dealId, stage, timeline, rebuild) {
         title: view.needsText || view.toggleTitle,
         'aria-expanded': open ? 'true' : 'false',
         onclick: () => {
-          stageOpen.set(stageKey, !open)
+          const current = rowOpen(stageOpen, stageShown, stageKey, stageDefaults.get(stageKey) === true)
+          stageOpen.set(stageKey, !current)
+          if (current) stageShown.delete(stageKey)
+          else stageShown.add(stageKey)
           rebuild()
         },
       },
       h('span', { class: 'mono stage-row-id' }, view.id),
       h('span', { class: 'stage-row-kind muted' }, view.kindText),
-      h('span', { class: 'stage-row-att' }, view.attemptsText),
+      h('span', { class: 'stage-row-att fresh', 'data-fresh': `stage:${stageKey}` }, view.attemptsText),
       h('span', { class: 'sp' }),
       h('span', { class: `badge t-${view.tone}`, title: view.stateLabel }, h('i'), view.stateLabel),
       h('span', { class: 'stage-row-tog' }, open ? '▾' : '▸'),
@@ -1053,13 +1183,19 @@ function stageBlockNode(dealId, stage, timeline, rebuild) {
       ),
     )
   }
-  if (!open) return h('div', { class: 'stage-block' }, ...nodes)
+  if (!open) return h('div', { class: 'stage-block', 'data-key': `block:${stageKey}` }, ...nodes)
   if (!bars.length) nodes.push(h('div', { class: 'att-none muted' }, 'попыток нет'))
   bars.forEach((bar, index) => {
-    const attKey = `${stageKey}#${index}`
-    nodes.push(...attRowNodes(stage, bar, attKey, openNow(attOpen, attKey, compactAttemptView(stage, bar).openByDefault), rebuild))
+    // Ключ попытки — её номер, а не место в списке: новая попытка сдвинула бы
+    // индексы, и раскрытие переехало бы на чужую строку.
+    const attKey = `${stageKey}#${bar.number || index}`
+    const barView = compactAttemptView(stage, bar)
+    attDefaults.set(attKey, barView.openByDefault)
+    const attOpenNow = rowOpen(attOpen, attShown, attKey, barView.openByDefault)
+    if (attOpenNow) attShown.add(attKey)
+    nodes.push(...attRowNodes(stage, bar, attKey, attOpenNow, rebuild))
   })
-  return h('div', { class: 'stage-block' }, ...nodes)
+  return h('div', { class: 'stage-block', 'data-key': `block:${stageKey}` }, ...nodes)
 }
 
 /**
@@ -1070,21 +1206,25 @@ function stageBlockNode(dealId, stage, timeline, rebuild) {
  * Пустой граф печатает причину (`stages_note` бэкенда: нет спеки, спека не
  * читается) — «этапов нет» и «спеки нет» разные факты.
  */
-function stagesColumn(dealId, data, timeline) {
-  const feed = shapeStages(data)
-  const host = h('div', { class: 'stages-list' })
+function stagesColumn(dealId) {
+  const host = h('div', { class: 'stages-list', 'data-key': 'stages-list' })
+  // Пересборка по клику читает текущий снимок дела, а не тот, что был при
+  // создании панели: иначе после тихого обновления раскрытие рисовало бы старые
+  // попытки, а новая строка исчезала бы до следующего тика.
   const rebuild = () => {
     clear(host)
+    const feed = shapeStages(dealSnap.data)
     if (feed.empty) {
       host.append(h('div', { class: 'panel-b muted' }, feed.note || 'этапов нет'))
       return
     }
-    host.append(...feed.stages.map((stage) => stageBlockNode(dealId, stage, timeline, rebuild)))
+    host.append(...feed.stages.map((stage) => stageBlockNode(dealId, stage, dealSnap.attempts, rebuild)))
   }
   rebuild()
+  const feed = shapeStages(dealSnap.data)
   return h(
     'div',
-    { class: 'panel deal-stages' },
+    { class: 'panel deal-stages', 'data-key': 'stages' },
     h('div', { class: 'panel-h' }, feed.empty ? 'этапы' : `этапы · ${feed.count}`),
     // Путь к спеке — именем файла, полный путь в подсказке.
     feed.spec ? h('div', { class: 'stages-spec mono muted', title: feed.spec }, fileLabel(feed.spec)) : null,
@@ -1117,13 +1257,16 @@ function dealFactSpans(scale) {
   // Числа, которые уже стоят в KPI (попытки, длительность), здесь не повторяются:
   // одна цифра в двух местах читается как два разных факта.
   const parts = [
-    h('span', { title: 'вопросы человеку по таймлайну' }, 'вопросы: ', h('b', null, facts.questions.text)),
+    h('span', { title: 'вопросы человеку по таймлайну', 'data-key': 'fact:questions' }, 'вопросы: ', h('b', null, facts.questions.text)),
   ]
   if (facts.budget) {
     parts.push(
       h(
         'span',
-        { title: facts.budget.exhausted ? `потолок исчерпан: ${facts.budget.exhausted}` : 'потолок дела целиком' },
+        {
+          title: facts.budget.exhausted ? `потолок исчерпан: ${facts.budget.exhausted}` : 'потолок дела целиком',
+          'data-key': 'fact:budget',
+        },
         'бюджет: ',
         h('b', null, facts.budget.text || '—'),
       ),
@@ -1133,14 +1276,17 @@ function dealFactSpans(scale) {
     parts.push(
       h(
         'span',
-        { title: facts.published.mrUrl || facts.published.ref || 'факт журнала' },
+        {
+          title: facts.published.mrUrl || facts.published.ref || 'факт журнала',
+          'data-key': 'fact:published',
+        },
         'публикация: ',
         h('b', { class: 'mono' }, facts.published.text || '—'),
       ),
     )
   }
   if (facts.closed) {
-    parts.push(h('span', { title: facts.closed.cause || '' }, 'закрытие: ', h('b', null, facts.closed.text)))
+    parts.push(h('span', { title: facts.closed.cause || '', 'data-key': 'fact:closed' }, 'закрытие: ', h('b', null, facts.closed.text)))
   }
   return parts
 }
@@ -1153,6 +1299,7 @@ function markerNode(marker, index) {
       class: `scale-marker t-${marker.tone}${marker.tick ? ' tick' : ''}`,
       style: `left:${marker.pct}%;top:${(index % 2) * 13}px`,
       title: marker.title,
+      'data-key': `marker:${marker.type}:${marker.at}`,
       'aria-label': marker.ariaLabel,
       role: 'img',
       tabindex: '0',
@@ -1208,23 +1355,26 @@ function toneVar(tone) {
  * время начала, конца и длительность живут в подсказке строки — они не спорят с
  * чипами за место на дорожке.
  */
-function attemptRowNode(view) {
+function attemptRowNode(view, key) {
   const label = h(
     'div',
     { class: 'tl-lbl', 'data-tip': view.bandTip || view.title || '' },
     h('span', { class: 'tl-n' }, view.label.number),
-    h('span', { class: `tl-st t-${view.label.tone}` }, view.label.status),
+    // Исход попытки — то, что меняется от тика к тику: подсвечивается он, а не
+    // вся дорожка (полоса растёт непрерывно, вспышка на ней была бы миганием).
+    h('span', { class: `tl-st t-${view.label.tone} fresh`, 'data-fresh': key }, view.label.status),
     // Надбавка «не всё показано» — в подписи, а не поверх дорожки: она не
     // должна перекрывать чипы.
     view.badge ? h('span', { class: 'tl-more', title: view.note || view.title }, view.badge) : null,
   )
-  const track = h('div', { class: 'tl-track' })
+  const track = h('div', { class: 'tl-track', 'data-key': `track:${key}` })
   if (view.band) {
     track.append(
       h('span', {
         class: `tl-band t-${view.band.tone || 'grey'}`,
         style: `left:${view.band.leftPct}%;width:${view.band.widthPct}%`,
         'data-tip': view.bandTip,
+        'data-key': 'band',
       }),
     )
   }
@@ -1235,6 +1385,7 @@ function attemptRowNode(view) {
         class: 'tl-wait',
         style: `left:${wait.fromPct}%;width:${wait.widthPct}%`,
         'data-tip': wait.title,
+        'data-key': `wait:${wait.fromPct}`,
       }),
     )
   }
@@ -1244,6 +1395,7 @@ function attemptRowNode(view) {
         class: `tl-call${chip.unfinished ? ' tl-unfinished' : ''}`,
         'data-level': String(chip.level || 0),
         'data-tone': chip.tone,
+        'data-key': `call:${chip.id}`,
         style: chip.unfinished
           ? `left:${chip.leftPct}%;top:${chip.top}px;width:${chip.widthPct}%;color:${toneVar(chip.tone)}`
           : `left:${chip.leftPct}%;top:${chip.top}px;width:${chip.widthPct}%;background:${toneVar(chip.tone)}`,
@@ -1256,7 +1408,7 @@ function attemptRowNode(view) {
     )
   }
   if (view.marks.length) {
-    const marks = h('div', { class: 'tl-marks' })
+    const marks = h('div', { class: 'tl-marks', 'data-key': 'marks' })
     for (const mark of view.marks) {
       marks.append(
         h(
@@ -1266,6 +1418,7 @@ function attemptRowNode(view) {
             style: `left:${mark.pct}%`,
             'data-tip': mark.title,
             'aria-label': mark.ariaLabel,
+            'data-key': `mark:${mark.type}:${mark.pct}`,
           },
           h('i'),
         ),
@@ -1280,6 +1433,7 @@ function attemptRowNode(view) {
     {
       class: `tl-row${view.failed ? ' is-failed' : ''}`,
       style: `--tl-collapsed:${view.collapsed}px;--tl-full:${view.full}px`,
+      'data-key': key,
     },
     label,
     track,
@@ -1309,15 +1463,15 @@ function laneNode(lane, bars, scale) {
         )
       : null,
     h('span', { class: 'sp' }),
-    h('span', { class: 'tl-lane-meta' }, view.meta),
+    h('span', { class: 'tl-lane-meta fresh', 'data-fresh': `lane:${lane.key}` }, view.meta),
   )
   return h(
     'div',
-    { class: 'tl-lane' },
+    { class: 'tl-lane', 'data-key': `lane:${lane.key}` },
     head,
     view.empty
       ? h('div', { class: 'tl-row-empty' }, 'попыток не было')
-      : h('div', { class: 'tl-rows' }, ...view.rows.map((row) => attemptRowNode(row.view))),
+      : h('div', { class: 'tl-rows' }, ...view.rows.map((row) => attemptRowNode(row.view, `attempt:${row.key}`))),
   )
 }
 
@@ -1359,12 +1513,12 @@ function selectedCall() {
 function kpiStrip(scale) {
   return h(
     'div',
-    { class: 'duty-kpi' },
+    { class: 'duty-kpi', 'data-key': 'kpi' },
     ...scale.kpi.map((item) =>
       h(
         'div',
-        { class: 'duty-kpi-cell', title: item.title || '' },
-        h('span', { class: 'duty-kpi-v' }, item.value),
+        { class: 'duty-kpi-cell', title: item.title || '', 'data-key': `kpi:${item.key}` },
+        h('span', { class: 'duty-kpi-v fresh', 'data-fresh': `kpi:${item.key}` }, item.value),
         h('span', { class: 'duty-kpi-l' }, item.label),
         item.note ? h('span', { class: 'duty-kpi-n' }, item.note) : null,
       ),
@@ -1448,15 +1602,18 @@ function scalePanel(scale) {
   if (scale.empty) {
     return h(
       'div',
-      { class: 'panel', style: 'margin-bottom:14px' },
-      h('div', { class: 'panel-h' }, 'шкала времени'),
+      { class: 'panel', style: 'margin-bottom:14px', 'data-key': 'scale' },
+      h('div', { class: 'panel-h' }, 'шкала времени', refreshedNode()),
       h('div', { class: 'panel-b muted' }, 'событий и попыток нет: рисовать нечего'),
     )
   }
   const panel = h(
     'div',
-    { class: 'panel', style: 'margin-bottom:14px' },
-    h('div', { class: 'panel-h' }, `шкала времени · ${scale.axis.text}`),
+    { class: 'panel', style: 'margin-bottom:14px', 'data-key': 'scale' },
+    // Подпись «обновлено ЧЧ:ММ:СС» — весь индикатор тихого обновления, и он же
+    // единственное место, где видно, что страница живая. `aria-live="off"`:
+    // диктор не должен читать время каждые пять секунд.
+    h('div', { class: 'panel-h' }, `шкала времени · ${scale.axis.text}`, refreshedNode()),
     h(
       'div',
       { class: 'panel-b' },
@@ -1479,7 +1636,7 @@ function scalePanel(scale) {
           ...scale.axis.ticks.map((tick) =>
             h(
               'span',
-              { class: `scale-tick align-${tick.align}`, style: `left:${tick.pct}%`, title: tick.clock },
+              { class: `scale-tick align-${tick.align}`, style: `left:${tick.pct}%`, title: tick.clock, 'data-key': `tick:${tick.pct}` },
               tick.edge ? `${tick.edge} ${tick.clock}` : tick.clock,
             ),
           ),
@@ -1497,7 +1654,7 @@ function scalePanel(scale) {
           'div',
           { class: 'scale-grid', 'aria-hidden': 'true' },
           ...scale.axis.ticks.map((tick) =>
-            h('span', { class: 'scale-grid-line', style: `left:${tick.pct}%` }),
+            h('span', { class: 'scale-grid-line', style: `left:${tick.pct}%`, 'data-key': `grid:${tick.pct}` }),
           ),
         ),
         // Сжатые промежутки оси: пара пунктиров по краям и подпись посередине.
@@ -1508,12 +1665,13 @@ function scalePanel(scale) {
               'svg',
               { class: 'tl-idle-layer' },
               ...scale.idle.gaps.flatMap((gap) => [
-                h('line', { class: 'tl-idle', x1: `${gap.leftPct}%`, y1: '0', x2: `${gap.leftPct}%`, y2: '100%' }),
-                h('line', { class: 'tl-idle', x1: `${gap.rightPct}%`, y1: '0', x2: `${gap.rightPct}%`, y2: '100%' }),
+                h('line', { class: 'tl-idle', 'data-key': `idle:${gap.from}:l`, x1: `${gap.leftPct}%`, y1: '0', x2: `${gap.leftPct}%`, y2: '100%' }),
+                h('line', { class: 'tl-idle', 'data-key': `idle:${gap.from}:r`, x1: `${gap.rightPct}%`, y1: '0', x2: `${gap.rightPct}%`, y2: '100%' }),
                 h(
                   'text',
                   {
                     class: 'tl-idle-label',
+                    'data-key': `idle:${gap.from}:t`,
                     x: `${gap.labelPct}%`,
                     y: '50%',
                     'text-anchor': gap.labelAnchor,
@@ -1542,7 +1700,7 @@ function scalePanel(scale) {
         // (`scale.tools`), а не пять слов из константы.
         h(
           'div',
-          { class: 'scale-side' },
+          { class: 'scale-side', 'data-key': 'tools' },
           h('span', { class: 'scale-keys-h' }, 'инструменты'),
           ...scale.tools.map((item) =>
             h(
@@ -1550,6 +1708,7 @@ function scalePanel(scale) {
               {
                 class: 'scale-key',
                 'data-tone': item.tone,
+                'data-key': `tool:${item.tone}`,
                 role: 'button',
                 tabindex: '0',
                 'aria-pressed': 'false',
@@ -1557,7 +1716,7 @@ function scalePanel(scale) {
               },
               h('span', { class: `scale-key-dot t-${item.tone}` }),
               h('span', { class: 'scale-key-l' }, item.label),
-              h('span', { class: 'scale-key-n' }, String(item.count)),
+              h('span', { class: 'scale-key-n fresh', 'data-fresh': `tool:${item.tone}` }, String(item.count)),
             ),
           ),
         ),
@@ -1570,6 +1729,25 @@ function scalePanel(scale) {
   )
   // Фильтр, выбранный в легенде, переживает перерисовку данных: экран
   // пересобирается по новому кадру, а подсветка остаётся там, где её оставили.
+  wireScalePanel(panel)
+  return panel
+}
+
+// Панели, которые уже слушают клики. Тихий патч правит узлы на месте, поэтому
+// панель — тот же элемент, что и до тика, и второй набор обработчиков на ней
+// doubling'ом ловил бы каждый клик дважды.
+const wiredPanels = new WeakSet()
+
+/**
+ * Обработчики панели шкалы: легенда семейств и выбор вызова.
+ *
+ * Ставятся один раз на элемент, а не на каждую отрисовку: клики делегированы
+ * панели, поэтому заменённые внутри неё чипы продолжают работать. Состояние
+ * (фильтр, выбранный вызов) живёт на экране, а не в узлах.
+ */
+function wireScalePanel(panel) {
+  if (wiredPanels.has(panel)) return
+  wiredPanels.add(panel)
   applyToolFilter(panel)
 
   // Легенда семейств — переключатели: клик подсвечивает семейство на дорожках,
@@ -1607,7 +1785,6 @@ function scalePanel(scale) {
     host.replaceChildren(inspectorNode(selectedCall()))
     if (document.activeElement && document.activeElement.blur) document.activeElement.blur()
   })
-  return panel
 }
 
 function viewDeal(dealId) {
@@ -1628,7 +1805,6 @@ function viewDeal(dealId) {
   // «pid жив» собирает общий шейпер, чтобы экран «Дело» и таблица «Сейчас»
   // говорили об одном и том же одними словами.
   const deal = data.deal ? shapeDeal(data.deal) : null
-  const timeline = dealSnap.attempts ? shapeAttempts(dealSnap.attempts) : null
   // Шкала времени: ось, дорожки этапов, полосы и маркеры — из одного шейпера
   // (`shapeDealTime`), того же, что вшит в десктопный плагин.
   const scale = shapeDealTime(data, dealSnap.attempts)
@@ -1638,7 +1814,7 @@ function viewDeal(dealId) {
   // отбирал место у графа, а сам граф висел отдельной панелью внизу.
   const head = h(
     'div',
-    { class: 'deal-head' },
+    { class: 'deal-head', 'data-key': 'head' },
     h(
       'div',
       { class: 'deal-head-top' },
@@ -1651,7 +1827,7 @@ function viewDeal(dealId) {
       ),
       h(
         'div',
-        { class: 'deal-head-side' },
+        { class: 'deal-head-side', 'data-key': 'status' },
         // Закрытое дело: статус словами (`завершено`/`в архиве`), а не значением store.
         deal ? Badge(deal.state, deal.humanKind) : h('span', { class: 'badge t-gray' }, h('i'), finishedStatusMeta(data.status).label),
       ),
@@ -1662,14 +1838,17 @@ function viewDeal(dealId) {
       // Статус уже стоит бейджем справа, исполнитель у дела без рана не записан:
       // «исполнитель: —» — это пустое поле, а не факт.
       data.assignee ? h('span', null, 'исполнитель: ', h('b', null, data.assignee)) : null,
-      deal ? h('span', null, 'попытка: ', h('b', null, `${deal.attemptAgeText} (${deal.attemptNote})`)) : null,
-      deal ? h('span', null, 'лизинг: ', h('b', null, `${deal.leaseText}`)) : null,
+      deal ? h('span', { 'data-key': 'fact:attempt' }, 'попытка: ', h('b', null, `${deal.attemptAgeText} (${deal.attemptNote})`)) : null,
+      deal ? h('span', { 'data-key': 'fact:lease' }, 'лизинг: ', h('b', null, `${deal.leaseText}`)) : null,
       h('span', null, 'создано: ', h('b', null, fmtClock(data.created_at))),
-      deal ? h('span', null, 'последнее действие: ', h('b', null, `${deal.lastActionAgeText} назад`)) : null,
+      deal ? h('span', { 'data-key': 'fact:action' }, 'последнее действие: ', h('b', null, `${deal.lastActionAgeText} назад`)) : null,
     ),
     // Факты шкалы: попытки по этапам, длительность, вопросы, бюджет, публикация.
-    h('div', { class: 'deal-facts' }, ...dealFactSpans(scale)),
+    h('div', { class: 'deal-facts', 'data-key': 'facts' }, ...dealFactSpans(scale)),
     deal && deal.evidence ? h('div', { class: 'why-evidence', style: 'margin-top:10px', text: deal.evidence }) : null,
+    // Отказы опроса молчат, пока их меньше трёх: одиночный таймаут — не повод
+    // махать баннером. Три подряд — это уже сломанное обновление, и о нём честно.
+    dealSnap.refreshError ? errorBanner(`обновление не удалось: ${dealSnap.refreshError}`, () => loadDeal(dealId)) : null,
   )
 
   // Документы дела: тело из store и спека — разные вещи, и рисовать вместо одной
@@ -1680,7 +1859,7 @@ function viewDeal(dealId) {
   const left = docs.length
     ? h(
         'div',
-        { class: 'panel' },
+        { class: 'panel', 'data-key': 'docs' },
         ...docs.map((doc) =>
           h(
             'div',
@@ -1702,11 +1881,11 @@ function viewDeal(dealId) {
   // Этапы и попытки — одним тонким столбцом (320 px) рядом с описанием: шапка
   // попытки раньше повторялась в широкой ленте этапов и в отдельной панели
   // попыток, и страница дела росла на три с половиной экрана.
-  const stages = stagesColumn(data.id, data, timeline)
+  const stages = stagesColumn(data.id)
 
   return h(
     'div',
-    null,
+    { 'data-key': 'deal' },
     h('div', { style: 'margin-bottom:10px' }, h('a', { href: '#/deal' }, '← к списку дел')),
     head,
     kpiStrip(scale),
@@ -1714,6 +1893,203 @@ function viewDeal(dealId) {
     left ? h('div', { class: 'deal-cols' }, left, stages) : stages,
   )
 }
+
+/* ------------------------------------------ тихое обновление дела (0.0.8) */
+
+/** Дело открыто прямо сейчас: маршрут тот же и это не отказ по старому адресу. */
+const dealOn = (dealId) => route.name === 'deal' && route.bad !== true && String(route.id || '') === String(dealId || '')
+
+/** Подпись «обновлено ЧЧ:ММ:СС» в шапке панели — весь индикатор тихого тика. */
+function refreshedNode() {
+  const at = dealSnap.refreshedAt
+  return h('span', { class: 'refreshed', 'aria-live': 'off', 'data-key': 'refreshed' }, at ? `обновлено ${fmtClock(at)}` : '')
+}
+
+/**
+ * Плоский снимок вида «ключ → значение» для сверки двух тиков.
+ *
+ * Ключи те же, что стоят в разметке (`data-fresh`), поэтому подсветить
+ * изменившееся — это найти узел по ключу, а не сравнивать деревья целиком.
+ */
+function dealSpots(detail, attempts) {
+  const d = detail && typeof detail === 'object' ? detail : {}
+  const scale = shapeDealTime(d, attempts)
+  const feed = shapeStages(d)
+  const spots = []
+  for (const bar of scale.bars) {
+    spots.push({
+      key: `attempt:${bar.laneKey || ''}-${bar.number || ''}`,
+      state: bar.outcomeText,
+      outcome: bar.outcome,
+      durationText: bar.durationText,
+      pct: bar.endPct,
+    })
+  }
+  for (const lane of scale.lanes) spots.push({ key: `lane:${lane.key}`, value: String(lane.count) })
+  for (const item of scale.kpi) spots.push({ key: `kpi:${item.key}`, value: item.value })
+  for (const item of scale.tools) spots.push({ key: `tool:${item.tone}`, value: String(item.count) })
+  // Столбец этапов: те же значения, что напечатаны в `stage-row`/`att-row`.
+  for (const stage of feed.stages || []) {
+    const view = compactStageView(stage)
+    const stageKey = `${d.id}:${view.id}`
+    spots.push({ key: `stage:${stageKey}`, value: view.attemptsText, state: view.stateLabel })
+    stageColumnBars(stage, attempts).forEach((bar, index) => {
+      const barView = compactAttemptView(stage, bar)
+      spots.push({ key: `att:${stageKey}#${bar.number || index}`, value: barView.durationText, outcome: barView.outcomeText })
+    })
+  }
+  return spots
+}
+
+/** Системная настройка «меньше движения»: подсветка при ней не навешивается. */
+function prefersReducedMotion() {
+  return Boolean(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches)
+}
+
+// Таймеры снятия подсветки: повторный тик по тому же узлу не должен гасить
+// подсветку раньше срока, который поставил предыдущий.
+const freshTimers = new WeakMap()
+
+/** Коротко подсветить значения, которые изменились между тиками. */
+function markFresh(keys) {
+  if (!keys.length || prefersReducedMotion()) return
+  const wanted = new Set(keys)
+  for (const el of app.querySelectorAll('[data-fresh]')) {
+    if (!wanted.has(el.getAttribute('data-fresh'))) continue
+    el.classList.add('is-fresh')
+    const prev = freshTimers.get(el)
+    if (prev) clearTimeout(prev)
+    freshTimers.set(el, setTimeout(() => el.classList.remove('is-fresh'), FRESH_HIGHLIGHT_MS))
+  }
+}
+
+// Фильтр легенды и выбранный вызов — состояние экрана, а не ответа: после патча
+// узлы приходят «чистыми», и отметки надо вернуть, иначе подсветка гаснет на
+// каждом тике.
+function syncScaleState() {
+  applyToolFilter(app)
+  for (const chip of app.querySelectorAll('.tl-call')) {
+    const on = Boolean(dutySelectedCallId) && chip.getAttribute('data-call-id') === dutySelectedCallId
+    chip.classList.toggle('tl-sel', on)
+  }
+}
+
+/**
+ * Обновить страницу дела по свежему ответу: правка на месте, без перерисовки.
+ *
+ * Полная сборка `viewDeal` нужна и здесь — она даёт новое дерево; но в DOM
+ * остаётся старое, и `morph` переносит в него только разницу. Поэтому раскрытые
+ * попытки, прокрутка и фильтр переживают тик.
+ */
+function patchDeal(dealId) {
+  const host = app.firstElementChild
+  // Страницы ещё нет (первый заход) — рисуем целиком, патчить нечего.
+  if (!host || !host.hasAttribute('data-key')) {
+    render()
+    return
+  }
+  const prev = dealSnap.spots
+  const next = dealSpots(dealSnap.data, dealSnap.attempts)
+  morph(host, viewDeal(dealId))
+  const panel = app.querySelector('[data-key="scale"]')
+  if (panel) wireScalePanel(panel)
+  syncScaleState()
+  markFresh(freshKeys(prev, next))
+  dealSnap.spots = next
+}
+
+// Петля опроса: следующий тик ставится после завершения предыдущего
+// (`setTimeout`, а не `setInterval`) — иначе медленный ответ накладывал бы тики.
+const dealPoll = { timer: null, failures: 0 }
+
+function dealPollStop() {
+  if (dealPoll.timer !== null) clearTimeout(dealPoll.timer)
+  dealPoll.timer = null
+}
+
+/** Человек правит текст на странице — тик уступает: набранное не отбираем. */
+function editingNow() {
+  const active = document.activeElement
+  if (!active || active === document.body) return false
+  const tag = String(active.tagName || '').toUpperCase()
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true
+  return active.isContentEditable === true
+}
+
+/** Когда опрашивать — по правилам шейпера, а не по своему счёту секунд. */
+function dealPlan() {
+  return refreshPlan({
+    terminal: Boolean(dealSnap.data && dealSnap.data.terminal === true),
+    hidden: document.hidden === true,
+    failures: dealPoll.failures,
+    focused: editingNow(),
+  })
+}
+
+/**
+ * Поставить следующий тик.
+ *
+ * Скрытая вкладка не опрашивает вовсе — таймера нет, а вернувшаяся вкладка
+ * получает один немедленный тик из `visibilitychange`. Пропущенный из-за фокуса
+ * тик ставится снова через период: после ухода фокуса обновление обычное.
+ */
+function dealPollLater(dealId) {
+  dealPollStop()
+  if (document.hidden === true) return
+  const plan = dealPlan()
+  dealPoll.timer = setTimeout(() => void dealPollTick(dealId), plan.delaySec * 1000)
+}
+
+async function dealPollTick(dealId) {
+  dealPoll.timer = null
+  // Маршрут сменился или дело закрыли — тик не наш: петля умирает молча.
+  if (!dealOn(dealId)) {
+    dealPoll.failures = 0
+    return
+  }
+  if (dealSnap.loading || dealPlan().skip) {
+    dealPollLater(dealId)
+    return
+  }
+  try {
+    const [detail, attempts] = await Promise.all([
+      api(`/deal/${encodeURIComponent(dealId)}`),
+      api(`/duty/${encodeURIComponent(dealId)}/attempts`),
+    ])
+    if (!dealOn(dealId)) return
+    dealSnap.data = detail
+    dealSnap.attempts = attempts
+    dealSnap.error = null
+    dealSnap.refreshError = ''
+    dealPoll.failures = 0
+    dealSnap.refreshedAt = Math.floor(Date.now() / 1000)
+    // Шапка страницы считает возраст снимка — тик её тоже двигает, иначе она
+    // врала бы «обновлено 5 минут назад» под свежей панелью.
+    setStamp(Date.now())
+    patchDeal(dealId)
+  } catch (err) {
+    if (!dealOn(dealId)) return
+    dealPoll.failures += 1
+    // Молчим, пока отказов меньше трёх: одиночный таймаут — не сломанное дело.
+    // Три подряд — уже сломанное обновление, и о нём говорится словами.
+    if (dealPoll.failures >= REFRESH_FAIL_SILENT) {
+      dealSnap.refreshError = err.message || 'сеть'
+      patchDeal(dealId)
+    }
+  }
+  dealPollLater(dealId)
+}
+
+/** Вернувшаяся вкладка: один немедленный тик и дальше по расписанию. */
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden === true) {
+    dealPollStop()
+    return
+  }
+  if (!route.id || route.bad || route.name !== 'deal') return
+  dealPollStop()
+  void dealPollTick(route.id)
+})
 
 /* ---------------------------------------------------------------- маршруты */
 
@@ -1753,6 +2129,13 @@ function render() {
 
 function schedule() {
   clearTimeout(timer)
+  // Страница дела опрашивает себя сама (`dealPollLater`): её период зависит от
+  // состояния дела — идущее обновляем часто, закрытое редко, — а общий таймер
+  // экранов знает только «медленно/быстро».
+  if (route.name === 'deal' && route.id && !route.bad) {
+    dealPollLater(route.id)
+    return
+  }
   // «Здоровье» и «Завершённые» — по журналу за всю историю: они не меняются за
   // секунды, и опрашивать их так же часто, как срез «сейчас», незачем.
   const slow = route.name === 'health' || route.name === 'deals'
@@ -1771,7 +2154,11 @@ function run() {
 }
 
 function onRoute() {
+  // Ушли со страницы дела — петля опроса останавливается здесь, а не на
+  // следующем тике: иначе смена маршрута оставила бы висеть чужой запрос.
+  dealPollStop()
   route = parseRoute()
+  if (route.name !== 'deal') dealPoll.failures = 0
   // Данные, которых нет для нового экрана, не переиспользуем: иначе «Здоровье»
   // покажет старый снимок «сейчас» под своими KPI, а «Завершённые» — вчерашний
   // список под новым заголовком.

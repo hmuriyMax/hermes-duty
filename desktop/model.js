@@ -2554,6 +2554,97 @@ function shapeDealTime(detail, attemptsPayload) {
   }
 }
 
+/* ------------------------------------- тихое обновление страницы дела (0.0.8)
+ *
+ * Дело меняется минутами, а страница дела — снимок: чтобы увидеть, что попытка
+ * закончилась, надо жать обновление руками. Грубый `location.reload()` раз в
+ * пять секунд был бы худшим из решений — мигание, потеря прокрутки, сброс
+ * раскрытых попыток. Поэтому страница тихо опрашивает тот же адрес и правит
+ * изменившиеся узлы; период и пороги живут здесь, чтобы веб и десктоп не
+ * разъехались в правилах.
+ */
+
+// Идущее дело обновляем часто, закрытое — редко: у закрытого не меняется ничего,
+// кроме, разве что, поздней телеметрии.
+const REFRESH_LIVE_SEC = 5
+const REFRESH_DONE_SEC = 30
+// Отказы подряд: 5 → 10 → 20 → 40. Дальше не чаще раза в 40 секунд — сервер,
+// который лежит, не станет здоровее от третьего запроса в минуту.
+const REFRESH_BACKOFF_SEC = [5, 10, 20, 40]
+// Пока отказов меньше трёх, экран молчит: одиночный таймаут — не сломанное дело,
+// и рисовать по нему ошибку значило бы мигать баннером на каждом сбое сети.
+const REFRESH_FAIL_SILENT = 3
+
+/**
+ * План следующего тиха: когда опрашивать и надо ли вообще.
+ *
+ * `skip` — тик пропускается, но не навсегда: `delaySec` остаётся периодом (кроме
+ * скрытой вкладки, где опрос стоит до `visibilitychange`). Решение принимает
+ * шейпер, а не поверхность: иначе веб и десктоп начнут считать секунды по-своему.
+ */
+function refreshPlan(state) {
+  const s = state && typeof state === 'object' ? state : {}
+  const terminal = s.terminal === true
+  const period = terminal ? REFRESH_DONE_SEC : REFRESH_LIVE_SEC
+  // Скрытая вкладка не опрашивает вовсе: `delaySec: 0` — «сразу после возврата».
+  if (s.hidden === true) return { delaySec: 0, skip: true, reason: 'вкладка не видна' }
+  // Человек печатает или правит — нечего забирать у него набранный текст.
+  if (s.focused === true) return { delaySec: period, skip: true, reason: 'введён текст' }
+  const failures = Math.max(0, Math.floor(Number(s.failures) || 0))
+  if (failures >= 1) {
+    const delaySec = REFRESH_BACKOFF_SEC[Math.min(failures - 1, REFRESH_BACKOFF_SEC.length - 1)]
+    return { delaySec, skip: false, reason: `отказов подряд: ${failures}` }
+  }
+  return { delaySec: period, skip: false, reason: '' }
+}
+
+// Поля вида, по которым видно изменение значения. Сверка идёт по ним, а не по
+// всему узлу: у полосы меняется ширина каждую секунду у идущей попытки, и
+// подсвечивать от этого всю шкалу незачем.
+const FRESH_FIELDS = ['state', 'outcome', 'durationText', 'label', 'text', 'value', 'pct']
+
+/** Стабильный ключ узла вида: `key`, иначе `id`, иначе начало промежутка. */
+function freshNodeKey(node) {
+  const n = node && typeof node === 'object' ? node : {}
+  if (n.key !== undefined && n.key !== null && n.key !== '') return String(n.key)
+  if (n.id !== undefined && n.id !== null && n.id !== '') return String(n.id)
+  if (n.from !== undefined && n.from !== null) return `from:${n.from}`
+  return ''
+}
+
+/** Подпись значения: только поля вида, в одном порядке. */
+function freshSignature(node) {
+  const n = node && typeof node === 'object' ? node : {}
+  return FRESH_FIELDS.map((field) => {
+    const value = n[field]
+    return value === undefined || value === null ? '' : String(value)
+  }).join('\u0000')
+}
+
+/**
+ * Ключи узлов, чьё значение изменилось между двумя снимками вида.
+ *
+ * Пропавший или появившийся узел сюда не попадает: его вставляет или удаляет
+ * патч, а подсветка — про изменившееся значение уже нарисованного узла. Иначе
+ * новая попытка вспыхивала бы целиком, хотя она просто появилась.
+ */
+function freshKeys(prev, next) {
+  const before = new Map()
+  for (const node of Array.isArray(prev) ? prev : []) {
+    const key = freshNodeKey(node)
+    if (key) before.set(key, node)
+  }
+  const keys = []
+  for (const node of Array.isArray(next) ? next : []) {
+    const key = freshNodeKey(node)
+    if (!key || !before.has(key)) continue
+    if (freshSignature(before.get(key)) === freshSignature(node)) continue
+    if (keys.includes(key)) continue
+    keys.push(key)
+  }
+  return keys
+}
+
 export {
   STATE_META,
   WAIT_HUMAN_LABEL,
@@ -2605,4 +2696,10 @@ export {
   cmdShort,
   eventsSummary,
   noticeLines,
+  REFRESH_LIVE_SEC,
+  REFRESH_DONE_SEC,
+  REFRESH_BACKOFF_SEC,
+  REFRESH_FAIL_SILENT,
+  refreshPlan,
+  freshKeys,
 }

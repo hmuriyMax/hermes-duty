@@ -127,9 +127,11 @@ test('карточка дела рисует столбец этапов из о
   // один шейпер на обе поверхности: правила состояний этапа живут в model.js
   assert.match(app, /shapeStages/)
   assert.ok(!/STAGE_META\s*=\s*\{/.test(app), 'в app.js появилась своя таблица состояний этапа')
-  // столбец встроен в карточку дела и собран компактным видом шейпера
-  assert.match(app, /function stagesColumn\(dealId, data, timeline\)/)
-  assert.match(app, /stagesColumn\(data\.id, data, timeline\)/)
+  // столбец встроен в карточку дела и собран компактным видом шейпера. Данные он
+  // берёт из текущего снимка дела, а не из аргументов отрисовки: тихий тик правит
+  // готовые узлы, и пересборка по клику обязана видеть свежий ответ.
+  assert.match(app, /function stagesColumn\(dealId\)/)
+  assert.match(app, /stagesColumn\(data\.id\)/)
   assert.match(app, /compactStageView\(stage\)/)
   assert.match(app, /compactAttemptView\(stage, bar\)/)
   // причина пустоты приходит с бэкенда (`stages_note`), а не выдумывается экраном
@@ -555,3 +557,273 @@ test('веб: сжатый простой подписан на оси, без �
   assert.equal(plain.querySelectorAll('text.tl-idle-label').length, 0, 'подпись нарисована там, где сжатия нет')
 })
 
+
+/* ------------------ страница дела обновляется сама и тихо (0.0.8) --------- */
+
+const DEAL_ID = 'd_0123456789abcdef'
+const DEAL_T0 = 1_700_000_000
+
+/**
+ * Два ответа одного дела: живая попытка, потом та же попытка закрыта.
+ *
+ * Форма — как у бэкенда: `stages[].attempts[]` знает `live`/`duration_sec`,
+ * `/attempts` — те же попытки для шкалы. Между тиками меняется и длительность
+ * (KPI), и состояние попытки — то есть проверять есть что.
+ */
+function dealRound(live, nowSec) {
+  const attempt = {
+    n: 1,
+    run_id: `${DEAL_ID}:impl#1`,
+    stage: 'impl',
+    started_at: DEAL_T0 + 1,
+    live: live === true,
+    outcome: live ? '' : 'done',
+    duration_sec: live ? null : 180,
+    finished_at: live ? null : DEAL_T0 + 181,
+  }
+  return {
+    detail: {
+      id: DEAL_ID,
+      title: 'дело с попыткой',
+      repo: '/x/hermes-duty',
+      status: live ? 'running' : 'done',
+      terminal: !live,
+      now: nowSec,
+      created_at: DEAL_T0,
+      timeline: [{ kind: 'created', at: DEAL_T0, summary: '' }],
+      stages: [{ id: 'impl', kind: 'agent', role: 'implementer', state: live ? 'running' : 'done', needs: [], attempts: [attempt] }],
+    },
+    attempts: {
+      now: nowSec,
+      attempts: [
+        {
+          stage: 'impl',
+          attempt: 1,
+          start: DEAL_T0 + 1,
+          end: live ? null : DEAL_T0 + 181,
+          status: live ? 'running' : 'done',
+          outcome: live ? '' : 'done',
+          lease: live ? 'live' : '',
+          duration_sec: live ? null : 180,
+        },
+      ],
+    },
+  }
+}
+
+/**
+ * Страница дела с живой петлёй опроса: сеть отдаёт заранее заданные ответы, а
+ * таймеры не идут сами — тест прогоняет ровно один тик. Так видно то, что
+ * обещано: страница правит нарисованные узлы, а не собирается заново.
+ */
+async function liveDealPage(rounds, options = {}) {
+  const root = jsdomRoot()
+  const { JSDOM } = await import(pathToFileURL(join(root, 'jsdom', 'lib', 'api.js')).href)
+  const dir = mkdtempSync(join(tmpdir(), 'duty-web-live-'))
+  writeFileSync(join(dir, 'app.js'), app)
+  writeFileSync(join(dir, 'model.js'), read('desktop/model.js'))
+  const dom = new JSDOM(
+    '<!doctype html><div id="app"></div><span id="stamp"></span><span id="ver"></span><span id="human"></span><div id="tabs"></div><button id="refresh"></button>',
+    { url: `http://localhost/#/deal/${DEAL_ID}` },
+  )
+  const win = dom.window
+  globalThis.window = win
+  globalThis.document = win.document
+  globalThis.Node = win.Node
+  globalThis.localStorage = win.localStorage
+  globalThis.location = win.location
+  // jsdom держит документ в состоянии `prerender` (`hidden === true`), а опрос
+  // по правилу молчит в скрытой вкладке. Тест изображает видимую вкладку.
+  Object.defineProperty(win.document, 'hidden', { configurable: true, get: () => false })
+  Object.defineProperty(win.document, 'visibilityState', { configurable: true, get: () => 'visible' })
+  // `prefers-reduced-motion` подменяется на уровне поверхности: шейпер про
+  // анимации ничего не знает, решает браузерная настройка.
+  if (options.reduceMotion) win.matchMedia = () => ({ matches: true })
+
+  const timers = new Map()
+  let seq = 0
+  let current = 0
+  let seen = 0
+  const clock = { ms: DEAL_T0 * 1000 + 60_000 }
+  const saved = {
+    fetch: globalThis.fetch,
+    setTimeout: globalThis.setTimeout,
+    setInterval: globalThis.setInterval,
+    clearTimeout: globalThis.clearTimeout,
+    clearInterval: globalThis.clearInterval,
+    now: Date.now,
+  }
+  const reply = (body) => ({ ok: true, status: 200, json: async () => body })
+  globalThis.fetch = async (url) => {
+    const text = String(url)
+    if (text.includes('/attempts')) {
+      const round = rounds[Math.min(current, rounds.length - 1)]
+      if (round.fail) throw new Error('сеть')
+      return reply(round.attempts)
+    }
+    // `/health` за версией шапки — не дело: ответ пустой, счётчик ответов не двигает.
+    if (!text.includes('/deal/')) return reply({})
+    current = Math.min(seen, rounds.length - 1)
+    seen += 1
+    if (rounds[current].fail) throw new Error('сеть')
+    return reply(rounds[current].detail)
+  }
+  globalThis.setTimeout = (fn) => {
+    seq += 1
+    timers.set(seq, fn)
+    return seq
+  }
+  globalThis.clearTimeout = (id) => {
+    timers.delete(id)
+  }
+  globalThis.setInterval = () => 0
+  globalThis.clearInterval = () => {}
+  Date.now = () => clock.ms
+
+  const flush = async () => {
+    for (let i = 0; i < 80; i += 1) await new Promise((resolve) => setImmediate(resolve))
+  }
+
+  try {
+    await import(pathToFileURL(join(dir, 'app.js')).href)
+    for (let i = 0; i < 60 && !win.document.querySelector('.scale-plot'); i += 1) await flush()
+  } catch (err) {
+    Object.assign(globalThis, { fetch: saved.fetch, setTimeout: saved.setTimeout, setInterval: saved.setInterval, clearTimeout: saved.clearTimeout, clearInterval: saved.clearInterval })
+    Date.now = saved.now
+    throw err
+  }
+
+  return {
+    doc: win.document,
+    /** Прогнать один запланированный тик: часы вперёд, ответ следующий, петля дальше. */
+    async tick(advanceSec = 37) {
+      clock.ms += advanceSec * 1000
+      // Последний таймер — тот, что поставила петля: раньше него в очереди
+      // лежат только снятые таймауты `api` и подсветки.
+      const id = [...timers.keys()].pop()
+      assert.ok(id !== undefined, 'петля опроса не поставила следующий тик')
+      const fire = timers.get(id)
+      timers.delete(id)
+      fire()
+      await flush()
+    },
+    restore() {
+      Object.assign(globalThis, {
+        fetch: saved.fetch,
+        setTimeout: saved.setTimeout,
+        setInterval: saved.setInterval,
+        clearTimeout: saved.clearTimeout,
+        clearInterval: saved.clearInterval,
+      })
+      Date.now = saved.now
+    },
+  }
+}
+
+test('страница дела не перезагружается целиком: ни location.reload, ни setInterval', () => {
+  // `setInterval` в файле ровно один — часы в шапке тикают раз в секунду. Опрос
+  // дела идёт `setTimeout`-петлёй: следующий тик ставится после ответа, иначе
+  // медленный ответ накладывал бы тики друг на друга.
+  assert.ok(!app.includes('location.reload'), 'страница перезагружается целиком')
+  const intervals = app.match(/setInterval\(/g) || []
+  assert.equal(intervals.length, 1, `setInterval не один: ${intervals.length}`)
+  assert.match(app, /ticker = setInterval\(tickStamp, 1000\)/, 'единственный setInterval — не часы шапки')
+  assert.match(app, /dealPoll\.timer = setTimeout\(\(\) => void dealPollTick\(dealId\)/, 'тик ставится не setTimeout-петлёй')
+})
+
+test('подпись «обновлено» — единственный индикатор тика, и она не для диктора', () => {
+  const css = read('dashboard/web/styles.css')
+  assert.match(app, /class: 'refreshed', 'aria-live': 'off'/, 'у отметки нет aria-live="off"')
+  assert.match(app, /`обновлено \$\{fmtClock\(at\)\}`/, 'отметка не печатает время');
+  assert.match(css, /\.panel-h \.refreshed \{[^}]*color: var\(--text-3\)[^}]*font-size: 10px[^}]*margin-left: auto/, 'отметка не мелкая и не у правого края')
+  // Никаких «обновляется…», спиннеров и тостов: тик ничего не объявляет.
+  assert.ok(!/обновляется/i.test(app), 'на странице появилось «обновляется…»')
+})
+
+test('подсветка изменившегося — только цвет, и её отключает prefers-reduced-motion', () => {
+  const css = read('dashboard/web/styles.css')
+  assert.match(css, /\.fresh \{ transition: color \.2s ease; \}/, 'у подсветки нет перехода цвета')
+  assert.match(css, /\.fresh\.is-fresh \{ color: var\(--accent\); \}/, 'изменившееся не подсвечено')
+  assert.match(
+    css,
+    /@media \(prefers-reduced-motion: reduce\) \{[\s\S]*?\.fresh\.is-fresh \{ color: inherit; \}/,
+    'при prefers-reduced-motion подсветка не выключается',
+  )
+  // Только цвет: масштаба и сдвига в правилах нет.
+  const fresh = css.slice(css.indexOf('.fresh '), css.indexOf('.panel-b {'))
+  assert.ok(!/transform|scale|animation/.test(fresh), 'подсветка двигает узел, а не только красит')
+})
+
+test('веб: тик правит узлы на месте — раскрытая попытка остаётся раскрытой', async (t) => {
+  if (!jsdomRoot()) return t.skip('нет jsdom в ~/.hermes/hermes-agent/node_modules')
+  const page = await liveDealPage([dealRound(true, DEAL_T0 + 60), dealRound(false, DEAL_T0 + 181)])
+  try {
+    const stamp = page.doc.querySelector('.panel-h .refreshed')
+    const row = page.doc.querySelector('.att-row')
+    const dur = row && row.querySelector('.att-row-dur')
+    const stagesPanel = page.doc.querySelector('.deal-stages')
+    const block = page.doc.querySelector('.stage-block')
+    const scale = page.doc.querySelector('[data-key="scale"]')
+    assert.ok(stamp, 'в шапке панели нет отметки «обновлено»')
+    assert.ok(row && row.classList.contains('open'), 'живая попытка не раскрыта без клика')
+    assert.match(dur.textContent, /идёт/)
+    const before = stamp.textContent
+
+    await page.tick()
+
+    // Отметка обновилась — это весь индикатор тика.
+    assert.notEqual(page.doc.querySelector('.panel-h .refreshed').textContent, before, 'отметка «обновлено» не изменилась')
+    assert.match(page.doc.querySelector('.panel-h .refreshed').textContent, /^обновлено \d\d:\d\d:\d\d$/)
+    // Тот же самый узел строки: раскрытие, обработчик и прокрутка на месте.
+    assert.equal(page.doc.querySelector('.att-row'), row, 'строка попытки заменена, а не обновлена')
+    assert.equal(row.classList.contains('open'), true, 'раскрытая попытка схлопнулась после тика')
+    assert.match(row.querySelector('.att-row-dur').textContent, /3 мин/, 'значение попытки не обновилось')
+    // Панели и блоки этапов — те же узлы: перерисована не страница, а значения.
+    assert.equal(page.doc.querySelector('.deal-stages'), stagesPanel, 'панель этапов пересобрана целиком')
+    assert.equal(page.doc.querySelector('.stage-block'), block, 'блок этапа пересобран целиком')
+    assert.equal(page.doc.querySelector('[data-key="scale"]'), scale, 'панель шкалы пересобрана целиком')
+    assert.equal(page.doc.querySelectorAll('.att-row').length, 1, 'строк попыток стало не одна')
+    // Изменившееся значение подсвечено, и только оно.
+    const fresh = [...page.doc.querySelectorAll('.is-fresh')].map((el) => el.getAttribute('data-fresh'))
+    assert.ok(fresh.includes('kpi:duration'), `подсветка не попала на изменившееся: ${fresh.join(', ')}`)
+    assert.ok(!fresh.includes('kpi:attempts'), 'подсветилось и то, что не менялось')
+  } finally {
+    page.restore()
+  }
+})
+
+test('веб: при prefers-reduced-motion подсветка не навешивается', async (t) => {
+  if (!jsdomRoot()) return t.skip('нет jsdom в ~/.hermes/hermes-agent/node_modules')
+  const page = await liveDealPage([dealRound(true, DEAL_T0 + 60), dealRound(false, DEAL_T0 + 181)], { reduceMotion: true })
+  try {
+    await page.tick()
+    assert.equal(page.doc.querySelectorAll('.is-fresh').length, 0, 'подсветка навешена при prefers-reduced-motion')
+    // Тик при этом сделал свою работу: значение попытки обновилось.
+    assert.match(page.doc.querySelector('.att-row-dur').textContent, /3 мин/)
+  } finally {
+    page.restore()
+  }
+})
+
+test('веб: отказы опроса молчат до третьего и только тогда говорят', async (t) => {
+  if (!jsdomRoot()) return t.skip('нет jsdom в ~/.hermes/hermes-agent/node_modules')
+  // Три отказа подряд после удачного кадра: до третьего на экране не должно
+  // появиться ни строчки — одиночный таймаут это не сломанное дело.
+  const page = await liveDealPage([dealRound(true, DEAL_T0 + 60), { fail: true }, { fail: true }, { fail: true }])
+  try {
+    const stamp = page.doc.querySelector('.panel-h .refreshed').textContent
+    await page.tick()
+    assert.equal(page.doc.querySelectorAll('.banner').length, 0, 'ошибка нарисована с первого отказа')
+    await page.tick()
+    assert.equal(page.doc.querySelectorAll('.banner').length, 0, 'ошибка нарисована со второго отказа')
+    // Панель при этом цела: страница не превратилась в экран ошибки.
+    assert.equal(page.doc.querySelector('.panel-h .refreshed').textContent, stamp, 'отметка сдвинулась без ответа')
+    assert.ok(page.doc.querySelector('.scale-plot'), 'шкала исчезла после отказов')
+    await page.tick()
+    const banner = page.doc.querySelector('.banner')
+    assert.ok(banner, 'третий отказ подряд прошёл молча')
+    assert.match(banner.textContent, /обновление не удалось/)
+  } finally {
+    page.restore()
+  }
+})

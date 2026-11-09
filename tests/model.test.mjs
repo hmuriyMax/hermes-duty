@@ -52,6 +52,12 @@ import {
   compactAttemptView,
   cmdShort,
   eventsSummary,
+  REFRESH_LIVE_SEC,
+  REFRESH_DONE_SEC,
+  REFRESH_BACKOFF_SEC,
+  REFRESH_FAIL_SILENT,
+  refreshPlan,
+  freshKeys,
 } from '../desktop/model.js'
 
 // Ожидаемый порядок приоритета — это ожидание теста к ответу бэкенда
@@ -2310,4 +2316,88 @@ test('обе поверхности берут геометрию и склон�
     assert.ok(/attemptView|laneView/.test(text), `${name}: вид таймлайна не из шейпера`)
   }
   assert.ok(/function attemptView\(/.test(shaper))
+})
+
+/* --------------------------- тихое обновление страницы дела (0.0.8) */
+
+test('период опроса дела зависит от состояния дела, а не от экрана', () => {
+  // Идущее дело меняется минутами, но заметно: 5 секунд. Закрытое уже не
+  // меняется — 30 секунд, чтобы не дёргать сервер без причины.
+  assert.deepEqual(refreshPlan({ terminal: false }), { delaySec: REFRESH_LIVE_SEC, skip: false, reason: '' })
+  assert.deepEqual(refreshPlan({ terminal: true }), { delaySec: REFRESH_DONE_SEC, skip: false, reason: '' })
+  assert.equal(REFRESH_LIVE_SEC, 5)
+  assert.equal(REFRESH_DONE_SEC, 30)
+})
+
+test('скрытая вкладка не опрашивает: skip с причиной и нулевой задержкой', () => {
+  const plan = refreshPlan({ terminal: false, hidden: true })
+  assert.equal(plan.skip, true)
+  assert.equal(plan.delaySec, 0)
+  assert.match(plan.reason, /вкладка не видна/)
+  // Скрытая вкладка молчит и у закрытого дела: состояние дел не отменяет
+  // «человека нет за экраном».
+  assert.equal(refreshPlan({ terminal: true, hidden: true }).skip, true)
+})
+
+test('фокус в вводе останавливает тик, но период сохраняется', () => {
+  // Тик пропускается, чтобы не забрать набранный текст, а задержка остаётся
+  // обычным периодом — после ухода фокуса обновление идёт как обычно.
+  const live = refreshPlan({ terminal: false, focused: true })
+  assert.equal(live.skip, true)
+  assert.equal(live.delaySec, REFRESH_LIVE_SEC)
+  assert.match(live.reason, /введён текст/)
+  const done = refreshPlan({ terminal: true, focused: true })
+  assert.equal(done.skip, true)
+  assert.equal(done.delaySec, REFRESH_DONE_SEC)
+})
+
+test('отказы подряд растягивают паузу 5 → 10 → 20 → 40 и дальше не растут', () => {
+  const delays = [1, 2, 3, 7].map((failures) => refreshPlan({ terminal: false, failures }).delaySec)
+  assert.deepEqual(delays, [5, 10, 20, 40])
+  assert.deepEqual(REFRESH_BACKOFF_SEC, [5, 10, 20, 40])
+  // Дальше потолок: сервер, который лежит, не станет здоровее от частых запросов.
+  assert.equal(refreshPlan({ terminal: true, failures: 40 }).delaySec, 40)
+  // Отказ не «съедает» тик: запрос всё равно делается, просто позже.
+  assert.equal(refreshPlan({ failures: 2 }).skip, false)
+})
+
+test('порог тишины: ошибка рисуется только с третьего отказа подряд', () => {
+  assert.equal(REFRESH_FAIL_SILENT, 3)
+})
+
+test('freshKeys называет только изменившиеся значения, а не пропавшие узлы', () => {
+  const prev = [
+    { key: 'kpi:attempts', value: '2' },
+    { key: 'kpi:duration', value: '4 мин' },
+    { key: 'attempt:impl-#1', state: 'провал', durationText: '3 мин' },
+  ]
+  const next = [
+    { key: 'kpi:attempts', value: '2' },
+    { key: 'kpi:duration', value: '5 мин' },
+    { key: 'attempt:impl-#1', state: 'провал', durationText: '3 мин' },
+    // Новая попытка: её вставляет патч, а не подсветка.
+    { key: 'attempt:impl-#2', state: 'идёт', durationText: 'идёт' },
+  ]
+  assert.deepEqual(freshKeys(prev, next), ['kpi:duration'])
+  // Пропавший узел тоже не «изменился»: его удаляет патч.
+  assert.deepEqual(freshKeys(prev, [prev[0], prev[2]]), [])
+  // Изменилось поле вида, а не служебное: `title` для подсветки не значение.
+  assert.deepEqual(freshKeys([{ key: 'a', label: 'идёт', title: 'x' }], [{ key: 'a', label: 'идёт', title: 'y' }]), [])
+  assert.deepEqual(freshKeys([{ key: 'a', label: 'идёт' }], [{ key: 'a', label: 'готово' }]), ['a'])
+})
+
+test('правила обновления живут в шейпере, а не на поверхностях', () => {
+  const web = readFileSync(new URL('../dashboard/web/app.js', import.meta.url), 'utf8')
+  // Веб спрашивает план у шейпера и своих секунд не держит.
+  assert.ok(/refreshPlan\(/.test(web), 'веб: опрос идёт мимо refreshPlan')
+  assert.ok(!/REFRESH_LIVE_SEC|REFRESH_DONE_SEC|REFRESH_BACKOFF_SEC/.test(web), 'веб: свои секунды вместо refreshPlan')
+  // Десктоп своего таймера в этом деле не заводит, но правило приходит к нему
+  // вшитой копией шейпера — разъехаться правилам негде.
+  const plugin = readFileSync(new URL('../desktop/plugin.js', import.meta.url), 'utf8')
+  const inlined = /\/\/ duty:model-start([\s\S]*?)\/\/ duty:model-end/.exec(plugin)
+  assert.ok(inlined, 'десктоп: нет вшитой копии шейпера')
+  assert.ok(/function refreshPlan\(/.test(inlined[1]), 'десктоп: во вшитой копии нет refreshPlan')
+  const surface = plugin.replace(/\/\/ duty:model-start[\s\S]*?\/\/ duty:model-end/, '')
+  assert.ok(!/refreshPlan\(/.test(surface), 'десктоп: свой таймер обновления сверх шейпера')
+  assert.ok(!/REFRESH_LIVE_SEC|REFRESH_DONE_SEC/.test(surface), 'десктоп: свои секунды обновления')
 })

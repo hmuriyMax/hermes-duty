@@ -64,7 +64,12 @@ FAILURE_LOG_LIMIT = 5
 
 # Метка «я уже перезапускался»: без неё неудачный поиск интерпретатора дал бы
 # бесконечную цепочку `execv`.
-REEXEC_MARK = "DUTY_CLI_REEXEC"
+# Метка «я уже перезапускался» — АРГУМЕНТ, а не переменная окружения. Переменная
+# наследуется дочерними процессами, и этап дела, внутри которого зовут `bin/duty`,
+# получал метку от родителя: CLI видел «перезапуск уже был», интерпретатор без
+# fastapi отвергался, и этап падал кодом 2 на ровном месте (дело d_9ea4d348,
+# этап check). Аргумент живёт ровно один exec и дальше не передаётся.
+REEXEC_ARG = "--duty-reexec"
 
 # `dashboard/plugin_api.py` — тот же модуль, что грузит плагин: пакета у него нет,
 # поэтому берём его по пути и кладём в `sys.modules` под стабильным именем.
@@ -326,7 +331,7 @@ def _ensure_interpreter(argv: Optional[list[str]]) -> None:
     if importlib.util.find_spec("fastapi") is not None:
         return
     args = list(sys.argv[1:] if argv is None else argv)
-    if os.environ.get(REEXEC_MARK):
+    if REEXEC_ARG in args:
         print(
             "duty: в текущем интерпретаторе нет fastapi, а интерпретатор агента не найден "
             f"({sys.executable}). Укажите его через DUTY_PYTHON.",
@@ -336,9 +341,8 @@ def _ensure_interpreter(argv: Optional[list[str]]) -> None:
     for candidate in _agent_pythons():
         if Path(candidate).resolve() == Path(sys.executable).resolve():
             continue
-        os.environ[REEXEC_MARK] = "1"
         try:
-            os.execv(candidate, [candidate, str(Path(__file__).resolve()), *args])
+            os.execv(candidate, [candidate, str(Path(__file__).resolve()), REEXEC_ARG, *args])
         except OSError:
             continue
     print(
@@ -2140,7 +2144,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     """Точка входа CLI: вернуть код 0/1/2, ничего не печатая в stderr без причины."""
     _ensure_interpreter(argv)
     parser = build_parser()
-    words = _positionals_first(list(sys.argv[1:] if argv is None else argv), ("block", "changes"))
+    # Метка перезапуска — не команда пользователя: до разбора её нет. Она живёт в
+    # argv ровно на один exec, поэтому вычищается здесь, а не в окружении.
+    raw = list(sys.argv[1:] if argv is None else argv)
+    words = _positionals_first([word for word in raw if word != REEXEC_ARG], ("block", "changes"))
     args = parser.parse_args(words)
     if not args.command:
         parser.print_help()

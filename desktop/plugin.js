@@ -3743,6 +3743,18 @@ const FINISHED_PER_REPO = 5
 const SKELETON_MIN_MS = 260
 
 const EMPTY_FINISHED_GROUP = { rows: [], total: 0, next: null, done: false, loading: false, error: null }
+// Сколько раз пробуем список закрытых дел: первый запрос может совпасть с подъёмом
+// бэкенда, и пустой ответ нельзя показывать как «завершённых дел нет».
+const DEALS_ATTEMPTS = 3
+
+/** Ответ `/deals` со своим путём в тексте ошибки: путь — половина диагноза. */
+async function dealsPayload(path) {
+  try {
+    return await rest(path, { timeoutMs: REQUEST_TIMEOUT_MS })
+  } catch (err) {
+    throw new Error(`${path} → ${errText(err)}`)
+  }
+}
 
 function useFinishedPages(enabled) {
   const [index, setIndex] = useState(null)
@@ -3773,7 +3785,11 @@ function useFinishedPages(enabled) {
         const query =
           `/deals?limit=${FINISHED_PER_REPO}&repo=${encodeURIComponent(repo)}` +
           (cursor ? `&cursor=${encodeURIComponent(cursor)}` : '')
-        const page = shapeFinishedPage(await rest(query, { timeoutMs: REQUEST_TIMEOUT_MS }))
+        const raw = await dealsPayload(query)
+        if (!raw || typeof raw !== 'object' || !Array.isArray(raw.deals)) {
+          throw new Error('ответ /deals без списка дел')
+        }
+        const page = shapeFinishedPage(raw)
         const shown = dir === 'more' ? (groupsRef.current[repo] || EMPTY_FINISHED_GROUP).rows : []
         patchGroup(repo, {
           rows: shown.concat(page.rows),
@@ -3795,15 +3811,34 @@ function useFinishedPages(enabled) {
 
   const loadIndex = useCallback(async () => {
     setError(null)
-    try {
-      const page = shapeFinished(await rest('/deals?limit=1', { timeoutMs: REQUEST_TIMEOUT_MS }))
-      if (!alive.current) return
-      setIndex({ repos: page.repos, total: page.total, errors: page.errors, note: page.note })
-      for (const item of page.repos) patchGroup(item.repo, { total: item.total })
-      await Promise.all(page.repos.map((item) => loadGroup(item.repo, 'reset')))
-    } catch (err) {
-      if (alive.current) setError(errText(err))
+    let lastError = ''
+    // Ответ без `repos` — не «завершённых нет», а «ответа ещё нет»: первый запрос
+    // может прийти в момент подъёма бэкенда. Три попытки и честная причина в
+    // баннере вместо пустого «0 из 0» (09.11, кейс «дела не прогрузились»).
+    for (let attempt = 1; attempt <= DEALS_ATTEMPTS; attempt += 1) {
+      try {
+        const raw = await dealsPayload('/deals?limit=1')
+        if (!raw || typeof raw !== 'object' || !Array.isArray(raw.repos)) {
+          const keys = raw && typeof raw === 'object' ? Object.keys(raw).join(', ') || 'пусто' : typeof raw
+          throw new Error(`ответ /deals без списка репозиториев (ключи: ${keys})`)
+        }
+        const page = shapeFinished(raw)
+        // Store не прочитался (частый случай — писатель держит базу): это не факт
+        // «завершённых дел нет», а неудачное чтение. Пробуем ещё раз.
+        if (!page.repos.length && page.errors.length) {
+          throw new Error(`store: ${page.errors[0].reason}`)
+        }
+        if (!alive.current) return
+        setIndex({ repos: page.repos, total: page.total, errors: page.errors, note: page.note })
+        for (const item of page.repos) patchGroup(item.repo, { total: item.total })
+        await Promise.all(page.repos.map((item) => loadGroup(item.repo, 'reset')))
+        return
+      } catch (err) {
+        lastError = errText(err)
+        if (attempt < DEALS_ATTEMPTS) await new Promise((resolve) => setTimeout(resolve, 400 * attempt))
+      }
     }
+    if (alive.current) setError(lastError)
   }, [patchGroup, loadGroup])
 
   useEffect(() => {
@@ -4807,6 +4842,14 @@ function FinishedBlock({ finished, onPick }) {
       h('span', { className: 'duty-spacer' }),
       h('span', { className: 'duty-muted' }, `по ${FINISHED_PER_REPO} на проект`),
     ),
+    finished.error
+      ? h(
+          'div',
+          { className: 'duty-banner', style: { margin: '0 0 8px' } },
+          h('span', null, `завершённые не обновились: ${finished.error}`),
+          h(Button, { size: 'xs', variant: 'secondary', onClick: () => void finished.reload() }, 'повторить'),
+        )
+      : null,
     finished.index.errors && finished.index.errors.length
       ? h(
           'div',
@@ -4880,9 +4923,15 @@ function FinishedBlock({ finished, onPick }) {
       : h(
           'div',
           { className: 'duty-empty' },
-          h('b', null, 'завершённых дел нет'),
-          // Причина пустоты — словами бэкенда (`note`), а не своя догадка.
-          h('span', { className: 'duty-muted' }, finished.index.note || 'в store нет ни одного закрытого дела'),
+          h('b', null, finished.index.errors.length ? 'завершённые не прочитались' : 'завершённых дел нет'),
+          // Причина пустоты — словами бэкенда (`note`/`errors`), а не своя догадка.
+          h(
+            'span',
+            { className: 'duty-muted' },
+            finished.index.errors.length
+              ? `store: ${finished.index.errors[0].reason}`
+              : finished.index.note || 'в store нет ни одного закрытого дела',
+          ),
         ),
   )
 }

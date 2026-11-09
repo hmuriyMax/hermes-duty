@@ -831,6 +831,8 @@ async function loadFinishedIndex() {
   render()
   try {
     const page = shapeFinished(await api('/deals?limit=1'))
+    // Store не прочитался — это не «завершённых дел нет»: оставляем блок пустым
+    // по факту ошибки, а не по факту отсутствия дел.
     finished.index = page
     for (const item of page.repos) {
       const group = finishedGroup(item.repo)
@@ -976,7 +978,17 @@ function finishedSection() {
       body.push(noticesBlock(index.errors.map((err) => `источник ${err.source} недоступен: ${err.reason}`)))
     }
     if (!groups.length) {
-      body.push(h('div', { class: 'panel-b muted' }, index.note || 'в store нет ни одного закрытого дела'))
+      // Сначала — ошибка чтения, и только потом «дел нет»: пустой ответ
+      // нечитаемого store не доказывает, что закрытых дел не существует.
+      body.push(
+        h(
+          'div',
+          { class: 'panel-b muted' },
+          index.errors.length
+            ? `store: ${index.errors[0].reason}`
+            : index.note || 'в store нет ни одного закрытого дела',
+        ),
+      )
     } else {
       body.push(
         h(

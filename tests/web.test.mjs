@@ -82,9 +82,9 @@ test('«Завершённые» листаются по проектам: пя�
   assert.match(app, /const FINISHED_PER_REPO = 5/)
   // Десктоп листает те же группы тем же шейпером: индекс — `/deals?limit=1`,
   // страница проекта — `shapeFinishedPage`, свой курсор у каждого.
-  assert.match(pluginSource, /rest\('\/deals\?limit=1'/)
-  assert.match(pluginSource, /shapeFinished\(await rest\('\/deals\?limit=1'/)
-  assert.match(pluginSource, /shapeFinishedPage\(await rest\(query/)
+  assert.match(pluginSource, /dealsPayload\('\/deals\?limit=1'\)/)
+  assert.match(pluginSource, /shapeFinishedPage\(raw\)/)
+  assert.match(pluginSource, /const DEALS_ATTEMPTS = 3/)
   assert.match(pluginSource, /const FINISHED_PER_REPO = 5/)
   assert.match(pluginSource, /cursor=\$\{encodeURIComponent\(cursor\)\}/)
   // второго счёта в строках нет: вопросы/попытки/длительность — поля ответа

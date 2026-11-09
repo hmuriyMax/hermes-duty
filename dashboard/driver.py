@@ -49,10 +49,12 @@ Python — то есть гейт «дело проходит impl → verify �
    глотаются: они попадают в отчёт (`answers_errors`) и в вывод шага, чтобы
    «вопрос закрыт, но не разобран» не читалось как «ответа нет».
 8. **«Все этапы закрыты» — это факт журнала, а не строка вывода.** Когда `transit`
-   отвечает `done`, драйвер пишет `completed` (`cause='all_stages_done'`, список
-   пройденных этапов) и строку дела **одной транзакцией** — тем же путём, что
-   `bin/duty close` (`deals.close_stages_done`). Без этого прогон объявлял
-   «итог: дело закрыто», а в журнале не было `completed`, и дело оставалось
+   отвечает `done`, драйвер пишет `completed` и строку дела **одной транзакцией** —
+   тем же путём, что `bin/duty close` (`deals.close_stages_done`). Чем закрывается
+   дело, решает `deals.closure_of`: граф без закрывающего этапа — `cause='all_stages_done'`
+   со списком пройденных этапов; граф с `close` — слово лида, `cause='lead_closed'`
+   и его `summary` (иначе движок закрывал бы дело мимо приговора). Без этого прогон
+   объявлял «итог: дело закрыто», а в журнале не было `completed`, и дело оставалось
    `status='running'` (живой прогон `d_6e764042`). Печать итога — после записи и
    по ней. Повторный прогон на закрытом деле второго `completed` не пишет и
    отвечает «уже закрыто» с причиной и временем из журнала.
@@ -452,40 +454,27 @@ def _closure(conn: sqlite3.Connection, deal: Any, spec: Any, now: float) -> dict
             "refused": "",
         }
     stages = [str(stage.id) for stage in transit.graph(spec, events)]
+    # Чем закрывается дело и чьим итогом — из журнала, а не из памяти прогона:
+    # попытку закрывает тот же факт `attempt_ended`, и повторный `run` читает его
+    # так же, как первый. Правило одно с проходом отпускания (`release._closed`).
+    cause, summary = deals.closure_of(events, stages)
     closing = str(spec_module.CLOSE_STAGE)
-    cause = deals.CLOSE_CAUSE_ALL_STAGES
-    summary = ""
-    if closing in stages:
-        # Итог лида и его приговор — из журнала, а не из памяти прогона: попытку
-        # закрывает тот же факт `attempt_ended`, и повторный `run` читает его так
-        # же, как первый.
-        cause = deals.CLOSE_CAUSE_LEAD
-        approved = False
-        for event in events:
-            payload = journal.payload_of(event)
-            if str(payload.get("stage") or "") != closing:
-                continue
-            kind = str(event.get("kind") or "")
-            if kind == journal.VERDICT_CHANGES:
-                approved = False
-            elif kind == journal.VERDICT_APPROVE:
-                approved = True
-            elif kind == "attempt_ended" and isinstance(payload.get("result"), dict):
-                summary = str(payload["result"].get("summary") or "")
-        if not approved:
-            row = deals.deal_row(conn, str(deal["id"])) or {}
-            return {
-                "written": False,
-                "already": False,
-                "cause": cause,
-                "at": int(now),
-                "stages": stages,
-                "status": str(row.get("status") or ""),
-                "refused": (
-                    f"закрывающий этап {closing!r} не закрыт приговором approve: "
-                    "дело закрывает лид, «все этапы пройдены» этого не заменяет"
-                ),
-            }
+    if not cause:
+        # Граф с `close`, а приговора `approve` нет: закрывать нечем. Отказ
+        # называется, а не выдаётся за «все этапы пройдены».
+        row = deals.deal_row(conn, str(deal["id"])) or {}
+        return {
+            "written": False,
+            "already": False,
+            "cause": deals.CLOSE_CAUSE_LEAD,
+            "at": int(now),
+            "stages": stages,
+            "status": str(row.get("status") or ""),
+            "refused": (
+                f"закрывающий этап {closing!r} не закрыт приговором approve: "
+                "дело закрывает лид, «все этапы пройдены» этого не заменяет"
+            ),
+        }
     try:
         result = deals.close_stages_done(
             conn,

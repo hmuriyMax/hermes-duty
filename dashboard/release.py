@@ -27,8 +27,9 @@
    спрашивающий журнал.
 2. **Материализуется уже посчитанный ответ `transit`** тем писателем, который у
    этого ответа есть: `run`/`wait(retry)` → `deals.release_deal`; `done` →
-   `deals.close_stages_done`; `failed` → `deals.set_blocked` (отказ движка без
-   начала попытки, `details.refused`) либо `runner.park_exhausted` (попытки
+   `deals.close_stages_done` (граф с закрывающим этапом закрывает лид — `cause`
+   и итог даёт `deals.closure_of`); `failed` → `deals.set_blocked` (отказ движка
+   без начала попытки, `details.refused`) либо `runner.park_exhausted` (попытки
    исчерпаны); `park` гейта → `runner.park_gate`. Своего решения проход не
    принимает: «а может, закрыть?» здесь не спрашивают.
 3. **Идемпотентность — ключом события от журнала**, а не от решения: `after` =
@@ -369,7 +370,7 @@ def _materialise(
     if decision.kind == transit.WAIT and decision.what == transit.WAIT_RETRY:
         return _released(conn, deal, events, decision, at, dry_run=dry_run)
     if decision.kind == transit.DECISION_DONE:
-        return _closed(conn, deal, deal_spec, at, dry_run=dry_run)
+        return _closed(conn, deal, deal_spec, events, at, dry_run=dry_run)
     if decision.kind == transit.DECISION_FAILED:
         return _stopped(conn, deal, deal_spec, events, at, home=home, dry_run=dry_run)
     if decision.kind == transit.PARK:
@@ -427,22 +428,56 @@ def _released(
     }
 
 
-def _closed(conn: Any, deal: dict[str, Any], deal_spec: Any, at: int, *, dry_run: bool) -> dict[str, Any]:
-    """Все этапы пройдены, `completed` не записан: закрытие тем же писателем."""
-    stages = [str(stage.id) for stage in getattr(deal_spec, "stages", ())]
+def _closed(
+    conn: Any,
+    deal: dict[str, Any],
+    deal_spec: Any,
+    events: list[dict[str, Any]],
+    at: int,
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Все этапы пройдены, `completed` не записан: закрытие тем же писателем.
+
+    Граф — из журнала (`transit.graph`), а не из файла спеки: принятый план растит
+    граф, и закрытие по устаревшему набору назвало бы не те этапы
+    (`docs/ENGINE-1.0.md`, раздел 7). Чем закрывается дело, решает
+    `deals.closure_of`: граф без закрывающего этапа (`spec.CLOSE_STAGE`) —
+    `cause='all_stages_done'`; граф с ним закрывает **лид** своим `approve`, и
+    итог дела — его `summary`. Приговора нет — отказ (`DealError`), а не
+    `completed` мимо лида: иначе ушедший движок закрывал бы дело сам.
+    """
+    stages = [str(stage.id) for stage in transit.graph(deal_spec, events)]
+    cause, summary = deals.closure_of(events, stages)
+    if not cause:
+        raise deals.DealError(
+            f"close: закрывающий этап {str(spec_module.CLOSE_STAGE)!r} в графе дела "
+            f"{deal['id']} не закрыт приговором approve — дело закрывает лид, "
+            "«все этапы пройдены» этого не заменяет"
+        )
     written = 0
     if not dry_run:
         result = deals.close_stages_done(
-            conn, str(deal["id"]), stages=stages, source=SOURCE, now=at
+            conn,
+            str(deal["id"]),
+            stages=stages,
+            source=SOURCE,
+            now=at,
+            cause=cause,
+            summary=summary,
         )
         written = int(result.get("events") or 0)
+    reason = "все этапы пройдены: закрытие записано движком"
+    if cause == deals.CLOSE_CAUSE_LEAD:
+        reason = "лид закрыл дело приговором approve: закрытие записано движком"
     return {
         "deal": str(deal["id"]),
         "action": ACTION_CLOSED,
         "from": RUNNING_STATUS,
         "to": "done",
         "stages": stages,
-        "reason": "все этапы пройдены: закрытие записано движком",
+        "cause": cause,
+        "reason": reason,
         "written": written,
         "dry_run": bool(dry_run),
     }

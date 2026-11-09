@@ -1284,6 +1284,41 @@ def close_deal(
 HUMAN_HOLD_STATUSES = ("blocked", "review")
 
 
+def closure_of(events: Iterable[dict[str, Any]], stages: Iterable[str]) -> tuple[str, str]:
+    """Чем закрывается дело и чьим итогом — `(cause, summary)`.
+
+    Чистая функция: граф приходит аргументом, журнал читает вызывающий. Правило
+    одно на всех писателей закрытия (`driver._closure`, `release._closed`): граф
+    без закрывающего этапа (`spec.CLOSE_STAGE`) закрывается «все этапы пройдены»
+    и итога не несёт; граф с ним — словом лида, и итог — `summary` его последней
+    попытки из `result.json`, а не текст движка (`docs/ENGINE-1.0.md`, раздел 9).
+
+    Пустой `cause` — закрывать нечем: в графе есть закрывающий этап, а приговора
+    `approve` в журнале нет. Это не «все этапы пройдены» и не тишина: вызывающий
+    обязан назвать отказ, а не записать закрытие мимо лида.
+    """
+    names = [str(stage) for stage in stages]
+    closing = str(_spec().CLOSE_STAGE)
+    if closing not in names:
+        return CLOSE_CAUSE_ALL_STAGES, ""
+    approved = False
+    summary = ""
+    for event in events or ():
+        payload = journal.payload_of(event)
+        if str(payload.get("stage") or "") != closing:
+            continue
+        kind = str(event.get("kind") or "")
+        if kind == journal.VERDICT_CHANGES:
+            approved = False
+        elif kind == journal.VERDICT_APPROVE:
+            approved = True
+        elif kind == "attempt_ended" and isinstance(payload.get("result"), dict):
+            summary = str(payload["result"].get("summary") or "")
+    if not approved:
+        return "", ""
+    return CLOSE_CAUSE_LEAD, summary
+
+
 def close_stages_done(
     conn: sqlite3.Connection,
     deal_id: str,

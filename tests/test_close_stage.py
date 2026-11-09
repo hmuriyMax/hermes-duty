@@ -51,6 +51,7 @@ deals = load_module("hermes_duty_deals", "deals.py")
 transit = load_module("hermes_duty_transit", "transit.py")
 runner = load_module("hermes_duty_runner", "runner.py")
 driver = load_module("hermes_duty_driver", "driver.py")
+release = load_module("hermes_duty_release", "release.py")
 
 from test_runner import Fake  # noqa: E402
 
@@ -470,3 +471,80 @@ def test_repeat_closure_names_the_lead_fact(tmp_path: Path) -> None:
         event for event in journal.read_events(conn, str(deal["id"])) if event["kind"] == "completed"
     ]
     assert len(completions) == 1
+
+
+# --------------------- 6. второй писатель закрытия: проход отпускания
+
+
+def running(conn: sqlite3.Connection, deal: dict[str, Any]) -> None:
+    """Строка `running` — так её ставит движок, взяв лизинг (как в `test_release`)."""
+    with conn:
+        deals._set_status(conn, deal, "running", NOW)
+
+
+def test_release_closes_the_deal_with_the_lead_word(tmp_path: Path) -> None:
+    """Движок ушёл после `approve` — проход отпускания закрывает дело словом лида.
+
+    Тот же класс, что «дело висит `running`, когда движка нет» (0.0.8): приговор
+    лида в журнале есть, а `completed` нет. Второй писатель закрытия обязан
+    закрывать **той же причиной и тем же итогом**, что прогон: `cause='lead_closed'`
+    поверх графа с `close` — отказ, а не тихое закрытие мимо приговора.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, GOOD)
+    deal = make_deal(conn, spec)
+    append(
+        conn,
+        deal,
+        [
+            {"kind": "attempt_ended", "payload": ended("impl", summary="сделано")},
+            {"kind": "attempt_ended", "payload": ended("close", summary="итог лида: сделано и проверено")},
+            {"kind": "collected", "payload": approve("close")[1]},
+        ],
+    )
+    running(conn, deal)
+
+    rows = release.sweep(conn, NOW + 300, home=home)
+
+    assert len(rows) == 1, rows
+    assert rows[0]["action"] == "closed", rows
+    assert rows[0]["cause"] == deals.CLOSE_CAUSE_LEAD
+    fact = journal.closed_fact(journal.read_events(conn, str(deal["id"])))
+    assert fact is not None
+    assert fact["payload"]["cause"] == deals.CLOSE_CAUSE_LEAD
+    assert fact["payload"]["summary"] == "итог лида: сделано и проверено"
+    assert fact["payload"]["stages"] == ["impl", "close"]
+    assert deals.deal_row(conn, str(deal["id"]))["status"] == "done"
+
+
+def test_release_does_not_close_without_the_verdict(tmp_path: Path) -> None:
+    """`close` закончился попыткой без приговора: проход дело не закрывает, а называет отказ.
+
+    `transit` видит «все этапы закрыты», но приговора нет — и закрытие от этого не
+    появляется. Отказ виден строкой `error`, а дело остаётся `running`: решает
+    человек (`bin/duty close`) или новый приговор лида, а не ушедший движок.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, GOOD)
+    deal = make_deal(conn, spec)
+    append(
+        conn,
+        deal,
+        [
+            {"kind": "attempt_ended", "payload": ended("impl", summary="сделано")},
+            {"kind": "attempt_ended", "payload": ended("close", summary="итог без приговора")},
+        ],
+    )
+    running(conn, deal)
+    decision = transit.next_stage(spec, journal.read_events(conn, str(deal["id"])), NOW + 300)
+    assert decision.kind == transit.DECISION_DONE, decision.kind
+
+    rows = release.sweep(conn, NOW + 300, home=home)
+
+    assert len(rows) == 1, rows
+    assert "approve" in str(rows[0].get("error") or ""), rows
+    assert journal.closed_fact(journal.read_events(conn, str(deal["id"]))) is None
+    assert deals.deal_row(conn, str(deal["id"]))["status"] == "running"
+

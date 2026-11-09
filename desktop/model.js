@@ -1583,6 +1583,7 @@ const MARKER_META = {
 // не показывает, но и не выдумывает: незнакомая причина остаётся как есть.
 const CLOSE_CAUSE_WORD = {
   all_stages_done: 'все этапы пройдены',
+  lead_closed: 'закрыто лидом',
   closed_by_human: 'закрыто человеком',
   stopped_by_human: 'остановлено человеком',
 }

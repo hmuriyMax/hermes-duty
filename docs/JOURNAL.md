@@ -68,6 +68,10 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 | `question_asked` | `ask()` создал вопрос в пуле | `question_id`, `session_key`, `critical`, `timeout`, `routing` (`{target, reason, stage, attempt}` — если вопрос адресовал движок) |
 | `question_answered` | ответ найден в пуле — или у вопроса вышел срок (`answered_via='expired'`): закрытие по TTL снимает факт так же, как ответ | `question_id`, `answer_len`, `answered_via` |
 | `published` | публикующий этап отчитался, и движок **подтвердил** факт: `git ls-remote origin` видит заявленный sha (сверка по префиксу: сокращённый sha законен, пока однозначен). Пишет движок (`dashboard/runner.published_claim`), а не исполнитель: `published` в `result.json` — заявка | `stage`, `attempt`, `sha` (полный, из `ls-remote`), `claimed_sha` (что сказал исполнитель), `branch`, `mr_url` (заявка — GitLab движку не виден), `ref` (что нашлось в origin), `verified_by` (`git ls-remote`) |
+| `plan_proposed` | этап плана отчитался предложением: `plan: {stages, reason}` в `result.json` стал фактом. Граф **не меняет** — предложение ещё не план (правило 12) | `rev`, `stages[]`, `reason`, `source_stage`, `attempt` |
+| `plan_accepted` | предложение стало графом: предложение прошло `spec.parse_plan` по хартии (или человек ответил «принять» на гейте плана) | `rev`, `by` (`engine`\|`human`) |
+| `plan_rejected` | валидатор или человек отказал предложению: этап плана возвращается в работу с причиной и списком отказов; сверх `charter.max_rounds_replan` — `failed(contract)` | `rev`, `why`, `issues[]` |
+| `plan_gate` | план дороже порога `charter.plan_gate` — ждём человека (`ask()`), до ответа дело стоит в `wait_human` | `rev`, `reason`, `question_id` |
 
 Восемь видов (`review_requested`, `changes_requested`, `collected`, `gate_opened`,
 `gate_closed`, `patched`, `commented`, `attached`) заведены вместе с W5 — владением

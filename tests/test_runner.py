@@ -586,6 +586,51 @@ def test_worktree_created_and_kept_on_success(tmp_path: Path) -> None:
     assert report["tree"] == str(tree)
 
 
+def test_deal_branch_holds_the_commit(tmp_path: Path) -> None:
+    """Коммит попытки закреплён веткой дела, а не висит в отвязанном HEAD.
+
+    Дело `d_9ea4d348` показало цену: две попытки отчитались `done`, коммиты
+    существовали, но ни одна ветка на них не указывала — работу (1576 строк)
+    пришлось закреплять руками, иначе первый `git gc` забрал бы её.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    repo = git_repo(tmp_path)
+    spec = worktree_spec(tmp_path, repo)
+    run(conn, spec, deal, home, Fake(result={"status": "done", "summary": "готово"}, pack=True))
+
+    ended = only(conn, deal, "attempt_ended")
+    commit = ended["payload"]["commit"]
+    details = ended["payload"]["details"]
+    assert details["branch"] == f"duty/{deal['id']}"
+    assert details["branch_error"] is None
+
+    # Ссылка настоящая: ветка существует и содержит коммит.
+    listed = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--contains", commit], capture_output=True, text=True
+    ).stdout
+    assert f"duty/{deal['id']}" in listed
+
+    # Дерево попытки при этом ветку не занимает: оно в detached HEAD, поэтому
+    # следующая попытка того же дела не спорит с ним за имя.
+    tree = runner.attempt_dir(home, deal, "impl", 1) / "tree"
+    head = subprocess.run(
+        ["git", "-C", str(tree), "symbolic-ref", "--quiet", "--short", "HEAD"], capture_output=True, text=True
+    )
+    assert head.returncode != 0, f"дерево заняло ветку: {head.stdout.strip()}"
+
+
+def test_branch_anchor_failure_is_a_fact_not_a_verdict(tmp_path: Path) -> None:
+    """Отказ `git branch -f` не отменяет коммит: работа есть, причина — в событии."""
+    deal = {"id": "d_probe"}
+    broken = tmp_path / "не-репозиторий"
+    broken.mkdir()
+    branch, reason = runner.anchor_commit(broken, deal, "0" * 40)
+    assert branch == "duty/d_probe"
+    assert "git branch -f" in reason
+
+
 def test_worktree_kept_when_attempt_failed_with_work(tmp_path: Path) -> None:
     """Упавшая попытка с незакоммиченной работой дерево НЕ удаляет.
 

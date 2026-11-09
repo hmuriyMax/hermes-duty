@@ -469,8 +469,10 @@ def prepare_tree(
         # `--detach`: база — это коммит, а не ветка. Ветка может быть уже занята
         # другим деревом (главный checkout, дерево прошлой попытки), и тогда
         # `git worktree add <путь> <ветка>` отказывает «is already used by
-        # worktree». Попытка всегда отводится от коммита, поэтому detach —
-        # не обход, а верная модель: ветку двигает не попытка, а публикация.
+        # worktree». Попытка отводится от коммита, поэтому detach — верная модель:
+        # дерево попытки ветку не занимает, и две попытки не спорят за имя.
+        # Ссылку на работу даёт ветка ДЕЛА (`anchor_commit`): detached HEAD сам по
+        # себе имени не даёт, и без этого ветку коммит жил бы до первого `git gc`.
         code, reason = _git(["worktree", "add", "--detach", str(tree), rev], repo)
         if code != 0:
             raise RunnerError(f"git worktree add {tree} от {rev!r} в {repo}: {reason or code}")
@@ -682,6 +684,38 @@ def commit_tree(tree: Path, deal: Any, stage_id: str, attempt: int) -> tuple[str
     if code != 0 or not out:
         return "", f"git rev-parse HEAD отказал: {out or code}"
     return out.split()[0], ""
+
+
+DEAL_BRANCH_PREFIX = "duty/"
+
+
+def deal_branch(deal: Any) -> str:
+    """Ветка дела: имя, за которое держится вся работа дела.
+
+    Одна ветка на дело, а не на этап: этапы дела идут цепочкой (`needs`), поэтому
+    их коммиты — одна линия. Имя не совпадает с ветками человека (`main`,
+    `release/*`), так что двигать её движку можно без спроса.
+    """
+    return f"{DEAL_BRANCH_PREFIX}{deal['id']}"
+
+
+def anchor_commit(tree: Path, deal: Any, commit: str) -> tuple[str, str]:
+    """Поставить ветку дела на коммит: `(ветка, причина отказа)`.
+
+    Дерево попытки остаётся в detached HEAD — ветку оно не занимает, и две
+    попытки не спорят за неё. Но сам коммит получает ссылку: без неё работа дела
+    живёт до первого `git gc`, и ровно это случилось с `d_9ea4d348`, где коммиты
+    `impl_core`/`impl_wire` пришлось закреплять руками (`git branch duty/... `).
+    Отказ закрепления не отменяет коммит: работа уже зафиксирована, поэтому
+    причина уходит в событие, а не в вердикт попытки.
+    """
+    if not commit:
+        return "", ""
+    branch = deal_branch(deal)
+    code, reason = _git(["branch", "-f", branch, commit], Path(tree))
+    if code != 0:
+        return branch, f"git branch -f {branch} отказал: {reason or code}"
+    return branch, ""
 
 
 def tree_dirty(tree: Path) -> tuple[bool, int]:
@@ -1808,12 +1842,16 @@ def run_shell_stage(
                 outcome, kind, reason = OUTCOME_FAILED, failures.verdict_kind(verdict), verdict.reason()
 
     committed = ""
+    branch = ""
+    branch_error = ""
     if outcome == OUTCOME_DONE and tree is not None:
         committed, commit_error = commit_tree(tree, deal, stage_id, attempt)
         if not committed:
             outcome = OUTCOME_FAILED
             kind = FAIL_INFRA
             reason = f"работа попытки не зафиксирована коммитом: {commit_error}"
+        else:
+            branch, branch_error = anchor_commit(tree, deal, committed)
 
     # Дерево упавшей попытки убирается только пустым. Правило было перевёрнуто:
     # дерево удалялось ровно тогда, когда работы в коммите ещё не было, и падение
@@ -1858,6 +1896,10 @@ def run_shell_stage(
             # Сохранённое дерево упавшей попытки: адрес работы, которую не
             # успели закоммитить. Пусто — сохранять было нечего.
             "tree_kept": kept_tree or None,
+            # Ветка дела и отказ её закрепления: ссылка на работу — факт, а не
+            # догадка «коммит где-то есть».
+            "branch": branch or None,
+            "branch_error": branch_error or None,
             "verdict": verdict.as_payload() if verdict is not None else None,
             # У команды свидетель один — `commit|artifacts`; поле заполняется,
             # когда пакет действительно проверялся (объявлены `artifacts`).
@@ -2968,12 +3010,16 @@ def run_stage(
     # Неудача фиксации — инфра: работа сделана, но «что видел этап» не станет
     # воспроизводимым, и `done` отдавать нельзя.
     committed = ""
+    branch = ""
+    branch_error = ""
     if outcome == OUTCOME_DONE and tree is not None:
         committed, commit_error = commit_tree(tree, deal, stage_id, attempt)
         if not committed:
             outcome = OUTCOME_FAILED
             kind = FAIL_INFRA
             reason = f"работа попытки не зафиксирована коммитом: {commit_error}"
+        else:
+            branch, branch_error = anchor_commit(tree, deal, committed)
 
     # Дерево упавшей попытки убирается только пустым. Правило было перевёрнуто:
     # дерево удалялось ровно тогда, когда работы в коммите ещё не было, и падение
@@ -3017,6 +3063,10 @@ def run_stage(
             # Сохранённое дерево упавшей попытки: адрес работы, которую не
             # успели закоммитить. Пусто — сохранять было нечего.
             "tree_kept": kept_tree or None,
+            # Ветка дела и отказ её закрепления: ссылка на работу — факт, а не
+            # догадка «коммит где-то есть».
+            "branch": branch or None,
+            "branch_error": branch_error or None,
             "stderr_path": str(stderr_file) if stderr_file is not None else None,
             "verdict": verdict.as_payload() if verdict is not None else None,
             # Чем этап назвал работу, когда пакет принят (`evidence.witness`):

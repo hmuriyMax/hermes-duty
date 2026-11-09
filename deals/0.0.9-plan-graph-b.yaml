@@ -1,0 +1,63 @@
+# Дело: план растёт из журнала — второй заход, двумя этапами
+#
+# Первый заход (дело d_7d92affb) упал на infra: 284 вызова, 42M токенов, 55
+# минут, отчёта нет. Объём один заход не выдерживает, поэтому тот же срез
+# разрезан на два исполняющих этапа: ядро (журнал + хартия + валидатор плана) и
+# проводка (transit/runner/driver/stagefeed). Второй этап начинает от коммита
+# первого — дерево, работа и отчёт в контракте.
+#
+# base приколот к 2c28405 (голова release/v0.0.9 после фикса «дерево упавшей
+# попытки не удаляется»): новое дерево — новое дело.
+#
+# ПОЧЕМУ ДВА ЭТАПА, А НЕ ТРИ. Резка на `journal`/`spec`/`transit` дала бы три
+# дерева и три отчёта ради файлов, которые правятся одним движением. Граница
+# проведена по проверяемости: ядро закрывается своим тестовым файлом, проводка —
+# сквозным тестом графа.
+#
+# Адреса приговора: `next` и `impl_core` (вернуть всю цепочку на доработку).
+# Возврат на `impl_core` переоткрывает и `impl_wire` — он зависит от ядра, и
+# иначе проводка осталась бы на старом дереве.
+
+duty: 0.0.9-plan-graph-b
+repo: ~/.hermes/plugins/hermes-duty
+base: 2c28405
+
+budget: {minutes: 360}
+
+stages:
+  - id: impl_core
+    role: implementer
+    workspace: worktree
+    budget: {minutes: 100}
+    evidence:
+      - {cmd: "env -u PYTHONPATH ~/.hermes/hermes-agent/venv/bin/python -m pytest tests/test_journal.py tests/test_spec.py -q -p no:randomly", must: 0, timeout_sec: 600}
+      - {cmd: "env -u PYTHONPATH bin/duty spec check examples/duty.yaml", must: 0, timeout_sec: 120}
+      - {cmd: "env -u PYTHONPATH bin/duty spec check examples/duty-minimal.yaml", must: 0, timeout_sec: 120}
+
+  - id: impl_wire
+    role: implementer
+    needs: [impl_core]
+    workspace: worktree
+    budget: {minutes: 110}
+    evidence:
+      - {cmd: "env -u PYTHONPATH ~/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q -p no:randomly", must: 0, timeout_sec: 900}
+      - {cmd: "node --test tests/*.test.mjs", must: 0, timeout_sec: 600}
+      - {cmd: "env -u PYTHONPATH bin/duty-model-sync --check", must: 0, timeout_sec: 120}
+
+  - id: check
+    kind: shell
+    needs: [impl_wire]
+    budget: {minutes: 40}
+    workspace: worktree
+    cmd: "env -u PYTHONPATH bin/duty-model-sync --check && env -u PYTHONPATH bin/duty spec check examples/duty.yaml && env -u PYTHONPATH bin/duty spec check examples/duty-minimal.yaml && node --test tests/*.test.mjs && env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q -p no:randomly && HERMES_HOME=$HOME/.hermes env -u PYTHONPATH bin/duty demo"
+    must: 0
+
+  - id: review
+    role: reviewer
+    needs: [check]
+    workspace: none
+    budget: {minutes: 60}
+    verdict:
+      approve: next
+      changes: impl_core
+      max_rounds: 3

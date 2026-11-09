@@ -439,6 +439,22 @@ def _event_line(event: dict[str, Any]) -> str:
     return ""
 
 
+def _demo_version() -> str:
+    """Версия плагина из `plugin.yaml` — единственный источник номера.
+
+    Литерал в подписи отчёта переживает bump и обещает «вне 0.0.4» на версии 0.0.8:
+    пятая копия номера в коде рассинхронизируется молча.
+    """
+    meta = Path(__file__).resolve().parent.parent / "plugin.yaml"
+    try:
+        for line in meta.read_text(encoding="utf-8").splitlines():
+            if line.startswith("version:"):
+                return line.split(":", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return "?"
+
+
 def render_demo(report: dict[str, Any]) -> str:
     """Текст прогона для терминала: спека, шаги, журнал, проверки, граница."""
     out: list[str] = []
@@ -472,7 +488,7 @@ def render_demo(report: dict[str, Any]) -> str:
     for check in report["checks"]:
         out.append(f"  [{'OK' if check['ok'] else 'FAIL'}] {check['name']}: {check['detail']}")
     out.append("")
-    out.append("ЧЕГО ЕЩЁ НЕТ (вне 0.0.4):")
+    out.append(f"ЧЕГО ЕЩЁ НЕТ (вне {_demo_version()}):")
     for item in report["engine_todo"]:
         out.append(f"  · {item}")
     return "\n".join(out)

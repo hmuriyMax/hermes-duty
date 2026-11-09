@@ -3740,8 +3740,11 @@ const CSS = `
 .duty-mtl-sausage:focus-visible{outline:2px solid var(--ui-accent);outline-offset:2px}
 .duty-mtl-sausage.is-clipped{border-top-left-radius:0;border-bottom-left-radius:0}
 .duty-mtl-sausage.inexact{opacity:.45}
+/* Дело в работе — пульсирующий ореол вокруг всей сосиски, а не вокруг этапа. */
+.duty-mtl-sausage.is-live{animation:duty-mtl-live 2.8s ease-in-out infinite}
+@keyframes duty-mtl-live{0%,100%{box-shadow:0 0 0 0 transparent,0 0 7px -2px color-mix(in srgb,var(--ui-accent) 45%,transparent)}50%{box-shadow:0 0 0 1px color-mix(in srgb,var(--ui-accent) 26%,transparent),0 0 13px -1px color-mix(in srgb,var(--ui-accent) 78%,transparent)}}
 /* Роли этапов: цвет — кто работает (имплементер всегда один, ревьюер другой). */
-.duty-mtl-seg{position:absolute;top:0;bottom:0;min-width:2px;background:var(--role-fill,var(--role-other))}
+.duty-mtl-seg{position:absolute;top:0;bottom:0;min-width:2px;background-color:var(--role-fill,var(--role-other))}
 .duty-mtl-seg.r-planner{--role-base:var(--role-planner)}
 .duty-mtl-seg.r-implementer{--role-base:var(--role-implementer)}
 .duty-mtl-seg.r-documenter{--role-base:var(--role-documenter)}
@@ -3753,31 +3756,19 @@ const CSS = `
 /* Повторы одной роли внутри дела различаются оттенком. */
 .duty-mtl-seg.shade-1{--role-fill:color-mix(in srgb,var(--role-base,var(--role-other)) 68%,var(--ui-surface-background))}
 .duty-mtl-seg.shade-2{--role-fill:color-mix(in srgb,var(--role-base,var(--role-other)) 88%,var(--ui-text-primary))}
-.duty-mtl-seg.t-green{--glow:var(--ui-green)}
-.duty-mtl-seg.t-blue{--glow:var(--ui-blue)}
-.duty-mtl-seg.t-yellow{--glow:var(--ui-yellow)}
-.duty-mtl-seg.t-red{--glow:var(--ui-red)}
-.duty-mtl-seg.t-gray{--glow:var(--ui-stroke-tertiary)}
 /* Свечение краёв вместо рамки: градиент гаснет к середине, поэтому цвета соседних
    этапов не перебиваются, а геометрия полосы не меняется. */
-/* Ореол — две полосы света над и под этапом, шириной ровно в этап: box-shadow
-   лез бы влево-вправо, и на стыке двух этапов ореолы складывались бы в пятно. */
-.duty-mtl-seg:before,.duty-mtl-seg:after{content:'';position:absolute;left:0;right:0;height:var(--glow-size,5px);pointer-events:none;opacity:.85;-webkit-mask-image:linear-gradient(to right,transparent,#000 3px,#000 calc(100% - 3px),transparent);mask-image:linear-gradient(to right,transparent,#000 3px,#000 calc(100% - 3px),transparent)}
-.duty-mtl-seg:before{bottom:100%;background:linear-gradient(to top,color-mix(in srgb,var(--glow,var(--ui-stroke-secondary)) 78%,transparent),transparent)}
-.duty-mtl-seg:after{top:100%;background:linear-gradient(to bottom,color-mix(in srgb,var(--glow,var(--ui-stroke-secondary)) 78%,transparent),transparent)}
+/* Отказ — красное штрихование поверх цвета роли: роль видна, а падение читается
+   рисунком. */
+.duty-mtl-seg.is-failed{background-image:repeating-linear-gradient(135deg,color-mix(in srgb,var(--ui-red) 88%,transparent) 0 2.5px,transparent 2.5px 6px)}
 .duty-mtl-sausage .duty-mtl-seg:first-child{border-top-left-radius:3px;border-bottom-left-radius:3px}
 .duty-mtl-sausage .duty-mtl-seg:last-child{border-top-right-radius:3px;border-bottom-right-radius:3px}
 .duty-mtl-sausage.is-clipped .duty-mtl-seg:first-child{border-top-left-radius:0;border-bottom-left-radius:0}
-.duty-mtl-seg.is-running{--glow-size:6px}
-.duty-mtl-seg.is-running:before,.duty-mtl-seg.is-running:after{animation:duty-mtl-breathe 2.6s ease-in-out infinite}
+
 /* Отказ горит ярче и чаще: единственное состояние, которое просит действия. */
-.duty-mtl-seg.is-failed{--glow-size:8px}
-.duty-mtl-seg.is-failed:before,.duty-mtl-seg.is-failed:after{animation:duty-mtl-fail 1.4s ease-in-out infinite}
-.duty-mtl-seg.is-failed:before{background:linear-gradient(to top,var(--ui-red),transparent)}
-.duty-mtl-seg.is-failed:after{background:linear-gradient(to bottom,var(--ui-red),transparent)}
+
 .duty-mtl-seg.clipped{border-left:1px solid var(--ui-surface-background)}
-@keyframes duty-mtl-breathe{0%,100%{opacity:.5}50%{opacity:1}}
-@keyframes duty-mtl-fail{0%,100%{opacity:.65;filter:brightness(1)}50%{opacity:1;filter:brightness(1.4)}}
+
 .duty-mtl-age{color:var(--ui-text-secondary);text-align:right;font-size:11.5px}
 .duty-mtl-state{color:var(--ui-text-tertiary);text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11.5px}
 .duty-mtl-axis{display:grid;grid-template-columns:var(--duty-mtl-cols);gap:12px;height:15px;margin-top:4px}
@@ -3793,17 +3784,11 @@ const CSS = `
 .duty-mtl-window-input.is-bad{border-color:var(--ui-red);background:color-mix(in srgb,var(--ui-red) 14%,transparent)}
 .duty-mtl-legend{display:flex;flex-wrap:wrap;gap:4px 14px;padding:8px 12px 10px;border-top:1px solid var(--ui-stroke-tertiary);font-size:11.5px}
 .duty-mtl-legend-item{display:inline-flex;align-items:center;gap:6px;color:var(--ui-text-secondary)}
-.duty-mtl-dot{position:relative;width:14px;height:9px;border-radius:2px;background:var(--role-implementer);--glow:var(--ui-stroke-secondary)}
-.duty-mtl-dot.t-green{--glow:var(--ui-green)}
-.duty-mtl-dot.t-blue{--glow:var(--ui-blue)}
-.duty-mtl-dot.t-yellow{--glow:var(--ui-yellow)}
-.duty-mtl-dot.t-red{--glow:var(--ui-red)}
-.duty-mtl-dot.t-gray{--glow:var(--ui-stroke-tertiary)}
-.duty-mtl-dot:before,.duty-mtl-dot:after{content:'';position:absolute;left:0;right:0;height:3px}
-.duty-mtl-dot:before{bottom:100%;background:linear-gradient(to top,var(--glow),transparent)}
-.duty-mtl-dot:after{top:100%;background:linear-gradient(to bottom,var(--glow),transparent)}
+.duty-mtl-dot{position:relative;width:14px;height:9px;border-radius:2px;background-color:var(--role-implementer)}
+.duty-mtl-dot.t-red{background-image:repeating-linear-gradient(135deg,color-mix(in srgb,var(--ui-red) 88%,transparent) 0 2px,transparent 2px 5px)}
+.duty-mtl-dot.t-blue{animation:duty-mtl-live 2.8s ease-in-out infinite}
 .duty-mtl-legend-item.is-running{color:var(--ui-text-primary)}
-@media (prefers-reduced-motion: reduce){.duty-mtl-seg.is-running:before,.duty-mtl-seg.is-running:after,.duty-mtl-seg.is-failed:before,.duty-mtl-seg.is-failed:after{animation:none}}
+@media (prefers-reduced-motion: reduce){.duty-mtl-sausage.is-live,.duty-mtl-dot.t-blue{animation:none}.duty-mtl-sausage.is-live{box-shadow:0 0 0 1px color-mix(in srgb,var(--ui-accent) 26%,transparent),0 0 9px -1px color-mix(in srgb,var(--ui-accent) 55%,transparent)}}
 
 /* Кнопка подгрузки под списком проекта: по центру и заметная — единственный
  * способ получить следующие строки, искать её в углу не надо. */
@@ -5269,7 +5254,7 @@ function DutyMiniTimeline({ view, onOpen, windowSec, onWindow }) {
               h(
                 'span',
                 {
-                  className: `duty-mtl-sausage${row.exact ? '' : ' inexact'}${row.clipped ? ' is-clipped' : ''}`,
+                  className: `duty-mtl-sausage${row.open ? ' is-live' : ''}${row.exact ? '' : ' inexact'}${row.clipped ? ' is-clipped' : ''}`,
                   style: { left: `${row.bar.leftPct}%`, width: `${row.bar.widthPct}%` },
                   role: 'link',
                   tabIndex: 0,

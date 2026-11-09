@@ -1172,6 +1172,14 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
   background: color-mix(in srgb, var(--text-3) 20%, transparent);
   cursor: pointer;
 }
+/* Дело в работе — пульсирующий ореол вокруг всей сосиски, а не вокруг этапа:
+   «идёт прямо сейчас» относится к делу, а какой именно этап работает, видно по
+   правому краю полосы. */
+.tl-sausage.is-live { animation: tl-live 2.8s ease-in-out infinite; }
+@keyframes tl-live {
+  0%, 100% { box-shadow: 0 0 0 0 transparent, 0 0 7px -2px color-mix(in srgb, var(--accent) 45%, transparent); }
+  50% { box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 26%, transparent), 0 0 13px -1px color-mix(in srgb, var(--accent) 78%, transparent); }
+}
 .tl-sausage:hover { filter: brightness(1.08); }
 .tl-sausage:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 /* Начало раньше окна: левый край срезан — рисунок говорит «началось раньше», а
@@ -1188,7 +1196,8 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
   top: 0;
   bottom: 0;
   min-width: 2px;
-  background: var(--role-fill, var(--role-other));
+  background-color: var(--role-fill, var(--role-other));
+  background-repeat: repeat;
 }
 .tl-seg.r-planner { --role-base: var(--role-planner); }
 .tl-seg.r-implementer { --role-base: var(--role-implementer); }
@@ -1203,68 +1212,25 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
    поэтому оттенок читается и в светлой, и в тёмной теме. */
 .tl-seg.shade-1 { --role-fill: color-mix(in srgb, var(--role-base, var(--role-other)) 68%, var(--card)); }
 .tl-seg.shade-2 { --role-fill: color-mix(in srgb, var(--role-base, var(--role-other)) 88%, var(--text)); }
-.tl-seg.t-green { --glow: var(--ok); }
-.tl-seg.t-blue { --glow: var(--accent); }
-.tl-seg.t-yellow { --glow: var(--warn); }
-.tl-seg.t-red { --glow: var(--danger); }
-.tl-seg.t-gray { --glow: var(--text-3); }
 /* Свечение краёв вместо рамки: градиент гаснет к середине полосы, поэтому цвета
    соседних этапов не перебиваются, а геометрия не меняется вовсе (край — тень,
    а не бордюр: стыки этапов остаются на месте). */
-/* Ореол — две вертикальные полосы света над и под этапом, шириной ровно в этап.
-   Не box-shadow: его размытие лезет влево и вправо, и на стыке двух этапов два
-   ореола складываются в мутное пятно. Полоса света обрезана своей колонкой, так
-   что соседние этапы светят рядом, а не друг в друга. */
-.tl-seg::before,
-.tl-seg::after {
-  content: '';
-  position: absolute;
-  left: 0;
-  right: 0;
-  height: var(--glow-size, 5px);
-  pointer-events: none;
-  opacity: .85;
-  /* Свет гаснет и по краям колонки: на стыке двух этапов обе полосы сходят на
-     нет, вместо того чтобы столкнуться двумя разными цветами вплотную. */
-  -webkit-mask-image: linear-gradient(to right, transparent, #000 3px, #000 calc(100% - 3px), transparent);
-  mask-image: linear-gradient(to right, transparent, #000 3px, #000 calc(100% - 3px), transparent);
+/* Отказ — красное штрихование поверх цвета роли: полоса остаётся узнаваемой по
+   роли, а «здесь упало» читается рисунком, а не ещё одним оттенком. Угол 135°,
+   чтобы штрихи не совпадали с вертикалями сетки под полосой. */
+.tl-seg.is-failed {
+  background-image: repeating-linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--danger) 88%, transparent) 0 2.5px,
+    transparent 2.5px 6px
+  );
 }
-.tl-seg::before {
-  bottom: 100%;
-  background: linear-gradient(to top, color-mix(in srgb, var(--glow, var(--border-strong)) 78%, transparent), transparent);
-}
-.tl-seg::after {
-  top: 100%;
-  background: linear-gradient(to bottom, color-mix(in srgb, var(--glow, var(--border-strong)) 78%, transparent), transparent);
-}
-/* Идущий этап: свет дышит — «здесь работают сейчас». Заливка роли при этом не
-   мигает: она называет исполнителя, а не его состояние. */
-.tl-seg.is-running { --glow-size: 6px; }
-.tl-seg.is-running::before,
-.tl-seg.is-running::after { animation: tl-glow-run 2.6s ease-in-out infinite; }
-/* Отказ горит ярче, шире и чаще: это единственное состояние, которое просит
-   действия. */
-.tl-seg.is-failed { --glow-size: 8px; }
-.tl-seg.is-failed::before,
-.tl-seg.is-failed::after {
-  background: linear-gradient(to top, var(--danger), transparent);
-  animation: tl-glow-fail 1.4s ease-in-out infinite;
-}
-.tl-seg.is-failed::after { background: linear-gradient(to bottom, var(--danger), transparent); }
-.tl-seg.clipped { border-left: 1px solid var(--card); }
+
 /* Скругление — только у внешних краёв дела: внутри этапы стыкуются вплотную. */
 .tl-sausage .tl-seg:first-child { border-top-left-radius: 3px; border-bottom-left-radius: 3px; }
 .tl-sausage .tl-seg:last-child { border-top-right-radius: 3px; border-bottom-right-radius: 3px; }
 .tl-sausage.is-clipped .tl-seg:first-child { border-top-left-radius: 0; border-bottom-left-radius: 0; }
 
-@keyframes tl-glow-run {
-  0%, 100% { opacity: .5; }
-  50% { opacity: 1; }
-}
-@keyframes tl-glow-fail {
-  0%, 100% { opacity: .65; filter: brightness(1); }
-  50% { opacity: 1; filter: brightness(1.4); }
-}
 
 @keyframes tl-breathe {
   0%, 100% { opacity: .55; }
@@ -1305,31 +1271,23 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
 }
 .tl-legend-item { display: inline-flex; align-items: center; gap: 6px; color: var(--text-2); }
 /* Легенда объясняет грамматику полосы: заливка — профиль этапа, яркий край —
-   состояние. Поэтому образец легенды — тоже полоска с краем, а не цветной
-   квадрат: иначе зелёный квадрат обещал бы зелёную заливку. */
+   состояние. Поэтому легенда показывает рисунок: у отказа — штрихование, у
+   «в работе» — пульс, как у самого дела. */
 .tl-legend-dot {
   position: relative;
   width: 14px;
   height: 9px;
   border-radius: 2px;
-  background: var(--role-implementer);
-  --glow: var(--border-strong);
+  background-color: var(--role-implementer);
 }
-.tl-legend-dot.t-green { --glow: var(--ok); }
-.tl-legend-dot.t-blue { --glow: var(--accent); }
-.tl-legend-dot.t-yellow { --glow: var(--warn); }
-.tl-legend-dot.t-red { --glow: var(--danger); }
-.tl-legend-dot.t-gray { --glow: var(--text-3); }
-.tl-legend-dot::before,
-.tl-legend-dot::after {
-  content: '';
-  position: absolute;
-  left: 0;
-  right: 0;
-  height: 3px;
+.tl-legend-dot.t-red {
+  background-image: repeating-linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--danger) 88%, transparent) 0 2px,
+    transparent 2px 5px
+  );
 }
-.tl-legend-dot::before { bottom: 100%; background: linear-gradient(to top, var(--glow), transparent); }
-.tl-legend-dot::after { top: 100%; background: linear-gradient(to bottom, var(--glow), transparent); }
+.tl-legend-dot.t-blue { animation: tl-live 2.8s ease-in-out infinite; }
 .tl-legend-item.is-running { color: var(--text); }
 
 /* Выбор окна: пресеты + своё значение. Стоит в шапке справа, поэтому шапка —
@@ -1485,15 +1443,19 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .tl-seg.is-running::before,
-  .tl-seg.is-running::after,
-  .tl-seg.is-failed::before,
-  .tl-seg.is-failed::after,
+  .tl-sausage.is-live,
+  .tl-legend-dot.t-blue,
   .finished-body,
   .finished-group,
   .finished-group tbody tr,
   .skel,
   .skel-cell,
   .skel-tr { animation: none; transition: none; }
+  /* Без анимации ореол «дела в работе» остаётся ровным: состояние не должно
+     исчезать вместе с движением. */
+  .tl-sausage.is-live {
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 26%, transparent),
+      0 0 9px -1px color-mix(in srgb, var(--accent) 55%, transparent);
+  }
   .more-btn:hover:not([disabled]) { transform: none; }
 }

@@ -731,7 +731,7 @@ function timelineBlock(model) {
               h(
                 'span',
                 {
-                  class: `tl-sausage${row.exact ? '' : ' inexact'}${row.clipped ? ' is-clipped' : ''}`,
+                  class: `tl-sausage${row.open ? ' is-live' : ''}${row.exact ? '' : ' inexact'}${row.clipped ? ' is-clipped' : ''}`,
                   style: `left:${row.bar.leftPct}%;width:${row.bar.widthPct}%`,
                   role: 'link',
                   tabindex: '0',

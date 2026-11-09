@@ -638,9 +638,9 @@ test('десктоп: мини-таймлайн — сосиска на обще
   assert.match(html, /class="duty-mtl-seg r-planner [^"]*is-done/, 'этап plan не в роли планировщика')
   // Свечение на десктопе тоже наружу, и тело дела его не обрезает.
   const pluginCss = read('desktop/plugin.js').replace(/\/\*[\s\S]*?\*\//g, '')
-  assert.match(pluginCss, /\.duty-mtl-seg:before\{bottom:100%/, 'десктоп: свет не стоит над этапом')
-  assert.match(pluginCss, /\.duty-mtl-seg:after\{top:100%/, 'десктоп: свет не стоит под этапом')
-  assert.doesNotMatch(pluginCss, /\.duty-mtl-seg:after\{[^}]*inset 0 0/, 'десктоп: внутреннее свечение осталось')
+  assert.match(pluginCss, /\.duty-mtl-seg\.is-failed\{background-image:repeating-linear-gradient\(135deg/, 'десктоп: отказ без штрихования')
+  assert.match(pluginCss, /\.duty-mtl-sausage\.is-live\{animation:duty-mtl-live/, 'десктоп: у дела в работе нет пульса')
+  assert.doesNotMatch(pluginCss, /\.duty-mtl-seg:before\{/, 'десктоп: подсветка по краям этапа осталась')
   assert.match(pluginCss, /\.duty-mtl-sausage\{[^}]*overflow:visible/, 'десктоп: сосиска обрезает свечение')
   assert.match(pluginCss, /\.duty-mtl-seg\.shade-1\{--role-fill:color-mix/, 'десктоп: у повтора роли нет оттенка')
   assert.match(html, /class="duty-mtl-seg r-implementer [^"]*is-running/, 'этап impl не в роли имплементера')

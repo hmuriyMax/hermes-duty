@@ -865,7 +865,7 @@ test('веб: таймлайн — сосиски на общей сетке, к
   assert.match(app, /class: `tl-mini-row\$\{row\.open \? '' : ' is-done'\}`, 'data-key': `tl:\$\{row\.key\}` \}/,
     'веб: на строке таймлайна появился обработчик клика')
   // Дело и его название — ссылки.
-  assert.match(app, /class: `tl-sausage\$\{row\.exact/, 'веб: сосиска не рисуется')
+  assert.match(app, /class: `tl-sausage\$\{row\.open \? ' is-live' : ''\}\$\{row\.exact/, 'веб: сосиска не рисуется')
   assert.match(app, /onclick: open\(row\.id\)/, 'веб: сосиска не открывает дело')
   assert.match(app, /class: 'tl-title',\s+href: `#\/deal\/\$\{encodeURIComponent\(row\.id\)\}`/,
     'веб: название дела не ссылка')
@@ -894,24 +894,23 @@ test('веб: таймлайн — сосиски на общей сетке, к
   for (const role of ['planner', 'implementer', 'documenter', 'tester', 'reviewer', 'publisher']) {
     assert.match(css, new RegExp(`\\.tl-seg\\.r-${role} \\{ --role-base: var\\(--role-${role}\\); \\}`), `веб: у роли ${role} нет своей краски`)
   }
-  assert.match(css, /\.tl-seg\.t-green \{ --glow: var\(--ok\); \}/, 'веб: пройден не зелёный страницы дела')
-  assert.match(css, /\.tl-seg\.t-red \{ --glow: var\(--danger\); \}/, 'веб: отказ не красный страницы дела')
-  assert.match(css, /\.tl-seg\.t-blue \{ --glow: var\(--accent\); \}/, 'веб: идущий не акцент страницы дела')
+  // Состояние больше не красит полосу: пройден и идёт выглядят цветом роли,
+  // отказ — штрихованием, «идёт» относится к делу целиком и живёт пульсом.
   // Состояние — ореол снаружи полосы, а не рамка и не внутренняя заливка: тело
   // дела целиком остаётся цветом роли, а свет ложится вокруг него.
-  // Ореол — полосы света над и под этапом, шириной в сам этап: box-shadow
-  // размывался бы влево-вправо и складывался с соседним ореолом в пятно.
-  assert.match(css, /\.tl-seg::before \{[^}]*bottom: 100%/s, 'веб: свет не стоит над этапом')
-  assert.match(css, /\.tl-seg::after \{[^}]*top: 100%/s, 'веб: свет не стоит под этапом')
-  assert.match(css, /\.tl-seg::before \{[^}]*linear-gradient\(to top/s, 'веб: свет над этапом не гаснет вверх')
-  assert.match(css, /\.tl-seg::before,\n\.tl-seg::after \{[^}]*mask-image/s, 'веб: свет не гаснет на стыке этапов')
-  assert.doesNotMatch(css, /\.tl-seg::after \{[^}]*inset 0 0/s, 'веб: свечение всё ещё светит внутрь полосы')
+  // Отказ — красное штрихование поверх цвета роли, а не свечение по краям.
+  assert.match(css, /\.tl-seg\.is-failed \{[^}]*repeating-linear-gradient\(\s*135deg/s, 'веб: отказ без штрихования')
+  assert.match(css, /\.tl-seg\.is-failed \{[^}]*var\(--danger\)/s, 'веб: штрихование не красное')
+  assert.doesNotMatch(css, /\.tl-seg::before/s, 'веб: подсветка по краям этапа осталась')
+  // «В работе» — пульс вокруг всего дела, а не вокруг отдельного этапа.
+  assert.match(css, /\.tl-sausage\.is-live \{ animation: tl-live/, 'веб: у дела в работе нет пульса')
+  assert.match(css, /@keyframes tl-live \{/, 'веб: пульс не описан')
+  assert.match(app, /tl-sausage\$\{row\.open \? ' is-live' : ''\}/, 'веб: разметка не помечает живое дело')
+  assert.doesNotMatch(css, /\.tl-seg\.t-(green|blue|yellow|gray) \{/s, 'веб: состояние всё ещё красит полосу этапа')
   assert.doesNotMatch(css, /\.tl-seg::after \{[^}]*inset: 0/s, 'веб: ореол всё ещё лежит на самой полосе')
   // Внешний свет требует не обрезать тело дела: иначе ореол срежется по краю.
   assert.match(css, /\.tl-sausage \{[^}]*overflow: visible/s, 'веб: сосиска обрезает свечение')
   assert.match(css, /\.tl-sausage \.tl-seg:first-child \{[^}]*border-top-left-radius: 3px/s, 'веб: скругление не переехало на крайние этапы')
-  assert.match(css, /\.tl-seg\.is-failed::after \{[^}]*animation/, 'веб: отказ не горит ярче')
-  assert.match(css, /\.tl-seg\.is-running::after \{[^}]*animation/, 'веб: идущий этап не дышит')
 
   // Окно таймлайна выбирается: пресеты и ввод с клавиатуры.
   assert.match(app, /TL_WINDOWS\.map/, 'веб: нет пресетов окна')

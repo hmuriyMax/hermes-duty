@@ -632,7 +632,12 @@ pre.body {
 .scale-bar-k { font-size: 10.5px; color: var(--text); padding: 0 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .scale-markers { position: relative; height: 42px; margin-top: 10px; border-top: 1px solid var(--border); }
+/* Якорь маркера: `end` ставит вывод ПЕРЕД его моментом (вердикт принадлежит
+ * законченному этапу, а момент совпадает со стартом следующего), `start` —
+ * после (вопрос открывает ожидание). По умолчанию — по центру. */
 .scale-marker { position: absolute; display: flex; flex-direction: column; align-items: center; transform: translateX(-50%); }
+.scale-marker.anchor-end { transform: translateX(calc(-100% - 1px)); }
+.scale-marker.anchor-start { transform: translateX(1px); }
 .scale-marker-dot {
   display: grid;
   place-items: center;
@@ -923,6 +928,8 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
  * кромке убегала при разворачивании, а палка стоит на своём времени всегда. */
 .tl-marks { position: absolute; inset: 0; pointer-events: none; }
 .tl-mark { position: absolute; top: -3px; bottom: -3px; width: 3px; transform: translateX(-50%); pointer-events: auto; cursor: pointer; }
+.tl-mark.anchor-end { transform: translateX(calc(-100% - 1px)); }
+.tl-mark.anchor-start { transform: translateX(1px); }
 .tl-mark i { display: block; width: 100%; height: 100%; border-radius: 2px; background: currentColor; opacity: .9; }
 /* Палка тонкая: попадание мышью расширяется невидимым «полем» вокруг, иначе
  * в неё почти невозможно попасть и подсказка не появляется. */
@@ -956,6 +963,11 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
   font-family: var(--mono); font-size: 10.5px; line-height: 1.5;
   opacity: 0; pointer-events: none; transition: opacity .09s ease; z-index: 30;
 }
+/* Подсказка должна быть поверх соседних дорожек: у самих хостов `transform`,
+ * то есть свой контекст наложения, и z-index 30 внутри него не поднимал её над
+ * следующими строками. Поэтому на наведении поднимается сам хост. */
+.tl-call:hover, .tl-band:hover, .tl-lbl:hover, .tl-mark:hover, .tl-wait:hover,
+.tl-call:focus-visible, .tl-mark:focus-visible { z-index: 40; }
 .tl-call:hover::after, .tl-band:hover::after, .tl-lbl:hover::after,
 .tl-mark:hover::after, .tl-wait:hover::after { opacity: 1; }
 .tl-call.tl-sel { box-shadow: inset 0 0 0 1.5px var(--accent), 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent); }

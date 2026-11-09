@@ -1260,7 +1260,10 @@ const BAR_MIN_PCT = 2
 // и по длительности, и по доле оси: короткая пауза в долгом деле и так не мешает,
 // а длинная пауза в очень долгом деле не искажает вид.
 const IDLE_MIN_SEC = 600
-const IDLE_MIN_SHARE = 0.08
+// Доля оси, ниже которой простой не трогаем. Восьми процентов не хватало: в деле
+// d_d9087160 пауза 13 минут на трёхчасовой оси — это 7.4 %, и сжатия не было
+// вовсе, хотя пауза глазом читается как провал в работе.
+const IDLE_MIN_SHARE = 0.05
 // Сжатый промежуток занимает столько процентов оси, но все сжатия вместе — не
 // больше суммы: иначе ось врала бы про доли работы.
 const IDLE_GAP_PCT = 3
@@ -1272,15 +1275,19 @@ const IDLE_LABEL_EDGE_PCT = 12
 // Подпись и тон маркера: журнал назвал событие — экран назвал его тем же словом.
 // `tick` — тонкая засечка старта/закрытия попытки (их на оси много); остальные
 // виды — то, что случилось с делом, и они рисуются заметно.
+// `anchor` — куда маркер «прицеплен» к своему моменту. Вывод (вердикт, ответ,
+// закрытие) принадлежит тому, что уже случилось, поэтому стоит ПЕРЕД моментом:
+// иначе вердикт читается как начало следующего этапа — его момент совпадает со
+// стартом следующей попытки. Вопрос, наоборот, открывает ожидание и стоит после.
 const MARKER_META = {
-  question: { label: 'вопрос человеку', tone: 'yellow', tick: false },
-  answer: { label: 'ответ человека', tone: 'green', tick: false },
-  verdict: { label: 'вердикт', tone: 'blue', tick: false },
-  budget: { label: 'отказ по бюджету', tone: 'red', tick: false },
-  published: { label: 'публикация', tone: 'green', tick: false },
-  closed: { label: 'закрыто', tone: 'gray', tick: false },
-  started: { label: 'старт попытки', tone: 'gray', tick: true },
-  ended: { label: 'конец попытки', tone: 'gray', tick: true },
+  question: { label: 'вопрос человеку', tone: 'yellow', tick: false, anchor: 'start' },
+  answer: { label: 'ответ человека', tone: 'green', tick: false, anchor: 'end' },
+  verdict: { label: 'вердикт', tone: 'blue', tick: false, anchor: 'end' },
+  budget: { label: 'отказ по бюджету', tone: 'red', tick: false, anchor: 'end' },
+  published: { label: 'публикация', tone: 'green', tick: false, anchor: 'end' },
+  closed: { label: 'закрыто', tone: 'gray', tick: false, anchor: 'end' },
+  started: { label: 'старт попытки', tone: 'gray', tick: true, anchor: 'middle' },
+  ended: { label: 'конец попытки', tone: 'gray', tick: true, anchor: 'middle' },
 }
 
 // Причина закрытия по-русски: `cause` из журнала — машинное слово, экран его
@@ -1644,6 +1651,9 @@ function attemptView(bar, scale) {
     type: marker.type,
     tone: marker.tone,
     pct: marker.pct,
+    // Якорь едет вместе с маркером: палка вывода стоит ПЕРЕД своим моментом,
+    // иначе вердикт читается как начало следующего этапа.
+    anchor: marker.anchor,
     title: marker.title,
     ariaLabel: marker.ariaLabel,
   }))
@@ -2317,6 +2327,7 @@ function shapeDealTime(detail, attemptsPayload) {
       label: meta.label,
       tone: meta.tone,
       tick: meta.tick,
+      anchor: meta.anchor,
       summary: event.summary,
       // Человеческое тело подписи: вопрос/ответ текстом, причина закрытия
       // словами. Пауза «вопрос → ответ» называет им сам вопрос.

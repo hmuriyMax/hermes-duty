@@ -1296,7 +1296,7 @@ function markerNode(marker, index) {
   return h(
     'span',
     {
-      class: `scale-marker t-${marker.tone}${marker.tick ? ' tick' : ''}`,
+      class: `scale-marker t-${marker.tone}${marker.tick ? ' tick' : ''} anchor-${marker.anchor || 'middle'}`,
       style: `left:${marker.pct}%;top:${(index % 2) * 13}px`,
       title: marker.title,
       'data-key': `marker:${marker.type}:${marker.at}`,
@@ -1414,7 +1414,7 @@ function attemptRowNode(view, key) {
         h(
           'span',
           {
-            class: `tl-mark t-${mark.tone}`,
+            class: `tl-mark t-${mark.tone} anchor-${mark.anchor || 'middle'}`,
             style: `left:${mark.pct}%`,
             'data-tip': mark.title,
             'aria-label': mark.ariaLabel,

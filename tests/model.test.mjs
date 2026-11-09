@@ -992,17 +992,29 @@ test('сжатие простоя: короткая пауза не сжимае
   assert.equal(scale.bars[1].endPct, 100)
 })
 
-test('сжатие простоя: пауза, незаметная на оси (меньше 8 %), не сжимается', () => {
+test('сжатие простоя: пауза, незаметная на оси (меньше 5 %), не сжимается', () => {
   // Восемь минут в деле на три часа — 4.4 % оси: длинная пауза в долгом деле
   // вида не искажает, сжимать её значило бы врать про доли.
   const short = idleScale([[1, 1001], [1481, 10800]])
   assert.deepEqual(short.idle.gaps, [])
   assert.equal(short.bars[1].leftPct, Math.round(((1481 - 1) / 10799) * 1000) / 10)
-  // Порог по доле работает и без порога по длительности: 15 минут в четырёх
-  // часах — это 6.25 % оси, хотя секунд больше десяти минут.
-  const quarter = idleScale([[1, 1001], [1901, 14400]])
+  // Порог по доле работает и без порога по длительности: десять минут в четырёх
+  // часах — это 4.2 % оси, хотя секунд ровно десять минут.
+  const quarter = idleScale([[1, 1001], [1601, 14400]])
   assert.deepEqual(quarter.idle.gaps, [], 'сжатие по одной длительности, без доли оси')
-  assert.equal(quarter.bars[1].leftPct, Math.round(((1901 - 1) / 14399) * 1000) / 10)
+  assert.equal(quarter.bars[1].leftPct, Math.round(((1601 - 1) / 14399) * 1000) / 10)
+})
+
+test('сжатие простоя: пауза 13 минут на трёхчасовой оси сжимается (дело d_d9087160)', () => {
+  // Ровно этот случай Max увидел как «сжатия нет»: 773 секунды между проверкой
+  // и её повтором на оси в 10 517 секунд — 7.4 %. При пороге в восемь процентов
+  // промежуток оставался пустым, хотя провал в работе читается глазом.
+  const scale = idleScale([[8, 2719], [2719, 8927], [9700, 9834], [9835, 10516]])
+  assert.equal(scale.idle.gaps.length, 1, 'пауза 13 минут так и не сжалась')
+  const gap = scale.idle.gaps[0]
+  assert.equal(gap.sec, 773)
+  assert.ok(Math.abs(gap.rightPct - gap.leftPct - 3) < 0.11, `сжатие шириной ${gap.rightPct - gap.leftPct} %`)
+  assert.match(gap.text, /простой 12 мин|простой 13 мин/)
 })
 
 test('сжатие простоя: много простоев — по 3 % и не больше 20 % на все', () => {
@@ -2400,4 +2412,59 @@ test('правила обновления живут в шейпере, а не 
   const surface = plugin.replace(/\/\/ duty:model-start[\s\S]*?\/\/ duty:model-end/, '')
   assert.ok(!/refreshPlan\(/.test(surface), 'десктоп: свой таймер обновления сверх шейпера')
   assert.ok(!/REFRESH_LIVE_SEC|REFRESH_DONE_SEC/.test(surface), 'десктоп: свои секунды обновления')
+})
+
+test('маркер вывода стоит перед своим моментом, вопрос — после', () => {
+  // Вердикт записывается в тот же миг, когда стартует следующая попытка: по
+  // центру он читался как начало следующего этапа, а он про законченный.
+  const scale = shapeDealTime(
+    {
+      now: undefined,
+      terminal: true,
+      timeline: [
+        { kind: 'created', at: 1, summary: '' },
+        { kind: 'question_asked', at: 100, summary: 'вопрос #429' },
+        { kind: 'question_answered', at: 200, summary: 'ответ человека' },
+        { kind: 'attempt_started', at: 250, summary: '' },
+        { kind: 'attempt_ended', at: 300, summary: '' },
+        { kind: 'collected', at: 400, summary: 'review → next' },
+        { kind: 'completed', at: 500, summary: 'all_stages_done' },
+      ],
+      stages: [{ id: 'impl', needs: [] }],
+    },
+    { attempts: [{ stage: 'impl', attempt: 1, start: 1, end: 400, status: 'done', outcome: 'done' }] },
+  )
+  const byType = (type) => scale.markers.find((marker) => marker.type === type)
+  assert.equal(byType('verdict').anchor, 'end', 'вердикт не прицеплен к концу этапа')
+  assert.equal(byType('answer').anchor, 'end')
+  // Закрытие в этом синтетическом журнале не распознаётся как маркер: его вид
+  // зависит от того, как записан `completed`, поэтому проверяем то, что есть.
+  assert.equal(byType('closed').anchor, 'end', 'закрытие стоит не перед своим моментом')
+  assert.equal(byType('question').anchor, 'start', 'вопрос не открывает ожидание')
+  assert.equal(byType('ended').anchor, 'middle', 'засечка конца попытки уехала из центра')
+})
+
+test('палка маркера несёт тот же якорь, что и маркер', () => {
+  // Палки живут в строке попытки (`lane.marks`), и без якоря они снова
+  // центрировались на моменте: вердикт наползал на следующий этап.
+  const scale = shapeDealTime(
+    {
+      now: undefined,
+      terminal: true,
+      timeline: [
+        { kind: 'created', at: 1, summary: '' },
+        { kind: 'collected', at: 400, summary: 'review → next' },
+        { kind: 'completed', at: 500, summary: 'all_stages_done' },
+      ],
+      stages: [{ id: 'impl', needs: [] }],
+    },
+    { attempts: [{ stage: 'impl', attempt: 1, start: 1, end: 400, status: 'done', outcome: 'done' }] },
+  )
+  // Палки живут в виде попытки (`attemptView`), не в дорожке: берём ту же
+  // функцию, что зовёт страница.
+  const bar = scale.bars[0]
+  const view = attemptView(bar, scale)
+  const verdictMark = (view.marks || []).find((m) => m.type === 'verdict')
+  assert.ok(verdictMark, 'вердикта нет в палках попытки')
+  assert.equal(verdictMark.anchor, 'end', 'палка вердикта центрируется вместо привязки к концу')
 })

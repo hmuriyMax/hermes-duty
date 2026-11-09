@@ -70,6 +70,28 @@ def _journal() -> Any:
 
 journal = _journal()
 
+# `dashboard/spec.py` рядом — по тому же правилу, что и журнал: нужен один словарь
+# имён на плагин. Здесь из него берётся одно слово — id закрывающего этапа
+# (`spec.CLOSE_STAGE`): «дело с закрывающим этапом закрывает лид» — правило
+# `close_stages_done`, а не догадка вызывающего о том, как зовут этот этап.
+SPEC_MODULE_NAME = "hermes_duty_spec"
+
+
+def _spec() -> Any:
+    """`dashboard/spec.py` — модуль спеки, один на процесс."""
+    loaded = sys.modules.get(SPEC_MODULE_NAME)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / "spec.py"
+    spec = importlib.util.spec_from_file_location(SPEC_MODULE_NAME, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise ImportError(f"spec module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[SPEC_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 # Своё пространство id: `d_<hex>`; kanban-дела — `t_<hex>` (`docs/OWNERSHIP.md`).
 OWN_PREFIX = "d_"
 
@@ -1184,6 +1206,11 @@ CLOSE_CAUSE_STOP = "stopped_by_human"
 # дело оставалось живым (`status='running'` без `completed`) — движок называл
 # результат, которого в системе не было.
 CLOSE_CAUSE_ALL_STAGES = "all_stages_done"
+# Причина закрытия 1.0: дело закрыл **лид** — закрывающий этап (`spec.CLOSE_STAGE`)
+# вынес приговор `approve`. Это не то же, что «все этапы пройдены»: пройденный
+# граф — условие, а решение («дело кончено, вот итог») — слово лида, и итог дела
+# лежит в `summary` этого факта (`docs/ENGINE-1.0.md`, раздел 9).
+CLOSE_CAUSE_LEAD = "lead_closed"
 
 # Два решения человека одной командой (`duty decide`): слова закрытого набора,
 # чтобы «продолжить» и «остановить» не угадывались по тексту ответа.
@@ -1264,18 +1291,28 @@ def close_stages_done(
     stages: Iterable[str] = (),
     source: str = "engine",
     now: Optional[int] = None,
+    cause: str = CLOSE_CAUSE_ALL_STAGES,
+    summary: str = "",
 ) -> dict[str, Any]:
-    """Закрыть дело по факту «все этапы пройдены»: одно `completed` и строка дела.
+    """Закрыть дело по пройденному графу: одно `completed` и строка дела.
 
-    Это закрытие **движком**, а не человеком: `cause='all_stages_done'`, а
-    `stages` называет граф, который пройден (`["impl","verify","review"]`). Второй
-    причины закрытия не заводится — вид события тот же `completed`, что у
-    `close`/`complete` (`docs/JOURNAL.md`).
+    Два повода, и оба пишутся здесь, потому что правила одни (дело держит человек,
+    идемпотентность, одна транзакция со строкой): `cause='all_stages_done'` —
+    «все этапы графа пройдены» (`stages` — этот граф, `["impl","verify","review"]`),
+    `cause='lead_closed'` — дело закрыл лид приговором `approve`, и его итог лежит
+    в `summary` (`docs/ENGINE-1.0.md`, раздел 9). Второй причины не заводится —
+    вид события тот же `completed`, что у `close`/`complete` (`docs/JOURNAL.md`).
 
-    Идемпотентность — ключом события: он считается от одного `cause`, поэтому
-    повторный прогон на уже закрытом деле даёт `events: 0` и не трогает ни
-    строку, ни `updated_at`. Гонка двух прогонов решается там же, `INSERT OR
-    IGNORE`: второй факт не ляжет, и второй `completed` не появится.
+    Дело с закрывающим этапом (`spec.CLOSE_STAGE`) в графе «все этапы пройдены»
+    не закрывает: граф пройден — условие, а «дело кончено» говорит лид. Такой
+    вызов — отказ (`DealError`), а не тихое закрытие мимо приговора. Граф приходит
+    от вызывающего (`transit.graph` в прогоне): сама функция журнал на граф не
+    читает и второго чтения плана не заводит.
+
+    Идемпотентность — ключом события: он считается от `cause`, поэтому повторный
+    прогон на уже закрытом деле даёт `events: 0` и не трогает ни строку, ни
+    `updated_at`. Гонка двух прогонов решается там же, `INSERT OR IGNORE`: второй
+    факт не ляжет, и второй `completed` не появится.
 
     Дело, которое держит человек, — отказ (`DealError`) и ни одной записи:
     «все этапы пройдены» — факт графа, а не разрешение стереть блок или ожидание
@@ -1286,6 +1323,14 @@ def close_stages_done(
     now = _now_sec() if now is None else int(now)
     deal = _require_row(conn, deal_id)
     _reject_archived(deal, "close")
+    names = [str(stage) for stage in stages]
+    closing = str(_spec().CLOSE_STAGE)
+    if cause == CLOSE_CAUSE_ALL_STAGES and closing in names:
+        raise DealError(
+            f"close: в графе дела {deal['id']} есть закрывающий этап {closing!r} — "
+            "дело закрывает лид приговором approve (cause='lead_closed'), а не "
+            "«все этапы пройдены»"
+        )
     block = _open_block_kind(conn, str(deal["id"]))
     if block is not None:
         raise DealError(
@@ -1297,15 +1342,13 @@ def close_stages_done(
             f"close: дело {deal['id']} держит человек (status={deal['status']}) — "
             "закрытие движком не перебивает решение человека"
         )
-    names = [str(stage) for stage in stages]
-    event = _event(
-        deal,
-        "completed",
-        {"cause": CLOSE_CAUSE_ALL_STAGES, "stages": names},
-        source,
-        {"cause": CLOSE_CAUSE_ALL_STAGES},
-        now,
-    )
+    payload: dict[str, Any] = {"cause": cause, "stages": names}
+    # Итог — слова лида (`result.json:summary`), а не текст движка: пустой итог не
+    # переписывается пустым ключом, «закрыто без итога» читается отсутствием поля.
+    text = " ".join(str(summary or "").split())
+    if text:
+        payload["summary"] = text
+    event = _event(deal, "completed", payload, source, {"cause": cause}, now)
     return _apply(conn, deal, [event], "done", now)
 
 

@@ -415,9 +415,17 @@ def _closure(conn: sqlite3.Connection, deal: Any, spec: Any, now: float) -> dict
     `transit` говорит «все этапы закрыты» — но это **решение**, а не факт: до
     0.0.4 прогон печатал «итог: дело закрыто» и на этом кончал, оставляя дело
     `status='running'` без `completed` (живой прогон `d_6e764042`). Здесь
-    недостающая половина: тот же путь, что у `bin/duty close` (W16) —
-    `deals.close_stages_done` пишет `completed` с
-    `cause='all_stages_done'` и строку дела одной транзакцией.
+    недостающая половина: `deals.close_stages_done` пишет `completed` и строку
+    дела одной транзакцией, тем же путём, что `bin/duty close` (W16).
+
+    Чем закрывается дело — решает граф журнала, а не решение прогона
+    (`docs/ENGINE-1.0.md`, раздел 9). Граф без закрывающего этапа — прежний
+    `cause='all_stages_done'`. Граф с `close` закрывается **словом лида**: его
+    приговор `approve` и его `summary` из `result.json` (итог дела, а не текст
+    движка) ложатся в `completed` с `cause='lead_closed'`. Приговора нет —
+    закрывать нечем: прогон называет отказ, а не пишет «закрыто» поверх работы,
+    которую лид не принял. Тот же приговор `changes` возвращает дело на названный
+    им этап (`transit`) и сюда не доходит: дело не `done`.
 
     Идемпотентность не в памяти прогона, а в журнале: есть `completed` — второй не
     пишется, и `updated_at` не двигается. Повторный `run` на закрытом деле поэтому
@@ -426,9 +434,9 @@ def _closure(conn: sqlite3.Connection, deal: Any, spec: Any, now: float) -> dict
     Ответ — `{written, already, cause, at, stages, status, refused}`: `written` —
     факт лёг этим прогоном, `already` — он был раньше (время тогда из журнала, а
     не из часов), `refused` — закрывать было нельзя (дело держит человек:
-    `blocked`/`review`/`archived`), и причина названа словами. Отказ здесь не
-    глотается: прогон обязан сказать «все этапы закрыты, но дело не закрыто», а
-    не выдать одно за другое.
+    `blocked`/`review`/`archived`; лид не вынес `approve`), и причина названа
+    словами. Отказ здесь не глотается: прогон обязан сказать «все этапы закрыты,
+    но дело не закрыто», а не выдать одно за другое.
     """
     events = journal.read_events(conn, str(deal["id"]))
     fact = journal.closed_fact(events)
@@ -444,6 +452,40 @@ def _closure(conn: sqlite3.Connection, deal: Any, spec: Any, now: float) -> dict
             "refused": "",
         }
     stages = [str(stage.id) for stage in transit.graph(spec, events)]
+    closing = str(spec_module.CLOSE_STAGE)
+    cause = deals.CLOSE_CAUSE_ALL_STAGES
+    summary = ""
+    if closing in stages:
+        # Итог лида и его приговор — из журнала, а не из памяти прогона: попытку
+        # закрывает тот же факт `attempt_ended`, и повторный `run` читает его так
+        # же, как первый.
+        cause = deals.CLOSE_CAUSE_LEAD
+        approved = False
+        for event in events:
+            payload = journal.payload_of(event)
+            if str(payload.get("stage") or "") != closing:
+                continue
+            kind = str(event.get("kind") or "")
+            if kind == journal.VERDICT_CHANGES:
+                approved = False
+            elif kind == journal.VERDICT_APPROVE:
+                approved = True
+            elif kind == "attempt_ended" and isinstance(payload.get("result"), dict):
+                summary = str(payload["result"].get("summary") or "")
+        if not approved:
+            row = deals.deal_row(conn, str(deal["id"])) or {}
+            return {
+                "written": False,
+                "already": False,
+                "cause": cause,
+                "at": int(now),
+                "stages": stages,
+                "status": str(row.get("status") or ""),
+                "refused": (
+                    f"закрывающий этап {closing!r} не закрыт приговором approve: "
+                    "дело закрывает лид, «все этапы пройдены» этого не заменяет"
+                ),
+            }
     try:
         result = deals.close_stages_done(
             conn,
@@ -451,13 +493,15 @@ def _closure(conn: sqlite3.Connection, deal: Any, spec: Any, now: float) -> dict
             stages=stages,
             source=runner.ENGINE_SOURCE,
             now=int(now),
+            cause=cause,
+            summary=summary,
         )
     except deals.DealError as exc:
         row = deals.deal_row(conn, str(deal["id"])) or {}
         return {
             "written": False,
             "already": False,
-            "cause": deals.CLOSE_CAUSE_ALL_STAGES,
+            "cause": cause,
             "at": int(now),
             "stages": stages,
             "status": str(row.get("status") or ""),
@@ -466,7 +510,7 @@ def _closure(conn: sqlite3.Connection, deal: Any, spec: Any, now: float) -> dict
     return {
         "written": int(result.get("events") or 0) > 0,
         "already": bool(result.get("idempotent")),
-        "cause": deals.CLOSE_CAUSE_ALL_STAGES,
+        "cause": cause,
         "at": int(now),
         "stages": stages,
         "status": "done",

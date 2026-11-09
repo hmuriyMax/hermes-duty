@@ -90,6 +90,17 @@ GATE_KIND = "gate"
 # предложение свидетелем: три копии строки разошлись бы на первом переименовании.
 PLAN_STAGE = "plan"
 
+# Этап, который **закрывает дело** (1.0, `docs/ENGINE-1.0.md`, разделы 9 и 10): в
+# seed-графе он называется `close` и идёт ролью лида. Слово одно на плагин — по
+# нему валидатор требует приговора и роли, `deals` не даёт закрыть дело «все
+# этапы пройдены», а прогон пишет `completed cause=lead_closed` из отчёта лида.
+CLOSE_STAGE = "close"
+
+# Роль закрывающего этапа: итог дела — слово лида, а не текст движка. Хартия
+# `allowed_roles` этим набором не расширяется: `close` объявляется в seed-спеке,
+# а планом его не добавляют (`parse_plan` отказывает на занятый `id`).
+CLOSE_ROLE = "lead"
+
 # Дефолты хартии (`docs/ENGINE-1.0.md`, раздел 5): без блока `charter` дело
 # живёт по ним, и это ровно поведение 0.0.8 — план никто не предлагает, граф не
 # растёт. `max_stages = 12` — потолок графа, `max_rounds_replan = 3` — сколько раз
@@ -1354,6 +1365,62 @@ def _check_verdicts(spec: Spec) -> list[Issue]:
     return issues
 
 
+def _check_close_stage(spec: Spec) -> list[Issue]:
+    """Закрывающий этап: лид, приговор и никакой команды.
+
+    `close` — не обычное имя, а роль этапа в деле 1.0 (`docs/ENGINE-1.0.md`,
+    раздел 9): дело закрывает **лид**, и закрытие — его приговор (`approve: next`
+    — «дело закрыто», `changes: <этап>` — «вернуть в работу»), а не код возврата
+    команды и не тишина. Отсюда три отказа, и все — до запуска:
+
+    - роль обязана быть `lead`: отчёт о том, чем кончилось дело, пишет тот, кто
+      вёл дело, а не ревьюер и не исполнитель;
+    - `kind` только `agent`: командой дело не закрывается (у `shell` нет
+      приговора — его договор `must`), гейт закрывает дело лишь отказом человека;
+    - `verdict` объявлен: без него `runner.report_verdict` не требует приговора, и
+      этап «просто закончится» — то самое «дело закрылось, а спросить не у кого».
+
+    Хартия `allowed_roles` здесь ни при чём: она про этапы, которые план вправе
+    добавить, а `close` объявлен в seed-спеке и планом не переопределяется.
+    """
+    issues: list[Issue] = []
+    for stage in spec.stages:
+        if stage.id != CLOSE_STAGE:
+            continue
+        if stage.kind != DEFAULT_STAGE_KIND:
+            issues.append(
+                Issue(
+                    spec.path,
+                    stage.line_of("kind"),
+                    "close.kind",
+                    f"у закрывающего этапа {stage.id!r} kind: {stage.kind}: дело закрывает "
+                    "его приговор, а не код возврата команды и не ответ человека",
+                )
+            )
+            continue
+        if stage.role != CLOSE_ROLE:
+            issues.append(
+                Issue(
+                    spec.path,
+                    stage.line_of("role"),
+                    "close.role",
+                    f"у закрывающего этапа {stage.id!r} роль {stage.role!r}: дело закрывает "
+                    f"лид (role: {CLOSE_ROLE}), и хартия этого не расширяет",
+                )
+            )
+        if stage.verdict is None:
+            issues.append(
+                Issue(
+                    spec.path,
+                    stage.line,
+                    "close.verdict",
+                    f"у закрывающего этапа {stage.id!r} нет verdict: approve: next значит "
+                    "«дело закрыто», changes: <этап> — «вернуть в работу»",
+                )
+            )
+    return issues
+
+
 def _check_charter(spec: Spec, profiles: frozenset[str]) -> list[Issue]:
     """Хартия: потолки положительны, разрешённое существует, порог гейта достижим.
 
@@ -2035,6 +2102,7 @@ def validate_spec(spec: Spec, *, profiles: Optional[frozenset[str]] = None) -> l
     issues += _check_reachable(spec)
     issues += _check_evidence(spec)
     issues += _check_verdicts(spec)
+    issues += _check_close_stage(spec)
     issues += _check_review_gate(spec)
     issues += _check_publish_gate(spec)
     issues += _check_workspace(spec)

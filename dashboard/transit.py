@@ -1432,14 +1432,16 @@ def next_stage(spec: Any, events: Iterable[Any], now: Any) -> Decision:
             + tail,
         )
 
-    states = _slice(spec, board)
+    # Срез — по графу журнала (`view`), а не по файлу: этап, добавленный принятым
+    # планом, обязан быть в `states`, иначе `done` наступал бы, пока он не закрыт.
+    states = _slice(view, board)
 
-    stopped = _first(spec, states, FAILED)
+    stopped = _first(view, states, FAILED)
     if stopped is not None:
         node = board.stages[stopped.id]
         return failed(node.fail_kind or UNCLASSIFIED, f"этап {stopped.id!r}: {node.reason}")
 
-    parked = _first(spec, states, PARKED)
+    parked = _first(view, states, PARKED)
     if parked is not None:
         node = board.stages[parked.id]
         return park(parked.id, node.question_id, f"этап {parked.id!r}: {node.reason}")

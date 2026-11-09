@@ -1,0 +1,83 @@
+# Дело 0.1.0: лид ведёт дело целиком
+#
+# Цель версии — то, что docs/ENGINE-1.0.md называет «дело перестаёт быть спекой,
+# написанной до начала»: лид предлагает план, переставляет и добавляет этапы,
+# отвечает на вопросы этапов (или переадресует человеку) и закрывает дело по
+# итогам ревью и проверок.
+#
+# Граф: четыре исполняющих этапа по швам проверяемости (у каждого свой тестовый
+# файл), затем проверка и приговор. Пятый шов — параллельные этапы — последним:
+# он самый рискованный, и если он встанет, три предыдущих уже закоммичены.
+#
+# base приколот к 97c2982 (голова release/v0.1.0 после переноса линии с 0.0.10):
+# дерево этапа отводится от объявленного base, поэтому правки, влитые после
+# create, для дела невидимы — новое дерево будет новым делом.
+#
+# Адреса приговора: `next` (принять) и `impl_close` (вернуть всю цепочку на
+# доработку: правки этапов идут по одному движению, и возврат в середину оставил
+# бы поздние этапы на старом дереве).
+#
+# Ревью зависит И от исполнителя, И от проверки: shell-этап коммита не делает, и
+# `needs: [check]` дал бы ревьюеру чистое дерево от базы дела — приговор по
+# пустоте (docs/SPEC.md, правило `needs`).
+
+duty: 0.1.0-lead
+repo: ~/.hermes/plugins/hermes-duty
+base: 97c2982
+
+budget: {minutes: 720}
+
+stages:
+  - id: impl_close
+    role: implementer
+    workspace: worktree
+    budget: {minutes: 110}
+    evidence:
+      - {cmd: "env -u PYTHONPATH ~/.hermes/hermes-agent/venv/bin/python -m pytest tests/test_close_stage.py -q -p no:randomly", must: 0, timeout_sec: 600}
+      - {cmd: "env -u PYTHONPATH ~/.hermes/hermes-agent/venv/bin/python -m pytest tests/test_deals.py tests/test_transit.py -q -p no:randomly", must: 0, timeout_sec: 900}
+      - {cmd: "env -u PYTHONPATH bin/duty spec check examples/duty.yaml", must: 0, timeout_sec: 120}
+
+  - id: impl_questions
+    role: implementer
+    needs: [impl_close]
+    workspace: worktree
+    budget: {minutes: 120}
+    evidence:
+      - {cmd: "env -u PYTHONPATH ~/.hermes/hermes-agent/venv/bin/python -m pytest tests/test_ask_role.py -q -p no:randomly", must: 0, timeout_sec: 600}
+      - {cmd: "env -u PYTHONPATH ~/.hermes/hermes-agent/venv/bin/python -m pytest tests/test_ask.py tests/test_routing.py -q -p no:randomly", must: 0, timeout_sec: 600}
+
+  - id: impl_plan_more
+    role: implementer
+    needs: [impl_questions]
+    workspace: worktree
+    budget: {minutes: 110}
+    evidence:
+      - {cmd: "env -u PYTHONPATH ~/.hermes/hermes-agent/venv/bin/python -m pytest tests/test_plan_reorder.py -q -p no:randomly", must: 0, timeout_sec: 600}
+      - {cmd: "env -u PYTHONPATH ~/.hermes/hermes-agent/venv/bin/python -m pytest tests/test_plan_graph.py tests/test_spec.py -q -p no:randomly", must: 0, timeout_sec: 900}
+
+  - id: impl_parallel
+    role: implementer
+    needs: [impl_plan_more]
+    workspace: worktree
+    budget: {minutes: 120}
+    evidence:
+      - {cmd: "env -u PYTHONPATH ~/.hermes/hermes-agent/venv/bin/python -m pytest tests/test_parallel.py -q -p no:randomly", must: 0, timeout_sec: 600}
+      - {cmd: "env -u PYTHONPATH ~/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q -p no:randomly", must: 0, timeout_sec: 1200}
+
+  - id: check
+    kind: shell
+    needs: [impl_parallel]
+    workspace: worktree
+    budget: {minutes: 45}
+    cmd: "env -u PYTHONPATH bin/duty-model-sync --check && env -u PYTHONPATH bin/duty spec check examples/duty.yaml && env -u PYTHONPATH bin/duty spec check examples/duty-minimal.yaml && node --test tests/*.test.mjs && env -u PYTHONPATH /Users/mshchemilkin/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q -p no:randomly && HERMES_HOME=$HOME/.hermes env -u PYTHONPATH bin/duty demo && hermes plugins validate ."
+    must: 0
+
+  - id: review
+    role: reviewer
+    needs: [impl_parallel, check]
+    workspace: none
+    budget: {minutes: 70}
+    verdict:
+      approve: next
+      changes: impl_close
+      max_rounds: 2

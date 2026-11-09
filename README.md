@@ -431,6 +431,7 @@ HERMES_HOME=~/.hermes ~/.hermes/plugins/hermes-duty/bin/duty now
   docs/JOURNAL.md        # контракт журнала: набор событий, fold, ingest, ask()
   docs/OWNERSHIP.md      # контракт владения: store дел, мутации, id, инварианты
   docs/VERSIONING.md     # контракт версий и ритуал bin/duty-version
+  docs/ENGINE-1.0.md     # замысел 1.0: хартия и план, граф растёт из событий журнала
   docs/RUNBOOK.md        # как проверить плагин руками
   docs/SPEC.md           # контракт формата duty.yaml: поля и правила отказа до запуска
   examples/demo.yaml     # образец учёта для `duty demo` (формату 0.0.4 не отвечает: см. выше)

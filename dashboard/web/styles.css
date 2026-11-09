@@ -24,6 +24,16 @@
   --shadow: 0 1px 3px rgba(16, 24, 40, 0.08), 0 8px 24px rgba(16, 24, 40, 0.06);
   --radius: 12px;
   --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  /* Восемь профилей этапов: цвет говорит «какой это этап», а не «как он прошёл».
+     Оттенки приглушены — состояние рисуется яркой подсветкой краёв поверх. */
+  --stage-1: #6f8fc9;
+  --stage-2: #8a7ccc;
+  --stage-3: #5a9fb0;
+  --stage-4: #bb9a55;
+  --stage-5: #b07a9e;
+  --stage-6: #7a9e63;
+  --stage-7: #8a93a8;
+  --stage-8: #a8877a;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -48,6 +58,15 @@
     --purple: #a78bfa;
     --purple-soft: rgba(167, 139, 250, 0.14);
     --shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.35);
+    /* В темноте те же профили, но светлее: на #101216 приглушённые тонут. */
+    --stage-1: #7d9ddb;
+    --stage-2: #a08fe0;
+    --stage-3: #66b3c4;
+    --stage-4: #cfae66;
+    --stage-5: #c48cae;
+    --stage-6: #8db374;
+    --stage-7: #9aa5ba;
+    --stage-8: #bb9787;
   }
 }
 
@@ -1158,26 +1177,48 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
 .tl-sausage.is-clipped { border-top-left-radius: 0; border-bottom-left-radius: 0; }
 .tl-sausage.inexact { opacity: .45; }
 
-/* Полоса этапа: без своих скруглений — она часть тела дела. */
+/* Полоса этапа: без своих скруглений — она часть тела дела.
+   Заливка — профиль этапа (`--stage-N`), состояние — подсветка верхнего и
+   нижнего краёв (`--status`): цвет профиля не меняется от того, прошёл этап или
+   упал, иначе соседние этапы разных профилей читались бы как одно целое. */
 .tl-seg {
   position: absolute;
   top: 0;
   bottom: 0;
   min-width: 2px;
-  background: var(--seg, var(--border-strong));
+  background: var(--stage-fill, var(--border-strong));
 }
-.tl-seg.t-green { --seg: var(--ok); }
-.tl-seg.t-blue { --seg: var(--accent); }
-.tl-seg.t-yellow { --seg: var(--warn); }
-.tl-seg.t-red { --seg: var(--danger); }
-.tl-seg.t-gray { --seg: var(--border-strong); }
-/* Идущий этап: тот же цвет, но полоса дышит — «здесь работают сейчас». */
-.tl-seg.is-running { animation: tl-breathe 2.6s ease-in-out infinite; }
+.tl-seg.s-1 { --stage-fill: var(--stage-1); }
+.tl-seg.s-2 { --stage-fill: var(--stage-2); }
+.tl-seg.s-3 { --stage-fill: var(--stage-3); }
+.tl-seg.s-4 { --stage-fill: var(--stage-4); }
+.tl-seg.s-5 { --stage-fill: var(--stage-5); }
+.tl-seg.s-6 { --stage-fill: var(--stage-6); }
+.tl-seg.s-7 { --stage-fill: var(--stage-7); }
+.tl-seg.s-8 { --stage-fill: var(--stage-8); }
+.tl-seg.t-green { --status: var(--ok); }
+.tl-seg.t-blue { --status: var(--accent); }
+.tl-seg.t-yellow { --status: var(--warn); }
+.tl-seg.t-red { --status: var(--danger); }
+.tl-seg.t-gray { --status: var(--text-3); }
+/* Край рисуется inset-тенью: она не меняет геометрию полосы, поэтому стыки
+   этапов остаются на месте и соседние полосы не расходятся. */
+.tl-seg::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  box-shadow: inset 0 2px 0 var(--status, var(--border-strong)), inset 0 -2px 0 var(--status, var(--border-strong));
+  opacity: .85;
+}
+/* Идущий этап: край дышит — «здесь работают сейчас». Заливка профиля при этом
+   не мигает: она называет этап, а не его состояние. */
+.tl-seg.is-running::after { animation: tl-breathe 2.6s ease-in-out infinite; }
 .tl-seg.clipped { border-left: 1px solid var(--card); }
 
 @keyframes tl-breathe {
-  0%, 100% { filter: brightness(1); }
-  50% { filter: brightness(1.3); }
+  0%, 100% { opacity: .55; }
+  50% { opacity: 1; }
 }
 
 .tl-mini-age { color: var(--text-2); font-variant-numeric: tabular-nums; text-align: right; font-size: 11.5px; }
@@ -1213,12 +1254,21 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
   font-size: 11.5px;
 }
 .tl-legend-item { display: inline-flex; align-items: center; gap: 6px; color: var(--text-2); }
-.tl-legend-dot { width: 9px; height: 9px; border-radius: 2px; background: var(--border-strong); }
-.tl-legend-dot.t-green { background: var(--ok); }
-.tl-legend-dot.t-blue { background: var(--accent); }
-.tl-legend-dot.t-yellow { background: var(--warn); }
-.tl-legend-dot.t-red { background: var(--danger); }
-.tl-legend-dot.t-gray { background: var(--border-strong); }
+/* Легенда объясняет грамматику полосы: заливка — профиль этапа, яркий край —
+   состояние. Поэтому образец легенды — тоже полоска с краем, а не цветной
+   квадрат: иначе зелёный квадрат обещал бы зелёную заливку. */
+.tl-legend-dot {
+  width: 14px;
+  height: 9px;
+  border-radius: 2px;
+  background: var(--stage-7);
+  box-shadow: inset 0 2px 0 var(--border-strong), inset 0 -2px 0 var(--border-strong);
+}
+.tl-legend-dot.t-green { box-shadow: inset 0 2px 0 var(--ok), inset 0 -2px 0 var(--ok); }
+.tl-legend-dot.t-blue { box-shadow: inset 0 2px 0 var(--accent), inset 0 -2px 0 var(--accent); }
+.tl-legend-dot.t-yellow { box-shadow: inset 0 2px 0 var(--warn), inset 0 -2px 0 var(--warn); }
+.tl-legend-dot.t-red { box-shadow: inset 0 2px 0 var(--danger), inset 0 -2px 0 var(--danger); }
+.tl-legend-dot.t-gray { box-shadow: inset 0 2px 0 var(--text-3), inset 0 -2px 0 var(--text-3); }
 .tl-legend-item.is-running { color: var(--text); }
 
 /* ==================================================== завершённые (0.0.9)

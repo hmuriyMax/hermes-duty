@@ -886,12 +886,17 @@ test('веб: таймлайн — сосиски на общей сетке, к
   assert.match(css, /\.tl-sausage \{[^}]*border-radius: 3px/s, 'веб: у сосиски нет единой формы')
   assert.doesNotMatch(css, /\.tl-seg \{[^}]*border-radius/s, 'веб: у этапа своё скругление')
 
-  // Цвет — состояние этапа из словаря страницы дела, а не своя палитра имён.
-  assert.match(app, /class: `tl-seg t-\$\{segment\.tone\}/, 'веб: тоны этапов не приходят из шейпера')
+  // Заливка — профиль этапа (соседние этапы различаются цветом), состояние —
+  // подсветка верхнего и нижнего краёв (09.11, Макс).
+  assert.match(app, /class: `tl-seg s-\$\{segment\.slot\} t-\$\{segment\.tone\}/, 'веб: профиль этапа не приходит из шейпера')
   assert.doesNotMatch(css, /--st-[1-8]/, 'веб: палитра «свой цвет на этап» осталась')
-  assert.match(css, /\.tl-seg\.t-green \{ --seg: var\(--ok\); \}/, 'веб: пройден не зелёный страницы дела')
-  assert.match(css, /\.tl-seg\.t-red \{ --seg: var\(--danger\); \}/, 'веб: отказ не красный страницы дела')
-  assert.match(css, /\.tl-seg\.t-blue \{ --seg: var\(--accent\); \}/, 'веб: идущий не акцент страницы дела')
+  assert.match(css, /\.tl-seg\.s-1 \{ --stage-fill: var\(--stage-1\); \}/, 'веб: слот профиля не красит полосу')
+  assert.match(css, /\.tl-seg\.t-green \{ --status: var\(--ok\); \}/, 'веб: пройден не зелёный страницы дела')
+  assert.match(css, /\.tl-seg\.t-red \{ --status: var\(--danger\); \}/, 'веб: отказ не красный страницы дела')
+  assert.match(css, /\.tl-seg\.t-blue \{ --status: var\(--accent\); \}/, 'веб: идущий не акцент страницы дела')
+  // Края — inset-тень: она не двигает геометрию, поэтому стыки этапов на месте.
+  assert.match(css, /\.tl-seg::after \{[^}]*inset 0 2px 0 var\(--status/, 'веб: состояние не подсвечивает край')
+  assert.match(css, /\.tl-seg::after \{[^}]*inset 0 -2px 0 var\(--status/, 'веб: нижний край не подсвечен')
 })
 
 

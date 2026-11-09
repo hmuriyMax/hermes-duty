@@ -329,6 +329,49 @@ const TL_MAX_ROWS = 14
  */
 const TL_SEG_STATES = ['done', 'running', 'failed']
 
+/**
+ * Цвет профиля этапа: соседние этапы различаются оттенком, а не только стыком.
+ *
+ * Слот — идентичность этапа (`impl`, `check`, `review`…), а не его состояние:
+ * состояние теперь живёт подсветкой краёв. Набор фиксирован и общий для веба и
+ * десктопа, иначе одно и то же дело выглядело бы по-разному на двух
+ * поверхностях. Незнакомый этап получает слот по своему имени — стабильно, чтобы
+ * цвет не прыгал между перерисовками и реплеями.
+ */
+const STAGE_SLOTS = {
+  plan: 1,
+  impl: 2,
+  implement: 2,
+  wire: 2,
+  code: 2,
+  doc: 3,
+  docs: 3,
+  check: 4,
+  verify: 4,
+  test: 4,
+  tests: 4,
+  review: 5,
+  verdict: 5,
+  fix: 6,
+  publish: 7,
+  ship: 7,
+  deploy: 7,
+}
+const STAGE_SLOT_COUNT = 8
+
+/** Слот цвета профиля этапа: 1…8, по имени, а не по порядку появления. */
+function stageSlot(stage) {
+  const key = String(stage || '').trim().toLowerCase()
+  if (!key) return STAGE_SLOT_COUNT
+  const known = STAGE_SLOTS[key]
+  if (known) return known
+  // Своя сумма вместо хешей платформы: значение обязано совпадать на вебе и в
+  // jsdom-прогоне десктопа, а `Math.imul`-хеши там разные реализации.
+  let acc = 0
+  for (let i = 0; i < key.length; i += 1) acc = (acc + key.charCodeAt(i) * (i + 3)) % 997
+  return (acc % (STAGE_SLOT_COUNT - 1)) + 1
+}
+
 /** Шаг сетки: чем короче окно, тем мельче деления. */
 const TL_TICKS = [
   [20 * 60, 5 * 60],
@@ -373,6 +416,8 @@ function timelineSegments(spans, barFrom, barTo) {
     segments.push({
       stage: String((item && item.stage) || ''),
       state,
+      // Оттенок — профиль этапа; край полосы — состояние (09.11, Макс).
+      slot: stageSlot(item && item.stage),
       tone: meta.tone,
       // Доли сосиски: экран не пересчитывает координаты, он их только ставит.
       leftPct: Number((((left - a) / width) * 100).toFixed(2)),
@@ -2978,6 +3023,9 @@ export {
   WAIT_HUMAN_LABEL,
   TONE_COLOR,
   STAGE_META,
+  STAGE_SLOTS,
+  STAGE_SLOT_COUNT,
+  stageSlot,
   FINISHED_STATUS_META,
   WITHOUT_REPO_LABEL,
   ALL_REPOS,

@@ -378,6 +378,49 @@ const TL_MAX_ROWS = 14
  */
 const TL_SEG_STATES = ['done', 'running', 'failed']
 
+/**
+ * Цвет профиля этапа: соседние этапы различаются оттенком, а не только стыком.
+ *
+ * Слот — идентичность этапа (`impl`, `check`, `review`…), а не его состояние:
+ * состояние теперь живёт подсветкой краёв. Набор фиксирован и общий для веба и
+ * десктопа, иначе одно и то же дело выглядело бы по-разному на двух
+ * поверхностях. Незнакомый этап получает слот по своему имени — стабильно, чтобы
+ * цвет не прыгал между перерисовками и реплеями.
+ */
+const STAGE_SLOTS = {
+  plan: 1,
+  impl: 2,
+  implement: 2,
+  wire: 2,
+  code: 2,
+  doc: 3,
+  docs: 3,
+  check: 4,
+  verify: 4,
+  test: 4,
+  tests: 4,
+  review: 5,
+  verdict: 5,
+  fix: 6,
+  publish: 7,
+  ship: 7,
+  deploy: 7,
+}
+const STAGE_SLOT_COUNT = 8
+
+/** Слот цвета профиля этапа: 1…8, по имени, а не по порядку появления. */
+function stageSlot(stage) {
+  const key = String(stage || '').trim().toLowerCase()
+  if (!key) return STAGE_SLOT_COUNT
+  const known = STAGE_SLOTS[key]
+  if (known) return known
+  // Своя сумма вместо хешей платформы: значение обязано совпадать на вебе и в
+  // jsdom-прогоне десктопа, а `Math.imul`-хеши там разные реализации.
+  let acc = 0
+  for (let i = 0; i < key.length; i += 1) acc = (acc + key.charCodeAt(i) * (i + 3)) % 997
+  return (acc % (STAGE_SLOT_COUNT - 1)) + 1
+}
+
 /** Шаг сетки: чем короче окно, тем мельче деления. */
 const TL_TICKS = [
   [20 * 60, 5 * 60],
@@ -422,6 +465,8 @@ function timelineSegments(spans, barFrom, barTo) {
     segments.push({
       stage: String((item && item.stage) || ''),
       state,
+      // Оттенок — профиль этапа; край полосы — состояние (09.11, Макс).
+      slot: stageSlot(item && item.stage),
       tone: meta.tone,
       // Доли сосиски: экран не пересчитывает координаты, он их только ставит.
       leftPct: Number((((left - a) / width) * 100).toFixed(2)),
@@ -3576,15 +3621,24 @@ const CSS = `
 .duty-mtl-sausage:focus-visible{outline:2px solid var(--ui-accent);outline-offset:2px}
 .duty-mtl-sausage.is-clipped{border-top-left-radius:0;border-bottom-left-radius:0}
 .duty-mtl-sausage.inexact{opacity:.45}
-.duty-mtl-seg{position:absolute;top:0;bottom:0;min-width:2px;background:var(--seg,var(--ui-stroke-secondary))}
-.duty-mtl-seg.t-green{--seg:var(--ui-green)}
-.duty-mtl-seg.t-blue{--seg:var(--ui-blue)}
-.duty-mtl-seg.t-yellow{--seg:var(--ui-yellow)}
-.duty-mtl-seg.t-red{--seg:var(--ui-red)}
-.duty-mtl-seg.t-gray{--seg:var(--ui-stroke-secondary)}
-.duty-mtl-seg.is-running{animation:duty-mtl-breathe 2.6s ease-in-out infinite}
+.duty-mtl-seg{position:absolute;top:0;bottom:0;min-width:2px;background:var(--seg-fill,var(--ui-stroke-secondary))}
+.duty-mtl-seg.s-1{--seg-fill:#7d9ddb}
+.duty-mtl-seg.s-2{--seg-fill:#a08fe0}
+.duty-mtl-seg.s-3{--seg-fill:#66b3c4}
+.duty-mtl-seg.s-4{--seg-fill:#cfae66}
+.duty-mtl-seg.s-5{--seg-fill:#c48cae}
+.duty-mtl-seg.s-6{--seg-fill:#8db374}
+.duty-mtl-seg.s-7{--seg-fill:#9aa5ba}
+.duty-mtl-seg.s-8{--seg-fill:#bb9787}
+.duty-mtl-seg.t-green{--seg-status:var(--ui-green)}
+.duty-mtl-seg.t-blue{--seg-status:var(--ui-blue)}
+.duty-mtl-seg.t-yellow{--seg-status:var(--ui-yellow)}
+.duty-mtl-seg.t-red{--seg-status:var(--ui-red)}
+.duty-mtl-seg.t-gray{--seg-status:var(--ui-stroke-tertiary)}
+.duty-mtl-seg:after{content:'';position:absolute;inset:0;pointer-events:none;box-shadow:inset 0 2px 0 var(--seg-status,var(--ui-stroke-secondary)),inset 0 -2px 0 var(--seg-status,var(--ui-stroke-secondary));opacity:.85}
+.duty-mtl-seg.is-running:after{animation:duty-mtl-breathe 2.6s ease-in-out infinite}
 .duty-mtl-seg.clipped{border-left:1px solid var(--ui-surface-background)}
-@keyframes duty-mtl-breathe{0%,100%{filter:brightness(1)}50%{filter:brightness(1.3)}}
+@keyframes duty-mtl-breathe{0%,100%{opacity:.55}50%{opacity:1}}
 .duty-mtl-age{color:var(--ui-text-secondary);text-align:right;font-size:11.5px}
 .duty-mtl-state{color:var(--ui-text-tertiary);text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11.5px}
 .duty-mtl-axis{display:grid;grid-template-columns:var(--duty-mtl-cols);gap:12px;height:15px;margin-top:4px}
@@ -3592,14 +3646,14 @@ const CSS = `
 .duty-mtl-tick{position:absolute;transform:translateX(-50%);font-size:10px;font-variant-numeric:tabular-nums;color:var(--ui-text-tertiary);white-space:nowrap}
 .duty-mtl-legend{display:flex;flex-wrap:wrap;gap:4px 14px;padding:8px 12px 10px;border-top:1px solid var(--ui-stroke-tertiary);font-size:11.5px}
 .duty-mtl-legend-item{display:inline-flex;align-items:center;gap:6px;color:var(--ui-text-secondary)}
-.duty-mtl-dot{width:9px;height:9px;border-radius:2px;background:var(--ui-stroke-secondary)}
-.duty-mtl-dot.t-green{background:var(--ui-green)}
-.duty-mtl-dot.t-blue{background:var(--ui-blue)}
-.duty-mtl-dot.t-yellow{background:var(--ui-yellow)}
-.duty-mtl-dot.t-red{background:var(--ui-red)}
-.duty-mtl-dot.t-gray{background:var(--ui-stroke-secondary)}
+.duty-mtl-dot{width:14px;height:9px;border-radius:2px;background:#9aa5ba;box-shadow:inset 0 2px 0 var(--ui-stroke-secondary),inset 0 -2px 0 var(--ui-stroke-secondary)}
+.duty-mtl-dot.t-green{box-shadow:inset 0 2px 0 var(--ui-green),inset 0 -2px 0 var(--ui-green)}
+.duty-mtl-dot.t-blue{box-shadow:inset 0 2px 0 var(--ui-blue),inset 0 -2px 0 var(--ui-blue)}
+.duty-mtl-dot.t-yellow{box-shadow:inset 0 2px 0 var(--ui-yellow),inset 0 -2px 0 var(--ui-yellow)}
+.duty-mtl-dot.t-red{box-shadow:inset 0 2px 0 var(--ui-red),inset 0 -2px 0 var(--ui-red)}
+.duty-mtl-dot.t-gray{box-shadow:inset 0 2px 0 var(--ui-stroke-tertiary),inset 0 -2px 0 var(--ui-stroke-tertiary)}
 .duty-mtl-legend-item.is-running{color:var(--ui-text-primary)}
-@media (prefers-reduced-motion: reduce){.duty-mtl-seg.is-running{animation:none}}
+@media (prefers-reduced-motion: reduce){.duty-mtl-seg.is-running,.duty-mtl-seg.is-running:after{animation:none}}
 
 /* Кнопка подгрузки под списком проекта: по центру и заметная — единственный
  * способ получить следующие строки, искать её в углу не надо. */
@@ -5017,7 +5071,7 @@ function DutyMiniTimeline({ view, onOpen }) {
                 (row.segments || []).map((segment) =>
                   h('i', {
                     key: `seg-${segment.stage}-${segment.leftPct}`,
-                    className: `duty-mtl-seg t-${segment.tone} is-${segment.state}${segment.clipped ? ' clipped' : ''}`,
+                    className: `duty-mtl-seg s-${segment.slot} t-${segment.tone} is-${segment.state}${segment.clipped ? ' clipped' : ''}`,
                     style: { left: `${segment.leftPct}%`, width: `${segment.widthPct}%` },
                     title: segment.title,
                   }),

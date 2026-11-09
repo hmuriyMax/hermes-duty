@@ -71,6 +71,7 @@ STAGEFEED_MODULE_NAME = "hermes_duty_stagefeed"
 BUDGET_MODULE_NAME = "hermes_duty_budget"
 # `dashboard/publish.py` — факт публикации дела по журналу (`published`).
 PUBLISH_MODULE_NAME = "hermes_duty_publish"
+FAILURES_MODULE_NAME = "hermes_duty_failures"
 
 
 def _load_journal() -> Any:
@@ -185,6 +186,24 @@ def _load_budget() -> Any:
 
 
 budget = _load_budget()
+
+
+def _load_failures() -> Any:
+    """Загрузить `dashboard/failures.py` — словарь классов отказа и их имена."""
+    loaded = sys.modules.get(FAILURES_MODULE_NAME)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / "failures.py"
+    spec = importlib.util.spec_from_file_location(FAILURES_MODULE_NAME, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise ImportError(f"failures module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[FAILURES_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+failures = _load_failures()
 
 
 def _load_publish() -> Any:
@@ -3302,6 +3321,10 @@ def _own_attempt(row: dict[str, Any], now: int) -> dict[str, Any]:
         "exit": row["exit"],
         "outcome": row["outcome"],
         "kind": row["kind"],
+        # Имя класса словами: слаг (`infra`, `contract`) ничего не говорит человеку,
+        # а перевод в каждой поверхности заново разъехался бы. Текст приходит
+        # готовым — обе поверхности только печатают его.
+        "kind_text": failures.describe_class(row["kind"]),
         "reason": reason,
         "error": reason,
         "summary": "",

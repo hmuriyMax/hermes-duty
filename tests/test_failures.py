@@ -781,3 +781,43 @@ def test_why_shows_parked_block_with_reason(tmp_path: Path) -> None:
     assert log["parked"]["reason"] == failures.REASON_RETRIES
     assert "парковка:" in text and "2/1 infra" in text
     assert f"вопрос #{report['question_id']}" in text
+
+# ------------------------------------------------- имена классов для человека
+
+
+@pytest.mark.parametrize(("kind", "word"), [("infra", "среда"), ("contract", "договорённость"), ("capability", "доступ")])
+def test_describe_class_names_the_class_in_words(kind: str, word: str) -> None:
+    """Класс называется словом про то, чья это работа, а не повтором слага.
+
+    Слаг в подсказке провалившейся попытки ничего не объясняет: человек читает
+    «отказ infra» и переводит в голове. Имя поэтому живёт здесь одно на обе
+    поверхности, а не в каждом шейпере заново.
+    """
+    text = failures.describe_class(kind)
+
+    assert word in text
+    assert text != kind
+
+
+@pytest.mark.parametrize("kind", ["timeout", "", "INFRA", "infra ", "unknown", None, 7])
+def test_describe_class_does_not_guess_outside_the_set(kind: object) -> None:
+    """Значение вне набора — «неизвестный класс», без исключения и без догадки.
+
+    Регистр и пробелы намеренно не прощаются, а не-строка не роняет срез: класс
+    приходит из данных (журнал, чужая доска), и падать на нём нельзя. Догадка
+    «наверное, инфраструктура» врала бы про причину отказа.
+    """
+    assert failures.describe_class(kind) == failures.UNKNOWN_CLASS_TEXT
+
+
+def test_class_names_are_one_per_class() -> None:
+    """Набор имён закрыт вместе с набором классов, и имена не совпадают.
+
+    Второй копии набора в модуле быть не должно: `CLASS_TEXT` — единственное
+    место, где класс назван словами, и его ключи обязаны совпадать с `CLASSES`.
+    """
+    assert set(failures.CLASS_TEXT) == set(failures.CLASSES)
+    names = {failures.describe_class(kind) for kind in failures.CLASSES}
+
+    assert len(names) == len(failures.CLASSES)
+    assert failures.UNKNOWN_CLASS_TEXT not in names

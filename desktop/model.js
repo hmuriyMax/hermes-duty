@@ -319,21 +319,123 @@ const TL_WINDOW_SEC = 24 * 3600
 const TL_MAX_ROWS = 14
 
 /**
- * Мини-таймлайн дел: одна дорожка на дело, полоса от начала до конца.
+ * Палитра этапов: цвет — свойство этапа, а не дела.
  *
- * Верхушка страницы отвечает на «что вообще происходило и сколько это длится»
- * одним взглядом: активные дела тянутся до `now`, завершённые — до своего
- * `finishedAt` (09.11, Макс: «показывать и завершённые»). Геометрия считается
+ * Восьми слотов хватает плану любой длины: девятый этап получает первый цвет, и
+ * это читается лучше, чем двадцать почти одинаковых оттенков (в живом store на
+ * 09.11 — семь разных имён этапов). Слот выдаётся по первому появлению имени
+ * этапа сверху вниз, поэтому `impl` во всех дорожках одного цвета и легенда
+ * сходится с картинкой.
+ */
+const TL_STAGE_TONES = ['s1', 's2', 's3', 's4', 's5', 's6', 's7', 's8']
+/** Шаг сетки: чем короче окно, тем мельче деления. */
+const TL_TICKS = [
+  [20 * 60, 5 * 60],
+  [60 * 60, 10 * 60],
+  [3 * 3600, 30 * 60],
+  [8 * 3600, 3600],
+  [TL_WINDOW_SEC, 3 * 3600],
+]
+
+/** Слот палитры для имени этапа: выдаётся один раз на всю картинку. */
+function stageTone(stage, slots) {
+  const name = String(stage || '')
+  if (!name) return 'gray'
+  if (!slots.has(name)) slots.set(name, TL_STAGE_TONES[slots.size % TL_STAGE_TONES.length])
+  return slots.get(name)
+}
+
+/**
+ * Границы этапов на дорожке: полосы из журнала, обрезанные окном оси.
+ *
+ * Дело идёт не сплошняком: между попытками оно ждёт диспетчера, и пустое место на
+ * дорожке — это факт, а не дефект рисунка. Поэтому полоса этапа рисуется там, где
+ * он работал, и не растягивается на паузу.
+ */
+function timelineSegments(spans, axisFrom, axisTo, slots) {
+  const a = numOrNull(axisFrom)
+  const b = numOrNull(axisTo)
+  if (a === null || b === null) return []
+  const span = Math.max(1, b - a)
+  const out = []
+  for (const item of Array.isArray(spans) ? spans : []) {
+    const from = numOrNull(item && item.start)
+    const end = numOrNull(item && item.end)
+    if (from === null) continue
+    const to = end === null ? b : end
+    const left = Math.max(a, from)
+    const right = Math.min(b, to)
+    if (right <= left) continue
+    const outcome = String((item && item.outcome) || '')
+    out.push({
+      stage: String((item && item.stage) || ''),
+      // Провал и инфраструктурный отказ дают один цвет: он говорит «этап не
+      // дошёл», а какой именно отказ — в подсказке.
+      state: outcome === 'failed' ? 'failed' : end === null ? 'running' : 'done',
+      tone: stageTone(item && item.stage, slots),
+      leftPct: Number((((left - a) / span) * 100).toFixed(2)),
+      widthPct: Number(Math.max(0.4, ((right - left) / span) * 100).toFixed(2)),
+      clipped: from < a,
+      open: end === null,
+      durationText: fmtAge(Math.max(0, to - from)),
+      title:
+        `${String((item && item.stage) || 'этап')}` +
+        (Number.isInteger(item && item.attempt) ? ` · попытка ${item.attempt}` : '') +
+        (end === null ? ' · идёт' : outcome === 'failed' ? ' · провал' : ' · готово') +
+        ` · ${fmtAge(Math.max(0, to - from))}`,
+    })
+  }
+  return out
+}
+
+/**
+ * Деления оси: ровные шаги от круглого времени, а не от начала дел.
+ *
+ * `gridStepPct`/`gridFirstPct` — те же деления как фон дорожки: сетка рисуется
+ * градиентом, поэтому каждая дорожка несёт один и тот же рисунок, и вертикали
+ * сходятся от строки к строке без отдельных элементов на каждую линию.
+ */
+function timelineTicks(axisFrom, axisTo) {
+  const a = numOrNull(axisFrom)
+  const b = numOrNull(axisTo)
+  if (a === null || b === null || b <= a) return { ticks: [], stepPct: 0, firstPct: 0, stepSec: 0 }
+  const span = b - a
+  const step = (TL_TICKS.find(([limit]) => span <= limit) || TL_TICKS[TL_TICKS.length - 1])[1]
+  const ticks = []
+  for (let at = Math.ceil(a / step) * step; at <= b; at += step) {
+    // На коротком окне секунды — факт (шаг 5 минут), на длинном — шум.
+    const label = step < 600 ? fmtClock(at) : fmtClock(at).slice(0, 5)
+    ticks.push({ leftPct: Number((((at - a) / span) * 100).toFixed(2)), label, at })
+  }
+  return {
+    ticks,
+    stepSec: step,
+    stepPct: Number(((step / span) * 100).toFixed(3)),
+    firstPct: ticks.length ? ticks[0].leftPct : 0,
+  }
+}
+
+/**
+ * Мини-таймлайн дел: одна дорожка на дело, полосы этапов внутри неё.
+ *
+ * Верхушка страницы отвечает на «что происходило и сколько это длится» одним
+ * взглядом: активные дела тянутся до `now`, завершённые — до своего `finishedAt`
+ * (09.11, Макс: «показывать и завершённые»). Цвет внутри дорожки — этап, пустое
+ * место — пауза между попытками, красный — этап не дошёл. Геометрия считается
  * здесь, а не на поверхности: веб и десктоп обязаны рисовать одну картину.
+ *
+ * `spansById` — границы этапов из журнала (`GET /spans`): без них дорожка
+ * рисуется одним тоном состояния, как до 0.0.9.
  *
  * Окно — не длиннее суток (`TL_WINDOW_SEC`). Дело, начавшееся раньше окна, не
  * пропадает: его полоса начинается у левого края и помечена `clipped` — рисунок
  * говорит «началось раньше», а не выдумывает начало. Дело без записанного начала
  * рисуется штрихованной полосой от края (`exact: false`).
  */
-function dealTimeline(activeDeals, finishedDeals, now) {
+function dealTimeline(activeDeals, finishedDeals, now, spansById) {
   const moment = numOrNull(now)
   const windowFrom = moment === null ? null : moment - TL_WINDOW_SEC
+  const spans = spansById && typeof spansById === 'object' ? spansById : {}
   const rows = []
   for (const deal of Array.isArray(activeDeals) ? activeDeals : []) {
     if (!deal) continue
@@ -373,45 +475,73 @@ function dealTimeline(activeDeals, finishedDeals, now) {
   const axisFrom = windowFrom !== null ? (earliest === null ? windowFrom : Math.max(windowFrom, earliest)) : earliest
   const span = axisFrom === null || axisTo === null ? 0 : Math.max(1, axisTo - axisFrom)
   const pct = (at) => Math.max(0, Math.min(100, ((at - axisFrom) / span) * 100))
+  const slots = new Map()
+  const legend = new Map()
+  const outRows = visible.map((row) => {
+    const from = startOf(row)
+    const to = row.open ? axisTo : row.end
+    const left = from === null ? 0 : pct(from)
+    const right = to === null ? 100 : pct(to)
+    const duration = from === null || to === null ? null : Math.max(0, to - from)
+    const clipped = row.from !== null && windowFrom !== null && row.from < windowFrom
+    const deal = row.deal
+    const segments = timelineSegments(spans[String(deal.id || '')], axisFrom, axisTo, slots)
+    for (const segment of segments) {
+      const seen = legend.get(segment.stage) || { stage: segment.stage, tone: segment.tone, sec: 0, failed: false, running: false }
+      seen.sec += Math.round((segment.widthPct / 100) * span)
+      seen.failed = seen.failed || segment.state === 'failed'
+      seen.running = seen.running || segment.state === 'running'
+      legend.set(segment.stage, seen)
+    }
+    const title = String(deal.titleFull || deal.title || '')
+    const repoFull = deal.repoLabel || String(deal.repo || '')
+    return {
+      key: String(deal.id || ''),
+      id: String(deal.id || ''),
+      repo: deal.repoShort || repoShort(deal.repo),
+      repoFull,
+      title,
+      open: row.open,
+      state: deal.state || deal.status || '',
+      stateLabel: row.stateLabel,
+      tone: row.tone,
+      stageText: deal.stageText || '',
+      stageLive: deal.stageLive === true,
+      performer: deal.assignee || '',
+      segments,
+      durationText: duration === null ? 'начало неизвестно' : fmtAge(duration),
+      leftPct: Number(left.toFixed(1)),
+      widthPct: Number(Math.max(1.5, right - left).toFixed(1)),
+      // Начало раньше окна или неизвестно вовсе: рисунок помечает это, а не
+      // выдаёт догадку за факт.
+      clipped,
+      exact: row.from !== null,
+      hint:
+        `${title || '(без названия)'}\n${deal.id || ''}${repoFull ? ` · ${repoFull}` : ''}` +
+        `\n${row.stateLabel || '—'}${duration === null ? '' : ` · ${fmtAge(duration)}`}` +
+        (segments.length
+          ? `\n${segments
+              .map((segment) => `${segment.stage} ${segment.durationText}${segment.state === 'failed' ? ' ✕' : segment.state === 'running' ? ' …' : ''}`)
+              .join(' · ')}`
+          : '') +
+        (clipped ? '\nначалось раньше окна суток' : ''),
+    }
+  })
+  const axis = timelineTicks(axisFrom, axisTo)
   return {
-    empty: visible.length === 0,
+    empty: outRows.length === 0,
     windowText: axisFrom === null || axisTo === null ? '' : `${fmtSpan(axisFrom, axisTo)} · окно до суток`,
+    ticks: axis.ticks,
+    grid: { stepPct: axis.stepPct, firstPct: axis.firstPct, stepSec: axis.stepSec },
+    legend: [...legend.values()].map((item) => ({
+      stage: item.stage,
+      tone: item.tone,
+      durationText: fmtAge(item.sec),
+      failed: item.failed,
+      running: item.running,
+    })),
     omitted,
-    rows: visible.map((row) => {
-      const from = startOf(row)
-      const to = row.open ? axisTo : row.end
-      const left = from === null ? 0 : pct(from)
-      const right = to === null ? 100 : pct(to)
-      const duration = from === null || to === null ? null : Math.max(0, to - from)
-      const clipped = row.from !== null && windowFrom !== null && row.from < windowFrom
-      const deal = row.deal
-      const label = [String(deal.repoShort || repoShort(deal.repo)), String(deal.id || '')].filter(Boolean).join(' · ')
-      return {
-        key: String(deal.id || ''),
-        id: String(deal.id || ''),
-        repo: deal.repoShort || repoShort(deal.repo),
-        title: deal.titleFull || deal.title || '',
-        open: row.open,
-        state: deal.state || deal.status || '',
-        stateLabel: row.stateLabel,
-        tone: row.tone,
-        stageText: deal.stageText || '',
-        stageLive: deal.stageLive === true,
-        performer: deal.assignee || '',
-        durationText: duration === null ? 'начало неизвестно' : fmtAge(duration),
-        leftPct: Number(left.toFixed(1)),
-        widthPct: Number(Math.max(1.5, right - left).toFixed(1)),
-        // Начало раньше окна или неизвестно вовсе: рисунок помечает это, а не
-        // выдаёт догадку за факт.
-        clipped,
-        exact: row.from !== null,
-        title:
-          `${label} · ${deal.titleFull || deal.title || '—'} · ${row.stateLabel || '—'}` +
-          (duration === null ? ' · начало неизвестно' : ` · ${fmtAge(duration)}`) +
-          (row.open ? '' : ' · завершено') +
-          (clipped ? ' · началось раньше окна суток' : ''),
-      }
-    }),
+    rows: outRows,
   }
 }
 
@@ -747,8 +877,35 @@ function shapeFinished(payload) {
     limit: Number(data.limit) || 0,
     truncated: data.truncated === true,
     statuses: (Array.isArray(data.statuses) ? data.statuses : []).map(String),
+    // Репозитории с числом закрытых дел: страница листает группы отдельно, и
+    // «5 из 23» берётся отсюда, а не из длины загруженной страницы.
+    repos: (Array.isArray(data.repos) ? data.repos : []).map((item) => {
+      const repo = String((item && item.repo) || '')
+      return { repo, short: repoShort(repo), label: repoLabel(repo), total: Number(item && item.total) || 0 }
+    }),
     note: String(data.note || ''),
     errors,
+  }
+}
+
+/**
+ * Одна страница завершённых дел одного репозитория.
+ *
+ * Группа листается сама: у каждой свой курсор, поэтому «+5» не сдвигает соседей.
+ * `next` — курсор следующей страницы этой группы (`null` — она последняя).
+ */
+function shapeFinishedPage(payload) {
+  const data = payload && typeof payload === 'object' ? payload : {}
+  const rows = (Array.isArray(data.deals) ? data.deals : []).map(shapeFinishedRow)
+  return {
+    now: numOrNull(data.now),
+    rows,
+    total: Number(data.total) || 0,
+    next: data.next_cursor ? String(data.next_cursor) : null,
+    errors: (Array.isArray(data.errors) ? data.errors : []).map((error) => ({
+      source: String((error && error.source) || 'источник'),
+      reason: String((error && error.reason) || 'причина не записана'),
+    })),
   }
 }
 
@@ -2837,6 +2994,7 @@ export {
   fmtClock,
   shapeDeal,
   shapeFinished,
+  shapeFinishedPage,
   questionsText,
   stateCounts,
   stateLabel,

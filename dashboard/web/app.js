@@ -47,6 +47,7 @@ import {
   shapeDeal,
   shapeDealTime,
   shapeFinished,
+  shapeFinishedPage,
   shapeNow,
   shapeStages,
   compactStageView,
@@ -256,12 +257,54 @@ let ticker = null
 const snap = { data: null, error: null, loading: false }
 const filter = { repo: ALL_REPOS, states: new Set(), query: '', effQuery: '' }
 const health = { data: null, error: null, loading: false }
-const FINISHED_PAGE = 20
-// Завершённые живут на той же странице, свёрнутыми. `prev` — стек курсоров для
-// «новее»: бэкенд отдаёт строго «старше курсора», и обратный ход помнит, откуда
-// пришли, — смещения (`offset`) в API нет намеренно.
-const finished = { data: null, error: null, loading: false, open: false, cursor: null, prev: [] }
+/**
+ * Границы этапов, пришедшие из журнала: `deal_id -> [{stage,start,end,outcome}]`.
+ *
+ * Живёт вне блока завершённых: это факт о деле, а не о списке, и переживает и
+ * переключение фильтра, и повторный запрос.
+ */
+const timelineSpans = {}
+
+/**
+ * Снимок страницы дела: своё состояние у каждого адреса, потому что вкладка
+ * «Дело» живёт дольше одного запроса (поллинг, раскрытые попытки).
+ */
 const dealSnap = { key: '', data: null, attempts: null, error: null, loading: false, refreshedAt: 0, refreshError: '', spots: [] }
+
+/**
+ * Состояние блока «завершённые»: группы листаются сами.
+ *
+ * `perRepo` — сколько строк показывать на проект. Курсор живёт в группе, поэтому
+ * «+5» подтягивает следующую пятёрку каждого проекта, не сдвигая соседей и не
+ * повторяя строк (курсор — ключ `finished_at:id`, а не смещение).
+ */
+const FINISHED_PER_REPO = 5
+const finished = {
+  open: false,
+  perRepo: FINISHED_PER_REPO,
+  index: null, // ответ /deals: total, repos и ошибки источников
+  groups: new Map(), // repo -> {label, total, rows, cursor, done, loading, error}
+  error: null,
+  loading: false,
+  pages: 0, // сколько раз нажимали «загрузить ещё» — для счётчика «показано N»
+}
+
+/** Группа по репозиторию: строка состояния заводится один раз. */
+function finishedGroup(repo) {
+  const key = String(repo || '')
+  if (!finished.groups.has(key)) {
+    finished.groups.set(key, {
+      repo: key,
+      rows: [],
+      total: 0,
+      cursor: null,
+      done: false,
+      loading: false,
+      error: null,
+    })
+  }
+  return finished.groups.get(key)
+}
 
 function setStamp(at) {
   stampAt = at
@@ -284,10 +327,13 @@ async function loadNow() {
     snap.data = await api('/now')
     snap.error = null
     setStamp(Date.now())
-    // Завершённые нужны таймлайну, а не только свёрнутому блоку: первая загрузка
-    // идёт сразу, дальше — тихое обновление той же страницы без сброса курсора.
-    if (!finished.data) void loadFinished('reset')
-    else if (finished.open) void loadFinished('keep')
+    // Границы этапов спрашиваются для того, что нарисовано: активные дела плюс
+    // первая пятёрка каждого проекта. Уже известные не перезапрашиваются.
+    const painted = shapeNow(snap.data).deals.map((deal) => deal.id)
+    for (const group of finished.groups.values()) {
+      for (const row of group.rows.slice(0, FINISHED_PER_REPO)) painted.push(row.id)
+    }
+    void loadTimelineSpans(painted)
   } catch (err) {
     snap.error = err.message
   } finally {
@@ -520,70 +566,157 @@ function searchBlock() {
 }
 
 /**
- * Общий таймлайн активных дел: дорожка на дело, полоса от начала до «сейчас».
+ * Мини-таймлайн дел: дорожка на дело, полосы этапов внутри.
  *
- * Картина отвечает на «что идёт и сколько это длится» одним взглядом, а
- * подробности остаются в списке ниже. Геометрия — из шейпера (`dealTimeline`),
- * клик открывает дело.
+ * Сверху — шкала с делениями, под ней дорожки одним блоком: сетка и линия «сейчас»
+ * принадлежат полотну, а не каждой строке, иначе картинка рассыпается на набор
+ * серых полосок. Цвет полосы — этап (легенда под таймлайном), пустое место —
+ * пауза между попытками.
  */
 function timelineBlock(model) {
-  // Завершённые идут в ту же картинку (09.11): «что происходило сегодня» — это
-  // и идущее, и уже закрытое. Окно — сутки, его держит шейпер.
-  const done = finished.data ? shapeFinished(finished.data).deals : []
-  const view = dealTimeline(model.deals, done, model.now)
-  const head = h(
-    'div',
-    { class: 'panel-h' },
-    'таймлайн дел',
-    view.windowText ? h('span', { class: 'muted', style: 'margin-left:8px' }, view.windowText) : null,
-    view.omitted
-      ? h('span', { class: 'muted', style: 'margin-left:auto' }, `ещё ${view.omitted} не показано`)
-      : null,
-  )
+  const done = finished.index
+    ? [...finished.groups.values()].flatMap((group) => group.rows)
+    : []
+  const spans = timelineSpans
+  const view = dealTimeline(model.deals, done, model.now, spans)
   if (view.empty) {
-    return h('div', { class: 'panel tl-mini' }, head, h('div', { class: 'panel-b muted' }, 'за сутки дел не было'))
+    return h(
+      'div',
+      { class: 'panel tl-mini' },
+      h('div', { class: 'panel-h' }, 'таймлайн дел'),
+      h('div', { class: 'panel-b muted' }, 'за сутки дел не было'),
+    )
   }
+  const ticks = view.ticks || []
   return h(
     'div',
     { class: 'panel tl-mini' },
-    head,
     h(
       'div',
-      { class: 'tl-mini-rows' },
-      ...view.rows.map((row) =>
+      { class: 'panel-h' },
+      'таймлайн дел',
+      view.windowText ? h('span', { class: 'muted tl-window' }, view.windowText) : null,
+      view.omitted ? h('span', { class: 'muted tl-omitted' }, `ещё ${view.omitted} не показано`) : null,
+    ),
+    h(
+      'div',
+      { class: 'tl-body' },
+      h(
+        'div',
+        { class: 'tl-rows' },
+        // Сетка и «сейчас» — на полотне под дорожками: одна вертикаль на все
+        // строки, а не своя в каждой.
         h(
           'div',
-          {
-            class: `tl-mini-row${row.open ? '' : ' is-done'}`,
-            tabindex: '0',
-            title: row.title,
-            'data-key': `tl:${row.key}`,
-            onclick: () => {
-              location.hash = `#/deal/${encodeURIComponent(row.id)}`
-            },
-            onkeydown: (e) => {
-              if (e.key === 'Enter') location.hash = `#/deal/${encodeURIComponent(row.id)}`
-            },
-          },
-          h('span', { class: 'tl-mini-lbl' }, h('b', null, row.repo), h('span', { class: 'muted' }, row.id)),
+          { class: 'tl-grid' },
+          ...ticks.map((tick) => h('span', { class: 'tl-gridline', style: `left:${tick.leftPct}%` })),
+          h('span', { class: 'tl-now-line' }),
+        ),
+        ...view.rows.map((row) =>
           h(
-            'span',
-            { class: 'tl-mini-track' },
-            h('span', {
-              class: `tl-mini-bar t-${row.tone}${row.exact ? '' : ' inexact'}${row.clipped ? ' clipped' : ''}`,
-              style: `left:${row.leftPct}%;width:${row.widthPct}%`,
-            }),
-            row.stageLive && row.open
-              ? h('span', { class: 'tl-mini-now', style: `left:${row.leftPct + row.widthPct}%` })
-              : null,
+            'div',
+            {
+              class: `tl-mini-row${row.open ? '' : ' is-done'}`,
+              tabindex: '0',
+              title: row.hint,
+              'data-key': `tl:${row.key}`,
+              onclick: () => {
+                location.hash = `#/deal/${encodeURIComponent(row.id)}`
+              },
+              onkeydown: (e) => {
+                if (e.key === 'Enter') location.hash = `#/deal/${encodeURIComponent(row.id)}`
+              },
+            },
+            h(
+              'span',
+              { class: 'tl-mini-lbl' },
+              h('span', { class: 'tl-repo' }, row.repo),
+              h('span', { class: 'tl-title' }, row.title || row.id),
+            ),
+            h(
+              'span',
+              {
+                class: 'tl-mini-track',
+                // Сетка — фоном дорожки: каждая строка несёт один и тот же
+                // рисунок делений, и вертикали сходятся без элементов на линию.
+                style: `--grid-step:${view.grid.stepPct}%;--grid-first:${view.grid.firstPct}%`,
+              },
+              row.segments.length
+                ? row.segments.map((segment) =>
+                    h('span', {
+                      class: `tl-seg t-${segment.tone} is-${segment.state}${segment.clipped ? ' clipped' : ''}`,
+                      style: `left:${segment.leftPct}%;width:${segment.widthPct}%`,
+                      title: segment.title,
+                    }),
+                  )
+                : h('span', {
+                    class: `tl-mini-bar t-${row.tone}${row.exact ? '' : ' inexact'}${row.clipped ? ' clipped' : ''}`,
+                    style: `left:${row.leftPct}%;width:${row.widthPct}%`,
+                  }),
+              row.stageLive && row.open
+                ? h('span', { class: 'tl-mini-now', style: `left:${row.leftPct + row.widthPct}%` })
+                : null,
+            ),
+            h('span', { class: 'tl-mini-age mono' }, row.durationText),
+            h('span', { class: 'tl-mini-state' }, row.stateLabel),
           ),
-          h('span', { class: 'tl-mini-age mono' }, row.durationText),
-          h('span', { class: 'tl-mini-state' }, row.stateLabel),
+        ),
+      ),
+      // Шкала сидит в той же сетке колонок, что дорожки: подписи делений стоят
+      // ровно под своими линиями.
+      h(
+        'div',
+        { class: 'tl-axis' },
+        h('span', { class: 'tl-axis-gap' }),
+        h(
+          'span',
+          { class: 'tl-axis-track' },
+          ...ticks.map((tick) => h('span', { class: 'tl-tick', style: `left:${tick.leftPct}%` }, tick.label)),
         ),
       ),
     ),
+    view.legend.length
+      ? h(
+          'div',
+          { class: 'tl-legend' },
+          ...view.legend.map((item) =>
+            h(
+              'span',
+              { class: `tl-legend-item${item.failed ? ' is-failed' : ''}${item.running ? ' is-running' : ''}` },
+              h('i', { class: `tl-legend-dot t-${item.tone}` }),
+              item.stage,
+              h('span', { class: 'muted' }, item.durationText),
+            ),
+          ),
+        )
+      : null,
   )
 }
+
+/**
+ * Границы этапов для дорожек: один запрос на все показанные дела.
+ *
+ * Спрашивается то, что нарисовано (активные и первая пятёрка каждого проекта), а
+ * не весь store: подсказка этапов у строки, которую не видно, никому не нужна.
+ * Ошибка не глушит таймлайн — дорожки рисуются одним тоном состояния.
+ */
+async function loadTimelineSpans(ids) {
+  const wanted = [...new Set(ids.filter(Boolean))]
+  const known = Object.keys(timelineSpans)
+  if (wanted.length && wanted.every((id) => known.includes(id))) return
+  if (!wanted.length) return
+  try {
+    const payload = await api(`/spans?ids=${encodeURIComponent(wanted.join(','))}`)
+    const spans = payload && typeof payload.spans === 'object' && payload.spans ? payload.spans : {}
+    for (const [id, list] of Object.entries(spans)) timelineSpans[id] = list
+    render()
+  } catch (err) {
+    // Молча: подсказка этапов — украшение, а не факт, на котором стоит страница.
+  }
+}
+
+
+
 
 function viewNow() {
   if (!snap.data && snap.error) return errorBanner(`ошибка запроса /now: ${snap.error}`, loadNow)
@@ -599,6 +732,9 @@ function viewNow() {
     )
   }
   const model = shapeNow(snap.data)
+  // Индекс завершённых нужен и со свёрнутым блоком: таймлайн рисует и закрытое
+  // (09.11). Грузится один раз, дальше группы живут своей жизнью.
+  if (!finished.index && !finished.loading) void loadFinishedIndex()
   const view = filterNow(model, filter)
   const stale = Boolean(snap.error)
   const lines = noticeLines(model, stale)
@@ -660,43 +796,85 @@ function viewNow() {
 // пересчитывает (`shapeFinished`, `desktop/model.js`).
 
 /**
- * Загрузка страницы завершённых дел: `dir='next'` — старше текущего курсора,
- * `dir='prev'` — назад по стеку, `dir='reset'` — с начала.
+ * Индекс групп: сколько закрытых дел у каждого проекта.
+ *
+ * Один запрос на всю картину (`/deals?limit=1` — строки не нужны, нужны числа),
+ * дальше каждая группа тянет свою первую пятёрку. Показывать числа из уже
+ * загруженной страницы нельзя: там ровно столько строк, сколько влезло, и «5 из
+ * 5» на деле с двадцатью закрытиями было бы враньём.
  */
-async function loadFinished(dir = 'reset') {
-  if (dir === 'next' && finished.data) {
-    if (!finished.data.next_cursor) return
-    finished.prev.push(finished.cursor)
-    finished.cursor = finished.data.next_cursor
-  } else if (dir === 'prev') {
-    finished.cursor = finished.prev.pop() || null
-  } else if (dir === 'reset') {
-    finished.cursor = null
-    finished.prev = []
-  }
-  // `keep` — тихое обновление той же страницы: курсор и стек остаются, иначе
-  // авто-обновление каждый тик возвращало бы человека на первую страницу.
+async function loadFinishedIndex() {
   finished.loading = true
+  finished.error = null
   render()
-  const query = `/deals?limit=${FINISHED_PAGE}` + (finished.cursor ? `&cursor=${encodeURIComponent(finished.cursor)}` : '')
   try {
-    finished.data = await api(query)
-    finished.error = null
-    if (dir === 'reset') setStamp(Date.now())
+    const page = shapeFinished(await api('/deals?limit=1'))
+    finished.index = page
+    for (const item of page.repos) {
+      const group = finishedGroup(item.repo)
+      group.total = item.total
+    }
   } catch (err) {
     finished.error = err.message
-  } finally {
     finished.loading = false
+    render()
+    return
+  }
+  finished.loading = false
+  await Promise.all((finished.index?.repos || []).map((item) => loadFinishedGroup(item.repo, 'reset')))
+  render()
+}
+
+/**
+ * Страница одной группы: `reset` — первая пятёрка, `more` — следующая по курсору.
+ *
+ * Ошибка остаётся в группе, а не на всей панели: один недоступный репозиторий не
+ * повод гасить остальные.
+ */
+async function loadFinishedGroup(repo, dir = 'more') {
+  const group = finishedGroup(repo)
+  if (group.loading) return
+  const cursor = dir === 'more' ? group.cursor : null
+  if (dir === 'more' && group.done) return
+  group.loading = true
+  group.error = null
+  render()
+  try {
+    const query =
+      `/deals?limit=${finished.perRepo}&repo=${encodeURIComponent(repo)}` +
+      (cursor ? `&cursor=${encodeURIComponent(cursor)}` : '')
+    const page = shapeFinishedPage(await api(query))
+    group.rows = dir === 'more' ? group.rows.concat(page.rows) : page.rows
+    group.cursor = page.next
+    group.done = page.next === null
+    group.total = page.total || group.rows.length
+    // Пришедшие строки сразу просят свои границы этапов: дорожки таймлайна
+    // рисуются цветом этапа, а не одной полосой.
+    void loadTimelineSpans(group.rows.map((row) => row.id))
+  } catch (err) {
+    group.error = err.message
+  } finally {
+    group.loading = false
     render()
   }
 }
 
-/** Свернуть/развернуть блок завершённых: свёрнут он до первого запроса. */
+/** «Загрузить ещё»: по следующей пятёрке в каждом проекте, у которого есть что. */
+async function loadFinishedMore() {
+  const pending = [...finished.groups.values()].filter((group) => !group.done)
+  if (!pending.length) return
+  finished.pages += 1
+  await Promise.all(pending.map((group) => loadFinishedGroup(group.repo, 'more')))
+}
+
+/** Свернуть/развернуть блок: свёрнут он до первого запроса. */
 function toggleFinished() {
   finished.open = !finished.open
-  if (finished.open && !finished.data) void loadFinished('reset')
+  if (finished.open && !finished.index) void loadFinishedIndex()
   else render()
 }
+
+
 
 /** Бейдж терминального статуса: у закрытого дела нет состояния ожидания. */
 function finishedBadge(deal) {
@@ -730,17 +908,135 @@ function finishedRow(deal) {
   )
 }
 
-/** Группа «Завершённых» — репозиторий: самый свежий закрытый первым. */
-function finishedGroupBlock(group) {
+/** Скелет группы: показываем форму строк, а не пустоту на месте чисел. */
+function finishedSkeleton(count = 3) {
+  return h(
+    'div',
+    { class: 'panel-b' },
+    h('div', { class: 'skel skel-title' }),
+    ...[0, 1, 2].slice(0, count).map((index) =>
+      h('div', { class: 'skel skel-row', style: `animation-delay:${index * 90}ms` }),
+    ),
+  )
+}
+
+/**
+ * Блок завершённых дел внутри страницы «Дела».
+ *
+ * Группы — по репозиторию, у каждой своя пятёрка и свой «+5»: список листается
+ * проектами, потому что смотреть «что делали в этом репозитории» и есть вопрос.
+ * Общая кнопка поднимает по пятёрке сразу во всех группах.
+ */
+function finishedSection() {
+  const index = finished.index
+  const groups = [...finished.groups.values()]
+  const shown = groups.reduce((sum, group) => sum + group.rows.length, 0)
+  const total = index ? index.total : 0
+  const head = h(
+    'div',
+    { class: 'panel-h' },
+    'завершённые',
+    index ? h('span', { class: 'muted finished-count' }, `${shown} из ${total}`) : null,
+    h(
+      'button',
+      {
+        class: 'icon-btn',
+        style: 'margin-left:auto',
+        onclick: toggleFinished,
+        'data-key': 'finished-toggle',
+        title: finished.open ? 'свернуть' : 'развернуть',
+      },
+      finished.open ? 'свернуть ⌃' : 'показать ⌄',
+    ),
+  )
+  const body = []
+  if (finished.open) {
+    if (finished.error && !index) {
+      body.push(errorBanner(`ошибка запроса /deals: ${finished.error}`, () => void loadFinishedIndex()))
+    } else if (!index) {
+      body.push(finishedSkeleton())
+    } else {
+      if (index.errors.length) {
+        body.push(noticesBlock(index.errors.map((err) => `источник ${err.source} недоступен: ${err.reason}`)))
+      }
+      if (!groups.length) {
+        body.push(h('div', { class: 'panel-b muted' }, index.note || 'в store нет ни одного закрытого дела'))
+      } else {
+        body.push(
+          h(
+            'div',
+            { class: 'finished-body' },
+            ...groups.map((group, position) =>
+              finishedGroupSection(group, position),
+            ),
+          ),
+        )
+        const pending = groups.some((group) => !group.done || group.loading)
+        body.push(
+          h(
+            'div',
+            { class: 'pager' },
+            h(
+              'button',
+              {
+                class: `chip more-btn${groups.some((group) => group.loading) ? ' busy' : ''}`,
+                disabled: !pending,
+                onclick: () => void loadFinishedMore(),
+                'data-key': 'finished-more',
+              },
+              pending ? `загрузить ещё по ${finished.perRepo}` : 'всё загружено',
+            ),
+            h(
+              'span',
+              { class: 'muted' },
+              `проектов: ${groups.length} · по ${finished.perRepo} на проект${finished.pages ? ` · ещё ${finished.pages}` : ''}`,
+            ),
+          ),
+        )
+      }
+    }
+  }
+  return h(
+    'div',
+    { class: `panel finished-panel${finished.open ? ' is-open' : ''}`, 'data-key': 'finished' },
+    head,
+    ...body,
+  )
+}
+
+/** Группа завершённых: имя проекта, «5 из 23» и своя кнопка «+5». */
+function finishedGroupSection(group, position) {
+  const label = repoLabelOf(group.repo)
+  const left = Math.max(0, group.total - group.rows.length)
+  const rows = group.rows.length
+    ? group.rows.map((deal) => finishedRow(deal))
+    : [0, 1, 2].map((index) =>
+        h(
+          'tr',
+          { class: 'skel-tr', style: `animation-delay:${index * 70}ms` },
+          h('td', { colspan: '10' }, h('span', { class: 'skel skel-cell' })),
+        ),
+      )
   return h(
     'section',
-    { class: 'grp' },
+    { class: 'finished-group', style: `animation-delay:${Math.min(position * 60, 300)}ms` },
     h(
       'div',
       { class: 'grp-h' },
-      h('span', { class: group.repo ? 'grp-k mono' : 'grp-k mono muted', title: group.repo || 'репозиторий не назван' }, group.label),
-      h('span', { class: 'n' }, `${group.count}`),
-      h('span', { class: 'grp-s muted' }, `свежее закрытие: ${group.deals[0].finishedText}`),
+      h('span', { class: 'grp-k mono', title: group.repo || 'репозиторий не назван' }, label),
+      h('span', { class: 'n' }, `${rows.length ? group.rows.length : 0} из ${group.total}`),
+      group.error ? h('span', { class: 'grp-s danger' }, `ошибка: ${group.error}`) : null,
+      h(
+        'button',
+        {
+          class: `chip more-btn${group.loading ? ' busy' : ''}`,
+          style: 'margin-left:auto',
+          disabled: group.loading || group.done,
+          onclick: () => void loadFinishedGroup(group.repo, 'more'),
+          'data-key': `finished-more:${group.repo}`,
+        },
+        group.done ? 'всё' : group.loading ? 'загрузка…' : `+${finished.perRepo}${left ? ` · осталось ${left}` : ''}`,
+      ),
     ),
     h(
       'table',
@@ -764,75 +1060,20 @@ function finishedGroupBlock(group) {
           h('th', null, 'публикация'),
         ),
       ),
-      h('tbody', null, ...group.deals.map(finishedRow)),
+      h('tbody', null, ...rows),
     ),
   )
 }
 
-/**
- * Блок завершённых дел внутри страницы «Дела»: по умолчанию свёрнут.
- *
- * Кнопки пагинации — курсорные: «новее» возвращается по стеку запросов, «старее»
- * берёт `next_cursor` бэкенда. Показывать «страницу N из M» нечем и не нужно:
- * список живёт в времени, а не в нумерации.
- */
-function finishedSection() {
-  const data = finished.data
-  const model = data ? shapeFinished(data) : null
-  const head = h(
-    'div',
-    { class: 'panel-h' },
-    'завершённые',
-    model ? h('span', { class: 'muted', style: 'margin-left:8px' }, `${model.count} из ${model.total}`) : null,
-    h(
-      'button',
-      { class: 'icon-btn', style: 'margin-left:auto', onclick: toggleFinished, title: finished.open ? 'свернуть' : 'развернуть' },
-      finished.open ? 'свернуть ⌃' : 'показать ⌄',
-    ),
-  )
-  const body = []
-  if (finished.open) {
-    if (finished.error && !data) body.push(errorBanner(`ошибка запроса /deals: ${finished.error}`, () => loadFinished('reset')))
-    else if (!data) body.push(h('div', { class: 'panel-b muted' }, 'загрузка…'))
-    else {
-      if (finished.error) {
-        body.push(errorBanner(`снимок от ${fmtClock(model.now)} — обновление не удалось: ${finished.error}`, () => loadFinished('reset')))
-      }
-      if (model.errors.length) {
-        body.push(noticesBlock(model.errors.map((err) => `источник ${err.source} недоступен: ${err.reason}`)))
-      }
-      if (!model.count) {
-        body.push(
-          h(
-            'div',
-            { class: 'panel-b muted' },
-            model.note || 'в store нет ни одного закрытого дела',
-          ),
-        )
-      } else {
-        body.push(...model.groups.map(finishedGroupBlock))
-      }
-      body.push(
-        h(
-          'div',
-          { class: 'pager' },
-          h(
-            'button',
-            { class: 'chip', disabled: !finished.prev.length, onclick: () => void loadFinished('prev') },
-            '← новее',
-          ),
-          h(
-            'button',
-            { class: 'chip', disabled: !(data && data.next_cursor), onclick: () => void loadFinished('next') },
-            'старее →',
-          ),
-          h('span', { class: 'muted' }, `по ${FINISHED_PAGE} на страницу`),
-        ),
-      )
-    }
-  }
-  return h('div', { class: 'panel finished-panel', 'data-key': 'finished' }, head, ...body)
+/** Подпись репозитория для группы: хвост пути, полный — в подсказке. */
+function repoLabelOf(repo) {
+  const path = String(repo || '')
+  if (!path) return 'без репозитория'
+  const parts = path.split('/').filter(Boolean)
+  return parts.length ? parts[parts.length - 1] : path
 }
+
+
 
 /* -------------------------------------------------------- экран «почему стоит» */
 

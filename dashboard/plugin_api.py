@@ -1756,6 +1756,17 @@ def collect_deals(
     # закрытия (`finished_at: null`) уходит в конец, а не притворяется свежим.
     rows.sort(key=_deals_cursor_key)
     total = len(rows)
+    # Сколько закрытых дел у каждого репозитория — до отсечения страницей: по
+    # этому числу страница показывает «5 из 23» и листает группы отдельно, а не
+    # общим потоком, в котором один проект вытесняет другой.
+    by_repo: dict[str, int] = {}
+    for row in rows:
+        key = str(row.get("repo") or "")
+        by_repo[key] = by_repo.get(key, 0) + 1
+    repos = [
+        {"repo": key, "total": count}
+        for key, count in sorted(by_repo.items(), key=lambda item: (item[0] == "", item[0]))
+    ]
     after = _parse_deals_cursor(cursor) if cursor else None
     if after is not None:
         # Строго после курсора: страница не повторяет строку, на которой
@@ -1775,6 +1786,7 @@ def collect_deals(
         "cursor": cursor or "",
         "next_cursor": next_cursor,
         "truncated": next_cursor is not None,
+        "repos": repos,
         "deals": shown,
         "note": _finished_note(shown, statuses, repo, errors),
         "errors": errors,
@@ -3108,6 +3120,108 @@ def ask_deal(deal_id: str, payload: dict[str, Any] = Body(...)) -> Any:
         "deduped": not result.created,
         "adopted": result.adopted,
         "errors": [],
+    }
+
+
+# Границы этапов на таймлайне: начало и конец попытки. `attempt_progress` сюда
+# не входит намеренно — его на два порядка больше, а рисунку он не нужен.
+SPAN_KINDS = ("attempt_started", "attempt_ended")
+# Потолок дел в одном запросе: страница спрашивает разом за все дорожки, и
+# «пришли весь store» было бы приглашением к запросу на 500 дел.
+SPAN_MAX_DEALS = 40
+
+
+def _spans_of(events: list[dict[str, Any]], now: int) -> list[dict[str, Any]]:
+    """Полосы этапов дела: пара `attempt_started` ↔ `attempt_ended` по `run_id`.
+
+    Конец без начала, как и в ленте попыток, — мусор и пропускается: полоса без
+    начала не рисуется. Незакрытая попытка остаётся с `end: null` — поверхность
+    тянет её до `now` сама, потому что «кончилась сейчас» было бы догадкой.
+
+    `outcome`/`kind` берутся из `attempt_ended`: по ним полоса красится (успех,
+    провал, инфраструктура), поэтому они едут вместе с границами, а не читаются
+    поверхностью из другого ответа.
+    """
+    opened: dict[str, dict[str, Any]] = {}
+    spans: list[dict[str, Any]] = []
+    for event in events:
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        stage = str(payload.get("stage") or "")
+        attempt = payload.get("attempt")
+        run_id = str(payload.get("run_id") or "") or f"{stage}#{attempt}"
+        kind = str(event.get("kind") or "")
+        if kind == "attempt_started":
+            if run_id in opened:
+                continue
+            opened[run_id] = {
+                "stage": stage,
+                "role": str(payload.get("contract", {}).get("role") or "") if isinstance(payload.get("contract"), dict) else "",
+                "attempt": attempt if isinstance(attempt, int) else None,
+                "start": int(event.get("ts") or 0),
+                "end": None,
+                "outcome": None,
+                "kind": None,
+            }
+            continue
+        span = opened.pop(run_id, None)
+        if span is None:
+            continue
+        span["end"] = int(event.get("ts") or 0)
+        span["outcome"] = str(payload.get("outcome") or "") or None
+        span["kind"] = str(payload.get("kind") or "") or None
+        spans.append(span)
+    spans.extend(opened.values())
+    spans.sort(key=lambda item: (item["start"], item["stage"]))
+    return spans
+
+
+@router.get("/spans")
+def spans(ids: str = "", board: Optional[str] = None) -> dict[str, Any]:
+    """Границы этапов для нарисованных дорожек: `{"d_x": [{stage,start,end,…}]}`.
+
+    Одна ручка на много дел, потому что таймлайн показывает их рядом: запрос на
+    дело превратил бы верхушку страницы в 14 запросов. `missing` называет дела,
+    которых в store нет, — поверхность не должна молча рисовать пустую дорожку.
+    """
+    wanted = [item.strip() for item in str(ids or "").split(",") if item.strip()]
+    if len(wanted) > SPAN_MAX_DEALS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"ids: не больше {SPAN_MAX_DEALS} дел за запрос, пришло {len(wanted)}",
+        )
+    _refuse_board_filter(board)
+    home = _hermes_home()
+    now = _now_sec()
+    if not wanted:
+        return {"now": now, "count": 0, "spans": {}, "missing": []}
+    try:
+        conn = deals.open_store(home, create=False, readonly=True)
+    except Exception as exc:  # noqa: BLE001 - свой store не открылся
+        raise HTTPException(
+            status_code=503,
+            headers=NO_STORE_HEADERS,
+            detail=f"store unreadable: {type(exc).__name__}: {exc}",
+        ) from exc
+    try:
+        events = journal.read_kinds(conn, wanted, SPAN_KINDS)
+        known = {
+            str(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM deals WHERE id IN (" + ",".join("?" * len(wanted)) + ")",
+                tuple(wanted),
+            )
+        }
+    finally:
+        conn.close()
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for event in events:
+        grouped.setdefault(str(event.get("deal_id") or ""), []).append(event)
+    return {
+        "now": now,
+        "count": len(wanted),
+        "spans": {deal_id: _spans_of(items, now) for deal_id, items in grouped.items() if deal_id},
+        "missing": [deal_id for deal_id in wanted if deal_id not in known],
+        "note": "",
     }
 
 

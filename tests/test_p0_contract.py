@@ -263,6 +263,11 @@ DEALS_KEYS = {
     "note",
     "errors",
     "deals",
+    # Число закрытых дел по репозиториям: по нему страница листает группы по
+    # пятёрке на проект (0.0.9), а не общим потоком.
+    "repos",
+    "repos[].repo",
+    "repos[].total",
     "deals[].id",
     "deals[].repo",
     "deals[].title",

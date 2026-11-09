@@ -70,14 +70,16 @@ test('навигация: одна страница дел, «почему ст�
   assert.match(app, /if \(route\.name === 'deals'\) \{/)
 })
 
-test('«Завершённые» — список из `/deals`, числа берутся у бэкенда', () => {
-  // страница ходит в тот же роут, что `bin/duty deals`, и группирует тем же шейпером
-  assert.match(app, /api\(query\)/)
-  assert.match(app, /`\/deals\?limit=\$\{FINISHED_PAGE\}`/)
-  // Пагинация — курсорная, без смещений: страница берёт `next_cursor` бэкенда.
-  assert.match(app, /data\.next_cursor/)
-  assert.match(app, /finished\.prev\.push/)
-  assert.match(app, /shapeFinished\(data\)/)
+test('«Завершённые» листаются по проектам: пятёрка на репозиторий и свой курсор', () => {
+  // Индекс групп — числа от бэкенда: `/deals?limit=1` даёт `repos` с total.
+  assert.match(app, /api\('\/deals\?limit=1'\)/)
+  assert.match(app, /shapeFinishedPage\(await api\(query\)\)/)
+  // «+5» — следующая страница своей группы по курсору, а не сдвиг общего списка.
+  assert.match(app, /`\/deals\?limit=\$\{finished\.perRepo\}&repo=\$\{encodeURIComponent\(repo\)\}`/)
+  assert.match(app, /cursor=\$\{encodeURIComponent\(cursor\)\}/)
+  assert.match(app, /group\.cursor = page\.next/)
+  // Потолок «по 5 на проект» — константа, а не магия в трёх местах.
+  assert.match(app, /const FINISHED_PER_REPO = 5/)
   assert.match(pluginSource, /rest\('\/deals'/)
   assert.match(pluginSource, /shapeFinished\(finished\.data\)/)
   // второго счёта в строках нет: вопросы/попытки/длительность — поля ответа
@@ -85,7 +87,7 @@ test('«Завершённые» — список из `/deals`, числа бе
   assert.match(pluginSource, /deal\.questions\.text/)
   assert.ok(!/question_asked/.test(app), 'в app.js появился свой счёт вопросов')
   // пусто — словами бэкенда (`note`), а не пустым квадратом
-  assert.match(app, /model\.note \|\| 'в store нет ни одного закрытого дела'/)
+  assert.match(app, /index\.note \|\| 'в store нет ни одного закрытого дела'/)
 })
 
 test('«Дело» без выбранного дела показывает выбор, а не пустоту', () => {

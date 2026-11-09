@@ -519,6 +519,34 @@ def read_events(
     return out
 
 
+def read_kinds(
+    conn: sqlite3.Connection, deal_ids: Iterable[str], kinds: Iterable[str]
+) -> list[dict[str, Any]]:
+    """События названных видов по названным делам — одним запросом.
+
+    Нужно границам этапов на таймлайне: начало и конец попытки — это
+    `attempt_started`/`attempt_ended`, а `attempt_progress` пишется на два порядка
+    чаще и для рисунка не нужен. Отбор по видам делает SQL, а не разбор: тащить в
+    память 8 000 progress-событий дела, чтобы найти в них две строки, — та же
+    работа, что читать журнал целиком.
+    """
+    ids = [str(item) for item in deal_ids or () if str(item)]
+    wanted = [str(item) for item in kinds or () if str(item)]
+    if not ids or not wanted:
+        return []
+    sql = (
+        "SELECT id, ts, recorded_at, deal_id, kind, payload, source, idempotency_key "
+        "FROM events WHERE deal_id IN (" + ",".join("?" * len(ids)) + ") "
+        "AND kind IN (" + ",".join("?" * len(wanted)) + ") ORDER BY deal_id, id"
+    )
+    out: list[dict[str, Any]] = []
+    for row in conn.execute(sql, tuple(ids + wanted)):
+        item = dict(row)
+        item["payload"] = _payload(item)
+        out.append(item)
+    return out
+
+
 def counts(conn: sqlite3.Connection) -> dict[str, int]:
     """Сколько в журнале: событий и дел (для `/health`)."""
     row = conn.execute("SELECT COUNT(*) AS events, COUNT(DISTINCT deal_id) AS deals FROM events").fetchone()

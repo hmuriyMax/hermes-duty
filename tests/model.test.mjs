@@ -2146,6 +2146,7 @@ test('завершённые: пусто — словами бэкенда, ар
     now: null,
     deals: [],
     groups: [],
+    repos: [],
     count: 0,
     total: 0,
     limit: 0,

@@ -684,6 +684,21 @@ def commit_tree(tree: Path, deal: Any, stage_id: str, attempt: int) -> tuple[str
     return out.split()[0], ""
 
 
+def tree_dirty(tree: Path) -> tuple[bool, int]:
+    """Есть ли в дереве попытки незакоммиченная работа: `(грязно, файлов)`.
+
+    Нужна там, где решается судьба дерева упавшей попытки: удалять можно только
+    пустое. `git status --porcelain` не читается — считаем «грязно»: не сумев
+    подтвердить пустоту, дерево сохраняем, потому что в нём может лежать
+    единственная копия работы.
+    """
+    code, out = _git_stdout(["status", "--porcelain"], Path(tree))
+    if code != 0:
+        return True, -1
+    lines = [line for line in out.splitlines() if line.strip()]
+    return bool(lines), len(lines)
+
+
 def remove_tree(spec: Any, stage: Any, workdir: Path) -> tuple[bool, str]:
     """Убрать дерево упавшей попытки; `(убрано, причина)` — оба факта в событие.
 
@@ -1800,10 +1815,22 @@ def run_shell_stage(
             kind = FAIL_INFRA
             reason = f"работа попытки не зафиксирована коммитом: {commit_error}"
 
+    # Дерево упавшей попытки убирается только пустым. Правило было перевёрнуто:
+    # дерево удалялось ровно тогда, когда работы в коммите ещё не было, и падение
+    # на 55-й минуте уносило единственную копию правок (дело d_7d92affb: 1300
+    # строк, 284 вызова, коммита нет — и дерево стёрто). Уборка — не побочный
+    # эффект падения: пустое дерево убирается, грязное остаётся и называется
+    # путём в событии.
     cleaned = False
     cleanup = ""
+    kept_tree = ""
     if outcome != OUTCOME_DONE and stage.workspace == "worktree":
-        cleaned, cleanup = remove_tree(spec, stage, workdir)
+        tree_path = Path(workdir) / "tree"
+        dirty, _files = tree_dirty(tree_path) if tree_path.exists() else (False, 0)
+        if dirty:
+            kept_tree = str(tree_path)
+        else:
+            cleaned, cleanup = remove_tree(spec, stage, workdir)
 
     payload: dict[str, Any] = {
         "run_id": run_id,
@@ -1828,6 +1855,9 @@ def run_shell_stage(
             "tree": str(tree) if tree is not None else None,
             "cleaned": cleaned,
             "cleanup": cleanup or None,
+            # Сохранённое дерево упавшей попытки: адрес работы, которую не
+            # успели закоммитить. Пусто — сохранять было нечего.
+            "tree_kept": kept_tree or None,
             "verdict": verdict.as_payload() if verdict is not None else None,
             # У команды свидетель один — `commit|artifacts`; поле заполняется,
             # когда пакет действительно проверялся (объявлены `artifacts`).
@@ -2945,10 +2975,22 @@ def run_stage(
             kind = FAIL_INFRA
             reason = f"работа попытки не зафиксирована коммитом: {commit_error}"
 
+    # Дерево упавшей попытки убирается только пустым. Правило было перевёрнуто:
+    # дерево удалялось ровно тогда, когда работы в коммите ещё не было, и падение
+    # на 55-й минуте уносило единственную копию правок (дело d_7d92affb: 1300
+    # строк, 284 вызова, коммита нет — и дерево стёрто). Уборка — не побочный
+    # эффект падения: пустое дерево убирается, грязное остаётся и называется
+    # путём в событии.
     cleaned = False
     cleanup = ""
+    kept_tree = ""
     if outcome != OUTCOME_DONE and stage.workspace == "worktree":
-        cleaned, cleanup = remove_tree(spec, stage, workdir)
+        tree_path = Path(workdir) / "tree"
+        dirty, _files = tree_dirty(tree_path) if tree_path.exists() else (False, 0)
+        if dirty:
+            kept_tree = str(tree_path)
+        else:
+            cleaned, cleanup = remove_tree(spec, stage, workdir)
 
     payload: dict[str, Any] = {
         "run_id": run_id,
@@ -2972,6 +3014,9 @@ def run_stage(
             "tree": str(tree) if tree is not None else None,
             "cleaned": cleaned,
             "cleanup": cleanup or None,
+            # Сохранённое дерево упавшей попытки: адрес работы, которую не
+            # успели закоммитить. Пусто — сохранять было нечего.
+            "tree_kept": kept_tree or None,
             "stderr_path": str(stderr_file) if stderr_file is not None else None,
             "verdict": verdict.as_payload() if verdict is not None else None,
             # Чем этап назвал работу, когда пакет принят (`evidence.witness`):

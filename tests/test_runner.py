@@ -586,6 +586,35 @@ def test_worktree_created_and_kept_on_success(tmp_path: Path) -> None:
     assert report["tree"] == str(tree)
 
 
+def test_worktree_kept_when_attempt_failed_with_work(tmp_path: Path) -> None:
+    """Упавшая попытка с незакоммиченной работой дерево НЕ удаляет.
+
+    Правило было перевёрнуто: дерево убиралось ровно тогда, когда коммита ещё не
+    было, и падение уносило единственную копию правок (дело d_7d92affb: 1300
+    строк на 55-й минуте — и пусто). Теперь путь сохранённого дерева — факт
+    события (`tree_kept`), а пустое дерево по-прежнему убирается.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    repo = git_repo(tmp_path)
+    spec = worktree_spec(tmp_path, repo)
+    fake = Fake(exit_code=2, files={"work-in-progress.py": "print('правка')\n"})
+    run(conn, spec, deal, home, fake)
+
+    tree = runner.attempt_dir(home, deal, "impl", 1) / "tree"
+    assert tree.is_dir(), "дерево с работой удалено"
+    assert (tree / "work-in-progress.py").is_file()
+    ended = only(conn, deal, "attempt_ended")
+    details = ended["payload"]["details"]
+    assert ended["payload"]["outcome"] == "failed"
+    assert details["cleaned"] is False
+    assert details["tree_kept"] == str(tree)
+    assert str(tree) in subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list"], capture_output=True, text=True
+    ).stdout
+
+
 def test_worktree_removed_when_attempt_failed(tmp_path: Path) -> None:
     """Упавшая попытка дерево удаляет, а путь и причину называет в событии."""
     home = make_home(tmp_path)

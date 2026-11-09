@@ -62,7 +62,7 @@ function moduleForRender(root) {
   const source = read('desktop/plugin.js')
     .replace(/from '@hermes\/plugin-sdk'/, "from './sdk.mjs'")
     .concat(
-      '\nexport { DutyLane, DutyAttemptRow, ScalePanel, KpiStrip, SpecStrip, CallInspector, DutyMiniTimeline, FinishedBlock, shapeFinishedRow, dealTimeline, stageSlot, DutyPage }\n',
+      '\nexport { DutyLane, DutyAttemptRow, ScalePanel, KpiStrip, SpecStrip, CallInspector, DutyMiniTimeline, FinishedBlock, shapeFinishedRow, dealTimeline, stageRole, DutyPage, parseWindow, TL_WINDOWS, windowLabel }\n',
     )
   const file = join(dir, 'plugin.mjs')
   writeFileSync(file, source)
@@ -634,14 +634,19 @@ test('десктоп: мини-таймлайн — сосиска на обще
   assert.match(html, /--duty-mtl-step:/, 'шаг сетки не передан')
   // Сосиска — одно тело дела; этапы внутри без своих скруглений.
   assert.match(html, /class="duty-mtl-sausage/, 'нет сосиски')
-  assert.match(html, /class="duty-mtl-seg s-\d+ t-/, 'нет полос этапов с профилем')
-  // Профиль этапа — слот цвета, состояние — край: у двух этапов одного профиля
-  // слот совпадает, у разных — различается.
-  assert.match(html, /class="duty-mtl-seg s-1 [^"]*is-done/, 'этап plan не в своём слоте')
-  assert.match(html, /class="duty-mtl-seg s-2 [^"]*is-running/, 'этап impl не в своём слоте')
-  assert.equal(mod.stageSlot('impl'), mod.stageSlot('Implement'), 'слот зависит от регистра')
-  assert.notEqual(mod.stageSlot('impl'), mod.stageSlot('review'), 'impl и review одного цвета')
-  assert.ok(mod.stageSlot('какой-то-новый-этап') >= 1 && mod.stageSlot('какой-то-новый-этап') <= 8, 'слот вне палитры')
+  assert.match(html, /class="duty-mtl-seg r-[a-z]+ t-/, 'нет полос этапов с ролью')
+  assert.match(html, /class="duty-mtl-seg r-planner [^"]*is-done/, 'этап plan не в роли планировщика')
+  // Свечение на десктопе тоже наружу, и тело дела его не обрезает.
+  const pluginCss = read('desktop/plugin.js').replace(/\/\*[\s\S]*?\*\//g, '')
+  assert.match(pluginCss, /\.duty-mtl-seg:after\{[^}]*box-shadow:0 -2px/, 'десктоп: свечение светит внутрь полосы')
+  assert.doesNotMatch(pluginCss, /\.duty-mtl-seg:after\{[^}]*inset 0 0/, 'десктоп: внутреннее свечение осталось')
+  assert.match(pluginCss, /\.duty-mtl-sausage\{[^}]*overflow:visible/, 'десктоп: сосиска обрезает свечение')
+  assert.match(html, /class="duty-mtl-seg r-implementer [^"]*is-running/, 'этап impl не в роли имплементера')
+  assert.equal(mod.stageRole('impl'), mod.stageRole('Implement'), 'роль зависит от регистра')
+  assert.equal(mod.stageRole('impl_core'), 'implementer', 'вариант имени потерял роль')
+  assert.equal(mod.stageRole('review'), 'reviewer')
+  assert.notEqual(mod.stageRole('impl'), mod.stageRole('review'), 'impl и review одного цвета')
+  assert.equal(mod.stageRole('какой-то-новый-этап'), 'other', 'незнакомый этап выдумал роль')
   assert.ok(!/duty-mtl-seg[^"]*" style="[^"]*border-radius/.test(html), 'у полосы этапа своё скругление')
   // Кликабельны дело и название: строка — только раскладка.
   const rowTag = html.slice(html.indexOf('<div class="duty-mtl-row'), html.indexOf('>', html.indexOf('<div class="duty-mtl-row')) + 1)

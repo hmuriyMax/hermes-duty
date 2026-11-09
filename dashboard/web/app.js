@@ -58,6 +58,11 @@ import {
   REFRESH_FAIL_SILENT,
   refreshPlan,
   freshKeys,
+  TL_WINDOWS,
+  TL_WINDOW_KEY,
+  TL_WINDOW_SEC,
+  parseWindow,
+  windowLabel,
 } from './model.js'
 
 const TOKEN = window.__HERMES_SESSION_TOKEN__ || ''
@@ -264,6 +269,19 @@ const health = { data: null, error: null, loading: false }
  * переключение фильтра, и повторный запрос.
  */
 const timelineSpans = {}
+
+// Окно таймлайна — выбор человека и он переживает перезагрузку: разбирать свежее
+// дело хочется в часовом окне, а «когда всё встало» — в недельном.
+const tlWindow = {
+  sec: Number(localStorage.getItem(TL_WINDOW_KEY)) || TL_WINDOW_SEC,
+  set(sec) {
+    const next = Number(sec)
+    if (!Number.isFinite(next) || next <= 0) return
+    this.sec = next
+    try { localStorage.setItem(TL_WINDOW_KEY, String(next)) } catch { /* приватный режим */ }
+    render()
+  },
+}
 
 /**
  * Снимок страницы дела: своё состояние у каждого адреса, потому что вкладка
@@ -575,6 +593,62 @@ function searchBlock() {
 }
 
 /**
+ * Выбор окна таймлайна: пресеты плюс ввод с клавиатуры (`45m`, `12h`, `2d`).
+ *
+ * Кнопки отвечают на частый вопрос в один клик, поле — на точный: «полчаса назад
+ * всё сломалось» не выразить пятёркой пресетов. Непонятный ввод не применяется:
+ * поле краснеет, окно остаётся прежним — молча подставлять своё значение нельзя.
+ */
+function tlWindowControl() {
+  const apply = (input) => {
+    const sec = parseWindow(input.value)
+    if (sec === null) {
+      input.classList.add('is-bad')
+      setTimeout(() => input.classList.remove('is-bad'), 900)
+      return false
+    }
+    input.classList.remove('is-bad')
+    input.value = ''
+    tlWindow.set(sec)
+    return true
+  }
+  return h(
+    'span',
+    { class: 'tl-window-pick', title: `окно ${windowLabel(tlWindow.sec)}` },
+    ...TL_WINDOWS.map((item) =>
+      h(
+        'button',
+        {
+          type: 'button',
+          class: `tl-window-btn${tlWindow.sec === item.sec ? ' is-on' : ''}`,
+          title: `окно ${item.label}`,
+          onclick: () => tlWindow.set(item.sec),
+        },
+        item.key.replace('h', 'ч').replace('d', 'д'),
+      ),
+    ),
+    h('input', {
+      class: 'tl-window-input',
+      type: 'text',
+      inputmode: 'numeric',
+      placeholder: 'своё',
+      title: 'окно: 45m · 12h · 2d · число = часы',
+      onkeydown: (e) => {
+        if (e.key === 'Enter') {
+          if (apply(e.target)) e.target.blur()
+        } else if (e.key === 'Escape') {
+          e.target.value = ''
+          e.target.blur()
+        }
+      },
+      onblur: (e) => {
+        if (e.target.value.trim()) apply(e.target)
+      },
+    }),
+  )
+}
+
+/**
  * Мини-таймлайн дел: дорожка на дело, полосы этапов внутри.
  *
  * Сверху — шкала с делениями, под ней дорожки одним блоком: сетка и линия «сейчас»
@@ -587,13 +661,14 @@ function timelineBlock(model) {
     ? [...finished.groups.values()].flatMap((group) => group.rows)
     : []
   const spans = timelineSpans
-  const view = dealTimeline(model.deals, done, model.now, spans)
+  const view = dealTimeline(model.deals, done, model.now, spans, tlWindow.sec)
   if (view.empty) {
     return h(
       'div',
       { class: 'panel tl-mini' },
-      h('div', { class: 'panel-h' }, 'таймлайн дел'),
-      h('div', { class: 'panel-b muted' }, 'за сутки дел не было'),
+      h('div', { class: 'panel-h' }, 'таймлайн дел', h('span', { class: 'tl-spacer' }), tlWindowControl()),
+      // Окно называем словами: «за сутки» при выбранном часе было бы неправдой.
+      h('div', { class: 'panel-b muted' }, `за ${windowLabel(tlWindow.sec)} дел не было`),
     )
   }
   const ticks = view.ticks || []
@@ -610,6 +685,8 @@ function timelineBlock(model) {
       'таймлайн дел',
       view.windowText ? h('span', { class: 'muted tl-window' }, view.windowText) : null,
       view.omitted ? h('span', { class: 'muted tl-omitted' }, `ещё ${view.omitted} не показано`) : null,
+      h('span', { class: 'tl-spacer' }),
+      tlWindowControl(),
     ),
     h(
       'div',
@@ -672,7 +749,7 @@ function timelineBlock(model) {
                 row.segments.length
                   ? row.segments.map((segment) =>
                       h('i', {
-                        class: `tl-seg s-${segment.slot} t-${segment.tone} is-${segment.state}${segment.clipped ? ' clipped' : ''}`,
+                        class: `tl-seg r-${segment.role} t-${segment.tone} is-${segment.state}${segment.clipped ? ' clipped' : ''}`,
                         style: `left:${segment.leftPct}%;width:${segment.widthPct}%`,
                         title: segment.title,
                       }),

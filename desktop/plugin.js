@@ -250,11 +250,22 @@ function fmtTitle(title, max) {
 
 /** Время события как ЧЧ:ММ:СС — попытки идут минутами, секунды нужны для порядка. */
 function fmtClock(at) {
-  if (!at) return '—'
+  if (at === null || at === undefined || at === '') return '—'
   const dt = new Date(Number(at) * 1000)
   if (Number.isNaN(dt.getTime())) return '—'
   const pad = (n) => String(n).padStart(2, '0')
   return `${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`
+}
+
+/** Дата события как ДД.ММ — подпись деления на окне длиннее суток. */
+function fmtDate(at) {
+  if (at === null || at === undefined || at === '') return '—'
+  const value = Number(at)
+  if (Number.isNaN(value)) return '—'
+  const dt = new Date(value * 1000)
+  if (Number.isNaN(dt.getTime())) return '—'
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${pad(dt.getDate())}.${pad(dt.getMonth() + 1)}`
 }
 
 /** Одна строка таблицы «сейчас» из дела ответа `/now`. */
@@ -359,11 +370,59 @@ function stateCounts(deals) {
 /* ---------------------------------- общий таймлайн активных дел (0.0.9) */
 
 /**
- * Окно мини-таймлайна: сутки. Шире — картинка перестаёт читаться (дела недельной
- * давности сжимают сегодняшние в пиксель), а вопрос у верхушки страницы —
- * «что происходило сегодня», а не «вся история».
+ * Окно мини-таймлайна: по умолчанию сутки, но окно выбирается.
+ *
+ * Вопрос у верхушки страницы бывает разный: «что было за час» (разбор свежего
+ * дела) и «что было за неделю» (когда всё встало). Поэтому окно — это выбор
+ * человека, а не константа: пресеты плюс ввод с клавиатуры (`90m`, `12h`, `3d`).
  */
 const TL_WINDOW_SEC = 24 * 3600
+const TL_WINDOWS = [
+  { key: '1h', sec: 3600, label: '1 час' },
+  { key: '3h', sec: 3 * 3600, label: '3 часа' },
+  { key: '12h', sec: 12 * 3600, label: '12 часов' },
+  { key: '1d', sec: 24 * 3600, label: '1 день' },
+  { key: '7d', sec: 7 * 86400, label: '7 дней' },
+]
+/** Пределы ручного окна: меньше пяти минут шкала пустая, больше месяца — шум. */
+const TL_WINDOW_MIN = 5 * 60
+/** Ключ, под которым выбранное окно живёт в localStorage. */
+const TL_WINDOW_KEY = 'duty:tlWindow'
+const TL_WINDOW_MAX = 30 * 86400
+
+/**
+ * Разобрать окно, введённое с клавиатуры: `45m`, `90 минут`, `12h`, `1d`, `7д`.
+ *
+ * Голое число — часы: так вводят чаще всего. Пустое или непонятное — `null`,
+ * и поверхность оставляет прежнее окно: молча подставлять своё значение вместо
+ * опечатки нельзя.
+ */
+function parseWindow(input) {
+  const raw = String(input === null || input === undefined ? '' : input)
+    .trim()
+    .toLowerCase()
+    .replace(',', '.')
+  if (!raw) return null
+  const match = raw.match(/^(\d+(?:\.\d+)?)\s*(m|min|mins|м|мин|h|hr|hrs|ч|час|часа|часов|d|day|days|д|дн|день|дня|дней)?$/)
+  if (!match) return null
+  const value = Number(match[1])
+  if (!Number.isFinite(value) || value <= 0) return null
+  const unit = match[2] || 'h'
+  const sec = /^(m|min|mins|м|мин)$/.test(unit)
+    ? value * 60
+    : /^(d|day|days|д|дн|день|дня|дней)$/.test(unit)
+      ? value * 86400
+      : value * 3600
+  return Math.min(TL_WINDOW_MAX, Math.max(TL_WINDOW_MIN, Math.round(sec)))
+}
+
+/** Короткая подпись окна: `2 ч`, `45 мин`, `3 дн`. */
+function windowLabel(sec) {
+  const value = Number(sec) || TL_WINDOW_SEC
+  if (value % 86400 === 0) return `${value / 86400} дн`
+  if (value % 3600 === 0) return `${value / 3600} ч`
+  return `${Math.round(value / 60)} мин`
+}
 /** Потолок строк таймлайна: активные плюс свежие завершённые, остальное — числом. */
 const TL_MAX_ROWS = 14
 
@@ -379,57 +438,86 @@ const TL_MAX_ROWS = 14
 const TL_SEG_STATES = ['done', 'running', 'failed']
 
 /**
- * Цвет профиля этапа: соседние этапы различаются оттенком, а не только стыком.
+ * Роль этапа — постоянный цвет: имплементер всегда одного оттенка, ревьюер
+ * другого (09.11, Макс).
  *
- * Слот — идентичность этапа (`impl`, `check`, `review`…), а не его состояние:
- * состояние теперь живёт подсветкой краёв. Набор фиксирован и общий для веба и
- * десктопа, иначе одно и то же дело выглядело бы по-разному на двух
- * поверхностях. Незнакомый этап получает слот по своему имени — стабильно, чтобы
- * цвет не прыгал между перерисовками и реплеями.
+ * Цвет называет, КТО работает, а не какой это по счёту этап: иначе «impl» в
+ * двух делах выглядел бы по-разному, и цвет перестал бы быть подсказкой.
+ * Незнакомое имя разбирается по токенам (`impl_core` → имплементер); если ни
+ * один токен не опознан — нейтральный «прочее», а не выдуманная роль.
  */
-const STAGE_SLOTS = {
-  plan: 1,
-  impl: 2,
-  implement: 2,
-  wire: 2,
-  code: 2,
-  doc: 3,
-  docs: 3,
-  check: 4,
-  verify: 4,
-  test: 4,
-  tests: 4,
-  review: 5,
-  verdict: 5,
-  fix: 6,
-  publish: 7,
-  ship: 7,
-  deploy: 7,
+const STAGE_ROLES = {
+  planner: { label: 'планировщик' },
+  implementer: { label: 'имплементер' },
+  documenter: { label: 'документалист' },
+  tester: { label: 'тестер' },
+  reviewer: { label: 'ревьюер' },
+  publisher: { label: 'публикатор' },
+  other: { label: 'прочее' },
 }
-const STAGE_SLOT_COUNT = 8
+const STAGE_ROLE_TOKENS = {
+  plan: 'planner',
+  planning: 'planner',
+  lead: 'planner',
+  design: 'planner',
+  impl: 'implementer',
+  implement: 'implementer',
+  implementation: 'implementer',
+  wire: 'implementer',
+  code: 'implementer',
+  coding: 'implementer',
+  fix: 'implementer',
+  patch: 'implementer',
+  doc: 'documenter',
+  docs: 'documenter',
+  document: 'documenter',
+  write: 'documenter',
+  check: 'tester',
+  verify: 'tester',
+  test: 'tester',
+  tests: 'tester',
+  qa: 'tester',
+  review: 'reviewer',
+  reviewer: 'reviewer',
+  verdict: 'reviewer',
+  approve: 'reviewer',
+  publish: 'publisher',
+  ship: 'publisher',
+  deploy: 'publisher',
+  release: 'publisher',
+}
 
-/** Слот цвета профиля этапа: 1…8, по имени, а не по порядку появления. */
-function stageSlot(stage) {
-  const key = String(stage || '').trim().toLowerCase()
-  if (!key) return STAGE_SLOT_COUNT
-  const known = STAGE_SLOTS[key]
-  if (known) return known
-  // Своя сумма вместо хешей платформы: значение обязано совпадать на вебе и в
-  // jsdom-прогоне десктопа, а `Math.imul`-хеши там разные реализации.
-  let acc = 0
-  for (let i = 0; i < key.length; i += 1) acc = (acc + key.charCodeAt(i) * (i + 3)) % 997
-  return (acc % (STAGE_SLOT_COUNT - 1)) + 1
+/** Роль этапа по имени: первый опознанный токен, иначе `other`. */
+function stageRole(stage) {
+  const raw = String(stage === null || stage === undefined ? '' : stage)
+    .trim()
+    .toLowerCase()
+  if (!raw) return 'other'
+  const tokens = raw.split(/[^0-9a-zа-яё]+/).filter(Boolean)
+  for (const token of tokens) {
+    const role = STAGE_ROLE_TOKENS[token]
+    if (role) return role
+  }
+  // Слипшееся имя (`implcore`): ищем токен в начале строки.
+  for (const token of Object.keys(STAGE_ROLE_TOKENS)) {
+    if (raw.startsWith(token)) return STAGE_ROLE_TOKENS[token]
+  }
+  return 'other'
 }
 
 /** Шаг сетки: чем короче окно, тем мельче деления. */
 const TL_TICKS = [
-  [20 * 60, 5 * 60],
-  [60 * 60, 10 * 60],
-  [2 * 3600, 20 * 60],
+  // До двенадцати делений на окно: столько читается, не сливаясь в частокол.
+  [60 * 60, 5 * 60],
+  [3 * 3600, 15 * 60],
   [6 * 3600, 30 * 60],
-  // Дальше — по часам: на суточном окне час читается, а три часа давали редкую
-  // шкалу, по которой нельзя оценить, когда что было (09.11, Макс).
-  [TL_WINDOW_SEC, 3600],
+  [12 * 3600, 3600],
+  // Сутки — по часам: на этом окне час читается, а три часа давали редкую шкалу,
+  // по которой нельзя оценить, когда что было (09.11, Макс).
+  [86400, 3600],
+  [3 * 86400, 6 * 3600],
+  [7 * 86400, 12 * 3600],
+  [TL_WINDOW_MAX, 86400],
 ]
 
 /**
@@ -465,8 +553,8 @@ function timelineSegments(spans, barFrom, barTo) {
     segments.push({
       stage: String((item && item.stage) || ''),
       state,
-      // Оттенок — профиль этапа; край полосы — состояние (09.11, Макс).
-      slot: stageSlot(item && item.stage),
+      // Заливка — роль этапа (кто работает), свечение краёв — состояние.
+      role: stageRole(item && item.stage),
       tone: meta.tone,
       // Доли сосиски: экран не пересчитывает координаты, он их только ставит.
       leftPct: Number((((left - a) / width) * 100).toFixed(2)),
@@ -496,10 +584,25 @@ function timelineTicks(axisFrom, axisTo) {
   const span = b - a
   const step = (TL_TICKS.find(([limit]) => span <= limit) || TL_TICKS[TL_TICKS.length - 1])[1]
   const ticks = []
-  for (let at = Math.ceil(a / step) * step; at <= b; at += step) {
-    // На коротком окне секунды — факт (шаг 5 минут), на длинном — шум.
-    const label = step < 600 ? fmtClock(at) : fmtClock(at).slice(0, 5)
-    ticks.push({ leftPct: Number((((at - a) / span) * 100).toFixed(2)), label, at })
+  // Окно длиннее суток считается от местной полуночи, а не от кратного эпохе
+  // шага: иначе деления ложатся на 03:00 и 15:00, и дату на шкале не поставить.
+  let cursor
+  if (span > 86400) {
+    const dayStart = new Date(a * 1000)
+    dayStart.setHours(0, 0, 0, 0)
+    cursor = Math.floor(dayStart.getTime() / 1000)
+  } else {
+    cursor = Math.ceil(a / step) * step
+  }
+  for (; cursor <= b; cursor += step) {
+    if (cursor < a) continue
+    // На коротком окне секунды — факт (шаг минута), на длинном — шум.
+    const clock = fmtClock(cursor)
+    // За сутками часы не отвечают на «когда»: полночь подписана датой, остальные
+    // деления — временем, иначе на неделе получилось бы «09.11 · 09.11 · 09.11».
+    const midnight = clock.slice(0, 5) === '00:00'
+    const label = span > 86400 && midnight ? fmtDate(cursor) : step < 60 ? clock : clock.slice(0, 5)
+    ticks.push({ leftPct: Number((((cursor - a) / span) * 100).toFixed(2)), label, at: cursor })
   }
   return {
     ticks,
@@ -527,9 +630,10 @@ function timelineTicks(axisFrom, axisTo) {
  * говорит «началось раньше», а не выдумывает начало. Дело без записанного начала
  * рисуется полупрозрачной сосиской от края (`exact: false`).
  */
-function dealTimeline(activeDeals, finishedDeals, now, spansById) {
+function dealTimeline(activeDeals, finishedDeals, now, spansById, windowSec) {
   const moment = numOrNull(now)
-  const windowFrom = moment === null ? null : moment - TL_WINDOW_SEC
+  const winSec = Number(windowSec) > 0 ? Number(windowSec) : TL_WINDOW_SEC
+  const windowFrom = moment === null ? null : moment - winSec
   const spans = spansById && typeof spansById === 'object' ? spansById : {}
   const rows = []
   for (const deal of Array.isArray(activeDeals) ? activeDeals : []) {
@@ -617,13 +721,14 @@ function dealTimeline(activeDeals, finishedDeals, now, spansById) {
               .map((segment) => `${segment.stage} ${segment.durationText}${segment.state === 'failed' ? ' ✕' : segment.state === 'running' ? ' …' : ''}`)
               .join(' · ')}`
           : '') +
-        (clipped ? '\nначалось раньше окна суток' : ''),
+        (clipped ? `\nначалось раньше окна (${windowLabel(winSec)})` : ''),
     }
   })
   const axis = timelineTicks(axisFrom, axisTo)
   return {
     empty: outRows.length === 0,
-    windowText: axisFrom === null || axisTo === null ? '' : `${fmtSpan(axisFrom, axisTo)} · окно до суток`,
+    windowSec: winSec,
+    windowText: axisFrom === null || axisTo === null ? '' : `${fmtSpan(axisFrom, axisTo)} · окно ${windowLabel(winSec)}`,
     ticks: axis.ticks,
     grid: { stepPct: axis.stepPct, firstPct: axis.firstPct, stepSec: axis.stepSec },
     // Легенда называет состояния, а не этапы: цвет в сосиске — это состояние.
@@ -3601,6 +3706,7 @@ const CSS = `
  * рисуют; сосиска — одно тело с небольшим скруглением, этапы внутри стыкуются
  * вплотную, и границей служит только цвет.
  */
+.duty-page{--role-planner:#a78bfa;--role-implementer:#60a5fa;--role-documenter:#2dd4bf;--role-tester:#fbbf24;--role-reviewer:#f472b6;--role-publisher:#a3e635;--role-other:#94a3b8}
 .duty-mtl{margin:2px 0 14px;border:1px solid var(--ui-stroke-tertiary);border-radius:8px;background:color-mix(in srgb, var(--ui-text-primary) 2%, transparent);overflow:hidden}
 .duty-mtl-h{display:flex;align-items:baseline;gap:10px;padding:8px 12px 6px;font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--ui-text-tertiary)}
 .duty-mtl-omitted{margin-left:auto}
@@ -3616,44 +3722,60 @@ const CSS = `
 .duty-mtl-title:focus-visible{outline:2px solid var(--ui-accent);outline-offset:2px;border-radius:3px}
 .duty-mtl-row.is-done .duty-mtl-title{color:var(--ui-text-secondary)}
 .duty-mtl-track{position:relative;height:16px}
-.duty-mtl-sausage{position:absolute;top:0;bottom:0;overflow:hidden;border-radius:3px;background:color-mix(in srgb,var(--ui-text-tertiary) 22%,transparent);cursor:pointer}
+.duty-mtl-sausage{position:absolute;top:0;bottom:0;overflow:visible;border-radius:3px;background:color-mix(in srgb,var(--ui-text-tertiary) 22%,transparent);cursor:pointer}
 .duty-mtl-sausage:hover{filter:brightness(1.08)}
 .duty-mtl-sausage:focus-visible{outline:2px solid var(--ui-accent);outline-offset:2px}
 .duty-mtl-sausage.is-clipped{border-top-left-radius:0;border-bottom-left-radius:0}
 .duty-mtl-sausage.inexact{opacity:.45}
-.duty-mtl-seg{position:absolute;top:0;bottom:0;min-width:2px;background:var(--seg-fill,var(--ui-stroke-secondary))}
-.duty-mtl-seg.s-1{--seg-fill:#7d9ddb}
-.duty-mtl-seg.s-2{--seg-fill:#a08fe0}
-.duty-mtl-seg.s-3{--seg-fill:#66b3c4}
-.duty-mtl-seg.s-4{--seg-fill:#cfae66}
-.duty-mtl-seg.s-5{--seg-fill:#c48cae}
-.duty-mtl-seg.s-6{--seg-fill:#8db374}
-.duty-mtl-seg.s-7{--seg-fill:#9aa5ba}
-.duty-mtl-seg.s-8{--seg-fill:#bb9787}
-.duty-mtl-seg.t-green{--seg-status:var(--ui-green)}
-.duty-mtl-seg.t-blue{--seg-status:var(--ui-blue)}
-.duty-mtl-seg.t-yellow{--seg-status:var(--ui-yellow)}
-.duty-mtl-seg.t-red{--seg-status:var(--ui-red)}
-.duty-mtl-seg.t-gray{--seg-status:var(--ui-stroke-tertiary)}
-.duty-mtl-seg:after{content:'';position:absolute;inset:0;pointer-events:none;box-shadow:inset 0 2px 0 var(--seg-status,var(--ui-stroke-secondary)),inset 0 -2px 0 var(--seg-status,var(--ui-stroke-secondary));opacity:.85}
+/* Роли этапов: цвет — кто работает (имплементер всегда один, ревьюер другой). */
+.duty-mtl-seg{position:absolute;top:0;bottom:0;min-width:2px;background:var(--role-fill,var(--role-other))}
+.duty-mtl-seg.r-planner{--role-fill:var(--role-planner)}
+.duty-mtl-seg.r-implementer{--role-fill:var(--role-implementer)}
+.duty-mtl-seg.r-documenter{--role-fill:var(--role-documenter)}
+.duty-mtl-seg.r-tester{--role-fill:var(--role-tester)}
+.duty-mtl-seg.r-reviewer{--role-fill:var(--role-reviewer)}
+.duty-mtl-seg.r-publisher{--role-fill:var(--role-publisher)}
+.duty-mtl-seg.r-other{--role-fill:var(--role-other)}
+.duty-mtl-seg.t-green{--glow:var(--ui-green)}
+.duty-mtl-seg.t-blue{--glow:var(--ui-blue)}
+.duty-mtl-seg.t-yellow{--glow:var(--ui-yellow)}
+.duty-mtl-seg.t-red{--glow:var(--ui-red)}
+.duty-mtl-seg.t-gray{--glow:var(--ui-stroke-tertiary)}
+/* Свечение краёв вместо рамки: градиент гаснет к середине, поэтому цвета соседних
+   этапов не перебиваются, а геометрия полосы не меняется. */
+.duty-mtl-seg:after{content:'';position:absolute;inset:0;pointer-events:none;border-radius:inherit;box-shadow:0 -2px 5px -1px color-mix(in srgb,var(--glow,var(--ui-stroke-secondary)) 70%,transparent),0 2px 5px -1px color-mix(in srgb,var(--glow,var(--ui-stroke-secondary)) 70%,transparent);opacity:.85}
+.duty-mtl-sausage .duty-mtl-seg:first-child{border-top-left-radius:3px;border-bottom-left-radius:3px}
+.duty-mtl-sausage .duty-mtl-seg:last-child{border-top-right-radius:3px;border-bottom-right-radius:3px}
+.duty-mtl-sausage.is-clipped .duty-mtl-seg:first-child{border-top-left-radius:0;border-bottom-left-radius:0}
 .duty-mtl-seg.is-running:after{animation:duty-mtl-breathe 2.6s ease-in-out infinite}
+/* Отказ горит ярче и чаще: единственное состояние, которое просит действия. */
+.duty-mtl-seg.is-failed:after{box-shadow:0 -3px 8px -1px color-mix(in srgb,var(--ui-red) 92%,transparent),0 3px 8px -1px color-mix(in srgb,var(--ui-red) 92%,transparent);animation:duty-mtl-fail 1.4s ease-in-out infinite}
 .duty-mtl-seg.clipped{border-left:1px solid var(--ui-surface-background)}
-@keyframes duty-mtl-breathe{0%,100%{opacity:.55}50%{opacity:1}}
+@keyframes duty-mtl-breathe{0%,100%{opacity:.5}50%{opacity:1}}
+@keyframes duty-mtl-fail{0%,100%{opacity:.65;filter:brightness(1)}50%{opacity:1;filter:brightness(1.4)}}
 .duty-mtl-age{color:var(--ui-text-secondary);text-align:right;font-size:11.5px}
 .duty-mtl-state{color:var(--ui-text-tertiary);text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11.5px}
 .duty-mtl-axis{display:grid;grid-template-columns:var(--duty-mtl-cols);gap:12px;height:15px;margin-top:4px}
 .duty-mtl-axis-track{position:relative;height:15px}
 .duty-mtl-tick{position:absolute;transform:translateX(-50%);font-size:10px;font-variant-numeric:tabular-nums;color:var(--ui-text-tertiary);white-space:nowrap}
+.duty-mtl-spacer{flex:1 1 auto}
+.duty-mtl-window{display:inline-flex;align-items:center;gap:2px}
+.duty-mtl-window-btn{font:inherit;font-size:11px;line-height:1.3;padding:2px 7px;border-radius:6px;border:1px solid transparent;background:transparent;color:var(--ui-text-secondary);cursor:pointer}
+.duty-mtl-window-btn:hover{background:var(--ui-surface-hover,rgba(255,255,255,.06));color:var(--ui-text-primary)}
+.duty-mtl-window-btn.is-on{color:var(--ui-text-primary);background:color-mix(in srgb,var(--ui-accent) 14%,transparent);border-color:color-mix(in srgb,var(--ui-accent) 45%,transparent)}
+.duty-mtl-window-input{width:58px;font:inherit;font-size:11px;padding:2px 6px;border-radius:6px;border:1px solid var(--ui-stroke-secondary);background:var(--ui-surface-background);color:var(--ui-text-primary)}
+.duty-mtl-window-input:focus{outline:none;border-color:var(--ui-accent)}
+.duty-mtl-window-input.is-bad{border-color:var(--ui-red);background:color-mix(in srgb,var(--ui-red) 14%,transparent)}
 .duty-mtl-legend{display:flex;flex-wrap:wrap;gap:4px 14px;padding:8px 12px 10px;border-top:1px solid var(--ui-stroke-tertiary);font-size:11.5px}
 .duty-mtl-legend-item{display:inline-flex;align-items:center;gap:6px;color:var(--ui-text-secondary)}
-.duty-mtl-dot{width:14px;height:9px;border-radius:2px;background:#9aa5ba;box-shadow:inset 0 2px 0 var(--ui-stroke-secondary),inset 0 -2px 0 var(--ui-stroke-secondary)}
-.duty-mtl-dot.t-green{box-shadow:inset 0 2px 0 var(--ui-green),inset 0 -2px 0 var(--ui-green)}
-.duty-mtl-dot.t-blue{box-shadow:inset 0 2px 0 var(--ui-blue),inset 0 -2px 0 var(--ui-blue)}
-.duty-mtl-dot.t-yellow{box-shadow:inset 0 2px 0 var(--ui-yellow),inset 0 -2px 0 var(--ui-yellow)}
-.duty-mtl-dot.t-red{box-shadow:inset 0 2px 0 var(--ui-red),inset 0 -2px 0 var(--ui-red)}
-.duty-mtl-dot.t-gray{box-shadow:inset 0 2px 0 var(--ui-stroke-tertiary),inset 0 -2px 0 var(--ui-stroke-tertiary)}
+.duty-mtl-dot{width:14px;height:9px;border-radius:2px;background:var(--role-implementer);box-shadow:0 -1px 4px -1px var(--ui-stroke-secondary),0 1px 4px -1px var(--ui-stroke-secondary)}
+.duty-mtl-dot.t-green{box-shadow:0 -1px 4px -1px var(--ui-green),0 1px 4px -1px var(--ui-green)}
+.duty-mtl-dot.t-blue{box-shadow:0 -1px 4px -1px var(--ui-blue),0 1px 4px -1px var(--ui-blue)}
+.duty-mtl-dot.t-yellow{box-shadow:0 -1px 4px -1px var(--ui-yellow),0 1px 4px -1px var(--ui-yellow)}
+.duty-mtl-dot.t-red{box-shadow:0 -1px 4px -1px var(--ui-red),0 1px 4px -1px var(--ui-red)}
+.duty-mtl-dot.t-gray{box-shadow:0 -1px 4px -1px var(--ui-stroke-tertiary),0 1px 4px -1px var(--ui-stroke-tertiary)}
 .duty-mtl-legend-item.is-running{color:var(--ui-text-primary)}
-@media (prefers-reduced-motion: reduce){.duty-mtl-seg.is-running,.duty-mtl-seg.is-running:after{animation:none}}
+@media (prefers-reduced-motion: reduce){.duty-mtl-seg.is-running:after,.duty-mtl-seg.is-failed:after{animation:none}}
 
 /* Кнопка подгрузки под списком проекта: по центру и заметная — единственный
  * способ получить следующие строки, искать её в углу не надо. */
@@ -4982,14 +5104,77 @@ function FinishedBlock({ finished, onPick }) {
  * Кликабельны дело и его название, а не вся строка: длительность и состояние —
  * показания, а не ссылки (09.11, Макс).
  */
-function DutyMiniTimeline({ view, onOpen }) {
+/**
+ * Выбор окна таймлайна: пресеты плюс ввод с клавиатуры (`45m`, `12h`, `2d`).
+ *
+ * Кнопки отвечают на частый вопрос в один клик, поле — на точный: «полчаса назад
+ * всё сломалось» не выразить пятёркой пресетов. Непонятный ввод не применяется:
+ * поле краснеет, окно остаётся прежним.
+ */
+function DutyTimelineWindow({ windowSec, onWindow }) {
+  const apply = (input) => {
+    const sec = typeof parseWindow === 'function' ? parseWindow(input.value) : null
+    if (sec === null) {
+      input.classList.add('is-bad')
+      setTimeout(() => input.classList.remove('is-bad'), 900)
+      return false
+    }
+    input.classList.remove('is-bad')
+    input.value = ''
+    onWindow(sec)
+    return true
+  }
+  return h(
+    'span',
+    { className: 'duty-mtl-window', title: `окно ${windowLabel(windowSec)}` },
+    ...TL_WINDOWS.map((item) =>
+      h(
+        'button',
+        {
+          type: 'button',
+          key: `w-${item.key}`,
+          className: windowSec === item.sec ? 'duty-mtl-window-btn is-on' : 'duty-mtl-window-btn',
+          title: `окно ${item.label}`,
+          onClick: () => onWindow(item.sec),
+        },
+        item.key.replace('h', 'ч').replace('d', 'д'),
+      ),
+    ),
+    h('input', {
+      className: 'duty-mtl-window-input',
+      type: 'text',
+      placeholder: 'своё',
+      title: 'окно: 45m · 12h · 2d · число = часы',
+      onKeyDown: (event) => {
+        if (event.key === 'Enter') {
+          if (apply(event.target)) event.target.blur()
+        } else if (event.key === 'Escape') {
+          event.target.value = ''
+          event.target.blur()
+        }
+      },
+      onBlur: (event) => {
+        if (event.target.value.trim()) apply(event.target)
+      },
+    }),
+  )
+}
+
+function DutyMiniTimeline({ view, onOpen, windowSec, onWindow }) {
   if (!view) return null
   if (view.empty) {
     return h(
       'div',
       { className: 'duty-mtl' },
-      h('div', { className: 'duty-mtl-h' }, h('span', null, 'таймлайн дел')),
-      h('div', { className: 'duty-muted', style: { padding: '0 12px 10px' } }, 'за сутки дел не было'),
+      h(
+        'div',
+        { className: 'duty-mtl-h' },
+        h('span', null, 'таймлайн дел'),
+        h('span', { className: 'duty-mtl-spacer' }),
+        DutyTimelineWindow({ windowSec, onWindow }),
+      ),
+      // Окно называем словами: «за сутки» при выбранном часе было бы неправдой.
+      h('div', { className: 'duty-muted', style: { padding: '0 12px 10px' } }, `за ${windowLabel(windowSec)} дел не было`),
     )
   }
   const ticks = view.ticks || []
@@ -5007,6 +5192,8 @@ function DutyMiniTimeline({ view, onOpen }) {
       h('span', null, 'таймлайн дел'),
       view.windowText ? h('span', { className: 'duty-muted' }, view.windowText) : null,
       view.omitted ? h('span', { className: 'duty-muted duty-mtl-omitted' }, `ещё ${view.omitted} не показано`) : null,
+      h('span', { className: 'duty-mtl-spacer' }),
+      DutyTimelineWindow({ windowSec, onWindow }),
     ),
     h(
       'div',
@@ -5071,7 +5258,7 @@ function DutyMiniTimeline({ view, onOpen }) {
                 (row.segments || []).map((segment) =>
                   h('i', {
                     key: `seg-${segment.stage}-${segment.leftPct}`,
-                    className: `duty-mtl-seg s-${segment.slot} t-${segment.tone} is-${segment.state}${segment.clipped ? ' clipped' : ''}`,
+                    className: `duty-mtl-seg r-${segment.role} t-${segment.tone} is-${segment.state}${segment.clipped ? ' clipped' : ''}`,
                     style: { left: `${segment.leftPct}%`, width: `${segment.widthPct}%` },
                     title: segment.title,
                   }),
@@ -5270,6 +5457,24 @@ function DutyPage() {
   const [effQuery, setEffQuery] = useState('')
   const [sel, setSel] = useState(null)
   const [tick, setTick] = useState(() => Date.now())
+  // Окно таймлайна: выбор человека, переживает перезагрузку приложения.
+  const [tlWindowSec, setTlWindowSec] = useState(() => {
+    try {
+      return Number(localStorage.getItem(TL_WINDOW_KEY)) || TL_WINDOW_SEC
+    } catch {
+      return TL_WINDOW_SEC
+    }
+  })
+  const setTlWindow = useCallback((sec) => {
+    const next = Number(sec)
+    if (!Number.isFinite(next) || next <= 0) return
+    setTlWindowSec(next)
+    try {
+      localStorage.setItem(TL_WINDOW_KEY, String(next))
+    } catch {
+      // приватный режим: окно живёт до перезагрузки
+    }
+  }, [])
   // «Здоровье» запрашивается только когда экран открыт: это скан всех досок.
   const stats = useStats(screen === 'health')
   // «Завершённые» — часть экрана «Сейчас» (как на вебе): блок стоит под списком
@@ -5306,8 +5511,8 @@ function DutyPage() {
   )
   const spans = useSpans(timelineIds)
   const timeline = useMemo(
-    () => (model ? dealTimeline(model.deals, finishedRows, model.now, spans) : null),
-    [model, finishedRows, spans],
+    () => (model ? dealTimeline(model.deals, finishedRows, model.now, spans, tlWindowSec) : null),
+    [model, finishedRows, spans, tlWindowSec],
   )
 
   if (!rest) {
@@ -5504,7 +5709,7 @@ function DutyPage() {
     list = h(
       'div',
       { className: 'duty-list' },
-      h(DutyMiniTimeline, { view: timeline, onOpen: openTimelineRow }),
+      h(DutyMiniTimeline, { view: timeline, onOpen: openTimelineRow, windowSec: tlWindowSec, onWindow: setTlWindow }),
       view.count
         ? view.groups.map((group) => h(DealGroup, { key: `grp-${group.repo || 'without'}`, group, selectedKey, onPick: pick }))
         : h(EmptyState, { view, model, onReset: resetFilters, stale }),

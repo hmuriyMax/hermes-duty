@@ -45,6 +45,12 @@ import {
   shapeNow,
   shapeRepos,
   dealTimeline,
+  timelineTicks,
+  TL_WINDOWS,
+  TL_WINDOW_SEC,
+  parseWindow,
+  windowLabel,
+  stageRole,
   shapeStages,
   stageMeta,
   stateLabel,
@@ -2617,6 +2623,80 @@ test('мини-таймлайн: пауза между попытками ост
   assert.ok(first.leftPct + first.widthPct < second.leftPct - 1, 'пауза закрашена')
 })
 
+test('мини-таймлайн: окно выбирается — пресеты, клавиатура, границы', () => {
+  // Пресеты — те, что стоят кнопками: час, три, двенадцать, сутки, неделя.
+  assert.deepEqual(TL_WINDOWS.map((item) => item.key), ['1h', '3h', '12h', '1d', '7d'])
+  assert.equal(TL_WINDOW_SEC, 24 * 3600, 'окно по умолчанию перестало быть сутками')
+
+  // Клавиатура: минуты, часы, дни и словами; голое число — часы.
+  assert.equal(parseWindow('45m'), 45 * 60)
+  assert.equal(parseWindow('12h'), 12 * 3600)
+  assert.equal(parseWindow('7d'), 7 * 86400)
+  assert.equal(parseWindow('2'), 2 * 3600)
+  assert.equal(parseWindow('1 день'), 86400)
+  assert.equal(parseWindow('  90 МИН '), 90 * 60)
+  // Непонятный ввод и выход за пределы: `null` значит «не применяй», а не «своё значение».
+  assert.equal(parseWindow('abc'), null)
+  assert.equal(parseWindow(''), null)
+  assert.equal(parseWindow('-5h'), null)
+  assert.equal(parseWindow('1m'), 5 * 60, 'нижняя граница не поднята до пяти минут')
+  assert.equal(parseWindow('365d'), 30 * 86400, 'верхняя граница не месяц')
+  assert.equal(windowLabel(3600), '1 ч')
+  assert.equal(windowLabel(7 * 86400), '7 дн')
+  assert.equal(windowLabel(90 * 60), '90 мин')
+
+  // Окно доходит до геометрии: часовое окно срезает трёхчасовое дело.
+  const long = tlDeal('d_long', { createdAt: TL_NOW - 3 * 3600, state: 'working', stateLabel: 'работает', tone: 'blue' })
+  const narrow = dealTimeline([long], [], TL_NOW, {}, 3600)
+  assert.equal(narrow.windowSec, 3600)
+  assert.match(narrow.windowText, /окно 1 ч/)
+  assert.equal(narrow.rows[0].clipped, true, 'в часовом окне дело не помечено срезанным')
+  assert.match(narrow.rows[0].hint, /началось раньше окна \(1 ч\)/)
+  // Завершённое дело вне окна не рисуется вовсе — иначе оно нулевой длины у края.
+  const oldDone = tlDeal('d_done', { finishedAt: TL_NOW - 2 * 86400, status: 'completed', statusLabel: 'закрыто' })
+  assert.equal(dealTimeline([], [oldDone], TL_NOW, {}, 86400).rows.length, 0, 'дело вне окна всё равно нарисовано')
+  assert.equal(dealTimeline([], [oldDone], TL_NOW, {}, 7 * 86400).rows.length, 1, 'недельное окно потеряло закрытое дело')
+})
+
+test('деления: короткие окна дробятся, длинные подписаны датами', () => {
+  const hour = timelineTicks(TL_NOW, TL_NOW + 3600)
+  assert.equal(hour.stepSec, 300, 'часовое окно не дробится по пять минут')
+  assert.ok(hour.ticks.length >= 10, `на часе мало делений: ${hour.ticks.length}`)
+
+  const day = timelineTicks(TL_NOW, TL_NOW + 86400)
+  assert.equal(day.stepSec, 3600, 'на сутках шаг не часовой')
+
+  // Неделя: делений не частокол, полночь подписана датой, остальные — временем.
+  const week = timelineTicks(TL_NOW, TL_NOW + 7 * 86400)
+  assert.ok(week.ticks.length <= 20, `на неделе частокол: ${week.ticks.length}`)
+  assert.ok(week.ticks.some((tick) => /^\d\d\.\d\d$/.test(tick.label)), 'на неделе нет ни одной даты')
+  for (const tick of week.ticks) {
+    assert.match(tick.label, /^(\d\d\.\d\d|\d\d:\d\d)$/, `подпись деления не время и не дата: ${tick.label}`)
+  }
+})
+
+test('этапы красит роль, состояние живёт в тоне', () => {
+  // Дело начинается раньше первого этапа: иначе первый этап лежит вне дорожки.
+  const deal = tlDeal('d_roles', { createdAt: TL_NOW - 4 * 3600, state: 'working', stateLabel: 'работает', tone: 'blue' })
+  const spans = {
+    d_roles: [
+      { stage: 'plan', start: TL_NOW - 4 * 3600, end: TL_NOW - 3.5 * 3600, outcome: 'ok' },
+      { stage: 'impl_core', start: TL_NOW - 3.5 * 3600, end: TL_NOW - 2 * 3600, outcome: 'ok' },
+      { stage: 'check-js', start: TL_NOW - 2 * 3600, end: TL_NOW - 1.5 * 3600, outcome: 'failed' },
+      { stage: 'review', start: TL_NOW - 1.5 * 3600, end: null, outcome: null },
+    ],
+  }
+  const segments = dealTimeline([deal], [], TL_NOW, spans).rows[0].segments
+  assert.deepEqual(segments.map((segment) => segment.role), ['planner', 'implementer', 'tester', 'reviewer'])
+  // Роль не зависит от состояния: упавший и пройденный этапы одной роли — одного цвета.
+  assert.equal(segments[2].tone, 'red')
+  assert.equal(segments[1].tone, 'green')
+  assert.equal(stageRole('impl'), stageRole('fix'), 'имплементер и починка разных ролей')
+  assert.equal(stageRole('verify'), 'tester')
+  assert.equal(stageRole('publish'), 'publisher')
+  assert.equal(stageRole(''), 'other')
+})
+
 test('мини-таймлайн: окно не длиннее суток, начало раньше окна помечено', () => {
   const old = tlDeal('d_old', {
     createdAt: TL_NOW - 40 * 3600,
@@ -2628,7 +2708,7 @@ test('мини-таймлайн: окно не длиннее суток, нач
   const row = view.rows[0]
   assert.equal(row.clipped, true, 'дело старше суток не помечено')
   assert.equal(row.bar.leftPct, 0, 'сосиска не прижата к левому краю')
-  assert.match(view.windowText, /окно до суток/)
+  assert.match(view.windowText, /окно 1 дн/)
 })
 
 test('мини-таймлайн: без границ этапов сосиска заливается тоном состояния', () => {

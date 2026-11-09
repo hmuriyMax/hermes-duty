@@ -24,16 +24,17 @@
   --shadow: 0 1px 3px rgba(16, 24, 40, 0.08), 0 8px 24px rgba(16, 24, 40, 0.06);
   --radius: 12px;
   --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
-  /* Восемь профилей этапов: цвет говорит «какой это этап», а не «как он прошёл».
-     Оттенки приглушены — состояние рисуется яркой подсветкой краёв поверх. */
-  --stage-1: #6f8fc9;
-  --stage-2: #8a7ccc;
-  --stage-3: #5a9fb0;
-  --stage-4: #bb9a55;
-  --stage-5: #b07a9e;
-  --stage-6: #7a9e63;
-  --stage-7: #8a93a8;
-  --stage-8: #a8877a;
+  /* Роли этапов: заливка говорит, КТО работает, а не какой это этап по счёту.
+     Имплементер всегда один цвет, ревьюер — другой, в любом деле и на обеих
+     поверхностях. Оттенки насыщенные: на 16-пиксельной полосе полутон не
+     различить, а цвет здесь — подсказка, а не украшение. */
+  --role-planner: #7c3aed;
+  --role-implementer: #2563eb;
+  --role-documenter: #0d9488;
+  --role-tester: #d97706;
+  --role-reviewer: #db2777;
+  --role-publisher: #65a30d;
+  --role-other: #64748b;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -58,15 +59,14 @@
     --purple: #a78bfa;
     --purple-soft: rgba(167, 139, 250, 0.14);
     --shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.35);
-    /* В темноте те же профили, но светлее: на #101216 приглушённые тонут. */
-    --stage-1: #7d9ddb;
-    --stage-2: #a08fe0;
-    --stage-3: #66b3c4;
-    --stage-4: #cfae66;
-    --stage-5: #c48cae;
-    --stage-6: #8db374;
-    --stage-7: #9aa5ba;
-    --stage-8: #bb9787;
+    /* В темноте те же роли, но светлее и звонче: на #101216 тёмные тона тонут. */
+    --role-planner: #a78bfa;
+    --role-implementer: #60a5fa;
+    --role-documenter: #2dd4bf;
+    --role-tester: #fbbf24;
+    --role-reviewer: #f472b6;
+    --role-publisher: #a3e635;
+    --role-other: #94a3b8;
   }
 }
 
@@ -1164,7 +1164,9 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
   position: absolute;
   top: 0;
   bottom: 0;
-  overflow: hidden;
+  /* Свечение живёт снаружи полосы, поэтому тело не обрезает своих этапов —
+     скругление держат крайние этапы, а не overflow. */
+  overflow: visible;
   /* Скругление маленькое: дело — полоса на шкале времени, а не таблетка. */
   border-radius: 3px;
   background: color-mix(in srgb, var(--text-3) 20%, transparent);
@@ -1186,35 +1188,61 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
   top: 0;
   bottom: 0;
   min-width: 2px;
-  background: var(--stage-fill, var(--border-strong));
+  background: var(--role-fill, var(--role-other));
 }
-.tl-seg.s-1 { --stage-fill: var(--stage-1); }
-.tl-seg.s-2 { --stage-fill: var(--stage-2); }
-.tl-seg.s-3 { --stage-fill: var(--stage-3); }
-.tl-seg.s-4 { --stage-fill: var(--stage-4); }
-.tl-seg.s-5 { --stage-fill: var(--stage-5); }
-.tl-seg.s-6 { --stage-fill: var(--stage-6); }
-.tl-seg.s-7 { --stage-fill: var(--stage-7); }
-.tl-seg.s-8 { --stage-fill: var(--stage-8); }
-.tl-seg.t-green { --status: var(--ok); }
-.tl-seg.t-blue { --status: var(--accent); }
-.tl-seg.t-yellow { --status: var(--warn); }
-.tl-seg.t-red { --status: var(--danger); }
-.tl-seg.t-gray { --status: var(--text-3); }
-/* Край рисуется inset-тенью: она не меняет геометрию полосы, поэтому стыки
-   этапов остаются на месте и соседние полосы не расходятся. */
+.tl-seg.r-planner { --role-fill: var(--role-planner); }
+.tl-seg.r-implementer { --role-fill: var(--role-implementer); }
+.tl-seg.r-documenter { --role-fill: var(--role-documenter); }
+.tl-seg.r-tester { --role-fill: var(--role-tester); }
+.tl-seg.r-reviewer { --role-fill: var(--role-reviewer); }
+.tl-seg.r-publisher { --role-fill: var(--role-publisher); }
+.tl-seg.r-other { --role-fill: var(--role-other); }
+.tl-seg.t-green { --glow: var(--ok); }
+.tl-seg.t-blue { --glow: var(--accent); }
+.tl-seg.t-yellow { --glow: var(--warn); }
+.tl-seg.t-red { --glow: var(--danger); }
+.tl-seg.t-gray { --glow: var(--text-3); }
+/* Свечение краёв вместо рамки: градиент гаснет к середине полосы, поэтому цвета
+   соседних этапов не перебиваются, а геометрия не меняется вовсе (край — тень,
+   а не бордюр: стыки этапов остаются на месте). */
 .tl-seg::after {
   content: '';
   position: absolute;
   inset: 0;
   pointer-events: none;
-  box-shadow: inset 0 2px 0 var(--status, var(--border-strong)), inset 0 -2px 0 var(--status, var(--border-strong));
+  border-radius: inherit;
+  /* Свечение наружу: полоса красится ролью целиком, а состояние ложится ореолом
+     вокруг неё. Внутрь не светим специально — иначе край полосы выцветает и цвет
+     этапа перестаёт читаться. */
+  box-shadow:
+    0 -2px 5px -1px color-mix(in srgb, var(--glow, var(--border-strong)) 70%, transparent),
+    0 2px 5px -1px color-mix(in srgb, var(--glow, var(--border-strong)) 70%, transparent);
   opacity: .85;
 }
-/* Идущий этап: край дышит — «здесь работают сейчас». Заливка профиля при этом
-   не мигает: она называет этап, а не его состояние. */
-.tl-seg.is-running::after { animation: tl-breathe 2.6s ease-in-out infinite; }
+/* Идущий этап: свет по краю дышит — «здесь работают сейчас». Заливка роли при
+   этом не мигает: она называет исполнителя, а не его состояние. */
+.tl-seg.is-running::after { animation: tl-glow-run 2.6s ease-in-out infinite; }
+/* Отказ горит ярче и чаще: это единственное состояние, которое просит действия. */
+.tl-seg.is-failed::after {
+  box-shadow:
+    0 -3px 8px -1px color-mix(in srgb, var(--danger) 92%, transparent),
+    0 3px 8px -1px color-mix(in srgb, var(--danger) 92%, transparent);
+  animation: tl-glow-fail 1.4s ease-in-out infinite;
+}
 .tl-seg.clipped { border-left: 1px solid var(--card); }
+/* Скругление — только у внешних краёв дела: внутри этапы стыкуются вплотную. */
+.tl-sausage .tl-seg:first-child { border-top-left-radius: 3px; border-bottom-left-radius: 3px; }
+.tl-sausage .tl-seg:last-child { border-top-right-radius: 3px; border-bottom-right-radius: 3px; }
+.tl-sausage.is-clipped .tl-seg:first-child { border-top-left-radius: 0; border-bottom-left-radius: 0; }
+
+@keyframes tl-glow-run {
+  0%, 100% { opacity: .5; }
+  50% { opacity: 1; }
+}
+@keyframes tl-glow-fail {
+  0%, 100% { opacity: .65; filter: brightness(1); }
+  50% { opacity: 1; filter: brightness(1.4); }
+}
 
 @keyframes tl-breathe {
   0%, 100% { opacity: .55; }
@@ -1261,15 +1289,50 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
   width: 14px;
   height: 9px;
   border-radius: 2px;
-  background: var(--stage-7);
-  box-shadow: inset 0 2px 0 var(--border-strong), inset 0 -2px 0 var(--border-strong);
+  background: var(--role-implementer);
+  box-shadow: 0 -1px 4px -1px var(--border-strong), 0 1px 4px -1px var(--border-strong);
 }
-.tl-legend-dot.t-green { box-shadow: inset 0 2px 0 var(--ok), inset 0 -2px 0 var(--ok); }
-.tl-legend-dot.t-blue { box-shadow: inset 0 2px 0 var(--accent), inset 0 -2px 0 var(--accent); }
-.tl-legend-dot.t-yellow { box-shadow: inset 0 2px 0 var(--warn), inset 0 -2px 0 var(--warn); }
-.tl-legend-dot.t-red { box-shadow: inset 0 2px 0 var(--danger), inset 0 -2px 0 var(--danger); }
-.tl-legend-dot.t-gray { box-shadow: inset 0 2px 0 var(--text-3), inset 0 -2px 0 var(--text-3); }
+.tl-legend-dot.t-green { box-shadow: 0 -1px 4px -1px var(--ok), 0 1px 4px -1px var(--ok); }
+.tl-legend-dot.t-blue { box-shadow: 0 -1px 4px -1px var(--accent), 0 1px 4px -1px var(--accent); }
+.tl-legend-dot.t-yellow { box-shadow: 0 -1px 4px -1px var(--warn), 0 1px 4px -1px var(--warn); }
+.tl-legend-dot.t-red { box-shadow: 0 -1px 4px -1px var(--danger), 0 1px 4px -1px var(--danger); }
+.tl-legend-dot.t-gray { box-shadow: 0 -1px 4px -1px var(--text-3), 0 1px 4px -1px var(--text-3); }
 .tl-legend-item.is-running { color: var(--text); }
+
+/* Выбор окна: пресеты + своё значение. Стоит в шапке справа, поэтому шапка —
+   flex с распоркой, а не голая строка. */
+.tl-spacer { flex: 1 1 auto; }
+.tl-window-pick { display: inline-flex; align-items: center; gap: 2px; }
+.tl-window-btn {
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.3;
+  padding: 2px 7px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.tl-window-btn:hover { background: var(--bg-hover); color: var(--text); }
+.tl-window-btn.is-on {
+  color: var(--text);
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.tl-window-input {
+  width: 58px;
+  font: inherit;
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--text);
+}
+.tl-window-input::placeholder { color: var(--text-3); }
+.tl-window-input:focus { outline: none; border-color: var(--accent); }
+.tl-window-input.is-bad { border-color: var(--danger); background: var(--danger-soft); }
 
 /* ==================================================== завершённые (0.0.9)
  *
@@ -1389,7 +1452,8 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .tl-seg.is-running,
+  .tl-seg.is-running::after,
+  .tl-seg.is-failed::after,
   .finished-body,
   .finished-group,
   .finished-group tbody tr,

@@ -201,11 +201,22 @@ function fmtTitle(title, max) {
 
 /** Время события как ЧЧ:ММ:СС — попытки идут минутами, секунды нужны для порядка. */
 function fmtClock(at) {
-  if (!at) return '—'
+  if (at === null || at === undefined || at === '') return '—'
   const dt = new Date(Number(at) * 1000)
   if (Number.isNaN(dt.getTime())) return '—'
   const pad = (n) => String(n).padStart(2, '0')
   return `${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`
+}
+
+/** Дата события как ДД.ММ — подпись деления на окне длиннее суток. */
+function fmtDate(at) {
+  if (at === null || at === undefined || at === '') return '—'
+  const value = Number(at)
+  if (Number.isNaN(value)) return '—'
+  const dt = new Date(value * 1000)
+  if (Number.isNaN(dt.getTime())) return '—'
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${pad(dt.getDate())}.${pad(dt.getMonth() + 1)}`
 }
 
 /** Одна строка таблицы «сейчас» из дела ответа `/now`. */
@@ -310,11 +321,59 @@ function stateCounts(deals) {
 /* ---------------------------------- общий таймлайн активных дел (0.0.9) */
 
 /**
- * Окно мини-таймлайна: сутки. Шире — картинка перестаёт читаться (дела недельной
- * давности сжимают сегодняшние в пиксель), а вопрос у верхушки страницы —
- * «что происходило сегодня», а не «вся история».
+ * Окно мини-таймлайна: по умолчанию сутки, но окно выбирается.
+ *
+ * Вопрос у верхушки страницы бывает разный: «что было за час» (разбор свежего
+ * дела) и «что было за неделю» (когда всё встало). Поэтому окно — это выбор
+ * человека, а не константа: пресеты плюс ввод с клавиатуры (`90m`, `12h`, `3d`).
  */
 const TL_WINDOW_SEC = 24 * 3600
+const TL_WINDOWS = [
+  { key: '1h', sec: 3600, label: '1 час' },
+  { key: '3h', sec: 3 * 3600, label: '3 часа' },
+  { key: '12h', sec: 12 * 3600, label: '12 часов' },
+  { key: '1d', sec: 24 * 3600, label: '1 день' },
+  { key: '7d', sec: 7 * 86400, label: '7 дней' },
+]
+/** Пределы ручного окна: меньше пяти минут шкала пустая, больше месяца — шум. */
+const TL_WINDOW_MIN = 5 * 60
+/** Ключ, под которым выбранное окно живёт в localStorage. */
+const TL_WINDOW_KEY = 'duty:tlWindow'
+const TL_WINDOW_MAX = 30 * 86400
+
+/**
+ * Разобрать окно, введённое с клавиатуры: `45m`, `90 минут`, `12h`, `1d`, `7д`.
+ *
+ * Голое число — часы: так вводят чаще всего. Пустое или непонятное — `null`,
+ * и поверхность оставляет прежнее окно: молча подставлять своё значение вместо
+ * опечатки нельзя.
+ */
+function parseWindow(input) {
+  const raw = String(input === null || input === undefined ? '' : input)
+    .trim()
+    .toLowerCase()
+    .replace(',', '.')
+  if (!raw) return null
+  const match = raw.match(/^(\d+(?:\.\d+)?)\s*(m|min|mins|м|мин|h|hr|hrs|ч|час|часа|часов|d|day|days|д|дн|день|дня|дней)?$/)
+  if (!match) return null
+  const value = Number(match[1])
+  if (!Number.isFinite(value) || value <= 0) return null
+  const unit = match[2] || 'h'
+  const sec = /^(m|min|mins|м|мин)$/.test(unit)
+    ? value * 60
+    : /^(d|day|days|д|дн|день|дня|дней)$/.test(unit)
+      ? value * 86400
+      : value * 3600
+  return Math.min(TL_WINDOW_MAX, Math.max(TL_WINDOW_MIN, Math.round(sec)))
+}
+
+/** Короткая подпись окна: `2 ч`, `45 мин`, `3 дн`. */
+function windowLabel(sec) {
+  const value = Number(sec) || TL_WINDOW_SEC
+  if (value % 86400 === 0) return `${value / 86400} дн`
+  if (value % 3600 === 0) return `${value / 3600} ч`
+  return `${Math.round(value / 60)} мин`
+}
 /** Потолок строк таймлайна: активные плюс свежие завершённые, остальное — числом. */
 const TL_MAX_ROWS = 14
 
@@ -330,57 +389,86 @@ const TL_MAX_ROWS = 14
 const TL_SEG_STATES = ['done', 'running', 'failed']
 
 /**
- * Цвет профиля этапа: соседние этапы различаются оттенком, а не только стыком.
+ * Роль этапа — постоянный цвет: имплементер всегда одного оттенка, ревьюер
+ * другого (09.11, Макс).
  *
- * Слот — идентичность этапа (`impl`, `check`, `review`…), а не его состояние:
- * состояние теперь живёт подсветкой краёв. Набор фиксирован и общий для веба и
- * десктопа, иначе одно и то же дело выглядело бы по-разному на двух
- * поверхностях. Незнакомый этап получает слот по своему имени — стабильно, чтобы
- * цвет не прыгал между перерисовками и реплеями.
+ * Цвет называет, КТО работает, а не какой это по счёту этап: иначе «impl» в
+ * двух делах выглядел бы по-разному, и цвет перестал бы быть подсказкой.
+ * Незнакомое имя разбирается по токенам (`impl_core` → имплементер); если ни
+ * один токен не опознан — нейтральный «прочее», а не выдуманная роль.
  */
-const STAGE_SLOTS = {
-  plan: 1,
-  impl: 2,
-  implement: 2,
-  wire: 2,
-  code: 2,
-  doc: 3,
-  docs: 3,
-  check: 4,
-  verify: 4,
-  test: 4,
-  tests: 4,
-  review: 5,
-  verdict: 5,
-  fix: 6,
-  publish: 7,
-  ship: 7,
-  deploy: 7,
+const STAGE_ROLES = {
+  planner: { label: 'планировщик' },
+  implementer: { label: 'имплементер' },
+  documenter: { label: 'документалист' },
+  tester: { label: 'тестер' },
+  reviewer: { label: 'ревьюер' },
+  publisher: { label: 'публикатор' },
+  other: { label: 'прочее' },
 }
-const STAGE_SLOT_COUNT = 8
+const STAGE_ROLE_TOKENS = {
+  plan: 'planner',
+  planning: 'planner',
+  lead: 'planner',
+  design: 'planner',
+  impl: 'implementer',
+  implement: 'implementer',
+  implementation: 'implementer',
+  wire: 'implementer',
+  code: 'implementer',
+  coding: 'implementer',
+  fix: 'implementer',
+  patch: 'implementer',
+  doc: 'documenter',
+  docs: 'documenter',
+  document: 'documenter',
+  write: 'documenter',
+  check: 'tester',
+  verify: 'tester',
+  test: 'tester',
+  tests: 'tester',
+  qa: 'tester',
+  review: 'reviewer',
+  reviewer: 'reviewer',
+  verdict: 'reviewer',
+  approve: 'reviewer',
+  publish: 'publisher',
+  ship: 'publisher',
+  deploy: 'publisher',
+  release: 'publisher',
+}
 
-/** Слот цвета профиля этапа: 1…8, по имени, а не по порядку появления. */
-function stageSlot(stage) {
-  const key = String(stage || '').trim().toLowerCase()
-  if (!key) return STAGE_SLOT_COUNT
-  const known = STAGE_SLOTS[key]
-  if (known) return known
-  // Своя сумма вместо хешей платформы: значение обязано совпадать на вебе и в
-  // jsdom-прогоне десктопа, а `Math.imul`-хеши там разные реализации.
-  let acc = 0
-  for (let i = 0; i < key.length; i += 1) acc = (acc + key.charCodeAt(i) * (i + 3)) % 997
-  return (acc % (STAGE_SLOT_COUNT - 1)) + 1
+/** Роль этапа по имени: первый опознанный токен, иначе `other`. */
+function stageRole(stage) {
+  const raw = String(stage === null || stage === undefined ? '' : stage)
+    .trim()
+    .toLowerCase()
+  if (!raw) return 'other'
+  const tokens = raw.split(/[^0-9a-zа-яё]+/).filter(Boolean)
+  for (const token of tokens) {
+    const role = STAGE_ROLE_TOKENS[token]
+    if (role) return role
+  }
+  // Слипшееся имя (`implcore`): ищем токен в начале строки.
+  for (const token of Object.keys(STAGE_ROLE_TOKENS)) {
+    if (raw.startsWith(token)) return STAGE_ROLE_TOKENS[token]
+  }
+  return 'other'
 }
 
 /** Шаг сетки: чем короче окно, тем мельче деления. */
 const TL_TICKS = [
-  [20 * 60, 5 * 60],
-  [60 * 60, 10 * 60],
-  [2 * 3600, 20 * 60],
+  // До двенадцати делений на окно: столько читается, не сливаясь в частокол.
+  [60 * 60, 5 * 60],
+  [3 * 3600, 15 * 60],
   [6 * 3600, 30 * 60],
-  // Дальше — по часам: на суточном окне час читается, а три часа давали редкую
-  // шкалу, по которой нельзя оценить, когда что было (09.11, Макс).
-  [TL_WINDOW_SEC, 3600],
+  [12 * 3600, 3600],
+  // Сутки — по часам: на этом окне час читается, а три часа давали редкую шкалу,
+  // по которой нельзя оценить, когда что было (09.11, Макс).
+  [86400, 3600],
+  [3 * 86400, 6 * 3600],
+  [7 * 86400, 12 * 3600],
+  [TL_WINDOW_MAX, 86400],
 ]
 
 /**
@@ -416,8 +504,8 @@ function timelineSegments(spans, barFrom, barTo) {
     segments.push({
       stage: String((item && item.stage) || ''),
       state,
-      // Оттенок — профиль этапа; край полосы — состояние (09.11, Макс).
-      slot: stageSlot(item && item.stage),
+      // Заливка — роль этапа (кто работает), свечение краёв — состояние.
+      role: stageRole(item && item.stage),
       tone: meta.tone,
       // Доли сосиски: экран не пересчитывает координаты, он их только ставит.
       leftPct: Number((((left - a) / width) * 100).toFixed(2)),
@@ -447,10 +535,25 @@ function timelineTicks(axisFrom, axisTo) {
   const span = b - a
   const step = (TL_TICKS.find(([limit]) => span <= limit) || TL_TICKS[TL_TICKS.length - 1])[1]
   const ticks = []
-  for (let at = Math.ceil(a / step) * step; at <= b; at += step) {
-    // На коротком окне секунды — факт (шаг 5 минут), на длинном — шум.
-    const label = step < 600 ? fmtClock(at) : fmtClock(at).slice(0, 5)
-    ticks.push({ leftPct: Number((((at - a) / span) * 100).toFixed(2)), label, at })
+  // Окно длиннее суток считается от местной полуночи, а не от кратного эпохе
+  // шага: иначе деления ложатся на 03:00 и 15:00, и дату на шкале не поставить.
+  let cursor
+  if (span > 86400) {
+    const dayStart = new Date(a * 1000)
+    dayStart.setHours(0, 0, 0, 0)
+    cursor = Math.floor(dayStart.getTime() / 1000)
+  } else {
+    cursor = Math.ceil(a / step) * step
+  }
+  for (; cursor <= b; cursor += step) {
+    if (cursor < a) continue
+    // На коротком окне секунды — факт (шаг минута), на длинном — шум.
+    const clock = fmtClock(cursor)
+    // За сутками часы не отвечают на «когда»: полночь подписана датой, остальные
+    // деления — временем, иначе на неделе получилось бы «09.11 · 09.11 · 09.11».
+    const midnight = clock.slice(0, 5) === '00:00'
+    const label = span > 86400 && midnight ? fmtDate(cursor) : step < 60 ? clock : clock.slice(0, 5)
+    ticks.push({ leftPct: Number((((cursor - a) / span) * 100).toFixed(2)), label, at: cursor })
   }
   return {
     ticks,
@@ -478,9 +581,10 @@ function timelineTicks(axisFrom, axisTo) {
  * говорит «началось раньше», а не выдумывает начало. Дело без записанного начала
  * рисуется полупрозрачной сосиской от края (`exact: false`).
  */
-function dealTimeline(activeDeals, finishedDeals, now, spansById) {
+function dealTimeline(activeDeals, finishedDeals, now, spansById, windowSec) {
   const moment = numOrNull(now)
-  const windowFrom = moment === null ? null : moment - TL_WINDOW_SEC
+  const winSec = Number(windowSec) > 0 ? Number(windowSec) : TL_WINDOW_SEC
+  const windowFrom = moment === null ? null : moment - winSec
   const spans = spansById && typeof spansById === 'object' ? spansById : {}
   const rows = []
   for (const deal of Array.isArray(activeDeals) ? activeDeals : []) {
@@ -568,13 +672,14 @@ function dealTimeline(activeDeals, finishedDeals, now, spansById) {
               .map((segment) => `${segment.stage} ${segment.durationText}${segment.state === 'failed' ? ' ✕' : segment.state === 'running' ? ' …' : ''}`)
               .join(' · ')}`
           : '') +
-        (clipped ? '\nначалось раньше окна суток' : ''),
+        (clipped ? `\nначалось раньше окна (${windowLabel(winSec)})` : ''),
     }
   })
   const axis = timelineTicks(axisFrom, axisTo)
   return {
     empty: outRows.length === 0,
-    windowText: axisFrom === null || axisTo === null ? '' : `${fmtSpan(axisFrom, axisTo)} · окно до суток`,
+    windowSec: winSec,
+    windowText: axisFrom === null || axisTo === null ? '' : `${fmtSpan(axisFrom, axisTo)} · окно ${windowLabel(winSec)}`,
     ticks: axis.ticks,
     grid: { stepPct: axis.stepPct, firstPct: axis.firstPct, stepSec: axis.stepSec },
     // Легенда называет состояния, а не этапы: цвет в сосиске — это состояние.
@@ -3023,9 +3128,16 @@ export {
   WAIT_HUMAN_LABEL,
   TONE_COLOR,
   STAGE_META,
-  STAGE_SLOTS,
-  STAGE_SLOT_COUNT,
-  stageSlot,
+  STAGE_ROLES,
+  stageRole,
+  TL_WINDOWS,
+  TL_WINDOW_KEY,
+  TL_WINDOW_SEC,
+  TL_WINDOW_MIN,
+  TL_WINDOW_MAX,
+  parseWindow,
+  windowLabel,
+  fmtDate,
   FINISHED_STATUS_META,
   WITHOUT_REPO_LABEL,
   ALL_REPOS,
@@ -3054,6 +3166,8 @@ export {
   shapeNow,
   filterNow,
   dealTimeline,
+  timelineSegments,
+  timelineTicks,
   outcomeTone,
   layoutCalls,
   laneView,

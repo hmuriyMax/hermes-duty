@@ -104,15 +104,21 @@ test('провал попытки: красный тон, своя полоса 
   assert.equal(ok.band.tone, 'green')
 })
 
-test('группы — по репозиторию: названные по имени, «без репозитория» последней', () => {
+test('группы — по репозиторию: в списке хвост пути, «без репозитория» последней', () => {
   // Доска ушла (0.0.6): группировка списка — `repo`, а дело адресуется своим id.
+  // Подпись группы — последний сегмент пути (09.11): абсолютный путь в заголовке
+  // группы читался как шум; полный путь остался в `repo` для фильтров и подсказок.
   assert.deepEqual(
     model.groups.map((group) => group.label),
+    ['hermes-duty', 'pinned-review-service', 'sx-widgets-api', WITHOUT_REPO_LABEL],
+  )
+  assert.deepEqual(
+    model.groups.map((group) => group.repo),
     [
       '~/.hermes/plugins/hermes-duty',
       '~/go/src/gitlab.ozon.ru/review/pinned-review-service',
       '~/go/src/gitlab.ozon.ru/sx/sx-widgets-api',
-      WITHOUT_REPO_LABEL,
+      '',
     ],
   )
   assert.deepEqual(
@@ -359,7 +365,73 @@ test('пустой attempt: возраст и лизинг показывают�
   const withRun = model.deals.find((item) => item.id === 'd_w0rk0001')
   assert.equal(withRun.attemptAgeText, '3 мин')
   assert.equal(withRun.attemptNote, 'pid жив')
-  assert.equal(withRun.leaseText, 'жив')
+  // Лизинг живой — «идёт», а не «жив»: строка отвечает на «что происходит».
+  assert.equal(withRun.leaseText, 'идёт')
+})
+
+test('живость попытки: «идёт», «лизинг истёк», «без лизинга» — не «неизвестно»', () => {
+  // Статус попытки уже содержит живость (`_own_attempt`): `running` — лизинг
+  // живой, `orphan` — срок вышел, `unknown` — срока нет ни в store, ни в
+  // событии. Слово на экране отвечает на вопрос «что с попыткой», а не
+  // пересказывает отсутствующее поле (09.11).
+  const attempts = {
+    attempts: [
+      { attempt: 1, stage: 'impl', start: 1_000, end: null, status: 'running', calls: [] },
+      { attempt: 2, stage: 'impl', start: 2_000, end: null, status: 'orphan', calls: [] },
+      { attempt: 3, stage: 'impl', start: 3_000, end: null, status: 'unknown', calls: [] },
+    ],
+    crash_outcomes: [],
+  }
+  const scale = shapeDealTime({ timeline: [], terminal: false }, attempts)
+  assert.deepEqual(
+    scale.bars.map((bar) => bar.leaseText),
+    ['идёт', 'лизинг истёк', 'без лизинга'],
+  )
+})
+
+test('исполнитель: роль текущего этапа вместо пустой колонки', () => {
+  // `assignee` в store пуст у дел, созданных без `--assignee` (44 из 53 на
+  // 09.11), а роль этапа журнал знает. Пустая ячейка читалась как «никто».
+  const payload = {
+    now: 1_800_000_000,
+    count: 2,
+    deals: [
+      {
+        repo: '/tmp/r',
+        id: 'd_0000a001',
+        title: 'с ролью',
+        assignee: null,
+        status: 'running',
+        waiting: { state: 'working' },
+        stage: { id: 'impl', role: 'implementer', attempt: 1, live: true },
+        attempt: null,
+        lease: { state: 'none' },
+        last_action: { kind: 'created', at: 1_799_999_000, age_sec: 1000, summary: '' },
+        created_at: 1_799_999_000,
+      },
+      {
+        repo: '/tmp/r',
+        id: 'd_0000a002',
+        title: 'с исполнителем',
+        assignee: 'reviewer',
+        status: 'running',
+        waiting: { state: 'working' },
+        stage: { id: 'review', role: 'reviewer', attempt: 1, live: true },
+        attempt: null,
+        lease: { state: 'none' },
+        last_action: { kind: 'created', at: 1_799_999_000, age_sec: 1000, summary: '' },
+        created_at: 1_799_999_000,
+      },
+    ],
+  }
+  const shaped = shapeNow(payload)
+  const byStage = shaped.deals.find((deal) => deal.id === 'd_0000a001')
+  const byAssignee = shaped.deals.find((deal) => deal.id === 'd_0000a002')
+  assert.equal(byStage.assignee, 'implementer')
+  assert.match(byStage.assigneeNote, /роль текущего этапа «impl»/)
+  // Записанный исполнитель главнее: роль этапа его не подменяет.
+  assert.equal(byAssignee.assignee, 'reviewer')
+  assert.equal(byAssignee.assigneeNote, 'исполнитель дела')
 })
 
 test('строка таблицы — все поля запроса: репозиторий, id, title, assignee, попытка, лизинг, действие, состояние', () => {
@@ -839,7 +911,7 @@ test('шкала времени: смещение полосы — от нача
   // живая попытка тянется до `now` и называется по лизингу
   assert.equal(scale.bars[2].open, true)
   assert.equal(scale.bars[2].endAt, 1500)
-  assert.equal(scale.bars[2].leaseText, 'жив')
+  assert.equal(scale.bars[2].leaseText, 'идёт')
   assert.equal(scale.bars[2].durationText, 'идёт')
   assert.equal(scale.bars[2].tone, 'blue')
   // подписи с абсолютным временем — у каждой полосы
@@ -2248,11 +2320,12 @@ function bar(calls, extra = {}) {
 
 const axis = { axis: { start: 0, end: 10 } }
 
-test('обрезанные вызовы видны на экране, а не только в данных', () => {
+test('на подписи попытки — суммарное число вызовов, а не «сколько влезло»', () => {
   const view = attemptView(bar([{ name: 'read_file', at: 1, ms: 100 }], { callsOmitted: 3 }), axis)
-  // Нарисовано ровно то, что пришло; остальное названо надбавкой.
+  // Нарисовано ровно то, что пришло; сумма называет факт из журнала.
   assert.equal(view.chips.length, 1)
-  assert.equal(view.badge, '+3')
+  assert.equal(view.badge, '4 вызова')
+  assert.equal(view.badgeCut, true)
   assert.match(view.note, /ещё 3 вызова не показано/)
   assert.match(view.title, /не показано/)
 })
@@ -2274,13 +2347,15 @@ test('попытка без поля calls не роняет вид', () => {
   assert.equal(view.badge, '')
 })
 
-test('нехватка уровней названа, а не спрятана', () => {
-  // Двенадцать вызовов в одном и том же месте: уровней пять, остальные лягут
-  // друг на друга — и это число обязано быть на экране.
+test('нехватка уровней — свойство рисунка, а не строка на подписи', () => {
+  // Двенадцать вызовов в одном и том же месте: уровней пять, часть чипов ляжет
+  // друг на друга. На экран выносится сумма вызовов, а не число наложений:
+  // «⋯8» человеку ничего не говорило (Макс, 09.11).
   const calls = Array.from({ length: 12 }, (_, index) => ({ name: 'read_file', at: 1, ms: 100 + index }))
   const view = attemptView(bar(calls), axis)
-  assert.match(view.badge, /⋯/)
-  assert.match(view.note, /уровней не хватило/)
+  assert.equal(view.badge, '12 вызовов')
+  assert.doesNotMatch(view.badge, /⋯/)
+  assert.doesNotMatch(view.note, /уровней не хватило/)
 })
 
 test('сводка дорожки считает всё, включая невидимое', () => {

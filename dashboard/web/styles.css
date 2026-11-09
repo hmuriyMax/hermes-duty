@@ -295,6 +295,11 @@ select:focus, input[type="search"]:focus { outline: 2px solid var(--accent-soft)
 
 table { width: 100%; border-collapse: collapse; }
 
+/* Список дел — таблица на каждую группу: без `fixed` колонки считаются по
+   содержимому, и заголовок одной группы сдвигает их относительно соседней. */
+table.grp-table { table-layout: fixed; }
+.grp-table td, .grp-table th { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 thead th {
   text-align: left;
   font-size: 11px;
@@ -321,6 +326,10 @@ tbody tr.row:focus-visible { outline: 2px solid var(--accent); outline-offset: -
 
 td.ttl { max-width: 520px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 td.n { font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* Идущий этап дела — акцентом и точкой: «где оно стоит» не должно тонуть
+   среди прочих ячеек строки. */
+td.stage-now { color: var(--accent); font-weight: 600; }
+td.stage-now::before { content: '● '; font-size: 9px; vertical-align: 2px; }
 
 /* ---------- бейджи ---------- */
 .badge {
@@ -882,13 +891,19 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 .tl-st.t-red { color: var(--danger); }
 .tl-st.t-yellow { color: var(--warn); }
 .tl-st.t-blue { color: var(--accent); }
+/* Суммарное число вызовов попытки: факт, а не предупреждение — тон нейтральный.
+ * Жёлтым помечается только усечённое потолком: у части вызовов чипа нет. */
 .tl-more {
   font-family: var(--mono, ui-monospace, monospace);
   font-size: 9.5px;
   font-weight: 700;
-  color: var(--warn);
+  color: var(--text-3, var(--text-2));
   padding: 0 3px;
   border-radius: 3px;
+  background: color-mix(in srgb, var(--text-3, var(--text-2)) 14%, transparent);
+}
+.tl-more.is-cut {
+  color: var(--warn);
   background: color-mix(in srgb, var(--warn) 16%, transparent);
 }
 /* Вызов без результата: полый чип — длительности нет, а не ноль. */
@@ -1043,3 +1058,98 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
 @media (prefers-reduced-motion: reduce) {
   .spec-node.is-live rect { animation: none; }
 }
+
+/* ---------- мини-таймлайн активных дел (0.0.9) ---------- */
+/* Полоса тянется от начала дела до «сейчас»: длительность видно глазом, а не
+   только числом в столбце. Тон полосы — тон состояния, как у бейджа. */
+.tl-mini { margin-bottom: 14px; }
+
+.tl-mini .panel-h { display: flex; align-items: center; }
+
+.tl-mini-rows { padding: 6px 12px 10px; display: flex; flex-direction: column; gap: 4px; }
+
+.tl-mini-row {
+  display: grid;
+  grid-template-columns: 27% 1fr 72px 110px;
+  gap: 10px;
+  align-items: center;
+  padding: 3px 4px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.tl-mini-row:hover { background: var(--bg-hover); }
+.tl-mini-row:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.tl-mini-lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tl-mini-lbl b { font-weight: 600; color: var(--text-1); }
+.tl-mini-lbl .muted { margin-left: 6px; font-family: var(--mono, ui-monospace, monospace); font-size: 10.5px; }
+
+.tl-mini-track { position: relative; height: 12px; border-radius: 4px; background: var(--bg-soft); }
+
+.tl-mini-bar { position: absolute; top: 0; bottom: 0; border-radius: 4px; background: var(--text-3); opacity: .75; }
+.tl-mini-bar.t-green { background: var(--ok); }
+.tl-mini-bar.t-yellow { background: var(--warn); }
+.tl-mini-bar.t-red { background: var(--danger); }
+.tl-mini-bar.t-purple { background: var(--purple); }
+.tl-mini-bar.t-blue { background: var(--accent); }
+/* Начало не записано: полоса тянется от края и штрихована — рисунок не выдаёт
+   догадку за факт. */
+.tl-mini-bar.inexact {
+  opacity: .35;
+  background-image: repeating-linear-gradient(45deg, transparent 0 3px, var(--card) 3px 6px);
+}
+
+/* Завершённое дело в таймлайне: полоса не тянется до «сейчас» и не спорит с
+   активными — она тише, но видна. */
+.tl-mini-row.is-done { color: var(--text-3); }
+.tl-mini-row.is-done .tl-mini-bar { opacity: .5; }
+.tl-mini-row.is-done .tl-mini-age,
+.tl-mini-row.is-done .tl-mini-state { color: var(--text-3); }
+
+/* Начало раньше окна суток: у левого края полосы — засечка «обрезано», чтобы
+   рисунок не утверждал, что дело началось ровно с края. */
+.tl-mini-bar.clipped::before {
+  content: '';
+  position: absolute;
+  left: -3px;
+  top: -2px;
+  bottom: -2px;
+  width: 3px;
+  border-radius: 2px;
+  background: currentColor;
+  opacity: .5;
+}
+
+.tl-mini-now {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 2px;
+  background: var(--accent);
+  border-radius: 1px;
+  transform: translateX(-1px);
+}
+
+.tl-mini-age { color: var(--text-2); font-variant-numeric: tabular-nums; text-align: right; }
+.tl-mini-state { color: var(--text-3); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------- свёрнутый блок завершённых ---------- */
+.finished-panel { margin-top: 14px; }
+.finished-panel .panel-h { display: flex; align-items: center; gap: 8px; }
+.finished-panel .panel-h .icon-btn {
+  font-size: 11px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 8px;
+  background: var(--card);
+  cursor: pointer;
+}
+.finished-panel .panel-h .icon-btn:hover { background: var(--bg-hover); }
+
+.pager { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--border); }
+.pager .chip[disabled] { opacity: .45; cursor: default; }
+.pager .muted { margin-left: auto; font-size: 11px; }

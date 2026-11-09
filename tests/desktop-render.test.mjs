@@ -114,8 +114,10 @@ test('десктоп: DutyLane рисует svg-значок, который л�
     assert.ok(rule.includes(declaration), `.duty-tl-kind-ico: нет ${declaration}`)
   }
 
-  // Потолок назван числом на экране, а не только в тултипе.
-  assert.match(html, /class="[^"]*\bduty-tl-more\b[^>]*>\+6</, 'надбавка +6 не отрисована')
+  // Число вызовов названо на подписи попытки, а не только в тултипе.
+  assert.match(html, /class="[^"]*\bduty-tl-more\b[^"]*"[^>]*>8 вызовов</, 'сумма вызовов не отрисована')
+  // Потолок данных — единственное, что помечается: `is-cut`.
+  assert.match(html, /class="[^"]*\bduty-tl-more is-cut\b/, 'усечённые вызовы не помечены')
   // Ось — линейка: метки-времена и вертикальная сетка по ним (макет d-merge).
   const modelMod = await import(pathToFileURL(join(pluginRoot, 'desktop/model.js')).href)
   const scaleModel = modelMod.shapeDealTime(

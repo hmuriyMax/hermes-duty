@@ -257,6 +257,8 @@ DEALS_KEYS = {
     "count",
     "total",
     "limit",
+    "cursor",
+    "next_cursor",
     "truncated",
     "note",
     "errors",

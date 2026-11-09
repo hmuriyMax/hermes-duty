@@ -127,10 +127,12 @@ const OUTCOME_TONE = {
 }
 
 const LEASE_LABEL = {
-  live: 'жив',
+  live: 'идёт',
   expired: 'истёк',
   none: 'нет',
-  unknown: 'неизвестен',
+  // Срок лизинга нигде не записан: не «неизвестно» (слово ни о чём), а факт —
+  // лизинга нет, и жив ли процесс, журнал не говорит.
+  unknown: 'без лизинга',
 }
 
 /**
@@ -270,6 +272,18 @@ function shapeDeal(deal) {
   const attemptAge = attempt && attempt.age_sec !== undefined ? attempt.age_sec : null
   const lastAge = action.age_sec !== undefined ? action.age_sec : null
   const repo = String(d.repo || '')
+  // Исполнитель: у дела он не всегда записан (`assignee` в store пуст у дел,
+  // созданных без `--assignee`), но роль текущего этапа известна из журнала —
+  // и это тот же ответ на вопрос «кто этим занят». Пустая колонка вместо него
+  // читалась как «никто» (09.11).
+  const assigned = String(d.assignee || '').trim()
+  const stageRole = stage ? String(stage.role || '').trim() : ''
+  const performer = assigned || stageRole || '—'
+  const performerNote = assigned
+    ? 'исполнитель дела'
+    : stageRole
+      ? `роль текущего этапа${stage && stage.id ? ` «${stage.id}»` : ''}`
+      : 'исполнитель не записан'
   // «pid не записан» и «состояние pid неизвестно» (`os.kill` вернул OSError) — разные факты.
   let attemptNote = 'нет попытки'
   if (attempt) {
@@ -285,10 +299,18 @@ function shapeDeal(deal) {
     // Пусто — законное состояние «без репозитория», подпись даёт `repoLabel`.
     repo,
     repoLabel: repoLabel(repo),
+    // Хвост пути для списков и таймлайна: полный адрес — в подсказке и карточке.
+    repoShort: repoShort(repo),
     id: String(d.id || ''),
     title: fmtTitle(d.title),
     titleFull: String(d.title || ''),
-    assignee: String(d.assignee || '—'),
+    // Начало дела: `created_at` из store; `ageSec` — возраст из ответа. Общий
+    // таймлайн тянет полосу дела от начала и берёт одно из двух.
+    createdAt: numOrNull(d.created_at),
+    ageSec: numOrNull(d._age_sec),
+    stageRole,
+    assignee: performer,
+    assigneeNote: performerNote,
     status: String(d.status || '—'),
     state: String(waiting.state || ''),
     stateLabel: meta.label,
@@ -320,7 +342,7 @@ function shapeDeal(deal) {
     stageText: stage
       ? `${String(stage.id || '—')} · попытка ${Number(stage.attempt) || 0}${stage.live === true ? ' · идёт' : ''}`
       : '',
-    search: `${d.repo || ''} ${d.id || ''} ${d.title || ''} ${d.assignee || ''} ${waiting.state || ''}`.toLowerCase(),
+    search: `${d.repo || ''} ${d.id || ''} ${d.title || ''} ${d.assignee || ''} ${stageRole} ${waiting.state || ''}`.toLowerCase(),
   }
 }
 
@@ -332,6 +354,114 @@ function stateCounts(deals) {
     counts[state] = (counts[state] || 0) + 1
   }
   return counts
+}
+
+/* ---------------------------------- общий таймлайн активных дел (0.0.9) */
+
+/**
+ * Окно мини-таймлайна: сутки. Шире — картинка перестаёт читаться (дела недельной
+ * давности сжимают сегодняшние в пиксель), а вопрос у верхушки страницы —
+ * «что происходило сегодня», а не «вся история».
+ */
+const TL_WINDOW_SEC = 24 * 3600
+/** Потолок строк таймлайна: активные плюс свежие завершённые, остальное — числом. */
+const TL_MAX_ROWS = 14
+
+/**
+ * Мини-таймлайн дел: одна дорожка на дело, полоса от начала до конца.
+ *
+ * Верхушка страницы отвечает на «что вообще происходило и сколько это длится»
+ * одним взглядом: активные дела тянутся до `now`, завершённые — до своего
+ * `finishedAt` (09.11, Макс: «показывать и завершённые»). Геометрия считается
+ * здесь, а не на поверхности: веб и десктоп обязаны рисовать одну картину.
+ *
+ * Окно — не длиннее суток (`TL_WINDOW_SEC`). Дело, начавшееся раньше окна, не
+ * пропадает: его полоса начинается у левого края и помечена `clipped` — рисунок
+ * говорит «началось раньше», а не выдумывает начало. Дело без записанного начала
+ * рисуется штрихованной полосой от края (`exact: false`).
+ */
+function dealTimeline(activeDeals, finishedDeals, now) {
+  const moment = numOrNull(now)
+  const windowFrom = moment === null ? null : moment - TL_WINDOW_SEC
+  const rows = []
+  for (const deal of Array.isArray(activeDeals) ? activeDeals : []) {
+    if (!deal) continue
+    const started = numOrNull(deal.createdAt)
+    const age = numOrNull(deal.ageSec)
+    const from = started !== null ? started : age !== null && moment !== null ? moment - age : null
+    rows.push({ deal, from, end: null, open: true, stateLabel: deal.stateLabel || deal.state || '', tone: deal.tone || 'gray' })
+  }
+  for (const deal of Array.isArray(finishedDeals) ? finishedDeals : []) {
+    if (!deal) continue
+    const end = numOrNull(deal.finishedAt)
+    // Завершённое дело вне окна не рисуем вовсе: его полоса была бы нулевой
+    // длины у левого края и только шумела бы.
+    if (end !== null && windowFrom !== null && end < windowFrom) continue
+    rows.push({
+      deal,
+      from: numOrNull(deal.createdAt),
+      end,
+      open: false,
+      stateLabel: deal.statusLabel || deal.status || 'завершено',
+      tone: deal.tone || 'gray',
+    })
+  }
+  const visible = rows.slice(0, TL_MAX_ROWS)
+  const omitted = rows.length - visible.length
+  const axisTo = moment !== null ? moment : visible.reduce((max, row) => (row.end !== null && (max === null || row.end > max) ? row.end : max), null)
+  const startOf = (row) => {
+    const raw = row.from !== null ? row.from : row.end
+    if (raw === null) return null
+    if (windowFrom !== null && raw < windowFrom) return windowFrom
+    return raw
+  }
+  const starts = visible.map(startOf).filter((value) => value !== null)
+  // Ось — по фактическим делам, но не длиннее суток: пустые часы слева
+  // (когда дела начались час назад) растянули бы полосы в нитки.
+  const earliest = starts.length ? Math.min(...starts) : null
+  const axisFrom = windowFrom !== null ? (earliest === null ? windowFrom : Math.max(windowFrom, earliest)) : earliest
+  const span = axisFrom === null || axisTo === null ? 0 : Math.max(1, axisTo - axisFrom)
+  const pct = (at) => Math.max(0, Math.min(100, ((at - axisFrom) / span) * 100))
+  return {
+    empty: visible.length === 0,
+    windowText: axisFrom === null || axisTo === null ? '' : `${fmtSpan(axisFrom, axisTo)} · окно до суток`,
+    omitted,
+    rows: visible.map((row) => {
+      const from = startOf(row)
+      const to = row.open ? axisTo : row.end
+      const left = from === null ? 0 : pct(from)
+      const right = to === null ? 100 : pct(to)
+      const duration = from === null || to === null ? null : Math.max(0, to - from)
+      const clipped = row.from !== null && windowFrom !== null && row.from < windowFrom
+      const deal = row.deal
+      const label = [String(deal.repoShort || repoShort(deal.repo)), String(deal.id || '')].filter(Boolean).join(' · ')
+      return {
+        key: String(deal.id || ''),
+        id: String(deal.id || ''),
+        repo: deal.repoShort || repoShort(deal.repo),
+        title: deal.titleFull || deal.title || '',
+        open: row.open,
+        state: deal.state || deal.status || '',
+        stateLabel: row.stateLabel,
+        tone: row.tone,
+        stageText: deal.stageText || '',
+        stageLive: deal.stageLive === true,
+        performer: deal.assignee || '',
+        durationText: duration === null ? 'начало неизвестно' : fmtAge(duration),
+        leftPct: Number(left.toFixed(1)),
+        widthPct: Number(Math.max(1.5, right - left).toFixed(1)),
+        // Начало раньше окна или неизвестно вовсе: рисунок помечает это, а не
+        // выдаёт догадку за факт.
+        clipped,
+        exact: row.from !== null,
+        title:
+          `${label} · ${deal.titleFull || deal.title || '—'} · ${row.stateLabel || '—'}` +
+          (duration === null ? ' · начало неизвестно' : ` · ${fmtAge(duration)}`) +
+          (row.open ? '' : ' · завершено') +
+          (clipped ? ' · началось раньше окна суток' : ''),
+      }
+    }),
+  }
 }
 
 /**
@@ -374,7 +504,10 @@ function groupDeals(deals) {
   const groups = [...named.keys()].sort().map((repo) => ({
     key: repo,
     repo,
-    label: repo,
+    // В списке — только хвост пути (`payout-sx-widgets-api`): абсолютный путь
+    // как заголовок группы читается как шум. Полный путь остаётся в `repo` и в
+    // подсказке шапки; по `repo` же группируются дела.
+    label: repoShort(repo),
     // Выдуманного тона у группы нет: она про репозиторий, а не про ожидание.
     // Состояния видны в шапке группы и бейджами в строках.
     tone: '',
@@ -607,6 +740,8 @@ function shapeFinishedRow(raw) {
     id: String(row.id || ''),
     repo,
     repoLabel: repoLabel(repo),
+    // Хвост пути — для списков и таймлайна; полный адрес остаётся в подсказке.
+    repoShort: repoShort(repo),
     title: fmtTitle(row.title, 90),
     titleFull: String(row.title || ''),
     assignee: String(row.assignee || '—'),
@@ -1416,13 +1551,37 @@ function fmtDuration(sec) {
   return fmtAge(value)
 }
 
-/** Лизинг незакрытой попытки словом: `жив`/`лизинг истёк`/`неизвестно`. */
+/**
+ * Слово о лизинге попытки: что с ней происходит.
+ *
+ * Решает не только поле `lease`, но и `status`: `_own_attempt` уже сложил
+ * живость в статус (`running` — лизинг живой, `orphan` — срок вышел, `unknown` —
+ * срока нет ни в store, ни в событии). Ключ по одному `lease` давал «неизвестно»
+ * на идущей попытке, потому что ручка попыток это поле не отдавала (09.11).
+ */
 function leaseWord(lease, status) {
   const key = String(lease || '')
-  if (key === 'live') return 'жив'
-  if (key === 'expired') return 'лизинг истёк'
-  if (key === 'dead' || status === 'orphan') return 'лизинг истёк'
-  return 'неизвестно'
+  const mark = String(status || '')
+  if (key === 'live' || mark === 'running') return 'идёт'
+  if (key === 'expired' || key === 'dead' || mark === 'orphan') return 'лизинг истёк'
+  // Срок нигде не записан: «идёт» было бы догадкой, а «неизвестно» не отвечало
+  // ни на один вопрос.
+  return 'без лизинга'
+}
+
+/**
+ * Ось таймлайна словами: `16:31 → 16:41`, а через полночь — с датой слева.
+ *
+ * Время суток без даты на переходе через полночь читалось бы как «конец раньше
+ * начала».
+ */
+function fmtSpan(from, to) {
+  const a = numOrNull(from)
+  const b = numOrNull(to)
+  if (a === null || b === null) return ''
+  const day = (value) => new Date(value * 1000).toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' })
+  const left = day(a) === day(b) ? fmtClock(a) : `${day(a)} ${fmtClock(a)}`
+  return `${left} → ${fmtClock(b)}`
 }
 
 /** Сколько дел в секундах — только конечные числа, иначе `null`. */
@@ -1606,11 +1765,12 @@ const KIND_ICON = {
 }
 
 /**
- * Вид строки попытки: подпись, штрихи, чипы и надбавка «сколько не показано».
+ * Вид строки попытки: подпись, штрихи, чипы и суммарное число вызовов.
  *
- * `badge` — то, что нельзя прятать: `+N` вызовов отрезано потолком и `⋯M`
- * наложено из-за нехватки уровней. Обе цифры приходят из данных, а не из
- * «сколько влезло».
+ * `badge` — сколько вызовов инструментов было у попытки: показанные плюс
+ * отрезанные потолком (`calls_omitted`), то есть факт из журнала, а не «сколько
+ * влезло на дорожку». Сколько чипов легло друг на друга из-за нехватки уровней —
+ * свойство раскладки, а не работы: на экран это число не выносится.
  */
 function attemptView(bar, scale) {
   const b = bar && typeof bar === 'object' ? bar : {}
@@ -1630,10 +1790,9 @@ function attemptView(bar, scale) {
       })
     : { chips: [], height: TL.top + TL.levelH, clipped: 0 }
   const omitted = numOrNull(b.callsOmitted) || 0
-  const clipped = layout.clipped || 0
+  const total = calls.length + omitted
   const notes = []
   if (omitted) notes.push(`ещё ${fmtCount(omitted)} ${plural(omitted, 'вызов', 'вызова', 'вызовов')} не показано (потолок)`)
-  if (clipped) notes.push(`${fmtCount(clipped)} ${plural(clipped, 'вызов', 'вызова', 'вызовов')} наложено: уровней не хватило`)
   const chips = layout.chips.map((chip) => {
     const call = chip.call || {}
     // Подсказка и инспектор читают одни и те же поля: имя инструмента, время
@@ -1748,10 +1907,10 @@ function attemptView(bar, scale) {
     chips,
     marks,
     waits,
-    // Надбавка на экране: `+N` — обрезано данными, `⋯M` — наложено рисунком.
-    badge: [omitted ? `+${fmtCount(omitted)}` : '', clipped ? `⋯${fmtCount(clipped)}` : '']
-      .filter(Boolean)
-      .join(' '),
+    // Надбавка на экране: суммарное число вызовов попытки. `badgeCut` — у части
+    // вызовов чипа нет (потолок данных), и это единственное, что стоит выделять.
+    badge: total ? `${fmtCount(total)} ${plural(total, 'вызов', 'вызова', 'вызовов')}` : '',
+    badgeCut: Boolean(omitted),
     note: notes.join(' · '),
     title: [b.title || '', notes.join(' · ')].filter(Boolean).join(' · '),
   }
@@ -2817,7 +2976,13 @@ function DutyAttemptRow({ view, callSel, onSelectCall, toolFilter }) {
     { className: 'duty-tl-lbl', 'data-tip': view.bandTip || view.title || '' },
     h('span', { className: 'duty-tl-n' }, view.label.number),
     h('span', { className: `duty-tl-st t-${view.label.tone}` }, view.label.status),
-    view.badge ? h('span', { className: 'duty-tl-more', title: view.note || view.title }, view.badge) : null,
+    view.badge
+      ? h(
+          'span',
+          { className: `duty-tl-more${view.badgeCut ? ' is-cut' : ''}`, title: view.note || view.title },
+          view.badge,
+        )
+      : null,
   )
   const track = []
   if (view.band) {
@@ -2959,6 +3124,10 @@ const CSS = `
 .duty-row:hover td{background:color-mix(in srgb, var(--ui-text-primary) 6%, transparent)}
 .duty-row.sel td{background:color-mix(in srgb, var(--ui-accent) 12%, transparent)}
 .duty-mono{font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:11px;color:var(--ui-text-secondary)}
+/* Идущий этап дела — акцентом и точкой: «где оно стоит» не должно тонуть
+ * среди прочих ячеек строки. */
+.duty-stage-now{color:var(--ui-accent) !important;font-weight:600}
+.duty-stage-now::before{content:'● ';font-size:9px;vertical-align:2px}
 .duty-badge{display:inline-flex;align-items:center;gap:4px;padding:1px 7px;border-radius:999px;font-size:11px;white-space:nowrap;border:1px solid color-mix(in srgb, currentColor 45%, transparent);background:color-mix(in srgb, currentColor 14%, transparent)}
 .duty-badge i{display:inline-block;width:6px;height:6px;border-radius:50%;background:currentColor}
 .duty-empty{display:flex;flex-direction:column;gap:8px;align-items:flex-start;padding:48px 16px;color:var(--ui-text-secondary)}
@@ -3108,8 +3277,10 @@ const CSS = `
 .duty-tl-st.t-yellow{color:var(--ui-yellow)}
 .duty-tl-st.t-blue{color:var(--ui-blue)}
 .duty-tl-ms{font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:10px;color:var(--ui-text-tertiary);text-align:right}
-/* Надбавка «сколько не показано»: обрезанное нельзя показывать полным. */
-.duty-tl-more{font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:9.5px;font-weight:700;color:var(--ui-yellow);padding:0 3px;border-radius:3px;background:color-mix(in srgb, var(--ui-yellow) 16%, transparent)}
+/* Суммарное число вызовов попытки: факт, а не предупреждение — тон нейтральный.
+ * Жёлтым помечается только усечённое потолком: у части вызовов чипа нет. */
+.duty-tl-more{font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:9.5px;font-weight:700;color:var(--ui-text-tertiary);padding:0 3px;border-radius:3px;background:color-mix(in srgb, var(--ui-text-tertiary) 14%, transparent)}
+.duty-tl-more.is-cut{color:var(--ui-yellow);background:color-mix(in srgb, var(--ui-yellow) 16%, transparent)}
 /* Вызов без результата: полый чип — длительности нет, а не ноль. */
 .duty-tl-call.duty-tl-unfinished,.duty-tl-tick.duty-tl-unfinished{background:transparent !important;box-shadow:inset 0 0 0 1.5px currentColor !important;opacity:.9}
 .duty-tl-track{position:relative;height:100%}
@@ -3417,8 +3588,15 @@ function DealRow({ deal, selected, onPick }) {
     },
     h('td', { className: 'duty-mono', title: deal.id }, deal.id),
     h('td', { title: deal.titleFull }, deal.title),
-    h('td', { title: deal.assignee }, deal.assignee),
-    h('td', { className: 'duty-muted duty-mono', title: deal.stageText || 'этап не начат' }, deal.stageText || '—'),
+    h('td', { title: deal.assigneeNote || 'исполнитель' }, deal.assignee),
+    h(
+      'td',
+      {
+        className: `duty-muted duty-mono${deal.stageLive ? ' duty-stage-now' : ''}`,
+        title: deal.stageText || 'этап не начат',
+      },
+      deal.stageText || '—',
+    ),
     h('td', { className: 'duty-num', title: attemptTitle }, deal.attemptAgeText),
     h('td', { title: leaseTitle }, deal.leaseText),
     h('td', { className: 'duty-num', title: `${deal.lastActionKind}: ${deal.lastActionSummary || '—'}` }, deal.lastActionAgeText),
@@ -3448,14 +3626,14 @@ function DealGroup({ group, selectedKey, onPick }) {
       h(
         'colgroup',
         null,
-        h('col', { style: { width: '104px' } }),
-        h('col', null),
-        h('col', { style: { width: '132px' } }),
-        h('col', { style: { width: '104px' } }),
-        h('col', { style: { width: '68px' } }),
-        h('col', { style: { width: '64px' } }),
-        h('col', { style: { width: '72px' } }),
-        h('col', { style: { width: '124px' } }),
+        h('col', { style: { width: '9%' } }),
+        h('col', { style: { width: '28%' } }),
+        h('col', { style: { width: '12%' } }),
+        h('col', { style: { width: '10%' } }),
+        h('col', { style: { width: '7%' } }),
+        h('col', { style: { width: '6%' } }),
+        h('col', { style: { width: '8%' } }),
+        h('col', { style: { width: '12%' } }),
       ),
       h(
         'thead',
@@ -4186,6 +4364,22 @@ function FinishedTable({ group, onPick }) {
   return h(
     'table',
     { className: 'duty-table duty-finished-table' },
+    // Колонки заданы явно: у каждого репозитория своя таблица, и без ширин
+    // браузер считает их по содержимому — колонки групп разъезжались (09.11).
+    h(
+      'colgroup',
+      null,
+      h('col', { style: { width: '8%' } }),
+      h('col', { style: { width: '9%' } }),
+      h('col', { style: { width: '23%' } }),
+      h('col', { style: { width: '8%' } }),
+      h('col', { style: { width: '6%' } }),
+      h('col', { style: { width: '6%' } }),
+      h('col', { style: { width: '8%' } }),
+      h('col', { style: { width: '13%' } }),
+      h('col', { style: { width: '10%' } }),
+      h('col', { style: { width: '9%' } }),
+    ),
     h(
       'thead',
       null,
@@ -4370,8 +4564,11 @@ function DealScreen({ sel, onBack }) {
         { style: { flex: '1 1 auto', minWidth: 0 } },
         h(
           'div',
+          // На подробной странице путь стоит целиком: списки сокращают его до
+          // хвоста, а тут человек пришёл смотреть одно дело — адрес репозитория
+          // и есть факт, а не шум (09.11).
           { className: 'duty-mono', title: repoLabel((detail.data && detail.data.repo) || sel.repo) },
-          `${repoShort((detail.data && detail.data.repo) || sel.repo)} · ${sel.id}`,
+          `${repoLabel((detail.data && detail.data.repo) || sel.repo)} · ${sel.id}`,
         ),
         h('div', { className: 'duty-deal-title' }, (detail.data && detail.data.title) || sel.titleFull || '—'),
         detail.data ? h(SpecStrip, { spec: scale.spec }) : null,

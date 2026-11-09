@@ -358,6 +358,43 @@ def test_finished_repo_filter_and_limit(client: TestClient, home: Path) -> None:
     assert [row["title"] for row in limited["deals"]] == ["без репозитория", "b1"]
 
 
+def test_finished_cursor_pagination_walks_backwards_without_repeats(
+    client: TestClient, home: Path
+) -> None:
+    """Курсор — пара «факт закрытия + id»: страницы не повторяют строк и не теряют их."""
+    ids = []
+    for index in range(5):
+        deal_id = make_deal(home, repo="repo-a", title=f"c{index}", created_at=NOW - 1000)
+        # Два дела закрыты одно и то же мгновение: ключ обязан различать их по id,
+        # иначе страница повторит строку или перескочит через неё.
+        close_stages_done(home, deal_id, stages=["impl"], ts=NOW - 500 + (index // 2))
+        ids.append(deal_id)
+
+    first = client.get("/deals", params={"limit": 2}).json()
+    assert first["cursor"] == ""
+    assert first["next_cursor"]
+    assert first["truncated"] is True
+
+    second = client.get("/deals", params={"limit": 2, "cursor": first["next_cursor"]}).json()
+    third = client.get("/deals", params={"limit": 2, "cursor": second["next_cursor"]}).json()
+
+    walked = [row["id"] for page in (first, second, third) for row in page["deals"]]
+    # Все дела ровно по одному разу, свежие сверху — тот же порядок, что у полного списка.
+    assert sorted(walked) == sorted(ids)
+    assert len(walked) == len(set(walked)) == 5
+    assert walked == [row["id"] for row in client.get("/deals", params={"limit": 50}).json()["deals"]]
+    # Последняя страница сама говорит, что она последняя.
+    assert third["next_cursor"] is None
+    assert third["truncated"] is False
+    # `total` — сколько дел подошло под фильтр целиком, а не размер страницы.
+    assert [page["total"] for page in (first, second, third)] == [5, 5, 5]
+
+    # Кривой курсор — отказ с форматом, а не пустая страница.
+    broken = client.get("/deals", params={"cursor": "nonsense"})
+    assert broken.status_code == 400
+    assert "finished_at" in broken.json()["detail"]
+
+
 def test_finished_status_filter_narrows_and_refuses_open_status(
     client: TestClient, home: Path
 ) -> None:

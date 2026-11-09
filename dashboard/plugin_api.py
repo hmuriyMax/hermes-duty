@@ -1676,6 +1676,37 @@ def _finished_note(
     return f"завершённых дел нет: в {where} ни одного дела в статусе {', '.join(statuses)}"
 
 
+def _deals_cursor_key(row: dict[str, Any]) -> tuple[int, str]:
+    """Ключ порядка строки списка: `(-finished_at, id)`.
+
+    Знак минус — потому что список идёт свежими вверх, а ключ должен расти в том
+    же направлении, что и порядок: тогда «следующая страница» — это `key >
+    ключ последней строки`. `finished_at` может быть `null` (факта закрытия в
+    журнале нет): такие строки уезжают в конец списка, и ключ у них — `0`.
+    """
+    return (-int(row.get("finished_at") or 0), str(row.get("id") or ""))
+
+
+def _parse_deals_cursor(cursor: str) -> tuple[int, str]:
+    """`<finished_at>:<id>` → ключ порядка; кривой курсор — отказ.
+
+    Курсор приходит от поверхности, а не от человека, но отказ с форматом честнее
+    пустого списка: «страница пуста» и «курсор сломан» — разные факты.
+    """
+    text = str(cursor or "").strip()
+    at, sep, deal_id = text.partition(":")
+    if not sep or not deal_id.strip() or not re.fullmatch(r"-?\d+", at.strip()):
+        raise HTTPException(
+            status_code=400,
+            headers=NO_STORE_HEADERS,
+            detail=(
+                f"?cursor={cursor!r}: ожидалось `<finished_at>:<id>` "
+                "(ключ последней строки страницы из `next_cursor`)"
+            ),
+        )
+    return (-int(at.strip()), deal_id.strip())
+
+
 def collect_deals(
     home: Path,
     now: int,
@@ -1683,13 +1714,16 @@ def collect_deals(
     statuses: tuple[str, ...] = FINISHED_STATUSES,
     repo: Optional[str] = None,
     limit: int = DEFAULT_DEALS_LIMIT,
+    cursor: Optional[str] = None,
 ) -> dict[str, Any]:
     """Список завершённых дел: закрытые и архивные, свежие сверху.
 
     `repo` — фильтр группировки (`None` — все репозитории, `""` — ровно дела
     **без** репозитория), как у `/now` и `/stats`. `limit` режет список после
     сортировки, а `total` называет, сколько дел подошло под фильтр целиком:
-    иначе «50 строк» читалось бы как «50 закрытых дел».
+    иначе «50 строк» читалось бы как «50 закрытых дел». `cursor` — «строго
+    старше названного ключа»: следующая страница без смещения, поэтому новое
+    закрытие между запросами не сдвигает окно и не повторяет строку.
 
     Ошибка store не валит ответ — она в `errors[]`, а причина пустоты — в
     `note`: «дел нет» и «store не прочитался» разные факты.
@@ -1720,16 +1754,27 @@ def collect_deals(
             conn.close()
     # Свежие сверху: закрытие — то, чем дело попадает в список. Дело без факта
     # закрытия (`finished_at: null`) уходит в конец, а не притворяется свежим.
-    rows.sort(key=lambda item: (-(item["finished_at"] or 0), item["id"]))
+    rows.sort(key=_deals_cursor_key)
     total = len(rows)
+    after = _parse_deals_cursor(cursor) if cursor else None
+    if after is not None:
+        # Строго после курсора: страница не повторяет строку, на которой
+        # остановилась, даже если в списке есть дела с тем же мгновением закрытия.
+        rows = [row for row in rows if _deals_cursor_key(row) > after]
     shown = rows[:limit]
+    next_cursor = None
+    if shown and len(rows) > len(shown):
+        last = shown[-1]
+        next_cursor = f"{int(last.get('finished_at') or 0)}:{last.get('id')}"
     return {
         "now": now,
         "statuses": list(statuses),
         "count": len(shown),
         "total": total,
         "limit": limit,
-        "truncated": total > len(shown),
+        "cursor": cursor or "",
+        "next_cursor": next_cursor,
+        "truncated": next_cursor is not None,
         "deals": shown,
         "note": _finished_note(shown, statuses, repo, errors),
         "errors": errors,
@@ -2904,6 +2949,7 @@ def deals_list(
     status: Optional[str] = None,
     repo: Optional[str] = None,
     limit: Optional[int] = None,
+    cursor: Optional[str] = None,
     board: Optional[str] = None,
 ) -> dict[str, Any]:
     """Завершённые дела: списком, группа — `repo`, свежие сверху.
@@ -2915,6 +2961,14 @@ def deals_list(
     свойство дела, а не адрес). `?limit=N` — сколько строк отдать (по умолчанию
     50, не больше 500): `total` и `truncated` называют, сколько дел подошло под
     фильтр целиком. `?board=` — отказ (400) с подсказкой: доск нет.
+
+    `?cursor=<finished_at>:<id>` — курсорная пагинация: отдать только дела
+    **строго старше** названного (ключ — пара «факт закрытия + id», тот же, по
+    которому список отсортирован). `next_cursor` в ответе — ключ последней строки
+    страницы, `null` — страница последняя. Смещение (`offset`) не заводится
+    намеренно: список меняется между запросами (новое закрытие сдвигает окно), и
+    страница «2» по смещению показывала бы повтор или пропуск. Кривой курсор —
+    отказ 400 с форматом, а не пустой список.
 
     Строка несёт `finished_at`, `cause`, `stages`, `attempts`, `questions`,
     `published` и `duration_sec` — те же факты журнала, что у
@@ -2934,7 +2988,9 @@ def deals_list(
                 "дел не выгружается целиком"
             ),
         )
-    return collect_deals(_hermes_home(), _now_sec(), statuses=statuses, repo=repo, limit=shown)
+    return collect_deals(
+        _hermes_home(), _now_sec(), statuses=statuses, repo=repo, limit=shown, cursor=cursor
+    )
 
 
 @router.get("/now")
@@ -3139,6 +3195,14 @@ def _own_attempt(row: dict[str, Any], now: int) -> dict[str, Any]:
         "commit": row["commit"],
         "pid": row["pid"],
         "reaped": row["reaped"],
+        # Живость лизинга отдельным полем: `status` называет попытку
+        # (`running`/`orphan`/`unknown`), а поверхность ещё и пишет, почему она
+        # так решила — «идёт» или «без лизинга». Без этого поля экран не отличал
+        # идущую попытку от неизвестной и говорил «неизвестно» про живую (09.11).
+        "lease": row.get("lease"),
+        "lease_expires": row.get("lease_expires"),
+        "live": row.get("live"),
+        "dead": row.get("dead"),
         "progress": row["progress"],
         # Вызовы инструментов из телеметрии (`attempt_progress`): по паре
         # «старт ↔ результат» на вызов. Без них таймлайн рисует только полосу

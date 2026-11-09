@@ -1,16 +1,22 @@
-/* Hermes Duty — веб-версия (0.0.7).
+/* Hermes Duty — веб-версия.
  *
- * Пять экранов поверх трёх API-ответов плагина:
- *   #/now             «Сейчас»            — GET /now
- *   #/deals           «Завершённые»       — GET /deals
+ * Три экрана поверх четырёх API-ответов плагина:
+ *   #/now             «Дела»              — GET /now + GET /deals (подвал, свёрнут)
  *   #/why             «Почему стоит»      — GET /now (группировка + evidence)
  *   #/health          «Здоровье»          — GET /stats
  *   #/deal/<deal_id>  «Дело»              — GET /deal/{deal_id} + /duty/{deal_id}/attempts
  *
+ * С 09.11 «Сейчас», «Завершённые» и «Дело» — одна страница: сверху мини-таймлайн
+ * активных дел, ниже строки по репозиториям, в подвале свёрнутый блок завершённых
+ * с курсорной пагинацией. Вкладок «Завершённые» и «Дело» больше нет: первая
+ * дублировала список, вторая открывала пустой выбор дела. `#/deals` остался
+ * старым адресом и открывает ту же страницу с раскрытым подвалом.
+ *
  * Дело адресуется ТОЛЬКО своим id `d_<hex>` (0.0.6: доски нет). Прежний адрес
  * `#/deal/<board>/<id>` — отказ: страница называет, что доски больше нет, вместо
  * того чтобы открыть полусломанную карточку. Список дел группируется по `repo`,
- * дела без репозитория — отдельной группой и последней.
+ * дела без репозитория — отдельной группой и последней; в списках репозиторий
+ * подписан хвостом пути, полный путь — на странице дела.
  *
  * Шейпер ответов не дублируется: он импортируется из `./model.js`, а бэкенд
  * отдаёт тот же файл, что вшит в десктопный плагин. Таксономия состояний и
@@ -26,6 +32,7 @@ import {
   attemptView,
   laneView,
   filterNow,
+  dealTimeline,
   fmtAge,
   fmtClock,
   groupStatesText,
@@ -249,7 +256,11 @@ let ticker = null
 const snap = { data: null, error: null, loading: false }
 const filter = { repo: ALL_REPOS, states: new Set(), query: '', effQuery: '' }
 const health = { data: null, error: null, loading: false }
-const finished = { data: null, error: null, loading: false }
+const FINISHED_PAGE = 20
+// Завершённые живут на той же странице, свёрнутыми. `prev` — стек курсоров для
+// «новее»: бэкенд отдаёт строго «старше курсора», и обратный ход помнит, откуда
+// пришли, — смещения (`offset`) в API нет намеренно.
+const finished = { data: null, error: null, loading: false, open: false, cursor: null, prev: [] }
 const dealSnap = { key: '', data: null, attempts: null, error: null, loading: false, refreshedAt: 0, refreshError: '', spots: [] }
 
 function setStamp(at) {
@@ -273,6 +284,10 @@ async function loadNow() {
     snap.data = await api('/now')
     snap.error = null
     setStamp(Date.now())
+    // Завершённые нужны таймлайну, а не только свёрнутому блоку: первая загрузка
+    // идёт сразу, дальше — тихое обновление той же страницы без сброса курсора.
+    if (!finished.data) void loadFinished('reset')
+    else if (finished.open) void loadFinished('keep')
   } catch (err) {
     snap.error = err.message
   } finally {
@@ -314,14 +329,40 @@ function dealRow(deal) {
     },
     h('td', { class: 'mono' }, deal.id),
     h('td', { class: 'ttl', title: deal.titleFull }, deal.title),
-    h('td', null, deal.assignee),
+    h('td', { title: deal.assigneeNote || 'исполнитель' }, deal.assignee),
     // Этап и номер попытки из журнала (`/now.stage`): «что сейчас» видно в
-    // строке, без открытия дела. Прочерк — у дела ещё не было попытки.
-    h('td', { class: 'mono muted', title: deal.stageText || 'этап не начат' }, deal.stageText || '—'),
+    // строке, без открытия дела. Прочерк — у дела ещё не было попытки. Идущий
+    // этап подсвечен акцентом: это ответ на «где оно стоит», и он не должен
+    // тонуть среди прочих ячеек (09.11).
+    h(
+      'td',
+      { class: `mono muted${deal.stageLive ? ' stage-now' : ''}`, title: deal.stageText || 'этап не начат' },
+      deal.stageText || '—',
+    ),
     h('td', { class: 'n', title: attemptTitle }, deal.attemptAgeText),
     h('td', { title: leaseTitle }, deal.leaseText),
     h('td', { class: 'n', title: `${deal.lastActionKind}: ${deal.lastActionSummary || '—'}` }, deal.lastActionAgeText),
     h('td', null, Badge(deal.state, deal.humanKind)),
+  )
+}
+
+/**
+ * Ширины колонок списков — доли, общие для всех групп и обеих поверхностей.
+ *
+ * Группа дел — отдельная таблица на репозиторий: без явных ширин браузер считает
+ * колонки по содержимому, и заголовок одной группы сдвигает колонки относительно
+ * соседней (09.11, Макс). Доли, а не пиксели: на узком окне колонки сжимаются
+ * вместе, а не съедают «заголовок» до нуля.
+ */
+const NOW_COLS = ['9%', '28%', '12%', '10%', '7%', '6%', '8%', '12%']
+const FINISHED_COLS = ['8%', '9%', '23%', '8%', '6%', '6%', '8%', '13%', '10%', '9%']
+
+/** `<colgroup>` по списку ширин: одна геометрия у всех групп списка. */
+function colGroup(widths) {
+  return h(
+    'colgroup',
+    null,
+    ...widths.map((width, index) => h('col', { key: index, style: width ? `width:${width}` : null })),
   )
 }
 
@@ -344,7 +385,8 @@ function groupBlock(group) {
     ),
     h(
       'table',
-      null,
+      { class: 'grp-table' },
+      colGroup(NOW_COLS),
       h(
         'thead',
         null,
@@ -450,6 +492,99 @@ function filtersBlock(model) {
   )
 }
 
+/**
+ * Панель поиска: единственный фильтр на странице.
+ *
+ * Чипы состояний и селект репозитория убраны (09.11, Макс: «я ими не пользуюсь»):
+ * состояние и репозиторий видны в строках и группировке, а частый вопрос —
+ * «где это дело» — закрывает поиск по id, заголовку, исполнителю и этапу.
+ */
+function searchBlock() {
+  return h(
+    'div',
+    { class: 'filters' },
+    h('input', {
+      type: 'search',
+      placeholder: 'поиск: id, заголовок, исполнитель, этап',
+      value: filter.query,
+      oninput: (e) => {
+        filter.query = e.target.value
+        clearTimeout(filter.debounce)
+        filter.debounce = setTimeout(() => {
+          filter.effQuery = filter.query
+          render()
+        }, SEARCH_DEBOUNCE_MS)
+      },
+    }),
+  )
+}
+
+/**
+ * Общий таймлайн активных дел: дорожка на дело, полоса от начала до «сейчас».
+ *
+ * Картина отвечает на «что идёт и сколько это длится» одним взглядом, а
+ * подробности остаются в списке ниже. Геометрия — из шейпера (`dealTimeline`),
+ * клик открывает дело.
+ */
+function timelineBlock(model) {
+  // Завершённые идут в ту же картинку (09.11): «что происходило сегодня» — это
+  // и идущее, и уже закрытое. Окно — сутки, его держит шейпер.
+  const done = finished.data ? shapeFinished(finished.data).deals : []
+  const view = dealTimeline(model.deals, done, model.now)
+  const head = h(
+    'div',
+    { class: 'panel-h' },
+    'таймлайн дел',
+    view.windowText ? h('span', { class: 'muted', style: 'margin-left:8px' }, view.windowText) : null,
+    view.omitted
+      ? h('span', { class: 'muted', style: 'margin-left:auto' }, `ещё ${view.omitted} не показано`)
+      : null,
+  )
+  if (view.empty) {
+    return h('div', { class: 'panel tl-mini' }, head, h('div', { class: 'panel-b muted' }, 'за сутки дел не было'))
+  }
+  return h(
+    'div',
+    { class: 'panel tl-mini' },
+    head,
+    h(
+      'div',
+      { class: 'tl-mini-rows' },
+      ...view.rows.map((row) =>
+        h(
+          'div',
+          {
+            class: `tl-mini-row${row.open ? '' : ' is-done'}`,
+            tabindex: '0',
+            title: row.title,
+            'data-key': `tl:${row.key}`,
+            onclick: () => {
+              location.hash = `#/deal/${encodeURIComponent(row.id)}`
+            },
+            onkeydown: (e) => {
+              if (e.key === 'Enter') location.hash = `#/deal/${encodeURIComponent(row.id)}`
+            },
+          },
+          h('span', { class: 'tl-mini-lbl' }, h('b', null, row.repo), h('span', { class: 'muted' }, row.id)),
+          h(
+            'span',
+            { class: 'tl-mini-track' },
+            h('span', {
+              class: `tl-mini-bar t-${row.tone}${row.exact ? '' : ' inexact'}${row.clipped ? ' clipped' : ''}`,
+              style: `left:${row.leftPct}%;width:${row.widthPct}%`,
+            }),
+            row.stageLive && row.open
+              ? h('span', { class: 'tl-mini-now', style: `left:${row.leftPct + row.widthPct}%` })
+              : null,
+          ),
+          h('span', { class: 'tl-mini-age mono' }, row.durationText),
+          h('span', { class: 'tl-mini-state' }, row.stateLabel),
+        ),
+      ),
+    ),
+  )
+}
+
 function viewNow() {
   if (!snap.data && snap.error) return errorBanner(`ошибка запроса /now: ${snap.error}`, loadNow)
   if (!snap.data) {
@@ -471,7 +606,7 @@ function viewNow() {
 
   if (verEl && !verEl.textContent && snap.data.by_state) verEl.textContent = ''
 
-  // «N вопросов + M блокировок» по тому, что сейчас на экране (с фильтрами):
+  // «N вопросов + M блокировок» по тому, что сейчас на экране (с поиском):
   // вопрос — на него можно ответить, блокировка — нужен человек без вопроса.
   if (humanEl) {
     humanEl.textContent = view.count ? humanLine(view.humanCounts) : ''
@@ -489,14 +624,17 @@ function viewNow() {
     const note = noticesBlock(lines)
     if (note) parts.push(note)
   }
-  parts.push(filtersBlock(model))
+  parts.push(searchBlock())
+  // Таймлайн — по тому, что видно (фильтр поиска), но по полному набору, когда
+  // поиск пуст: верхушка страницы описывает срез, а не выборку под строкой.
+  parts.push(timelineBlock(view))
 
   if (!view.count) {
     parts.push(
       h(
         'div',
         { class: 'empty' },
-        h('b', null, model.count > 0 ? 'под фильтры ничего не подошло' : 'нет активных дел'),
+        h('b', null, model.count > 0 ? 'поиск ничего не нашёл' : 'нет активных дел'),
         h(
           'span',
           { class: 'muted' },
@@ -508,6 +646,9 @@ function viewNow() {
   } else {
     parts.push(...view.groups.map(groupBlock))
   }
+  // Завершённые — на той же странице, свёрнутыми: отдельная вкладка для «что уже
+  // сделано» заставляла переключаться ради справки (09.11).
+  parts.push(finishedSection())
   return h('div', null, ...parts)
 }
 
@@ -518,18 +659,43 @@ function viewNow() {
 // попытки, вопросы, длительность и публикация приходят с бэкенда, страница их не
 // пересчитывает (`shapeFinished`, `desktop/model.js`).
 
-async function loadFinished() {
+/**
+ * Загрузка страницы завершённых дел: `dir='next'` — старше текущего курсора,
+ * `dir='prev'` — назад по стеку, `dir='reset'` — с начала.
+ */
+async function loadFinished(dir = 'reset') {
+  if (dir === 'next' && finished.data) {
+    if (!finished.data.next_cursor) return
+    finished.prev.push(finished.cursor)
+    finished.cursor = finished.data.next_cursor
+  } else if (dir === 'prev') {
+    finished.cursor = finished.prev.pop() || null
+  } else if (dir === 'reset') {
+    finished.cursor = null
+    finished.prev = []
+  }
+  // `keep` — тихое обновление той же страницы: курсор и стек остаются, иначе
+  // авто-обновление каждый тик возвращало бы человека на первую страницу.
   finished.loading = true
+  render()
+  const query = `/deals?limit=${FINISHED_PAGE}` + (finished.cursor ? `&cursor=${encodeURIComponent(finished.cursor)}` : '')
   try {
-    finished.data = await api('/deals')
+    finished.data = await api(query)
     finished.error = null
-    setStamp(Date.now())
+    if (dir === 'reset') setStamp(Date.now())
   } catch (err) {
     finished.error = err.message
   } finally {
     finished.loading = false
     render()
   }
+}
+
+/** Свернуть/развернуть блок завершённых: свёрнут он до первого запроса. */
+function toggleFinished() {
+  finished.open = !finished.open
+  if (finished.open && !finished.data) void loadFinished('reset')
+  else render()
 }
 
 /** Бейдж терминального статуса: у закрытого дела нет состояния ожидания. */
@@ -578,7 +744,8 @@ function finishedGroupBlock(group) {
     ),
     h(
       'table',
-      null,
+      { class: 'grp-table' },
+      colGroup(FINISHED_COLS),
       h(
         'thead',
         null,
@@ -602,65 +769,69 @@ function finishedGroupBlock(group) {
   )
 }
 
-function viewFinished() {
-  if (!finished.data && finished.error) {
-    return errorBanner(`ошибка запроса /deals: ${finished.error}`, loadFinished)
-  }
-  if (!finished.data) {
-    return h(
-      'div',
-      { class: 'grp' },
-      h(
-        'div',
-        { class: 'panel-b' },
-        ...[0, 1, 2, 3].map((i) => h('div', { class: 'skel', style: `width:${92 - i * 10}%` })),
-      ),
-    )
-  }
-  const model = shapeFinished(finished.data)
-  const parts = []
-  if (finished.error) {
-    parts.push(
-      errorBanner(`снимок от ${fmtClock(model.now)} — обновление не удалось: ${finished.error}`, loadFinished),
-    )
-  }
-  if (model.errors.length) {
-    parts.push(noticesBlock(model.errors.map((err) => `источник ${err.source} недоступен: ${err.reason}`)))
-  }
-  parts.push(
+/**
+ * Блок завершённых дел внутри страницы «Дела»: по умолчанию свёрнут.
+ *
+ * Кнопки пагинации — курсорные: «новее» возвращается по стеку запросов, «старее»
+ * берёт `next_cursor` бэкенда. Показывать «страницу N из M» нечем и не нужно:
+ * список живёт в времени, а не в нумерации.
+ */
+function finishedSection() {
+  const data = finished.data
+  const model = data ? shapeFinished(data) : null
+  const head = h(
+    'div',
+    { class: 'panel-h' },
+    'завершённые',
+    model ? h('span', { class: 'muted', style: 'margin-left:8px' }, `${model.count} из ${model.total}`) : null,
     h(
-      'div',
-      { class: 'note' },
-      h(
-        'div',
-        null,
-        'Здесь только завершённые дела — закрытые и архивные. Числа строки (попытки, вопросы, длительность) — те же факты журнала, что в карточке дела: открыть её можно по id. Карточки kanban — отдельное наблюдение, не дела.',
-      ),
+      'button',
+      { class: 'icon-btn', style: 'margin-left:auto', onclick: toggleFinished, title: finished.open ? 'свернуть' : 'развернуть' },
+      finished.open ? 'свернуть ⌃' : 'показать ⌄',
     ),
   )
-  parts.push(
-    h(
-      'div',
-      { class: 'muted' },
-      `дел: ${model.count} из ${model.total} · статусы: ${model.statuses.join(', ') || '—'}`,
-    ),
-  )
-  if (model.truncated) {
-    parts.push(noticesBlock([`показаны не все: лимит ${model.limit}, всего ${model.total} — список режется лимитом /deals`]))
+  const body = []
+  if (finished.open) {
+    if (finished.error && !data) body.push(errorBanner(`ошибка запроса /deals: ${finished.error}`, () => loadFinished('reset')))
+    else if (!data) body.push(h('div', { class: 'panel-b muted' }, 'загрузка…'))
+    else {
+      if (finished.error) {
+        body.push(errorBanner(`снимок от ${fmtClock(model.now)} — обновление не удалось: ${finished.error}`, () => loadFinished('reset')))
+      }
+      if (model.errors.length) {
+        body.push(noticesBlock(model.errors.map((err) => `источник ${err.source} недоступен: ${err.reason}`)))
+      }
+      if (!model.count) {
+        body.push(
+          h(
+            'div',
+            { class: 'panel-b muted' },
+            model.note || 'в store нет ни одного закрытого дела',
+          ),
+        )
+      } else {
+        body.push(...model.groups.map(finishedGroupBlock))
+      }
+      body.push(
+        h(
+          'div',
+          { class: 'pager' },
+          h(
+            'button',
+            { class: 'chip', disabled: !finished.prev.length, onclick: () => void loadFinished('prev') },
+            '← новее',
+          ),
+          h(
+            'button',
+            { class: 'chip', disabled: !(data && data.next_cursor), onclick: () => void loadFinished('next') },
+            'старее →',
+          ),
+          h('span', { class: 'muted' }, `по ${FINISHED_PAGE} на страницу`),
+        ),
+      )
+    }
   }
-  if (!model.count) {
-    parts.push(
-      h(
-        'div',
-        { class: 'empty' },
-        h('b', null, 'завершённых дел нет'),
-        h('span', { class: 'muted' }, model.note || 'в store нет ни одного закрытого дела'),
-      ),
-    )
-    return h('div', null, ...parts)
-  }
-  parts.push(...model.groups.map(finishedGroupBlock))
-  return h('div', null, ...parts)
+  return h('div', { class: 'panel finished-panel', 'data-key': 'finished' }, head, ...body)
 }
 
 /* -------------------------------------------------------- экран «почему стоит» */
@@ -1446,9 +1617,11 @@ function attemptRowNode(view, key) {
     // Исход попытки — то, что меняется от тика к тику: подсвечивается он, а не
     // вся дорожка (полоса растёт непрерывно, вспышка на ней была бы миганием).
     h('span', { class: `tl-st t-${view.label.tone} fresh`, 'data-fresh': key }, view.label.status),
-    // Надбавка «не всё показано» — в подписи, а не поверх дорожки: она не
-    // должна перекрывать чипы.
-    view.badge ? h('span', { class: 'tl-more', title: view.note || view.title }, view.badge) : null,
+    // Суммарное число вызовов попытки — в подписи, а не поверх дорожки: оно не
+    // должно перекрывать чипы.
+    view.badge
+      ? h('span', { class: `tl-more${view.badgeCut ? ' is-cut' : ''}`, title: view.note || view.title }, view.badge)
+      : null,
   )
   const track = h('div', { class: 'tl-track', 'data-key': `track:${key}` })
   if (view.band) {
@@ -2200,7 +2373,6 @@ function render() {
   if (route.name === 'now') body.append(viewNow())
   else if (route.name === 'why') body.append(viewWhy())
   else if (route.name === 'health') body.append(viewHealth())
-  else if (route.name === 'deals') body.append(viewFinished())
   else if (route.bad) body.append(viewDealBadAddress(route.board, route.id))
   else body.append(route.id ? viewDeal(route.id) : viewDealPicker())
 
@@ -2223,7 +2395,7 @@ function schedule() {
   }
   // «Здоровье» и «Завершённые» — по журналу за всю историю: они не меняются за
   // секунды, и опрашивать их так же часто, как срез «сейчас», незачем.
-  const slow = route.name === 'health' || route.name === 'deals'
+  const slow = route.name === 'health'
   const ms = slow ? HEALTH_REFRESH_MS : REFRESH_MS
   timer = setTimeout(run, ms)
 }
@@ -2232,7 +2404,6 @@ function run() {
   if (route.name === 'now') void loadNow()
   else if (route.name === 'why') void loadNow()
   else if (route.name === 'health') void loadHealth()
-  else if (route.name === 'deals') void loadFinished()
   else if (route.bad) void loadNow()
   else if (route.id) void loadDeal(route.id)
   else void loadNow()
@@ -2243,11 +2414,17 @@ function onRoute() {
   // следующем тике: иначе смена маршрута оставила бы висеть чужой запрос.
   dealPollStop()
   route = parseRoute()
+  // `#/deals` — прежний отдельный экран списка: он больше не вкладка, но старый
+  // адрес открывает ту же страницу с развёрнутым блоком завершённых.
+  if (route.name === 'deals') {
+    route = { name: 'now' }
+    finished.open = true
+  }
   if (route.name !== 'deal') dealPoll.failures = 0
   // Данные, которых нет для нового экрана, не переиспользуем: иначе «Здоровье»
   // покажет старый снимок «сейчас» под своими KPI, а «Завершённые» — вчерашний
   // список под новым заголовком.
-  if ((route.name === 'health' && !health.data) || (route.name === 'deals' && !finished.data)) {
+  if (route.name === 'health' && !health.data) {
     stampAt = null
     tickStamp()
   }

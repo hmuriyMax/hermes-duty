@@ -53,23 +53,31 @@ test('бейдж дела в вебе подписывается по human_kind
   )
 })
 
-test('пять экранов маршрутизируются', () => {
+test('навигация: одна страница дел, «почему стоит» и «здоровье»', () => {
+  // 09.11: «Сейчас», «Завершённые» и «Дело» стали одной страницей — вкладки,
+  // ведущей на пустой выбор дела, больше нет, а завершённые живут в её подвале.
   assert.match(app, /parts\[0\] === 'deal'/)
   assert.match(app, /parts\[0\] === 'why'/)
   assert.match(app, /parts\[0\] === 'health'/)
-  assert.match(app, /parts\[0\] === 'deals'/)
   assert.match(app, /return \{ name: 'now' \}/)
-  // «Дело» — таб, а не только следствие клика по строке: экран, до которого
-  // нельзя дойти из навигации, на своём месте не читается.
-  for (const tab of ['now', 'deals', 'deal', 'why', 'health']) {
+  for (const tab of ['now', 'why', 'health']) {
     assert.match(html, new RegExp(`data-tab="${tab}"`), `нет вкладки ${tab}`)
   }
+  for (const gone of ['deals', 'deal']) {
+    assert.ok(!html.includes(`data-tab="${gone}"`), `вкладка ${gone} вернулась в навигацию`)
+  }
+  // Прежний адрес списка не 404: он открывает ту же страницу с раскрытым блоком.
+  assert.match(app, /if \(route\.name === 'deals'\) \{/)
 })
 
 test('«Завершённые» — список из `/deals`, числа берутся у бэкенда', () => {
   // страница ходит в тот же роут, что `bin/duty deals`, и группирует тем же шейпером
-  assert.match(app, /api\('\/deals'\)/)
-  assert.match(app, /shapeFinished\(finished\.data\)/)
+  assert.match(app, /api\(query\)/)
+  assert.match(app, /`\/deals\?limit=\$\{FINISHED_PAGE\}`/)
+  // Пагинация — курсорная, без смещений: страница берёт `next_cursor` бэкенда.
+  assert.match(app, /data\.next_cursor/)
+  assert.match(app, /finished\.prev\.push/)
+  assert.match(app, /shapeFinished\(data\)/)
   assert.match(pluginSource, /rest\('\/deals'/)
   assert.match(pluginSource, /shapeFinished\(finished\.data\)/)
   // второго счёта в строках нет: вопросы/попытки/длительность — поля ответа

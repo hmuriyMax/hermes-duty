@@ -90,7 +90,7 @@ test('веб создаёт svg в SVG-namespace, а не через createEleme
 const HTML_TAGS = [
   'a', 'article', 'b', 'br', 'button', 'code', 'div', 'em', 'h1', 'h2', 'h3', 'h4', 'hr', 'i',
   'input', 'label', 'li', 'ol', 'option', 'p', 'pre', 'section', 'select', 'small',
-  'span', 'strong', 'table', 'tbody', 'td', 'textarea', 'th', 'thead', 'tr', 'ul',
+  'span', 'strong', 'table', 'tbody', 'td', 'textarea', 'th', 'thead', 'tr', 'ul', 'col', 'colgroup',
 ]
 
 test('веб: каждый тег разметки классифицирован (svg-namespace либо HTML)', () => {

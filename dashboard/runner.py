@@ -402,6 +402,50 @@ def attempt_dir(home: Path, deal: Any, stage: str, attempt: int) -> Path:
     return base / "workspaces" / f"{deal['id']}-{stage}-{int(attempt)}"
 
 
+def _tree_is_from(tree: Path, rev: str) -> bool:
+    """Дерево отведено от `rev` (или позже него): база — предок его HEAD.
+
+    Нужна для повтора в сохранённом дереве: `git worktree` от той же базы даёт
+    базу предком HEAD, а дерево от другой базы — нет, и продолжать в нём нельзя.
+    """
+    if not rev:
+        return False
+    code, _ = _git(["merge-base", "--is-ancestor", rev, "HEAD"], Path(tree))
+    return code == 0
+
+
+def kept_tree(conn: Any, deal: Any, stage: str, attempt: int) -> Optional[Path]:
+    """Дерево прошлой попытки этапа, сохранённое как рабочее, — если оно есть.
+
+    Правило 0.0.9 сохраняет дерево упавшей попытки с незакоммиченной правкой
+    (`details.tree_kept`), но повтор всё равно начинал от базы, и работа
+    оставалась мёртвым грузом: координатору приходилось закрывать дело и
+    начинать новое от коммита (так вышло с `d_d5901481`, где разрыв гейтвея убил
+    попытку с 212 строками и 932 зелёными тестами). Продолжение дела идёт туда,
+    где оно остановилось: последняя закончившаяся попытка этого этапа назвала
+    своё сохранённое дерево — оно и берётся.
+
+    База не пересчитывается: дерево отведено от базы этапа, и проверку родства
+    делает `prepare_tree`. Дерево, которого уже нет на диске, — не сохранённое
+    дерево, а запись о нём.
+    """
+    events = journal.read_events(conn, str(deal["id"]))
+    for event in reversed(list(events)):
+        payload = event.get("payload") or {}
+        if event.get("kind") != "attempt_ended":
+            continue
+        if str(payload.get("stage") or "") != stage:
+            continue
+        if int(payload.get("attempt") or 0) >= int(attempt):
+            continue
+        kept = (payload.get("details") or {}).get("tree_kept")
+        if not kept:
+            return None
+        path = Path(str(kept))
+        return path if path.is_dir() else None
+    return None
+
+
 def contract_path(workdir: Path, stage: str, attempt: int) -> Path:
     """Файл входного контракта попытки."""
     return Path(workdir) / DUTY_SUBDIR / f"in-{stage}-{int(attempt)}.json"
@@ -457,18 +501,66 @@ def _git_stdout(args: Iterable[str], cwd: Path) -> tuple[int, str]:
 # --------------------------------------------------------------------- дерево
 
 
+def open_tree(
+    conn: Any,
+    deal: Any,
+    spec: Any,
+    stage: Any,
+    stage_id: str,
+    attempt: int,
+    workdir: Path,
+    stage_base: str,
+    *,
+    clock: Any,
+    source: str = ENGINE_SOURCE,
+) -> tuple[Optional[Path], Path]:
+    """Дерево попытки: продолжение сохранённого или новое от базы этапа.
+
+    Повтор после падения не должен начинать с базы: сохранённое дерево прошлой
+    попытки содержит работу, которую движок сам же и уберёг (`tree_kept`).
+    Продолжение пишется фактом `tree_reused` — по нему видно, что попытка №2
+    началась не с чистого листа, а с чужой остановки.
+    """
+    reuse = kept_tree(conn, deal, stage_id, attempt) if int(attempt) > 1 else None
+    tree, cwd = prepare_tree(spec, stage, workdir, base=stage_base, reuse=reuse)
+    if reuse is not None and tree is not None and Path(tree) == Path(reuse):
+        now = _now_sec(int(clock()))
+        event = _event(
+            deal,
+            "tree_reused",
+            {"stage": stage_id, "attempt": int(attempt), "from": str(reuse)},
+            {"stage": stage_id, "attempt": int(attempt)},
+            now,
+            source,
+        )
+        journal.append(conn, [event])
+    return tree, cwd
+
+
 def prepare_tree(
-    spec: Any, stage: Any, workdir: Path, *, base: Optional[str] = None
+    spec: Any,
+    stage: Any,
+    workdir: Path,
+    *,
+    base: Optional[str] = None,
+    reuse: Optional[Path] = None,
 ) -> tuple[Optional[Path], Path]:
     """Дерево попытки по `workspace` этапа: (дерево или None, cwd процесса).
 
     `worktree` — своё дерево от базы этапа (`base`, по умолчанию `spec.base`:
     валидатор уже проверил, что rev существует); `dir` — каталог дела из `repo`
     спеки, без worktree; `none` — дерева нет, cwd — сам каталог попытки.
+
+    `reuse` — дерево прошлой попытки, сохранённое как рабочее (`kept_tree`):
+    повтор продолжается в нём, а не с базы. Годится только дерево, отведённое
+    от той же базы этапа: если база не предок его HEAD, работа в дереве — про
+    другой код, и повтор отводят заново (иначе этап проверял бы чужое).
     """
     workdir = Path(workdir)
     if stage.workspace == "worktree":
         repo = Path(str(spec.repo or "")).expanduser()
+        if reuse is not None and _tree_is_from(reuse, base if base is not None else spec.base or ""):
+            return Path(reuse), Path(reuse)
         tree = workdir / "tree"
         rev = str(base if base is not None else spec.base or "")
         # `--detach`: база — это коммит, а не ветка. Ветка может быть уже занята
@@ -1916,7 +2008,9 @@ def run_shell_stage(
         workdir.mkdir(parents=True, exist_ok=True)
         events = journal.read_events(conn, str(deal["id"]))
         stage_base = base_of_stage(spec, stage, events)
-        tree, cwd = prepare_tree(spec, stage, workdir, base=stage_base)
+        tree, cwd = open_tree(
+            conn, deal, spec, stage, stage_id, attempt, workdir, stage_base, clock=clock
+        )
     except (RunnerError, OSError) as exc:
         kind = FAIL_CONTRACT if isinstance(exc, BaseError) else FAIL_INFRA
         release(conn, deal=deal, stage=stage_id, pid=engine_pid)
@@ -3251,7 +3345,9 @@ def run_stage(
         # отказ контракта, а не инфраструктуры: дерево от одного из них потеряло
         # бы работу другого.
         stage_base = base_of_stage(spec, stage, events)
-        tree, cwd = prepare_tree(spec, stage, workdir, base=stage_base)
+        tree, cwd = open_tree(
+            conn, deal, spec, stage, stage_id, attempt, workdir, stage_base, clock=clock
+        )
     except (RunnerError, OSError) as exc:
         kind = FAIL_CONTRACT if isinstance(exc, BaseError) else FAIL_INFRA
         release(conn, deal=deal, stage=stage_id, pid=engine_pid)

@@ -102,6 +102,7 @@ EVENT_KINDS = (
     "attempt_started",
     "attempt_progress",
     "attempt_ended",
+    "tree_reused",
     "released",
     "blocked",
     "unblocked",
@@ -139,6 +140,7 @@ NON_STATE_KINDS = (
     "patched",
     "question_answered",
     "attempt_progress",
+    "tree_reused",
     "published",
     "plan_proposed",
 )

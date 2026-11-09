@@ -193,12 +193,25 @@ test('разворот строки и правки экрана дела: пр�
     assert.doesNotMatch(text, /tl-mark i\s*\{[^}]*border-radius:\s*50%/, `${name}: маркер снова точка`)
   }
 
-  // Подсказки переносятся по словам, а не висят одной строкой.
-  for (const [name, text] of [['веб', css], ['десктоп', plugin]]) {
-    const rule = text.slice(text.indexOf('content:attr(data-tip)') >= 0 ? text.indexOf('content:attr(data-tip)') - 400 : text.indexOf('content: attr(data-tip)') - 400)
-    assert.match(rule.slice(0, 900), /white-space:\s*normal/, `${name}: подсказка не переносится`)
-    assert.match(rule.slice(0, 900), /max-width:\s*240px/, `${name}: у подсказки нет предела ширины`)
+  // Подсказка — свой слой в body, а не `::after` внутри дорожки: внутри её
+  // резала панель по `overflow`, а соседние строки со своим контекстом наложения
+  // оказывались выше любого `z-index` у хоста.
+  for (const [name, text, cls] of [['веб', css, '.tl-tip'], ['десктоп', plugin, '.duty-tl-tip']]) {
+    const start = text.indexOf(`${cls}{`) >= 0 ? text.indexOf(`${cls}{`) : text.indexOf(`${cls} {`)
+    assert.ok(start > 0, `${name}: нет слоя подсказки`)
+    const rule = text.slice(start, text.indexOf('}', start))
+    assert.match(rule, /position:\s*fixed/, `${name}: подсказка не в своём слое`)
+    assert.match(rule, /z-index:\s*9999/, `${name}: подсказка не поверх страницы`)
+    assert.match(rule, /white-space:\s*normal/, `${name}: подсказка не переносится`)
+    assert.match(rule, /max-width:\s*280px/, `${name}: у подсказки нет предела ширины`)
+    assert.doesNotMatch(text, /data-tip\);position:absolute/, `${name}: подсказка всё ещё ::after в дорожке`)
   }
+  assert.match(app, /function bindTipLayer\(\)[\s\S]{0,400}pointerover/, 'веб: подсказка не ловит наведение')
+  assert.match(app, /'aria-hidden': 'true'/, 'веб: слой подсказки без aria-hidden')
+  assert.match(plugin, /function dutyTipBind\(\)[\s\S]{0,400}pointerover/, 'десктоп: подсказка не ловит наведение')
+  // Автообновление подменяет узлы: подсказку надо снять, иначе она висит на месте.
+  assert.match(app, /dutyTipFollow/, 'веб: подсказка не сверяется с живостью хоста')
+  assert.match(plugin, /!dutyTipHost\.isConnected/, 'десктоп: подсказка не сверяется с живостью хоста')
 
   // Граф этапов — в заголовке дела, статус — в правом углу.
   assert.match(app, /deal-head-top[\s\S]{0,700}specStrip\(scale\.spec\)/, 'веб: граф не в заголовке')

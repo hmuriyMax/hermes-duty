@@ -2729,6 +2729,85 @@ function dutyToneVar(tone) {
  * начала, конца и длительность живут в подсказке строки — они не спорят с чипами
  * за место на дорожке. Вид приходит готовым (`attemptView`), здесь только DOM.
  */
+/* ---------------------------------------- слой подсказок поверх всей страницы */
+/* Та же причина, что в вебе: внутри дорожки подсказку режет панель по
+ * `overflow`, а соседние строки со своим контекстом наложения оказываются выше
+ * любого `z-index` у хоста. Подсказка — один узел в `body`, наведение ловится
+ * делегированием, потому что обновление страницы подменяет узлы. */
+const DUTY_TIP_HOSTS = '.duty-tl-call, .duty-tl-band, .duty-tl-lbl, .duty-tl-mark, .duty-tl-wait'
+
+let dutyTipBound = false
+let dutyTipNode = null
+let dutyTipHost = null
+
+function dutyTipHide() {
+  dutyTipHost = null
+  if (!dutyTipNode) return
+  dutyTipNode.style.opacity = '0'
+  dutyTipNode.setAttribute('aria-hidden', 'true')
+}
+
+function dutyTipPlace(host) {
+  const text = host.getAttribute('data-tip')
+  if (!text) return dutyTipHide()
+  if (!dutyTipNode || !dutyTipNode.isConnected) {
+    dutyTipNode = document.createElement('div')
+    dutyTipNode.className = 'duty-tl-tip'
+    dutyTipNode.setAttribute('role', 'tooltip')
+    dutyTipNode.setAttribute('aria-hidden', 'true')
+    document.body.append(dutyTipNode)
+  }
+  if (dutyTipNode.textContent !== text) dutyTipNode.textContent = text
+  dutyTipNode.style.opacity = '1'
+  dutyTipNode.setAttribute('aria-hidden', 'false')
+  const box = host.getBoundingClientRect()
+  const own = dutyTipNode.getBoundingClientRect()
+  const pad = 8
+  const gap = 7
+  let left = box.left + box.width / 2 - own.width / 2
+  left = Math.max(pad, Math.min(left, window.innerWidth - own.width - pad))
+  let top = box.top - own.height - gap
+  if (top < pad) top = Math.min(box.bottom + gap, window.innerHeight - own.height - pad)
+  dutyTipNode.style.left = `${Math.round(left)}px`
+  dutyTipNode.style.top = `${Math.round(top)}px`
+}
+
+function dutyTipBind() {
+  if (dutyTipBound || typeof document === 'undefined') return
+  dutyTipBound = true
+  const hostOf = (event) => {
+    const target = event.target
+    return target && target.closest ? target.closest(DUTY_TIP_HOSTS) : null
+  }
+  document.addEventListener('pointerover', (event) => {
+    const host = hostOf(event)
+    if (!host) return
+    dutyTipHost = host
+    dutyTipPlace(host)
+  })
+  document.addEventListener('pointerout', (event) => {
+    const host = hostOf(event)
+    if (!host || host !== dutyTipHost) return
+    const next = event.relatedTarget
+    if (next && host.contains(next)) return
+    dutyTipHide()
+  })
+  document.addEventListener('focusin', (event) => {
+    const host = hostOf(event)
+    if (!host) return
+    dutyTipHost = host
+    dutyTipPlace(host)
+  })
+  document.addEventListener('focusout', dutyTipHide)
+  const follow = () => {
+    if (!dutyTipHost) return
+    if (!dutyTipHost.isConnected) return dutyTipHide()
+    dutyTipPlace(dutyTipHost)
+  }
+  window.addEventListener('scroll', follow, true)
+  window.addEventListener('resize', follow)
+}
+
 function DutyAttemptRow({ view, callSel, onSelectCall, toolFilter }) {
   // Подсветка семейства: чужие вызовы гаснут, но остаются на месте — картина
   // дела не рассыпается, просто читается другое.
@@ -3065,8 +3144,8 @@ const CSS = `
 .duty-tl-call{position:absolute;height:10px;border-radius:2px;cursor:pointer;box-shadow:inset 0 0 0 1px rgba(0,0,0,.22)}
 .duty-tl-row:hover .duty-tl-call{box-shadow:inset 0 0 0 1px rgba(0,0,0,.45)}
 /* Подсказка — общий слой для чипа, полосы попытки, подписи и маркера. */
-.duty-tl-call::after,.duty-tl-band::after,.duty-tl-lbl::after,.duty-tl-mark::after,.duty-tl-wait::after{content:attr(data-tip);position:absolute;left:50%;bottom:calc(100% + 7px);transform:translateX(-50%);padding:3px 7px;border-radius:5px;white-space:normal;max-width:240px;width:max-content;text-align:left;background:var(--ui-surface-raised, var(--ui-surface-background));color:var(--ui-text-primary);border:1px solid var(--ui-stroke-tertiary);box-shadow:0 8px 20px rgba(0,0,0,.38);font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:10.5px;line-height:1.5;opacity:0;pointer-events:none;transition:opacity .09s ease;z-index:30}
-.duty-tl-call:hover::after,.duty-tl-band:hover::after,.duty-tl-lbl:hover::after,.duty-tl-mark:hover::after,.duty-tl-wait:hover::after{opacity:1}
+.duty-tl-tip{position:fixed;left:0;top:0;z-index:9999;padding:3px 7px;border-radius:5px;white-space:normal;max-width:280px;width:max-content;text-align:left;background:var(--ui-surface-raised, var(--ui-surface-background));color:var(--ui-text-primary);border:1px solid var(--ui-stroke-tertiary);box-shadow:0 8px 20px rgba(0,0,0,.38);font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:10.5px;line-height:1.5;opacity:0;pointer-events:none;transition:opacity .09s ease}
+.duty-tl-call,.duty-tl-band,.duty-tl-lbl,.duty-tl-mark,.duty-tl-wait{cursor:pointer}
 .duty-tl-call.duty-tl-sel{box-shadow:inset 0 0 0 1.5px var(--ui-accent),0 0 0 2px color-mix(in srgb, var(--ui-accent) 35%, transparent)}
 .duty-tl-insp{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-height:26px;margin-top:10px;padding:4px 9px;border-radius:6px;border:1px solid var(--ui-stroke-tertiary);background:var(--ui-surface-raised, var(--ui-surface-background));font-size:11.5px}
 .duty-tl-insp.empty{color:var(--ui-text-tertiary);border-style:dashed;background:transparent}
@@ -4395,6 +4474,7 @@ function EmptyState({ view, model, onReset, stale }) {
 }
 
 function DutyPage() {
+  dutyTipBind()
   const snap = useNow()
   const [screen, setScreen] = useState('now')
   // Фильтр по репозиторию вместо доски: ALL_REPOS — все, '' — без репозитория.

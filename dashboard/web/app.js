@@ -1070,6 +1070,89 @@ const rowOpen = (overrides, shown, key, byDefault) =>
  * экран не считает: попытка ленты ищется в ответе ручки по `runId` (оба зовут
  * одну попытку одним именем), и ей подмешивается один факт — `events`.
  */
+/* ---------------------------------------- слой подсказок поверх всей страницы */
+/* Подсказка не может жить внутри дорожки: панель обрезает её по `overflow`, а
+ * соседние строки с собственным контекстом наложения оказываются выше. Поэтому
+ * подсказка — один элемент в `body`, положение считается от прямоугольника
+ * хоста: над ним, а если сверху не влезла — под ним; по горизонтали прижимается
+ * к краю окна. Наведение ловится делегированием: автообновление меняет узлы. */
+const TIP_HOSTS = '.tl-call, .tl-band, .tl-lbl, .tl-mark, .tl-wait'
+
+let tipEl = null
+let tipHost = null
+
+function tipNode() {
+  if (tipEl && tipEl.isConnected) return tipEl
+  tipEl = h('div', { class: 'tl-tip', role: 'tooltip', 'aria-hidden': 'true' })
+  document.body.append(tipEl)
+  return tipEl
+}
+
+function hideTip() {
+  tipHost = null
+  if (!tipEl) return
+  tipEl.style.opacity = '0'
+  tipEl.setAttribute('aria-hidden', 'true')
+}
+
+function placeTip(host) {
+  const text = host.getAttribute('data-tip')
+  if (!text) return hideTip()
+  const tip = tipNode()
+  if (tip.textContent !== text) tip.textContent = text
+  tip.style.opacity = '1'
+  tip.setAttribute('aria-hidden', 'false')
+  const box = host.getBoundingClientRect()
+  const own = tip.getBoundingClientRect()
+  const pad = 8
+  const gap = 7
+  const vw = window.innerWidth
+  const vh = window.innerHeight
+  let left = box.left + box.width / 2 - own.width / 2
+  left = Math.max(pad, Math.min(left, vw - own.width - pad))
+  let top = box.top - own.height - gap
+  if (top < pad) top = Math.min(box.bottom + gap, vh - own.height - pad)
+  tip.style.left = `${Math.round(left)}px`
+  tip.style.top = `${Math.round(top)}px`
+}
+
+function bindTipLayer() {
+  const hostOf = (event) => {
+    const target = event.target
+    return target && target.closest ? target.closest(TIP_HOSTS) : null
+  }
+  document.addEventListener('pointerover', (event) => {
+    const host = hostOf(event)
+    if (!host) return
+    tipHost = host
+    placeTip(host)
+  })
+  document.addEventListener('pointerout', (event) => {
+    const host = hostOf(event)
+    if (!host || host !== tipHost) return
+    const next = event.relatedTarget
+    if (next && host.contains(next)) return
+    hideTip()
+  })
+  document.addEventListener('focusin', (event) => {
+    const host = hostOf(event)
+    if (!host) return
+    tipHost = host
+    placeTip(host)
+  })
+  document.addEventListener('focusout', hideTip)
+  // Прокрутка и изменение размера: подсказка привязана к месту хоста.
+  const follow = () => {
+    if (!tipHost) return
+    if (!tipHost.isConnected) return hideTip()
+    placeTip(tipHost)
+  }
+  window.addEventListener('scroll', follow, true)
+  window.addEventListener('resize', follow)
+  // Автообновление подменяет узлы: если хост исчез, подсказку надо снять.
+  window.dutyTipFollow = follow
+}
+
 function stageColumnBars(stage, timeline) {
   const rows = Array.isArray(stage.attempts) ? stage.attempts : []
   const extra = timeline && Array.isArray(timeline.attempts) ? timeline.attempts : []
@@ -1991,6 +2074,8 @@ function patchDeal(dealId) {
   const prev = dealSnap.spots
   const next = dealSpots(dealSnap.data, dealSnap.attempts)
   morph(host, viewDeal(dealId))
+  // Хост подсказки мог исчезнуть вместе со старой строкой: тогда подсказку снимаем.
+  if (typeof window.dutyTipFollow === 'function') window.dutyTipFollow()
   const panel = app.querySelector('[data-key="scale"]')
   if (panel) wireScalePanel(panel)
   syncScaleState()
@@ -2184,6 +2269,7 @@ async function loadVersion() {
   }
 }
 
+bindTipLayer()
 ticker = setInterval(tickStamp, 1000)
 tickStamp()
 void loadVersion()

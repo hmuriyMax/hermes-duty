@@ -954,22 +954,18 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 
 /* --------------------------------------------- подсказка вызова и инспектор */
 /* Подсказка своим слоем: на 10-пиксельном чипе нативный `title` ждать секунду. */
-.tl-call::after, .tl-band::after, .tl-lbl::after, .tl-mark::after, .tl-wait::after {
-  content: attr(data-tip);
-  position: absolute; left: 50%; bottom: calc(100% + 7px); transform: translateX(-50%);
-  padding: 3px 7px; border-radius: 5px; white-space: normal; max-width: 240px; width: max-content; text-align: left;
-  background: var(--card); color: var(--text); border: 1px solid var(--border);
+/* Подсказка — свой слой в `body` (см. `bindTipLayer` в app.js): внутри дорожки
+ * её резала панель по `overflow`, а соседние строки с собственным контекстом
+ * наложения оказывались выше любого `z-index` у хоста. */
+.tl-tip {
+  position: fixed; left: 0; top: 0; z-index: 9999;
+  padding: 3px 7px; border-radius: 5px; white-space: normal; max-width: 280px; width: max-content;
+  text-align: left; background: var(--card); color: var(--text); border: 1px solid var(--border);
   box-shadow: 0 8px 20px rgba(0, 0, 0, .38);
   font-family: var(--mono); font-size: 10.5px; line-height: 1.5;
-  opacity: 0; pointer-events: none; transition: opacity .09s ease; z-index: 30;
+  opacity: 0; pointer-events: none; transition: opacity .09s ease;
 }
-/* Подсказка должна быть поверх соседних дорожек: у самих хостов `transform`,
- * то есть свой контекст наложения, и z-index 30 внутри него не поднимал её над
- * следующими строками. Поэтому на наведении поднимается сам хост. */
-.tl-call:hover, .tl-band:hover, .tl-lbl:hover, .tl-mark:hover, .tl-wait:hover,
-.tl-call:focus-visible, .tl-mark:focus-visible { z-index: 40; }
-.tl-call:hover::after, .tl-band:hover::after, .tl-lbl:hover::after,
-.tl-mark:hover::after, .tl-wait:hover::after { opacity: 1; }
+.tl-call, .tl-band, .tl-lbl, .tl-mark, .tl-wait { cursor: pointer; }
 .tl-call.tl-sel { box-shadow: inset 0 0 0 1.5px var(--accent), 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent); }
 .tl-call { cursor: pointer; }
 

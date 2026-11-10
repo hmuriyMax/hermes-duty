@@ -136,6 +136,20 @@ stages:
 """
 
 
+# Спека с этапом плана: лид растит граф из журнала, в файле этапов плана нет.
+PLAN_CHAIN = """
+duty: probe
+stages:
+  - id: plan
+    role: lead
+    workspace: none
+  - id: close
+    role: lead
+    needs: [plan]
+    workspace: none
+"""
+
+
 # ------------------------------------------------------------------ фикстуры
 
 
@@ -410,8 +424,46 @@ def test_fixture_d_eb4ad2bb_is_released_once(tmp_path: Path) -> None:
     assert row_of(conn, deal)["updated_at"] == NOW + 500
 
 
-# ------------------------------- 2. дело, которое держит человек, не трогается
+def test_release_reads_plan_stages_the_file_does_not_know(tmp_path: Path) -> None:
+    """Этап из принятого плана (в файле спеки его нет) — не «не найден в спеке».
 
+    Кейс d_c8551c18: attempt_ended по этапу `review` из плана ревизии 1; проход
+    отпускания искал этап только в файле, отвечал «этап не найден в спеке дела» —
+    и дело навсегда оставалось `running` без живого факта. Этап ищется и в графе
+    журнала: движение по факту, а не по догадке.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, PLAN_CHAIN)
+    deal = make_deal(conn, spec_path=spec.path)
+    # План принят: в графе появился этап `review`, в файле его нет.
+    seed(conn, deal, "attempt_started", {"stage": "plan", "attempt": 1, "run_id": "plan#1", "pid": 1}, key="t:plan:start")
+    seed(conn, deal, "attempt_ended", {"stage": "plan", "attempt": 1, "outcome": "done", "kind": None, "reason": "", "run_id": "plan#1"}, key="t:plan:end")
+    seed(conn, deal, "plan_proposed", {"rev": 1, "stages": [{"id": "review", "role": "tester", "needs": ["plan"], "workspace": "none", "evidence": [{"cmd": "true", "must": 0}]}], "reason": "", "source_stage": "plan", "attempt": 1}, key="t:propose")
+    seed(conn, deal, "plan_accepted", {"rev": 1, "by": "engine"}, key="t:accept")
+    end_attempt(conn, deal, stage="review", attempt=1, outcome="failed", kind="contract", reason="evidence.missing")
+    mark_running(conn, deal)
+    assert transit.next_stage(spec, events(conn, deal), NOW + 300).kind == transit.DECISION_FAILED
+
+    rows = release.sweep(conn, NOW + 300, home=home)
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.get("error") is None
+    assert row["action"] == "rethink"
+    assert row["written"] == 1
+    rethinks = [event for event in events(conn, deal) if str(event["kind"]) == "plan_rethink"]
+    assert len(rethinks) == 1
+    assert journal.payload_of(rethinks[0])["failed_stage"] == "review"
+    # Следующий проход читает новый граф: дело возвращено лиду.
+    second = release.sweep(conn, NOW + 600, home=home)
+    assert len(second) == 1
+    assert second[0]["action"] == "released"
+    assert second[0]["to"] == "ready"
+    assert row_of(conn, deal)["status"] == "ready"
+
+
+# ------------------------------- 2. дело, которое держит человек, не трогается
 
 def test_release_does_not_touch_deal_held_by_human(tmp_path: Path) -> None:
     """`blocked`, `review`, `archived` — ни факта, ни строки: решает человек."""

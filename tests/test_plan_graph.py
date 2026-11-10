@@ -387,6 +387,60 @@ def test_replan_over_the_limit_fails_with_contract(tmp_path: Path) -> None:
     assert (decision.kind, decision.fail_kind) == ("failed", "contract")
 
 
+def test_plan_rethink_returns_the_failed_stage_to_work(tmp_path: Path) -> None:
+    """`plan_rethink` возвращает дело лиду: упавший этап снова в работе.
+
+    Кейс d_c8551c18: этап `review` из принятого плана исчерпал попытки, движок
+    записал переосмысление — а срез отвечал `failed`: узел упавшего этапа
+    оставался FAILED, и решение лида было недостижимо. Старый формат факта
+    (диагноз в `stage`) фолд вовсе игнорировал: событие выглядело «этапным»,
+    хотя этап плана — факт дела.
+    """
+    spec = seed_spec(tmp_path)
+    journal_events = events(
+        ("attempt_started", {"stage": "plan", "attempt": 1, "run_id": "plan#1"}),
+        ("attempt_ended", ended("plan")),
+        ("plan_proposed", {"rev": 1, "stages": [plan_stage("review")], "reason": "", "source_stage": "plan", "attempt": 1}),
+        accepted(1),
+        ("attempt_started", {"stage": "review", "attempt": 1, "run_id": "review#1"}),
+        ("attempt_ended", ended("review", 1, "failed", "contract")),
+        # Старый формат: диагноз в `stage` — событие выглядит «этапным».
+        ("plan_rethink", {"stage": "review", "kind": "contract", "attempt": 1, "why": "evidence.missing", "total": 1, "round": 1}),
+    )
+
+    states = transit.stage_states(spec, journal_events)
+    # Упавший этап больше не FAILED: он ждёт решения лида (needs: план в работе).
+    assert states["review"].state != "failed"
+    assert states["plan"].state == "pending"
+    decision = transit.next_stage(spec, journal_events, NOW)
+    assert decision.pair == [("plan", 2)]
+
+
+def test_plan_rethink_with_failed_stage_key_reaches_the_lead(tmp_path: Path) -> None:
+    """Новый формат диагноза (`failed_stage`) — тот же исход без `stage` в payload.
+
+    Факт плана — факт дела: `stage` в payload делает событие «этапным», и фолд
+    его терял. `failed_stage` адресует диагноз, не принадлежность.
+    """
+    spec = seed_spec(tmp_path)
+    journal_events = events(
+        ("attempt_started", {"stage": "plan", "attempt": 1, "run_id": "plan#1"}),
+        ("attempt_ended", ended("plan")),
+        ("plan_proposed", {"rev": 1, "stages": [plan_stage("review")], "reason": "", "source_stage": "plan", "attempt": 1}),
+        accepted(1),
+        ("attempt_started", {"stage": "review", "attempt": 1, "run_id": "review#1"}),
+        ("attempt_ended", ended("review", 1, "failed", "contract")),
+        ("plan_rethink", {"failed_stage": "review", "kind": "contract", "attempt": 1, "why": "evidence.missing", "total": 1, "round": 1}),
+    )
+
+    states = transit.stage_states(spec, journal_events)
+    assert states["review"].state != "failed"
+    assert states["plan"].state == "pending"
+    assert "evidence.missing" in states["plan"].reason
+    decision = transit.next_stage(spec, journal_events, NOW)
+    assert decision.pair == [("plan", 2)]
+
+
 # ------------------------------------------------- 4–5. правила хартии в отчёте
 
 

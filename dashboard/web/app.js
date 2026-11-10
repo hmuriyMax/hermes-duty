@@ -88,20 +88,22 @@ const stampEl = document.getElementById('stamp')
 const verEl = document.getElementById('ver')
 const humanEl = document.getElementById('human')
 
+// Элементы с этой осью — не HTML: `createElement('svg')` создаёт элемент в
+// HTML-namespace, и браузер его не рисует вовсе. Ошибка не видна в разметке, и
+// именно поэтому список назван явно, а не выводится из имени тега.
+const SVG_NS = 'http://www.w3.org/2000/svg'
+const SVG_TAGS = new Set(['svg', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'g', 'use', 'text', 'title'])
+
 // Значок плагина в шапке: та же геометрия, что у значка дела (`DEAL_ICON` из
-// шейпера) и у favicon вкладки — один рисунок на все места плагина.
+// шейпера) и у favicon вкладки — один рисунок на все места плагина. Блок стоит
+// после `SVG_TAGS`: `h()` читает список тегов, и вызов до инициализации падает
+// по TDZ, роняя весь модуль (страница остаётся на «загрузка…»).
 const brandIcoEl = document.getElementById('brand-ico')
 if (brandIcoEl) {
   brandIcoEl.append(
     h('svg', { class: 'brand-ico-svg', viewBox: '0 0 16 16', 'aria-hidden': 'true' }, h('path', { d: DEAL_ICON })),
   )
 }
-
-// Элементы с этой осью — не HTML: `createElement('svg')` создаёт элемент в
-// HTML-namespace, и браузер его не рисует вовсе. Ошибка не видна в разметке, и
-// именно поэтому список назван явно, а не выводится из имени тега.
-const SVG_NS = 'http://www.w3.org/2000/svg'
-const SVG_TAGS = new Set(['svg', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'g', 'use', 'text', 'title'])
 
 function h(tag, props, ...children) {
   const el = SVG_TAGS.has(tag) ? document.createElementNS(SVG_NS, tag) : document.createElement(tag)

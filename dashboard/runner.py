@@ -1297,7 +1297,20 @@ def build_contract(
         "раннер спасёт его и запишет сам (кейс d_2fc749fb, попытки 1 и 6)",
         "размечай вопрос: kind (fact | authority), risky (true) и default — "
         "без разметки вопрос считается властным и уходит человеку",
+        # Кейс d_c8551c18 review#2/#3: ревьюер краулил MR через GitLab API
+        # пофайлово (410 get_file), сжёг бюджет попытки (11.4M токенов) и умер
+        # по capability; #4 сдал чужой started_at из прошлой попытки.
     ]
+    if stage.role == "reviewer":
+        boundaries += [
+            "дифф ревьюится в локальном дереве (git diff против base, чтение файлов), "
+            "а не через GitLab API пофайлово: краул файла за файлом сжигает бюджет "
+            "попытки до вердикта",
+            "команды evidence прогоняются первыми, до чтения кода: их записи "
+            "(со свежим started_at этой попытки) — вход в отчёт, а не хвост",
+            "evidence — только собственные прогоны этой попытки: чужие started_at "
+            "и старые result.json отклоняются валидатором (evidence.stale)",
+        ]
     evidence: list[dict[str, Any]] = []
     for item in getattr(stage, "evidence", ()):
         command: dict[str, Any] = {"cmd": item.cmd, "must": item.must}

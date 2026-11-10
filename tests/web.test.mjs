@@ -242,7 +242,7 @@ test('разворот строки и правки экрана дела: пр�
     // будем рисовать все квадратики с наложением… прозрачностью»). Рамки у
     // чипов больше нет: перекрытие читается плотностью цвета.
     assert.doesNotMatch(text, /box-shadow:\s*inset\s+0\s+0\s+0\s+1px\s+rgba\(0,\s*0,\s*0,\s*\.22\)/, `${name}: рамка чипа вернулась`)
-    assert.match(text, /:not\(:hover\):not\(:focus-visible\)\s+[^{]*tl-call[^{]*\{[^}]*top:\s*0[^}]*opacity:\s*\.45/, `${name}: свёрнутая строка не рисуется нахлёстом`)
+    assert.match(text, /:not\(:hover\):not\(:focus-visible\)\s+[^{]*tl-call[^{]*\{[^}]*top:\s*calc\(50%[^}]*opacity:\s*\.45/, `${name}: свёрнутая строка не рисуется нахлёстом`)
   }
   assert.match(app, /'data-level':\s*String\(chip\.level/, 'веб не отдаёт уровень чипа в разметку')
   assert.match(plugin, /'data-level':\s*String\(chip\.level/, 'десктоп не отдаёт уровень чипа в разметку')

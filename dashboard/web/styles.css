@@ -1052,7 +1052,7 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
  * вызовы становились бы точками. */
 .tl-row:hover .tl-call, .tl-row:focus-visible .tl-call { width: var(--w-log); }
 .tl-row:not(:hover):not(:focus-visible) .tl-call {
-  top: 0 !important;
+  top: calc(50% - 5px) !important; /* чип 10px по центру свёрнутой строки */
   opacity: .45;
 }
 .tl-row:not(:hover):not(:focus-visible) .tl-call.tl-unfinished,

@@ -4087,7 +4087,7 @@ const CSS = `
  * работы, а не россыпь квадратиков; наведение раскрывает строку, и чипы
  * доезжают на свои уровни. */
 .duty-tl-row:hover .duty-tl-call,.duty-tl-row:focus-visible .duty-tl-call{width:var(--w-log)}
-.duty-tl-row:not(:hover):not(:focus-visible) .duty-tl-call{top:0!important;opacity:.45}
+.duty-tl-row:not(:hover):not(:focus-visible) .duty-tl-call{top:calc(50% - 5px)!important;opacity:.45}
 .duty-tl-row:not(:hover):not(:focus-visible) .duty-tl-call.duty-tl-unfinished,
 .duty-tl-row:not(:hover):not(:focus-visible) .duty-tl-call.duty-tl-sel{opacity:1}
 .duty-tl-row:not(:hover):not(:focus-visible) .duty-tl-call.duty-tl-dim{opacity:.18}

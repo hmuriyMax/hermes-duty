@@ -3393,3 +3393,22 @@ def test_publish_gate_question_carries_commit_stat_and_review(tmp_path: Path) ->
     # Адрес вопроса несёт одобренный коммит: по нему сверяется дерево перед спавном.
     assert row["text"] == "Публикуем этот коммит?"
 
+
+
+def test_reviewer_contract_warns_against_gitlab_crawl(tmp_path: Path) -> None:
+    """Контракт review-этапа учит: локальный дифф, evidence первыми, свой started_at.
+
+    Кейс d_c8551c18: ревьюер краулил MR через GitLab API пофайлово (410
+    get_file), сжёг бюджет попытки (11.4M токенов, capability), а одна попытка
+    сдала evidence с чужим started_at из прошлой попытки (evidence.stale).
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = plan_spec(tmp_path)
+    run_stage(conn, spec, deal, home, Fake(result=None, exit_code=0, lines=[]))
+    contract_file = runner.contract_path(runner.attempt_dir(home, deal, "plan", 1), "plan", 1)
+    contract = json.loads(contract_file.read_text(encoding="utf-8"))
+    # план-этап ведёт lead — правила ревьюера ему не нужны
+    boundaries = "\n".join(contract["boundaries"])
+    assert "GitLab API пофайлово" not in boundaries

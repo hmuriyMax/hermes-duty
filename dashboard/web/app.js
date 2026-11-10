@@ -50,6 +50,7 @@ import {
   shapeFinishedPage,
   shapeNow,
   shapeStages,
+  stageColumnBars,
   compactStageView,
   compactAttemptView,
   stateLabel,
@@ -1694,16 +1695,6 @@ function bindTipLayer() {
   window.dutyTipFollow = follow
 }
 
-function stageColumnBars(stage, timeline) {
-  const rows = Array.isArray(stage.attempts) ? stage.attempts : []
-  const extra = timeline && Array.isArray(timeline.attempts) ? timeline.attempts : []
-  if (!rows.length) return extra.filter((attempt) => attempt.stage === stage.id)
-  return rows.map((row) => {
-    if (row.runId === null || row.runId === undefined) return row
-    const found = extra.find((attempt) => String(attempt.runId) === String(row.runId))
-    return found ? { ...row, events: found.events } : row
-  })
-}
 
 /** Доказательство строкой: код выхода тоном, обрезанная команда, время. */
 function attEvNode(row) {
@@ -1752,6 +1743,21 @@ function attRowNodes(stage, bar, key, open, rebuild) {
     ),
   ]
   if (!open) return nodes
+  // Числа попытки — здесь, в подробностях «этапов», а не значком на шкале:
+  // гуттер узкий, «136 вызовов · 11 646 133 токена» в нём обрезалось.
+  if (view.statsText) {
+    nodes.push(
+      h(
+        'div',
+        {
+          class: `att-stats mono${view.statsCut ? ' is-cut' : ''}`,
+          title: view.statsNote || view.statsText,
+          'data-key': `stats:${key}`,
+        },
+        view.statsText,
+      ),
+    )
+  }
   for (const row of view.evidenceRows) nodes.push(attEvNode(row))
   if (view.summary) nodes.push(h('div', { class: 'att-summary' }, view.summary))
   if (view.error) nodes.push(h('div', { class: 'att-error' }, view.error))
@@ -2010,11 +2016,6 @@ function attemptRowNode(view, key) {
     // Исход попытки — то, что меняется от тика к тику: подсвечивается он, а не
     // вся дорожка (полоса растёт непрерывно, вспышка на ней была бы миганием).
     h('span', { class: `tl-st t-${view.label.tone} fresh`, 'data-fresh': key }, view.label.status),
-    // Суммарное число вызовов попытки — в подписи, а не поверх дорожки: оно не
-    // должно перекрывать чипы.
-    view.badge
-      ? h('span', { class: `tl-more${view.badgeCut ? ' is-cut' : ''}`, title: view.note || view.title }, view.badge)
-      : null,
   )
   const track = h('div', { class: 'tl-track', 'data-key': `track:${key}` })
   if (view.band) {

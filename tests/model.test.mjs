@@ -29,6 +29,7 @@ import {
   humanLine,
   noticeLines,
   attemptView,
+  stageColumnBars,
   laneView,
   layoutCalls,
   outcomeTone,
@@ -2353,14 +2354,24 @@ function bar(calls, extra = {}) {
 
 const axis = { axis: { start: 0, end: 10 } }
 
-test('на подписи попытки — суммарное число вызовов, а не «сколько влезло»', () => {
+test('числа попытки — подробностями в блоке этапов, не значком на шкале', () => {
   const view = attemptView(bar([{ name: 'read_file', at: 1, ms: 100 }], { callsOmitted: 3 }), axis)
   // Нарисовано ровно то, что пришло; сумма называет факт из журнала.
   assert.equal(view.chips.length, 1)
-  assert.equal(view.badge, '4 вызова')
-  assert.equal(view.badgeCut, true)
+  // Значка на строке шкалы больше нет: гуттер узкий, длинная строка обрезалась
+  // (Макс, 09.11: «эту стату писать в подробностях в блоке ЭТАПЫ только»).
+  assert.equal(view.badge, undefined)
+  assert.equal(view.badgeCut, undefined)
   assert.match(view.note, /ещё 3 вызова не показано/)
   assert.match(view.title, /не показано/)
+  // Подробности считают показанных плюс отрезанных потолком.
+  const stats = compactAttemptView(
+    { id: 'impl', attempts: [] },
+    { number: '#1', calls: [{ name: 'read_file', at: 1, ms: 100 }], callsOmitted: 3 },
+  )
+  assert.equal(stats.statsText, '4 вызова')
+  assert.equal(stats.statsCut, true)
+  assert.match(stats.statsNote, /ещё 3 вызова не показано/)
 })
 
 test('вызов без результата ≠ вызов длиной 0 мс', () => {
@@ -2377,7 +2388,6 @@ test('попытка без поля calls не роняет вид', () => {
   const view = attemptView(broken, axis)
   assert.deepEqual(view.chips, [])
   assert.deepEqual(view.ticks, [])
-  assert.equal(view.badge, '')
 })
 
 test('нехватка уровней — свойство рисунка, а не строка на подписи', () => {
@@ -2386,26 +2396,50 @@ test('нехватка уровней — свойство рисунка, а н
   // «⋯8» человеку ничего не говорило (Макс, 09.11).
   const calls = Array.from({ length: 12 }, (_, index) => ({ name: 'read_file', at: 1, ms: 100 + index }))
   const view = attemptView(bar(calls), axis)
-  assert.equal(view.badge, '12 вызовов')
-  assert.doesNotMatch(view.badge, /⋯/)
   assert.doesNotMatch(view.note, /уровней не хватило/)
+  // Подробности считают все вызовы, а не только нарисованные чипы.
+  const stats = compactAttemptView({ id: 'impl', attempts: [] }, { number: '#1', calls })
+  assert.match(stats.statsText, /^12 вызовов/)
+  assert.doesNotMatch(stats.statsText, /⋯/)
 })
 
-test('подпись попытки называет токены, если телеметрия их записала', () => {
+test('подробности попытки называют токены, если телеметрия их записала', () => {
   // Живой кейс d_a6f787fa (Макс, 10.11): число лежит в KPI шапки, а на строке
-  // попытки его не было — «40 вызовов · 1 фраза» без расхода. Попытка говорит
-  // своим числом; shell-попытка — молчит, без «—» (прочерк один, в шапке).
-  const withTokens = attemptView(
-    bar([{ name: 'read_file', at: 1, ms: 100 }], { tokens: 1303268, says: shapeSays([{ seq: 1, at: 2, text: 'смотрю' }]) }),
-    axis,
+  // попытки его не было. Макс, 09.11: «эту стату писать в подробностях в блоке
+  // ЭТАПЫ только» — подробности здесь и живут. Shell-попытка молчит, без «—»
+  // (прочерк один, в шапке).
+  const withTokens = compactAttemptView(
+    { id: 'impl', attempts: [] },
+    {
+      number: '#1',
+      calls: [{ name: 'read_file', at: 1, ms: 100 }],
+      says: shapeSays([{ seq: 1, at: 2, text: 'смотрю' }]),
+      tokens: 1303268,
+    },
   )
-  assert.equal(withTokens.badge, '1 вызов · 1 фраза · 1 303 268 токенов')
+  assert.equal(withTokens.statsText, '1 вызов · 1 фраза · 1 303 268 токенов')
   // Один токен — не «токенов».
-  const one = attemptView(bar([{ name: 'read_file', at: 1, ms: 100 }], { tokens: 1 }), axis)
-  assert.match(one.badge, /1 токен$/)
+  const one = compactAttemptView(
+    { id: 'impl', attempts: [] },
+    { number: '#1', calls: [{ name: 'read_file', at: 1, ms: 100 }], tokens: 1 },
+  )
+  assert.match(one.statsText, /1 токен$/)
   // Нет телеметрии — нет и числа: shell-этап (Макс, 10.11: «—» на полосе был бы ложью).
-  const silent = attemptView(bar([{ name: 'read_file', at: 1, ms: 100 }]), axis)
-  assert.equal(silent.badge, '1 вызов')
+  const silent = compactAttemptView(
+    { id: 'impl', attempts: [] },
+    { number: '#1', calls: [{ name: 'read_file', at: 1, ms: 100 }] },
+  )
+  assert.equal(silent.statsText, '1 вызов')
+  // Слияние записи этапа с лентой: токены и pid приходят из записи этапа, шаги
+  // и вызовы — из ленты; ни один источник не затирает другой.
+  const merged = stageColumnBars(
+    { id: 'impl', attempts: [{ n: 1, number: '#1', runId: 'r1', tokens: 5, pid: 42 }] },
+    { attempts: [{ runId: 'r1', stage: 'impl', calls: [{ name: 'read_file', at: 1, ms: 10 }], progress: 7 }] },
+  )
+  const mergedView = compactAttemptView({ id: 'impl', attempts: [] }, merged[0])
+  assert.match(mergedView.statsText, /5 токенов/)
+  assert.match(mergedView.statsText, /pid 42/)
+  assert.match(mergedView.statsText, /шагов 7/)
 })
 
 test('сводка дорожки считает всё, включая невидимое', () => {
@@ -2953,8 +2987,16 @@ test('сказанное — отдельная полка: точка на ст
   assert.equal(view.sayTicks.length, 1)
   assert.match(view.sayTicks[0].tip, /Смотрю, где ломается гейт/)
   assert.match(view.sayTicks[0].tip, /1 мин/, 'длительность фразы потеряна')
-  assert.match(view.badge, /1 вызов/)
-  assert.match(view.badge, /1 фраза/)
+  const stats = compactAttemptView(
+    { id: 'impl', attempts: [] },
+    {
+      number: '#1',
+      calls: [{ name: 'read_file', at: 1_010, ms: 200 }],
+      says: shapeSays([{ seq: 2, at: 1_900, ms: 60_000, text: 'фраза' }]),
+    },
+  )
+  assert.match(stats.statsText, /1 вызов/)
+  assert.match(stats.statsText, /1 фраза/)
 })
 
 test('обрезанная фраза говорит, сколько осталось', () => {

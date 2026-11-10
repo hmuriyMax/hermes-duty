@@ -116,10 +116,9 @@ test('десктоп: DutyLane рисует svg-значок, который л�
     assert.ok(rule.includes(declaration), `.duty-tl-kind-ico: нет ${declaration}`)
   }
 
-  // Число вызовов названо на подписи попытки, а не только в тултипе.
-  assert.match(html, /class="[^"]*\bduty-tl-more\b[^"]*"[^>]*>8 вызовов</, 'сумма вызовов не отрисована')
-  // Потолок данных — единственное, что помечается: `is-cut`.
-  assert.match(html, /class="[^"]*\bduty-tl-more is-cut\b/, 'усечённые вызовы не помечены')
+  // Числа вызовов на подписи попытки больше нет: гуттер узкий, длинная строка
+  // обрезалась — подробности переехали в блок «этапов» (Макс, 09.11).
+  assert.doesNotMatch(html, /duty-tl-more/, 'значок вызовов вернулся на подпись попытки')
   // Ось — линейка: метки-времена и вертикальная сетка по ним (макет d-merge).
   const modelMod = await import(pathToFileURL(join(pluginRoot, 'desktop/model.js')).href)
   const scaleModel = modelMod.shapeDealTime(
@@ -455,6 +454,7 @@ test('десктоп: строки этапов раскрываются кли�
                 {
                   n: 1, run_id: 'verify#1', outcome: 'failed', kind: 'contract', started_at: 1_600,
                   finished_at: 2_000, duration_sec: 400, reason: 'commit.foreign: чужое готовое',
+                  tokens: 1_303_268, pid: 96_673, progress: 7,
                   evidence: [{ cmd: 'npm test', exit: 1, started_at: 1_600 }],
                 },
               ],
@@ -463,7 +463,14 @@ test('десктоп: строки этапов раскрываются кли�
           timeline: [{ kind: 'created', at: 900, summary: '' }],
         }
       }
-      if (path.includes('/attempts')) return { attempts: [] }
+      if (path.includes('/attempts')) {
+        return {
+          attempts: [
+            // Лента дела: вызовы и шаги живут в журнале дела, а не в записи этапа.
+            { run_id: 'verify#1', stage: 'verify', calls: [{ name: 'read_file', at: 1_700, ms: 100 }], progress: 7 },
+          ],
+        }
+      }
       return {}
     })
 
@@ -500,6 +507,13 @@ test('десктоп: строки этапов раскрываются кли�
     await settle(60)
     const ev = blocks[0].querySelector('.duty-att-ev')
     assert.ok(ev, 'клик по попытке не показал доказательства')
+    // Числа попытки — подробностями в «этапах», а не значком на шкале.
+    const stats = blocks[1].querySelector('.duty-att-stats')
+    assert.ok(stats, 'у проваленной попытки нет строки подробностей')
+    assert.match(stats.textContent, /1 303 268 токенов/, `в подробностях нет токенов: ${stats.textContent}`)
+    assert.match(stats.textContent, /pid 96673/, 'в подробностях нет pid')
+    assert.match(stats.textContent, /шагов 7/, 'в подробностях нет шагов')
+    assert.match(stats.getAttribute('title') || '', /токен/, 'в подсказке подробностей нет пояснения')
     const cmd = ev.querySelector('.duty-att-ev-cmd')
     assert.ok(cmd, 'в доказательстве нет строки команды')
     assert.equal(cmd.getAttribute('title'), fullCmd, 'подсказка не несёт полную команду')

@@ -943,22 +943,19 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 .tl-st.t-red { color: var(--danger); }
 .tl-st.t-yellow { color: var(--warn); }
 .tl-st.t-blue { color: var(--accent); }
-/* Суммарное число вызовов попытки: факт, а не предупреждение — тон нейтральный.
- * Жёлтым помечается только усечённое потолком: у части вызовов чипа нет. */
-.tl-more {
+/* Числа попытки (вызовы, фразы, токены) живут в подробностях блока «этапы»,
+ * а не значком на шкале: гуттер узкий, длинная строка в нём обрезалась. */
+.att-stats {
   font-family: var(--mono, ui-monospace, monospace);
-  font-size: 9.5px;
-  font-weight: 700;
-  color: var(--text-3, var(--text-2));
-  padding: 0 3px;
-  border-radius: 3px;
-  background: color-mix(in srgb, var(--text-3, var(--text-2)) 14%, transparent);
+  font-size: 10px;
+  color: var(--text-2);
+  padding: 1px 6px;
+  border-radius: 4px;
+  width: fit-content;
+  background: color-mix(in srgb, var(--text-3) 10%, transparent);
 }
-.tl-more.is-cut {
-  color: var(--warn);
-  background: color-mix(in srgb, var(--warn) 16%, transparent);
-}
-/* Вызов без результата: полый чип — длительности нет, а не ноль. */
+.att-stats.is-cut { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent); }
+
 .tl-call.tl-unfinished, .tl-tick.tl-unfinished {
   background: transparent !important;
   box-shadow: inset 0 0 0 1.5px currentColor !important;

@@ -1757,6 +1757,40 @@ function compactAttemptView(stage, bar) {
 
   const evidenceRows = mine.map(compactEvidenceRow)
 
+  // Числа попытки — здесь, в столбце «этапы», а не значком на шкале: гуттер
+  // узкий, и «136 вызовов · 11 646 133 токена» в нём обрезалось (Макс, 09.11:
+  // «эту стату писать в подробностях в блоке ЭТАПЫ только»). Считается из
+  // журнала дела: показанные плюс отрезанные потолком.
+  const callsCount = (Array.isArray(b.calls) ? b.calls.length : 0) + (numOrNull(b.callsOmitted) || 0)
+  const saysCount = (Array.isArray(b.says) ? b.says.length : 0) + (numOrNull(b.saysOmitted) || 0)
+  const tokensNum = b.tokens !== null && b.tokens !== undefined ? b.tokens : own && own.tokens
+  // pid приходит из записи этапа или с лентой: у слияния два источника, и
+  // пустой `attempts` у переданного этапа не должен прятать pid с полосы.
+  const pidNum = b.pid !== null && b.pid !== undefined ? b.pid : own && own.pid
+  const exitNum = b.exit !== null && b.exit !== undefined ? b.exit : own && own.exit
+  const progressNum = b.progress !== null && b.progress !== undefined ? b.progress : own && own.progress
+  const cut = (numOrNull(b.callsOmitted) || 0) + (numOrNull(b.saysOmitted) || 0)
+  const statsParts = [
+    callsCount ? `${fmtCount(callsCount)} ${plural(callsCount, 'вызов', 'вызова', 'вызовов')}` : '',
+    saysCount ? `${fmtCount(saysCount)} ${plural(saysCount, 'фраза', 'фразы', 'фраз')}` : '',
+    tokensNum !== null && tokensNum !== undefined
+      ? `${fmtCount(tokensNum)} ${plural(Number(tokensNum) || 0, 'токен', 'токена', 'токенов')}`
+      : '',
+    progressNum !== null && progressNum !== undefined && Number(progressNum) > 0
+      ? `шагов ${fmtCount(progressNum)}`
+      : '',
+    // Код выхода у закрытой попытки: точнее бейджа «провал» — видно, чем кончилось.
+    exitNum !== null && exitNum !== undefined ? `выход ${exitNum}` : '',
+    pidNum ? `pid ${pidNum}` : '',
+  ].filter(Boolean)
+  const statsNote = []
+  if (numOrNull(b.callsOmitted) || 0) {
+    statsNote.push(`ещё ${fmtCount(b.callsOmitted)} ${plural(Number(b.callsOmitted), 'вызов', 'вызова', 'вызовов')} не показано (потолок)`)
+  }
+  if (numOrNull(b.saysOmitted) || 0) {
+    statsNote.push(`ещё ${fmtCount(b.saysOmitted)} ${plural(Number(b.saysOmitted), 'фраза', 'фразы', 'фраз')} не показано (потолок)`)
+  }
+
   return {
     label,
     durationText,
@@ -1764,6 +1798,10 @@ function compactAttemptView(stage, bar) {
     tone,
     openByDefault: tone === 'red' || open,
     evidenceRows,
+    // Подробности попытки для блока «этапы»: вызовы, фразы, токены, шаги, pid.
+    statsText: statsParts.join(' · '),
+    statsCut: cut > 0,
+    statsNote: statsNote.join(' · '),
     summary: String(b.summary || ''),
     // `error` — как есть; у ленты этапа вместо него `reason` (один факт, два
     // имени в двух ручках), и подписи «ошибка» здесь не выдумывается.
@@ -1774,6 +1812,42 @@ function compactAttemptView(stage, bar) {
     // сводку на живых данных (`[]` в JS — правда).
     eventsText: eventsSummary(barEvents.length ? barEvents : ownEvents),
   }
+}
+
+/**
+ * Попытки этапа для столбца «этапы»: свои записи этапа, дополненные попыткой
+ * ленты дела (`runId`) — в записи этапа вызовов и фраз нет, они живут в
+ * журнале дела. Общая для веба и десктопа: две локальные копии разъехались бы
+ * при первой же правке набора полей.
+ */
+function stageColumnBars(stage, timeline) {
+  const rows = Array.isArray(stage.attempts) ? stage.attempts : []
+  const extra = timeline && Array.isArray(timeline.attempts) ? timeline.attempts : []
+  if (!rows.length) return extra.filter((attempt) => attempt.stage === stage.id)
+  // Лента приходит в двух формах: поверхностям — уже шейпнутой (`runId`), из
+  // ответа ручки — сырой (`run_id`). Не узнав вторую, слияние молча не случалось,
+  // и подробности попытки теряли вызовы и шаги.
+  const runOf = (attempt) => (attempt ? attempt.runId ?? attempt.run_id ?? null : null)
+  return rows.map((row) => {
+    const runId = runOf(row)
+    if (runId === null || runId === undefined) return row
+    const found = extra.find((attempt) => String(runOf(attempt)) === String(runId))
+    if (!found) return row
+    // Поля ленты перекрывают пустые места записи этапа, но не затирают факты:
+    // у записи этапа свои pid и токены из огорода процесса.
+    return {
+      ...found,
+      ...row,
+      events: found.events,
+      calls: found.calls,
+      callsOmitted: found.callsOmitted ?? found.calls_omitted,
+      says: found.says,
+      saysOmitted: found.saysOmitted ?? found.says_omitted,
+      progress: row.progress ?? found.progress,
+      tokens: row.tokens ?? found.tokens,
+      tools: row.tools ?? found.tools,
+    }
+  })
 }
 
 /* ---------------------------------------- шкала времени дела (E2, 0.0.5) */
@@ -2480,20 +2554,10 @@ function attemptView(bar, scale) {
     // одинаково, а означают разное — «думал и говорил» против «ничего не шло».
     sayTicks,
     silences,
-    // Надбавка на экране: суммарное число вызовов и фраз попытки, а когда
-    // телеметрия записала токены — и они. У shell-попытки токенов нет, и тройка
-    // не рисует «—»: честное отсутствие живёт одним прочерком в KPI-строке
-    // шапки, продублированный на каждой полосе он был бы шумом.
-    badge: [
-      total ? `${fmtCount(total)} ${plural(total, 'вызов', 'вызова', 'вызовов')}` : '',
-      says.length ? `${fmtCount(says.length)} ${plural(says.length, 'фраза', 'фразы', 'фраз')}` : '',
-      b.tokens !== null && b.tokens !== undefined
-        ? `${fmtCount(b.tokens)} ${plural(Number(b.tokens) || 0, 'токен', 'токена', 'токенов')}`
-        : '',
-    ]
-      .filter(Boolean)
-      .join(' · '),
-    badgeCut: Boolean(omitted),
+    // Значок с числами («136 вызовов · …») на строке шкалы больше не живёт:
+    // гуттер узкий, длинная строка обрезалась, а подробности переехали в блок
+    // «этапы» (`compactAttemptView.statsText`). Усечение живёт в подсказке
+    // попытки (`note` → `title`).
     note: notes.join(' · '),
     title: [b.title || '', notes.join(' · ')].filter(Boolean).join(' · '),
   }
@@ -3589,13 +3653,6 @@ function DutyAttemptRow({ view, callSel, onSelectCall, toolFilter }) {
     { className: 'duty-tl-lbl', 'data-tip': view.bandTip || view.title || '' },
     h('span', { className: 'duty-tl-n' }, view.label.number),
     h('span', { className: `duty-tl-st t-${view.label.tone}` }, view.label.status),
-    view.badge
-      ? h(
-          'span',
-          { className: `duty-tl-more${view.badgeCut ? ' is-cut' : ''}`, title: view.note || view.title },
-          view.badge,
-        )
-      : null,
   )
   const track = []
   if (view.band) {
@@ -3805,6 +3862,8 @@ const CSS = `
 .duty-att-row-tog{margin-left:auto}
 .duty-att-ev{display:flex;align-items:baseline;gap:6px;margin-left:12px;padding:2px 2px 2px 0;font-size:11px;color:var(--ui-text-tertiary)}
 .duty-att-ev-cmd{color:var(--ui-text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.duty-att-stats{font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:10px;color:var(--ui-text-secondary);padding:1px 6px;border-radius:4px;background:color-mix(in srgb,var(--ui-text-tertiary) 10%,transparent);width:fit-content}
+.duty-att-stats.is-cut{color:var(--ui-yellow);background:color-mix(in srgb,var(--ui-yellow) 14%,transparent)}
 .duty-att-log{margin-left:12px;padding:2px 2px 2px 0;font-size:11px;color:var(--ui-text-tertiary)}
 .duty-att-none{margin-left:12px;padding:2px 2px 2px 0;font-size:11px}
 /* Ожидание человека — видимой строкой под этапом: дело может стоять на нём. */
@@ -3921,8 +3980,6 @@ const CSS = `
 .duty-tl-ms{font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:10px;color:var(--ui-text-tertiary);text-align:right}
 /* Суммарное число вызовов попытки: факт, а не предупреждение — тон нейтральный.
  * Жёлтым помечается только усечённое потолком: у части вызовов чипа нет. */
-.duty-tl-more{font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:9.5px;font-weight:700;color:var(--ui-text-tertiary);padding:0 3px;border-radius:3px;background:color-mix(in srgb, var(--ui-text-tertiary) 14%, transparent)}
-.duty-tl-more.is-cut{color:var(--ui-yellow);background:color-mix(in srgb, var(--ui-yellow) 16%, transparent)}
 /* Вызов без результата: полый чип — длительности нет, а не ноль. */
 .duty-tl-call.duty-tl-unfinished,.duty-tl-tick.duty-tl-unfinished{background:transparent !important;box-shadow:inset 0 0 0 1.5px currentColor !important;opacity:.9}
 .duty-tl-track{position:relative;height:100%}
@@ -4534,16 +4591,6 @@ function DealGroup({ group, selectedKey, onPick }) {
  * экран не считает: попытка ленты ищется в ответе ручки по `runId` (оба зовут
  * одну попытку одним именем), и ей подмешивается один факт — `events`.
  */
-function stageColumnBars(stage, timeline) {
-  const rows = Array.isArray(stage.attempts) ? stage.attempts : []
-  const extra = timeline && Array.isArray(timeline.attempts) ? timeline.attempts : []
-  if (!rows.length) return extra.filter((attempt) => attempt.stage === stage.id)
-  return rows.map((row) => {
-    if (row.runId === null || row.runId === undefined) return row
-    const found = extra.find((attempt) => String(attempt.runId) === String(row.runId))
-    return found ? { ...row, events: found.events } : row
-  })
-}
 
 /**
  * Строка попытки: `#n`, длительность, исход словами, глиф раскрытия.
@@ -4572,6 +4619,21 @@ function CompactAttemptRow({ stage, attempt, open, onToggle }) {
     ),
   ]
   if (!open) return h('div', { className: 'duty-att-item' }, ...children)
+  // Числа попытки — подробностями здесь, а не значком на шкале: гуттер узкий,
+  // длинная строка «136 вызовов · 11 646 133 токена» в нём обрезалась.
+  if (view.statsText) {
+    children.push(
+      h(
+        'div',
+        {
+          key: 'stats',
+          className: `duty-att-stats${view.statsCut ? ' is-cut' : ''}`,
+          title: view.statsNote || view.statsText,
+        },
+        view.statsText,
+      ),
+    )
+  }
   view.evidenceRows.forEach((row, i) => {
     children.push(
       h(

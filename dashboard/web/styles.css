@@ -452,6 +452,8 @@ td.stage-now::before { content: '● '; font-size: 9px; vertical-align: 2px; }
 }
 
 .deal-head h1 { margin: 4px 0 8px; font-size: 19px; line-height: 1.3; }
+.deal-title-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+svg.deal-ico { flex: none; width: 16px; height: 16px; fill: none; stroke: var(--accent); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 /* Слева — имя дела и граф этапов, справа в углу — статус. */
 .deal-head-top { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px 18px; align-items: start; }
 .deal-head-main { min-width: 0; }
@@ -861,16 +863,23 @@ pre.body {
   overscroll-behavior-x: contain;
   scrollbar-width: thin;
   scrollbar-color: var(--border) transparent;
-  background: linear-gradient(
-      90deg,
-      var(--card) 0,
-      var(--card) calc(var(--tl-gutter, 186px) + var(--tl-gap, 8px) - 1px),
-      var(--border) calc(var(--tl-gutter, 186px) + var(--tl-gap, 8px) - 1px),
-      var(--border) calc(var(--tl-gutter, 186px) + var(--tl-gap, 8px)),
-      transparent calc(var(--tl-gutter, 186px) + var(--tl-gap, 8px))
-    )
-    left top / 100% 100% no-repeat;
-  background-attachment: scroll;
+}
+.scale-wrap { position: relative; }
+/* Подложка левого столбца — не фон скроллера, а слой ПОВЕРХ содержимого:
+ * фон скроллера прячется под чипами, а слой вне скроллера стоит на месте,
+ * пока содержимое проезжает под ним (Макс, 10.11: «нет фона у колонки»). */
+.tl-gutter-bg {
+  position: absolute;
+  left: -1px;
+  top: 0;
+  bottom: 0;
+  width: calc(var(--tl-gutter, 186px) + var(--tl-gap, 8px) + 1px);
+  background: var(--card);
+  border-right: 1px solid var(--border);
+  /* Над всем содержимым дорожек (`.tl-lanes` — z1), но под липнущими
+   * подписями (z3), иначе слой накрыл бы их текст. */
+  z-index: 2;
+  pointer-events: none;
 }
 .scale-main.is-wide::-webkit-scrollbar { height: 8px; }
 .scale-main.is-wide::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }

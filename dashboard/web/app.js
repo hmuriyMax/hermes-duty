@@ -64,6 +64,7 @@ import {
   TL_WINDOW_SEC,
   parseWindow,
   windowLabel,
+  DEAL_ICON,
 } from './model.js'
 
 const TOKEN = window.__HERMES_SESSION_TOKEN__ || ''
@@ -2408,6 +2409,10 @@ function scalePanel(scale) {
       h(
         'div',
         { class: 'scale-wrap' },
+        // Подложка левого столбца: живёт ВНЕ скроллера, поэтому не едет с
+        // содержимым и накрывает его целиком — чипы не видны ни в зазорах
+        // между строками, ни между шапкой дорожки и строками.
+        h('div', { class: 'tl-gutter-bg', 'aria-hidden': 'true' }),
         h(
         'div',
         {
@@ -2625,7 +2630,14 @@ function viewDeal(dealId) {
         'div',
         { class: 'deal-head-main' },
         h('div', { class: 'mono muted', title: repoLabel(data.repo) }, `${repoShort(data.repo)} · ${data.id}`),
-        h('h1', null, data.title || '—'),
+        // Значок дела рядом с именем: та же геометрия, что у видов этапов
+        // (шейпер, `DEAL_ICON`), — «это дело», а не вид этапа.
+        h(
+          'div',
+          { class: 'deal-title-row' },
+          h('svg', { class: 'deal-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' }, h('path', { d: DEAL_ICON })),
+          h('h1', null, data.title || '—'),
+        ),
         specStrip(scale.spec),
       ),
       h(

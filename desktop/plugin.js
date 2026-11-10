@@ -3998,7 +3998,9 @@ const CSS = `
  * переменной --duty-tl-full со строки, переход делает CSS. */
 
 /* Шкала шире часа: листается по горизонтали, подписи прилипают слева (Макс, 09.11). */
-.duty-scale-main.is-wide{overflow-x:auto;overscroll-behavior-x:contain;scrollbar-width:thin;background:linear-gradient(90deg,var(--ui-bg-primary,#1a1a1a) 0,var(--ui-bg-primary,#1a1a1a) calc(var(--duty-tl-gutter,186px) + var(--duty-tl-gap,8px) - 1px),var(--ui-border-primary,rgba(127,127,127,.3)) calc(var(--duty-tl-gutter,186px) + var(--duty-tl-gap,8px) - 1px),var(--ui-border-primary,rgba(127,127,127,.3)) calc(var(--duty-tl-gutter,186px) + var(--duty-tl-gap,8px)),transparent calc(var(--duty-tl-gutter,186px) + var(--duty-tl-gap,8px))) left top/100% 100% no-repeat;background-attachment:scroll}
+.duty-scale-main.is-wide{overflow-x:auto;overscroll-behavior-x:contain;scrollbar-width:thin}
+.duty-scale-wrap{position:relative}
+.duty-tl-gutter-bg{position:absolute;left:-1px;top:0;bottom:0;width:calc(var(--duty-tl-gutter,186px) + var(--duty-tl-gap,8px) + 1px);background:var(--ui-bg-primary,#1a1a1a);border-right:1px solid var(--ui-border-primary,rgba(127,127,127,.3));z-index:2;pointer-events:none}
 .duty-scale-main.is-wide::-webkit-scrollbar{height:8px}
 .duty-scale-main.is-wide::-webkit-scrollbar-thumb{background:var(--ui-border-primary,rgba(127,127,127,.3));border-radius:4px}
 .duty-scale-main.is-wide::-webkit-scrollbar-track{background:transparent}
@@ -5104,6 +5106,9 @@ function ScalePanel({ scale, callSel, onSelectCall, toolFilter, onToggleTool }) 
     h(
       'div',
       { className: 'duty-scale-wrap' },
+      // Подложка левого столбца вне скроллера: стоит на месте, пока чипы
+      // проезжают под ней (Макс, 10.11: «нет фона у колонки»).
+      h('div', { className: 'duty-tl-gutter-bg', 'aria-hidden': true }),
       h(
         'div',
         {

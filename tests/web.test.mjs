@@ -65,10 +65,14 @@ test('шкала длиннее часа листается, мы висим н�
   assert.match(app, /if \(!el\.__tlUser\) return/, 'веб: пин снимается без жеста')
   assert.match(app, /event\.deltaX\) el\.__tlUser = true/, 'веб: колесо не считается жестом')
   assert.match(pluginSource, /if \(!el\.__tlUser\) return/, 'десктоп: пин снимается без жеста')
-  // Подложка левого столбца на всю высоту прокрутки, держится при элементе.
-  assert.match(css, /background-attachment: scroll/, 'веб: подложка столбца едет с содержимым')
-  assert.match(css, /var\(--card\) calc\(var\(--tl-gutter, 186px\)/, 'веб: подложка не в цвет карточки')
-  assert.match(pluginSource, /background-attachment:scroll/, 'десктоп: нет подложки столбца')
+  // Подложка левого столбца — слой поверх содержимого вне скроллера: фон
+  // скроллера прячется под чипами, а слой стоит на месте, пока они проезжают.
+  assert.match(app, /class: 'tl-gutter-bg'/, 'веб: нет слоя подложки')
+  assert.match(css, /\.tl-gutter-bg \{[\s\S]*?position: absolute/, 'веб: подложка не слоем поверх')
+  assert.match(css, /\.tl-gutter-bg \{[\s\S]*?z-index: 2/, 'веб: подложка не между контентом и подписями')
+  assert.match(css, /\.tl-gutter-bg \{[\s\S]*?pointer-events: none/, 'веб: подложка ловит клики')
+  assert.match(pluginSource, /duty-tl-gutter-bg/, 'десктоп: нет слоя подложки')
+  assert.match(pluginSource, /\.duty-tl-gutter-bg\{[\s\S]*?z-index:2/, 'десктоп: подложка не между контентом и подписями')
 })
 
 test('маркеры: центр палки точно на своём моменте', () => {

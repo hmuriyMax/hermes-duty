@@ -88,9 +88,10 @@ stages:
     role: implementer
     workspace: none
   - id: close
-    role: implementer
+    role: lead
     needs: [plan]
     workspace: none
+    verdict: {approve: next, changes: plan, max_rounds: 1}
 """
 
 # Спека 0.0.8: без `charter` и без этапа плана — граф задан файлом.
@@ -572,7 +573,8 @@ def test_close_uses_the_journal_graph(tmp_path: Path) -> None:
         fact["deal_id"] = deal["id"]
         fact["idempotency_key"] = deals.event_key("engine", deal["id"], fact["kind"], {"rev": 1})
     journal.append(conn, facts)
-    # Все этапы графа, включая добавленный планом, закрыты своими фактами.
+    # Все этапы графа, включая добавленный планом, закрыты своими фактами, и
+    # закрывающий этап вынес приговор — иначе дело не закрывается (1.0).
     journal.append(
         conn,
         [
@@ -586,6 +588,17 @@ def test_close_uses_the_journal_graph(tmp_path: Path) -> None:
                 "idempotency_key": deals.event_key("engine", deal["id"], "attempt_ended", {"stage": stage_id}),
             }
             for stage_id in ("plan", "close", "research")
+        ]
+        + [
+            {
+                "ts": NOW,
+                "recorded_at": NOW,
+                "deal_id": deal["id"],
+                "kind": "collected",
+                "payload": {"stage": "close", "target": "next", "reason": "итог дела", "attempt": 1},
+                "source": "engine",
+                "idempotency_key": deals.event_key("engine", deal["id"], "collected", {"stage": "close"}),
+            }
         ],
     )
 
@@ -685,13 +698,21 @@ def test_plan_stage_grows_the_graph_through_the_engine(tmp_path: Path) -> None:
         "close",
         1,
         home=home,
-        spawn=Fake(result={"status": "done", "summary": "закрыто"}, pack=True),
+        spawn=Fake(
+            result={
+                "status": "done",
+                "summary": "закрыто",
+                "verdict": {"action": "approve", "target": "next"},
+            },
+            pack=True,
+        ),
         clock=lambda: NOW,
     )
     assert finished["outcome"] == "done", (finished.get("kind"), finished.get("reason"))
 
     closed = driver._closure(conn, deal, spec, float(NOW))
     assert closed["written"] is True
+    assert closed["cause"] == deals.CLOSE_CAUSE_LEAD
     assert closed["stages"] == ["plan", "close", "research"]
 
 

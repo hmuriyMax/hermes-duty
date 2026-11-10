@@ -31,6 +31,15 @@
 | 6 | `hops_done >= max_hops` | `human` | `hops_exhausted` |
 | 7 | фактовый вопрос → роль из `allowed` | `role:<имя>` | `declared_role` |
 
+Две последние причины ставит **движок**, а не резолвер: он единственный знает,
+что роль уже спрошена и чем кончился её ответ (`dashboard/runner.py`,
+`_parked`). Вопрос при этом остаётся тем же, а адрес — тот же `human`:
+
+| # | условие | адрес | причина |
+|---|---|---|---|
+| 8 | роль переадресовала вопрос (`authority: true` в её ответе) | `human` | `role_redirected` |
+| 9 | попытка ответа роли упала (`infra`/`contract`) — вопрос не сгорает | `human` | `role_answer_failed` |
+
 Почему `risky` выше дефолта: властный вопрос — публикация, мерж, скоуп, доступы,
 приоритет — **никогда** не идёт по дефолту, и `to_human: never` этого не
 отменяет: иначе объявление «человеку не спрашивать» молча решало бы за человека.
@@ -74,6 +83,8 @@ REASON_DECLARED = "declared_role"
 REASON_ALLOWED_EMPTY = "allowed_empty"
 REASON_ONLY_SELF = "only_self"
 REASON_UNKNOWN_ROLE = "unknown_role"
+REASON_REDIRECTED = "role_redirected"
+REASON_ROLE_FAILED = "role_answer_failed"
 
 # Закрытый набор причин: он попадает в журнал (`question_asked.payload.routing`),
 # и по нему через месяц видно, почему вопрос ушёл этой роли, — это правило и
@@ -88,6 +99,8 @@ REASONS = (
     REASON_ALLOWED_EMPTY,
     REASON_ONLY_SELF,
     REASON_UNKNOWN_ROLE,
+    REASON_REDIRECTED,
+    REASON_ROLE_FAILED,
 )
 
 # Разметка класса вопроса. Значения сравниваются в нижнем регистре; всё, чего

@@ -49,10 +49,12 @@ Python — то есть гейт «дело проходит impl → verify �
    глотаются: они попадают в отчёт (`answers_errors`) и в вывод шага, чтобы
    «вопрос закрыт, но не разобран» не читалось как «ответа нет».
 8. **«Все этапы закрыты» — это факт журнала, а не строка вывода.** Когда `transit`
-   отвечает `done`, драйвер пишет `completed` (`cause='all_stages_done'`, список
-   пройденных этапов) и строку дела **одной транзакцией** — тем же путём, что
-   `bin/duty close` (`deals.close_stages_done`). Без этого прогон объявлял
-   «итог: дело закрыто», а в журнале не было `completed`, и дело оставалось
+   отвечает `done`, драйвер пишет `completed` и строку дела **одной транзакцией** —
+   тем же путём, что `bin/duty close` (`deals.close_stages_done`). Чем закрывается
+   дело, решает `deals.closure_of`: граф без закрывающего этапа — `cause='all_stages_done'`
+   со списком пройденных этапов; граф с `close` — слово лида, `cause='lead_closed'`
+   и его `summary` (иначе движок закрывал бы дело мимо приговора). Без этого прогон
+   объявлял «итог: дело закрыто», а в журнале не было `completed`, и дело оставалось
    `status='running'` (живой прогон `d_6e764042`). Печать итога — после записи и
    по ней. Повторный прогон на закрытом деле второго `completed` не пишет и
    отвечает «уже закрыто» с причиной и временем из журнала.
@@ -79,6 +81,18 @@ Python — то есть гейт «дело проходит impl → verify �
    не заметит человек (живое дело `d_eb4ad2bb`: 7.5 часа). Ошибки прохода
    (дело решить нечем: спеки нет, правила разошлись) не глотаются — они в
    `release_errors` отчёта.
+12. **Вопрос роли не сгорает, даже если движок ушёл.** Вопрос этапа,
+   адресованный роли (`ask.allowed`), задаётся и получается одним вызовом, и
+   пара `question_asked` → `question_answered` пишется одним шагом. Значит
+   открытый вопрос роли, до которого дожил проход по журналу, никто не
+   дожидается: движка, который его задал, уже нет. Перед решением (сразу после
+   `ask.sync_answers`) драйвер зовёт `runner.recover_role_questions`: передача
+   закрывается фактом `answered_via='failed'`, а вопрос уходит человеку тем же
+   путём, что упавшая попытка ответа (`ask()` плюс `blocked needs_input`).
+   Без этого дело стояло бы в `wait(question)` вечно — ответить нечем (строки
+   пула нет), а спавна роли больше не будет (попытка закрыта) — и работа
+   терялась бы. Восстановленные вопросы попадают в отчёт (`recovered`) и в
+   вывод прогона, а не срабатывают молча.
 
 ## Коды возврата — контракт `bin/duty run`
 
@@ -368,6 +382,7 @@ def _report(
     parked: Optional[dict[str, Any]] = None,
     released: int = 0,
     release_errors: Optional[list[dict[str, Any]]] = None,
+    recovered: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """Отчёт прогона: шаги, уборка, ответы пула, финальное решение, исход и код.
 
@@ -390,6 +405,9 @@ def _report(
     `release_errors` — дела, которые проход решить не смог (спеки нет, правила
     разошлись): пустой список вместо тишины, иначе «дело не отпущено» читалось бы
     как «отпускать было нечего».
+    `recovered` — вопросы роли, которые движок нашёл открытыми и увёл человеку
+    (`runner.recover_role_questions`): по строке на вопрос. Пустой список — таких
+    вопросов не было, и это факт прогона, а не отсутствие поля.
     """
     return {
         "deal": str(deal.get("id") or ""),
@@ -405,6 +423,7 @@ def _report(
         "parked": None if parked is None else dict(parked),
         "released": int(released or 0),
         "release_errors": list(release_errors or ()),
+        "recovered": list(recovered or ()),
         "exit_code": EXIT_CODES[outcome],
     }
 
@@ -415,9 +434,17 @@ def _closure(conn: sqlite3.Connection, deal: Any, spec: Any, now: float) -> dict
     `transit` говорит «все этапы закрыты» — но это **решение**, а не факт: до
     0.0.4 прогон печатал «итог: дело закрыто» и на этом кончал, оставляя дело
     `status='running'` без `completed` (живой прогон `d_6e764042`). Здесь
-    недостающая половина: тот же путь, что у `bin/duty close` (W16) —
-    `deals.close_stages_done` пишет `completed` с
-    `cause='all_stages_done'` и строку дела одной транзакцией.
+    недостающая половина: `deals.close_stages_done` пишет `completed` и строку
+    дела одной транзакцией, тем же путём, что `bin/duty close` (W16).
+
+    Чем закрывается дело — решает граф журнала, а не решение прогона
+    (`docs/ENGINE-1.0.md`, раздел 9). Граф без закрывающего этапа — прежний
+    `cause='all_stages_done'`. Граф с `close` закрывается **словом лида**: его
+    приговор `approve` и его `summary` из `result.json` (итог дела, а не текст
+    движка) ложатся в `completed` с `cause='lead_closed'`. Приговора нет —
+    закрывать нечем: прогон называет отказ, а не пишет «закрыто» поверх работы,
+    которую лид не принял. Тот же приговор `changes` возвращает дело на названный
+    им этап (`transit`) и сюда не доходит: дело не `done`.
 
     Идемпотентность не в памяти прогона, а в журнале: есть `completed` — второй не
     пишется, и `updated_at` не двигается. Повторный `run` на закрытом деле поэтому
@@ -426,9 +453,9 @@ def _closure(conn: sqlite3.Connection, deal: Any, spec: Any, now: float) -> dict
     Ответ — `{written, already, cause, at, stages, status, refused}`: `written` —
     факт лёг этим прогоном, `already` — он был раньше (время тогда из журнала, а
     не из часов), `refused` — закрывать было нельзя (дело держит человек:
-    `blocked`/`review`/`archived`), и причина названа словами. Отказ здесь не
-    глотается: прогон обязан сказать «все этапы закрыты, но дело не закрыто», а
-    не выдать одно за другое.
+    `blocked`/`review`/`archived`; лид не вынес `approve`), и причина названа
+    словами. Отказ здесь не глотается: прогон обязан сказать «все этапы закрыты,
+    но дело не закрыто», а не выдать одно за другое.
     """
     events = journal.read_events(conn, str(deal["id"]))
     fact = journal.closed_fact(events)
@@ -444,6 +471,27 @@ def _closure(conn: sqlite3.Connection, deal: Any, spec: Any, now: float) -> dict
             "refused": "",
         }
     stages = [str(stage.id) for stage in transit.graph(spec, events)]
+    # Чем закрывается дело и чьим итогом — из журнала, а не из памяти прогона:
+    # попытку закрывает тот же факт `attempt_ended`, и повторный `run` читает его
+    # так же, как первый. Правило одно с проходом отпускания (`release._closed`).
+    cause, summary = deals.closure_of(events, stages)
+    closing = str(spec_module.CLOSE_STAGE)
+    if not cause:
+        # Граф с `close`, а приговора `approve` нет: закрывать нечем. Отказ
+        # называется, а не выдаётся за «все этапы пройдены».
+        row = deals.deal_row(conn, str(deal["id"])) or {}
+        return {
+            "written": False,
+            "already": False,
+            "cause": deals.CLOSE_CAUSE_LEAD,
+            "at": int(now),
+            "stages": stages,
+            "status": str(row.get("status") or ""),
+            "refused": (
+                f"закрывающий этап {closing!r} не закрыт приговором approve: "
+                "дело закрывает лид, «все этапы пройдены» этого не заменяет"
+            ),
+        }
     try:
         result = deals.close_stages_done(
             conn,
@@ -451,13 +499,15 @@ def _closure(conn: sqlite3.Connection, deal: Any, spec: Any, now: float) -> dict
             stages=stages,
             source=runner.ENGINE_SOURCE,
             now=int(now),
+            cause=cause,
+            summary=summary,
         )
     except deals.DealError as exc:
         row = deals.deal_row(conn, str(deal["id"])) or {}
         return {
             "written": False,
             "already": False,
-            "cause": deals.CLOSE_CAUSE_ALL_STAGES,
+            "cause": cause,
             "at": int(now),
             "stages": stages,
             "status": str(row.get("status") or ""),
@@ -466,7 +516,7 @@ def _closure(conn: sqlite3.Connection, deal: Any, spec: Any, now: float) -> dict
     return {
         "written": int(result.get("events") or 0) > 0,
         "already": bool(result.get("idempotent")),
-        "cause": deals.CLOSE_CAUSE_ALL_STAGES,
+        "cause": cause,
         "at": int(now),
         "stages": stages,
         "status": "done",
@@ -592,6 +642,7 @@ def run(
     on_step: Optional[Callable[[dict[str, Any]], None]] = None,
     on_reap: Optional[Callable[[dict[str, Any]], None]] = None,
     on_answer_error: Optional[Callable[[dict[str, Any]], None]] = None,
+    on_recover: Optional[Callable[[dict[str, Any]], None]] = None,
     on_release: Optional[Callable[[dict[str, Any]], None]] = None,
     on_release_error: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> dict[str, Any]:
@@ -620,6 +671,7 @@ def run(
     answers_errors: list[dict[str, Any]] = []
     released: list[dict[str, Any]] = []
     release_errors: list[dict[str, Any]] = []
+    recovered: list[dict[str, Any]] = []
     made = 0
     outcome = ""
     note = ""
@@ -667,6 +719,12 @@ def run(
         Отпускание идёт последним и **до** решения (правило 11): строка `running`
         без живого факта — это тот же недостающий факт, что и осиротевшая
         попытка, и решение по журналу обязано читаться уже по полному журналу.
+
+        Восстановление вопроса роли (правило 12) — тоже до решения и сразу после
+        ответов пула: открытый вопрос роли означает, что движка, который его
+        задал, уже нет, и без этого факта решение прочитало бы `wait(question)`
+        навсегда. Между ответами пула и отпусканием: сначала факты канала
+        вопросов, потом «строка дела не сходится с журналом».
         """
         for row in reaper.sweep(conn, int(tick()), spec=spec):
             reaped.append(row)
@@ -681,6 +739,10 @@ def run(
             answers_errors.append(row)
             if on_answer_error is not None:
                 on_answer_error(row)
+        for row in runner.recover_role_questions(conn, deal, home=home, clock=tick):
+            recovered.append(row)
+            if on_recover is not None:
+                on_recover(row)
         release_pass()
         return _decide(conn, deal, spec, tick)
 
@@ -820,6 +882,7 @@ def run(
         parked=parked,
         released=len(released),
         release_errors=release_errors,
+        recovered=recovered,
     )
 
 
@@ -868,6 +931,7 @@ def drive(
     on_step: Optional[Callable[[dict[str, Any]], None]] = None,
     on_reap: Optional[Callable[[dict[str, Any]], None]] = None,
     on_answer_error: Optional[Callable[[dict[str, Any]], None]] = None,
+    on_recover: Optional[Callable[[dict[str, Any]], None]] = None,
     on_release: Optional[Callable[[dict[str, Any]], None]] = None,
     on_release_error: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> dict[str, Any]:
@@ -905,6 +969,7 @@ def drive(
             on_step=on_step,
             on_reap=on_reap,
             on_answer_error=on_answer_error,
+            on_recover=on_recover,
             on_release=on_release,
             on_release_error=on_release_error,
         )

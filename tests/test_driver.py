@@ -701,6 +701,7 @@ def test_json_report_schema(tmp_path: Path) -> None:
         "parked",
         "released",
         "release_errors",
+        "recovered",
         "exit_code",
     }
     assert restored["deal"] == deal["id"]

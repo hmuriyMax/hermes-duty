@@ -1366,6 +1366,11 @@ function shapeStage(stage, journal) {
     return shapeStageAttempt(item, key ? byAttempt.get(key) : null)
   })
   const evidence = (Array.isArray(s.evidence) ? s.evidence : []).map(shapeStageEvidence)
+  // Параллель и автор этапа — факты графа (`dashboard/stagefeed.py`): этап,
+  // которого нет в seed-спеке, добавлен планом лида, а «вместе с» объявлено
+  // спекой или планом. Экран не догадывается ни о том, ни о другом.
+  const parallelWith = (Array.isArray(s.parallel_with) ? s.parallel_with : []).map(String)
+  const addedBy = String(s.added_by || '')
   const kind = waits ? String(waits.kind || '') : ''
   const questionId =
     waits && waits.question_id !== null && waits.question_id !== undefined ? String(waits.question_id) : ''
@@ -1400,6 +1405,10 @@ function shapeStage(stage, journal) {
     rounds: Number(s.rounds) || 0,
     needs,
     needsText: needs.length ? `после: ${needs.join(', ')}` : '',
+    parallelWith,
+    parallelText: parallelWith.length ? `вместе с: ${parallelWith.join(', ')}` : '',
+    addedBy,
+    addedByText: addedBy ? `добавлен ${addedBy === 'lead' ? 'лидом' : `ролью ${addedBy}`}` : '',
     reason: String(s.reason || ''),
     waits,
     waitKind: kind,
@@ -1751,6 +1760,7 @@ const MARKER_META = {
 // не показывает, но и не выдумывает: незнакомая причина остаётся как есть.
 const CLOSE_CAUSE_WORD = {
   all_stages_done: 'все этапы пройдены',
+  lead_closed: 'закрыто лидом',
   closed_by_human: 'закрыто человеком',
   stopped_by_human: 'остановлено человеком',
 }
@@ -2662,11 +2672,15 @@ function specView(rawStages) {
       live: stage.state === 'running',
       kind: stage.kind || 'agent',
       needsText: stage.needsText,
+      parallelText: stage.parallelText,
+      addedByText: stage.addedByText,
       // Подсказка одной строкой: подпись узла, память о провалах и ожидание.
       title: [
         `${stage.id} · ${stage.stateLabel}`,
         fails ? `провалов ${fails}` : '',
         stage.needsText,
+        stage.parallelText,
+        stage.addedByText,
       ]
         .filter(Boolean)
         .join(' · '),

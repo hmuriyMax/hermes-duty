@@ -1114,6 +1114,17 @@ def _timeline(
             # переписать историю.
             if kind == "question_answered" and text.get("answer"):
                 row["answer_text"] = text["answer"]
+        # Вопрос роли (`dashboard/runner.ask_role`) пула не касается: строки там
+        # нет, и единственный источник его текста — журнал. Без этой ветки
+        # вопрос, на который уже ответили, выглядел бы в таймлайне пустым.
+        if kind in ("question_asked", "question_answered") and "question_text" not in row:
+            asked_text = payload.get("text")
+            if isinstance(asked_text, str) and asked_text:
+                row["question_text"] = asked_text
+        if kind == "question_answered" and "answer_text" not in row:
+            answer_text = payload.get("answer")
+            if isinstance(answer_text, str) and answer_text:
+                row["answer_text"] = answer_text
         rows.append(row)
     return rows
 

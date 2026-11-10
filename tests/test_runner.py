@@ -3462,3 +3462,15 @@ def test_plan_contract_carries_the_rethink_diagnosis(tmp_path: Path) -> None:
     assert contract["rethink"]["stage"] == "review"
     assert contract["rethink"]["total"] == 9
     assert "ревизия плана — лишь один из исходов" in contract["rethink"]["how"]
+
+
+def test_lettered_options_come_from_the_question_markup(tmp_path: Path) -> None:
+    """Варианты из «(a)… (b)…» попадают в пул даже без question.options.
+
+    Кейс d_c8551c18 #481: ревьюер перечислил варианты прозой, список не дал —
+    в пул ушёл вопрос без options_json: панель без кнопок, диспетчер не провёл
+    ответ «b». Маркировка — те же варианты, названные отчётом.
+    """
+    assert runner._lettered_options("Как поступить: (a) перепланировать; (b) принять; (c) иное.") == ["a", "b", "c"]
+    assert runner._lettered_options("повтор (a) и снова (a)") == ["a"]
+    assert runner._lettered_options("без вариантов") == []

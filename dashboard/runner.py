@@ -1313,6 +1313,13 @@ def build_contract(
         "раннер спасёт его и запишет сам (кейс d_2fc749fb, попытки 1 и 6)",
         "размечай вопрос: kind (fact | authority), risky (true) и default — "
         "без разметки вопрос считается властным и уходит человеку",
+        # Кейс d_c8551c18 #481: ревьюер перечислил варианты прозой «(a)… (b)…»
+        # в тексте, а поле question.options не заполнил — в пул ушёл вопрос без
+        # options_json: панель не показала кнопок, а диспетчер не провёл ответ
+        # «b» (свободный текст он за человека не решает).
+        "вопрос человеку несёт options: список коротких слов-вариантов "
+        "(напр. [\"a\", \"b\", \"c\"]) в поле question.options — только проза "
+        "в тексте вариантов не доставляет",
         # Кейс d_c8551c18 review#2/#3: ревьюер краулил MR через GitLab API
         # пофайлово (410 get_file), сжёг бюджет попытки (11.4M токенов) и умер
         # по capability; #4 сдал чужой started_at из прошлой попытки.
@@ -4788,6 +4795,25 @@ def _asked_role(
     ), why
 
 
+def _lettered_options(text: str) -> list[str]:
+    """Варианты из маркировки вопроса: «(a) … (b) … (c) …» → ["a", "b", "c"].
+
+    Попытки стабильно перечисляют варианты буквой в скобках, но забывают
+    продублировать их списком `question.options` (кейс d_c8551c18 #481: панель
+    без кнопок, диспетчер не провёл ответ «b»). Маркировка — те же варианты,
+    названные самим отчётом, поэтому сбор из неё честнее отсутствия кнопок.
+    Берём только одиночные метки без повторов и по порядку появления.
+    """
+    import re
+
+    found: list[str] = []
+    for match in re.finditer(r"[（(]([a-zа-яё0-9])[)）]", text, re.IGNORECASE):
+        label = match.group(1).lower()
+        if label not in found:
+            found.append(label)
+    return found
+
+
 def _parked(
     conn: sqlite3.Connection,
     deal: Any,
@@ -4824,6 +4850,8 @@ def _parked(
         raw_options = question.get("options")
         if isinstance(raw_options, list):
             options = [str(item) for item in raw_options]
+    if not options:
+        options = _lettered_options(text)
     if not text:
         text = str(result.get("summary") or "").strip()
     if not text:

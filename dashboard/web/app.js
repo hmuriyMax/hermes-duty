@@ -2085,6 +2085,8 @@ const TONE_VAR = {
   write: 'var(--ok)',
   run: 'var(--warn)',
   net: 'var(--danger)',
+  mcp: 'var(--teal)',
+  meta: 'var(--pink)',
   other: 'var(--text-3)',
 }
 function toneVar(tone) {

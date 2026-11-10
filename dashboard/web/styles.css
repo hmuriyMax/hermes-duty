@@ -21,6 +21,10 @@
   --ok-soft: rgba(22, 163, 74, 0.1);
   --purple: #7c3aed;
   --purple-soft: rgba(124, 58, 237, 0.1);
+  --teal: #0d9488;
+  --teal-soft: rgba(13, 148, 136, 0.1);
+  --pink: #db2777;
+  --pink-soft: rgba(219, 39, 119, 0.1);
   --shadow: 0 1px 3px rgba(16, 24, 40, 0.08), 0 8px 24px rgba(16, 24, 40, 0.06);
   --radius: 12px;
   --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
@@ -58,6 +62,10 @@
     --ok-soft: rgba(74, 222, 128, 0.14);
     --purple: #a78bfa;
     --purple-soft: rgba(167, 139, 250, 0.14);
+    --teal: #2dd4bf;
+    --teal-soft: rgba(45, 212, 191, 0.14);
+    --pink: #f472b6;
+    --pink-soft: rgba(244, 114, 182, 0.14);
     --shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.35);
     /* В темноте те же роли, но светлее и звонче: на #101216 тёмные тона тонут. */
     --role-planner: #a78bfa;
@@ -622,6 +630,8 @@ pre.body {
 .scale-key-dot.t-write { background: var(--ok); }
 .scale-key-dot.t-run { background: var(--warn); }
 .scale-key-dot.t-net { background: var(--danger); }
+.scale-key-dot.t-mcp { background: var(--teal); }
+.scale-key-dot.t-meta { background: var(--pink); }
 .scale-axis { position: relative; height: 15px; }
 .scale-head-gap { min-width: 0; }
 .scale-tick { position: absolute; font-size: 11px; color: var(--text-3); white-space: nowrap; font-variant-numeric: tabular-nums; }

@@ -25,6 +25,20 @@ const app = read('dashboard/web/app.js')
 const api = read('dashboard/plugin_api.py')
 const pluginSource = read('desktop/plugin.js')
 
+test('палитра инструментов: интеграции и служебные не серые', () => {
+  const css = read('dashboard/web/styles.css')
+  // Серый — только «не знаю»: mcp-коннекторы (jira/gitlab/goland) и служебные
+  // вызовы движка (tool_search, session_search) — сотни штук за дело, и серым
+  // они глушили карту вызовов.
+  assert.match(app, /mcp: 'var\(--teal\)'/, 'веб: у интеграций нет тона')
+  assert.match(app, /meta: 'var\(--pink\)'/, 'веб: у служебных нет тона')
+  assert.match(css, /\.scale-key-dot\.t-mcp \{ background: var\(--teal\)/, 'веб: легенда без интеграций')
+  assert.match(css, /\.scale-key-dot\.t-meta \{ background: var\(--pink\)/, 'веб: легенда без служебных')
+  assert.match(read('desktop/plugin.js'), /duty-t-mcp/, 'десктоп: легенда без интеграций')
+  assert.match(read('desktop/plugin.js'), /duty-t-meta/, 'десктоп: легенда без служебных')
+  assert.match(read('desktop/model.js'), /\^\(mcp__\|jira/, 'шейпер не узнаёт интеграции')
+})
+
 test('плавность дела: вход, уход и переезд строк анимированы', () => {
   // Патч правит узлы на месте (morph), поэтому движение отдаётся CSS: свежие
   // узлы помечаются, ушедшие доигрывают схлопывание, перестановка дорожек — FLIP.

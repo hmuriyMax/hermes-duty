@@ -2270,12 +2270,20 @@ const TL = {
 // CSS-цвет: палитры у поверхностей разные, а вид работы — общий факт.
 const TOOL_TONE = [
   // Поиск отделён от чтения: в деле их сотни, и одним цветом карта вызовов
-  // читалась как «всё одно и то же».
+  // читалась как «всё одно и то же». Интеграции и служебные вызовы — там же:
+  // без своих семейств джира/гитлаб/голанд и поиск инструментов красили сотни
+  // вызовов серым, и карта теряла главный сигнал — ЧТО делал агент.
   [/^(search_files|grep|glob|find|ripgrep)/i, 'search'],
   [/^(read_file|view|cat|ls|list|head|tail|stat)/i, 'read'],
   [/^(write_file|patch|apply_patch|edit|create|mkdir|mv|cp|rm)/i, 'write'],
   [/^(terminal|shell|bash|zsh|sh|run|exec|python|node|go|npm|git|make|cargo)/i, 'run'],
   [/^(web_|browser|http|fetch|curl|wget)/i, 'net'],
+  // Внешние системы: коннекторы MCP (mcp__gitlab__, mcp__goland__) и прямые
+  // клиенты тикетников — работа с чужими сервисами, не с файлами и не сеть.
+  [/^(mcp__|jira|gitlab|confluence|goland|codegraph|datagrip|youtrack)/i, 'mcp'],
+  // Служебные вызовы движка: поиск и разбор инструментов, состояние сессии —
+  // работа агента с самим собой, а не с задачей.
+  [/^(tool_search|tool_describe|tool_call|process_manage|session_search|memory|todo|skill|plan|task_note|kanban|note)/i, 'meta'],
 ]
 
 /**
@@ -2291,6 +2299,8 @@ const TOOL_LEGEND = [
   { tone: 'write', label: 'правка' },
   { tone: 'run', label: 'команды' },
   { tone: 'net', label: 'сеть' },
+  { tone: 'mcp', label: 'интеграции' },
+  { tone: 'meta', label: 'служебные' },
 ]
 
 /** Тон инструмента по имени; неизвестный — `other` («не знаю, что это» — факт). */

@@ -1022,9 +1022,34 @@ def test_plan_contract_teaches_the_proposal_form(tmp_path: Path) -> None:
     boundaries = "\n".join(contract["boundaries"])
     assert "needs/parallel_with" in boundaries
     assert "непустой" in boundaries
-    assert "этап close своим вердиктом" in boundaries
+    assert "приговор выносит close своим вердиктом" in boundaries
+    assert "не называется вовсе" in boundaries
     # Хвост этапа-плана: хартия и граф в контракте, как и было.
     assert "charter" in contract and "plan" in contract
+
+
+def test_contract_tells_how_to_deliver_the_report_without_write_file(
+    tmp_path: Path,
+) -> None:
+    """Граница отчёта не лжёт роли про write_file: оба пути доставки названы.
+
+    Кейс d_2fc749fb, попытки 1 и 6: контракт требовал «пишите write_file», роли
+    инструмент не принадлежал, лид тратил попытку на охоту за ним и выносил
+    приговор текстом вместо JSON. Формулировка теперь описывает оба пути: файл
+    (роль с write_file) и fenced JSON в финальном ответе (раннер спасает сам).
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = plan_spec(tmp_path)
+    run_stage(conn, spec, deal, home, Fake(result=None, exit_code=0, lines=[]))
+
+    contract_file = runner.contract_path(runner.attempt_dir(home, deal, "plan", 1), "plan", 1)
+    contract = json.loads(contract_file.read_text(encoding="utf-8"))
+    boundaries = "\n".join(contract["boundaries"])
+    assert "роль с write_file кладёт его в файл" in boundaries
+    assert "раннер спасёт его и запишет сам" in boundaries
+    assert "fenced" in boundaries
 
 
 def test_blocked_result_parks_the_deal_with_question(tmp_path: Path) -> None:

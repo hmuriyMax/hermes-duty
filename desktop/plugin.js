@@ -5127,8 +5127,10 @@ function ScalePanel({ scale, dealId, callSel, onSelectCall, toolFilter, onToggle
       'div',
       { className: 'duty-scale-wrap' },
       // Подложка левого столбца вне скроллера: стоит на месте, пока чипы
-      // проезжают под ней (Макс, 10.11: «нет фона у колонки»).
-      h('div', { className: 'duty-tl-gutter-bg', 'aria-hidden': true }),
+      // проезжают под ней (Макс, 10.11: «нет фона у колонки»). Только в режиме
+      // прокрутки: подписи поднимаются над слоем липкостью (`is-wide`), в узком
+      // виде слой закрыл бы их текст.
+      ...(scale.axis.zoom > 1 ? [h('div', { className: 'duty-tl-gutter-bg', 'aria-hidden': true })] : []),
       h(
         'div',
         {

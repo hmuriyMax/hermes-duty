@@ -589,6 +589,77 @@ def test_resume_attempt_answers_with_session(tmp_path: Path) -> None:
 # --------------------------------------------------------------------- дерево
 
 
+def test_plan_attempt_resumes_its_own_session(tmp_path: Path) -> None:
+    """Ревизия плана продолжает свою сессию, а не начинает разговор заново.
+
+    Кейс d_c8551c18: ревизии 4–7 повторяли отвергнутую форму — каждая попытка
+    была свежим процессом и помнила только контракт, а не собственные прошлые
+    ходы. Резюм ревизии — без ответа человека: входом остаётся новый контракт
+    попытки (`last_rejected`, `rethink`), журнал — источником истины.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = plan_spec(tmp_path)
+    seed(
+        conn,
+        deal,
+        "attempt_started",
+        {"stage": "plan", "attempt": 1, "run_id": "plan#1", "pid": 1},
+        key="test:plan1:started",
+    )
+    seed(
+        conn,
+        deal,
+        "attempt_ended",
+        {
+            "stage": "plan",
+            "attempt": 1,
+            "outcome": "done",
+            "details": {"session_id": "local-plan-77"},
+        },
+        key="test:plan1:ended",
+    )
+    fake = Fake(result=None, exit_code=0, lines=[])
+    runner.run_stage(conn, spec, deal, "plan", 2, home=home, spawn=fake, clock=lambda: NOW)
+
+    command = fake.calls[0]["cmd"]
+    assert "--resume" in command and "local-plan-77" in command
+    query_file = Path(command[command.index("--query-file") + 1])
+    # Входа-ответа у ревизии нет: резюм читает новый контракт попытки.
+    assert query_file.name == "in-plan-2.json"
+    contract = json.loads(query_file.read_text(encoding="utf-8"))
+    assert contract["session_id"] == "local-plan-77"
+    assert "answer_this_attempt" not in contract
+
+
+def test_other_stages_do_not_resume_without_an_answer(tmp_path: Path) -> None:
+    """Резюм без ответа — привилегия этапа плана, не всех этапов."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = none_spec(tmp_path)
+    seed(
+        conn,
+        deal,
+        "attempt_started",
+        {"stage": "impl", "attempt": 1, "run_id": "impl#1", "pid": 1},
+        key="test:impl1:started",
+    )
+    seed(
+        conn,
+        deal,
+        "attempt_ended",
+        {"stage": "impl", "attempt": 1, "outcome": "done", "details": {"session_id": "local-abc123"}},
+        key="test:impl1:ended",
+    )
+    fake = Fake(result={"status": "done", "summary": "сделал"})
+    runner.run_stage(conn, spec, deal, "impl", 2, home=home, spawn=fake, clock=lambda: NOW)
+
+    command = fake.calls[0]["cmd"]
+    assert "--resume" not in command
+
+
 def test_worktree_created_and_kept_on_success(tmp_path: Path) -> None:
     """Успешная попытка оставляет дерево: разбор ошибки идёт по нему же."""
     home = make_home(tmp_path)

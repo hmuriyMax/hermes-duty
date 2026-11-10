@@ -3783,7 +3783,14 @@ def start_stage(
         # текст ответа живёт в журнале, и продолжение берёт его оттуда — иначе
         # лид ответил бы, а этап продолжил бы работу, не увидев ответа.
         answer = role_answer_before(events, stage_id, attempt)
-    session_id = last_session(conn, deal, stage_id) if answer is not None else ""
+    # Этап плана резюмит свою сессию и без ответа человека: ревизии графа — один
+    # разговор лида с самим собой, и свежий процесс каждую попытку обнулял его
+    # контекст (кейс d_c8551c18: ревизии 4–7 повторяли отвергнутую форму, потому
+    # что помнили только контракт, а не собственные прошлые ходы). Журнал остаётся
+    # источником истины: входом резюма служит новый контракт (last_rejected,
+    # rethink), а не память модели.
+    resume = answer is not None or is_plan_stage(stage)
+    session_id = last_session(conn, deal, stage_id) if resume else ""
     contract = build_contract(
         spec,
         deal,
@@ -3808,9 +3815,11 @@ def start_stage(
     )
     contract_file = write_contract(contract_path(workdir, stage_id, attempt), contract)
     query_file = contract_file
-    if session_id:
-        # Продолжение: вход — ответ человека, а не второй контракт. Контракт уже
-        # записан и назван здесь же, чтобы попытка могла перечитать его целиком.
+    if session_id and answer is not None:
+        # Продолжение после ответа человека: вход — ответ, а не второй контракт.
+        # Контракт уже записан и назван здесь же, чтобы попытка могла перечитать
+        # его целиком. Резюм ревизии плана входа-ответа не имеет — её входом
+        # остаётся новый контракт попытки.
         query_file = write_answer(answer_path(workdir, stage_id, attempt), answer or "", contract_file)
 
     result_file = result_path(workdir)

@@ -3815,22 +3815,28 @@ function DutyLane({ lane, bars, scale, callSel, onSelectCall, toolFilter }) {
     h(
       'div',
       { className: 'duty-tl-lane-h' },
-      h('span', { className: 'duty-tl-lane-name', title: view.name }, view.name),
-      view.kind
-        ? h(
-            'span',
-            {
-              className: `duty-tl-kind duty-tl-kind-${view.kind}`,
-              title: view.kind === 'agent' ? `профиль: ${view.kindText}` : view.kind,
-            },
-            h(
-              'svg',
-              { className: 'duty-tl-kind-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' },
-              h('path', { d: view.icon }),
-            ),
-            view.kindText,
-          )
-        : null,
+      // Имя и профиль — в левой колонке, прилипают вместе с подписями попыток
+      // (Макс, 09.11: «попытки закреплены, а названия этапов и профиль — нет»).
+      h(
+        'div',
+        { className: 'duty-tl-lane-id' },
+        h('span', { className: 'duty-tl-lane-name', title: view.name }, view.name),
+        view.kind
+          ? h(
+              'span',
+              {
+                className: `duty-tl-kind duty-tl-kind-${view.kind}`,
+                title: view.kind === 'agent' ? `профиль: ${view.kindText}` : view.kind,
+              },
+              h(
+                'svg',
+                { className: 'duty-tl-kind-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' },
+                h('path', { d: view.icon }),
+              ),
+              view.kindText,
+            )
+          : null,
+      ),
       h('span', { className: 'duty-tl-lane-meta' }, view.meta),
     ),
     view.empty
@@ -3997,7 +4003,7 @@ const CSS = `
 .duty-scale-main.is-wide::-webkit-scrollbar-thumb{background:var(--ui-border-primary,rgba(127,127,127,.3));border-radius:4px}
 .duty-scale-main.is-wide::-webkit-scrollbar-track{background:transparent}
 .duty-scale-main.is-wide .duty-scale-head,.duty-scale-main.is-wide .duty-scale-plot{min-width:calc(var(--tl-zoom,1)*100%)}
-.duty-scale-main.is-wide .duty-scale-head-gap,.duty-scale-main.is-wide .duty-tl-lbl{position:sticky;left:0;z-index:3;background:var(--ui-bg-primary,#1a1a1a)}
+.duty-scale-main.is-wide .duty-scale-head-gap,.duty-scale-main.is-wide .duty-tl-lbl,.duty-scale-main.is-wide .duty-tl-lane-id{position:sticky;left:0;z-index:3;background:var(--ui-bg-primary,#1a1a1a)}
 .duty-scale-scroll-hint{font-size:11px;color:var(--ui-text-tertiary,#888);white-space:nowrap}
 .duty-scale-plot{position:relative}
 /* Ось, сетка и слой сжатий начинаются там же, где дорожка строки, — после
@@ -4026,7 +4032,8 @@ const CSS = `
 .duty-stage-block{animation:duty-fade-in .32s ease both}
 .duty-tl-lane{animation:duty-fade-in .32s ease both}
 @media (prefers-reduced-motion:reduce){.duty-stage-block,.duty-tl-lane{animation:none}.duty-scale-tick,.duty-scale-grid-line,.duty-tl-idle-gap,.duty-tl-call,.duty-tl-wait,.duty-tl-say,.duty-tl-lane,.duty-tl-row,.duty-stage-block,.duty-att-row{transition:none!important}}
-.duty-tl-lane-h{display:flex;align-items:center;gap:8px;min-height:20px}
+.duty-tl-lane-h{display:grid;grid-template-columns:var(--duty-tl-gutter,186px) 1fr;gap:var(--duty-tl-gap,8px);align-items:center;min-height:20px}
+.duty-tl-lane-id{display:flex;align-items:center;gap:6px;min-width:0;white-space:nowrap}
 .duty-tl-lane-name{font-size:12.5px;font-weight:600;color:var(--ui-text-primary);letter-spacing:.01em}
 .duty-tl-lane-meta{margin-left:auto;font-size:11px;color:var(--ui-text-tertiary);font-variant-numeric:tabular-nums;white-space:nowrap}
 .duty-tl-kind{display:inline-flex;align-items:center;gap:5px;height:19px;padding:0 7px;border-radius:5px;border:1px solid var(--ui-border-primary, rgba(127,127,127,.3));background:var(--ui-bg-quaternary);font-size:10.5px;font-weight:600;color:var(--ui-text-secondary)}
@@ -5018,7 +5025,26 @@ function ScalePanel({ scale, callSel, onSelectCall, toolFilter, onToggleTool }) 
   // дальше — прокрутку, висим на правой границе»): пока человек не уехал влево
   // сам, каждый тик держит в кадре свежую кромку.
   const scrollRef = useRef(null)
+  const rootRef = useRef(null)
   useEffect(() => {
+    const root = rootRef.current
+    // Левый столбец — под самый широкий контент (Макс, 09.11: «ширина столбца
+    // уже, чем ширина самого широкого контента»): меряем естественную ширину
+    // подписей (scrollWidth у усечённых многоточием) и кладём в --duty-tl-gutter.
+    if (root && root.querySelector) {
+      const wrap = root.querySelector('.duty-scale-wrap')
+      if (wrap) {
+        let need = 0
+        // Ячейка имени целиком: имя этапа и чип профиля в одной строке —
+        // максимального из детей мало, нужна их сумма (fix-planned-branch
+        // + «implementer» на d_c8551c18).
+        for (const el of root.querySelectorAll('.duty-tl-lbl > *, .duty-tl-lane-id')) {
+          need = Math.max(need, el.scrollWidth || 0)
+        }
+        // 18px — отступы ячейки, зазор и запас на красную кромку провала.
+        wrap.style.setProperty('--duty-tl-gutter', `${Math.min(360, Math.max(186, Math.ceil(need) + 18))}px`)
+      }
+    }
     const el = scrollRef.current
     if (!el || el.__tlPinned === false) return
     el.scrollLeft = el.scrollWidth
@@ -5058,7 +5084,7 @@ function ScalePanel({ scale, callSel, onSelectCall, toolFilter, onToggleTool }) 
   // подписей, справа — та же область, где рисуются чипы.
   return h(
     'div',
-    { className: 'duty-deal-scale' },
+    { ref: rootRef, className: 'duty-deal-scale' },
     head,
     h(
       'div',

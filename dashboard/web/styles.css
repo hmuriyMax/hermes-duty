@@ -606,9 +606,9 @@ pre.body {
 .scale-wrap, .scale-main { min-width: 0; }
 /* Шкала: дорожки слева, легенда семейств — правой колонкой, как в макете `d-merge`
  * (статистика инструментов стояла сбоку справа, а не над дорожками). */
-.scale-wrap { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; align-items: start; }
+.scale-wrap { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; align-items: start; --tl-gutter: 186px; --tl-gap: 8px; }
 .scale-side { display: flex; flex-direction: column; gap: 1px; min-width: 104px; padding-left: 10px; border-left: 1px solid var(--border); font-size: 10px; color: var(--text-3); line-height: 1.45; }
-.scale-head { display: grid; grid-template-columns: var(--tl-gutter, 186px) 1fr; gap: var(--tl-gap, 8px); align-items: end; margin-bottom: 6px; --tl-gutter: 186px; --tl-gap: 8px; }
+.scale-head { display: grid; grid-template-columns: var(--tl-gutter, 186px) 1fr; gap: var(--tl-gap, 8px); align-items: end; margin-bottom: 6px; }
 /* Легенда — колонкой слева, ровно над колонкой подписей попыток. */
 .scale-keys { display: flex; flex-direction: column; gap: 1px; font-size: 10px; color: var(--text-3); line-height: 1.45; }
 .scale-keys-h { font-size: 9.5px; text-transform: uppercase; letter-spacing: .06em; opacity: .7; }
@@ -857,9 +857,9 @@ pre.body {
 .scale-main.is-wide::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 .scale-main.is-wide::-webkit-scrollbar-track { background: transparent; }
 .scale-main.is-wide .scale-head, .scale-main.is-wide .scale-plot { min-width: calc(var(--tl-zoom, 1) * 100%); }
-.scale-main.is-wide .scale-head-gap, .scale-main.is-wide .tl-lbl { position: sticky; left: 0; z-index: 3; background: var(--card); }
+.scale-main.is-wide .scale-head-gap, .scale-main.is-wide .tl-lbl, .scale-main.is-wide .tl-lane-id { position: sticky; left: 0; z-index: 3; background: var(--card); }
 .scale-scroll-hint { font-size: 11px; color: var(--text-3); white-space: nowrap; }
-.scale-plot { position: relative; --tl-gutter: 186px; --tl-gap: 8px; }
+.scale-plot { position: relative; }
 /* Сетка под дорожками: линии по меткам оси, чтобы время читалось поперёк дорожек. */
 .scale-grid { position: absolute; top: -2px; bottom: 0; left: calc(var(--tl-gutter) + var(--tl-gap)); right: 0; pointer-events: none; z-index: 0; }
 .scale-grid-line { position: absolute; top: 0; bottom: 0; border-left: 1px dashed color-mix(in srgb, var(--text-3) 34%, transparent); }
@@ -900,7 +900,8 @@ pre.body {
 .tl-lane { display: flex; flex-direction: column; gap: 4px; }
 .tl-lane + .tl-lane { border-top: 1px solid var(--border); padding-top: 10px; }
 
-.tl-lane-h { display: flex; align-items: center; gap: 8px; min-height: 20px; }
+.tl-lane-h { display: grid; grid-template-columns: var(--tl-gutter, 186px) 1fr; gap: var(--tl-gap, 8px); align-items: center; min-height: 20px; }
+.tl-lane-id { display: flex; align-items: center; gap: 6px; min-width: 0; white-space: nowrap; }
 .tl-lane-name { font-size: 12.5px; font-weight: 600; color: var(--text); letter-spacing: .01em; }
 .tl-lane-meta { font-size: 11px; color: var(--text-3); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .tl-lane-h .sp { flex: 1; }

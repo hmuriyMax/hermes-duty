@@ -25,6 +25,25 @@ const app = read('dashboard/web/app.js')
 const api = read('dashboard/plugin_api.py')
 const pluginSource = read('desktop/plugin.js')
 
+test('левый столбец: шапка дорожки липнет вместе с подписями, ширина — по контенту', () => {
+  // Макс, 09.11: «очень криво обошелся с левым столбцом. попытки закреплены,
+  // а названия этапов и профиль - нет. плюс ширина столбца уже, чем ширина
+  // самого широкого контента».
+  const css = read('dashboard/web/styles.css')
+  // шапка дорожки — той же решёткой, что строка попытки
+  assert.match(css, /\.tl-lane-h \{ display: grid; grid-template-columns: var\(--tl-gutter, 186px\) 1fr/, 'веб: шапка дорожки не решёткой')
+  // имя и профиль — одна липнущая ячейка
+  assert.match(app, /class: 'tl-lane-id'/, 'веб: имя и профиль не в одной ячейке')
+  assert.match(css, /\.scale-main\.is-wide \.tl-lane-id \{ position: sticky/, 'веб: шапка дорожки не липнет')
+  // ширина столбца подстраивается под самый широкий контент
+  assert.match(app, /function fitScaleGutter/, 'веб: нет подгона ширины столбца')
+  assert.match(app, /\.tl-lbl > \*, \.tl-lane-id'/, 'веб: замер не по ячейке имени целиком')
+  assert.match(app, /Math\.min\(360, Math\.max\(186,/, 'веб: нет потолка 360px')
+  assert.match(pluginSource, /duty-tl-lane-id/, 'десктоп: нет ячейки имени')
+  assert.match(pluginSource, /duty-tl-lane-h\{display:grid;grid-template-columns:var\(--duty-tl-gutter,186px\) 1fr/, 'десктоп: шапка не решёткой')
+  assert.match(pluginSource, /--duty-tl-gutter/, 'десктоп: нет подгона ширины')
+})
+
 test('шкала длиннее часа листается, мы висим на правой кромке', () => {
   // Макс, 09.11: «максимальную ширину таймлайна в час, больше — прокрутка».
   // Масштаб заморожен на «вьюпорт = час»: длинное дело не сжимается, а
@@ -33,11 +52,11 @@ test('шкала длиннее часа листается, мы висим н�
   const css = read('dashboard/web/styles.css')
   assert.match(app, /scale-main\$\{scale\.axis\.zoom > 1 \? ' is-wide' : ''\}/, 'веб: широкая шкала не помечена')
   assert.match(app, /--tl-zoom:\$\{scale\.axis\.zoom\}/, 'веб: зум не в переменной')
-  assert.match(app, /pinScaleScroll\(panel\), 0\)/, 'веб: нет пина к правой кромке')
+  assert.match(app, /pinScaleScroll\(panel\)/, 'веб: нет пина к правой кромке')
   assert.match(app, /el\.__tlPinned = el\.scrollLeft \+ el\.clientWidth >= el\.scrollWidth - 8/, 'веб: нет снятия пина при ручном уезде')
   assert.match(css, /\.scale-main\.is-wide \{ overflow-x: auto/, 'веб: нет горизонтальной прокрутки')
   assert.match(css, /min-width: calc\(var\(--tl-zoom, 1\) \* 100%\)/, 'веб: дорожки не растягиваются до zoom')
-  assert.match(css, /\.scale-main\.is-wide \.scale-head-gap, \.scale-main\.is-wide \.tl-lbl \{ position: sticky/, 'веб: подписи не прилипают')
+  assert.match(css, /\.scale-main\.is-wide \.scale-head-gap, \.scale-main\.is-wide \.tl-lbl, \.scale-main\.is-wide \.tl-lane-id \{ position: sticky/, 'веб: подписи не прилипают')
   assert.match(pluginSource, /duty-scale-main\$\{wide \? ' is-wide' : ''\}/, 'десктоп: широкая шкала не помечена')
   assert.match(pluginSource, /el\.scrollLeft = el\.scrollWidth/, 'десктоп: нет пина')
   assert.match(pluginSource, /\.duty-scale-main\.is-wide\{overflow-x:auto/, 'десктоп: нет стиля прокрутки')

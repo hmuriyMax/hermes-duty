@@ -2216,26 +2216,32 @@ function attemptRowNode(view, key) {
 /** Дорожка этапа: имя, значок вида, состояние и строки попыток. */
 function laneNode(lane, bars, scale) {
   const view = laneView(lane, bars, scale)
+  // Шапка дорожки — той же решёткой, что строка попытки: имя и профиль живут
+  // в левой колонке и прилипают при прокрутке вместе с подписями попыток
+  // (Макс, 09.11: «попытки закреплены, а названия этапов и профиль — нет»).
   const head = h(
     'div',
     { class: 'tl-lane-h' },
-    h('span', { class: 'tl-lane-name', title: view.name }, view.name),
-    view.kind
-      ? h(
-          'span',
-          {
-            class: `tl-kind tl-kind-${view.kind}`,
-            title: view.kind === 'agent' ? `профиль: ${view.kindText}` : view.kind,
-          },
-          h(
-            'svg',
-            { class: 'tl-kind-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' },
-            h('path', { d: view.icon }),
-          ),
-          view.kindText,
-        )
-      : null,
-    h('span', { class: 'sp' }),
+    h(
+      'div',
+      { class: 'tl-lane-id' },
+      h('span', { class: 'tl-lane-name', title: view.name }, view.name),
+      view.kind
+        ? h(
+            'span',
+            {
+              class: `tl-kind tl-kind-${view.kind}`,
+              title: view.kind === 'agent' ? `профиль: ${view.kindText}` : view.kind,
+            },
+            h(
+              'svg',
+              { class: 'tl-kind-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' },
+              h('path', { d: view.icon }),
+            ),
+            view.kindText,
+          )
+        : null,
+    ),
     h('span', { class: 'tl-lane-meta fresh', 'data-fresh': `lane:${lane.key}` }, view.meta),
   )
   return h(
@@ -2513,11 +2519,14 @@ function scalePanel(scale) {
   wireScalePanel(panel)
     // «Висим на правой границе»: пока человек не уехал влево, каждый тик держит
   // в кадре свежую кромку. Флаг живёт на элементе — морф его не теряет.
-  // setTimeout, а не rAF: фоновая вкладка не рисует кадры, а кромка должна
-  // держаться и там (после возврата на вкладку морф обновит содержимое).
-  if (scale.axis.zoom > 1 && typeof requestAnimationFrame === 'function') {
-    setTimeout(() => pinScaleScroll(panel), 0)
-  }
+  // Микрозадача, а не setTimeout: панель монтируется в этом же синхронном
+  // проходе, а мериеть и пинить можно только по приделке к документу; таймер
+  // здесь ломал бы петлю опроса — тесты ждут тик последним запланированным
+  // таймером. rAF не годится: фоновая вкладка не рисует кадры.
+  queueMicrotask(() => {
+    fitScaleGutter(panel)
+    if (scale.axis.zoom > 1) pinScaleScroll(panel)
+  })
 return panel
 }
 
@@ -2982,6 +2991,24 @@ async function loadVersion() {
 // Прокрутка широкой шкалы: пока человек не уехал влево сам, каждый тик
 // дожимает скролл к правой свежей кромке; уехал — шкала ждёт его, вернулся
 // к краю — снова висит на «сейчас».
+// Левый столбец шкалы подстраивается под самый широкий контент (Макс, 09.11:
+// «ширина столбца уже, чем ширина самого широкого контента»): имя этапа и
+// профиль не должны выпирать за 186px по умолчанию. Меряем естественную ширину
+// подписей (scrollWidth у усечённых многоточием), результат — в `--tl-gutter`.
+function fitScaleGutter(root) {
+  const wrap = root && root.querySelector ? root.querySelector('.scale-wrap') : null
+  if (!wrap) return
+  let need = 0
+  // Ячейка имени целиком: имя этапа и чип профиля лежат в одной строке —
+  // максимального из детей мало, нужна их сумма (см. `fix-planned-branch`
+  // + «implementer» на d_c8551c18).
+  for (const el of root.querySelectorAll('.tl-lbl > *, .tl-lane-id')) {
+    need = Math.max(need, el.scrollWidth || 0)
+  }
+  // 18px — внутренние отступы ячейки, зазор и запас на красную кромку провала.
+  const px = Math.min(360, Math.max(186, Math.ceil(need) + 18))
+  wrap.style.setProperty('--tl-gutter', `${px}px`)
+}
 function pinScaleScroll(root) {
   const scroller = root && root.querySelector ? root.querySelector('.scale-main.is-wide') : null
   if (!scroller) return

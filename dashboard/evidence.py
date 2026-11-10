@@ -349,7 +349,7 @@ def witness(stage: Any) -> str:
     if str(getattr(stage, "role", "") or "") in spec_module.PUBLISHING_ROLES:
         return WITNESS_PUBLISHED
     if (
-        str(getattr(stage, "id", "") or "") == spec_module.PLAN_STAGE
+        spec_module.is_plan_stage(getattr(stage, "id", ""))
         and str(getattr(stage, "kind", spec_module.DEFAULT_STAGE_KIND)) == spec_module.DEFAULT_STAGE_KIND
     ):
         return WITNESS_PLAN

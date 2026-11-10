@@ -93,10 +93,31 @@ SHELL_KIND = "shell"
 GATE_KIND = "gate"
 
 # Этап, чей отчёт — предложение плана (1.0, `docs/ENGINE-1.0.md`, раздел 3): в
-# seed-графе он называется `plan`. Слово одно на плагин — по нему `runner`
-# требует план отчётом, `transit` читает факты плана, а `evidence` принимает
-# предложение свидетелем: три копии строки разошлись бы на первом переименовании.
-PLAN_STAGE = "plan"
+# seed-графе он называется `coordinator` — координатор дела, он же ведёт его по
+# ходу работы и закрывает (решение Макса, 11.11). Слово одно на плагин — по нему
+# `runner` требует план отчётом, `transit` читает факты плана, а `evidence`
+# принимает предложение свидетелем: три копии строки разошлись бы на первом
+# переименовании. `plan` — прежнее имя: дела, заведённые до переименования,
+# пишут его в журнале, и их факты читаются через `is_plan_stage`.
+PLAN_STAGE = "coordinator"
+PLAN_STAGE_LEGACY = ("plan",)
+
+
+def is_plan_stage(stage_id: Any) -> bool:
+    """Этот ли этап — вход дела (координатор): новое имя плюс старые журналы."""
+    return str(stage_id or "") == PLAN_STAGE or str(stage_id or "") in PLAN_STAGE_LEGACY
+
+
+# Профиль, под которым живёт роль координатора: отдельного профиля `coordinator`
+# в Hermes нет — процесс координатора — это профиль `lead` (права и скиллы те же,
+# имя роли в спеке и журнале — своё).
+COORDINATOR_PROFILE = "lead"
+PROFILE_ALIASES = {"coordinator": COORDINATOR_PROFILE}
+
+
+def spawn_profile(role: str) -> str:
+    """Профиль Hermes для роли этапа: координатор живёт под профилем `lead`."""
+    return PROFILE_ALIASES.get(str(role or ""), str(role or ""))
 
 # Этап, который **закрывает дело** (1.0, `docs/ENGINE-1.0.md`, разделы 9 и 10): в
 # seed-графе он называется `close` и идёт ролью лида. Слово одно на плагин — по
@@ -104,10 +125,13 @@ PLAN_STAGE = "plan"
 # этапы пройдены», а прогон пишет `completed cause=lead_closed` из отчёта лида.
 CLOSE_STAGE = "close"
 
-# Роль закрывающего этапа: итог дела — слово лида, а не текст движка. Хартия
+# Роль закрывающего этапа: итог дела — слово координатора, а не текст движка
+# (решение Макса, 11.11: close делает тот же координатор, что вёл дело). Хартия
 # `allowed_roles` этим набором не расширяется: `close` объявляется в seed-спеке,
-# а планом его не добавляют (`parse_plan` отказывает на занятый `id`).
-CLOSE_ROLE = "lead"
+# а планом его не добавляют (`parse_plan` отказывает на занятый `id`). `lead` —
+# прежняя роль: seed-спеки до переименования валидны и читаются дальше.
+CLOSE_ROLES = ("coordinator", "lead")
+CLOSE_ROLE = "coordinator"
 
 # Дефолты хартии (`docs/ENGINE-1.0.md`, раздел 5): без блока `charter` дело
 # живёт по ним, и это ровно поведение 0.0.8 — план никто не предлагает, граф не
@@ -1079,7 +1103,7 @@ def _check_roles(spec: Spec, profiles: frozenset[str]) -> list[Issue]:
             # У этапа-команды роли нет: кто её исполняет — это `cmd`, и роль
             # здесь отказывает (`_check_kind`), а не ищется среди профилей.
             continue
-        if stage.role not in profiles:
+        if spawn_profile(stage.role) not in profiles:
             issues.append(
                 Issue(
                     spec.path,
@@ -1406,14 +1430,14 @@ def _check_close_stage(spec: Spec) -> list[Issue]:
                 )
             )
             continue
-        if stage.role != CLOSE_ROLE:
+        if stage.role not in CLOSE_ROLES:
             issues.append(
                 Issue(
                     spec.path,
                     stage.line_of("role"),
                     "close.role",
                     f"у закрывающего этапа {stage.id!r} роль {stage.role!r}: дело закрывает "
-                    f"лид (role: {CLOSE_ROLE}), и хартия этого не расширяет",
+                    f"координатор (role: {CLOSE_ROLE}), и хартия этого не расширяет",
                 )
             )
         if stage.verdict is None:

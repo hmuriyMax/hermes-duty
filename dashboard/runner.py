@@ -1004,7 +1004,7 @@ def is_plan_stage(stage: Any) -> bool:
     чей это план.
     """
     return (
-        str(getattr(stage, "id", "") or "") == transit.PLAN_STAGE
+        spec_module.is_plan_stage(getattr(stage, "id", ""))
         and str(getattr(stage, "kind", STAGE_KIND_AGENT)) == STAGE_KIND_AGENT
     )
 
@@ -1434,10 +1434,11 @@ def spawn_command(role: str, query_file: Path, session_id: str = "") -> list[str
     """Команда спавна: ровно те ключи, что сверены с `hermes chat --help` и пробой.
 
     `--format stream-json` подразумевает `--quiet` и одиночный запрос; `-p` —
-    профиль роли из спеки, права не расширяются. `--resume` появляется только у
-    продолжения (после ответа человека).
+    профиль роли из спеки, права не расширяются (`spawn_profile`: координатор
+    живёт под профилем `lead`). `--resume` появляется только у продолжения
+    (после ответа человека).
     """
-    command = [HERMES_BIN, "chat", "-p", str(role)]
+    command = [HERMES_BIN, "chat", "-p", spec_module.spawn_profile(role)]
     if session_id:
         command.extend(["--resume", str(session_id)])
     command.extend(["--query-file", str(query_file), "--format", "stream-json", "--oneshot"])
@@ -4253,9 +4254,9 @@ def _rethink_park(
     возвращает (иначе петля), а число переосмыслений на дело —
     `MAX_RETHINKS_PER_DEAL`, дальше решает человек (прежний путь `park_exhausted`).
     """
-    if str(getattr(stage, "id", "")) == transit.PLAN_STAGE:
+    if spec_module.is_plan_stage(getattr(stage, "id", "")):
         return None
-    if not any(str(getattr(item, "id", "")) == transit.PLAN_STAGE for item in spec.stages):
+    if not any(spec_module.is_plan_stage(getattr(item, "id", "")) for item in spec.stages):
         return None  # без этапа плана переосмыслять некому — сразу человеку
     rethinks = sum(1 for event in events if str(event.get("kind") or "") == transit.PLAN_RETHINK)
     if rethinks >= MAX_RETHINKS_PER_DEAL:

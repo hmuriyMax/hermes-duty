@@ -261,6 +261,7 @@ PLAN_KINDS = (PLAN_PROPOSED, PLAN_ACCEPTED, PLAN_REJECTED, PLAN_RETHINK, PLAN_GA
 # писатель (`runner.report_plan`) и читатель (`graph`) не должны разойтись в том,
 # чей это план.
 PLAN_STAGE = spec_module.PLAN_STAGE
+PLAN_STAGE_LEGACY = spec_module.PLAN_STAGE_LEGACY
 
 APPROVE = "approve"
 CHANGES = "changes"
@@ -1149,10 +1150,17 @@ def _relinked(seed: tuple[Any, ...], proposed: tuple[Any, ...], plan_stage: str)
 
 
 def _plan_stage_of(board: _Board) -> str:
-    """id этапа плана: названный предложением, иначе `plan` из seed-графа."""
+    """id этапа плана: названный предложением, иначе координатор из seed-графа.
+
+    Старые seed-графы называют вход `plan` (`PLAN_STAGE_LEGACY`): ищем новое имя,
+    потом прежнее — журналы дел до переименования читаются дальше.
+    """
     if board.plan_stage:
         return board.plan_stage
-    return PLAN_STAGE if PLAN_STAGE in board.stages else ""
+    for name in (PLAN_STAGE, *PLAN_STAGE_LEGACY):
+        if name in board.stages:
+            return name
+    return ""
 
 
 def _plan_wait(board: _Board) -> str:

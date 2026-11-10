@@ -207,11 +207,16 @@ def test_lead_closes_the_deal(tmp_path: Path) -> None:
 
 
 def test_close_with_a_foreign_role_is_refused(tmp_path: Path) -> None:
-    """Закрывает лид, а не исполнитель: чужая роль — отказ `close.role`."""
+    """Закрывает координатор, а не исполнитель: чужая роль — отказ `close.role`."""
     found = issues(tmp_path, GOOD.replace("role: lead", "role: implementer"))
 
     assert "close.role" in rules(found)
-    assert any("lead" in issue.message for issue in found if issue.rule == "close.role")
+    assert any("координатор" in issue.message for issue in found if issue.rule == "close.role")
+
+
+def test_close_keeps_the_lead_role_of_old_seeds(tmp_path: Path) -> None:
+    """Seed-спеки до переименования (`close` ролью lead) остаются валидными."""
+    assert rules(issues(tmp_path, GOOD)) == set()
 
 
 def test_close_as_a_shell_command_is_refused(tmp_path: Path) -> None:
@@ -548,3 +553,24 @@ def test_release_does_not_close_without_the_verdict(tmp_path: Path) -> None:
     assert journal.closed_fact(journal.read_events(conn, str(deal["id"]))) is None
     assert deals.deal_row(conn, str(deal["id"]))["status"] == "running"
 
+
+
+def test_coordinator_seed_validates_and_spawns_lead_profile(tmp_path: Path) -> None:
+    """Новое имя: вход `coordinator` ролью `coordinator`, close — тот же координатор.
+
+    Решение Макса (11.11): первого лида зовём не plan, а coordinator; роль —
+    координатор и в начале дела, и по ходу; close делает тот же координатор.
+    Профиля `coordinator` в Hermes нет — спавн мапится на профиль `lead`
+    (`spec.spawn_profile`), права не расширяются.
+    """
+    coordinator_seed = GOOD.replace("id: plan", "id: coordinator").replace("role: lead", "role: coordinator")
+    coordinator_seed = coordinator_seed.replace("needs: [plan]", "needs: [coordinator]").replace(
+        "changes: plan", "changes: coordinator"
+    )
+    assert rules(issues(tmp_path, coordinator_seed)) == set()
+    # спавн: роль coordinator живёт под профилем lead
+    runner_module = load_module("hermes_duty_runner", "runner.py")
+    command = runner_module.spawn_command("coordinator", tmp_path / "query.txt")
+    assert "lead" in command
+    # прежнее имя валидно дальше: журналы дел до переименования
+    assert rules(issues(tmp_path, GOOD)) == set()

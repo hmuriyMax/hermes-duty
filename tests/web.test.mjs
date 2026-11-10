@@ -341,10 +341,18 @@ test('разворот строки и правки экрана дела: пр�
   assert.match(plugin, /!dutyTipHost\.isConnected/, 'десктоп: подсказка не сверяется с живостью хоста')
 
   // Граф этапов — в заголовке дела, статус — в правом углу.
-  assert.match(app, /deal-head-top[\s\S]{0,700}specStrip\(scale\.spec\)/, 'веб: граф не в заголовке')
+  assert.match(app, /deal-head-top[\s\S]{0,900}specStrip\(scale\.spec\)/, 'веб: граф не в заголовке')
   assert.match(app, /deal-head-side/, 'веб: у заголовка нет правой колонки под статус')
-  assert.match(plugin, /duty-deal-head-top[\s\S]{0,700}SpecStrip/, 'десктоп: граф не в заголовке')
+  assert.match(plugin, /duty-deal-head-top[\s\S]{0,900}SpecStrip/, 'десктоп: граф не в заголовке')
   assert.match(plugin, /duty-deal-head-side[\s\S]{0,400}StateBadge/, 'десктоп: статус не в правой колонке')
+
+  // Значок дела в заголовке: одна геометрия (`DEAL_ICON`) на обе поверхности,
+  // рядом с именем, в стиле видов этапов (16×16, stroke).
+  const modelSrc = read('desktop/model.js')
+  assert.match(modelSrc, /const DEAL_ICON =/, 'шейпер: нет константы значка дела')
+  assert.match(app, /class: 'deal-ico'[\s\S]{0,200}d: DEAL_ICON/, 'веб: значок дела не у заголовка')
+  assert.match(css, /svg\.deal-ico\s*\{[^}]*stroke-width:\s*1\.5/, 'веб: стиль значка дела не в общем стиле')
+  assert.match(plugin, /duty-deal-ico[\s\S]{0,200}d: DEAL_ICON/, 'десктоп: значок дела не у заголовка')
 
   // Статистика инструментов — правой колонкой от дорожек.
   assert.match(app, /class: 'scale-side'/, 'веб: нет правой колонки легенды')

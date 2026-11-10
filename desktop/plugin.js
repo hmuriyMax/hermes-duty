@@ -2376,6 +2376,14 @@ const KIND_ICON = {
   gate: 'M8 2.2 13.4 8 8 13.8 2.6 8Z',
 }
 
+// Значок дела: маршрут от входа к итогу — узлы старта и закрытия, соединённые
+// путём. Одна геометрия на обе поверхности (см. KIND_ICON): значок стоит рядом
+// с заголовком дела и читается как «это дело», а не как вид этапа.
+const DEAL_ICON =
+  'M3.5 10.9a1.6 1.6 0 1 0 0 3.2 1.6 1.6 0 0 0 0-3.2Z' +
+  'M12.5 1.9a1.6 1.6 0 1 0 0 3.2 1.6 1.6 0 0 0 0-3.2Z' +
+  'M4.7 11.3 11.3 4.7'
+
 /**
  * Вид строки попытки: подпись, штрихи, чипы и суммарное число вызовов.
  *
@@ -3956,6 +3964,8 @@ const CSS = `
 .duty-finished-table td{white-space:nowrap;text-overflow:ellipsis}
 .duty-deal-head{display:flex;flex-direction:column;gap:6px;border:1px solid var(--ui-stroke-tertiary);border-radius:8px;padding:10px 12px;margin-bottom:12px}
 .duty-deal-title{font-size:13px;font-weight:600;word-break:break-word}
+.duty-deal-title-row{display:flex;align-items:center;gap:7px;min-width:0}
+.duty-deal-ico{flex:none;width:15px;height:15px;fill:none;stroke:var(--ui-accent,currentColor);stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
 .duty-deal-facts{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--ui-text-secondary)}
 .duty-deal-facts b{color:var(--ui-text-primary);font-weight:600}
 .duty-deal-body{display:flex;flex-direction:column;gap:12px;min-width:0}
@@ -4021,7 +4031,7 @@ const CSS = `
 .duty-tl-idle-gap{position:absolute;top:0;bottom:0}
 .duty-tl-idle-band{position:absolute;inset:0;background:repeating-linear-gradient(135deg,color-mix(in srgb,var(--ui-text-tertiary) 38%,transparent) 0 2px,transparent 2px 7px);-webkit-mask-image:linear-gradient(to right,transparent,#000 6px,#000 calc(100% - 6px),transparent);mask-image:linear-gradient(to right,transparent,#000 6px,#000 calc(100% - 6px),transparent);opacity:.8}
 .duty-tl-idle-pill{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);white-space:nowrap;font-size:9px;line-height:1.3;letter-spacing:.02em;font-variant-numeric:tabular-nums;color:var(--ui-text-secondary);background:var(--ui-surface-background);border:1px solid var(--ui-stroke-secondary);border-radius:5px;padding:1px 4px}
-.duty-tl-lanes{position:relative;z-index:1;display:flex;flex-direction:column;gap:10px}
+.duty-tl-lanes{position:relative;display:flex;flex-direction:column;gap:10px}
 .duty-tl-lane{display:flex;flex-direction:column;gap:4px}
 .duty-tl-lane + .duty-tl-lane{border-top:1px solid var(--ui-border-primary, rgba(127,127,127,.2));padding-top:10px}
 /* Плавность дела: чипы и метки доезжают до новых процентов, дорожки и этапы —
@@ -5933,7 +5943,12 @@ function DealScreen({ sel, onBack }) {
           { className: 'duty-mono', title: repoLabel((detail.data && detail.data.repo) || sel.repo) },
           `${repoLabel((detail.data && detail.data.repo) || sel.repo)} · ${sel.id}`,
         ),
-        h('div', { className: 'duty-deal-title' }, (detail.data && detail.data.title) || sel.titleFull || '—'),
+        h(
+          'div',
+          { className: 'duty-deal-title-row' },
+          h('svg', { className: 'duty-deal-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' }, h('path', { d: DEAL_ICON })),
+          h('div', { className: 'duty-deal-title' }, (detail.data && detail.data.title) || sel.titleFull || '—'),
+        ),
         detail.data ? h(SpecStrip, { spec: scale.spec }) : null,
       ),
       h(

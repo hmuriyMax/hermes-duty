@@ -924,7 +924,10 @@ pre.body {
   border-radius: 5px;
   padding: 1px 4px;
 }
-.tl-lanes { position: relative; z-index: 1; display: flex; flex-direction: column; gap: 10px; }
+/* Без `z-index` у дорожек: с ним дорожки — свой stacking context, и липнущие
+ * подписи (z3) не поднимаются над подложкой столбца (z2). Порядок над сеткой
+ * (z0) и сжатым просто держится порядком в дереве. */
+.tl-lanes { position: relative; display: flex; flex-direction: column; gap: 10px; }
 .tl-lane { display: flex; flex-direction: column; gap: 4px; }
 .tl-lane + .tl-lane { border-top: 1px solid var(--border); padding-top: 10px; }
 

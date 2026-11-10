@@ -114,6 +114,8 @@ a:hover { text-decoration: underline; }
 }
 
 .brand small { color: var(--text-3); font-weight: 500; font-size: 11px; }
+.brand-ico { display: inline-grid; place-items: center; flex: none; }
+svg.brand-ico-svg { display: block; width: 15px; height: 15px; fill: none; stroke: var(--accent); stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 
 .pulse {
   width: 8px;

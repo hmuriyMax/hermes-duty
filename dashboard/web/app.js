@@ -88,6 +88,15 @@ const stampEl = document.getElementById('stamp')
 const verEl = document.getElementById('ver')
 const humanEl = document.getElementById('human')
 
+// Значок плагина в шапке: та же геометрия, что у значка дела (`DEAL_ICON` из
+// шейпера) и у favicon вкладки — один рисунок на все места плагина.
+const brandIcoEl = document.getElementById('brand-ico')
+if (brandIcoEl) {
+  brandIcoEl.append(
+    h('svg', { class: 'brand-ico-svg', viewBox: '0 0 16 16', 'aria-hidden': 'true' }, h('path', { d: DEAL_ICON })),
+  )
+}
+
 // Элементы с этой осью — не HTML: `createElement('svg')` создаёт элемент в
 // HTML-namespace, и браузер его не рисует вовсе. Ошибка не видна в разметке, и
 // именно поэтому список назван явно, а не выводится из имени тега.
@@ -2528,15 +2537,22 @@ function scalePanel(scale) {
   // проходе, а мериеть и пинить можно только по приделке к документу; таймер
   // здесь ломал бы петлю опроса — тесты ждут тик последним запланированным
   // таймером. rAF не годится: фоновая вкладка не рисует кадры.
+  const dealKey = String(route.id || '')
   queueMicrotask(() => {
-    fitScaleGutter(panel)
+    fitScaleGutter(panel, dealKey)
     if (scale.axis.zoom > 1) pinScaleScroll(panel)
   })
-  // После F5 браузер восстанавливает прежний scrollLeft уже после нашего пина —
-  // повторяем через два кадра, чтобы оказаться у правой кромки новой полосы
-  // (Макс, 09.11).
-  if (scale.axis.zoom > 1 && typeof requestAnimationFrame === 'function') {
-    requestAnimationFrame(() => requestAnimationFrame(() => pinScaleScroll(panel)))
+  // Повторный замер после кадров: подгрузившийся шрифт и дорисованные в морфе
+  // дорожки шире, чем микрозадача успела померять. Заодно это пин к правой
+  // кромке после F5: браузер восстанавливает прежний scrollLeft уже после
+  // нашего пина (Макс, 09.11).
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        fitScaleGutter(panel, dealKey)
+        if (scale.axis.zoom > 1) pinScaleScroll(panel)
+      }),
+    )
   }
 return panel
 }
@@ -3013,9 +3029,17 @@ async function loadVersion() {
 // «ширина столбца уже, чем ширина самого широкого контента»): имя этапа и
 // профиль не должны выпирать за 186px по умолчанию. Меряем естественную ширину
 // подписей (scrollWidth у усечённых многоточием), результат — в `--tl-gutter`.
-function fitScaleGutter(root) {
+// Ширина монотонна, пока открыто то же дело (Макс, 10.11: «столбец сужается
+// после первого же обновления»): тик с пустыми попытками или недорисованным
+// контентом не имеет права ужимать столбец обратно.
+const scaleGutterSeen = { deal: null, px: 0 }
+function fitScaleGutter(root, dealKey) {
   const wrap = root && root.querySelector ? root.querySelector('.scale-wrap') : null
   if (!wrap) return
+  if (scaleGutterSeen.deal !== dealKey) {
+    scaleGutterSeen.deal = dealKey
+    scaleGutterSeen.px = 0
+  }
   let need = 0
   // Ячейка имени целиком: имя этапа и чип профиля лежат в одной строке —
   // максимального из детей мало, нужна их сумма (см. `fix-planned-branch`
@@ -3023,8 +3047,9 @@ function fitScaleGutter(root) {
   for (const el of root.querySelectorAll('.tl-lbl > *, .tl-lane-id')) {
     need = Math.max(need, el.scrollWidth || 0)
   }
+  scaleGutterSeen.px = Math.max(scaleGutterSeen.px, need)
   // 18px — внутренние отступы ячейки, зазор и запас на красную кромку провала.
-  const px = Math.min(360, Math.max(186, Math.ceil(need) + 18))
+  const px = Math.min(360, Math.max(186, Math.ceil(scaleGutterSeen.px) + 18))
   wrap.style.setProperty('--tl-gutter', `${px}px`)
 }
 function pinScaleScroll(root) {

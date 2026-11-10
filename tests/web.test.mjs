@@ -73,6 +73,16 @@ test('шкала длиннее часа листается, мы висим н�
   assert.match(css, /\.tl-gutter-bg \{[\s\S]*?pointer-events: none/, 'веб: подложка ловит клики')
   assert.match(pluginSource, /duty-tl-gutter-bg/, 'десктоп: нет слоя подложки')
   assert.match(pluginSource, /\.duty-tl-gutter-bg\{[\s\S]*?z-index:2/, 'десктоп: подложка не между контентом и подписями')
+  // Ширина столбца монотонна, пока открыто то же дело: тик с пустыми попытками
+  // не ужимает столбец обратно (Макс, 10.11: «столбец сужается после первого же
+  // обновления»). Повторный замер — после кадров: шрифт догружается позже.
+  assert.match(app, /scaleGutterSeen\.px = Math\.max\(scaleGutterSeen\.px, need\)/, 'веб: ширина не монотонна')
+  assert.match(app, /fitScaleGutter\(panel, dealKey\)/, 'веб: замер не привязан к делу')
+  assert.match(app, /fitScaleGutter\(panel, dealKey\)\n?[\s\S]{0,80}pinScaleScroll\(panel\)/, 'веб: нет повторного замера после кадров')
+  assert.match(pluginSource, /seen\.px = Math\.max\(seen\.px,/, 'десктоп: ширина не монотонна')
+  // Дорожки без собственного z-index, иначе подписи не поднимаются над подложкой.
+  assert.ok(!/\.tl-lanes \{[^}]*z-index/.test(css), 'веб: у дорожек есть свой z-index — подписи под подложкой')
+  assert.ok(!/\.duty-tl-lanes\{[^}]*z-index/.test(pluginSource), 'десктоп: у дорожек есть свой z-index')
 })
 
 test('маркеры: центр палки точно на своём моменте', () => {
@@ -353,6 +363,12 @@ test('разворот строки и правки экрана дела: пр�
   assert.match(app, /class: 'deal-ico'[\s\S]{0,200}d: DEAL_ICON/, 'веб: значок дела не у заголовка')
   assert.match(css, /svg\.deal-ico\s*\{[^}]*stroke-width:\s*1\.5/, 'веб: стиль значка дела не в общем стиле')
   assert.match(plugin, /duty-deal-ico[\s\S]{0,200}d: DEAL_ICON/, 'десктоп: значок дела не у заголовка')
+
+  // Значок плагина: favicon вкладки, шапка страницы и карточка хаба — один
+  // рисунок. Шапку рисует app.js из `DEAL_ICON` (одна геометрия, не копия).
+  assert.match(html, /rel="icon"[^>]*favicon-duty\.svg/, 'веб: favicon плагина не подключён')
+  assert.match(app, /brand-ico-svg[\s\S]{0,200}d: DEAL_ICON/, 'веб: шапка не рисует значок из шейпера')
+  assert.match(css, /svg\.brand-ico-svg\s*\{[^}]*stroke:\s*var\(--accent\)/, 'веб: значок шапки не в общем стиле')
 
   // Статистика инструментов — правой колонкой от дорожек.
   assert.match(app, /class: 'scale-side'/, 'веб: нет правой колонки легенды')

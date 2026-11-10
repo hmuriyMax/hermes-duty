@@ -5031,7 +5031,7 @@ function callOf(scale, callId) {
 }
 
 /** Панель шкалы времени: подписанная ось, дорожка на этап, полосы и маркеры. */
-function ScalePanel({ scale, callSel, onSelectCall, toolFilter, onToggleTool }) {
+function ScalePanel({ scale, dealId, callSel, onSelectCall, toolFilter, onToggleTool }) {
   const active = Array.isArray(toolFilter) ? toolFilter : []
   // Прокрутка широкой шкалы (Макс, 09.11: «максимальную ширину таймлайна в час,
   // дальше — прокрутку, висим на правой границе»): пока человек не уехал влево
@@ -5042,6 +5042,9 @@ function ScalePanel({ scale, callSel, onSelectCall, toolFilter, onToggleTool }) 
   // или перетаскивание скроллбара. Программные скроллы (наш пин, восстановление
   // позиции браузером после F5) пин не снимают (Макс, 09.11: после обновления
   // страницы остаёмся у правой кромки).
+  // Ширина монотонна, пока открыто то же дело (Макс, 10.11: «столбец сужается
+  // после первого же обновления»): тик с пустыми попытками не ужимает столбец.
+  const gutterSeen = useRef({ deal: null, px: 0 })
   useEffect(() => {
     const el = scrollRef.current
     if (el && !el.__tlWatch) {
@@ -5065,16 +5068,23 @@ function ScalePanel({ scale, callSel, onSelectCall, toolFilter, onToggleTool }) 
     // подписей (scrollWidth у усечённых многоточием) и кладём в --duty-tl-gutter.
     if (root && root.querySelector) {
       const wrap = root.querySelector('.duty-scale-wrap')
+      const dealKey = String(dealId || '')
       if (wrap) {
+        const seen = gutterSeen.current
+        if (seen.deal !== dealKey) {
+          seen.deal = dealKey
+          seen.px = 0
+        }
         let need = 0
         // Ячейка имени целиком: имя этапа и чип профиля в одной строке —
         // максимального из детей мало, нужна их сумма (fix-planned-branch
         // + «implementer» на d_c8551c18).
-        for (const el of root.querySelectorAll('.duty-tl-lbl > *, .duty-tl-lane-id')) {
-          need = Math.max(need, el.scrollWidth || 0)
+        for (const cell of root.querySelectorAll('.duty-tl-lbl > *, .duty-tl-lane-id')) {
+          need = Math.max(need, cell.scrollWidth || 0)
         }
+        seen.px = Math.max(seen.px, need)
         // 18px — отступы ячейки, зазор и запас на красную кромку провала.
-        wrap.style.setProperty('--duty-tl-gutter', `${Math.min(360, Math.max(186, Math.ceil(need) + 18))}px`)
+        wrap.style.setProperty('--duty-tl-gutter', `${Math.min(360, Math.max(186, Math.ceil(seen.px) + 18))}px`)
       }
     }
     if (!el || el.__tlPinned === false) return
@@ -5996,7 +6006,7 @@ function DealScreen({ sel, onBack }) {
       // Шкала — первой и во всю ширину: это главный факт дела, а спецификация и
       // столбец этапов — пояснение к нему.
       h(KpiStrip, { scale }),
-      h(ScalePanel, { scale, callSel, onSelectCall: selectCall, toolFilter, onToggleTool: toggleTool }),
+      h(ScalePanel, { scale, dealId: sel.id, callSel, onSelectCall: selectCall, toolFilter, onToggleTool: toggleTool }),
       docs.length
         ? h(
             'div',

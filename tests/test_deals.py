@@ -1838,14 +1838,14 @@ def test_own_deal_without_attempts_still_says_the_engine_never_started(
     assert "bin/duty run" in evidence
 
 
-def test_repo_of_canonicalizes_path_and_name_to_one_group() -> None:
-    """Путь и имя — одна группа: канонизация по последнему компоненту пути.
+def test_repo_of_keeps_the_recorded_path_as_is() -> None:
+    """Путь хранится как записан (только ~ разворачивается) — расхождение видно.
 
-    Кейс d_99c2003f против d_2fc749fb: `/Users/.../payout-sx-widgets-api` и
-    `payout-sx-widgets-api` дали в `duty deals` две группы одного проекта.
+    Канонизация к короткому имени откатана (09.11, Макс): разные записи пути
+    должны быть видны как разные группы; полный путь показывает подсказка.
     """
-    assert deals.repo_of("/Users/mshchemilkin/GolandProjects/payout-sx-widgets-api") == "payout-sx-widgets-api"
+    assert deals.repo_of("/Users/mshchemilkin/GolandProjects/payout-sx-widgets-api") == "/Users/mshchemilkin/GolandProjects/payout-sx-widgets-api"
     assert deals.repo_of("payout-sx-widgets-api") == "payout-sx-widgets-api"
-    assert deals.repo_of("~/GolandProjects/payout-sx-widgets-api/") == "payout-sx-widgets-api"
+    assert deals.repo_of("~/GolandProjects/payout-sx-widgets-api") == "/Users/mshchemilkin/GolandProjects/payout-sx-widgets-api"
     assert deals.repo_of("") is None
     assert deals.repo_of(None) is None

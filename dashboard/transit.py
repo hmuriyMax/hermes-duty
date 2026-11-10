@@ -1253,9 +1253,10 @@ def _plan_fact(board: _Board, spec: Any, kind: str, payload: dict[str, Any], at:
         issues = [str(item).strip() for item in payload.get("issues") or () if str(item).strip()]
         text = why + (f": {'; '.join(issues)}" if issues else "")
     else:
-        # Диагноз едет в payload (`why` — причина последнего отказа, `stage` —
-        # упавший этап): без него лид начал бы с догадок, а не с фактов.
-        stage_id = str(payload.get("stage") or "")
+        # Диагноз едет в payload (`why` — причина последнего отказа,
+        # `failed_stage` — упавший этап; у старых фактов диагноз лежал в
+        # `stage`): без него лид начал бы с догадок, а не с фактов.
+        stage_id = str(payload.get("failed_stage") or payload.get("stage") or "")
         fail_kind = str(payload.get("kind") or "")
         if not why:
             why = f"этап {stage_id or '?'} исчерпал попытки ({fail_kind or 'unknown'})"
@@ -1270,6 +1271,21 @@ def _plan_fact(board: _Board, spec: Any, kind: str, payload: dict[str, Any], at:
     node.fail_kind = ""
     node.failed_at = 0
     node.reason = text if not max_rounds else f"{text} — реплан {node.rounds} из {max_rounds}"
+    if kind == PLAN_RETHINK:
+        # Упавший этап возвращается в работу вместе с планом: иначе срез
+        # (`next_stage`) видел бы его FAILED раньше «план решается» и навсегда
+        # отвечал `failed` — переосмысление не доходило бы до лида (кейс
+        # d_c8551c18: review исчерпал попытки, движок вернул дело лиду, а
+        # решение оставалось «дело упало»). Счётчики попыток не трогаются:
+        # их пересматривает новая ревизия плана, не фолд.
+        rethink_stage = str(payload.get("failed_stage") or payload.get("stage") or "")
+        fallen = board.stages.get(rethink_stage) if rethink_stage else None
+        if fallen is not None and fallen.state == FAILED:
+            fallen.state = PENDING
+            fallen.fail_kind = ""
+            fallen.failed_at = 0
+            fallen.question_id = None
+            fallen.reason = f"переосмысление: этап ждёт решения лида ({why})"
 
 
 def _fold(spec: Any, events: Iterable[Any]) -> _Board:
@@ -1299,8 +1315,10 @@ def _fold(spec: Any, events: Iterable[Any]) -> _Board:
         # Факт плана — факт **дела**: `stage` в его payload не пишется (адрес
         # предложения — `source_stage`). Событие с `stage` — факт этапа, даже если
         # вид назван плановым: чужой/мусорный журнал не должен держать дело
-        # ожиданием плана (правило 8).
-        if kind in PLAN_KINDS and not scoped:
+        # ожиданием плана (правило 8). Исключение — старые `plan_rethink`: их
+        # `stage` был диагнозом, а не адресом (кейс d_c8551c18), новый формат
+        # пишет `failed_stage`.
+        if kind in PLAN_KINDS and (not scoped or kind == PLAN_RETHINK):
             _plan_fact(board, view, kind, payload, _int(event.get("ts")))
             continue
         if kind == "question_answered":

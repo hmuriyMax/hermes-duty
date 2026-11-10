@@ -850,6 +850,15 @@ pre.body {
  * наведению/фокусу. Цвета — только переменные темы: страница следует за системой,
  * и второй палитры у неё нет. */
 
+/* Шкала шире часа (Макс, 09.11): не сжимаем в кашу, а листаем по горизонтали.
+ * Подписи попыток прилипают к левому краю и едут вместе с вьюпортом. */
+.scale-main.is-wide { overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+.scale-main.is-wide::-webkit-scrollbar { height: 8px; }
+.scale-main.is-wide::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+.scale-main.is-wide::-webkit-scrollbar-track { background: transparent; }
+.scale-main.is-wide .scale-head, .scale-main.is-wide .scale-plot { min-width: calc(var(--tl-zoom, 1) * 100%); }
+.scale-main.is-wide .scale-head-gap, .scale-main.is-wide .tl-lbl { position: sticky; left: 0; z-index: 3; background: var(--card); }
+.scale-scroll-hint { font-size: 11px; color: var(--text-3); white-space: nowrap; }
 .scale-plot { position: relative; --tl-gutter: 186px; --tl-gap: 8px; }
 /* Сетка под дорожками: линии по меткам оси, чтобы время читалось поперёк дорожек. */
 .scale-grid { position: absolute; top: -2px; bottom: 0; left: calc(var(--tl-gutter) + var(--tl-gap)); right: 0; pointer-events: none; z-index: 0; }

@@ -25,6 +25,24 @@ const app = read('dashboard/web/app.js')
 const api = read('dashboard/plugin_api.py')
 const pluginSource = read('desktop/plugin.js')
 
+test('шкала длиннее часа листается, мы висим на правой кромке', () => {
+  // Макс, 09.11: «максимальную ширину таймлайна в час, больше — прокрутка».
+  // Масштаб заморожен на «вьюпорт = час»: длинное дело не сжимается, а
+  // скроллится, и пока человек не уехал влево сам, каждый тик держит в кадре
+  // свежую правую кромку.
+  const css = read('dashboard/web/styles.css')
+  assert.match(app, /scale-main\$\{scale\.axis\.zoom > 1 \? ' is-wide' : ''\}/, 'веб: широкая шкала не помечена')
+  assert.match(app, /--tl-zoom:\$\{scale\.axis\.zoom\}/, 'веб: зум не в переменной')
+  assert.match(app, /pinScaleScroll\(panel\), 0\)/, 'веб: нет пина к правой кромке')
+  assert.match(app, /el\.__tlPinned = el\.scrollLeft \+ el\.clientWidth >= el\.scrollWidth - 8/, 'веб: нет снятия пина при ручном уезде')
+  assert.match(css, /\.scale-main\.is-wide \{ overflow-x: auto/, 'веб: нет горизонтальной прокрутки')
+  assert.match(css, /min-width: calc\(var\(--tl-zoom, 1\) \* 100%\)/, 'веб: дорожки не растягиваются до zoom')
+  assert.match(css, /\.scale-main\.is-wide \.scale-head-gap, \.scale-main\.is-wide \.tl-lbl \{ position: sticky/, 'веб: подписи не прилипают')
+  assert.match(pluginSource, /duty-scale-main\$\{wide \? ' is-wide' : ''\}/, 'десктоп: широкая шкала не помечена')
+  assert.match(pluginSource, /el\.scrollLeft = el\.scrollWidth/, 'десктоп: нет пина')
+  assert.match(pluginSource, /\.duty-scale-main\.is-wide\{overflow-x:auto/, 'десктоп: нет стиля прокрутки')
+})
+
 test('маркеры: центр палки точно на своём моменте', () => {
   // Сдвиги якорей в стороны оставляли щели: из под палок выглядывала кромка
   // полосы (Макс, 09.11). Центр палки — на моменте, якорь — только семантика.

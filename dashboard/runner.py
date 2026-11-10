@@ -1264,7 +1264,7 @@ def plan_payload(spec: Any, events: Iterable[Any]) -> dict[str, Any]:
             rethink = journal.payload_of(event)
             out["rethink"] = {
                 "why": str(rethink.get("why") or ""),
-                "stage": str(rethink.get("stage") or ""),
+                "stage": str(rethink.get("failed_stage") or rethink.get("stage") or ""),
                 "kind": str(rethink.get("kind") or ""),
                 "total": int(rethink.get("total") or 0),
                 "how": (
@@ -4268,7 +4268,12 @@ def _rethink_park(
                 deal,
                 transit.PLAN_RETHINK,
                 {
-                    "stage": stage.id,
+                    # Диагноз: какой этап упал. Ключ — `failed_stage`, а не
+                    # `stage`: факт плана — факт ДЕЛА, `stage` в payload делает
+                    # событие «этапным», и фолд его игнорирует (этап review не
+                    # существует для переосмысления) — кейс d_c8551c18, дело
+                    # навсегда оставалось `running` без живого факта.
+                    "failed_stage": stage.id,
                     "kind": kind,
                     "attempt": int(attempt),
                     "why": str(reason or ""),

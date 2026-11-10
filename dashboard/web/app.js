@@ -2386,7 +2386,14 @@ function scalePanel(scale) {
     // Подпись «обновлено ЧЧ:ММ:СС» — весь индикатор тихого обновления, и он же
     // единственное место, где видно, что страница живая. `aria-live="off"`:
     // диктор не должен читать время каждые пять секунд.
-    h('div', { class: 'panel-h' }, `шкала времени · ${scale.axis.text}`, refreshedNode()),
+    h(
+      'div',
+      { class: 'panel-h' },
+      `шкала времени · ${scale.axis.text}`,
+      scale.axis.zoom > 1 ? h('span', { class: 'scale-scroll-hint', title: `шкала шире часа в ${Math.round(scale.axis.zoom)} экрана — листается по горизонтали, правая кромка свежая` }, '⟷ прокрутка') : null,
+      h('span', { class: 'tl-spacer' }),
+      refreshedNode(),
+    ),
     h(
       'div',
       { class: 'panel-b' },
@@ -2397,7 +2404,12 @@ function scalePanel(scale) {
         { class: 'scale-wrap' },
         h(
         'div',
-        { class: 'scale-main' },
+        {
+          class: `scale-main${scale.axis.zoom > 1 ? ' is-wide' : ''}`,
+          // Ось заморожена на «вьюпорт = час»: дело длиннее — листается, и мы
+          // держимся правой свежей кромки (см. pinScaleScroll).
+          style: scale.axis.zoom > 1 ? `--tl-zoom:${scale.axis.zoom}` : '',
+        },
         h(
         'div',
         { class: 'scale-head' },
@@ -2499,7 +2511,14 @@ function scalePanel(scale) {
   // Фильтр, выбранный в легенде, переживает перерисовку данных: экран
   // пересобирается по новому кадру, а подсветка остаётся там, где её оставили.
   wireScalePanel(panel)
-  return panel
+    // «Висим на правой границе»: пока человек не уехал влево, каждый тик держит
+  // в кадре свежую кромку. Флаг живёт на элементе — морф его не теряет.
+  // setTimeout, а не rAF: фоновая вкладка не рисует кадры, а кромка должна
+  // держаться и там (после возврата на вкладку морф обновит содержимое).
+  if (scale.axis.zoom > 1 && typeof requestAnimationFrame === 'function') {
+    setTimeout(() => pinScaleScroll(panel), 0)
+  }
+return panel
 }
 
 // Панели, которые уже слушают клики. Тихий патч правит узлы на месте, поэтому
@@ -2960,6 +2979,24 @@ async function loadVersion() {
   }
 }
 
+// Прокрутка широкой шкалы: пока человек не уехал влево сам, каждый тик
+// дожимает скролл к правой свежей кромке; уехал — шкала ждёт его, вернулся
+// к краю — снова висит на «сейчас».
+function pinScaleScroll(root) {
+  const scroller = root && root.querySelector ? root.querySelector('.scale-main.is-wide') : null
+  if (!scroller) return
+  if (scroller.__tlPinned !== false) scroller.scrollLeft = scroller.scrollWidth
+}
+document.addEventListener(
+  'scroll',
+  (event) => {
+    const el = event.target
+    if (el instanceof Element && el.classList && el.classList.contains('scale-main')) {
+      el.__tlPinned = el.scrollLeft + el.clientWidth >= el.scrollWidth - 8
+    }
+  },
+  { capture: true, passive: true },
+)
 bindTipLayer()
 ticker = setInterval(tickStamp, 1000)
 tickStamp()

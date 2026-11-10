@@ -282,10 +282,24 @@ def _load_spec(path: str) -> Any:
         return None
 
 
-def _stage_of(spec: Any, stage_id: Any) -> Any:
-    """Этап спеки по id — тем же аксессором, что у драйвера (`spec.stage`)."""
+def _stage_of(spec: Any, stage_id: Any, events: Any = ()) -> Any:
+    """Этап дела по id: файл спеки, а мимо — граф журнала.
+
+    Второй источник нужен этапам, которых в файле нет: принятый план растит граф
+    из журнала (`plan_proposed` → `plan_accepted`), и попытка по такому этапу
+    заканчивается фактом, чей `stage` файловая спека не знает. Без прохода по
+    графу отпускание отвечало бы «этап не найден в спеке дела» и дело навсегда
+    оставалось бы `running` (кейс d_c8551c18: review из плана ревизии 1).
+    """
     finder = getattr(spec, "stage", None)
-    return finder(str(stage_id)) if callable(finder) else None
+    found = finder(str(stage_id)) if callable(finder) else None
+    if found is not None:
+        return found
+    graph = transit.graph(spec, events or ())
+    for item in graph:
+        if str(getattr(item, "id", "")) == str(stage_id):
+            return item
+    return None
 
 
 # -------------------------------------------------------------------- проход
@@ -374,7 +388,7 @@ def _materialise(
     if decision.kind == transit.DECISION_FAILED:
         return _stopped(conn, deal, deal_spec, events, at, home=home, dry_run=dry_run)
     if decision.kind == transit.PARK:
-        return _parked_gate(conn, deal, deal_spec, decision, at, dry_run=dry_run)
+        return _parked_gate(conn, deal, deal_spec, decision, at, events=events, dry_run=dry_run)
     return None
 
 
@@ -505,7 +519,7 @@ def _stopped(
     fact = _last_attempt(events)
     if fact is None or not fact["stage"]:
         return None
-    stage = _stage_of(deal_spec, fact["stage"])
+    stage = _stage_of(deal_spec, fact["stage"], events)
     if stage is None:
         return {
             "deal": deal_id,
@@ -582,6 +596,21 @@ def _stopped(
             "written": 0,
             "dry_run": False,
         }
+    if str(parked.get("reason") or "") == "rethink":
+        # Попытки исчерпал не человек, а лид: движок вернул ему дело (`plan_rethink`
+        # записан). Парковкой это не называется — строка остаётся `running`, и
+        # следующий проход отпустит дело по новому решению (`run` этапа плана).
+        return {
+            "deal": deal_id,
+            "action": "rethink",
+            "from": RUNNING_STATUS,
+            "to": "running",
+            "stage": fact["stage"],
+            "attempt": fact["attempt"],
+            "reason": str(parked.get("reason") or "") + ": " + (fact["reason"] or ""),
+            "written": 1,
+            "dry_run": False,
+        }
     return {
         "deal": deal_id,
         "action": ACTION_PARKED,
@@ -597,10 +626,17 @@ def _stopped(
 
 
 def _parked_gate(
-    conn: Any, deal: dict[str, Any], deal_spec: Any, decision: Any, at: int, *, dry_run: bool
+    conn: Any,
+    deal: dict[str, Any],
+    deal_spec: Any,
+    decision: Any,
+    at: int,
+    *,
+    events: Any = (),
+    dry_run: bool,
 ) -> Optional[dict[str, Any]]:
     """Вопрос гейта истёк: парковка гейта — тем же писателем, что в прогоне."""
-    stage = _stage_of(deal_spec, decision.stage)
+    stage = _stage_of(deal_spec, decision.stage, events)
     if stage is None or str(getattr(stage, "kind", "")) != spec_module.GATE_KIND:
         return None
     reason = str(getattr(decision, "reason", "") or "")

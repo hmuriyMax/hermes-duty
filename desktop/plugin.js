@@ -3449,6 +3449,10 @@ function shapeDealTime(detail, attemptsPayload) {
       start: axisStart,
       end: axisEnd,
       spanSec: durationSec,
+      // Ширина дорожки в экранах (Макс, 09.11: «максимальную ширину таймлайна
+      // в час»): масштаб оси замораживается на «вьюпорт = час», более длинное
+      // дело не сжимается, а листается по горизонтали. `1` — всё влезло.
+      zoom: durationSec === null ? 1 : Math.max(1, Math.round((durationSec / 3600) * 100) / 100),
       live,
       text: axisStart === null || axisEnd === null ? 'времени в журнале нет' : `${fmtClockShort(axisStart)}–${fmtClockShort(axisEnd)}`,
       ticks: axisTicks,
@@ -3981,6 +3985,14 @@ const CSS = `
  * Свёрнутая попытка — 20 px, раскрытие по наведению/фокусу. Высота приходит
  * переменной --duty-tl-full со строки, переход делает CSS. */
 
+/* Шкала шире часа: листается по горизонтали, подписи прилипают слева (Макс, 09.11). */
+.duty-scale-main.is-wide{overflow-x:auto;overscroll-behavior-x:contain;scrollbar-width:thin}
+.duty-scale-main.is-wide::-webkit-scrollbar{height:8px}
+.duty-scale-main.is-wide::-webkit-scrollbar-thumb{background:var(--ui-border-primary,rgba(127,127,127,.3));border-radius:4px}
+.duty-scale-main.is-wide::-webkit-scrollbar-track{background:transparent}
+.duty-scale-main.is-wide .duty-scale-head,.duty-scale-main.is-wide .duty-scale-plot{min-width:calc(var(--tl-zoom,1)*100%)}
+.duty-scale-main.is-wide .duty-scale-head-gap,.duty-scale-main.is-wide .duty-tl-lbl{position:sticky;left:0;z-index:3;background:var(--ui-bg-primary,#1a1a1a)}
+.duty-scale-scroll-hint{font-size:11px;color:var(--ui-text-tertiary,#888);white-space:nowrap}
 .duty-scale-plot{position:relative}
 /* Ось, сетка и слой сжатий начинаются там же, где дорожка строки, — после
  * колонки подписей. Без этого сдвига пунктир и подпись сжатия встают на 194 px
@@ -4996,11 +5008,28 @@ function callOf(scale, callId) {
 /** Панель шкалы времени: подписанная ось, дорожка на этап, полосы и маркеры. */
 function ScalePanel({ scale, callSel, onSelectCall, toolFilter, onToggleTool }) {
   const active = Array.isArray(toolFilter) ? toolFilter : []
+  // Прокрутка широкой шкалы (Макс, 09.11: «максимальную ширину таймлайна в час,
+  // дальше — прокрутку, висим на правой границе»): пока человек не уехал влево
+  // сам, каждый тик держит в кадре свежую кромку.
+  const scrollRef = useRef(null)
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el || el.__tlPinned === false) return
+    el.scrollLeft = el.scrollWidth
+  })
+  const onScroll = useCallback((event) => {
+    const el = event.currentTarget
+    el.__tlPinned = el.scrollLeft + el.clientWidth >= el.scrollWidth - 8
+  }, [])
+  const wide = (Number(scale.axis.zoom) || 1) > 1
   const head = h(
     'div',
     { className: 'duty-group-h' },
     h('span', null, 'шкала времени'),
     h('span', { className: 'duty-mono' }, scale.axis.text),
+    wide
+      ? h('span', { className: 'duty-scale-scroll-hint', title: `шкала шире часа в ${Math.round(scale.axis.zoom)} экрана — листается по горизонтали, правая кромка свежая` }, '⟷ прокрутка')
+      : null,
   )
   if (scale.empty) {
     return h('div', { className: 'duty-deal-scale' }, head, h('div', { className: 'duty-muted' }, 'событий и попыток нет: рисовать нечего'))
@@ -5030,7 +5059,12 @@ function ScalePanel({ scale, callSel, onSelectCall, toolFilter, onToggleTool }) 
       { className: 'duty-scale-wrap' },
       h(
         'div',
-        { className: 'duty-scale-main' },
+        {
+          ref: scrollRef,
+          className: `duty-scale-main${wide ? ' is-wide' : ''}`,
+          onScroll: wide ? onScroll : undefined,
+          style: wide ? { '--tl-zoom': String(scale.axis.zoom) } : undefined,
+        },
         h(
           'div',
           { className: 'duty-scale-head' },

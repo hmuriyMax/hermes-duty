@@ -863,6 +863,21 @@ test('легенда инструментов: семейства с числа�
   assert.equal(known, all - 1, `в легенде ${known}, вызовов ${all}`)
 })
 
+test('ось: масштаб заморожен на «вьюпорт = час», длинное дело листается', () => {
+  // Макс, 09.11: «максимальную ширину таймлайна в час, больше — прокрутка».
+  const short = shapeDealTime(
+    { now: 3_000, terminal: true, timeline: [{ kind: 'created', at: 1_000, summary: '' }], stages: [] },
+    { attempts: [{ stage: 'impl', attempt: 1, started_at: 1_000, ended_at: 3_000, status: 'done' }] },
+  )
+  assert.equal(short.axis.zoom, 1)
+  const long = shapeDealTime(
+    { now: 31_000, terminal: false, timeline: [{ kind: 'created', at: 1_000, summary: '' }], stages: [] },
+    { attempts: [{ stage: 'impl', attempt: 1, started_at: 1_000, ended_at: 31_000, status: 'done' }] },
+  )
+  // 30 000 с ≈ 8.33 часа дорожки — восемь экранов прокрутки.
+  assert.equal(long.axis.zoom, 8.33)
+})
+
 test('ширина чипа: свёрнутая строка линейна, развёрнутая логарифмична', () => {
   const view = attemptView(
     bar([

@@ -2012,6 +2012,8 @@ def render_release_row(row: dict[str, Any]) -> str:
         tail = "все этапы пройдены: completed"
     elif action == "parked":
         tail = "попытки исчерпаны: парковка"
+    elif action == "rethink":
+        tail = "попытки исчерпаны: дело возвращено лиду на переосмысление"
     elif action == "blocked":
         tail = "отказ движка: блок классом отказа"
     else:

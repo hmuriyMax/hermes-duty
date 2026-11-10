@@ -3400,6 +3400,10 @@ function shapeDealTime(detail, attemptsPayload) {
       start: axisStart,
       end: axisEnd,
       spanSec: durationSec,
+      // Ширина дорожки в экранах (Макс, 09.11: «максимальную ширину таймлайна
+      // в час»): масштаб оси замораживается на «вьюпорт = час», более длинное
+      // дело не сжимается, а листается по горизонтали. `1` — всё влезло.
+      zoom: durationSec === null ? 1 : Math.max(1, Math.round((durationSec / 3600) * 100) / 100),
       live,
       text: axisStart === null || axisEnd === null ? 'времени в журнале нет' : `${fmtClockShort(axisStart)}–${fmtClockShort(axisEnd)}`,
       ticks: axisTicks,

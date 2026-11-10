@@ -707,6 +707,26 @@ heartbeat движка). Живой случай: попытка погибла 
   `routing.target` и проверку `question_id`) — падает
   `test_a_human_question_is_not_recovered_as_a_lost_role_one`: у дела отнят
   единственный живой канал ответа.
+- применять перестановку этапа, который уже начинали (убрать проверку `started` из
+  `spec.parse_plan`) — падает `test_reorder_of_a_started_stage_is_refused` и
+  `test_parse_plan_reorder_of_a_started_stage_is_refused`: лид возвращал бы
+  сделанное в обход `verdict.changes`;
+- считать граф плана без перестановок (вернуть `_relinked` к `seed + added` без
+  `dataclasses.replace`) — падает
+  `test_reorder_of_a_stage_that_has_not_started_moves_it`: порядок остался бы
+  файловым, а предложение — принятым молча;
+- проверять цикл только по добавленным этапам (как было до 1.0) — падает
+  `test_cycle_closed_by_a_reorder_is_refused`: перестановка замкнула бы круг через
+  seed, и дело стояло бы вечно;
+- считать порог `plan_gate` только по этапным бюджетам (забыть `cost`) — падает
+  `test_declared_cost_moves_the_plan_gate`: дорогой план прошёл бы по дешёвым
+  этапам;
+- превратить объявленную параллель в ожидание (не исключать `_parallel` из `tail` в
+  `_relinked`) — падает `test_parallel_with_declared_by_the_plan_starts_both`:
+  «вместе с» стало бы «после»;
+- не отдавать `added_by`/`parallel_with` в срезе (`stagefeed.stages`) — падают
+  `test_stage_slice_names_the_author_and_the_parallel_of_added_stages` и тест
+  шейпера «параллель и автор этапа — из графа, а не догадка экрана».
 
 ## 11. Одно дело руками: от спеки до закрытых этапов
 

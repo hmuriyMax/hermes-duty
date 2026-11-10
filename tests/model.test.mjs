@@ -1814,6 +1814,23 @@ test('строка этапа: имя, вид, попытки и состоян�
   assert.equal(ask.waitHref, '/imsg')
 })
 
+test('параллель и автор этапа — из графа, а не догадка экрана', () => {
+  const [added, paired] = shapeStages({
+    stages: [
+      { id: 'docs', state: 'pending', added_by: 'lead', parallel_with: ['impl'] },
+      { id: 'impl', state: 'pending', added_by: '', parallel_with: [] },
+    ],
+  }).stages
+  assert.deepEqual(added.parallelWith, ['impl'])
+  assert.equal(added.parallelText, 'вместе с: impl')
+  assert.equal(added.addedBy, 'lead')
+  assert.equal(added.addedByText, 'добавлен лидом')
+  // у этапа из seed-спеки автора нет: пустое поле честнее слова «движок»
+  assert.equal(paired.addedBy, '')
+  assert.equal(paired.addedByText, '')
+  assert.equal(paired.parallelText, '')
+})
+
 test('счётчик попыток этапа склоняется и не выдумывает ноль', () => {
   const stage = (attempts) => shapeStages({ stages: [{ id: 'x', state: 'done', attempts }] }).stages[0]
   assert.equal(compactStageView(stage([])).attemptsText, 'попыток нет')

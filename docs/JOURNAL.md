@@ -68,7 +68,7 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 | `question_asked` | вопрос задан: `ask()` создал его в пуле — или движок отдал его роли (`runner.ask_role`, 1.0). У вопроса роли пула нет: `question_id`/`session_key` не пишутся, текст едет полем `text`, а адрес — тем же `routing` с `hops` | `question_id`, `session_key`, `critical`, `timeout`, `text` (у вопроса роли), `routing` (`{target, reason, stage, attempt}` и `hops` у вопроса роли — если вопрос адресовал движок) |
 | `question_answered` | ответ найден в пуле — или у вопроса вышел срок (`answered_via='expired'`), или ответила роль (`by`, `answer`) — либо передача роли закрылась без ответа (`answered_via='redirected'`/`'failed'`): вопрос ушёл человеку | `question_id`, `answer_len`, `answered_via`; у ответа роли — `by`, `hops`, `answer`, `routing` (`{stage, attempt}`), `reason` у переадресации и провала |
 | `published` | публикующий этап отчитался, и движок **подтвердил** факт: `git ls-remote origin` видит заявленный sha (сверка по префиксу: сокращённый sha законен, пока однозначен). Пишет движок (`dashboard/runner.published_claim`), а не исполнитель: `published` в `result.json` — заявка | `stage`, `attempt`, `sha` (полный, из `ls-remote`), `claimed_sha` (что сказал исполнитель), `branch`, `mr_url` (заявка — GitLab движку не виден), `ref` (что нашлось в origin), `verified_by` (`git ls-remote`) |
-| `plan_proposed` | этап плана отчитался предложением: `plan: {stages, reason}` в `result.json` стал фактом. Граф **не меняет** — предложение ещё не план (правило 12) | `rev`, `stages[]`, `reason`, `source_stage`, `attempt` |
+| `plan_proposed` | этап плана отчитался предложением: `plan: {stages, cost, reason}` в `result.json` стал фактом. Граф **не меняет** — предложение ещё не план (правило 12). В `stages[]` едут и добавления, и перестановки (запись с `id` из графа, назвавшая только `needs`/`parallel_with`) | `rev`, `stages[]`, `reason`, `source_stage`, `attempt`, `cost` (`{tokens}`, если план назвал цену) |
 | `plan_accepted` | предложение стало графом: предложение прошло `spec.parse_plan` по хартии (или человек ответил «принять» на гейте плана) | `rev`, `by` (`engine`\|`human`) |
 | `plan_rejected` | валидатор или человек отказал предложению: этап плана возвращается в работу с причиной и списком отказов; сверх `charter.max_rounds_replan` — `failed(contract)` | `rev`, `why`, `issues[]` |
 | `plan_gate` | план дороже порога `charter.plan_gate` — ждём человека (`ask()`), до ответа дело стоит в `wait_human` | `rev`, `reason`, `question_id` |
@@ -84,10 +84,16 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 Граф дела читается **одной функцией** (`transit.graph`): seed-спека плюс этапы
 принятой ревизии, повторно проверенные `spec.parse_plan` (журнал не второй
 валидатор: мусор в `plan_accepted` граф не вырастит). Предложение (`plan_proposed`)
-граф не меняет — оно предложение. Этапы seed, у которых в `needs` стоит этап
+граф не меняет — оно предложение. Запись ревизии с `id` уже существующего этапа —
+**перестановка**: у неё берутся только `needs`/`parallel_with`, и граф получает
+новые рёбра этого этапа; переставлять можно только неначатый этап (отказ
+`plan.reorder` пишет движок в момент предложения, по фактам попыток журнала).
+Этапы seed, у которых в `needs` стоит этап
 плана (`close`, `needs: [plan]`), получают ещё и «последние» этапы плана: иначе
 закрытие стало бы готово сразу после принятия плана и закрыло бы дело до работы,
-которую план объявил. Отказ (`plan_rejected`) возвращает этап плана в работу,
+которую план объявил. Этап, объявленный планом параллельным такому этапу seed, в
+его `needs` не попадает: объявленная параллель не превращается в ожидание. Отказ
+(`plan_rejected`) возвращает этап плана в работу,
 считает раунд и пишет причину с `issues[]`; сверх `charter.max_rounds_replan`
 этап кончается `failed(contract)`. Принятие закрывает этап плана — он предложил
 план и закрылся им.

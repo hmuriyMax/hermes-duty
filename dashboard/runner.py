@@ -928,30 +928,39 @@ def _plan_issues(issues: Iterable[Any]) -> list[str]:
     return out
 
 
-def plan_gate_reason(spec: Any, stages: Iterable[Any], graph: Iterable[Any]) -> str:
+def plan_gate_reason(
+    spec: Any, stages: Iterable[Any], graph: Iterable[Any], cost: Optional[dict[str, Any]] = None
+) -> str:
     """Почему план обязан спросить человека; пустая строка — порог не пройден.
 
     Порог объявлен хартией (`charter.plan_gate`, `docs/ENGINE-1.0.md`, раздел 5):
-    число этапов **всего** графа и доля бюджета дела, которую забирают этапные
-    бюджеты предложения. Ноль в поле — гейт по этому признаку выключен, поэтому
-    спека без `plan_gate` вопросов человеку не задаёт.
+    число этапов **всего** графа и доля бюджета дела, которую забирает
+    предложение. Доля считается по цене, которую назвал план (`cost.tokens`), а
+    этапные бюджеты — фолбэк: сумма бюджетов этапа бывает меньше цены, и порог по
+    ней не срабатывал бы никогда (`spec.parse_plan_cost`). Ноль в поле — гейт по
+    этому признаку выключен, поэтому спека без `plan_gate` вопросов человеку не
+    задаёт.
     """
     gate = getattr(getattr(spec, "charter", None), "plan_gate", None)
     if gate is None:
         return ""
-    total = len(tuple(graph))
+    # Этапы предложения называют перестановки тех же id, что уже в графе: считать
+    # их новыми значило бы показать порог, которого нет.
+    total = len({str(stage.id) for stage in graph})
     reasons: list[str] = []
     if int(getattr(gate, "min_stages", 0) or 0) > 0 and total > int(gate.min_stages):
         reasons.append(f"этапов в графе {total} больше порога {int(gate.min_stages)}")
     share = float(getattr(gate, "budget_share", 0.0) or 0.0)
     limit = getattr(getattr(spec, "budget", None), "tokens", None)
+    declared = _int((cost or {}).get("tokens")) if isinstance(cost, dict) else 0
     if share > 0 and isinstance(limit, int) and limit > 0:
-        asked = sum(int(getattr(getattr(stage, "budget", None), "tokens", 0) or 0) for stage in stages)
+        # Цена предложения — приоритет, этапные бюджеты — фолбэк: план, назвавший
+        # свою стоимость, не должен проходить порог по сумме, которую он же и
+        # нарисовал в этапах.
+        asked = declared or sum(int(getattr(getattr(stage, "budget", None), "tokens", 0) or 0) for stage in stages)
         if asked / limit > share:
-            reasons.append(
-                f"этапные бюджеты плана просят {asked} из {limit} токенов дела "
-                f"({asked / limit:.0%}) — больше доли {share:.0%}"
-            )
+            source = "план назвал цену" if declared else "этапные бюджеты плана просят"
+            reasons.append(f"{source} {asked} из {limit} токенов дела ({asked / limit:.0%}) — больше доли {share:.0%}")
     return "; ".join(reasons)
 
 
@@ -967,26 +976,28 @@ def report_plan(
 ) -> tuple[list[dict[str, Any]], str]:
     """Факты плана из отчёта этапа плана: (события, причина отказа).
 
-    Образец — `report_verdict`: структурное поле отчёта (`plan: {stages, reason}`)
-    становится фактом журнала в той же транзакции, что и `attempt_ended`, потому
-    что граф дела — это факт, а не слово в `summary` (`docs/ENGINE-1.0.md`,
-    раздел 4).
+    Образец — `report_verdict`: структурное поле отчёта (`plan: {stages, reason,
+    cost}`) становится фактом журнала в той же транзакции, что и `attempt_ended`,
+    потому что граф дела — это факт, а не слово в `summary`
+    (`docs/ENGINE-1.0.md`, раздел 4).
 
     Три исхода, и все три — факты, а не догадки:
 
     - этап плана отчитался без `plan` → `([], причина)`, и попытка становится
       отказом `contract`: этап, который должен планировать, не вправе «просто
       закончиться»;
-    - предложение не прошло `spec.parse_plan` → `plan_proposed` +
-      `plan_rejected(issues[])`: лид видит, какое правило нарушено, а граф не
-      растёт;
+    - предложение не прошло `spec.parse_plan` (или цену `spec.parse_plan_cost`) →
+      `plan_proposed` + `plan_rejected(issues[])`: лид видит, какое правило
+      нарушено, а граф не растёт;
     - предложение прошло и порог `plan_gate` не пройден → `plan_proposed` +
       `plan_accepted(by: engine)`. Пройден → только `plan_proposed`: решение
       принимает человек (`runner.plan_gate`).
 
     Валидация — `spec.parse_plan`, а не собственные проверки: «принять план на
     глаз» значит завести второй валидатор, который разойдётся с `spec check` на
-    первом же новом поле.
+    первом же новом поле. `started_ids` приходит из журнала
+    (`transit.started_stages`): переставлять план вправе только этап, который не
+    начинали.
     """
     if not is_plan_stage(stage):
         return [], ""
@@ -1009,17 +1020,28 @@ def report_plan(
     rev = 1 + max((int(_int(item.get("rev")) or 0) for item in proposals), default=0)
     raw_stages = raw.get("stages")
     charter = getattr(spec, "charter", None) or spec_module.Charter()
-    stages, issues = spec_module.parse_plan(raw_stages, charter=charter, base_ids=base_ids)
+    stages, issues = spec_module.parse_plan(
+        raw_stages,
+        charter=charter,
+        base_ids=base_ids,
+        base_needs={item.id: item.needs for item in graph},
+        started_ids=transit.started_stages(events),
+    )
+    cost, cost_issues = spec_module.parse_plan_cost(raw.get("cost"))
+    issues += cost_issues
+    payload: dict[str, Any] = {
+        "rev": rev,
+        "stages": raw_stages if isinstance(raw_stages, list) else [],
+        "reason": str(raw.get("reason") or "").strip(),
+        "source_stage": stage.id,
+        "attempt": int(attempt),
+    }
+    if cost is not None:
+        payload["cost"] = cost
     proposed = _event(
         deal,
         transit.PLAN_PROPOSED,
-        {
-            "rev": rev,
-            "stages": raw_stages if isinstance(raw_stages, list) else [],
-            "reason": str(raw.get("reason") or "").strip(),
-            "source_stage": stage.id,
-            "attempt": int(attempt),
-        },
+        payload,
         {"stage": stage.id, "attempt": int(attempt), "rev": rev},
         now,
     )
@@ -1033,7 +1055,7 @@ def report_plan(
             now,
         )
         return [proposed, rejected], ""
-    asked = plan_gate_reason(spec, stages, graph + tuple(stages))
+    asked = plan_gate_reason(spec, stages, graph + tuple(stages), cost)
     if asked:
         return [proposed], ""  # порог пройден: решает человек, граф пока не растёт
     accepted = _event(
@@ -1097,10 +1119,17 @@ def plan_payload(spec: Any, events: Iterable[Any]) -> dict[str, Any]:
     """Что этап плана знает о деле: существующий граф и остаток бюджета.
 
     План рисуется поверх графа, а не с нуля: `base_ids` — id, на которые можно
-    ссылаться в `needs` (переопределять их планом нельзя), `remaining` — расход и
+    ссылаться в `needs` (переписывать их нельзя), `remaining` — расход и
     потолок дела (если потолка нет, поля просто нет: «0 из 0» было бы выдумкой).
+
+    `started` у этапа графа — «у него была попытка»: такой этап план не
+    переставляет (`spec.parse_plan`, отказ `plan.reorder`), и лид должен видеть
+    это из контракта, а не из отказа. `parallel_with` в графе — объявленная
+    параллель, чтобы план её видел и продолжал, а не изобретал заново.
     """
+    events = list(events or ())
     graph = transit.graph(spec, events)
+    started = transit.started_stages(events)
     return {
         "graph": [
             {
@@ -1108,12 +1137,17 @@ def plan_payload(spec: Any, events: Iterable[Any]) -> dict[str, Any]:
                 "role": getattr(stage, "role", ""),
                 "kind": getattr(stage, "kind", STAGE_KIND_AGENT),
                 "needs": [str(need) for need in getattr(stage, "needs", ()) or ()],
+                "parallel_with": [str(other) for other in getattr(stage, "parallel_with", ()) or ()],
+                "started": stage.id in started,
             }
             for stage in graph
         ],
         "base_ids": [stage.id for stage in graph],
         "remaining": budget.describe(spec, events),
-        "report": "plan: {stages: [{id, role, kind, needs, evidence, budget}], reason}",
+        "report": (
+            "plan: {stages: [{id, role, kind, needs, parallel_with, evidence, budget}], "
+            "cost: {tokens}, reason}"
+        ),
     }
 
 
@@ -2770,11 +2804,13 @@ def _ordered_events(events: Iterable[Any]) -> list[dict[str, Any]]:
     )
 
 
-def _pending_plan(events: Iterable[Any]) -> Optional[tuple[int, str, list[Any]]]:
-    """Предложение, которое ещё не решено: `(rev, source_stage, stages)`.
+def _pending_plan(events: Iterable[Any]) -> Optional[dict[str, Any]]:
+    """Предложение, которое ещё не решено: его `plan_proposed` целиком.
 
     Читается по журналу, а не по памяти прогона: гейт плана может ставить другой
-    процесс, а «что решено» — факт, а не состояние в памяти.
+    процесс, а «что решено» — факт, а не состояние в памяти. Отдаётся факт, а не
+    разобранные поля: `cost` предложения — тоже его часть, и вытаскивать её
+    отдельным проходом значило бы читать журнал дважды.
     """
     proposals: dict[int, dict[str, Any]] = {}
     decided: set[int] = set()
@@ -2789,10 +2825,8 @@ def _pending_plan(events: Iterable[Any]) -> Optional[tuple[int, str, list[Any]]]
         elif kind in (transit.PLAN_ACCEPTED, transit.PLAN_REJECTED) and rev > 0:
             decided.add(rev)
     for rev in sorted(proposals, reverse=True):
-        if rev in decided:
-            continue
-        payload = proposals[rev]
-        return rev, str(payload.get("source_stage") or ""), list(payload.get("stages") or [])
+        if rev not in decided:
+            return proposals[rev]
     return None
 
 
@@ -2935,14 +2969,17 @@ def plan_gate(
     if pending is None:
         row["reason"] = "предложения плана нет: гейту плана нечего решать"
         return row
-    rev, stage_id, raw_stages = pending
+    rev = int(_int(pending.get("rev")) or 0)
+    stage_id = str(pending.get("source_stage") or "")
+    raw_stages = list(pending.get("stages") or [])
+    cost = pending.get("cost") if isinstance(pending.get("cost"), dict) else None
     row["rev"] = rev
     attempt = _last_plan_attempt(listed, stage_id)
     row.update(stage=stage_id, attempt=int(attempt))
     gate = _plan_gate_fact(listed, rev)
     if gate is None:
         parsed = _parsed_plan(spec, raw_stages, listed)
-        why = plan_gate_reason(spec, parsed, transit.graph(spec, listed) + parsed)
+        why = plan_gate_reason(spec, parsed, transit.graph(spec, listed) + parsed, cost)
         now = _now_sec(int(clock()))
         gate = _ask_plan_gate(
             conn,
@@ -3003,10 +3040,19 @@ def _append_plan_facts(conn: sqlite3.Connection, facts: list[dict[str, Any]]) ->
 
 
 def _parsed_plan(spec: Any, raw_stages: list[Any], events: Iterable[Any]) -> tuple[Any, ...]:
-    """Этапы предложения тем же разбором, что у движка: порог считается по ним."""
+    """Этапы предложения тем же разбором, что у движка: порог считается по ним.
+
+    `base_needs`/`started_ids` — те же, что у приёма предложения: перестановка
+    уже начатого этапа отказывает до гейта, а не только после него.
+    """
     charter = getattr(spec, "charter", None) or spec_module.Charter()
+    graph = transit.graph(spec, events)
     stages, _issues = spec_module.parse_plan(
-        raw_stages, charter=charter, base_ids=[stage.id for stage in transit.graph(spec, events)]
+        raw_stages,
+        charter=charter,
+        base_ids=[stage.id for stage in graph],
+        base_needs={stage.id: stage.needs for stage in graph},
+        started_ids=transit.started_stages(events),
     )
     return tuple(stages)
 

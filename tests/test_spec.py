@@ -2009,11 +2009,44 @@ def test_parse_plan_shell_stage_needs_cmd():
     assert "kind.cmd" in {issue.rule for issue in found}
 
 
-def test_parse_plan_refuses_parallel_with():
-    """Параллельные добавленные этапы — не этот срез: план их не объявляет."""
-    _, found = plan([{"id": "impl", "role": "implementer", "parallel_with": ["research"],
-                      "evidence": [{"cmd": "ls", "must": 0}]}])
-    assert "plan.parallel_with" in {issue.rule for issue in found}
+def test_parse_plan_parallel_with_is_declared_by_the_plan():
+    """`parallel_with` план объявляет (1.0): параллель — объявление, а не догадка.
+
+    Проверяется то, что видно до графа: запись принята и поле доехало до этапа.
+    Исполнение пары одновременно — дело `transit._batch`, и оно проверяется
+    `tests/test_plan_reorder.py`.
+    """
+    stages, found = plan([{"id": "impl", "role": "implementer", "parallel_with": ["close"],
+                           "evidence": [{"cmd": "ls", "must": 0}]}])
+    assert found == []
+    assert stages[0].parallel_with == ("close",)
+
+
+def test_parse_plan_reorder_names_only_needs_and_parallel_with():
+    """Перестановка этапа из графа не переписывает его: роль в ней — отказ."""
+    _, found = plan([{"id": "close", "role": "researcher", "needs": []}])
+    assert "plan.id" in {issue.rule for issue in found}
+
+
+def test_parse_plan_reorder_of_a_started_stage_is_refused():
+    """Этап, у которого была попытка, план не переставляет — это дело приговора."""
+    stages, found = spec_module.parse_plan(
+        [{"id": "close", "needs": []}],
+        charter=spec_module.Charter(),
+        base_ids=BASE_IDS,
+        base_needs={"plan": (), "close": ("plan",)},
+        started_ids=("close",),
+    )
+    assert stages == ()
+    assert "plan.reorder" in {issue.rule for issue in found}
+
+
+def test_parse_plan_cost_is_parsed_and_refused_when_not_positive():
+    """`cost` — цена предложения в токенах; ноль и мусор — отказ, а не «дешёво»."""
+    assert spec_module.parse_plan_cost({"tokens": 500})[0] == {"tokens": 500}
+    assert spec_module.parse_plan_cost(None) == (None, [])
+    for raw in ({"tokens": 0}, {"tokens": "много"}, {"tok": 5}, 500):
+        assert "plan.cost" in {issue.rule for issue in spec_module.parse_plan_cost(raw)[1]}
 
 
 def test_parse_plan_over_max_stages_is_refused():

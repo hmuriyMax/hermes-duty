@@ -36,7 +36,7 @@ import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 import yaml
 
@@ -71,6 +71,14 @@ VERDICT_KEYS = ("approve", "changes", "max_rounds")
 # годна: дефолты — это поведение 0.0.8, где план никто не предлагает.
 CHARTER_KEYS = ("max_stages", "max_rounds_replan", "allowed_roles", "allowed_kinds", "plan_gate")
 PLAN_GATE_KEYS = ("min_stages", "budget_share")
+# Что предложение плана вправе сказать про этап, который **уже есть** в графе:
+# только порядок (`needs`) и параллель (`parallel_with`). Остальные поля были бы
+# переписыванием этапа, а этап объявляется спекой (`parse_plan`, правило `plan.id`).
+REORDER_KEYS = ("id", "needs", "parallel_with")
+# Цена предложения (`docs/ENGINE-1.0.md`, раздел 5): план называет свою стоимость в
+# токенах сам, а не выводится из этапных бюджетов. Ключ один — «токены»; лимиты по
+# этапам как политика в 0.1.0 не объявляются.
+PLAN_COST_KEYS = ("tokens",)
 
 WORKSPACES = ("worktree", "dir", "none")
 TO_HUMAN = ("decisions_only", "never")
@@ -2124,11 +2132,59 @@ def validate_spec(spec: Spec, *, profiles: Optional[frozenset[str]] = None) -> l
 PLAN_PATH = "<plan>"
 
 
+def parse_plan_cost(raw: Any, *, path: Optional[Path] = None) -> tuple[Optional[dict[str, int]], list[Issue]]:
+    """Цена предложения плана: `{tokens: N}` или `None`, если цену не назвали.
+
+    План называет свою стоимость сам (`docs/ENGINE-1.0.md`, раздел 5): порог
+    `charter.plan_gate.budget_share` — про то, сколько план забирает у дела, а не
+    про сумму этапных бюджетов, которую лид может нарисовать любой. Разбор живёт
+    здесь, рядом с `parse_plan`, потому что план проверяется одним валидатором, а
+    не вторым в `runner`.
+
+    Молчание (`None`) — не ноль: цена не названа, и порог считается по этапным
+    бюджетам (фолбэк). `0` и отрицательное — та же неопределённость, то есть
+    отказ: «ноль токенов» — утверждение о бесплатной работе, а не о молчании.
+    """
+    where = Path(path) if path is not None else Path(PLAN_PATH)
+    if raw is None:
+        return None, []
+    if not isinstance(raw, dict):
+        return None, [
+            Issue(where, 1, "plan.cost", f"cost={raw!r}: цена плана — словарь {{{', '.join(PLAN_COST_KEYS)}}}")
+        ]
+    issues: list[Issue] = []
+    extra = sorted(str(key) for key in raw if key not in PLAN_COST_KEYS)
+    if extra:
+        issues.append(
+            Issue(
+                where,
+                1,
+                "plan.cost",
+                f"cost называет {', '.join(extra)}: цена плана — только {'/'.join(PLAN_COST_KEYS)}",
+            )
+        )
+    tokens = _int_or_none(raw.get("tokens"))
+    if tokens is None or tokens <= 0:
+        issues.append(
+            Issue(
+                where,
+                1,
+                "plan.cost",
+                f"cost.tokens={raw.get('tokens')!r}: цена плана — целое число токенов больше нуля "
+                "(не названа цена — не объявляй cost вовсе)",
+            )
+        )
+        return None, issues
+    return {"tokens": int(tokens)}, issues
+
+
 def parse_plan(
     raw_stages: Any,
     *,
     charter: Charter,
     base_ids: Iterable[str],
+    base_needs: Optional[Mapping[str, Iterable[str]]] = None,
+    started_ids: Iterable[str] = (),
     path: Optional[Path] = None,
 ) -> tuple[tuple[Stage, ...], list[Issue]]:
     """Предложение плана → этапы и отказы; непустые отказы — план не принимается.
@@ -2146,14 +2202,24 @@ def parse_plan(
     - этап, который что-то производит (его свидетель — работа: не `gate`, без
       `verdict`, не публикующий), обязан объявить `evidence` с командой: план не
       вправе добавить этап, который закроется без доказательств;
-    - `id` не переопределяет уже существующий этап, `needs` ведёт только на
-      известный этап, граф плана ацикличен;
-    - `len(seed ∪ план) <= charter.max_stages`;
-    - `parallel_with` планом не объявляется: параллельные добавленные этапы — не
-      этот срез.
+    - `needs` ведёт только на известный этап, граф плана ацикличен — и цикл,
+      замкнутый перестановкой через уже существующие этапы, тоже отказ;
+    - `len(seed ∪ план) <= charter.max_stages`.
+
+    **Перестановка.** Запись с `id`, который уже есть в графе, — не новый этап, а
+    перестановка: у неё читаются только `needs`/`parallel_with` (`REORDER_KEYS`), а
+    любое другое поле — `plan.id` («план не переписывает этап»). Переставлять можно
+    только этап, который **не начинали**: `started_ids` — id с фактом попытки, и
+    такая запись получает отказ `plan.reorder` («этап уже начат»). Ход, ради
+    которого эта проверка существует, — вернуть в работу то, что уже сделано, в
+    обход `verdict.changes`.
 
     `base_ids` — id уже существующего графа (seed плюс принятые ревизии): на них
-    плану ссылаться можно, переопределять — нет.
+    плану ссылаться можно, а `base_needs` (их `needs`) нужен, чтобы поймать цикл,
+    который перестановка замыкает через существующие этапы. `started_ids` читает
+    вызывающий, у которого есть журнал (`runner.report_plan`): сама проверка
+    структуры графа от попыток не зависит, и принятый план, чей этап потом начали,
+    остаётся графом.
     """
     where = Path(path) if path is not None else Path(PLAN_PATH)
     issues: list[Issue] = []
@@ -2163,30 +2229,80 @@ def parse_plan(
     # Строк в предложении нет: `lines` пуст, и `_parse_stage` берёт номер 1 —
     # отказ называет этап по `id`, а не по строке отчёта.
     lines: dict[tuple[Any, ...], int] = {}
+    base = {str(stage_id) for stage_id in base_ids}
+    started = {str(stage_id) for stage_id in started_ids}
     stages: list[Stage] = []
     for index, raw in enumerate(raw_stages):
+        # Какие поля назвала запись — видно только у сырого словаря, а разбирать
+        # перестановку иначе нечем: `_parse_stage` заполняет умолчания.
+        declared = _mapping(raw) or {}
+        moving = isinstance(declared.get("id"), str) and declared.get("id") in base
         try:
-            stages.append(_parse_stage(raw, index, where, lines, issues))
+            stage = _parse_stage(raw, index, where, lines, issues)
         except SpecError as exc:
             # Этап без `id` или не словарь — не повод бросать исключение: отказ
             # уезжает в `plan_rejected.issues[]`, и лид видит, что не так.
             issues.append(exc.issue())
-    base = {str(stage_id) for stage_id in base_ids}
-    known = base | {stage.id for stage in stages}
-    seen: set[str] = set()
-    for stage in stages:
-        if stage.id in base:
+            continue
+        extra = sorted(set(declared) - set(REORDER_KEYS))
+        if moving and extra:
             issues.append(
                 Issue(
                     where,
                     stage.line,
                     "plan.id",
-                    f"id {stage.id!r} уже есть в графе: план добавляет этапы, а не переопределяет их",
+                    f"id {stage.id!r} уже есть в графе: перестановка называет только "
+                    f"{'/'.join(REORDER_KEYS[1:])}, а поля {', '.join(extra)} переписывают этап",
                 )
             )
-        elif stage.id in seen:
+            continue
+        if moving and stage.id in started:
+            issues.append(
+                Issue(
+                    where,
+                    stage.line,
+                    "plan.reorder",
+                    f"этап {stage.id!r} уже начат: переставлять можно только этап, у которого "
+                    "нет попытки — сделанное возвращает приговор ревью, а не план",
+                )
+            )
+            continue
+        stages.append(stage)
+    known = base | {stage.id for stage in stages}
+    # Ссылки проверяются у всех записей, включая перестановки: `needs` и
+    # `parallel_with` — ровно то, чем перестановка и распоряжается.
+    for stage in stages:
+        for field_name in ("needs", "parallel_with"):
+            for value in getattr(stage, field_name):
+                if value == stage.id:
+                    issues.append(
+                        Issue(
+                            where,
+                            stage.line,
+                            f"plan.{field_name}",
+                            f"{field_name} этапа {stage.id!r} ссылается на себя",
+                        )
+                    )
+                    continue
+                if value in known:
+                    continue
+                issues.append(
+                    Issue(
+                        where,
+                        stage.line,
+                        f"plan.{field_name}",
+                        f"{field_name} этапа {stage.id!r} ссылается на несуществующий этап {value!r}",
+                    )
+                )
+    seen: set[str] = set()
+    for stage in stages:
+        moving = stage.id in base
+        if stage.id in seen:
             issues.append(Issue(where, stage.line, "plan.id", f"id {stage.id!r} повторяется в предложении"))
+            continue
         seen.add(stage.id)
+        if moving:
+            continue  # перестановка: роль, вид и evidence — не её дело
         if stage.kind not in charter.allowed_kinds:
             issues.append(
                 Issue(
@@ -2217,16 +2333,6 @@ def parse_plan(
                     "в seed-спеке и требует ревью в предках — планом она не добавляется",
                 )
             )
-        if stage.parallel_with:
-            issues.append(
-                Issue(
-                    where,
-                    stage.line,
-                    "plan.parallel_with",
-                    f"этап {stage.id!r} объявляет parallel_with: параллельные добавленные этапы "
-                    "планом не поддерживаются",
-                )
-            )
         if stage.kind == SHELL_KIND and not stage.cmd.strip():
             issues.append(
                 Issue(
@@ -2247,20 +2353,6 @@ def parse_plan(
                     f"{PUBLISHING_ROLES[0]}, а не этапа плана",
                 )
             )
-        for need in stage.needs:
-            if need == stage.id:
-                issues.append(
-                    Issue(where, stage.line, "plan.needs", f"needs этапа {stage.id!r} ссылается на себя")
-                )
-            elif need not in known:
-                issues.append(
-                    Issue(
-                        where,
-                        stage.line,
-                        "plan.needs",
-                        f"needs этапа {stage.id!r} ссылается на несуществующий этап {need!r}",
-                    )
-                )
         for evidence in stage.evidence:
             if not evidence.cmd.strip():
                 issues.append(
@@ -2295,15 +2387,22 @@ def parse_plan(
                     "только этап, чью работу можно проверить — объяви evidence {cmd, must}",
                 )
             )
-    added = {stage.id: stage for stage in stages if stage.id not in base}
+    # Граф — seed плюс предложение: перестановка меняет `needs` уже существующего
+    # этапа, поэтому цикл проверяется по объединённым рёбрам, а не только по
+    # добавленным. Иначе `plan.needs: [close]` поверх seed `close.needs: [plan]`
+    # принимался бы и вешал дело в ожидании, которого никто не снимет.
+    merged: dict[str, tuple[str, ...]] = {
+        str(stage_id): tuple(str(need) for need in needs) for stage_id, needs in (base_needs or {}).items()
+    }
+    merged.update({stage.id: stage.needs for stage in stages})
     trail: list[str] = []
     state: dict[str, int] = {}  # 1 — в обходе, 2 — обойдён
 
     def cycle(stage_id: str) -> Optional[list[str]]:
         state[stage_id] = 1
         trail.append(stage_id)
-        for need in added[stage_id].needs:
-            if need not in added:
+        for need in merged[stage_id]:
+            if need not in merged:
                 continue
             if state.get(need) == 1:
                 return trail[trail.index(need):] + [need]
@@ -2316,14 +2415,22 @@ def parse_plan(
         state[stage_id] = 2
         return None
 
-    for stage in added.values():
-        if state.get(stage.id):
+    by_id = {stage.id: stage for stage in stages}
+    for stage_id in merged:
+        if state.get(stage_id):
             continue
-        found = cycle(stage.id)
+        found = cycle(stage_id)
         if found is None:
             continue
+        # Отказ называет этап, который назвало предложение: у seed-этапа строки в
+        # предложении нет, и его `line` — строка отчёта, а не выдуманный номер.
         issues.append(
-            Issue(where, added[found[0]].line, "plan.cycle", f"граф плана цикличен: {' → '.join(found)}")
+            Issue(
+                where,
+                by_id[found[0]].line if found[0] in by_id else 1,
+                "plan.cycle",
+                f"граф плана цикличен: {' → '.join(found)}",
+            )
         )
         break
     if len(known) > charter.max_stages:

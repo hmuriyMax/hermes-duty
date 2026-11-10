@@ -1024,6 +1024,26 @@ def graph_spec(spec: Any, events: Iterable[Any]) -> Any:
     return _Graph(spec, stages)
 
 
+def started_stages(events: Iterable[Any]) -> frozenset[str]:
+    """id этапов, у которых была попытка: их план не переставляет.
+
+    Перестановка — про порядок будущей работы (`docs/ENGINE-1.0.md`, раздел 4):
+    этап, который уже начинали, переставляет не план, а приговор ревью
+    (`verdict.changes`) — иначе лид возвращал бы сделанное назад в обход ревью.
+    Факт попытки — `attempt_started` (и `attempt_ended` на случай журнала, где
+    первую половину пары не писали): обе строки говорят «этап трогали».
+    """
+    found: set[str] = set()
+    for event in _ordered(events):
+        if str(event.get("kind") or "") not in ("attempt_started", "attempt_ended"):
+            continue
+        payload = _payload(event)
+        stage_id = payload.get("stage")
+        if isinstance(stage_id, str) and stage_id:
+            found.add(stage_id)
+    return frozenset(found)
+
+
 def graph(spec: Any, events: Iterable[Any]) -> tuple[Any, ...]:
     """Граф дела: seed спеки плюс этапы последней принятой ревизии плана.
 
@@ -1037,6 +1057,12 @@ def graph(spec: Any, events: Iterable[Any]) -> tuple[Any, ...]:
     разошлись бы. Разбор — тем же `spec.parse_plan` по хартии: граф, который
     валидатор отверг бы, не становится графом и при чтении (мусорный журнал не
     роняет дело, правило 8 — граф остаётся seed-ом).
+
+    Ревизия несёт два вида записи: **добавление** (новый этап) и **перестановку**
+    (этап, который уже есть в графе, с новыми `needs`/`parallel_with`). Второе
+    проверяется без `started_ids`: «этап уже начат» — отказ момента предложения
+    (`runner.report_plan` знает журнал), а принятая перестановка остаётся графом и
+    после того, как её этап начали, — иначе граф сжался бы задним числом.
     """
     seed = tuple(getattr(spec, "stages", ()) or ())
     proposals: dict[int, Any] = {}
@@ -1066,6 +1092,7 @@ def graph(spec: Any, events: Iterable[Any]) -> tuple[Any, ...]:
         payload.get("stages"),
         charter=charter,
         base_ids=[stage.id for stage in seed],
+        base_needs={stage.id: stage.needs for stage in seed},
     )
     if issues:
         return seed
@@ -1073,25 +1100,44 @@ def graph(spec: Any, events: Iterable[Any]) -> tuple[Any, ...]:
     return _relinked(seed, tuple(stages), plan_stage)
 
 
-def _relinked(seed: tuple[Any, ...], added: tuple[Any, ...], plan_stage: str) -> tuple[Any, ...]:
-    """Seed плюс план: этапы seed, ждавшие план, ждут и то, что план произвёл.
+def _relinked(seed: tuple[Any, ...], proposed: tuple[Any, ...], plan_stage: str) -> tuple[Any, ...]:
+    """Seed плюс план: перестановки применены, этапы seed ждут «последние» из плана.
 
-    Без этой правки `close` с `needs: [plan]` стал бы готов сразу после
-    принятия плана и закрыл бы дело до работы, которую план объявил
+    Запись предложения с `id` из seed — перестановка, а не новый этап: у неё
+    берутся только `needs`/`parallel_with`, остальные поля этапа остаются
+    спекой (`spec.parse_plan`, `REORDER_KEYS`).
+
+    Без этого рёбра seed, ждавшие план, стали бы готовы сразу после принятия
+    плана и закрыли бы дело до работы, которую план объявил
     (`docs/ENGINE-1.0.md`, раздел 9: plan → research → … → close). Рёбра не
     додумываются: этап seed получает ровно те добавленные этапы, от которых
     никто из добавленных не зависит, — «последние из плана».
     """
+    seeded = {stage.id for stage in seed}
+    moving = {stage.id: stage for stage in proposed if stage.id in seeded}
+    added = tuple(stage for stage in proposed if stage.id not in seeded)
+    ordered: list[Any] = []
+    for stage in seed:
+        moved = moving.get(stage.id)
+        if moved is None:
+            ordered.append(stage)
+            continue
+        ordered.append(dataclasses.replace(stage, needs=moved.needs, parallel_with=moved.parallel_with))
     if not added:
-        return seed
+        return tuple(ordered)
     needed = {need for stage in added for need in stage.needs}
     tail = tuple(stage.id for stage in added if stage.id not in needed)
+    by_id = {stage.id: stage for stage in added}
     out: list[Any] = []
-    for stage in seed:
+    for stage in ordered:
         if plan_stage not in tuple(getattr(stage, "needs", ()) or ()):
             out.append(stage)
             continue
-        out.append(dataclasses.replace(stage, needs=tuple(dict.fromkeys((*stage.needs, *tail)))))
+        # Параллель, объявленная планом, не превращается в ожидание: этап, который
+        # идёт «вместе с» этим, не может быть его предшественником — иначе
+        # объявление параллели давало бы ровно обратное.
+        extra = tuple(stage_id for stage_id in tail if not _parallel(stage, by_id[stage_id]))
+        out.append(dataclasses.replace(stage, needs=tuple(dict.fromkeys((*stage.needs, *extra)))))
     return tuple(out) + added
 
 

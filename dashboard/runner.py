@@ -1249,15 +1249,31 @@ def plan_payload(spec: Any, events: Iterable[Any]) -> dict[str, Any]:
     # попытку за попыткой (кейс d_bdf8edfb: 9 ревизий с одной и той же прозой
     # в evidence). Лид обязан видеть, ЧТО именно отклонил валидатор.
     for event in reversed(events):
-        if str(event.get("kind") or "") != "plan_rejected":
-            continue
-        rejected = journal.payload_of(event)
-        if rejected.get("issues"):
-            out["last_rejected"] = {
-                "why": rejected.get("why"),
-                "issues": [str(issue) for issue in rejected.get("issues") or ()],
+        kind_name = str(event.get("kind") or "")
+        if kind_name == "plan_rejected":
+            rejected = journal.payload_of(event)
+            if rejected.get("issues"):
+                out["last_rejected"] = {
+                    "why": rejected.get("why"),
+                    "issues": [str(issue) for issue in rejected.get("issues") or ()],
+                }
+        if kind_name == "plan_rethink":
+            # Переосмысление — движок вернул дело лиду после исчерпания попыток
+            # этапа: сначала диагноз (почему падало, что реально делала попытка),
+            # потом выбор. Ревизия плана — один из исходов, не единственный.
+            rethink = journal.payload_of(event)
+            out["rethink"] = {
+                "why": str(rethink.get("why") or ""),
+                "stage": str(rethink.get("stage") or ""),
+                "kind": str(rethink.get("kind") or ""),
+                "total": int(rethink.get("total") or 0),
+                "how": (
+                    "сначала установи причину отказов по диагнозу; ревизия плана — "
+                    "лишь один из исходов; если решение за человеком — подними "
+                    "гейт плана"
+                ),
             }
-        break
+            break
     return out
 
 
@@ -4207,6 +4223,65 @@ def run_stage(
     return finish_stage(conn, deal, launched["live"], home=home, spawn=spawn, clock=clock, monotonic=monotonic)
 
 
+MAX_RETHINKS_PER_DEAL = 2
+
+
+def _rethink_park(
+    conn: sqlite3.Connection,
+    spec: Any,
+    deal: Any,
+    stage: Any,
+    attempt: int,
+    kind: str,
+    reason: str,
+    total: int,
+    events: list[dict[str, Any]],
+    clock: Callable[[], float],
+) -> Optional[dict[str, Any]]:
+    """Попытки исчерпаны — вернуть дело лиду на переосмысление, не человеку.
+
+    Лид — эксперт по делу: он сначала разбирается, что происходит (диагноз в
+    `plan_rethink`), и только потом выбирает исход — ревизия плана, другой
+    порядок, гейт человеку. Ограничения: этап плана сам себе переосмысление не
+    возвращает (иначе петля), а число переосмыслений на дело —
+    `MAX_RETHINKS_PER_DEAL`, дальше решает человек (прежний путь `park_exhausted`).
+    """
+    if str(getattr(stage, "id", "")) == transit.PLAN_STAGE:
+        return None
+    if not any(str(getattr(item, "id", "")) == transit.PLAN_STAGE for item in spec.stages):
+        return None  # без этапа плана переосмыслять некому — сразу человеку
+    rethinks = sum(1 for event in events if str(event.get("kind") or "") == transit.PLAN_RETHINK)
+    if rethinks >= MAX_RETHINKS_PER_DEAL:
+        return None
+    now = _now_sec(int(clock()))
+    journal.append(
+        conn,
+        [
+            _event(
+                deal,
+                transit.PLAN_RETHINK,
+                {
+                    "stage": stage.id,
+                    "kind": kind,
+                    "attempt": int(attempt),
+                    "why": str(reason or ""),
+                    "total": int(total),
+                    "round": rethinks + 1,
+                },
+                {"stage": stage.id, "attempt": int(attempt), "kind": kind, "round": rethinks + 1},
+                now,
+            )
+        ],
+    )
+    return {
+        "reason": "rethink",
+        "kind": kind,
+        "stage": stage.id,
+        "attempt": int(attempt),
+        "round": rethinks + 1,
+    }
+
+
 def park_exhausted(
     conn: sqlite3.Connection,
     spec: Any,
@@ -4245,6 +4320,14 @@ def park_exhausted(
     rule = failures.decide_park(kind=kind, attempts=attempts, total=total, policy_=policy)
     if rule is None:
         return None
+    # Прежде чем будить человека — вернуть дело лиду: он эксперт по делу и
+    # сначала должен разобраться, что происходит (кейс d_c8551c18: review
+    # падал шесть раз по одной причине, а движок каждый раз спрашивал человека
+    # про «continue»). Ревизия плана — один из исходов переосмысления, не
+    # единственный.
+    rethink = _rethink_park(conn, spec, deal, stage, attempt, kind, reason, total, events, clock)
+    if rethink is not None:
+        return rethink
     limit = failures.park_limit(rule, policy)
     counter = failures.counter(kind, attempts, limit)
     if rule == failures.REASON_TOO_MANY:

@@ -1016,8 +1016,10 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
  * кромке убегала при разворачивании, а палка стоит на своём времени всегда. */
 .tl-marks { position: absolute; inset: 0; pointer-events: none; }
 .tl-mark { position: absolute; top: -3px; bottom: -3px; width: 3px; transform: translateX(-50%); pointer-events: auto; cursor: pointer; }
-.tl-mark.anchor-end { transform: translateX(calc(-100% - 1px)); }
-.tl-mark.anchor-start { transform: translateX(1px); }
+/* Центр палки — точно на своём моменте, у всех якорей (Макс, 09.11: «центр
+ * палочки должен быть точно на таймлайне»): сдвиги в стороны оставляли щели, из
+ * под палок выглядывала кромка полосы. `anchor` остаётся семантикой события. */
+.tl-mark.anchor-end, .tl-mark.anchor-start { transform: translateX(-50%); }
 .tl-mark i { display: block; width: 100%; height: 100%; border-radius: 2px; background: currentColor; opacity: .9; }
 /* Палка тонкая: попадание мышью расширяется невидимым «полем» вокруг, иначе
  * в неё почти невозможно попасть и подсказка не появляется. */

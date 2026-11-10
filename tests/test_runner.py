@@ -3433,3 +3433,32 @@ def test_lead_plan_contract_does_not_carry_reviewer_boundaries(tmp_path: Path) -
     # план-этап ведёт lead — правила ревьюера ему не нужны
     boundaries = "\n".join(contract["boundaries"])
     assert "GitLab API пофайлово" not in boundaries
+
+
+def test_plan_contract_carries_the_rethink_diagnosis(tmp_path: Path) -> None:
+    """Контракт плана после переосмысления несёт диагноз и порядок действий.
+
+    Кейс d_c8551c18: review падал шесть раз по одной причине, а лид не видел
+    диагноза. Переосмысление обязано прийти лиду с фактом: какой этап, класс,
+    причина последнего отказа и что делать сначала.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = plan_spec(tmp_path)
+    events = [
+        {
+            "ts": int(NOW),
+            "recorded_at": int(NOW),
+            "deal_id": str(deal["id"]),
+            "kind": "plan_rethink",
+            "payload": {"stage": "review", "kind": "contract", "attempt": 5, "why": "evidence.missing", "total": 9, "round": 1},
+            "source": "engine",
+            "idempotency_key": "probe:rethink:1",
+        }
+    ]
+    contract = runner.plan_payload(spec, events)
+    assert contract["rethink"]["why"] == "evidence.missing"
+    assert contract["rethink"]["stage"] == "review"
+    assert contract["rethink"]["total"] == 9
+    assert "ревизия плана — лишь один из исходов" in contract["rethink"]["how"]

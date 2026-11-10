@@ -72,6 +72,7 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 | `plan_proposed` | этап плана отчитался предложением: `plan: {stages, cost, reason}` в `result.json` стал фактом. Граф **не меняет** — предложение ещё не план (правило 12). В `stages[]` едут и добавления, и перестановки (запись с `id` из графа, назвавшая только `needs`/`parallel_with`) | `rev`, `stages[]`, `reason`, `source_stage`, `attempt`, `cost` (`{tokens}`, если план назвал цену) |
 | `plan_accepted` | предложение стало графом: предложение прошло `spec.parse_plan` по хартии (или человек ответил «принять» на гейте плана) | `rev`, `by` (`engine`\|`human`) |
 | `plan_rejected` | валидатор или человек отказал предложению: этап плана возвращается в работу с причиной и списком отказов; сверх `charter.max_rounds_replan` — `failed(contract)` | `rev`, `why`, `issues[]` |
+| `plan_rethink` | попытки этапа исчерпаны — движок вернул дело лиду на переосмысление: лид разбирается в причине (диагноз в `why`/`stage`/`kind`), ревизия плана — лишь один из исходов; этап плана возвращается в работу, общий с `plan_rejected` счётчик `max_rounds_replan` | `stage`, `kind`, `attempt`, `why`, `total`, `round` |
 | `plan_gate` | план дороже порога `charter.plan_gate` — ждём человека (`ask()`), до ответа дело стоит в `wait_human` | `rev`, `reason`, `question_id` |
 
 Четыре вида плана заведены движком 1.0 (`docs/ENGINE-1.0.md`, раздел 8): файл

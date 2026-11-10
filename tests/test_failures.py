@@ -155,22 +155,24 @@ def seed(conn: sqlite3.Connection, deal: dict[str, Any], kind: str, payload: dic
     )
 
 
-def failed_attempt(conn: sqlite3.Connection, deal: dict[str, Any], attempt: int, kind: str) -> None:
+def failed_attempt(
+    conn: sqlite3.Connection, deal: dict[str, Any], attempt: int, kind: str, stage: str = "impl"
+) -> None:
     """Упавшая попытка в журнале: `attempt_started` + `attempt_ended` с классом."""
-    seed(conn, deal, "attempt_started", {"stage": "impl", "attempt": attempt, "pid": 100 + attempt, "run_id": f"impl#{attempt}"}, key=f"started:{attempt}")
+    seed(conn, deal, "attempt_started", {"stage": stage, "attempt": attempt, "pid": 100 + attempt, "run_id": f"{stage}#{attempt}"}, key=f"started:{stage}:{attempt}")
     seed(
         conn,
         deal,
         "attempt_ended",
         {
-            "stage": "impl",
+            "stage": stage,
             "attempt": attempt,
-            "run_id": f"impl#{attempt}",
+            "run_id": f"{stage}#{attempt}",
             "outcome": "failed",
             "kind": kind,
             "reason": f"попытка {attempt}: отказ {kind}",
         },
-        key=f"ended:{attempt}",
+        key=f"ended:{stage}:{attempt}",
     )
 
 
@@ -821,3 +823,104 @@ def test_class_names_are_one_per_class() -> None:
 
     assert len(names) == len(failures.CLASSES)
     assert failures.UNKNOWN_CLASS_TEXT not in names
+
+
+# ---------------------------------------------------------------- переосмысление
+
+
+def plan_impl_spec(tmp_path: Path) -> Any:
+    """Спека с этапом плана: переосмысление возвращает дело лиду."""
+    return write_spec(
+        tmp_path,
+        """
+duty: probe
+stages:
+  - id: plan
+    role: lead
+  - id: impl
+    role: implementer
+    needs: [plan]
+    workspace: none
+    retry: {max: 1, on: [infra]}
+""",
+    )
+
+
+def rethink(conn: sqlite3.Connection, spec: Any, deal: dict[str, Any], home: Path, kind: str = "infra") -> Any:
+    """Исчерпание на `impl` тем же путём, что у движка."""
+    return runner.park_exhausted(
+        conn,
+        spec,
+        deal,
+        stage_of(spec),
+        2,
+        kind,
+        "процесс упал сам: код выхода 7",
+        home=home,
+        clock=lambda: NOW,
+    )
+
+
+def test_park_returns_deal_to_lead_for_rethink(tmp_path: Path) -> None:
+    """Исчерпание попыток — не вопрос человеку, а переосмысление лидом.
+
+    Лид — эксперт по делу: движок возвращает ему диагноз (`plan_rethink`) и
+    возвращает этап плана в работу; вопрос человеку не задаётся, дело не
+    блокируется. Ревизия плана — лишь один из исходов.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = plan_impl_spec(tmp_path)
+    failed_attempt(conn, deal, 1, "infra")
+    failed_attempt(conn, deal, 2, "infra")
+
+    report = rethink(conn, spec, deal, home)
+
+    assert report is not None
+    assert report["reason"] == "rethink"
+    assert (report["stage"], report["kind"], report["round"]) == ("impl", "infra", 1)
+    kinds = [item["kind"] for item in events(conn, deal)]
+    assert "plan_rethink" in kinds
+    assert "question_asked" not in kinds
+    assert "blocked" not in kinds
+    assert deals.deal_row(conn, deal["id"])["status"] != "blocked"
+    # граф видит этап плана в работе: решение движка — снова план
+    states = transit.stage_states(spec, journal.read_events(conn, str(deal["id"])))
+    assert states["plan"].state == transit.PENDING
+
+
+def test_rethink_budget_ends_with_a_human_question(tmp_path: Path) -> None:
+    """Два переосмысления — предел: третий отказ спрашивает человека."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = plan_impl_spec(tmp_path)
+    failed_attempt(conn, deal, 1, "infra")
+    failed_attempt(conn, deal, 2, "infra")
+
+    assert rethink(conn, spec, deal, home)["reason"] == "rethink"
+    assert rethink(conn, spec, deal, home)["reason"] == "rethink"
+    report = rethink(conn, spec, deal, home)
+
+    assert report is not None
+    assert report["reason"] == failures.REASON_RETRIES
+    assert len(pool_rows(home)) == 1
+
+
+def test_plan_stage_never_rethinks_itself(tmp_path: Path) -> None:
+    """Упавший этап плана переосмыслением себе же вопрос не возвращает."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = plan_impl_spec(tmp_path)
+    failed_attempt(conn, deal, 1, "infra", stage="plan")
+    failed_attempt(conn, deal, 2, "infra", stage="plan")
+
+    report = runner.park_exhausted(
+        conn, spec, deal, stage_of(spec, "plan"), 2, "infra", "упал", home=home, clock=lambda: NOW
+    )
+
+    assert report is not None
+    assert report["reason"] == failures.REASON_RETRIES
+    assert "plan_rethink" not in [item["kind"] for item in events(conn, deal)]

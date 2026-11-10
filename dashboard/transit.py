@@ -252,8 +252,9 @@ GATE_KIND = "gate"
 PLAN_PROPOSED = "plan_proposed"
 PLAN_ACCEPTED = "plan_accepted"
 PLAN_REJECTED = "plan_rejected"
+PLAN_RETHINK = "plan_rethink"
 PLAN_GATE = "plan_gate"
-PLAN_KINDS = (PLAN_PROPOSED, PLAN_ACCEPTED, PLAN_REJECTED, PLAN_GATE)
+PLAN_KINDS = (PLAN_PROPOSED, PLAN_ACCEPTED, PLAN_REJECTED, PLAN_RETHINK, PLAN_GATE)
 
 # id этапа, чей отчёт — предложение плана: так он назван в seed-графе 1.0
 # (`docs/ENGINE-1.0.md`, раздел 3, `stages: - id: plan`). Слово берётся у спеки:
@@ -1232,18 +1233,33 @@ def _plan_fact(board: _Board, spec: Any, kind: str, payload: dict[str, Any], at:
                 f": вопрос #{question_id}" if question_id else ""
             )
         return
-    # `plan_rejected`: этап плана возвращается в работу с причиной и отказами, и
-    # сверх `max_rounds_replan` дело останавливается — как у `verdict.max_rounds`,
-    # иначе реплан превратился бы в бесконечный генератор бюджета.
+    # `plan_rejected`/`plan_rethink`: этап плана возвращается в работу с причиной,
+    # и сверх `max_rounds_replan` дело останавливается — как у `verdict.max_rounds`,
+    # иначе реплан превратился бы в бесконечный генератор бюджета. Отказ — реплан
+    # по ошибкам формы; переосмысление — движок вернул дело лиду после исчерпания
+    # попыток этапа: лид сначала разбирается в причине (диагноз в payload), и
+    # ревизия плана — лишь один из исходов. Счётчик раундов общий: и отказы, и
+    # переосмысления жгут ресурс лида.
     board.plan_gate = None
     if node is None:
         return
     node.rounds += 1
     charter = getattr(spec, "charter", None)
     max_rounds = _int(getattr(charter, "max_rounds_replan", 0))
-    why = str(payload.get("why") or "").strip() or "план отклонён"
-    issues = [str(item).strip() for item in payload.get("issues") or () if str(item).strip()]
-    text = why + (f": {'; '.join(issues)}" if issues else "")
+    why = str(payload.get("why") or "").strip()
+    if kind == PLAN_REJECTED:
+        if not why:
+            why = "план отклонён"
+        issues = [str(item).strip() for item in payload.get("issues") or () if str(item).strip()]
+        text = why + (f": {'; '.join(issues)}" if issues else "")
+    else:
+        # Диагноз едет в payload (`why` — причина последнего отказа, `stage` —
+        # упавший этап): без него лид начал бы с догадок, а не с фактов.
+        stage_id = str(payload.get("stage") or "")
+        fail_kind = str(payload.get("kind") or "")
+        if not why:
+            why = f"этап {stage_id or '?'} исчерпал попытки ({fail_kind or 'unknown'})"
+        text = f"переосмысление: {why}"
     if max_rounds and node.rounds > max_rounds:
         node.state = FAILED
         node.fail_kind = "contract"

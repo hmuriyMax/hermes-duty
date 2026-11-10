@@ -1882,10 +1882,11 @@ const IDLE_LABEL_MIN_PCT = 4
 // Подпись и тон маркера: журнал назвал событие — экран назвал его тем же словом.
 // `tick` — тонкая засечка старта/закрытия попытки (их на оси много); остальные
 // виды — то, что случилось с делом, и они рисуются заметно.
-// `anchor` — куда маркер «прицеплен» к своему моменту. Вывод (вердикт, ответ,
-// закрытие) принадлежит тому, что уже случилось, поэтому стоит ПЕРЕД моментом:
-// иначе вердикт читается как начало следующего этапа — его момент совпадает со
-// стартом следующей попытки. Вопрос, наоборот, открывает ожидание и стоит после.
+// `anchor` — семантика события у своего момента (вердикт/ответ — итог того, что
+// уже случилось, вопрос — открытие ожидания). Геометрию она больше не меняет:
+// центр палки всегда точно на своём моменте (Макс, 09.11: «центр палочки должен
+// быть точно на таймлайне») — сдвиги в стороны оставляли щели, из под палок
+// выглядывала кромка полосы.
 const MARKER_META = {
   question: { label: 'вопрос человеку', tone: 'yellow', tick: false, anchor: 'start' },
   answer: { label: 'ответ человека', tone: 'green', tick: false, anchor: 'end' },
@@ -4059,8 +4060,7 @@ const CSS = `
  * убегала при разворачивании, а палка стоит на своём времени всегда. */
 .duty-tl-marks{position:absolute;inset:0;pointer-events:none}
 .duty-tl-mark{position:absolute;top:-3px;bottom:-3px;width:3px;transform:translateX(-50%);pointer-events:auto;cursor:pointer}
-.duty-tl-mark.anchor-end{transform:translateX(calc(-100% - 1px))}
-.duty-tl-mark.anchor-start{transform:translateX(1px)}
+.duty-tl-mark.anchor-end,.duty-tl-mark.anchor-start{transform:translateX(-50%)}
 .duty-tl-mark:hover{z-index:40}
 /* Палка тонкая: попадание мышью расширяется невидимым «полем» вокруг. */
 .duty-tl-mark::before{content:'';position:absolute;left:-4px;right:-4px;top:0;bottom:0}

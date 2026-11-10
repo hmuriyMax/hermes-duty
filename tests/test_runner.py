@@ -908,6 +908,102 @@ def test_broken_result_is_contract(tmp_path: Path) -> None:
     assert "не разбирается" in report["reason"]
 
 
+RESCUE_REPORT = {
+    "status": "done",
+    "summary": "разведка завершена, план готов",
+    "plan": {"stages": [{"id": "group", "role": "implementer"}], "reason": "по журналу"},
+    "evidence": [],
+}
+
+
+def plan_spec(tmp_path: Path) -> Any:
+    """Спека с этапом-планом без дерева: как seed-спека кнопки «Продолжить»."""
+    return write_spec(
+        tmp_path,
+        """
+        duty: probe
+        stages:
+          - id: plan
+            role: lead
+            workspace: none
+        """,
+    )
+
+
+def run_stage(conn: sqlite3.Connection, spec: Any, deal: dict[str, Any], home: Path, fake: Any) -> dict[str, Any]:
+    """Один шаг движка этапа `plan` с подменённым спавном и неподвижными часами."""
+    return runner.run_stage(conn, spec, deal, "plan", 1, home=home, clock=lambda: NOW, spawn=fake)
+
+
+def test_report_said_but_not_written_is_rescued(tmp_path: Path) -> None:
+    """Read-only роль отчиталась текстом — раннер вынимает отчёт из ответа.
+
+    Дело d_2fc749fb: у лида нет `write_file`, отчёт ушёл финальной фразой, и
+    попытка падала контрактом «result.json нет» при готовом вердикте. Раннер
+    записывает файл за роль и честно помечает это в журнале.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = plan_spec(tmp_path)
+    fake = Fake(
+        result=None,
+        exit_code=0,
+        lines=[
+            {"type": "text", "text": "Проверяю заметку по тикету и историю."},
+            {"type": "tool_use", "name": "read_file"},
+            {"type": "text", "text": f"Итог разведки:\n```json\n{json.dumps(RESCUE_REPORT, ensure_ascii=False)}\n```"},
+        ],
+    )
+    report = run_stage(conn, spec, deal, home, fake)
+    assert (report["outcome"], report["kind"]) == ("done", None)
+    result_file = runner.result_path(runner.attempt_dir(home, deal, "plan", 1))
+    assert json.loads(result_file.read_text(encoding="utf-8")) == RESCUE_REPORT
+    rows = conn.execute("SELECT author, body FROM comments").fetchall()
+    assert len(rows) == 1 and rows[0][0] == "engine"
+    assert "из финального ответа" in rows[0][1]
+
+
+def test_plain_json_answer_is_rescued_only_with_status(tmp_path: Path) -> None:
+    """Голый JSON-объект тоже спасается; без `status` — нет (это не отчёт)."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = plan_spec(tmp_path)
+    fake = Fake(
+        result=None,
+        exit_code=0,
+        lines=[{"type": "text", "text": json.dumps(RESCUE_REPORT, ensure_ascii=False)}],
+    )
+    report = run_stage(conn, spec, deal, home, fake)
+    assert (report["outcome"], report["kind"]) == ("done", None)
+
+    home2 = make_home(tmp_path / "no-status")
+    conn2 = open_store(home2)
+    deal2 = make_deal(conn2)
+    spec2 = plan_spec(tmp_path / "no-status")
+    fake2 = Fake(
+        result=None,
+        exit_code=0,
+        lines=[{"type": "text", "text": 'Вот структура: {"summary": "просто пример"} — не отчёт.'}],
+    )
+    report2 = run_stage(conn2, spec2, deal2, home2, fake2)
+    assert (report2["outcome"], report2["kind"]) == ("failed", "contract")
+    assert "result.json нет" in report2["reason"]
+
+
+def test_written_result_is_not_rescued(tmp_path: Path) -> None:
+    """Отчёт записан файлом — спасения нет, и факта «commented» не появляется."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = plan_spec(tmp_path)
+    fake = Fake(result=dict(RESCUE_REPORT), exit_code=0)
+    report = run_stage(conn, spec, deal, home, fake)
+    assert (report["outcome"], report["kind"]) == ("done", None)
+    assert "commented" not in kinds(conn, deal)
+
+
 def test_blocked_result_parks_the_deal_with_question(tmp_path: Path) -> None:
     """`status: blocked` — вопрос через `ask()`, дело в `wait_human`, не отказ."""
     home = make_home(tmp_path)

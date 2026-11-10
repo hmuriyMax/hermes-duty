@@ -79,6 +79,7 @@ import importlib.util
 import json
 import os
 import queue
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -1659,6 +1660,10 @@ class Followed:
         self.usage = 0
         self.session_id = ""
         self.tools = 0
+        # Сказанное целиком, по кускам между инструментами: журнал несёт только
+        # превью, а финальный ответ нужен спасению отчёта (rescue_report) —
+        # read-only роль пишет отчёт текстом, а не файлом.
+        self.says: list[str] = []
 
     def __repr__(self) -> str:  # pragma: no cover - для отладки руками
         return (
@@ -1714,6 +1719,7 @@ def follow(
         text_started.clear()
         if not text.strip():
             return
+        state.says.append(text)
         seq += 1
         now = _now_sec(int(clock()))
         duration = None if started is None else max(0, int(round(now - started)))
@@ -1835,6 +1841,50 @@ def read_result(path: Path) -> tuple[Optional[dict[str, Any]], str]:
     if not isinstance(data, dict):
         return None, f"result.json не объект: {type(data).__name__}"
     return data, ""
+
+
+RESULT_FENCE_RE = re.compile(r"```(?:json)?[ \t]*\r?\n(.*?)```", re.DOTALL)
+
+RESCUE_COMMENT = (
+    "отчёт не был записан файлом — у роли нет write_file (read-only профиль); "
+    "раннер вынул его из финального ответа попытки и записал сам"
+)
+
+
+def rescue_report(result_file: Optional[Path], says: list[str]) -> Optional[str]:
+    """Спасение отчёта: вынуть его из финального ответа, если файла нет.
+
+    Контракт требует положить отчёт в `result.json` инструментом `write_file`,
+    но read-only профили (лид на seed-этапах `plan`/`close`, дело d_2fc749fb)
+    этого инструмента не имеют: агент честно выносит вердикт текстом — и попытка
+    падает контрактом при готовом отчёте. Если последний сказанный кусок — сам
+    отчёт (JSON-объект со `status`, цельно или в ```json-фенсе), раннер записывает
+    файл за роль и дальше отчёт идёт обычным путём: та же валидация, тот же гейт
+    доказательств. Годный объект ищется с конца: последний ответ важнее примеров
+    из середины. Ничего годного — `None`, и попытка падает как раньше: молча
+    выдумывать отчёт раннер не умеет.
+    """
+    if result_file is None:
+        return None
+    path = Path(result_file)
+    if path.is_file():
+        return None
+    for text in reversed(says):
+        candidates: list[str] = []
+        stripped = text.strip()
+        if stripped.startswith("{"):
+            candidates.append(stripped)
+        candidates.extend(fence.strip() for fence in RESULT_FENCE_RE.findall(text))
+        for candidate in reversed(candidates):
+            try:
+                data = json.loads(candidate)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(data, dict) and str(data.get("status") or "").strip():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+                return RESCUE_COMMENT
+    return None
 
 
 def classify(
@@ -3845,6 +3895,18 @@ def finish_agent_stage(
         release(conn, deal=deal, stage=stage_id, pid=pid)
         raise
     exit_code = live.process.exit_code if live.process.exit_code is not None else live.process.wait(KILL_GRACE_SEC)
+    # Спасение отчёта: до классификации — иначе готовый вердикт read-only роли
+    # падал бы контрактом «result.json нет» при написанном в ответе отчёте.
+    rescued = rescue_report(result_file, followed.says)
+    if rescued:
+        deals.add_comment(
+            conn,
+            str(deal["id"]),
+            author="engine",
+            body=rescued,
+            source=ENGINE_SOURCE,
+            now=_now_sec(int(clock())),
+        )
     result, result_error = read_result(result_file)
     outcome, kind, reason = classify(
         result=result,

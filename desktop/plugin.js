@@ -1864,6 +1864,90 @@ function markerBody(type, event) {
 }
 
 /**
+ * Маркеры одной точки оси — одна группа.
+ *
+ * Дело закрывается приговором: `collected` и `completed` случаются в одну
+ * секунду, `pctOf(event.at)` у обоих одинаковый, палки встают друг на друга, и
+ * человек видит один маркер вместо двух — по ленте не понять, что дело закрыл
+ * именно приговор. Поэтому маркеры с общим `pct` сводятся в группу: у неё
+ * набор видов, набор подписей и подпись-итог, называющая все («вердикт +
+ * закрыто»).
+ *
+ * Что здесь **не** делается:
+ *
+ * - время не двигается: группа стоит на том же `pct`, что и её участники, а
+ *   `at` берётся у первого из них. Раздвинуть палки по секундам значило бы
+ *   соврать про журнал — ось это факт, а не компоновка;
+ * - одиночный маркер возвращается как есть, без новых полей: поверхностям,
+ *   которым группа не нужна, ничего не приходится переучивать;
+ * - засечки старта/конца попытки (`tick`) не сводятся: их рисует отдельный
+ *   слой и интервал попытки, а не событие дела.
+ */
+function markerGroups(markers) {
+  const groups = new Map()
+  const out = []
+  for (const marker of markers) {
+    if (!marker) continue
+    if (marker.tick) {
+      out.push(marker)
+      continue
+    }
+    const head = groups.get(marker.pct)
+    if (!head) {
+      const group = { pct: marker.pct, members: [] }
+      groups.set(marker.pct, group)
+      out.push(group)
+      group.members.push(marker)
+      continue
+    }
+    head.members.push(marker)
+  }
+  return out.map((item) => {
+    // Один участник — это не группа: форма маркера остаётся прежней.
+    if (!item.members) return item
+    if (item.members.length === 1) return item.members[0]
+    const [first] = item.members
+    const label = item.members.map((member) => member.label).join(' + ')
+    const text = item.members.map((member) => member.text).filter(Boolean).join('; ')
+    const title = `${first.clock} · ${label}${text ? ` — ${text}` : ''}`
+    return {
+      // Вид и тон головы группы: легенда и глиф остаются осмысленными, а
+      // поверхность, ещё не знающая о группах, рисует один маркер вместо
+      // пустого места. `types`/`labels`/`members` — для той, что знает.
+      type: first.type,
+      types: item.members.map((member) => member.type),
+      grouped: true,
+      count: item.members.length,
+      at: first.at,
+      pct: item.pct,
+      clock: first.clock,
+      label,
+      labels: item.members.map((member) => member.label),
+      tone: first.tone,
+      tick: false,
+      anchor: first.anchor,
+      text,
+      title,
+      ariaLabel: title,
+      // Пауза «вопрос → ответ» считается до свёртки (по исходным маркерам), но
+      // маркер вопроса, попавший в группу, свои поля ожидания не теряет.
+      answered: item.members.some((member) => member.answered),
+      waitPct: Math.max(...item.members.map((member) => Number(member.waitPct) || 0)),
+      waitText: item.members.map((member) => member.waitText).filter(Boolean).join(' · '),
+      members: item.members.map((member) => ({
+        type: member.type,
+        label: member.label,
+        tone: member.tone,
+        anchor: member.anchor,
+        clock: member.clock,
+        text: member.text,
+        title: member.title,
+      })),
+    }
+  })
+}
+
+/**
  * Вид маркера по событию журнала; пусто — маркера нет.
  *
  * Гейт и отказ по бюджету узнаются по причине из `attempt_ended`
@@ -2337,6 +2421,13 @@ function attemptView(bar, scale) {
     type: marker.type,
     tone: marker.tone,
     pct: marker.pct,
+    // Группа едет в строку попытки целиком: поверхность по `members` рисует
+    // столбик на один `pct`, а `label` называет все события этой точки.
+    grouped: Boolean(marker.grouped),
+    types: marker.types || [],
+    label: marker.label,
+    count: marker.count || 1,
+    members: marker.members || [],
     // Якорь едет вместе с маркером: палка вывода стоит ПЕРЕД своим моментом,
     // иначе вердикт читается как начало следующего этапа.
     anchor: marker.anchor,
@@ -3227,6 +3318,11 @@ function shapeDealTime(detail, attemptsPayload) {
       : { key: 'tokens', label: 'токенов', value: '—', note: 'телеметрия не писала' },
   ]
 
+  // Свёртка маркеров одной точки оси — последним шагом: паузы «вопрос →
+  // ответ», ожидание и числа шапки считаются по исходным маркерам журнала, а
+  // не по тому, как их потом скомпоновали на оси.
+  const groupedMarkers = markerGroups(markers)
+
   return {
     now,
     live,
@@ -3246,7 +3342,7 @@ function shapeDealTime(detail, attemptsPayload) {
     },
     lanes,
     bars,
-    markers,
+    markers: groupedMarkers,
     waitSpans,
     // Сжатые промежутки оси — уже с координатами: поверхность ничего не считает.
     idle,
@@ -3564,12 +3660,16 @@ function DutyAttemptRow({ view, callSel, onSelectCall, toolFilter }) {
             'span',
             {
               key: `mark-${i}`,
-              className: `duty-tl-mark t-${mark.tone} anchor-${mark.anchor || 'middle'}`,
+              // Группа — столбик палок на одном `pct`: по палке на участника,
+              // своим тоном. Время у группы одно, поэтому сдвига нет.
+              className: `duty-tl-mark t-${mark.tone} anchor-${mark.anchor || 'middle'}${mark.grouped ? ' is-grouped' : ''}`,
               style: { left: `${mark.pct}%` },
               'data-tip': mark.title,
               'aria-label': mark.ariaLabel,
             },
-            h('i', null),
+            ...(mark.grouped && mark.members.length
+              ? mark.members.map((member, j) => h('i', { key: `member-${j}`, className: `t-${member.tone}` }))
+              : [h('i', { key: 'bar' })]),
           ),
         ),
       ),
@@ -3853,6 +3953,16 @@ const CSS = `
 .duty-tl-mark.t-yellow{color:var(--ui-yellow)}
 .duty-tl-mark.t-blue{color:var(--ui-blue)}
 .duty-tl-mark.t-gray{color:var(--ui-text-tertiary)}
+/* Группа маркеров одной точки оси: у группы несколько типов, поэтому палка на
+ * каждого участника — столбиком на том же left. Время одно: сдвиг палок соврал
+ * бы про журнал. */
+.duty-tl-mark.is-grouped{width:auto;display:flex;gap:1px}
+.duty-tl-mark.is-grouped i{width:2px;flex:none}
+.duty-tl-mark i.t-green{color:var(--ui-green)}
+.duty-tl-mark i.t-red{color:var(--ui-red)}
+.duty-tl-mark i.t-yellow{color:var(--ui-yellow)}
+.duty-tl-mark i.t-blue{color:var(--ui-blue)}
+.duty-tl-mark i.t-gray{color:var(--ui-text-tertiary)}
 .duty-tl-call{position:absolute;height:10px;border-radius:2px;cursor:pointer;box-shadow:inset 0 0 0 1px rgba(0,0,0,.22)}
 .duty-tl-row:hover .duty-tl-call{box-shadow:inset 0 0 0 1px rgba(0,0,0,.45)}
 /* Подсказка — общий слой для чипа, полосы попытки, подписи и маркера. */
@@ -4729,8 +4839,16 @@ function ScalePanel({ scale, callSel, onSelectCall, toolFilter, onToggleTool }) 
   }
   const kinds = []
   for (const marker of scale.markers) {
-    if (marker.tick || kinds.some((item) => item.type === marker.type)) continue
-    kinds.push(marker)
+    if (marker.tick) continue
+    // Группа называет все свои виды: у дела, закрытого приговором, «закрыто»
+    // иначе пропало бы из легенды — а его человек и ищет.
+    const types = marker.grouped && marker.types.length ? marker.types : [marker.type]
+    const labels = marker.grouped && marker.labels.length ? marker.labels : [marker.label]
+    for (const [i, type] of types.entries()) {
+      if (kinds.some((item) => item.type === type)) continue
+      const tone = marker.grouped && marker.members[i] ? marker.members[i].tone : marker.tone
+      kinds.push({ type, tone, label: labels[i] || marker.label })
+    }
   }
   // Шкала: дорожки слева, легенда семейств — правой колонкой, как в макете
   // `d-merge`. Ось стоит ровно над дорожками: слева пустая колонка шириной

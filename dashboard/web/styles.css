@@ -679,6 +679,11 @@ pre.body {
   color: inherit;
 }
 .scale-marker.tick .scale-marker-dot { width: 1px; height: 12px; border: 0; border-radius: 0; background: currentColor; background-clip: padding-box; }
+/* Группа на полосе маркеров: несколько глифов столбиком в одной точке оси.
+ * Высота полосы та же, поэтому глиф группы мельче — иначе второй вылез бы за
+ * кромку, а время у группы одно. */
+.scale-marker.is-grouped { gap: 1px; }
+.scale-marker.is-grouped .scale-marker-dot { width: 11px; height: 11px; font-size: 8px; }
 .scale-marker:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 /* Вопрос без ответа: интервал до «сейчас» подписью, а не догадкой о решении. */
@@ -1015,6 +1020,16 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 .tl-mark.t-yellow { color: var(--warn); }
 .tl-mark.t-blue { color: var(--accent); }
 .tl-mark.t-gray { color: var(--text-3); }
+/* Группа маркеров одной точки оси: у группы не один тип, а несколько, поэтому
+ * палка на каждого участника — столбиком на том же `left`. Ширину набирает сам
+ * столбик, время при этом одно: сдвинуть палки значило бы соврать про журнал. */
+.tl-mark.is-grouped { width: auto; display: flex; gap: 1px; }
+.tl-mark.is-grouped i { width: 2px; flex: none; }
+.tl-mark i.t-green { color: var(--ok); }
+.tl-mark i.t-red { color: var(--danger); }
+.tl-mark i.t-yellow { color: var(--warn); }
+.tl-mark i.t-blue { color: var(--accent); }
+.tl-mark i.t-gray { color: var(--text-3); }
 
 .tl-call {
   position: absolute; height: 10px; border-radius: 2px; cursor: pointer;

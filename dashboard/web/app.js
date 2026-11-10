@@ -1915,12 +1915,24 @@ function dealFactSpans(scale) {
   return parts
 }
 
-/** Маркер события: засечка старта/закрытия попытки или заметная точка события. */
+/**
+ * Маркер события: засечка старта/закрытия попытки или заметная точка события.
+ *
+ * Группа (несколько событий в одной точке оси) рисуется столбиком: глиф на
+ * каждого участника, своим тоном, в одном и том же `left` — время не сдвинуто.
+ * Одиночный маркер остаётся ровно прежним: один глиф, без класса группы.
+ */
 function markerNode(marker, index) {
+  const dots =
+    marker.grouped && marker.members.length
+      ? marker.members.map((member, i) =>
+          h('span', { class: `scale-marker-dot t-${member.tone}` }, MARKER_GLYPH[marker.types[i]] || ''),
+        )
+      : [h('span', { class: `scale-marker-dot t-${marker.tone}` }, MARKER_GLYPH[marker.type] || '')]
   return h(
     'span',
     {
-      class: `scale-marker t-${marker.tone}${marker.tick ? ' tick' : ''} anchor-${marker.anchor || 'middle'}`,
+      class: `scale-marker t-${marker.tone}${marker.tick ? ' tick' : ''}${marker.grouped ? ' is-grouped' : ''} anchor-${marker.anchor || 'middle'}`,
       style: `left:${marker.pct}%;top:${(index % 2) * 13}px`,
       title: marker.title,
       'data-key': `marker:${marker.type}:${marker.at}`,
@@ -1928,23 +1940,34 @@ function markerNode(marker, index) {
       role: 'img',
       tabindex: '0',
     },
-    h('span', { class: 'scale-marker-dot' }, MARKER_GLYPH[marker.type] || ''),
+    ...dots,
   )
 }
 
-/** Легенда маркеров: только те виды, что реально есть в журнале этого дела. */
+/**
+ * Легенда маркеров: только те виды, что реально есть в журнале этого дела.
+ *
+ * Группа называет все свои виды: легенда, знающая только голову группы, у дела,
+ * закрытого приговором, потеряла бы «закрыто» — а именно его человек и ищет.
+ */
 function markerLegend(scale) {
   const seen = []
   for (const marker of scale.markers) {
-    if (marker.tick || seen.some((item) => item.type === marker.type)) continue
-    seen.push(marker)
+    if (marker.tick) continue
+    const types = marker.grouped && marker.types.length ? marker.types : [marker.type]
+    const labels = marker.grouped && marker.labels.length ? marker.labels : [marker.label]
+    for (const [i, type] of types.entries()) {
+      if (seen.some((item) => item.type === type)) continue
+      const tone = marker.grouped && marker.members[i] ? marker.members[i].tone : marker.tone
+      seen.push({ type, tone, label: labels[i] || marker.label })
+    }
   }
   if (!seen.length) return null
   return h(
     'div',
     { class: 'scale-legend' },
     ...seen.map((marker) =>
-      h('span', { class: `t-${marker.tone}` }, `${MARKER_GLYPH[marker.type] || '•'} ${marker.label}`),
+      h('span', { class: `t-${marker.tone}`, 'data-key': `legend:${marker.type}` }, `${MARKER_GLYPH[marker.type] || '•'} ${marker.label}`),
     ),
     // Про засечки старта/конца здесь молчим: их больше нет, длительность
     // показывает фон попытки, а факты — палки-маркеры.
@@ -2061,17 +2084,23 @@ function attemptRowNode(view, key) {
   if (view.marks.length) {
     const marks = h('div', { class: 'tl-marks', 'data-key': 'marks' })
     for (const mark of view.marks) {
+      // Группа — столбик на одном `pct`: палка на участника, своим тоном, все
+      // стоят на времени события. Сдвиг по секундам соврал бы про журнал.
+      const bars =
+        mark.grouped && mark.members.length
+          ? mark.members.map((member, i) => h('i', { class: `t-${member.tone}`, 'data-key': `member:${i}` }))
+          : [h('i')]
       marks.append(
         h(
           'span',
           {
-            class: `tl-mark t-${mark.tone} anchor-${mark.anchor || 'middle'}`,
+            class: `tl-mark t-${mark.tone} anchor-${mark.anchor || 'middle'}${mark.grouped ? ' is-grouped' : ''}`,
             style: `left:${mark.pct}%`,
             'data-tip': mark.title,
             'aria-label': mark.ariaLabel,
             'data-key': `mark:${mark.type}:${mark.pct}`,
           },
-          h('i'),
+          ...bars,
         ),
       )
     }

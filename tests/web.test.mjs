@@ -958,3 +958,91 @@ test('веб: завершённые — без сворачивания, «ещ
   assert.match(app, /'data-key': `finished-row:\$\{deal\.id\}`/, 'веб: строки без ключа для morph')
   assert.match(app, /'data-key': `finished-group:\$\{group\.repo\}`/, 'веб: группы без ключа для morph')
 })
+
+
+/* ----------------- маркеры одной точки оси — группа (0.1.0) ---------------- */
+
+/**
+ * Дело, закрытое своим приговором: `collected` и `completed` — в одну секунду.
+ *
+ * `pctOf(event.at)` у обоих одинаковый, палки встают друг на друга, и по ленте
+ * не понять, что дело закрыл именно приговор. Шейпер сводит их в группу —
+ * поверхность обязана нарисовать всех участников, а не голову группы.
+ */
+function verdictClosedDeal() {
+  const at = DEAL_T0 + 180
+  return {
+    detail: {
+      id: DEAL_ID,
+      title: 'дело закрыто приговором',
+      repo: '/x/hermes-duty',
+      status: 'done',
+      terminal: true,
+      now: at,
+      created_at: DEAL_T0,
+      timeline: [
+        { kind: 'created', at: DEAL_T0, summary: '' },
+        { kind: 'collected', at, summary: 'ревью приняло работу' },
+        { kind: 'completed', at, summary: 'все этапы пройдены', cause: 'all_stages_done', stages: ['impl'] },
+      ],
+      stages: [{ id: 'impl', kind: 'agent', role: 'implementer', state: 'done', needs: [], attempts: [] }],
+    },
+    attempts: {
+      now: at,
+      attempts: [
+        { stage: 'impl', attempt: 1, start: DEAL_T0, end: at, status: 'done', outcome: 'done', duration_sec: 180 },
+      ],
+    },
+  }
+}
+
+test('веб: приговор и закрытие в одну секунду — один маркер с обоими видами', async (t) => {
+  if (!jsdomRoot()) return t.skip('нет jsdom в ~/.hermes/hermes-agent/node_modules')
+  const { detail, attempts } = verdictClosedDeal()
+  const doc = await renderDealPanel(detail, attempts)
+
+  const marks = [...doc.querySelectorAll('.tl-marks .tl-mark')]
+  assert.equal(marks.length, 1, `на точке оси ${marks.length} маркеров: группа не собрана или маркер потерян`)
+  const [mark] = marks
+  assert.ok(mark.className.includes('is-grouped'), `группа не помечена: ${mark.className}`)
+
+  // Палка на каждого участника — своим тоном: приговор синий, закрытие серое.
+  const bars = [...mark.querySelectorAll('i')]
+  assert.deepEqual(bars.map((bar) => bar.className), ['t-blue', 't-gray'], 'палки группы не своих тонов')
+
+  // Время не двинуто: группа стоит на координате своих событий (конец оси).
+  assert.equal(mark.style.left, '100%', `группа сдвинута с точки оси: ${mark.style.left}`)
+
+  // Подпись-итог называет все события точки, а не первое.
+  const tip = mark.getAttribute('data-tip') || ''
+  assert.ok(tip.includes('вердикт'), `в подсказке группы нет приговора: ${tip}`)
+  assert.ok(tip.includes('закрыто'), `в подсказке группы нет закрытия: ${tip}`)
+
+  // Легенда знает оба вида: «закрыто» не пропало вместе с головой группы.
+  const legend = [...doc.querySelectorAll('.scale-legend span')].map((span) => span.textContent)
+  assert.ok(legend.some((text) => text.includes('вердикт')), `в легенде нет приговора: ${legend.join(' | ')}`)
+  assert.ok(legend.some((text) => text.includes('закрыто')), `в легенде нет закрытия: ${legend.join(' | ')}`)
+})
+
+test('веб: одиночный маркер остаётся прежним — одна палка без класса группы', async (t) => {
+  if (!jsdomRoot()) return t.skip('нет jsdom в ~/.hermes/hermes-agent/node_modules')
+  const { detail, attempts } = verdictClosedDeal()
+  const half = DEAL_T0 + 90
+  detail.status = 'running'
+  detail.terminal = false
+  detail.now = half
+  detail.timeline = [
+    { kind: 'created', at: DEAL_T0, summary: '' },
+    { kind: 'question_asked', at: DEAL_T0 + 45, summary: 'q-1' },
+  ]
+  attempts.now = half
+  attempts.attempts = [{ stage: 'impl', attempt: 1, start: DEAL_T0, end: half, status: 'done', outcome: 'done', duration_sec: 90 }]
+  const doc = await renderDealPanel(detail, attempts)
+
+  const marks = [...doc.querySelectorAll('.tl-marks .tl-mark')]
+  assert.equal(marks.length, 1, `маркеров ${marks.length}, а событие одно`)
+  const [mark] = marks
+  assert.ok(!mark.className.includes('is-grouped'), `одиночный маркер помечен группой: ${mark.className}`)
+  assert.equal(mark.querySelectorAll('i').length, 1, 'у одиночного маркера больше одной палки')
+  assert.equal(mark.style.left, '50%', `одиночный маркер сдвинут: ${mark.style.left}`)
+})

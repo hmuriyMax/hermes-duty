@@ -1329,6 +1329,20 @@ def build_contract(
     if is_plan_stage(stage):
         contract["charter"] = charter_payload(spec)
         contract["plan"] = plan_payload(spec, events or ())
+        # Форма предложения — в границах, а не в отчёте об отказе: иначе лид
+        # узнаёт правила «перестановка называет только needs/parallel_with»
+        # из повторных `plan_rejected` и жжёт попытки реплана на ошибках формы
+        # (кейс d_2fc749fb: план «работы нет» отклонялся шестью issues за раз).
+        boundaries.extend(
+            [
+                "план — отчёт {status: done, plan: {stages: […], reason}}; список stages непустой",
+                "этап, чей id уже есть в графе: называть только id и needs/parallel_with — "
+                "поля role/kind/evidence/budget переписывают этап, план отклонят",
+                "новый этап — полный словарь {id, role, kind, needs, evidence, budget}",
+                "«работы нет» — не пустой список: назови минимальный хвост графа, "
+                "а приговор «делать нечего» выносит этап close своим вердиктом",
+            ]
+        )
     contract["report_to"] = str(report_to)
     contract["deadline_sec"] = int(deadline_sec)
     return contract

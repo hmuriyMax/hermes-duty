@@ -620,6 +620,7 @@ def fold(
     *,
     now: Optional[int] = None,
     pid_probe: Optional[Callable[[Any], Optional[bool]]] = None,
+    answer_of: Optional[Callable[[Any], Optional[str]]] = None,
 ) -> dict[str, Any]:
     """Состояние ожидания дела по его событиям — правила 1–13 контракта.
 
@@ -643,6 +644,10 @@ def fold(
     `now` подставляется тестами; по умолчанию берутся часы. `pid_probe` — тот же
     шов для живости pid: по умолчанию `pid_alive` (то есть `os.kill`), тесты
     подставляют свой ответ, чтобы результат не зависел от живых процессов.
+    `answer_of` — такой же шов для ответа пула: журнал сам пула не читает
+    (чистая функция), но поверхность, у которой пул открыт, может подсказать,
+    что человек уже ответил — иначе доказательство говорило «ответа нет» там,
+    где ответ лежит в пуле и ждёт проведения решения (кейс d_2fc749fb).
     """
     ordered = sorted(events, key=lambda ev: int(ev.get("id") or 0))
     if not ordered:
@@ -680,10 +685,17 @@ def fold(
         payload = _payload(question[1])
         number = payload.get("question_id")
         if number:
-            asked = (
-                f"вопрос #{number} задан {_ago(question[1].get('ts'), now_sec)}, "
-                f"ответа нет (session_key {payload.get('session_key') or '—'})"
-            )
+            answer = answer_of(number) if answer_of is not None else None
+            if answer:
+                asked = (
+                    f"вопрос #{number} задан {_ago(question[1].get('ts'), now_sec)}, "
+                    f"ответ получен: {answer[:40]} — решение не проведено (`duty decide`)"
+                )
+            else:
+                asked = (
+                    f"вопрос #{number} задан {_ago(question[1].get('ts'), now_sec)}, "
+                    f"ответа нет (session_key {payload.get('session_key') or '—'})"
+                )
         else:
             asked = (
                 f"вопрос {_question_address(payload)} задан {_ago(question[1].get('ts'), now_sec)}, "

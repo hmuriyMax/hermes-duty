@@ -780,6 +780,24 @@ def _payload_summary(payload: Optional[str]) -> Optional[str]:
     return text[:SUMMARY_LIMIT] + ("…" if len(text) > SUMMARY_LIMIT else "")
 
 
+def _pool_answer_of(home: Optional[Path]) -> Any:
+    """Шов для `journal.fold`: текст ответа пула по номеру вопроса.
+
+    Пул читается `ask.answer_of` (только чтение, честное «текста нет» при любом
+    сбое — тот же контракт, что у поверхности). Без `home` шов пуст: фолд тогда
+    живёт по журналу и отвечает «ответа нет», как раньше. Открывать пул на каждый
+    вызов — дорога заметная, но шов дёргается только у открытого вопроса дела,
+    а пул — локальный sqlite в режиме only-read.
+    """
+    if home is None:
+        return None
+
+    def probe(number: Any) -> Optional[str]:
+        return ask.answer_of(Path(home), number)
+
+    return probe
+
+
 def _pool_questions(home: Path) -> tuple[dict[str, dict[str, Any]], Optional[str], bool]:
     """Живые вопросы пула (`ask.LIVE_STATUSES`), разложенные по id дела.
 
@@ -1251,7 +1269,7 @@ def _own_shaped(
     месте врали бы про идущую работу.
     """
     last = events[-1] if events else None
-    folded = journal.fold(events, now=now)
+    folded = journal.fold(events, now=now, answer_of=_pool_answer_of(home))
     attempt, lease, attempts = _own_attempt_facts(events, leases or {}, now)
     return {
         "repo": row.get("repo"),
@@ -1332,7 +1350,7 @@ def _own_deals(
         out: list[dict[str, Any]] = []
         for row in deals.deal_rows(conn, open_only=True):
             events = journal_events.get(str(row["id"]), [])
-            folded = journal.fold(events, now=now)
+            folded = journal.fold(events, now=now, answer_of=_pool_answer_of(home))
             if not folded["active"]:
                 continue  # закрытое дело в срез не идёт (правило 2 fold)
             out.append(
@@ -1480,7 +1498,7 @@ def _own_response(
     """Полный ответ по делу своего store (та же форма, что `/deal`)."""
     deal_id = str(row["id"])
     events = journal.read_events(conn, deal_id)
-    folded = journal.fold(events, now=now)
+    folded = journal.fold(events, now=now, answer_of=_pool_answer_of(home))
     shaped = (
         _own_shaped(
             row,

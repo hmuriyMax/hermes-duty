@@ -693,6 +693,42 @@ def test_fold_question_without_answer_is_wait_human_question() -> None:
     assert "#42" in folded["evidence"]
 
 
+def test_fold_says_answer_is_received_when_pool_has_it(tmp_path=None) -> None:
+    """Шов `answer_of`: ответ в пуле — не «ответа нет», а «ответ получен, решение не проведено».
+
+    Дело d_2fc749fb: человек ответил через пул, а журнала `question_answered` ещё
+    нет (его пишет рантайм при перезапуске) — доказательство говорило «ответа нет»
+    и врало против системы записи. Журнал остаётся чистым: текст ответа приходит
+    швом, а не чтением БД внутри fold.
+    """
+    folded = journal.fold(
+        events(
+            ("created", None),
+            ("question_asked", {"question_id": 461, "session_key": "t_d_2fc749fb", "critical": 1, "timeout": 300}),
+        ),
+        now=NOW,
+        answer_of=lambda number: {461: "continue"}.get(int(number)),
+    )
+
+    assert folded["state"] == "wait_human"
+    assert folded["human_kind"] == "question"
+    assert "ответ получен: continue" in folded["evidence"]
+    assert "ответа нет" not in folded["evidence"]
+    assert "решение не проведено" in folded["evidence"]
+
+
+def test_fold_without_answer_probe_stays_journal_only() -> None:
+    """Шов не подставлен — формулировка прежняя: fold не обязан знать про пул."""
+    folded = journal.fold(
+        events(
+            ("created", None),
+            ("question_asked", {"question_id": 42, "session_key": "t_0001", "critical": 1, "timeout": 300}),
+        ),
+        now=NOW,
+    )
+    assert "ответа нет" in folded["evidence"]
+
+
 def test_fold_answered_question_is_not_waiting() -> None:
     """Ответ на вопрос снимает ожидание: тот же вопрос больше не «ждёт человек»."""
     folded = journal.fold(

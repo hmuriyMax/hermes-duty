@@ -1004,6 +1004,29 @@ def test_written_result_is_not_rescued(tmp_path: Path) -> None:
     assert "commented" not in kinds(conn, deal)
 
 
+def test_plan_contract_teaches_the_proposal_form(tmp_path: Path) -> None:
+    """Границы этапа плана называют форму предложения — до первого отказа хартии.
+
+    Дело d_2fc749fb: лид узнавал «перестановка называет только needs/parallel_with»
+    из повторных plan_rejected и жёг попытки реплана на ошибках формы. Правила
+    формы приезжают в контракте, вместе с хартией и графом.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = plan_spec(tmp_path)
+    run_stage(conn, spec, deal, home, Fake(result=None, exit_code=0, lines=[]))
+
+    contract_file = runner.contract_path(runner.attempt_dir(home, deal, "plan", 1), "plan", 1)
+    contract = json.loads(contract_file.read_text(encoding="utf-8"))
+    boundaries = "\n".join(contract["boundaries"])
+    assert "needs/parallel_with" in boundaries
+    assert "непустой" in boundaries
+    assert "этап close своим вердиктом" in boundaries
+    # Хвост этапа-плана: хартия и граф в контракте, как и было.
+    assert "charter" in contract and "plan" in contract
+
+
 def test_blocked_result_parks_the_deal_with_question(tmp_path: Path) -> None:
     """`status: blocked` — вопрос через `ask()`, дело в `wait_human`, не отказ."""
     home = make_home(tmp_path)

@@ -2391,6 +2391,23 @@ test('нехватка уровней — свойство рисунка, а н
   assert.doesNotMatch(view.note, /уровней не хватило/)
 })
 
+test('подпись попытки называет токены, если телеметрия их записала', () => {
+  // Живой кейс d_a6f787fa (Макс, 10.11): число лежит в KPI шапки, а на строке
+  // попытки его не было — «40 вызовов · 1 фраза» без расхода. Попытка говорит
+  // своим числом; shell-попытка — молчит, без «—» (прочерк один, в шапке).
+  const withTokens = attemptView(
+    bar([{ name: 'read_file', at: 1, ms: 100 }], { tokens: 1303268, says: shapeSays([{ seq: 1, at: 2, text: 'смотрю' }]) }),
+    axis,
+  )
+  assert.equal(withTokens.badge, '1 вызов · 1 фраза · 1 303 268 токенов')
+  // Один токен — не «токенов».
+  const one = attemptView(bar([{ name: 'read_file', at: 1, ms: 100 }], { tokens: 1 }), axis)
+  assert.match(one.badge, /1 токен$/)
+  // Нет телеметрии — нет и числа: shell-этап (Макс, 10.11: «—» на полосе был бы ложью).
+  const silent = attemptView(bar([{ name: 'read_file', at: 1, ms: 100 }]), axis)
+  assert.equal(silent.badge, '1 вызов')
+})
+
 test('сводка дорожки считает всё, включая невидимое', () => {
   const bars = [
     bar([{ name: 'read_file', at: 1, ms: 100 }], { callsOmitted: 4 }),

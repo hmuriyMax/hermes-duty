@@ -3998,7 +3998,7 @@ const CSS = `
  * переменной --duty-tl-full со строки, переход делает CSS. */
 
 /* Шкала шире часа: листается по горизонтали, подписи прилипают слева (Макс, 09.11). */
-.duty-scale-main.is-wide{overflow-x:auto;overscroll-behavior-x:contain;scrollbar-width:thin}
+.duty-scale-main.is-wide{overflow-x:auto;overscroll-behavior-x:contain;scrollbar-width:thin;background:linear-gradient(90deg,var(--ui-bg-primary,#1a1a1a) 0,var(--ui-bg-primary,#1a1a1a) calc(var(--duty-tl-gutter,186px) + var(--duty-tl-gap,8px) - 1px),var(--ui-border-primary,rgba(127,127,127,.3)) calc(var(--duty-tl-gutter,186px) + var(--duty-tl-gap,8px) - 1px),var(--ui-border-primary,rgba(127,127,127,.3)) calc(var(--duty-tl-gutter,186px) + var(--duty-tl-gap,8px)),transparent calc(var(--duty-tl-gutter,186px) + var(--duty-tl-gap,8px))) left top/100% 100% no-repeat;background-attachment:scroll}
 .duty-scale-main.is-wide::-webkit-scrollbar{height:8px}
 .duty-scale-main.is-wide::-webkit-scrollbar-thumb{background:var(--ui-border-primary,rgba(127,127,127,.3));border-radius:4px}
 .duty-scale-main.is-wide::-webkit-scrollbar-track{background:transparent}
@@ -5026,7 +5026,27 @@ function ScalePanel({ scale, callSel, onSelectCall, toolFilter, onToggleTool }) 
   // сам, каждый тик держит в кадре свежую кромку.
   const scrollRef = useRef(null)
   const rootRef = useRef(null)
+  // «Уехал влево» — только жест человека: колесо с горизонтальной составляющей
+  // или перетаскивание скроллбара. Программные скроллы (наш пин, восстановление
+  // позиции браузером после F5) пин не снимают (Макс, 09.11: после обновления
+  // страницы остаёмся у правой кромки).
   useEffect(() => {
+    const el = scrollRef.current
+    if (el && !el.__tlWatch) {
+      el.__tlWatch = true
+      el.addEventListener('wheel', (event) => {
+        if (event.deltaX) el.__tlUser = true
+      }, { passive: true })
+      // Скроллбар — единственный pointerdown прямо по контейнеру: клики по чипам
+      // и подписям пин не снимают.
+      el.addEventListener('pointerdown', (event) => {
+        if (event.target === el) el.__tlUser = true
+      })
+      el.addEventListener('scroll', () => {
+        if (!el.__tlUser) return
+        el.__tlPinned = el.scrollLeft + el.clientWidth >= el.scrollWidth - 8
+      }, { passive: true })
+    }
     const root = rootRef.current
     // Левый столбец — под самый широкий контент (Макс, 09.11: «ширина столбца
     // уже, чем ширина самого широкого контента»): меряем естественную ширину
@@ -5045,14 +5065,9 @@ function ScalePanel({ scale, callSel, onSelectCall, toolFilter, onToggleTool }) 
         wrap.style.setProperty('--duty-tl-gutter', `${Math.min(360, Math.max(186, Math.ceil(need) + 18))}px`)
       }
     }
-    const el = scrollRef.current
     if (!el || el.__tlPinned === false) return
     el.scrollLeft = el.scrollWidth
   })
-  const onScroll = useCallback((event) => {
-    const el = event.currentTarget
-    el.__tlPinned = el.scrollLeft + el.clientWidth >= el.scrollWidth - 8
-  }, [])
   const wide = (Number(scale.axis.zoom) || 1) > 1
   const head = h(
     'div',
@@ -5094,7 +5109,6 @@ function ScalePanel({ scale, callSel, onSelectCall, toolFilter, onToggleTool }) 
         {
           ref: scrollRef,
           className: `duty-scale-main${wide ? ' is-wide' : ''}`,
-          onScroll: wide ? onScroll : undefined,
           style: wide ? { '--tl-zoom': String(scale.axis.zoom) } : undefined,
         },
         h(

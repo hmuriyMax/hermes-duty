@@ -54,12 +54,21 @@ test('шкала длиннее часа листается, мы висим н�
   assert.match(app, /--tl-zoom:\$\{scale\.axis\.zoom\}/, 'веб: зум не в переменной')
   assert.match(app, /pinScaleScroll\(panel\)/, 'веб: нет пина к правой кромке')
   assert.match(app, /el\.__tlPinned = el\.scrollLeft \+ el\.clientWidth >= el\.scrollWidth - 8/, 'веб: нет снятия пина при ручном уезде')
-  assert.match(css, /\.scale-main\.is-wide \{ overflow-x: auto/, 'веб: нет горизонтальной прокрутки')
+  assert.match(css, /\.scale-main\.is-wide \{[\s\S]*?overflow-x: auto/, 'веб: нет горизонтальной прокрутки')
   assert.match(css, /min-width: calc\(var\(--tl-zoom, 1\) \* 100%\)/, 'веб: дорожки не растягиваются до zoom')
   assert.match(css, /\.scale-main\.is-wide \.scale-head-gap, \.scale-main\.is-wide \.tl-lbl, \.scale-main\.is-wide \.tl-lane-id \{ position: sticky/, 'веб: подписи не прилипают')
   assert.match(pluginSource, /duty-scale-main\$\{wide \? ' is-wide' : ''\}/, 'десктоп: широкая шкала не помечена')
   assert.match(pluginSource, /el\.scrollLeft = el\.scrollWidth/, 'десктоп: нет пина')
   assert.match(pluginSource, /\.duty-scale-main\.is-wide\{overflow-x:auto/, 'десктоп: нет стиля прокрутки')
+  // Пин снимает только жест человека, не программный скролл и не восстановление
+  // позиции браузером после F5.
+  assert.match(app, /if \(!el\.__tlUser\) return/, 'веб: пин снимается без жеста')
+  assert.match(app, /event\.deltaX\) el\.__tlUser = true/, 'веб: колесо не считается жестом')
+  assert.match(pluginSource, /if \(!el\.__tlUser\) return/, 'десктоп: пин снимается без жеста')
+  // Подложка левого столбца на всю высоту прокрутки, держится при элементе.
+  assert.match(css, /background-attachment: scroll/, 'веб: подложка столбца едет с содержимым')
+  assert.match(css, /var\(--card\) calc\(var\(--tl-gutter, 186px\)/, 'веб: подложка не в цвет карточки')
+  assert.match(pluginSource, /background-attachment:scroll/, 'десктоп: нет подложки столбца')
 })
 
 test('маркеры: центр палки точно на своём моменте', () => {

@@ -852,7 +852,26 @@ pre.body {
 
 /* Шкала шире часа (Макс, 09.11): не сжимаем в кашу, а листаем по горизонтали.
  * Подписи попыток прилипают к левому краю и едут вместе с вьюпортом. */
-.scale-main.is-wide { overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+/* Сплошная подложка левого столбца на всю высоту прокрутки: подписиattempt прилипают
+ * сами, а зазоры между строками и дорожками без подложки просвечивали бы чипами,
+ * проезжающими под столбцом. `background-attachment: scroll` у скроллящегося
+ * контейнера держит фон при элементе, а не при содержимом. */
+.scale-main.is-wide {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+  background: linear-gradient(
+      90deg,
+      var(--card) 0,
+      var(--card) calc(var(--tl-gutter, 186px) + var(--tl-gap, 8px) - 1px),
+      var(--border) calc(var(--tl-gutter, 186px) + var(--tl-gap, 8px) - 1px),
+      var(--border) calc(var(--tl-gutter, 186px) + var(--tl-gap, 8px)),
+      transparent calc(var(--tl-gutter, 186px) + var(--tl-gap, 8px))
+    )
+    left top / 100% 100% no-repeat;
+  background-attachment: scroll;
+}
 .scale-main.is-wide::-webkit-scrollbar { height: 8px; }
 .scale-main.is-wide::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 .scale-main.is-wide::-webkit-scrollbar-track { background: transparent; }

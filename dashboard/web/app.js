@@ -2527,6 +2527,12 @@ function scalePanel(scale) {
     fitScaleGutter(panel)
     if (scale.axis.zoom > 1) pinScaleScroll(panel)
   })
+  // После F5 браузер восстанавливает прежний scrollLeft уже после нашего пина —
+  // повторяем через два кадра, чтобы оказаться у правой кромки новой полосы
+  // (Макс, 09.11).
+  if (scale.axis.zoom > 1 && typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(() => requestAnimationFrame(() => pinScaleScroll(panel)))
+  }
 return panel
 }
 
@@ -3019,10 +3025,33 @@ document.addEventListener(
   (event) => {
     const el = event.target
     if (el instanceof Element && el.classList && el.classList.contains('scale-main')) {
+      if (!el.__tlUser) return
       el.__tlPinned = el.scrollLeft + el.clientWidth >= el.scrollWidth - 8
     }
   },
   { capture: true, passive: true },
+)
+// «Уехал» — только жест человека: колесо с горизонтальной составляющей или
+// перетаскивание скроллбара. Программные скроллы (наш пин, восстановление
+// позиции браузером после F5) пин не снимают (Макс, 09.11: после обновления
+// страницы остаёмся у правой кромки).
+document.addEventListener(
+  'wheel',
+  (event) => {
+    const el = event.target instanceof Element ? event.target.closest('.scale-main.is-wide') : null
+    if (el && event.deltaX) el.__tlUser = true
+  },
+  { capture: true, passive: true },
+)
+document.addEventListener(
+  'pointerdown',
+  (event) => {
+    // Скроллбар — единственный pointerdown прямо по контейнеру: клики по чипам
+    // и подписям пин не снимают.
+    const el = event.target instanceof Element ? event.target.closest('.scale-main.is-wide') : null
+    if (el && event.target === el) el.__tlUser = true
+  },
+  { capture: true },
 )
 bindTipLayer()
 ticker = setInterval(tickStamp, 1000)

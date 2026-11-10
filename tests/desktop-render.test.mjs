@@ -375,6 +375,17 @@ test('десктоп: экран «Дело» монтируется и рису
  * по строке этапа и по строке попытки раскрывает их. Подсказка обрезанной
  * команды несёт полную строку: обрезка идёт в шейпере, CSS-эллипсис её не хранит.
  */
+test('десктоп: этапы и дорожки анимированы на вход/уход, чипы доезжают', () => {
+  // Чипы keyed id вызова: React правит тот же узел, и CSS-переезд к новым
+  // процентам играется, а не пересоздаётся. Ушедшие этапы доигрывают уход
+  // снимком с is-leaving, вход — duty-fade-in.
+  assert.match(pluginSource(), /key: `call-\$\{chip\.id\}`/, 'чипы не имеют устойчивого ключа')
+  assert.match(pluginSource(), /is-leaving/, 'уход этапа не анимируется')
+  assert.match(pluginSource(), /duty-fade-in/, 'нет анимации входа')
+  assert.match(pluginSource(), /duty-scale-tick,\.duty-scale-grid-line/, 'метки оси не переезжают плавно')
+  assert.match(pluginSource(), /prefers-reduced-motion:reduce/, 'уважение reduced-motion потеряно')
+})
+
 test('десктоп: строки этапов раскрываются кликом, провал виден без клика', async (t) => {
   const reactModules = reactRoot()
   if (!reactModules) return t.skip('нет React в ~/.hermes/hermes-agent/node_modules')

@@ -25,6 +25,23 @@ const app = read('dashboard/web/app.js')
 const api = read('dashboard/plugin_api.py')
 const pluginSource = read('desktop/plugin.js')
 
+test('плавность дела: вход, уход и переезд строк анимированы', () => {
+  // Патч правит узлы на месте (morph), поэтому движение отдаётся CSS: свежие
+  // узлы помечаются, ушедшие доигрывают схлопывание, перестановка дорожек — FLIP.
+  assert.match(app, /function tagEntering/, 'вход не помечается')
+  assert.match(app, /function animateExit/, 'уход не анимируется')
+  assert.match(app, /function flipPlay/, 'перестановка дорожек не доезжает плавно')
+  assert.match(app, /is-new/, 'класс входа не ставится')
+  assert.match(app, /is-gone/, 'класс ухода не ставится')
+  assert.match(app, /`tick:\$\{tick\.at/, 'метки оси не имеют устойчивого ключа')
+  // Стили: переходы геометрии + вход/уход, при reduced-motion — всё выключено.
+  const css = read('dashboard/web/styles.css')
+  assert.match(css, /\.tl-call \{ transition: left/, 'чипы не переезжают плавно')
+  assert.match(css, /@keyframes duty-row-in/, 'нет анимации входа')
+  assert.match(css, /\.is-gone \{/, 'нет схлопывания ухода')
+  assert.match(css, /prefers-reduced-motion[\s\S]*\.is-new \{ animation: none/, ' reduced-motion не гасит вход')
+})
+
 test('веб-сборка на месте: html, модуль и стили', () => {
   for (const file of ['dashboard/web/index.html', 'dashboard/web/app.js', 'dashboard/web/styles.css']) {
     assert.ok(existsSync(new URL(file, root)), `${file} отсутствует`)

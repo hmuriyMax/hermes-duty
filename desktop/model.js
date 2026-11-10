@@ -3298,7 +3298,10 @@ function shapeDealTime(detail, attemptsPayload) {
     // Иначе часовое дело получало бы тринадцать подписей, а минутное — две.
     const step = [60, 120, 300, 600, 900, 1200, 1800, 2400, 3600, 7200, 10800, 21600, 43200, 86400]
       .find((candidate) => durationSec / candidate <= 8) || 86400
-    axisTicks.push({ pct: 0, edge: 'нач.', align: 'start', clock: fmtClock(axisStart) })
+    // `at` — момент деления в секундах: поверхностям он нужен как устойчивый
+    // ключ узла, иначе при расширении оси метка считалась бы новой и не
+    // доезжала до места плавно.
+    axisTicks.push({ pct: 0, edge: 'нач.', align: 'start', at: axisStart, clock: fmtClock(axisStart) })
     for (let at = Math.ceil(axisStart / step) * step; at < axisEnd; at += step) {
       // Метка на оси — той же координатой, что полосы и маркеры: внутри сжатого
       // промежутка она встаёт на его сжатую ширину, а не на реальное время.
@@ -3312,9 +3315,9 @@ function shapeDealTime(detail, attemptsPayload) {
       // половина подписи метки, итого 12 %; внутри него метку не рисуем вовсе,
       // чтобы её линия не перечёркивала слово.
       if (pct < TICK_EDGE_RESERVE_PCT || pct > 100 - TICK_EDGE_RESERVE_PCT) continue
-      axisTicks.push({ pct, edge: '', align: 'center', clock: fmtClock(at) })
+      axisTicks.push({ pct, edge: '', align: 'center', at, clock: fmtClock(at) })
     }
-    axisTicks.push({ pct: 100, edge: 'кон.', align: 'end', clock: fmtClock(axisEnd) })
+    axisTicks.push({ pct: 100, edge: 'кон.', align: 'end', at: axisEnd, clock: fmtClock(axisEnd) })
   }
   // KPI-строка (макет `d-merge`): пять чисел шапки, все — суммы по уже собранным
   // полосам и попыткам. Токены показываем только когда их записала телеметрия:

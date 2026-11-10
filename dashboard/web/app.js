@@ -74,6 +74,10 @@ const HEALTH_REFRESH_MS = 30000
 const TIMEOUT_MS = 15000
 const SEARCH_DEBOUNCE_MS = 240
 // Сколько живёт подсветка изменившегося значения (только цвет, без движения).
+// Плавность дела: вход/уход строк и перестановка дорожек. Одно значение на все
+// три движения, чтобы страница не дышала вразнобой.
+const FLIP_MS = 320
+const EXIT_MS = 280
 const FRESH_HIGHLIGHT_MS = 600
 
 /* ---------------------------------------------------------------- утилиты */
@@ -205,15 +209,101 @@ function morphChildren(oldParent, newParent) {
   placed.forEach((node, index) => {
     if (oldParent.childNodes[index] !== node) oldParent.insertBefore(node, oldParent.childNodes[index] || null)
   })
+  // Появившееся — свежие узлы, для которых не нашлось старого: помечаем, CSS
+  // проиграет вход. Класс снимается по окончании анимации, а при следующем
+  // патче его и так снёс бы syncAttrs.
+  wanted.forEach((next, index) => {
+    if (placed[index] === next && next.nodeType === 1) tagEntering(next)
+  })
   // Всё, что осталось за пределами нового списка, — пропало из ответа. Так
-  // удаляется одна закрытая попытка или целый этап, а не вся панель.
-  while (oldParent.childNodes.length > placed.length) oldParent.removeChild(oldParent.lastChild)
+  // удаляется одна закрытая попытка или целый этап, а не вся панель. Уход
+  // анимированный: узел остаётся доигрывать схлопывание и убирается по таймеру.
+  for (const gone of [...oldParent.childNodes].slice(placed.length)) {
+    if (!animateExit(gone)) oldParent.removeChild(gone)
+  }
+}
+
+/** Семейства узлов, чьё появление и уход стоят анимации: этапы и попытки. */
+const ENTERING_RE = /^(lane:|attempt:|track:|stage:|att:)/
+
+function tagEntering(el) {
+  const key = el.getAttribute('data-key') || ''
+  if (!ENTERING_RE.test(key) || prefersReducedMotion() || el.classList.contains('is-new')) return
+  el.classList.add('is-new')
+  el.addEventListener('animationend', () => el.classList.remove('is-new'), { once: true })
+}
+
+/** Оставить узел доигрывать уход (схлопывание высоты); false — убрать сразу. */
+function animateExit(node) {
+  if (!node || node.nodeType !== 1 || prefersReducedMotion()) return false
+  const key = node.getAttribute('data-key') || ''
+  if (!ENTERING_RE.test(key)) return false
+  // Замораживаем нынешнюю высоту: схлопывание идёт из неё, а не рывком.
+  node.style.height = `${node.offsetHeight}px`
+  node.style.overflow = 'hidden'
+  void node.offsetHeight // reflow: иначе переход не начнётся
+  node.classList.add('is-gone')
+  setTimeout(() => {
+    if (node.parentNode) node.parentNode.removeChild(node)
+  }, EXIT_MS + 60)
+  return true
+}
+
+/** Полный путь ключей узла: `lane:x/attempt:y` — уникален даже при `band`. */
+function nodePathKey(el) {
+  const parts = []
+  for (let cur = el; cur && cur.nodeType === 1; cur = cur.parentElement) {
+    const key = cur.getAttribute('data-key')
+    if (key) parts.unshift(key)
+  }
+  return parts.join('/')
+}
+
+/** Снять координаты ключевых узлов до патча — исход для FLIP-плавности. */
+function flipBefore(host) {
+  if (prefersReducedMotion()) return null
+  const map = new Map()
+  for (const el of host.querySelectorAll('[data-key]')) {
+    const key = el.getAttribute('data-key')
+    if (!ENTERING_RE.test(key)) continue
+    map.set(el.getAttribute('data-key'), el.getBoundingClientRect())
+  }
+  return map.size ? map : null
+}
+
+/** Доиграть перестановку: узлы, съехавшие по вертикали, доезжают плавно. */
+function flipPlay(root, before) {
+  if (!before) return
+  for (const el of root.querySelectorAll('[data-key]')) {
+    const key = el.getAttribute('data-key')
+    if (!ENTERING_RE.test(key) || !before.has(key)) continue
+    if (el.classList.contains('is-new') || el.classList.contains('is-gone')) continue
+    const prev = before.get(key)
+    const now = el.getBoundingClientRect()
+    const dy = prev.top - now.top
+    if (Math.abs(dy) < 1) continue
+    el.style.transition = 'none'
+    el.style.transform = `translateY(${dy}px)`
+    requestAnimationFrame(() => {
+      el.style.transition = `transform ${FLIP_MS}ms ease`
+      el.style.transform = ''
+      const done = () => {
+        el.style.transition = ''
+        el.style.transform = ''
+      }
+      el.addEventListener('transitionend', done, { once: true })
+      setTimeout(done, FLIP_MS + 80)
+    })
+  }
 }
 
 /** Свести новое поддерево со старым; вернуть узел, который остался в DOM. */
 function morph(oldNode, newNode) {
   if (!oldNode || oldNode.nodeType !== newNode.nodeType || oldNode.nodeName !== newNode.nodeName) {
-    if (oldNode && oldNode.parentNode) oldNode.parentNode.replaceChild(newNode, oldNode)
+    if (oldNode && oldNode.parentNode) {
+      oldNode.parentNode.replaceChild(newNode, oldNode)
+      if (newNode.nodeType === 1) tagEntering(newNode)
+    }
     return newNode
   }
   if (oldNode.nodeType !== 1) {
@@ -2036,7 +2126,7 @@ function attemptRowNode(view, key) {
         class: 'tl-silence',
         style: `left:${silence.leftPct}%;width:${silence.widthPct}%`,
         'data-tip': silence.tip,
-        'data-key': `silence:${silence.leftPct}`,
+        'data-key': `silence:${view.chips.length}-${silence.leftPct < 50 ? 'l' : 'r'}`,
       }),
     )
   }
@@ -2047,7 +2137,7 @@ function attemptRowNode(view, key) {
         class: 'tl-wait',
         style: `left:${wait.fromPct}%;width:${wait.widthPct}%`,
         'data-tip': wait.title,
-        'data-key': `wait:${wait.fromPct}`,
+        'data-key': `wait:${wait.title}`,
       }),
     )
   }
@@ -2317,7 +2407,7 @@ function scalePanel(scale) {
           ...scale.axis.ticks.map((tick) =>
             h(
               'span',
-              { class: `scale-tick align-${tick.align}`, style: `left:${tick.pct}%`, title: tick.clock, 'data-key': `tick:${tick.pct}` },
+              { class: `scale-tick align-${tick.align}`, style: `left:${tick.pct}%`, title: tick.clock, 'data-key': `tick:${tick.at ?? tick.clock}` },
               tick.edge ? `${tick.edge} ${tick.clock}` : tick.clock,
             ),
           ),
@@ -2335,7 +2425,7 @@ function scalePanel(scale) {
           'div',
           { class: 'scale-grid', 'aria-hidden': 'true' },
           ...scale.axis.ticks.map((tick) =>
-            h('span', { class: 'scale-grid-line', style: `left:${tick.pct}%`, 'data-key': `grid:${tick.pct}` }),
+            h('span', { class: 'scale-grid-line', style: `left:${tick.pct}%`, 'data-key': `grid:${tick.at ?? tick.clock}` }),
           ),
         ),
         // Сжатые промежутки оси: штрихованная полоса и пилюля со временем. Ось
@@ -2667,7 +2757,9 @@ function patchDeal(dealId) {
   }
   const prev = dealSnap.spots
   const next = dealSpots(dealSnap.data, dealSnap.attempts)
+  const before = flipBefore(host)
   morph(host, viewDeal(dealId))
+  flipPlay(app, before)
   // Хост подсказки мог исчезнуть вместе со старой строкой: тогда подсказку снимаем.
   if (typeof window.dutyTipFollow === 'function') window.dutyTipFollow()
   const panel = app.querySelector('[data-key="scale"]')

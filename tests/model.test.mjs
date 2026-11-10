@@ -967,6 +967,14 @@ test('шкала времени: дорожки в порядке работы, 
   assert.deepEqual(parallel.lanes.map((lane) => lane.key), ['review', 'impl'], 'при равном старте порядок графа не удержан')
 })
 
+test('шкала времени: у меток оси есть момент времени — устойчивый ключ поверхностей', () => {
+  const scale = shapeDealTime(TIME_DETAIL, TIME_ATTEMPTS)
+  // При расширении оси метка с тем же моментом правится на месте и доезжает
+  // плавно (CSS transition); без `at` она считалась бы новой на каждом тике.
+  assert.ok(scale.axis.ticks.length >= 2)
+  assert.ok(scale.axis.ticks.every((tick) => Number.isFinite(tick.at)), 'у метки оси нет момента времени')
+})
+
 test('шкала времени: перекрывающиеся этапы — на разных дорожках, дорожек по числу этапов', () => {
   const scale = shapeDealTime(TIME_DETAIL, TIME_ATTEMPTS)
   assert.deepEqual(

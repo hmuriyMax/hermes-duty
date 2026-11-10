@@ -3347,7 +3347,10 @@ function shapeDealTime(detail, attemptsPayload) {
     // Иначе часовое дело получало бы тринадцать подписей, а минутное — две.
     const step = [60, 120, 300, 600, 900, 1200, 1800, 2400, 3600, 7200, 10800, 21600, 43200, 86400]
       .find((candidate) => durationSec / candidate <= 8) || 86400
-    axisTicks.push({ pct: 0, edge: 'нач.', align: 'start', clock: fmtClock(axisStart) })
+    // `at` — момент деления в секундах: поверхностям он нужен как устойчивый
+    // ключ узла, иначе при расширении оси метка считалась бы новой и не
+    // доезжала до места плавно.
+    axisTicks.push({ pct: 0, edge: 'нач.', align: 'start', at: axisStart, clock: fmtClock(axisStart) })
     for (let at = Math.ceil(axisStart / step) * step; at < axisEnd; at += step) {
       // Метка на оси — той же координатой, что полосы и маркеры: внутри сжатого
       // промежутка она встаёт на его сжатую ширину, а не на реальное время.
@@ -3361,9 +3364,9 @@ function shapeDealTime(detail, attemptsPayload) {
       // половина подписи метки, итого 12 %; внутри него метку не рисуем вовсе,
       // чтобы её линия не перечёркивала слово.
       if (pct < TICK_EDGE_RESERVE_PCT || pct > 100 - TICK_EDGE_RESERVE_PCT) continue
-      axisTicks.push({ pct, edge: '', align: 'center', clock: fmtClock(at) })
+      axisTicks.push({ pct, edge: '', align: 'center', at, clock: fmtClock(at) })
     }
-    axisTicks.push({ pct: 100, edge: 'кон.', align: 'end', clock: fmtClock(axisEnd) })
+    axisTicks.push({ pct: 100, edge: 'кон.', align: 'end', at: axisEnd, clock: fmtClock(axisEnd) })
   }
   // KPI-строка (макет `d-merge`): пять чисел шапки, все — суммы по уже собранным
   // полосам и попыткам. Токены показываем только когда их записала телеметрия:
@@ -3720,7 +3723,7 @@ function DutyAttemptRow({ view, callSel, onSelectCall, toolFilter }) {
   for (const [i, chip] of view.chips.entries()) {
     track.push(
       h('span', {
-        key: `call-${i}`,
+        key: `call-${chip.id}`,
         className: `duty-tl-call${chip.unfinished ? ' duty-tl-unfinished' : ''}${callSel === chip.id ? ' duty-tl-sel' : ''}${active.length && !active.includes(chip.tone) ? ' duty-tl-dim' : ''}`,
         'data-level': String(chip.level || 0),
         'data-tip': chip.tip || chip.title,
@@ -3972,6 +3975,16 @@ const CSS = `
 .duty-tl-lanes{position:relative;z-index:1;display:flex;flex-direction:column;gap:10px}
 .duty-tl-lane{display:flex;flex-direction:column;gap:4px}
 .duty-tl-lane + .duty-tl-lane{border-top:1px solid var(--ui-border-primary, rgba(127,127,127,.2));padding-top:10px}
+/* Плавность дела: чипы и метки доезжают до новых процентов, дорожки и этапы —
+ * вход/уход. Значение одно на все движения, чтобы панель не дышала вразнобой.
+ * Обновления прилетают раз в 5 с: без переходов шкала дёргалась бы на каждом тике. */
+.duty-scale-tick,.duty-scale-grid-line,.duty-tl-idle-gap,.duty-tl-call,.duty-tl-wait,.duty-tl-say{transition:left .32s ease,width .32s ease,top .32s ease,background-color .32s ease}
+.duty-tl-lane,.duty-tl-row,.duty-stage-block,.duty-att-row{transition:opacity .28s ease,height .28s ease}
+.duty-stage-block.is-leaving,.duty-tl-lane.is-leaving{height:0!important;opacity:0;overflow:hidden;pointer-events:none}
+@keyframes duty-fade-in{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+.duty-stage-block{animation:duty-fade-in .32s ease both}
+.duty-tl-lane{animation:duty-fade-in .32s ease both}
+@media (prefers-reduced-motion:reduce){.duty-stage-block,.duty-tl-lane{animation:none}.duty-scale-tick,.duty-scale-grid-line,.duty-tl-idle-gap,.duty-tl-call,.duty-tl-wait,.duty-tl-say,.duty-tl-lane,.duty-tl-row,.duty-stage-block,.duty-att-row{transition:none!important}}
 .duty-tl-lane-h{display:flex;align-items:center;gap:8px;min-height:20px}
 .duty-tl-lane-name{font-size:12.5px;font-weight:600;color:var(--ui-text-primary);letter-spacing:.01em}
 .duty-tl-lane-meta{margin-left:auto;font-size:11px;color:var(--ui-text-tertiary);font-variant-numeric:tabular-nums;white-space:nowrap}
@@ -4684,13 +4697,43 @@ function CompactAttemptRow({ stage, attempt, open, onToggle }) {
 function CompactStages({ feed, timeline }) {
   const [openStages, setOpenStages] = useState({})
   const [openAtts, setOpenAtts] = useState({})
+  // Ушедшие этапы доигрывают уход: снимок этапа замораживается, класс
+  // `.is-leaving` схлопывает высоту, через мгновение узел убирается. Без этого
+  // этап исчезал бы рывком посреди спокойной панели (тик приходит раз в 5 с).
+  const [leaving, setLeaving] = useState([])
+  const seenIdsRef = useRef(null)
+  const prevStagesRef = useRef([])
+  useEffect(() => {
+    const stages = feed.stages || []
+    const ids = new Set(stages.map((stage) => stage.id))
+    const prev = seenIdsRef.current
+    const prevStages = prevStagesRef.current
+    seenIdsRef.current = ids
+    prevStagesRef.current = stages
+    if (!prev) return undefined
+    const gone = [...prev].filter((id) => !ids.has(id))
+    if (!gone.length) return undefined
+    const snapshots = gone
+      .map((id) => prevStages.find((stage) => stage.id === id))
+      .filter(Boolean)
+      .map((stage) => ({ id: stage.id, stage }))
+    if (!snapshots.length) return undefined
+    setLeaving((prevLeaving) => [
+      ...prevLeaving.filter((item) => !snapshots.some((snap) => snap.id === item.id)),
+      ...snapshots,
+    ])
+    const timer = setTimeout(() => {
+      setLeaving((prevLeaving) => prevLeaving.filter((item) => !snapshots.some((snap) => snap.id === item.id)))
+    }, 380)
+    return () => clearTimeout(timer)
+  }, [feed])
   const head = h('div', { className: 'duty-group-h' }, h('span', null, feed.empty ? 'этапы' : `этапы · ${feed.count}`))
   if (feed.empty) {
     return h('div', { className: 'duty-deal-stages' }, head, h('div', { className: 'duty-muted' }, feed.note || 'этапов нет'))
   }
-  const blocks = feed.stages.map((stage) => {
+  const stageBlock = (stage, isLeaving) => {
     const view = compactStageView(stage)
-    const open = openStages[view.id] === undefined ? view.openByDefault : openStages[view.id]
+    const open = isLeaving ? true : openStages[view.id] === undefined ? view.openByDefault : openStages[view.id]
     const bars = stageColumnBars(stage, timeline)
     const children = [
       h(
@@ -4738,8 +4781,13 @@ function CompactStages({ feed, timeline }) {
         )
       })
     }
-    return h('div', { className: 'duty-stage-block', key: `st-${stage.id}` }, ...children)
-  })
+    return h('div', { className: `duty-stage-block${isLeaving ? ' is-leaving' : ''}`, key: `st-${stage.id}` }, ...children)
+  }
+  const blocks = feed.stages.map((stage) => stageBlock(stage, false))
+  for (const item of leaving) {
+    if ((feed.stages || []).some((stage) => stage.id === item.id)) continue
+    blocks.push(stageBlock(item.stage, true))
+  }
   return h(
     'div',
     { className: 'duty-deal-stages' },
@@ -4960,7 +5008,7 @@ function ScalePanel({ scale, callSel, onSelectCall, toolFilter, onToggleTool }) 
             ...scale.axis.ticks.map((tick) =>
               h(
                 'span',
-                { className: `duty-scale-tick align-${tick.align}`, style: { left: `${tick.pct}%` }, title: tick.clock },
+                { key: `tick-${tick.at ?? tick.clock}`, className: `duty-scale-tick align-${tick.align}`, style: { left: `${tick.pct}%` }, title: tick.clock },
                 tick.edge ? `${tick.edge} ${tick.clock}` : tick.clock,
               ),
             ),
@@ -4976,7 +5024,7 @@ function ScalePanel({ scale, callSel, onSelectCall, toolFilter, onToggleTool }) 
             'div',
             { className: 'duty-scale-grid', 'aria-hidden': 'true' },
             ...scale.axis.ticks.map((tick) =>
-              h('span', { key: `grid-${tick.pct}`, className: 'duty-scale-grid-line', style: { left: `${tick.pct}%` } }),
+              h('span', { key: `grid-${tick.at ?? tick.clock}`, className: 'duty-scale-grid-line', style: { left: `${tick.pct}%` } }),
             ),
           ),
           // Сжатые промежутки оси: штрихованная полоса и пилюля со временем —

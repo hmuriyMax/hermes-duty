@@ -1037,8 +1037,36 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 
 .tl-row-empty { font-size: 11.5px; color: var(--text-3); }
 
+/* --------------------------------------------- плавность дела (вход/уход/сдвиг)
+ * Страница патчится на месте (morph), поэтому движение можно отдать CSS:
+ * чипы и метки едут к новым процентам, дорожки и строки — вход и уход.
+ */
+.tl-call { transition: left .32s ease, width .32s ease, top .32s ease, background-color .32s ease; }
+.scale-tick, .scale-grid-line, .tl-idle-gap, .tl-silence, .tl-wait { transition: left .32s ease, width .32s ease; }
+.tl-lane, .tl-row, .stage-row, .att-row { transition: opacity .28s ease, height .28s ease; }
+.is-new { animation: duty-row-in .32s ease both; }
+@keyframes duty-row-in {
+  from { opacity: 0; transform: translateY(5px); }
+  to { opacity: 1; transform: none; }
+}
+/* Уход: высота заморожена инлайном, класс схлопывает её до нуля. */
+.is-gone {
+  height: 0 !important;
+  opacity: 0;
+  margin: 0 !important;
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  border-top-width: 0 !important;
+  border-bottom-width: 0 !important;
+  pointer-events: none;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .tl-row, .tl-mini, .tl-stack, .tl-call, .tl-tick { transition: none; }
+  .tl-call, .scale-tick, .scale-grid-line, .tl-idle-gap, .tl-silence, .tl-wait,
+  .tl-lane, .tl-row, .stage-row, .att-row { transition: none !important; }
+  .is-new { animation: none; }
+  .is-gone { transition: none; }
 }
 
 /* --------------------------------------------- подсказка вызова и инспектор */

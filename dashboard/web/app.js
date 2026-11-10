@@ -2308,30 +2308,29 @@ function scalePanel(scale) {
             h('span', { class: 'scale-grid-line', style: `left:${tick.pct}%`, 'data-key': `grid:${tick.pct}` }),
           ),
         ),
-        // Сжатые промежутки оси: пара пунктиров по краям и подпись посередине.
-        // Ось сжимает пустое время — это должно быть видно, а не угадываться по
-        // «дыре» между полосами (`idle.gaps` считает шейпер, здесь только DOM).
+        // Сжатые промежутки оси: штрихованная полоса, знаки разрыва по краям и
+        // пилюля со временем. Ось сжимает пустое время — это должно читаться как
+        // «здесь шкала рвётся», а не как дыра в данных (`idle.gaps` считает
+        // шейпер, здесь только DOM).
         scale.idle.gaps.length
           ? h(
-              'svg',
-              { class: 'tl-idle-layer' },
-              ...scale.idle.gaps.flatMap((gap) => [
-                h('line', { class: 'tl-idle', 'data-key': `idle:${gap.from}:l`, x1: `${gap.leftPct}%`, y1: '0', x2: `${gap.leftPct}%`, y2: '100%' }),
-                h('line', { class: 'tl-idle', 'data-key': `idle:${gap.from}:r`, x1: `${gap.rightPct}%`, y1: '0', x2: `${gap.rightPct}%`, y2: '100%' }),
+              'div',
+              { class: 'tl-idle-layer', 'aria-hidden': 'true' },
+              ...scale.idle.gaps.map((gap) =>
                 h(
-                  'text',
+                  'span',
                   {
-                    class: 'tl-idle-label',
-                    'data-key': `idle:${gap.from}:t`,
-                    x: `${gap.labelPct}%`,
-                    y: '50%',
-                    'text-anchor': gap.labelAnchor,
-                    'dominant-baseline': 'middle',
+                    class: `tl-idle-gap is-${gap.kind}`,
+                    'data-key': `idle:${gap.from}`,
+                    style: `left:${gap.leftPct}%;width:${Math.max(0.6, gap.rightPct - gap.leftPct)}%`,
+                    title: gap.title,
                   },
-                  h('title', null, gap.title),
-                  gap.text,
+                  h('span', { class: 'tl-idle-band' }),
+                  h('span', { class: 'tl-idle-cut is-left' }),
+                  h('span', { class: 'tl-idle-cut is-right' }),
+                  gap.labeled ? h('span', { class: 'tl-idle-pill' }, `≈ ${gap.short}`) : null,
                 ),
-              ]),
+              ),
             )
           : null,
         h(

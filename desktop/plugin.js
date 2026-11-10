@@ -239,6 +239,19 @@ function fmtAge(sec) {
   return `${Math.floor(s / 86400)} д`
 }
 
+/**
+ * Время простоя коротко, для пилюли на оси: минуты до часа, дальше часы с
+ * десятыми (4 ч 50 м → «4,8 ч»). Целые часы соврали бы про половину дня, а
+ * «ч м» на сорока пикселях полосы не читается.
+ */
+function idleShort(sec) {
+  const value = Number(sec)
+  if (!Number.isFinite(value) || value <= 0) return '<1с'
+  if (value < 3600) return fmtAge(value)
+  const hours = Math.round((value / 3600) * 10) / 10
+  return `${String(hours).replace('.', ',')} ч`
+}
+
 /** Заголовок одной строкой с многоточием: ровно не длиннее `max` символов. */
 function fmtTitle(title, max) {
   const limit = Number.isFinite(Number(max)) && Number(max) > 4 ? Math.floor(Number(max)) : 64
@@ -1772,11 +1785,16 @@ const IDLE_MIN_SEC = 600
 const IDLE_MIN_SHARE = 0.05
 // Сжатый промежуток занимает столько процентов оси, но все сжатия вместе — не
 // больше суммы: иначе ось врала бы про доли работы.
-const IDLE_GAP_PCT = 3
-const IDLE_TOTAL_PCT = 20
+// Пять процентов, а не три: сжатый промежуток — не только место, но и знак
+// «здесь шкала рвётся», а на трёх процентах от него оставалась одна щель.
+const IDLE_GAP_PCT = 5
+const IDLE_TOTAL_PCT = 24
 // Подпись простоя ближе этого к краю шкалы переезжает внутрь: у правой границы
 // текст по центру уезжал за поле графика.
 const IDLE_LABEL_EDGE_PCT = 12
+// Уже этого промежуток не подписывается пилюлей — остаётся штрихование и
+// подсказка: пилюля шире среза и наезжала бы на соседний простой.
+const IDLE_LABEL_MIN_PCT = 4
 
 // Подпись и тон маркера: журнал назвал событие — экран назвал его тем же словом.
 // `tick` — тонкая засечка старта/закрытия попытки (их на оси много); остальные
@@ -2902,16 +2920,31 @@ function shapeDealTime(detail, attemptsPayload) {
         : center >= 100 - IDLE_LABEL_EDGE_PCT
           ? { anchor: 'end', at: rightPct }
           : { anchor: 'middle', at: center }
+      // Где стоит простой: до первой работы, после последней или между этапами.
+      // Слово в подписи отвечает на «что это за дыра», а не только «сколько».
+      const leading = !bars.some((bar) => bar.start !== null && bar.start < gap.from)
+      const trailing = !bars.some((bar) => bar.endAt !== null && bar.endAt > gap.to)
+      const kind = leading ? 'before' : trailing ? 'after' : 'pause'
+      const kindText = kind === 'before' ? 'до старта' : kind === 'after' ? 'после финиша' : 'между этапами'
+      const width = rightPct - leftPct
       return {
         from: gap.from,
         to: gap.to,
         sec,
+        // Короткая длительность без слова «простой»: она стоит пилюлей на самом
+        // промежутке, где места на фразу нет. Час и больше — с десятыми, иначе
+        // округление до целых врало бы про половину рабочего дня.
+        short: idleShort(sec),
+        kind,
         text,
         leftPct,
         rightPct,
+        // Подпись пилюлей ставится только если промежуток её вмещает: на узком
+        // срезе пилюля наезжала на соседнюю.
+        labeled: width >= IDLE_LABEL_MIN_PCT,
         labelPct: Math.round(edge.at * 10) / 10,
         labelAnchor: edge.anchor,
-        title: `${fmtClock(gap.from)}–${fmtClock(gap.to)}: ${text} · время на шкале сжато`,
+        title: `${fmtClock(gap.from)}–${fmtClock(gap.to)}: ${text} ${kindText} · время на шкале сжато`,
       }
     }),
     totalSec: idleTotalSec,
@@ -3732,9 +3765,18 @@ const CSS = `
 .duty-scale-grid-line{position:absolute;top:0;bottom:0;border-left:1px dashed color-mix(in srgb, var(--ui-text-tertiary) 34%, transparent)}
 /* Сжатый промежуток оси: два пунктира по краям и подпись посередине — иначе
  * смена масштаба читается как ошибка данных. */
-.duty-tl-idle-layer{position:absolute;top:-2px;left:calc(var(--duty-tl-gutter, 186px) + var(--duty-tl-gap, 8px));width:calc(100% - var(--duty-tl-gutter, 186px) - var(--duty-tl-gap, 8px));height:calc(100% + 2px);z-index:0;overflow:visible;fill:none;stroke:none}
-.duty-tl-idle{stroke:var(--ui-border-primary, rgba(127,127,127,.3));stroke-dasharray:2 3;stroke-width:1}
-.duty-tl-idle-label{fill:var(--ui-text-tertiary);font-size:9px;letter-spacing:.02em;pointer-events:none}
+/* Сжатый простой: штрихованная полоса и знаки разрыва по краям — «здесь шкала
+   рвётся». Пунктир читался как граница, а не как вырезанное время. */
+.duty-tl-idle-layer{position:absolute;top:-2px;left:calc(var(--duty-tl-gutter, 186px) + var(--duty-tl-gap, 8px));width:calc(100% - var(--duty-tl-gutter, 186px) - var(--duty-tl-gap, 8px));height:calc(100% + 2px);z-index:0;pointer-events:none}
+.duty-tl-idle-gap{position:absolute;top:0;bottom:0}
+.duty-tl-idle-band{position:absolute;inset:0;background:repeating-linear-gradient(135deg,color-mix(in srgb,var(--ui-text-tertiary) 38%,transparent) 0 2px,transparent 2px 7px);-webkit-mask-image:linear-gradient(to right,transparent,#000 6px,#000 calc(100% - 6px),transparent);mask-image:linear-gradient(to right,transparent,#000 6px,#000 calc(100% - 6px),transparent);opacity:.8}
+.duty-tl-idle-cut{position:absolute;top:0;bottom:0;width:8px;z-index:1}
+.duty-tl-idle-cut:before,.duty-tl-idle-cut:after{content:'';position:absolute;top:0;bottom:0;width:1.5px;background:color-mix(in srgb,var(--ui-text-primary) 55%,transparent);transform:skewX(-14deg)}
+.duty-tl-idle-cut:before{left:1px}
+.duty-tl-idle-cut:after{left:5px}
+.duty-tl-idle-cut.is-left{left:-2px}
+.duty-tl-idle-cut.is-right{right:-2px}
+.duty-tl-idle-pill{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);white-space:nowrap;font-size:9px;line-height:1.3;letter-spacing:.02em;font-variant-numeric:tabular-nums;color:var(--ui-text-secondary);background:var(--ui-surface-background);border:1px solid var(--ui-stroke-secondary);border-radius:5px;padding:1px 4px}
 .duty-tl-lanes{position:relative;z-index:1;display:flex;flex-direction:column;gap:10px}
 .duty-tl-lane{display:flex;flex-direction:column;gap:4px}
 .duty-tl-lane + .duty-tl-lane{border-top:1px solid var(--ui-border-primary, rgba(127,127,127,.2));padding-top:10px}
@@ -4724,43 +4766,28 @@ function ScalePanel({ scale, callSel, onSelectCall, toolFilter, onToggleTool }) 
               h('span', { key: `grid-${tick.pct}`, className: 'duty-scale-grid-line', style: { left: `${tick.pct}%` } }),
             ),
           ),
-          // Сжатые промежутки оси: пара пунктиров по краям и подпись посередине
-          // (`idle.gaps` считает шейпер — поверхность ничего не досчитывает).
+          // Сжатые промежутки оси: штрихованная полоса, знаки разрыва по краям и
+          // пилюля со временем — «здесь шкала рвётся», а не дыра в данных
+          // (`idle.gaps` считает шейпер, поверхность ничего не досчитывает).
           scale.idle.gaps.length
             ? h(
-                'svg',
-                { key: 'idle-layer', className: 'duty-tl-idle-layer' },
-                ...scale.idle.gaps.flatMap((gap) => [
-                  h('line', {
-                    key: `idle-l-${gap.from}`,
-                    className: 'duty-tl-idle',
-                    x1: `${gap.leftPct}%`,
-                    y1: '0',
-                    x2: `${gap.leftPct}%`,
-                    y2: '100%',
-                  }),
-                  h('line', {
-                    key: `idle-r-${gap.from}`,
-                    className: 'duty-tl-idle',
-                    x1: `${gap.rightPct}%`,
-                    y1: '0',
-                    x2: `${gap.rightPct}%`,
-                    y2: '100%',
-                  }),
+                'div',
+                { key: 'idle-layer', className: 'duty-tl-idle-layer', 'aria-hidden': 'true' },
+                ...scale.idle.gaps.map((gap) =>
                   h(
-                    'text',
+                    'span',
                     {
-                      key: `idle-t-${gap.from}`,
-                      className: 'duty-tl-idle-label',
-                      x: `${gap.labelPct}%`,
-                      y: '50%',
-                      textAnchor: gap.labelAnchor,
-                      dominantBaseline: 'middle',
+                      key: `idle-${gap.from}`,
+                      className: `duty-tl-idle-gap is-${gap.kind}`,
+                      style: { left: `${gap.leftPct}%`, width: `${Math.max(0.6, gap.rightPct - gap.leftPct)}%` },
+                      title: gap.title,
                     },
-                    h('title', null, gap.title),
-                    gap.text,
+                    h('span', { className: 'duty-tl-idle-band' }),
+                    h('span', { className: 'duty-tl-idle-cut is-left' }),
+                    h('span', { className: 'duty-tl-idle-cut is-right' }),
+                    gap.labeled ? h('span', { className: 'duty-tl-idle-pill' }, `≈ ${gap.short}`) : null,
                   ),
-                ]),
+                ),
               )
             : null,
           h(

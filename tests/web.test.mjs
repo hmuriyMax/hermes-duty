@@ -562,22 +562,26 @@ test('веб: сжатый простой подписан на оси, без �
     }
   }
 
-  // Простой 45 минут: пара пунктиров по краям и подпись с его временем.
+  // Простой 45 минут: штрихованная полоса, знаки разрыва и пилюля со временем.
   const squeezed = await renderDealPanel(detail(45 * 60), attempts(45 * 60))
-  const lines = squeezed.querySelectorAll('line.tl-idle')
-  assert.equal(lines.length, 2, `пунктиров ${lines.length}, а не пара на промежуток`)
-  const label = squeezed.querySelector('text.tl-idle-label')
-  assert.ok(label, 'подписи сжатого промежутка нет')
-  assert.equal(label.getAttribute('text-anchor'), 'middle', 'подпись не по центру промежутка')
-  assert.ok(label.textContent.includes('простой 45 мин'), `подпись простоя: ${label.textContent}`)
-  const tip = label.querySelector('title')
-  assert.ok(tip && tip.textContent.includes('сжато'), 'в подсказке нет пояснения, что время сжато')
+  const gapEl = squeezed.querySelectorAll('.tl-idle-gap')
+  assert.equal(gapEl.length, 1, `промежутков ${gapEl.length}, а не один`)
+  assert.equal(squeezed.querySelectorAll('.tl-idle-cut').length, 2, 'знаков разрыва не пара')
+  assert.ok(squeezed.querySelector('.tl-idle-band'), 'нет штрихования промежутка')
+  const pill = squeezed.querySelector('.tl-idle-pill')
+  assert.ok(pill, 'на полосе нет пилюли со временем')
+  assert.equal(pill.textContent, '≈ 45 мин', `пилюля: ${pill.textContent}`)
+  const tip = gapEl[0].getAttribute('title') || ''
+  assert.ok(tip.includes('сжато'), 'в подсказке нет пояснения, что время сжато')
+  assert.ok(tip.includes('простой 45 мин'), `подсказка простоя: ${tip}`)
+  assert.ok(gapEl[0].className.includes('is-pause'), 'простой между этапами не назван')
 
-  // Пунктир и цвет подписи — из styles.css: класс есть, правило есть, вместе
-  // они дают не сплошную линию, а «здесь время сжато».
+  // Штрихование, знак разрыва и пилюля — из styles.css: класс есть, правило
+  // есть, вместе они говорят «здесь время сжато», а не рисуют границу полосы.
   const css = read('dashboard/web/styles.css')
-  assert.match(css, /\.tl-idle \{[^}]*stroke-dasharray: 2 3/, 'нет пунктира у .tl-idle')
-  assert.match(css, /\.tl-idle-label \{[^}]*fill: var\(--text-3\)/, 'нет цвета у подписи сжатия')
+  assert.match(css, /\.tl-idle-band \{[^}]*repeating-linear-gradient/, 'нет штрихования у промежутка')
+  assert.match(css, /\.tl-idle-cut::before,/, 'знак разрыва не нарисован')
+  assert.match(css, /\.tl-idle-pill \{[^}]*border-radius: 5px/s, 'нет пилюли со временем')
 
   // Пауза в три минуты не сжимается — ни одного элемента сжатия на странице.
   const plain = await renderDealPanel(detail(3 * 60), attempts(3 * 60))

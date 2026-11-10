@@ -190,6 +190,19 @@ function fmtAge(sec) {
   return `${Math.floor(s / 86400)} д`
 }
 
+/**
+ * Время простоя коротко, для пилюли на оси: минуты до часа, дальше часы с
+ * десятыми (4 ч 50 м → «4,8 ч»). Целые часы соврали бы про половину дня, а
+ * «ч м» на сорока пикселях полосы не читается.
+ */
+function idleShort(sec) {
+  const value = Number(sec)
+  if (!Number.isFinite(value) || value <= 0) return '<1с'
+  if (value < 3600) return fmtAge(value)
+  const hours = Math.round((value / 3600) * 10) / 10
+  return `${String(hours).replace('.', ',')} ч`
+}
+
 /** Заголовок одной строкой с многоточием: ровно не длиннее `max` символов. */
 function fmtTitle(title, max) {
   const limit = Number.isFinite(Number(max)) && Number(max) > 4 ? Math.floor(Number(max)) : 64
@@ -1723,11 +1736,16 @@ const IDLE_MIN_SEC = 600
 const IDLE_MIN_SHARE = 0.05
 // Сжатый промежуток занимает столько процентов оси, но все сжатия вместе — не
 // больше суммы: иначе ось врала бы про доли работы.
-const IDLE_GAP_PCT = 3
-const IDLE_TOTAL_PCT = 20
+// Пять процентов, а не три: сжатый промежуток — не только место, но и знак
+// «здесь шкала рвётся», а на трёх процентах от него оставалась одна щель.
+const IDLE_GAP_PCT = 5
+const IDLE_TOTAL_PCT = 24
 // Подпись простоя ближе этого к краю шкалы переезжает внутрь: у правой границы
 // текст по центру уезжал за поле графика.
 const IDLE_LABEL_EDGE_PCT = 12
+// Уже этого промежуток не подписывается пилюлей — остаётся штрихование и
+// подсказка: пилюля шире среза и наезжала бы на соседний простой.
+const IDLE_LABEL_MIN_PCT = 4
 
 // Подпись и тон маркера: журнал назвал событие — экран назвал его тем же словом.
 // `tick` — тонкая засечка старта/закрытия попытки (их на оси много); остальные
@@ -2853,16 +2871,31 @@ function shapeDealTime(detail, attemptsPayload) {
         : center >= 100 - IDLE_LABEL_EDGE_PCT
           ? { anchor: 'end', at: rightPct }
           : { anchor: 'middle', at: center }
+      // Где стоит простой: до первой работы, после последней или между этапами.
+      // Слово в подписи отвечает на «что это за дыра», а не только «сколько».
+      const leading = !bars.some((bar) => bar.start !== null && bar.start < gap.from)
+      const trailing = !bars.some((bar) => bar.endAt !== null && bar.endAt > gap.to)
+      const kind = leading ? 'before' : trailing ? 'after' : 'pause'
+      const kindText = kind === 'before' ? 'до старта' : kind === 'after' ? 'после финиша' : 'между этапами'
+      const width = rightPct - leftPct
       return {
         from: gap.from,
         to: gap.to,
         sec,
+        // Короткая длительность без слова «простой»: она стоит пилюлей на самом
+        // промежутке, где места на фразу нет. Час и больше — с десятыми, иначе
+        // округление до целых врало бы про половину рабочего дня.
+        short: idleShort(sec),
+        kind,
         text,
         leftPct,
         rightPct,
+        // Подпись пилюлей ставится только если промежуток её вмещает: на узком
+        // срезе пилюля наезжала на соседнюю.
+        labeled: width >= IDLE_LABEL_MIN_PCT,
         labelPct: Math.round(edge.at * 10) / 10,
         labelAnchor: edge.anchor,
-        title: `${fmtClock(gap.from)}–${fmtClock(gap.to)}: ${text} · время на шкале сжато`,
+        title: `${fmtClock(gap.from)}–${fmtClock(gap.to)}: ${text} ${kindText} · время на шкале сжато`,
       }
     }),
     totalSec: idleTotalSec,

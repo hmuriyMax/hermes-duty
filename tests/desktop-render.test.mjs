@@ -555,16 +555,20 @@ test('десктоп: сжатый простой подписан на оси, 
   const squeezed = dealWithIdle(45 * 60)
   assert.equal(squeezed.idle.gaps.length, 1, 'фикстура без сжатия — проверка потеряла предмет')
   const panel = renderToStaticMarkup(React.createElement(mod.ScalePanel, { scale: squeezed }))
-  assert.match(panel, /<svg[^>]*class="duty-tl-idle-layer"/, 'сжатие рисуется не отдельным слоем оси')
-  assert.equal((panel.match(/class="duty-tl-idle"/g) || []).length, 2, 'пунктиров не пара на промежуток')
-  assert.match(panel, /class="duty-tl-idle-label"[^>]*text-anchor="middle"/, 'подпись не по центру промежутка')
-  assert.ok(panel.includes('простой 45 мин'), `подписи простоя нет на оси: ${squeezed.idle.gaps[0].text}`)
-  assert.match(panel, /<title>[^<]*сжато/, 'в подписи нет пояснения, что время сжато')
-  // CSS плагина рисует пунктир, а не сплошную линию: иначе пара читается как
-  // границы полосы, а не как «здесь время сжато».
+  // Сжатие — отдельный слой оси: штрихованная полоса, пара знаков разрыва и
+  // пилюля со временем. Пунктир читался как граница полосы, а не как вырезанное
+  // время (09.11, Макс: «чтобы было понятно, что таймлайн тут схлопывается»).
+  assert.match(panel, /<div[^>]*class="duty-tl-idle-layer"/, 'сжатие рисуется не отдельным слоем оси')
+  assert.equal((panel.match(/class="duty-tl-idle-gap/g) || []).length, 1, 'промежуток не нарисован')
+  assert.equal((panel.match(/class="duty-tl-idle-cut is-/g) || []).length, 2, 'знаков разрыва не пара на промежуток')
+  assert.match(panel, /class="duty-tl-idle-band"/, 'нет штрихования на промежутке')
+  assert.match(panel, /class="duty-tl-idle-pill"[^>]*>≈ 45 мин</, 'на полосе нет пилюли со временем')
+  assert.ok(panel.includes('простой 45 мин'), `подписи простоя нет в подсказке: ${squeezed.idle.gaps[0].text}`)
+  assert.match(panel, /title="[^"]*сжато/, 'в подсказке нет пояснения, что время сжато')
+  assert.match(panel, /class="duty-tl-idle-gap is-pause"/, 'простой между этапами не назван')
   const css = pluginSource().replace(/\/\*[\s\S]*?\*\//g, '')
-  assert.match(css, /\.duty-tl-idle\{[^}]*stroke-dasharray:2 3/, 'нет пунктира у .duty-tl-idle')
-  assert.match(css, /\.duty-tl-idle-label\{[^}]*fill:var\(--ui-text-tertiary\)/, 'нет цвета у подписи сжатия')
+  assert.match(css, /\.duty-tl-idle-band\{[^}]*repeating-linear-gradient/, 'нет штрихования у промежутка')
+  assert.match(css, /\.duty-tl-idle-cut:before,?\.duty-tl-idle-cut:after\{[^}]*skewX/, 'знак разрыва не наклонён')
   // Слой сжатия и сетка оси начинаются там же, где дорожка строки: после
   // колонки подписей (gutter + gap). При left:0 пунктир и подпись встают на
   // ~194 px левее промежутка и мерят проценты по ширине плагина, а не дорожки —

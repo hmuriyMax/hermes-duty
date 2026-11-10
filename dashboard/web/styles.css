@@ -840,9 +840,55 @@ pre.body {
 .scale-grid-line { position: absolute; top: 0; bottom: 0; border-left: 1px dashed color-mix(in srgb, var(--text-3) 34%, transparent); }
 /* Сжатый промежуток оси: два пунктира по краям и подпись посередине — иначе
  * смена масштаба читается как ошибка данных. */
-svg.tl-idle-layer { position: absolute; top: -2px; left: calc(var(--tl-gutter) + var(--tl-gap)); width: calc(100% - var(--tl-gutter) - var(--tl-gap)); height: calc(100% + 2px); z-index: 0; overflow: visible; fill: none; stroke: none }
-.tl-idle { stroke: var(--border); stroke-dasharray: 2 3; stroke-width: 1 }
-.tl-idle-label { fill: var(--text-3); font-size: 9px; letter-spacing: .02em; pointer-events: none }
+/* Сжатый простой: полоса со штрихованием и знаками разрыва по краям. Пунктир
+   читался как «граница», а не как «время вырезано» (09.11, Макс: «чтобы было
+   понятно, что таймлайн тут схлопывается»). */
+.tl-idle-layer { position: absolute; top: -2px; left: calc(var(--tl-gutter) + var(--tl-gap)); width: calc(100% - var(--tl-gutter) - var(--tl-gap)); height: calc(100% + 2px); z-index: 0; pointer-events: none }
+.tl-idle-gap { position: absolute; top: 0; bottom: 0; }
+/* Штрихование: диагональ в тон сетке, гаснет к краям — полоса читается как
+   «здесь время сжато», а не как ещё одна заливка данных. */
+.tl-idle-band {
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--text-3) 38%, transparent) 0 2px, transparent 2px 7px);
+  -webkit-mask-image: linear-gradient(to right, transparent, #000 6px, #000 calc(100% - 6px), transparent);
+  mask-image: linear-gradient(to right, transparent, #000 6px, #000 calc(100% - 6px), transparent);
+  opacity: .8;
+}
+/* Знак разрыва — две наклонные линии вместо пунктира: так рвут ось на графиках.
+   Стоит вплотную к краю промежутка и заметно контрастнее штриховки: это не
+   декорация, а пометка «здесь из шкалы вырезано время». */
+.tl-idle-cut { position: absolute; top: 0; bottom: 0; width: 8px; z-index: 1 }
+.tl-idle-cut::before,
+.tl-idle-cut::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1.5px;
+  background: color-mix(in srgb, var(--text) 55%, transparent);
+  transform: skewX(-14deg);
+}
+.tl-idle-cut::before { left: 1px; }
+.tl-idle-cut::after { left: 5px; }
+.tl-idle-cut.is-left { left: -2px; }
+.tl-idle-cut.is-right { right: -2px; }
+.tl-idle-pill {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  white-space: nowrap;
+  font-size: 9px;
+  line-height: 1.3;
+  letter-spacing: .02em;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 1px 4px;
+}
 .tl-lanes { position: relative; z-index: 1; display: flex; flex-direction: column; gap: 10px; }
 .tl-lane { display: flex; flex-direction: column; gap: 4px; }
 .tl-lane + .tl-lane { border-top: 1px solid var(--border); padding-top: 10px; }

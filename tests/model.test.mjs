@@ -1002,7 +1002,7 @@ function idleScale(bars, options) {
   )
 }
 
-test('сжатие простоя: 45 минут в двухчасовом деле занимают 3 %, работа — остальное', () => {
+test('сжатие простоя: 45 минут в двухчасовом деле занимают 5 %, работа — остальное', () => {
   // Две попытки по ~17 минут, между ними 45 минут пустоты: раньше середина
   // выглядела как «дело стояло», теперь пустота сжата, а работа читается.
   const scale = idleScale([[1, 1001], [3701, 7200]])
@@ -1011,12 +1011,17 @@ test('сжатие простоя: 45 минут в двухчасовом де�
   assert.equal(gap.sec, 2700)
   assert.equal(gap.from, 1001)
   assert.equal(gap.to, 3701)
-  assert.ok(Math.abs(gap.rightPct - gap.leftPct - 3) < 0.11, `сжатие шириной ${gap.rightPct - gap.leftPct} %`)
+  assert.ok(Math.abs(gap.rightPct - gap.leftPct - 5) < 0.11, `сжатие шириной ${gap.rightPct - gap.leftPct} %`)
   assert.equal(scale.idle.totalSec, 2700)
-  assert.equal(scale.idle.compressedPct, 3)
+  assert.equal(scale.idle.compressedPct, 5)
   assert.match(gap.text, /простой/)
   // Подпись говорит, что время сжато: молча сжатая ось читается как ошибка.
   assert.match(gap.title, /сжато/)
+  // Пилюля на полосе — короткое время и то, где простой стоит.
+  assert.equal(gap.short, '45 мин')
+  assert.equal(gap.kind, 'pause')
+  assert.equal(gap.labeled, true, 'пять процентов не вместили подпись')
+  assert.match(gap.title, /между этапами/)
   // Занятое время осталось на своих местах: левая полоса у нуля, правая — у ста,
   // и обе выросли, потому что пустота больше не занимает пол-оси.
   assert.equal(scale.bars[0].leftPct, 0)
@@ -1095,13 +1100,13 @@ test('сжатие простоя: пауза 13 минут на трёхчас�
   assert.equal(scale.idle.gaps.length, 1, 'пауза 13 минут так и не сжалась')
   const gap = scale.idle.gaps[0]
   assert.equal(gap.sec, 773)
-  assert.ok(Math.abs(gap.rightPct - gap.leftPct - 3) < 0.11, `сжатие шириной ${gap.rightPct - gap.leftPct} %`)
+  assert.ok(Math.abs(gap.rightPct - gap.leftPct - 5) < 0.11, `сжатие шириной ${gap.rightPct - gap.leftPct} %`)
   assert.match(gap.text, /простой 12 мин|простой 13 мин/)
 })
 
-test('сжатие простоя: много простоев — по 3 % и не больше 20 % на все', () => {
+test('сжатие простоя: много простоев — по 5 % и не больше 24 % на все', () => {
   // Восемь коротких полос через 20 минут простоя: семь промежутков, и сумма
-  // сжатий упирается в потолок (3 % на каждый дало бы 21 %).
+  // сжатий упирается в потолок (5 % на каждый дало бы 35 %).
   const bars = []
   let at = 1
   for (let i = 0; i < 8; i += 1) {
@@ -1111,24 +1116,24 @@ test('сжатие простоя: много простоев — по 3 % и �
   const scale = idleScale(bars)
   assert.equal(scale.idle.gaps.length, 7, 'не все промежутки сжаты')
   const widths = scale.idle.gaps.map((gap) => gap.rightPct - gap.leftPct)
-  for (const width of widths) assert.ok(width <= 3.1, `сжатие шириной ${width} % больше трёх`)
+  for (const width of widths) assert.ok(width <= 5.1, `сжатие шириной ${width} % больше пяти`)
   const total = widths.reduce((sum, width) => sum + width, 0)
-  assert.ok(total <= 20, `все сжатия вместе ${total} % — потолок в 20 % не держится`)
-  assert.ok(scale.idle.compressedPct <= 20, `шейпер отдал ${scale.idle.compressedPct} % сжатия`)
+  assert.ok(total <= 24, `все сжатия вместе ${total} % — потолок в 24 % не держится`)
+  assert.ok(scale.idle.compressedPct <= 24, `шейпер отдал ${scale.idle.compressedPct} % сжатия`)
   assert.equal(scale.idle.totalSec, 7 * 1200)
 })
 
 test('сжатие простоя: простой вокруг всей оси не сжимается больше правила', () => {
   // Одна попытка в середине живого дела: пустота и слева, и справа. Каждый
-  // промежуток получает свои 3 %, а не «всё, что осталось».
+  // промежуток получает свои 5 %, а не «всё, что осталось».
   const scale = idleScale([[3600, 3700]], { now: 7200, live: true })
   assert.equal(scale.idle.gaps.length, 2)
   for (const gap of scale.idle.gaps) {
-    assert.ok(gap.rightPct - gap.leftPct <= 3.1, `сжатие шириной ${gap.rightPct - gap.leftPct} %`)
+    assert.ok(gap.rightPct - gap.leftPct <= 5.1, `сжатие шириной ${gap.rightPct - gap.leftPct} %`)
   }
-  assert.ok(scale.idle.compressedPct <= 20)
+  assert.ok(scale.idle.compressedPct <= 24)
   // Единственная полоса не растянута на всю ось: оси осталось место на края.
-  assert.ok(scale.bars[0].leftPct >= 3 && scale.bars[0].endPct <= 97, `полоса ${scale.bars[0].leftPct}–${scale.bars[0].endPct}`)
+  assert.ok(scale.bars[0].leftPct >= 5 && scale.bars[0].endPct <= 95, `полоса ${scale.bars[0].leftPct}–${scale.bars[0].endPct}`)
 })
 
 test('сжатие простоя: координаты монотонны и не выходят за ось', () => {

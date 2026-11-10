@@ -36,7 +36,7 @@
 | `changes_requested` | `stage`, `target`, `reason` | приговор `changes`: возврат на `target` |
 | `completed` | без `stage` | дело закрыто целиком |
 | `question_asked` | без `stage` (так пишет `ask()`), адрес — в `routing.stage`/`routing.attempt` | вопрос этого этапа → `wait_human`; адреса нет — последней попытки |
-| `question_answered` | без `stage` | ответ на этот вопрос → новая попытка того же этапа |
+| `question_answered` | без `stage`; у вопроса роли ещё `by` — номера пула нет | ответ на этот вопрос → новая попытка того же этапа |
 | `blocked` | `block_kind='parked'`, `kind`, `stage`, `attempts`, `limit`, `reason` | дело запарковано: `wait(parked)`, подъёма нет |
 | `unblocked` | `previous_kind='parked'` | человек решил продолжать: счётчики класса сброшены, этап снова `pending` |
 
@@ -204,6 +204,17 @@ UNCLASSIFIED = failures.UNCLASSIFIED
 # (`dashboard/runner.report_verdict`), а не своей копией.
 NEXT = journal.VERDICT_NEXT
 
+# Чем закрывается передача вопроса роли, когда ответа нет: `redirected` — роль
+# переадресовала вопрос человеку (`authority: true`), `failed` — попытка ответа не
+# удалась (в том числе потому, что движок ушёл между вопросом и ответом:
+# `runner.recover_role_questions`). Вопрос при этом **жив** — он ушёл дальше, — и
+# пустой `answer_len` у такой пары сроком не считается (`_expired`): иначе
+# переадресованный вопрос читался бы как истёкший, и дело парковалось бы мимо
+# человека, который этот вопрос и должен получить.
+ROLE_ANSWER_REDIRECTED = "redirected"
+ROLE_ANSWER_FAILED = "failed"
+ROLE_ANSWER_KINDS = (ROLE_ANSWER_REDIRECTED, ROLE_ANSWER_FAILED)
+
 # Виды событий, которые срез этапа не меняют. Набор — журнальный
 # `NON_STATE_KINDS`, минус `question_answered`: для дела ответ закрывающий факт,
 # а для этапа ответ — вход (правило 5). Терминальность (правило 7) считается
@@ -252,6 +263,12 @@ PLAN_STAGE = spec_module.PLAN_STAGE
 
 APPROVE = "approve"
 CHANGES = "changes"
+
+# Сколько этапов движок ведёт одновременно (`_batch`, `runner.step`). Предел —
+# здесь, рядом с остальными лимитами слоя, и он же назван в `docs/SPEC.md` и
+# `docs/ENGINE-1.0.md`: больше двух попыток пачки — это два процесса модели, два
+# дерева и два лизинга на один шаг, и остальные этапы ждут своей пачки.
+MAX_PARALLEL = 2
 
 
 # ------------------------------------------------------------------- структуры
@@ -591,9 +608,16 @@ def _expired(payload: dict[str, Any]) -> bool:
     Это факт журнала (`docs/JOURNAL.md`): TTL снимает вопрос так же, как ответ, но
     входа у этапа не появляется — перезапускать попытку по пустому ответу значило
     бы выдать тишину за решение.
+
+    Пустой `answer_len` — срок только у ответа человека. Передача роли без ответа
+    (`redirected`/`failed`) закрывает **передачу**, а не вопрос: он ушёл дальше, и
+    читать его как истёкший значило бы парковать дело мимо живого вопроса.
     """
-    if str(payload.get("answered_via") or "").strip().lower() == "expired":
+    via = str(payload.get("answered_via") or "").strip().lower()
+    if via == "expired":
         return True
+    if via in ROLE_ANSWER_KINDS:
+        return False
     return _int(payload.get("answer_len")) == 0
 
 
@@ -793,25 +817,43 @@ def _deal_question(board: _Board, spec: Any, payload: dict[str, Any]) -> None:
     движка (`POST /ask`) и для фактов до W5. Без адресации этап, у которого
     попытка закончилась вопросом, не `done`, а `wait_human`: работа не сделана,
     её ждёт человек, и после ответа нужна **новая** попытка (правило 5).
+
+    Вопрос без `question_id` — вопрос **роли** (`dashboard/runner.ask_role`):
+    строки пула у него нет, поэтому пара «вопрос → ответ» держится адресом
+    (`routing.stage`/`routing.attempt`), а не номером. Ожидание у него то же
+    (`wait_human`): пока роль отвечает, работа не сделана, и это сказано
+    адресатом, а не пустым номером.
     """
     question_id = _question_id(payload)
     stage_id, attempt = _addressed(board, payload)
     board.question = (stage_id, question_id or "")
     node = board.stages.get(stage_id)
-    if node is None or question_id is None:
+    if node is None:
         return
-    node.question_id = question_id
+    if question_id is not None:
+        node.question_id = question_id
     node.attempt = max(node.attempt, attempt)
     if node.state in (FAILED, PARKED) or board.parked is not None:
         # Вопрос запаркованного дела — факт парковки, а не повод поднять этап:
         # исчерпанный этап остаётся `failed`, а дело — ждёт решения человека.
         return
     node.state = WAIT_HUMAN
+    if question_id is None:
+        node.reason = f"вопрос ушёл {_address_of(payload) or 'адресату'}: ответа нет"
+        return
     node.reason = (
         f"гейт: вопрос #{question_id} человеку — ждёт ответа"
         if _is_gate(spec, stage_id)
         else f"попытка {node.attempt} закончилась вопросом #{question_id}"
     )
+
+
+def _address_of(payload: dict[str, Any]) -> str:
+    """Адрес вопроса из `payload.routing` — для причины ожидания; пусто — не назван."""
+    routing_ = payload.get("routing")
+    if not isinstance(routing_, dict):
+        return ""
+    return str(routing_.get("target") or "")
 
 
 def _addressed(board: _Board, payload: dict[str, Any]) -> tuple[str, int]:
@@ -832,36 +874,46 @@ def _addressed(board: _Board, payload: dict[str, Any]) -> tuple[str, int]:
 
 
 def _deal_answer(board: _Board, spec: Any, payload: dict[str, Any]) -> None:
-    """Ответ или срок по вопросу дела: новая попытка того же этапа либо `park`."""
+    """Ответ или срок по вопросу дела: новая попытка того же этапа либо `park`.
+
+    Пара «вопрос → ответ» сверяется номером пула, а у вопроса роли номера нет —
+    тогда её держит адрес (вопрос без `question_id` отвечается ответом без
+    `question_id`). Смешивать нельзя: у вопроса с номером ответ без номера —
+    ответ **не** на него, и наоборот.
+    """
     stage_id, asked = board.question
     question_id = _question_id(payload)
-    if not asked or (question_id and question_id != asked):
+    if asked != (question_id or ""):
         return  # ответ на чужой/уже снятый вопрос: снимать нечего
     board.question = ("", "")
     node = board.stages.get(stage_id)
     if node is None or node.state in TERMINAL_STATES:
         return
+    number = f"#{asked}" if asked else ""
     if _expired(payload):
         node.state = PARKED
         node.reason = (
             _gate_park_reason(spec, stage_id, asked)
             if _is_gate(spec, stage_id)
-            else f"вопрос #{asked} закрыт по сроку без ответа"
+            else f"вопрос {number or '—'} закрыт по сроку без ответа"
         )
         return
     node.question_id = None
     if board.parked is not None:
         # Парковка: ответ на вопрос — ещё не решение продолжать. Подъём только
         # явным `unblocked` (`continue`), иначе дело крутилось бы само.
-        node.reason = f"ответ #{asked}: дело запарковано — ждёт решения человека"
+        node.reason = f"ответ {number or '—'}: дело запарковано — ждёт решения человека"
         return
     node.state = PENDING
     # У гейта следующая передача не «новая попытка процесса», а суд над ответом:
     # ответ человека — вход этапа, и это сказано словами, а не номером попытки.
+    # У ответа роли номер пула пуст, и её называет автор (`by`): «ответ роли lead».
+    by = str(payload.get("by") or "").strip()
+    who = f"роли {by}" if by else (number or "—")
     node.reason = (
-        f"гейт: ответ #{asked} получен — этап судит его по allow"
-        if _is_gate(spec, stage_id)
-        else f"ответ #{asked}: новая попытка {node.attempt + 1}"
+        f"гейт: ответ {who} получен — этап судит его по allow"
+        if _is_gate(spec, stage_id) and asked
+        else f"ответ {who}: новая попытка {node.attempt + 1}"
     )
 
 
@@ -978,6 +1030,26 @@ def graph_spec(spec: Any, events: Iterable[Any]) -> Any:
     return _Graph(spec, stages)
 
 
+def started_stages(events: Iterable[Any]) -> frozenset[str]:
+    """id этапов, у которых была попытка: их план не переставляет.
+
+    Перестановка — про порядок будущей работы (`docs/ENGINE-1.0.md`, раздел 4):
+    этап, который уже начинали, переставляет не план, а приговор ревью
+    (`verdict.changes`) — иначе лид возвращал бы сделанное назад в обход ревью.
+    Факт попытки — `attempt_started` (и `attempt_ended` на случай журнала, где
+    первую половину пары не писали): обе строки говорят «этап трогали».
+    """
+    found: set[str] = set()
+    for event in _ordered(events):
+        if str(event.get("kind") or "") not in ("attempt_started", "attempt_ended"):
+            continue
+        payload = _payload(event)
+        stage_id = payload.get("stage")
+        if isinstance(stage_id, str) and stage_id:
+            found.add(stage_id)
+    return frozenset(found)
+
+
 def graph(spec: Any, events: Iterable[Any]) -> tuple[Any, ...]:
     """Граф дела: seed спеки плюс этапы последней принятой ревизии плана.
 
@@ -991,6 +1063,12 @@ def graph(spec: Any, events: Iterable[Any]) -> tuple[Any, ...]:
     разошлись бы. Разбор — тем же `spec.parse_plan` по хартии: граф, который
     валидатор отверг бы, не становится графом и при чтении (мусорный журнал не
     роняет дело, правило 8 — граф остаётся seed-ом).
+
+    Ревизия несёт два вида записи: **добавление** (новый этап) и **перестановку**
+    (этап, который уже есть в графе, с новыми `needs`/`parallel_with`). Второе
+    проверяется без `started_ids`: «этап уже начат» — отказ момента предложения
+    (`runner.report_plan` знает журнал), а принятая перестановка остаётся графом и
+    после того, как её этап начали, — иначе граф сжался бы задним числом.
     """
     seed = tuple(getattr(spec, "stages", ()) or ())
     proposals: dict[int, Any] = {}
@@ -1020,6 +1098,7 @@ def graph(spec: Any, events: Iterable[Any]) -> tuple[Any, ...]:
         payload.get("stages"),
         charter=charter,
         base_ids=[stage.id for stage in seed],
+        base_needs={stage.id: stage.needs for stage in seed},
     )
     if issues:
         return seed
@@ -1027,25 +1106,44 @@ def graph(spec: Any, events: Iterable[Any]) -> tuple[Any, ...]:
     return _relinked(seed, tuple(stages), plan_stage)
 
 
-def _relinked(seed: tuple[Any, ...], added: tuple[Any, ...], plan_stage: str) -> tuple[Any, ...]:
-    """Seed плюс план: этапы seed, ждавшие план, ждут и то, что план произвёл.
+def _relinked(seed: tuple[Any, ...], proposed: tuple[Any, ...], plan_stage: str) -> tuple[Any, ...]:
+    """Seed плюс план: перестановки применены, этапы seed ждут «последние» из плана.
 
-    Без этой правки `close` с `needs: [plan]` стал бы готов сразу после
-    принятия плана и закрыл бы дело до работы, которую план объявил
+    Запись предложения с `id` из seed — перестановка, а не новый этап: у неё
+    берутся только `needs`/`parallel_with`, остальные поля этапа остаются
+    спекой (`spec.parse_plan`, `REORDER_KEYS`).
+
+    Без этого рёбра seed, ждавшие план, стали бы готовы сразу после принятия
+    плана и закрыли бы дело до работы, которую план объявил
     (`docs/ENGINE-1.0.md`, раздел 9: plan → research → … → close). Рёбра не
     додумываются: этап seed получает ровно те добавленные этапы, от которых
     никто из добавленных не зависит, — «последние из плана».
     """
+    seeded = {stage.id for stage in seed}
+    moving = {stage.id: stage for stage in proposed if stage.id in seeded}
+    added = tuple(stage for stage in proposed if stage.id not in seeded)
+    ordered: list[Any] = []
+    for stage in seed:
+        moved = moving.get(stage.id)
+        if moved is None:
+            ordered.append(stage)
+            continue
+        ordered.append(dataclasses.replace(stage, needs=moved.needs, parallel_with=moved.parallel_with))
     if not added:
-        return seed
+        return tuple(ordered)
     needed = {need for stage in added for need in stage.needs}
     tail = tuple(stage.id for stage in added if stage.id not in needed)
+    by_id = {stage.id: stage for stage in added}
     out: list[Any] = []
-    for stage in seed:
+    for stage in ordered:
         if plan_stage not in tuple(getattr(stage, "needs", ()) or ()):
             out.append(stage)
             continue
-        out.append(dataclasses.replace(stage, needs=tuple(dict.fromkeys((*stage.needs, *tail)))))
+        # Параллель, объявленная планом, не превращается в ожидание: этап, который
+        # идёт «вместе с» этим, не может быть его предшественником — иначе
+        # объявление параллели давало бы ровно обратное.
+        extra = tuple(stage_id for stage_id in tail if not _parallel(stage, by_id[stage_id]))
+        out.append(dataclasses.replace(stage, needs=tuple(dict.fromkeys((*stage.needs, *extra)))))
     return tuple(out) + added
 
 
@@ -1312,9 +1410,14 @@ def _batch(spec: Any, runnable: list[Any]) -> tuple[str, ...]:
     Одновременно идёт только объявленное (правило 3): два готовых этапа без
     `parallel_with` запускаются по одному, иначе слой сам придумал бы параллелизм,
     которого спека не просила. Порядок внутри пачки — объявления в спеке.
+
+    Размер пачки ограничен `MAX_PARALLEL`: остальные объявленные параллельными
+    этапы ждут своей пачки и попадут в следующий шаг, когда место освободится.
     """
     picked: list[Any] = []
     for stage in runnable:
+        if len(picked) >= MAX_PARALLEL:
+            break
         if all(_parallel(stage, other) for other in picked):
             picked.append(stage)
     return tuple(stage.id for stage in picked)
@@ -1432,14 +1535,16 @@ def next_stage(spec: Any, events: Iterable[Any], now: Any) -> Decision:
             + tail,
         )
 
-    states = _slice(spec, board)
+    # Срез — по графу журнала (`view`), а не по файлу: этап, добавленный принятым
+    # планом, обязан быть в `states`, иначе `done` наступал бы, пока он не закрыт.
+    states = _slice(view, board)
 
-    stopped = _first(spec, states, FAILED)
+    stopped = _first(view, states, FAILED)
     if stopped is not None:
         node = board.stages[stopped.id]
         return failed(node.fail_kind or UNCLASSIFIED, f"этап {stopped.id!r}: {node.reason}")
 
-    parked = _first(spec, states, PARKED)
+    parked = _first(view, states, PARKED)
     if parked is not None:
         node = board.stages[parked.id]
         return park(parked.id, node.question_id, f"этап {parked.id!r}: {node.reason}")

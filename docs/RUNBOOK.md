@@ -674,7 +674,72 @@ heartbeat движка). Живой случай: попытка погибла 
 - не писать `cause` в `completed` от человека — падает
   `test_close_writes_completed_with_human_cause`;
 - разрешить перезакрытие другим `reason` — падает
-  `test_close_refuses_to_rewrite_another_close`.
+  `test_close_refuses_to_rewrite_another_close`;
+- пустить вопрос роли пулом (вернуть `_parked` к одному каналу, без `_asked_role`) —
+  падают `test_the_lead_answers_the_stage_question_and_the_answer_is_a_fact` и
+  `test_factual_question_is_addressed_to_the_declared_role` (второй ждёт спавна
+  `researcher` и пустой пул);
+- считать `authority: true` обычным ответом роли (снять проверку в `_role_answer_of`
+  или в `_asked_role`) — падает
+  `test_authority_in_the_role_answer_sends_the_question_to_the_human`: вопрос,
+  который роль переадресовала, остался бы у неё;
+- отправить провал попытки ответа роли назад роли вместо человека — падают
+  `test_a_failed_answer_attempt_hands_the_question_to_the_human` и
+  `test_a_role_that_left_without_a_report_does_not_burn_the_question`: вопрос
+  сгорел бы вместе с упавшей ролью;
+- не отдавать ответ роли новой попытке (убрать `role_answer_before` из `run_stage`)
+  — падает `test_the_answered_stage_runs_again_with_the_answer_in_the_contract`:
+  этап спросил бы то же самое второй раз;
+- не закрывать вопрос без номера в `fold` (снимать только по `question_id`) — падает
+  `test_while_the_role_answers_the_deal_waits_human` (состояние `wait_human` стало
+  бы вечным);
+- снять вызов `runner.recover_role_questions` из `driver.decide` — падает
+  `test_a_lost_role_answer_does_not_leave_the_deal_waiting_forever`: дело стоит в
+  ожидании ответа, которого уже не будет, и следующий прогон никуда не идёт;
+- читать пустой `answer_len` как срок и у передачи роли (убрать `ROLE_ANSWER_KINDS`
+  из `transit._expired`) — падают три: `test_authority_in_the_role_answer_sends_the_question_to_the_human`,
+  `test_a_failed_answer_attempt_hands_the_question_to_the_human` и
+  `test_a_lost_role_answer_does_not_leave_the_deal_waiting_forever` (вопрос человеку
+  есть, а этап запаркован «по сроку без ответа»);
+- снять гард «попытка уже закрыта» (`asked_by_closed` в `runner._open_role_question`) —
+  падает `test_an_open_attempt_is_not_recovered`: вопрос отнят у живой роли;
+- пустить восстановление на вопрос человека (снять в `_open_role_question` фильтр
+  `routing.target` и проверку `question_id`) — падает
+  `test_a_human_question_is_not_recovered_as_a_lost_role_one`: у дела отнят
+  единственный живой канал ответа.
+- применять перестановку этапа, который уже начинали (убрать проверку `started` из
+  `spec.parse_plan`) — падает `test_reorder_of_a_started_stage_is_refused` и
+  `test_parse_plan_reorder_of_a_started_stage_is_refused`: лид возвращал бы
+  сделанное в обход `verdict.changes`;
+- считать граф плана без перестановок (вернуть `_relinked` к `seed + added` без
+  `dataclasses.replace`) — падает
+  `test_reorder_of_a_stage_that_has_not_started_moves_it`: порядок остался бы
+  файловым, а предложение — принятым молча;
+- проверять цикл только по добавленным этапам (как было до 1.0) — падает
+  `test_cycle_closed_by_a_reorder_is_refused`: перестановка замкнула бы круг через
+  seed, и дело стояло бы вечно;
+- считать порог `plan_gate` только по этапным бюджетам (забыть `cost`) — падает
+  `test_declared_cost_moves_the_plan_gate`: дорогой план прошёл бы по дешёвым
+  этапам;
+- превратить объявленную параллель в ожидание (не исключать `_parallel` из `tail` в
+  `_relinked`) — падает `test_parallel_with_declared_by_the_plan_starts_both`:
+  «вместе с» стало бы «после»;
+- не отдавать `added_by`/`parallel_with` в срезе (`stagefeed.stages`) — падают
+  `test_stage_slice_names_the_author_and_the_parallel_of_added_stages` и тест
+  шейпера «параллель и автор этапа — из графа, а не догадка экрана».
+- следить за попытками пачки по одной сразу (в `runner.step` закрывать попытку в том
+  же проходе, где подняли) — падают
+  `test_two_stages_declared_parallel_start_in_one_step_with_both_leases` (второй этап
+  стартует только после смерти первого: лизинга первого уже нет) и
+  `test_the_slice_shows_both_stages_running` (в срезе `done` вместо `running`);
+- снять предел пачки (`MAX_PARALLEL` в `transit._batch`) — падает
+  `test_the_parallel_limit_is_respected`: третьим шагом поехали бы три процесса;
+- не продлевать лизинг соседей по пачке (убрать `others` из `runner.follow`) —
+  падает `test_a_sibling_keeps_its_lease_while_the_engine_watches_the_first`: живая
+  вторая попытка протухла бы на сроке этапа;
+- выкинуть shell-этап из пачки (`start_shell_stage` мимо `_Live`) — падает
+  `test_a_shell_stage_and_an_agent_stage_stand_together`: команда и агент пошли бы
+  по очереди.
 
 ## 11. Одно дело руками: от спеки до закрытых этапов
 
@@ -757,9 +822,13 @@ bin/duty run d_a3ed4990             # до терминального исход
 
 Итог печатается **по записанному факту**: `completed` с `cause='all_stages_done'`
 и строкой дела пишутся одной транзакцией — тем же путём, что `bin/duty close`.
-Повторный `run` на закрытом деле второго факта не пишет и говорит «дело уже
-закрыто» с причиной и временем; дело, которое держит человек (`blocked`, `review`,
-`archived`), движок не закрывает и говорит об этом прямо.
+Если в графе дела есть закрывающий этап `close` (1.0, `docs/SPEC.md`), закрывает
+дело лид: его приговор `approve` пишется `completed cause=lead_closed` с итогом
+лида, а `changes: <этап>` возвращает дело в работу — тогда прогон кончается
+ожиданием, а не закрытием. Повторный `run` на закрытом деле второго факта не
+пишет и говорит «дело уже закрыто» с причиной и временем; дело, которое держит
+человек (`blocked`, `review`, `archived`), движок не закрывает и говорит об этом
+прямо.
 
 Вывод выше снят с фейковым исполнителем (раздел «Прогон без модели» ниже):
 с живой моделью те же строки приходят с ненулевыми `tokens` и `tools`, а время
@@ -1310,7 +1379,7 @@ bin/duty attempts d_a7040118
 |---|---|
 | S1 | сверка с `must` держит всю классификацию исхода shell-попытки: соседний кейс — `test_shell_must_accepts_its_own_code` (команда с кодом `must` обязана проходить) |
 | S2 | `test_gate_allow_defaults_to_every_option`, `test_gate_answer_outside_allow_stops_the_deal` |
-| S3 | `test_refused_shell_attempt_names_deal_minutes` — та же сверка в `run_shell_stage`: отказ обязан называть числа и у этапа-команды |
+| S3 | `test_refused_shell_attempt_names_deal_minutes` — та же сверка в `start_shell_stage`: отказ обязан называть числа и у этапа-команды |
 | S4/FIX-S4a | `test_publish_claim_by_a_short_sha_is_confirmed_by_origin`, `test_approval_of_a_short_gate_commit_is_ok` (обе — `same_commit` на уровне прогона), `test_publish_claim_of_an_ambiguous_sha_is_contract`: без сверки по префиксу неоднозначность тоже перестаёт ловиться |
 | FIX-V | `test_review_changes_returns_to_the_named_stage` (приговор `changes` тоже обязан стать фактом, иначе возврат на доработку не читается), `test_review_without_verdict_is_contract` (`done` без приговора остаётся `done` — тишина вместо отказа) |
 

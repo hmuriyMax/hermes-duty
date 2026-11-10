@@ -35,7 +35,8 @@
    `tokens` → превышение по `usage` из потока останавливает попытку.
    У этапа `kind: shell` (`docs/SPEC.md`) процесса роли нет вовсе: вместо спавна
    запускается `sh -c <cmd>` в том же дереве, а договор результата — код возврата
-   `must` и объявленные `artifacts`, а не `result.json` (`run_shell_stage`).
+   `must` и объявленные `artifacts`, а не `result.json` (`start_shell_stage` →
+   `finish_shell_stage`).
 5. **Телеметрия**: каждый `tool_use`/`tool_result` потока — событие
    `attempt_progress` (фаза, имя инструмента, длительность). Журнал отвечает
    «что делается прямо сейчас» без ps и хвостов логов.
@@ -72,6 +73,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -215,6 +217,12 @@ WORKSPACES_SUBDIR = ("kanban", "boards", "duty")
 
 # Служебный каталог попытки рядом с деревом: контракт и отчёт.
 DUTY_SUBDIR = ".duty"
+
+# Подкаталог рабочего каталога попытки, где работает отвечающая роль: вопрос
+# этапа адресован роли (`ask.allowed`), и её ответ — отдельный процесс со своим
+# контрактом и отчётом. Дерева и лизинга у него нет: роль ничего не сдаёт, она
+# отвечает на вопрос (`dashboard/runner.py`, `ask_role`).
+ASK_ROLE_SUBDIR = "ask"
 
 # Сколько ждать `git worktree add`/`remove`: checkout большого репозитория — не
 # мгновенный, но и не бесконечный.
@@ -1014,30 +1022,39 @@ def _plan_issues(issues: Iterable[Any]) -> list[str]:
     return out
 
 
-def plan_gate_reason(spec: Any, stages: Iterable[Any], graph: Iterable[Any]) -> str:
+def plan_gate_reason(
+    spec: Any, stages: Iterable[Any], graph: Iterable[Any], cost: Optional[dict[str, Any]] = None
+) -> str:
     """Почему план обязан спросить человека; пустая строка — порог не пройден.
 
     Порог объявлен хартией (`charter.plan_gate`, `docs/ENGINE-1.0.md`, раздел 5):
-    число этапов **всего** графа и доля бюджета дела, которую забирают этапные
-    бюджеты предложения. Ноль в поле — гейт по этому признаку выключен, поэтому
-    спека без `plan_gate` вопросов человеку не задаёт.
+    число этапов **всего** графа и доля бюджета дела, которую забирает
+    предложение. Доля считается по цене, которую назвал план (`cost.tokens`), а
+    этапные бюджеты — фолбэк: сумма бюджетов этапа бывает меньше цены, и порог по
+    ней не срабатывал бы никогда (`spec.parse_plan_cost`). Ноль в поле — гейт по
+    этому признаку выключен, поэтому спека без `plan_gate` вопросов человеку не
+    задаёт.
     """
     gate = getattr(getattr(spec, "charter", None), "plan_gate", None)
     if gate is None:
         return ""
-    total = len(tuple(graph))
+    # Этапы предложения называют перестановки тех же id, что уже в графе: считать
+    # их новыми значило бы показать порог, которого нет.
+    total = len({str(stage.id) for stage in graph})
     reasons: list[str] = []
     if int(getattr(gate, "min_stages", 0) or 0) > 0 and total > int(gate.min_stages):
         reasons.append(f"этапов в графе {total} больше порога {int(gate.min_stages)}")
     share = float(getattr(gate, "budget_share", 0.0) or 0.0)
     limit = getattr(getattr(spec, "budget", None), "tokens", None)
+    declared = _int((cost or {}).get("tokens")) if isinstance(cost, dict) else 0
     if share > 0 and isinstance(limit, int) and limit > 0:
-        asked = sum(int(getattr(getattr(stage, "budget", None), "tokens", 0) or 0) for stage in stages)
+        # Цена предложения — приоритет, этапные бюджеты — фолбэк: план, назвавший
+        # свою стоимость, не должен проходить порог по сумме, которую он же и
+        # нарисовал в этапах.
+        asked = declared or sum(int(getattr(getattr(stage, "budget", None), "tokens", 0) or 0) for stage in stages)
         if asked / limit > share:
-            reasons.append(
-                f"этапные бюджеты плана просят {asked} из {limit} токенов дела "
-                f"({asked / limit:.0%}) — больше доли {share:.0%}"
-            )
+            source = "план назвал цену" if declared else "этапные бюджеты плана просят"
+            reasons.append(f"{source} {asked} из {limit} токенов дела ({asked / limit:.0%}) — больше доли {share:.0%}")
     return "; ".join(reasons)
 
 
@@ -1053,26 +1070,28 @@ def report_plan(
 ) -> tuple[list[dict[str, Any]], str]:
     """Факты плана из отчёта этапа плана: (события, причина отказа).
 
-    Образец — `report_verdict`: структурное поле отчёта (`plan: {stages, reason}`)
-    становится фактом журнала в той же транзакции, что и `attempt_ended`, потому
-    что граф дела — это факт, а не слово в `summary` (`docs/ENGINE-1.0.md`,
-    раздел 4).
+    Образец — `report_verdict`: структурное поле отчёта (`plan: {stages, reason,
+    cost}`) становится фактом журнала в той же транзакции, что и `attempt_ended`,
+    потому что граф дела — это факт, а не слово в `summary`
+    (`docs/ENGINE-1.0.md`, раздел 4).
 
     Три исхода, и все три — факты, а не догадки:
 
     - этап плана отчитался без `plan` → `([], причина)`, и попытка становится
       отказом `contract`: этап, который должен планировать, не вправе «просто
       закончиться»;
-    - предложение не прошло `spec.parse_plan` → `plan_proposed` +
-      `plan_rejected(issues[])`: лид видит, какое правило нарушено, а граф не
-      растёт;
+    - предложение не прошло `spec.parse_plan` (или цену `spec.parse_plan_cost`) →
+      `plan_proposed` + `plan_rejected(issues[])`: лид видит, какое правило
+      нарушено, а граф не растёт;
     - предложение прошло и порог `plan_gate` не пройден → `plan_proposed` +
       `plan_accepted(by: engine)`. Пройден → только `plan_proposed`: решение
       принимает человек (`runner.plan_gate`).
 
     Валидация — `spec.parse_plan`, а не собственные проверки: «принять план на
     глаз» значит завести второй валидатор, который разойдётся с `spec check` на
-    первом же новом поле.
+    первом же новом поле. `started_ids` приходит из журнала
+    (`transit.started_stages`): переставлять план вправе только этап, который не
+    начинали.
     """
     if not is_plan_stage(stage):
         return [], ""
@@ -1095,17 +1114,28 @@ def report_plan(
     rev = 1 + max((int(_int(item.get("rev")) or 0) for item in proposals), default=0)
     raw_stages = raw.get("stages")
     charter = getattr(spec, "charter", None) or spec_module.Charter()
-    stages, issues = spec_module.parse_plan(raw_stages, charter=charter, base_ids=base_ids)
+    stages, issues = spec_module.parse_plan(
+        raw_stages,
+        charter=charter,
+        base_ids=base_ids,
+        base_needs={item.id: item.needs for item in graph},
+        started_ids=transit.started_stages(events),
+    )
+    cost, cost_issues = spec_module.parse_plan_cost(raw.get("cost"))
+    issues += cost_issues
+    payload: dict[str, Any] = {
+        "rev": rev,
+        "stages": raw_stages if isinstance(raw_stages, list) else [],
+        "reason": str(raw.get("reason") or "").strip(),
+        "source_stage": stage.id,
+        "attempt": int(attempt),
+    }
+    if cost is not None:
+        payload["cost"] = cost
     proposed = _event(
         deal,
         transit.PLAN_PROPOSED,
-        {
-            "rev": rev,
-            "stages": raw_stages if isinstance(raw_stages, list) else [],
-            "reason": str(raw.get("reason") or "").strip(),
-            "source_stage": stage.id,
-            "attempt": int(attempt),
-        },
+        payload,
         {"stage": stage.id, "attempt": int(attempt), "rev": rev},
         now,
     )
@@ -1119,7 +1149,7 @@ def report_plan(
             now,
         )
         return [proposed, rejected], ""
-    asked = plan_gate_reason(spec, stages, graph + tuple(stages))
+    asked = plan_gate_reason(spec, stages, graph + tuple(stages), cost)
     if asked:
         return [proposed], ""  # порог пройден: решает человек, граф пока не растёт
     accepted = _event(
@@ -1183,10 +1213,17 @@ def plan_payload(spec: Any, events: Iterable[Any]) -> dict[str, Any]:
     """Что этап плана знает о деле: существующий граф и остаток бюджета.
 
     План рисуется поверх графа, а не с нуля: `base_ids` — id, на которые можно
-    ссылаться в `needs` (переопределять их планом нельзя), `remaining` — расход и
+    ссылаться в `needs` (переписывать их нельзя), `remaining` — расход и
     потолок дела (если потолка нет, поля просто нет: «0 из 0» было бы выдумкой).
+
+    `started` у этапа графа — «у него была попытка»: такой этап план не
+    переставляет (`spec.parse_plan`, отказ `plan.reorder`), и лид должен видеть
+    это из контракта, а не из отказа. `parallel_with` в графе — объявленная
+    параллель, чтобы план её видел и продолжал, а не изобретал заново.
     """
+    events = list(events or ())
     graph = transit.graph(spec, events)
+    started = transit.started_stages(events)
     return {
         "graph": [
             {
@@ -1194,12 +1231,17 @@ def plan_payload(spec: Any, events: Iterable[Any]) -> dict[str, Any]:
                 "role": getattr(stage, "role", ""),
                 "kind": getattr(stage, "kind", STAGE_KIND_AGENT),
                 "needs": [str(need) for need in getattr(stage, "needs", ()) or ()],
+                "parallel_with": [str(other) for other in getattr(stage, "parallel_with", ()) or ()],
+                "started": stage.id in started,
             }
             for stage in graph
         ],
         "base_ids": [stage.id for stage in graph],
         "remaining": budget.describe(spec, events),
-        "report": "plan: {stages: [{id, role, kind, needs, evidence, budget}], reason}",
+        "report": (
+            "plan: {stages: [{id, role, kind, needs, parallel_with, evidence, budget}], "
+            "cost: {tokens}, reason}"
+        ),
     }
 
 
@@ -1637,12 +1679,17 @@ def follow(
     budget_tokens: Optional[int],
     monotonic: Callable[[], float],
     clock: Callable[[], float],
+    others: Iterable[tuple[str, int, int]] = (),
 ) -> Followed:
     """Читать поток до конца, писать телеметрию, держать лизинг и бюджет.
 
     Три вещи делаются по ходу, а не после: heartbeat лизинга (не реже TTL/3),
     проверка бюджета токенов по `usage` из `result` и таймаут. Иначе «процесс
     идёт» и «процесс висит» отличались бы только по ps.
+
+    `others` — лизинги соседей по пачке (`этап, pid, срок`): они продлеваются тем
+    же heartbeat'ом. Второй процесс пачки живой, пока за первым смотрят, и без
+    этого его лизинг протух бы на сроке этапа.
     """
     state = Followed()
     seq = 0
@@ -1715,6 +1762,15 @@ def follow(
                 ttl=ttl,
                 now=_now_sec(int(clock())),
             )
+            for other_stage, other_pid, other_ttl in others:
+                renew(
+                    conn,
+                    deal=deal,
+                    stage=other_stage,
+                    pid=other_pid,
+                    ttl=other_ttl,
+                    now=_now_sec(int(clock())),
+                )
             last_renew = monotonic()
         line = process.next_line(POLL_SEC)
         if line is None:
@@ -1855,6 +1911,7 @@ def follow_shell(
     deadline: float,
     monotonic: Callable[[], float],
     clock: Callable[[], float],
+    others: Iterable[tuple[str, int, int]] = (),
 ) -> ShellRun:
     """Довести команду этапа до конца: heartbeat лизинга, таймаут, хвост stdout.
 
@@ -1862,6 +1919,9 @@ def follow_shell(
     `logs`): журнал отвечает «чем кончилось», файл — «что было написано».
     Таймаут — наш собственный факт, поэтому проверяется по часам шага, а не по
     коду возврата: убитый по сроку процесс тоже вернёт код сигнала.
+
+    `others` — лизинги соседей по пачке: продлеваются тем же heartbeat'ом, иначе
+    вторая команда пачки потеряла бы лизинг, пока движок смотрит за первой.
     """
     state = ShellRun()
     last_renew = monotonic()
@@ -1870,6 +1930,15 @@ def follow_shell(
     while True:
         if monotonic() - last_renew >= renew_every:
             renew(conn, deal=deal, stage=stage.id, pid=pid, ttl=ttl, now=_now_sec(int(clock())))
+            for other_stage, other_pid, other_ttl in others:
+                renew(
+                    conn,
+                    deal=deal,
+                    stage=other_stage,
+                    pid=other_pid,
+                    ttl=other_ttl,
+                    now=_now_sec(int(clock())),
+                )
             last_renew = monotonic()
         line = process.next_line(POLL_SEC)
         if line is None:
@@ -2022,7 +2091,40 @@ def refuse_budget(
     }
 
 
-def run_shell_stage(
+@dataclasses.dataclass
+class _Live:
+    """Поднятая попытка, за которой ещё не следили: `start_stage` → `finish_stage`.
+
+    Подъём и слежение разделены ради пачки (`docs/ENGINE-1.0.md`, раздел 3): два
+    этапа одной пачки обязаны идти одновременно, а `follow` держит один процесс до
+    его смерти. Шаг поднимает все попытки пачки — у каждой свой лизинг и свой факт
+    `attempt_started` — и только потом следит за каждой.
+    """
+
+    spec: Any
+    stage: Any
+    attempt: int
+    run_id: str
+    workdir: Path
+    tree: Optional[Path]
+    cwd: Path
+    base: str
+    process: Any
+    pid: int
+    ttl: int
+    deadline_sec: int
+    began: float
+    started_at: int
+    kind: str = STAGE_KIND_AGENT
+    session_id: str = ""
+    result_file: Optional[Path] = None
+    previous: Any = ()
+    events: Any = ()
+    approval: Optional[Any] = None
+    budget_tokens: Optional[int] = None
+
+
+def start_shell_stage(
     conn: sqlite3.Connection,
     spec: Any,
     deal: Any,
@@ -2034,7 +2136,11 @@ def run_shell_stage(
     clock: Optional[Callable[[], float]] = None,
     monotonic: Optional[Callable[[], float]] = None,
 ) -> dict[str, Any]:
-    """Одна попытка shell-этапа: лизинг, дерево, команда, факты в журнал.
+    """Поднять попытку shell-этапа: лизинг, дерево, команда, `attempt_started`.
+
+    Ответ — `{"live": _Live, "result": None}`, когда команда пошла и за ней ещё
+    предстоит следить, и `{"live": None, "result": {...}}`, когда шаг закрыт сразу:
+    исчерпанный потолок, занятый лизинг или сбой дерева отдают прежний отчёт шага.
 
     Договор результата — код возврата и артефакты, а не `result.json`: команда не
     отчитывается, она либо сходится с `must`, либо нет. Вопросов человеку этап не
@@ -2065,16 +2171,19 @@ def run_shell_stage(
     spent = budget.refusal(spec, journal.read_events(conn, str(deal["id"])))
     refused = refuse_budget(conn, spec, deal, stage, attempt, spent, clock=clock)
     if refused is not None:
-        return refused
+        return {"live": None, "result": refused}
 
     held_at = _now_sec(int(clock()))
     if not lease(conn, deal=deal, stage=stage_id, attempt=attempt, pid=engine_pid, ttl=ttl, now=held_at):
         held = lease_of(conn, deal, stage_id) or {}
         return {
-            "started": False,
-            "stage": stage_id,
-            "attempt": attempt,
-            "reason": f"этап уже за процессом pid={held.get('pid')}, срок до {held.get('expires_at')}",
+            "live": None,
+            "result": {
+                "started": False,
+                "stage": stage_id,
+                "attempt": attempt,
+                "reason": f"этап уже за процессом pid={held.get('pid')}, срок до {held.get('expires_at')}",
+            },
         }
 
     stage_base = str(spec.base or "")
@@ -2108,16 +2217,19 @@ def run_shell_stage(
         journal.append(conn, [event])
         park = park_exhausted(conn, spec, deal, stage, attempt, kind, str(exc), home=home, clock=clock)
         return {
-            "started": True,
-            "stage": stage_id,
-            "attempt": attempt,
-            "outcome": OUTCOME_FAILED,
-            "kind": kind,
-            "reason": str(exc),
-            "workdir": str(workdir),
-            "tree": None,
-            "base": stage_base,
-            "park": park,
+            "live": None,
+            "result": {
+                "started": True,
+                "stage": stage_id,
+                "attempt": attempt,
+                "outcome": OUTCOME_FAILED,
+                "kind": kind,
+                "reason": str(exc),
+                "workdir": str(workdir),
+                "tree": None,
+                "base": stage_base,
+                "park": park,
+            },
         }
 
     actual_base = stage_base
@@ -2170,26 +2282,72 @@ def run_shell_stage(
             release(conn, deal=deal, stage=stage_id, pid=engine_pid)
         raise
 
-    began = monotonic()
+    return {
+        "live": _Live(
+            spec=spec,
+            stage=stage,
+            attempt=attempt,
+            run_id=run_id,
+            workdir=workdir,
+            tree=tree,
+            cwd=cwd,
+            base=actual_base,
+            process=process,
+            pid=pid,
+            ttl=ttl,
+            deadline_sec=deadline_sec,
+            began=monotonic(),
+            started_at=int(started["ts"]),
+            kind=STAGE_KIND_SHELL,
+        ),
+        "result": None,
+    }
+
+
+def finish_shell_stage(
+    conn: sqlite3.Connection,
+    deal: Any,
+    live: _Live,
+    *,
+    home: Path,
+    others: Iterable[tuple[str, int, int]] = (),
+    clock: Optional[Callable[[], float]] = None,
+    monotonic: Optional[Callable[[], float]] = None,
+) -> dict[str, Any]:
+    """Довести поднятую команду до факта: поток, код возврата, `attempt_ended`.
+
+    `others` — лизинги соседей по пачке: пока движок смотрит за этой командой, их
+    срок тоже продлевается, иначе живая попытка потеряла бы лизинг.
+    """
+    clock = clock or time.time
+    monotonic = monotonic or time.monotonic
+    spec = live.spec
+    stage, attempt, run_id = live.stage, live.attempt, live.run_id
+    stage_id = stage.id
+    workdir, tree, cwd = live.workdir, live.tree, live.cwd
+    pid, ttl, deadline_sec = live.pid, live.ttl, live.deadline_sec
+    actual_base = live.base
+    began = live.began
     try:
         followed = follow_shell(
             conn,
-            process,
+            live.process,
             deal=deal,
             stage=stage,
             attempt=attempt,
             ttl=ttl,
             deadline=began + deadline_sec,
+            others=others,
             monotonic=monotonic,
             clock=clock,
         )
     except sqlite3.Error:
-        process.stop()
+        live.process.stop()
         release(conn, deal=deal, stage=stage_id, pid=pid)
         raise
-    exit_code = process.exit_code if process.exit_code is not None else process.wait(KILL_GRACE_SEC)
+    exit_code = live.process.exit_code if live.process.exit_code is not None else live.process.wait(KILL_GRACE_SEC)
     duration = max(0.0, monotonic() - began)
-    process.close_logs()
+    live.process.close_logs()
     outcome, kind, reason = classify_shell(
         exit_code=exit_code, timed_out=followed.timed_out, must=int(getattr(stage, "must", 0)), timeout_sec=deadline_sec
     )
@@ -2207,7 +2365,7 @@ def run_shell_stage(
                 result,
                 stage,
                 workdir,
-                attempt_started_at=int(started["ts"]),
+                attempt_started_at=live.started_at,
                 now=now,
                 root=cwd,
                 base=spec.base,
@@ -2932,11 +3090,13 @@ def _ordered_events(events: Iterable[Any]) -> list[dict[str, Any]]:
     )
 
 
-def _pending_plan(events: Iterable[Any]) -> Optional[tuple[int, str, list[Any]]]:
-    """Предложение, которое ещё не решено: `(rev, source_stage, stages)`.
+def _pending_plan(events: Iterable[Any]) -> Optional[dict[str, Any]]:
+    """Предложение, которое ещё не решено: его `plan_proposed` целиком.
 
     Читается по журналу, а не по памяти прогона: гейт плана может ставить другой
-    процесс, а «что решено» — факт, а не состояние в памяти.
+    процесс, а «что решено» — факт, а не состояние в памяти. Отдаётся факт, а не
+    разобранные поля: `cost` предложения — тоже его часть, и вытаскивать её
+    отдельным проходом значило бы читать журнал дважды.
     """
     proposals: dict[int, dict[str, Any]] = {}
     decided: set[int] = set()
@@ -2951,10 +3111,8 @@ def _pending_plan(events: Iterable[Any]) -> Optional[tuple[int, str, list[Any]]]
         elif kind in (transit.PLAN_ACCEPTED, transit.PLAN_REJECTED) and rev > 0:
             decided.add(rev)
     for rev in sorted(proposals, reverse=True):
-        if rev in decided:
-            continue
-        payload = proposals[rev]
-        return rev, str(payload.get("source_stage") or ""), list(payload.get("stages") or [])
+        if rev not in decided:
+            return proposals[rev]
     return None
 
 
@@ -3097,14 +3255,17 @@ def plan_gate(
     if pending is None:
         row["reason"] = "предложения плана нет: гейту плана нечего решать"
         return row
-    rev, stage_id, raw_stages = pending
+    rev = int(_int(pending.get("rev")) or 0)
+    stage_id = str(pending.get("source_stage") or "")
+    raw_stages = list(pending.get("stages") or [])
+    cost = pending.get("cost") if isinstance(pending.get("cost"), dict) else None
     row["rev"] = rev
     attempt = _last_plan_attempt(listed, stage_id)
     row.update(stage=stage_id, attempt=int(attempt))
     gate = _plan_gate_fact(listed, rev)
     if gate is None:
         parsed = _parsed_plan(spec, raw_stages, listed)
-        why = plan_gate_reason(spec, parsed, transit.graph(spec, listed) + parsed)
+        why = plan_gate_reason(spec, parsed, transit.graph(spec, listed) + parsed, cost)
         now = _now_sec(int(clock()))
         gate = _ask_plan_gate(
             conn,
@@ -3165,10 +3326,19 @@ def _append_plan_facts(conn: sqlite3.Connection, facts: list[dict[str, Any]]) ->
 
 
 def _parsed_plan(spec: Any, raw_stages: list[Any], events: Iterable[Any]) -> tuple[Any, ...]:
-    """Этапы предложения тем же разбором, что у движка: порог считается по ним."""
+    """Этапы предложения тем же разбором, что у движка: порог считается по ним.
+
+    `base_needs`/`started_ids` — те же, что у приёма предложения: перестановка
+    уже начатого этапа отказывает до гейта, а не только после него.
+    """
     charter = getattr(spec, "charter", None) or spec_module.Charter()
+    graph = transit.graph(spec, events)
     stages, _issues = spec_module.parse_plan(
-        raw_stages, charter=charter, base_ids=[stage.id for stage in transit.graph(spec, events)]
+        raw_stages,
+        charter=charter,
+        base_ids=[stage.id for stage in graph],
+        base_needs={stage.id: stage.needs for stage in graph},
+        started_ids=transit.started_stages(events),
     )
     return tuple(stages)
 
@@ -3320,7 +3490,7 @@ def _gate_expired(answer: dict[str, Any]) -> bool:
 # ---------------------------------------------------------------------- шаг
 
 
-def run_stage(
+def start_stage(
     conn: sqlite3.Connection,
     spec: Any,
     deal: Any,
@@ -3333,11 +3503,13 @@ def run_stage(
     clock: Optional[Callable[[], float]] = None,
     monotonic: Optional[Callable[[], float]] = None,
 ) -> dict[str, Any]:
-    """Одна попытка этапа: лизинг, дерево, контракт, процесс, факты в журнал.
+    """Поднять попытку: лизинг, дерево, контракт, процесс, `attempt_started`.
 
-    Возвращает отчёт о шаге: `started` (попытка действительно пошла),
-    `outcome`/`kind`/`reason` — как в событии, `question_id` — если попытка
-    задала вопрос, `workdir`/`tree` — где она работала.
+    Ответ — `{"live": _Live, "result": None}`, когда попытка пошла и за ней ещё
+    предстоит следить, и `{"live": None, "result": {...}}`, когда шаг закрыт сразу:
+    гейт идёт своим путём (у него нет ни процесса, ни лизинга), shell-этап — тоже
+    (`start_shell_stage`), а отказ публикации, исчерпанный потолок, занятый лизинг
+    и сбой дерева отдают прежние отчёты шага.
 
     `answer` — ответ человека на вопрос прошлой попытки: с ним процесс
     продолжается резюмом (`RESUME-OK`), без него начинается новая сессия.
@@ -3356,15 +3528,19 @@ def run_stage(
         raise RunnerError(f"номер попытки {attempt}: попытки считаются с 1")
     if getattr(stage, "kind", STAGE_KIND_AGENT) == STAGE_KIND_SHELL:
         # Вид этапа — выбор спеки, а не режим движка: попытку исполняет команда,
-        # и её шаг живёт отдельной функцией (`run_shell_stage`), чтобы ветка
-        # агента осталась ровно той же, что была до 0.0.5.
-        return run_shell_stage(
+        # и её шаг живёт отдельной функцией (`start_shell_stage` →
+        # `finish_shell_stage`), чтобы ветка агента осталась ровно той же, что была
+        # до 0.0.5.
+        return start_shell_stage(
             conn, spec, deal, stage_id, attempt, home=home, spawn=spawn, clock=clock, monotonic=monotonic
         )
     if getattr(stage, "kind", STAGE_KIND_AGENT) == STAGE_KIND_GATE:
         # Гейт — тоже отдельная ветка: ни процесса, ни дерева, ни лизинга у него
         # нет, и общий путь агента для него был бы неверен в каждой строке.
-        return run_gate_stage(conn, spec, deal, stage_id, attempt, home=home, clock=clock)
+        return {
+            "live": None,
+            "result": run_gate_stage(conn, spec, deal, stage_id, attempt, home=home, clock=clock),
+        }
     ttl = ttl_sec(stage)
     deadline_sec = ttl
     engine_pid = os.getpid()
@@ -3385,7 +3561,7 @@ def run_stage(
             approval = publish.approval(events, gates, current=current)
         refused = refuse_publish(conn, deal, stage, attempt, approval, clock=clock)
         if refused is not None:
-            return refused
+            return {"live": None, "result": refused}
 
     # Потолок дела целиком (0.0.5) проверяется до лизинга и до спавна: расход
     # считается по журналу (`dashboard/budget.py`), поэтому переживает рестарт и
@@ -3394,7 +3570,7 @@ def run_stage(
     spent = budget.refusal(spec, journal.read_events(conn, str(deal["id"])))
     refused = refuse_budget(conn, spec, deal, stage, attempt, spent, clock=clock)
     if refused is not None:
-        return refused
+        return {"live": None, "result": refused}
 
     held_at = _now_sec(int(clock()))
     if not lease(
@@ -3402,10 +3578,13 @@ def run_stage(
     ):
         held = lease_of(conn, deal, stage_id) or {}
         return {
-            "started": False,
-            "stage": stage_id,
-            "attempt": attempt,
-            "reason": f"этап уже за процессом pid={held.get('pid')}, срок до {held.get('expires_at')}",
+            "live": None,
+            "result": {
+                "started": False,
+                "stage": stage_id,
+                "attempt": attempt,
+                "reason": f"этап уже за процессом pid={held.get('pid')}, срок до {held.get('expires_at')}",
+            },
         }
 
     stage_base = str(spec.base or "")
@@ -3446,16 +3625,19 @@ def run_stage(
             conn, spec, deal, stage, attempt, kind, str(exc), home=home, clock=clock
         )
         return {
-            "started": True,
-            "stage": stage_id,
-            "attempt": attempt,
-            "outcome": OUTCOME_FAILED,
-            "kind": kind,
-            "reason": str(exc),
-            "workdir": str(workdir),
-            "tree": None,
-            "base": stage_base,
-            "park": park,
+            "live": None,
+            "result": {
+                "started": True,
+                "stage": stage_id,
+                "attempt": attempt,
+                "outcome": OUTCOME_FAILED,
+                "kind": kind,
+                "reason": str(exc),
+                "workdir": str(workdir),
+                "tree": None,
+                "base": stage_base,
+                "park": park,
+            },
         }
 
     # Фактическая база дерева: `git rev-parse HEAD` после отвода. База в спеке
@@ -3469,6 +3651,11 @@ def run_stage(
 
     previous = previous_reports(conn, deal, spec, stage_id, events=events)
 
+    if answer is None:
+        # Ответ роли на вопрос прошлой попытки: строки пула у такого вопроса нет,
+        # текст ответа живёт в журнале, и продолжение берёт его оттуда — иначе
+        # лид ответил бы, а этап продолжил бы работу, не увидев ответа.
+        answer = role_answer_before(events, stage_id, attempt)
     session_id = last_session(conn, deal, stage_id) if answer is not None else ""
     contract = build_contract(
         spec,
@@ -3557,17 +3744,96 @@ def run_stage(
             release(conn, deal=deal, stage=stage_id, pid=engine_pid)
         raise
 
-    budget_tokens = getattr(getattr(stage, "budget", None), "tokens", None)
+    return {
+        "live": _Live(
+            spec=spec,
+            stage=stage,
+            attempt=attempt,
+            run_id=run_id,
+            workdir=workdir,
+            tree=tree,
+            cwd=cwd,
+            base=actual_base,
+            process=process,
+            pid=pid,
+            ttl=ttl,
+            deadline_sec=deadline_sec,
+            began=monotonic(),
+            started_at=int(started["ts"]),
+            session_id=session_id,
+            result_file=result_file,
+            previous=previous,
+            events=events,
+            approval=approval,
+            budget_tokens=getattr(getattr(stage, "budget", None), "tokens", None),
+        ),
+        "result": None,
+    }
+
+
+def finish_stage(
+    conn: sqlite3.Connection,
+    deal: Any,
+    live: _Live,
+    *,
+    home: Path,
+    others: Iterable[tuple[str, int, int]] = (),
+    spawn: Optional[Callable[..., Any]] = None,
+    clock: Optional[Callable[[], float]] = None,
+    monotonic: Optional[Callable[[], float]] = None,
+) -> dict[str, Any]:
+    """Довести поднятую попытку до факта: поток, классификация, `attempt_ended`.
+
+    Один вход на оба вида этапов: чем следить за процессом, решает `_Live.kind`,
+    а не вызывающий. `others` — лизинги соседей по пачке (`этап, pid, срок`):
+    пока движок смотрит за этим процессом, их срок тоже продлевается, иначе
+    живая попытка потеряла бы лизинг, ни разу не провинившись.
+    """
+    if live.kind == STAGE_KIND_SHELL:
+        return finish_shell_stage(conn, deal, live, home=home, others=others, clock=clock, monotonic=monotonic)
+    return finish_agent_stage(
+        conn, deal, live, home=home, others=others, spawn=spawn, clock=clock, monotonic=monotonic
+    )
+
+
+def finish_agent_stage(
+    conn: sqlite3.Connection,
+    deal: Any,
+    live: _Live,
+    *,
+    home: Path,
+    others: Iterable[tuple[str, int, int]] = (),
+    spawn: Optional[Callable[..., Any]] = None,
+    clock: Optional[Callable[[], float]] = None,
+    monotonic: Optional[Callable[[], float]] = None,
+) -> dict[str, Any]:
+    """Слежение за попыткой агента: поток, гейты, приговор, `attempt_ended`."""
+    spawner = spawn or spawn_process
+    clock = clock or time.time
+    monotonic = monotonic or time.monotonic
+    spec = live.spec
+    stage, attempt, run_id = live.stage, live.attempt, live.run_id
+    stage_id = stage.id
+    workdir, tree, cwd = live.workdir, live.tree, live.cwd
+    pid, ttl, deadline_sec = live.pid, live.ttl, live.deadline_sec
+    actual_base = live.base
+    session_id = live.session_id
+    result_file = live.result_file
+    approval = live.approval
+    budget_tokens = live.budget_tokens
+    events = live.events
+    previous = live.previous
     try:
         followed = follow(
             conn,
-            process,
+            live.process,
             deal=deal,
             stage=stage,
             attempt=attempt,
             ttl=ttl,
-            deadline=monotonic() + deadline_sec,
+            deadline=live.began + live.deadline_sec,
             budget_tokens=budget_tokens,
+            others=others,
             monotonic=monotonic,
             clock=clock,
         )
@@ -3575,10 +3841,10 @@ def run_stage(
         # Журнал не пишется — попытку не бросаем без присмотра: процесс гасим,
         # лизинг отпускаем, отказ идёт вызывающему. Иначе «шаг упал» оставил бы
         # живой процесс и занятый этап.
-        process.stop()
+        live.process.stop()
         release(conn, deal=deal, stage=stage_id, pid=pid)
         raise
-    exit_code = process.exit_code if process.exit_code is not None else process.wait(KILL_GRACE_SEC)
+    exit_code = live.process.exit_code if live.process.exit_code is not None else live.process.wait(KILL_GRACE_SEC)
     result, result_error = read_result(result_file)
     outcome, kind, reason = classify(
         result=result,
@@ -3589,7 +3855,7 @@ def run_stage(
     )
     status = str((result or {}).get("status") or "").strip().lower()
     parked = outcome == OUTCOME_DONE and status in BLOCKED_STATUSES
-    stderr_file = write_stderr(workdir, process.stderr_text)
+    stderr_file = write_stderr(workdir, live.process.stderr_text)
 
     # Гейт пакета: слово «готово» принимается только вместе с проверяемыми
     # доказательствами. Запускается после смерти процесса и до записи
@@ -3601,7 +3867,7 @@ def run_stage(
             result,
             stage,
             workdir,
-            attempt_started_at=int(started["ts"]),
+            attempt_started_at=live.started_at,
             now=now,
             root=cwd,
             base=spec.base,
@@ -3757,7 +4023,18 @@ def run_stage(
     question_target = ""
     question_reason = ""
     if parked:
-        question_id, address = _parked(conn, deal, stage, attempt, result or {}, home, clock)
+        question_id, address = _parked(
+            conn,
+            deal,
+            stage,
+            attempt,
+            result or {},
+            home,
+            clock,
+            spec=spec,
+            spawn=spawner,
+            previous=previous,
+        )
         question_target, question_reason = address.address, address.reason
 
     # Политика ретраев: если этот класс больше не повторяется (или дело набрало
@@ -3788,6 +4065,36 @@ def run_stage(
         "verdict": verdict.as_payload() if verdict is not None else None,
         "park": park,
     }
+
+
+def run_stage(
+    conn: sqlite3.Connection,
+    spec: Any,
+    deal: Any,
+    stage_id: str,
+    attempt: int,
+    *,
+    home: Path,
+    answer: Optional[str] = None,
+    spawn: Optional[Callable[..., Any]] = None,
+    clock: Optional[Callable[[], float]] = None,
+    monotonic: Optional[Callable[[], float]] = None,
+) -> dict[str, Any]:
+    """Одна попытка этапа: лизинг, дерево, контракт, процесс, факты в журнал.
+
+    Возвращает отчёт о шаге: `started` (попытка действительно пошла),
+    `outcome`/`kind`/`reason` — как в событии, `question_id` — если попытка
+    задала вопрос, `workdir`/`tree` — где она работала.
+
+    `answer` — ответ человека на вопрос прошлой попытки: с ним процесс
+    продолжается резюмом (`RESUME-OK`), без него начинается новая сессия.
+    """
+    launched = start_stage(
+        conn, spec, deal, stage_id, attempt, home=home, answer=answer, spawn=spawn, clock=clock, monotonic=monotonic
+    )
+    if launched["live"] is None:
+        return launched["result"]
+    return finish_stage(conn, deal, launched["live"], home=home, spawn=spawn, clock=clock, monotonic=monotonic)
 
 
 def park_exhausted(
@@ -3943,6 +4250,350 @@ def hops_done(conn: sqlite3.Connection, deal: Any, stage_id: str) -> int:
     return count
 
 
+def ask_role(
+    conn: sqlite3.Connection,
+    spec: Any,
+    deal: Any,
+    stage: Any,
+    attempt: int,
+    question: dict[str, Any],
+    address: Any,
+    *,
+    home: Path,
+    report: Optional[dict[str, Any]] = None,
+    previous: Iterable[dict[str, Any]] = (),
+    spawn: Optional[Callable[..., Any]] = None,
+    clock: Optional[Callable[[], float]] = None,
+) -> dict[str, Any]:
+    """Спросить роль за ответом на вопрос этапа: контракт, процесс, отчёт.
+
+    Фактовый вопрос из `ask.allowed` пул не трогает (`docs/JOURNAL.md`: «второй
+    канал не заводится»): отвечает роль, и её ответ — такой же факт журнала, как
+    ответ человека, только с автором-ролью. Поэтому здесь нет ни `ask()`, ни
+    строки пула: движок собирает контракт ответа (`build_contract` — тот же
+    формат входа, что у попытки), спавнит роль (`spawn_command` с профилем
+    адресата) и читает её `result.json`.
+
+    Контракт отличается от контракта попытки в трёх местах, и все три — правда о
+    том, что делает роль: `role` — адресат, а не роль этапа; в `question` едет
+    сам вопрос, а в `asked` — отчёт попытки, которая его задала (`summary` и
+    `result.json` целиком: без него «отвечает на вопрос» = «угадывает
+    контекст»); `evidence_to_produce` пуст и схема отчёта — `{answer}`, потому
+    что роль ничего не сдаёт и гейт пакета к ней не применяется.
+
+    Ответ — `{ok, answer, authority, kind, reason, role, workdir, exit_code}`.
+    `authority: true` в отчёте значит «это не мне решать»: вопрос уходит
+    человеку, и это не отказ роли. Провал попытки ответа (`infra`/`contract`) —
+    тоже не потеря вопроса: `_parked` отправляет его человеку с причиной.
+    """
+    spawner = spawn or spawn_process
+    clock = clock or time.time
+    workdir = attempt_dir(home, deal, stage.id, attempt) / ASK_ROLE_SUBDIR
+    workdir.mkdir(parents=True, exist_ok=True)
+    deadline_sec = ttl_sec(stage)
+    events = journal.read_events(conn, str(deal["id"]))
+    contract = build_contract(
+        spec,
+        deal,
+        stage,
+        attempt,
+        workdir=workdir,
+        tree=None,
+        cwd=workdir,
+        previous=list(previous),
+        deadline_sec=deadline_sec,
+        events=events,
+    )
+    contract["role"] = str(address.value)
+    contract["question"] = dict(question)
+    contract["asked"] = {
+        "stage": stage.id,
+        "attempt": int(attempt),
+        "summary": str((report or {}).get("summary") or ""),
+        "report": dict(report or {}),
+    }
+    contract["answer_report"] = {
+        "answer": {
+            "text": "твой ответ одной фразой — с ним этап продолжит работу",
+            "authority": "true — это не мне решать: вопрос уйдёт человеку",
+        }
+    }
+    contract["evidence_to_produce"] = []
+    contract["report_schema"] = {"answer": contract["answer_report"]["answer"]}
+    contract_file = write_contract(contract_path(workdir, stage.id, attempt), contract)
+    answer_file = result_path(workdir)
+    if answer_file.exists():
+        # Свой отчёт пишет только эта попытка ответа: остаток прошлой читался бы
+        # как её ответ.
+        answer_file.unlink()
+    try:
+        process = spawner(spawn_command(str(address.value), contract_file), workdir)
+    except OSError as exc:
+        return _role_failed(address, workdir, FAIL_INFRA, f"роль {address.value} не поднялась: {exc}")
+    code = process.wait(float(deadline_sec))
+    if code is None:
+        process.stop()
+    write_stderr(workdir, getattr(process, "stderr_text", ""))
+    result, error = read_result(answer_file)
+    text, authority = _role_answer_of(result)
+    if code is None:
+        return _role_failed(
+            address, workdir, FAIL_INFRA, f"роль {address.value} не ответила за {deadline_sec}с"
+        )
+    if result is None and code != 0:
+        return _role_failed(
+            address, workdir, FAIL_INFRA, f"роль {address.value} вышла кодом {code} без ответа"
+        )
+    if result is None:
+        return _role_failed(address, workdir, FAIL_CONTRACT, error)
+    if not text and not authority:
+        return _role_failed(
+            address,
+            workdir,
+            FAIL_CONTRACT,
+            f"роль {address.value} не назвала answer.text: {answer_file}",
+        )
+    return {
+        "ok": True,
+        "answer": text,
+        "authority": authority,
+        "kind": "",
+        "reason": "",
+        "role": str(address.value),
+        "workdir": str(workdir),
+        "exit_code": code,
+    }
+
+
+def _role_failed(address: Any, workdir: Path, kind: str, reason: str) -> dict[str, Any]:
+    """Попытка ответа роли не удалась — отказ с классом, а не пустой ответ.
+
+    Класс считается по тем же источникам, что у попытки этапа (`dashboard/
+    failures.py`): не поднялась/не ответила за срок/вышла ненулевым кодом без
+    отчёта — `infra`, отчёт есть, а ответа в нём нет — `contract`.
+    """
+    return {
+        "ok": False,
+        "answer": "",
+        "authority": False,
+        "kind": kind,
+        "reason": reason,
+        "role": str(address.value),
+        "workdir": str(workdir),
+        "exit_code": None,
+    }
+
+
+def _role_answer_of(result: Optional[dict[str, Any]]) -> tuple[str, bool]:
+    """Ответ роли из отчёта: текст и «это не мне решать».
+
+    `answer` бывает строкой (короткая форма) или словарём `{text, authority}`.
+    `authority` — только явное `true`: `"true"` строкой и прочие значения
+    властным ответом не считаются, иначе опечатка в отчёте решала бы за человека.
+    """
+    raw = (result or {}).get("answer")
+    if isinstance(raw, str):
+        return raw.strip(), False
+    if not isinstance(raw, dict):
+        return "", False
+    return str(raw.get("text") or "").strip(), raw.get("authority") is True
+
+
+def _role_question_fact(
+    deal: Any,
+    stage: Any,
+    attempt: int,
+    text: str,
+    question: dict[str, Any],
+    address: Any,
+    hops: int,
+    now: int,
+) -> dict[str, Any]:
+    """Вопрос, ушедший роли: `question_asked` без пула.
+
+    Номер пула и `session_key` у такого вопроса пусты — это не «потерянные
+    поля», а правда: строки пула не существует, вопрос прочитает роль из своего
+    контракта, а журнал хранит его текст и адрес. `routing.hops` — номер
+    передачи по цепочке (`max_hops`): он же потом считается `hops_done`.
+    """
+    payload: dict[str, Any] = {
+        "routing": {
+            **address.as_payload(),
+            "stage": stage.id,
+            "attempt": int(attempt),
+            "hops": int(hops) + 1,
+        },
+        "text": text,
+    }
+    text_full = question.get("text_full")
+    if isinstance(text_full, str) and text_full.strip():
+        payload["text_full"] = text_full.strip()
+    return _event(
+        deal,
+        "question_asked",
+        payload,
+        {"stage": stage.id, "attempt": int(attempt), "role": str(address.value)},
+        now,
+    )
+
+
+def _role_answer_fact(
+    deal: Any,
+    stage_id: str,
+    attempt: int,
+    role: str,
+    hops: int,
+    answer: str,
+    via: str,
+    now: int,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Ответ роли: `question_answered` с автором-ролью, а не с пулом.
+
+    Текст едет в журнале (`answer`), потому что пула у вопроса роли нет — там
+    его читать негде. `answer_len` остаётся у всех ответов: у ответа человека он
+    единственное, что есть, и одна форма на два источника не должна терять поле.
+    `hops` — номер передачи, которая этим фактом закрывается (`routing.hops`
+    вопроса плюс один, либо тот же, что записан в вопросе при восстановлении:
+    передача была одна, и номер у вопроса и ответа обязан совпасть).
+    `via` — чем кончилась передача, когда ответа нет: `redirected` («дальше
+    человек») или `failed` (попытка ответа упала) — по ним `transit` отличает
+    закрытие вопроса роли от ответа по сроку (`expired`).
+    """
+    payload: dict[str, Any] = {
+        "by": role,
+        "hops": int(hops),
+        "answer_len": len(answer),
+        "routing": {"stage": stage_id, "attempt": int(attempt)},
+    }
+    if answer:
+        payload["answer"] = answer
+    if via:
+        payload["answered_via"] = via
+    if reason:
+        payload["reason"] = reason
+    return _event(
+        deal,
+        "question_answered",
+        payload,
+        {"stage": stage_id, "attempt": int(attempt), "role": role, "via": via},
+        now,
+    )
+
+
+def role_answer_before(events: Iterable[Any], stage_id: str, attempt: int) -> Optional[str]:
+    """Ответ роли на вопрос попытки `attempt - 1` — вход этой попытки.
+
+    Ответа человека здесь нет и быть не может: у вопроса роли нет строки пула,
+    и текст живёт только в журнале. Ответ берётся у **сразу предыдущей** попытки
+    (`routing.attempt`), а не «последний известный»: иначе устаревший ответ
+    подставлялся бы в третью попытку после падения второй. `None` — роль эту
+    попытку не поднимала, и продолжение идёт как обычно.
+    """
+    for event in reversed(list(events)):
+        if not isinstance(event, dict) or str(event.get("kind") or "") != "question_answered":
+            continue
+        payload = journal.payload_of(event)
+        if not str(payload.get("by") or ""):
+            continue
+        routing_ = payload.get("routing")
+        if not isinstance(routing_, dict):
+            continue
+        if str(routing_.get("stage") or "") != stage_id:
+            continue
+        if _int(routing_.get("attempt")) != int(attempt) - 1:
+            continue
+        text = str(payload.get("answer") or "").strip()
+        return text or None
+    return None
+
+
+def _asked_role(
+    conn: sqlite3.Connection,
+    spec: Any,
+    deal: Any,
+    stage: Any,
+    attempt: int,
+    text: str,
+    question: dict[str, Any],
+    address: Any,
+    hops: int,
+    *,
+    result: dict[str, Any],
+    previous: Iterable[dict[str, Any]],
+    home: Path,
+    spawn: Optional[Callable[..., Any]],
+    clock: Callable[[], float],
+) -> tuple[Any, str]:
+    """Вопрос адресован роли: журнал вместо пула, спавн роли вместо парковки.
+
+    Вопрос пишется в журнал **до** спавна: пока роль отвечает, дело стоит в
+    `wait_human` (`transit`, правило 7 — вопроса без ответа другого состояния
+    нет), и это верное состояние, а не «попытка идёт». Ответ ложится той же
+    парой `question_asked` → `question_answered`, и этап поднимается **новой**
+    попыткой (`role_answer_before` отдаёт ей текст ответа).
+
+    Возвращает адрес, по которому вопрос идёт дальше, и причину переадресации:
+    `role:<имя>` — роль ответила, пул не нужен; `human` — роль переадресовала
+    (`authority: true`) или не ответила, и вопрос уходит человеку обычным путём.
+    """
+    now = _now_sec(int(clock()))
+    journal.append(conn, [_role_question_fact(deal, stage, attempt, text, question, address, hops, now)])
+    answer = ask_role(
+        conn,
+        spec,
+        deal,
+        stage,
+        attempt,
+        {**question, "text": text},
+        address,
+        home=home,
+        report=result,
+        previous=previous,
+        spawn=spawn,
+        clock=clock,
+    )
+    after = _now_sec(int(clock()))
+    if answer["ok"] and not answer["authority"]:
+        journal.append(
+            conn,
+            [
+                _role_answer_fact(
+                    deal, stage.id, attempt, str(address.value), hops + 1, answer["answer"], "", after
+                )
+            ],
+        )
+        return address, ""
+    # Вопрос не сгорает: и переадресация, и провал ответа ведут его человеку.
+    # Факт закрывает передачу роли (`redirected`/`failed`), причина едет рядом —
+    # иначе «почему спросили человека» разбиралось бы по коду.
+    why = (
+        f"роль {address.value} переадресовала вопрос человеку: authority"
+        if answer["ok"]
+        else answer["reason"]
+    )
+    journal.append(
+        conn,
+        [
+            _role_answer_fact(
+                deal,
+                stage.id,
+                attempt,
+                str(address.value),
+                hops + 1,
+                "",
+                transit.ROLE_ANSWER_REDIRECTED if answer["ok"] else transit.ROLE_ANSWER_FAILED,
+                after,
+                reason=why,
+            )
+        ],
+    )
+    return routing.Target(
+        routing.HUMAN,
+        reason=routing.REASON_REDIRECTED if answer["ok"] else routing.REASON_ROLE_FAILED,
+    ), why
+
+
 def _parked(
     conn: sqlite3.Connection,
     deal: Any,
@@ -3951,20 +4602,25 @@ def _parked(
     result: dict[str, Any],
     home: Path,
     clock: Callable[[], float],
-) -> tuple[int, Any]:
-    """Попытка задала вопрос: единственный канал `ask()` и дело в `wait_human`.
+    *,
+    spec: Any,
+    spawn: Optional[Callable[..., Any]] = None,
+    previous: Iterable[dict[str, Any]] = (),
+) -> tuple[Optional[int], Any]:
+    """Попытка задала вопрос: адрес решает `routing.route`, канал — адрес.
 
     `clarify` внутри `--oneshot` ответа не получает (`undelivered`,
     `docs/PROBES.md`), поэтому вопрос задаёт движок, а не процесс; текст вопроса
     приходит в `result.json` полем `question`.
 
-    Адрес вопроса решает `routing.route()` — без модели и по объявлениям спеки:
-    фактовый вопрос — роли из `ask.allowed`, властный и неразмеченный — человеку,
-    исчерпанная цепочка — человеку, несуществующий адресат — человеку с
-    `routing_failed`. Здесь только исполнение: факт в пул и адрес в журнал.
+    Два канала, и выбор между ними — адрес: роль из `ask.allowed` получает
+    вопрос движком (`_asked_role`: журнал и спавн роли), а всё остальное —
+    властный или неразмеченный вопрос, исчерпанная цепочка, несуществующий
+    адресат — идёт человеку пул-каналом `ask()` с парковкой `needs_input`, как
+    до 0.1.0. `route()` уже отправил вопрос человеку, если цепочка исчерпана,
+    поэтому спавн роли случается только внутри `max_hops`.
     """
     question = result.get("question")
-    address = routing.route(stage, question, hops_done(conn, deal, stage.id))
     if isinstance(question, str):
         question = {"text": question}
     text = ""
@@ -3978,6 +4634,28 @@ def _parked(
         text = str(result.get("summary") or "").strip()
     if not text:
         text = f"попытка {stage.id}#{attempt} просит решения: текста вопроса в отчёте нет"
+    hops = hops_done(conn, deal, stage.id)
+    address = routing.route(stage, question, hops)
+    note = ""
+    if address.kind == routing.ROLE:
+        address, note = _asked_role(
+            conn,
+            spec,
+            deal,
+            stage,
+            attempt,
+            text,
+            question if isinstance(question, dict) else {"text": text},
+            address,
+            hops,
+            result=result,
+            previous=previous,
+            home=home,
+            spawn=spawn,
+            clock=clock,
+        )
+        if address.kind == routing.ROLE:
+            return None, address
     asked = ask.ask(
         conn,
         {**deal, "home": Path(home)},
@@ -3993,6 +4671,7 @@ def _parked(
         reason=(
             f"попытка {stage.id}#{attempt}: вопрос #{asked.question_id} "
             f"адресован {address.address} ({address.reason}) — без ответа"
+            + (f"; ответ роли: {note}" if note else "")
         ),
         author=ENGINE_SOURCE,
         source=ENGINE_SOURCE,
@@ -4062,6 +4741,140 @@ def _answered_needs_input(conn: sqlite3.Connection, deal: Any) -> bool:
     return str(journal.payload_of(opened).get("block_kind") or "") == "needs_input"
 
 
+def recover_role_questions(
+    conn: sqlite3.Connection,
+    deal: Any,
+    *,
+    home: Path,
+    clock: Optional[Callable[[], float]] = None,
+) -> list[dict[str, Any]]:
+    """Открытый вопрос роли, которого уже никто не ждёт, — человеку, а не в вечность.
+
+    Вопрос роли движок задаёт и получает ответ **одним вызовом** (`_asked_role`):
+    пара `question_asked` → `question_answered` пишется одним шагом, и пока роль
+    отвечает, дело стоит в `wait_human` — другого состояния у вопроса нет. Значит
+    открытый вопрос роли, до которого дожил проход по журналу, никто не
+    дожидается: движка, который его задал, уже нет (SIGKILL, разрыв гейтвея, сбой
+    записи между двумя фактами).
+
+    Без этого прохода такой вопрос висел бы вечно, и дело было бы живым только до
+    `bin/duty close`, то есть работа терялась бы: строки пула у вопроса роли нет —
+    ответить человеку нечем, — а спавна роли больше не будет (попытка уже
+    закрыта `attempt_ended`, и `_runnable` поднимает только `pending`).
+
+    Поэтому передача закрывается фактом `question_answered` с
+    `answered_via='failed'`, а вопрос уходит человеку **тем же путём**, что у
+    упавшей попытки ответа: `ask()` (единственный канал пула) плюс `blocked` с
+    `block_kind='needs_input'`. Вопрос не сгорает, и следующий прогон двигает
+    дело дальше, как только человек ответит. Саму роль не переспрашиваем: ответ
+    ждал тот же движок, который ушёл, и «переспросить» значило бы надеяться, что
+    он не уйдёт снова.
+
+    Возвращает строки восстановления — по одной на вопрос: этап, попытка, роль,
+    номер вопроса в пуле и причина. Пустой список — восстанавливать нечего.
+    """
+    events = journal.read_events(conn, str(deal["id"]))
+    question = _open_role_question(events)
+    if question is None:
+        return []
+    payload = journal.payload_of(question)
+    routing_ = payload.get("routing")
+    address_of = routing_ if isinstance(routing_, dict) else {}
+    target = str(address_of.get("target") or "")
+    stage_id = str(address_of.get("stage") or "")
+    attempt = int(_int(address_of.get("attempt")) or 0)
+    hops = int(_int(address_of.get("hops")) or 0)
+    role = target.split(":", 1)[1] if ":" in target else target
+    text = str(payload.get("text") or "").strip() or (
+        f"попытка {stage_id}#{attempt} просит решения: текста вопроса в журнале нет"
+    )
+    now = _now_sec(int((clock or time.time)()))
+    why = (
+        f"вопрос роли {role} остался без ответа: движок, который его задал, "
+        "ответ не записал — вопрос уходит человеку"
+    )
+    journal.append(
+        conn,
+        [
+            _role_answer_fact(
+                deal, stage_id, attempt, role, hops, "", transit.ROLE_ANSWER_FAILED, now, reason=why
+            )
+        ],
+    )
+    address = routing.Target(routing.HUMAN, reason=routing.REASON_ROLE_FAILED)
+    asked = ask.ask(
+        conn,
+        {**deal, "home": Path(home)},
+        text,
+        str(payload.get("text_full") or "") or None,
+        None,
+        routing={**address.as_payload(), "stage": stage_id, "attempt": attempt},
+    )
+    deals.set_blocked(
+        conn,
+        str(deal["id"]),
+        kind="needs_input",
+        reason=f"попытка {stage_id}#{attempt}: {why} (вопрос #{asked.question_id})",
+        author=ENGINE_SOURCE,
+        source=ENGINE_SOURCE,
+        now=now,
+    )
+    return [
+        {
+            "stage": stage_id,
+            "attempt": attempt,
+            "role": role,
+            "question_id": int(asked.question_id),
+            "reason": why,
+        }
+    ]
+
+
+def _open_role_question(events: Iterable[Any]) -> Optional[dict[str, Any]]:
+    """Последний вопрос роли без ответа, чья попытка уже закрыта.
+
+    У вопроса роли нет `question_id` — строки пула не существует, — поэтому пара
+    «вопрос → ответ» держится порядком журнала: ответ без номера снимает
+    последний открытый вопрос без номера (ровно так же, как `journal.fold`,
+    `_open_question`). Вопросы человека сюда не попадают: у них номер есть, и
+    ждёт их человек, а не движок — переспрашивать за него нечего.
+
+    Третье условие — `attempt_ended` той же попытки **до** вопроса: вопрос роли
+    задаётся по закрытой попытке (`_parked` пишет его после `attempt_ended`),
+    поэтому «попытка ещё идёт» означало бы, что спрашивать рано и вопрос, может
+    быть, ещё дождётся своего ответа.
+    """
+    closed: set[tuple[str, int]] = set()
+    opened: Optional[dict[str, Any]] = None
+    asked_by_closed = False
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        kind = str(event.get("kind") or "")
+        payload = journal.payload_of(event)
+        if kind == "attempt_ended":
+            closed.add((str(payload.get("stage") or ""), int(_int(payload.get("attempt")) or 0)))
+            continue
+        if kind not in ("question_asked", "question_answered") or _question_id(payload) is not None:
+            continue
+        if kind == "question_answered":
+            opened, asked_by_closed = None, False
+            continue
+        routing_ = payload.get("routing")
+        target = str(routing_.get("target") or "") if isinstance(routing_, dict) else ""
+        if not target.startswith(f"{routing.ROLE}:"):
+            opened, asked_by_closed = None, False
+            continue
+        opened = event
+        asked_by_closed = (
+            str(routing_.get("stage") or ""),
+            int(_int(routing_.get("attempt")) or 0),
+        ) in closed
+    if opened is None or not asked_by_closed:
+        return None
+    return opened
+
+
 def step(
     conn: sqlite3.Connection,
     spec: Any,
@@ -4080,6 +4893,10 @@ def step(
     решает не этот слой, и выдумывать здесь шаг нельзя. `answer` относится к
     продолжению после вопроса и передаётся в каждую попытку этого шага.
 
+    Пачка (`decision.pair` длиннее одного) поднимается целиком и только потом
+    рассматривается: попытки идут одновременно, и падение одной не отменяет
+    вторую — у каждой свой лизинг, свой процесс и свой факт конца.
+
     Перед попытками движок закрывает блок, который ждал ответа
     (`close_answered_block`): ответ человека — уже факт журнала, а открытый
     `blocked` держал бы дело в `wait_human`, хотя движок снова взялся за работу.
@@ -4088,20 +4905,39 @@ def step(
     if kind != DECISION_RUN:
         return {"started": 0, "skipped": f"решение {kind or '—'} не запускает попыток", "runs": []}
     close_answered_block(conn, deal, clock=clock)
-    runs: list[dict[str, Any]] = []
+    runs: list[Optional[dict[str, Any]]] = []
+    live: list[tuple[int, _Live]] = []
     for stage_id, attempt in getattr(decision, "pair", []) or []:
-        runs.append(
-            run_stage(
-                conn,
-                spec,
-                deal,
-                str(stage_id),
-                int(attempt),
-                home=home,
-                answer=answer,
-                spawn=spawn,
-                clock=clock,
-                monotonic=monotonic,
-            )
+        launched = start_stage(
+            conn,
+            spec,
+            deal,
+            str(stage_id),
+            int(attempt),
+            home=home,
+            answer=answer,
+            spawn=spawn,
+            clock=clock,
+            monotonic=monotonic,
         )
-    return {"started": sum(1 for run in runs if run.get("started")), "runs": runs}
+        runs.append(launched["result"])
+        if launched["live"] is not None:
+            live.append((len(runs) - 1, launched["live"]))
+    # Слежение — после подъёма всей пачки: два этапа пачки идут одновременно, а не
+    # один за другим. Каждая попытка закрывается своим фактом (`attempt_ended`),
+    # поэтому «шаг закрыт» — это столько закрытий, сколько попыток в решении.
+    for index, attempt_live in live:
+        others = tuple(
+            (item.stage.id, item.pid, item.ttl) for number, item in live if number != index
+        )
+        runs[index] = finish_stage(
+            conn,
+            deal,
+            attempt_live,
+            home=home,
+            others=others,
+            spawn=spawn,
+            clock=clock,
+            monotonic=monotonic,
+        )
+    return {"started": sum(1 for run in runs if run.get("started")), "runs": list(runs)}

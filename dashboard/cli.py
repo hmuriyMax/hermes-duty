@@ -2071,6 +2071,23 @@ def render_answer_error(row: dict[str, Any]) -> str:
     )
 
 
+def render_role_recovery(row: dict[str, Any]) -> str:
+    """Строка о вопросе роли, который движок нашёл открытым и увёл человеку.
+
+    Восстановление — не тихая уборка: вопрос был адресован роли, её ответа не
+    стало (движок ушёл между вопросом и ответом), и теперь ответ ждёт человек.
+    Поэтому строка называет этап, попытку, роль и **номер вопроса в пуле** —
+    по нему человек и отвечает.
+    """
+    return "! вопрос роли: {}#{} · {} → человек, вопрос #{} · {}".format(
+        row.get("stage") or "—",
+        row.get("attempt") or 0,
+        row.get("role") or "—",
+        row.get("question_id") or "—",
+        row.get("reason") or "причина не записана",
+    )
+
+
 def render_run_final(report: dict[str, Any]) -> str:
     """Итог прогона одной строкой: что сделано и чего ждём.
 
@@ -2098,9 +2115,18 @@ def render_run_final(report: dict[str, Any]) -> str:
     released = int(report.get("released") or 0)
     if released:
         picked += f" · дел отпущено: {released}"
+    recovered = report.get("recovered") or []
+    if recovered:
+        picked += f" · вопросов роли восстановлено: {len(recovered)}"
     closed = report.get("closed")
     line = _run_final_line(report, note, made, picked, closed)
-    return "\n".join([line, *(render_release_error(row) for row in report.get("release_errors") or ())])
+    return "\n".join(
+        [
+            line,
+            *(render_release_error(row) for row in report.get("release_errors") or ()),
+            *(render_role_recovery(row) for row in recovered),
+        ]
+    )
 
 
 def _run_final_line(report: dict[str, Any], note: str, made: int, picked: str, closed: Any) -> str:
@@ -2187,6 +2213,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     on_step=None if args.json else (lambda row: print(render_run_step(row), file=out)),
                     on_reap=None if args.json else (lambda row: print(render_reap_row(row), file=out)),
                     on_answer_error=None if args.json else (lambda row: print(render_answer_error(row), file=out)),
+                    on_recover=None if args.json else (lambda row: print(render_role_recovery(row), file=out)),
                     on_release=None if args.json else (lambda row: print(render_release_row(row), file=out)),
                     on_release_error=None if args.json else (lambda row: print(render_release_error(row), file=out)),
                 )

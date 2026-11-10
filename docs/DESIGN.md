@@ -151,17 +151,27 @@ failures.classify → policy → decide_park
    ├─ повтор   → пауза 30 с … 5 мин, retry_at в срез (дело ждёт, движок не спит)
    ├─ исчерпан → park: ask() человеку + blocked(block_kind='parked')
    └─ закрыто  → transit считает следующий этап; все done → deals.close_stages_done
-                 (completed cause='all_stages_done' + строка дела, одна транзакция)
+                 (completed + строка дела, одна транзакция: cause='all_stages_done',
+                  а в графе с закрывающим этапом — слово лида, cause='lead_closed')
 ```
 
 Цикл («решение → шаг → перечитать журнал») — `dashboard/driver.py`. Он не знает ни
 одного правила перехода: спрашивает `transit`, отдаёт `runner`, снова читает
 журнал. Поэтому `bin/duty run`, убитый после `impl`, продолжает с `verify`.
 
+Шаг может вести **две попытки сразу** — только если граф объявил их параллельными
+(`transit._batch`, не больше `MAX_PARALLEL` = 2). Поэтому шаг разделён надвое:
+`start_stage` поднимает попытку (лизинг, дерево, контракт, процесс, `attempt_started`),
+`finish_stage` доводит её до факта (поток, гейты, приговор, `attempt_ended`), а
+`runner.step` сначала поднимает всю пачку и только потом следит за каждой попыткой.
+Своего состояния у пачки нет: две открытые попытки в журнале и есть «два этапа идут».
+
 **«Все этапы закрыты» — факт журнала, а не строка вывода.** `transit` отвечает
 `done`, и драйвер пишет это тем же путём, что `bin/duty close`: `completed` с
-`cause='all_stages_done'` и список пройденных этапов, одной транзакцией со строкой
-дела. До этой правки прогон печатал «итог: дело закрыто» и не записывал ничего —
+`cause` и списком пройденных этапов, одной транзакцией со строкой дела. Причину и
+итог называет граф из журнала: без закрывающего этапа — `all_stages_done`, с ним —
+`lead_closed` и `summary` лида из его отчёта (1.0, `docs/SPEC.md`). До этой правки
+прогон печатал «итог: дело закрыто» и не записывал ничего —
 дело оставалось `status='running'` без `completed` (живой прогон `d_6e764042`), то
 есть движок называл результат, которого в системе не было. Итог в консоли
 печатается **по записанному факту**; повторный `run` второго `completed` не пишет и
@@ -184,7 +194,7 @@ failures.classify → policy → decide_park
 | Можно ли вообще запускать это дело? | `validate_spec()`: формат, ключи, граф, гейты, `review-gate` | `dashboard/spec.py` (контракт — `docs/SPEC.md`) |
 | Что делать дальше: `run`, `wait`, `done`, `failed`, `park`? | `next_stage(spec, events, now)` — чистая функция, ни БД, ни сети, ни часов | `dashboard/transit.py` |
 | В каком состоянии каждый этап и какая у него попытка? | `stage_states(spec, events)` — тот же свёрточный проход, что у решения | `dashboard/transit.py` |
-| Как поднять попытку: лизинг, дерево, контракт, спавн, поток? | `run_stage()` / `step()` | `dashboard/runner.py` |
+| Как поднять попытку: лизинг, дерево, контракт, спавн, поток? | `start_stage()` / `finish_stage()` (`run_stage()` — тот же путь для одного этапа) и `step()` | `dashboard/runner.py` |
 | От чего отводится дерево этапа и кто коммитит принятую работу? | `base_of_stage(spec, stage, events)` — база **этапа** (`spec.base` у входа, коммит последней успешной попытки предшественника у следующего; предшественник, не произведший коммита (`workspace: dir`/`none`), базой не становится — берётся `spec.base`; расходящиеся коммиты предшественников — `BaseError` = `failed(contract)`); `commit_tree(tree, …)` — `git add -A` и коммит `duty: <deal> <stage> attempt <n>` в дереве попытки (detached HEAD: дерево попытки ветку не занимает), а `anchor_commit(tree, deal, commit)` ставит на этот коммит ветку дела `duty/<deal_id>` — иначе работа живёт до первого `git gc` | `dashboard/runner.py` |
 | Где лизинг этапа и сколько он живёт? | таблица `leases` в своей `duty/duty.db`, TTL из `budget.minutes` | `dashboard/runner.py` |
 | «Что делается прямо сейчас»? | `attempt_progress` на каждый `tool_use`/`tool_result`; `fold` копит `progress: {tools, last_tool, last_at}` | `dashboard/runner.py` → `dashboard/journal.py` |
@@ -252,7 +262,7 @@ failures.classify → policy → decide_park
 
 | что на экране | откуда факт |
 |---|---|
-| этапы в порядке объявления графа, роль, состояние, номер попытки, раунды | `transit.stage_states(spec, events)` — тот же предикат «готов», что у движка |
+| этапы в порядке объявления графа, роль, состояние, номер попытки, раунды, объявленная параллель `parallel_with`, автор добавленного этапа `added_by` | `transit.stage_states(spec, events)` — тот же предикат «готов», что у движка; граф — `transit.graph` (seed плюс принятый план), поэтому параллель и автор — факты графа, а не догадка поверхности |
 | попытка: pid, начало, конец, длительность, код выхода, исход, класс отказа, токены, инструменты, причина, база дерева `base`, что произвела попытка `commit`, `reaped` (закрыл движок) | `attempt_started` / `attempt_ended` журнала (по `run_id`) |
 | живость попытки: `live` / `dead` / неизвестно | срок лизинга из `attempt_started`; `attempt_ended` значит «закрыта» |
 | ожидание: вопрос (номер + ссылка на панель пула `/imsg`) или гейт графа | `stage_states` (`question_id`, `reason`) |
@@ -368,7 +378,7 @@ failures.classify → policy → decide_park
 
 | # | состояние | какой факт журнала его даёт |
 |---|---|---|
-| 1 | `wait_human` | `question_asked` без `question_answered` (живой вопрос пула); `blocked` без `unblocked` с `block_kind≠capability` (в том числе `parked` — попытки исчерпаны); `review_requested` без `collected`/`changes_requested` |
+| 1 | `wait_human` | `question_asked` без `question_answered` (живой вопрос: пула — пара по `question_id`, роли — пара по порядку журнала); `blocked` без `unblocked` с `block_kind≠capability` (в том числе `parked` — попытки исчерпаны); `review_requested` без `collected`/`changes_requested` |
 | 2 | `capability` | `blocked` без `unblocked`, где `block_kind='capability'` или причина блока содержит слово из `CAPABILITY_WORDS` (доступ, права, разрешение, `permission`, `access`, `credential`, `token`, `forbidden`, `403`) |
 | 3 | `dead_lease` | `claimed` со сроком `claim_expires`, который прошёл, и без `attempt_started` за ним |
 | 4 | `crashed` | `attempt_started` без `attempt_ended`, а записанный `pid` мёртв |
@@ -537,7 +547,8 @@ failures.classify → policy → decide_park
 - `first_try.closed = 0` — это «считать не по чему» (`share: null`), а не «сто
   процентов»;
 - `waiting_human_sec` и `waiting_sec` — **разные величины**: первая меряет
-  `question_asked` → `question_answered` (сколько ждал человек), вторая — `created` →
+  `question_asked` → `question_answered` по номеру пула (сколько ждал человек; вопрос
+  роли номера не имеет и в неё не входит — ждали роль), вторая — `created` →
   первая попытка этапа (сколько ждал движок). Подменять одну другой нельзя;
 - `contract_refusals` считается по классу `contract` (`attempt_ended.kind`, старые
   записи — `details.class`) и разбивается по правилу: `details.rule`, иначе код

@@ -91,6 +91,11 @@ PUBLISHED = "published"
 # поля не имеют — и это `agent`: до 0.0.5 других видов у этапа не было.
 STAGE_KIND_AGENT = "agent"
 
+# Кто добавил этап, которого нет в seed-спеке: план предлагает лид
+# (`spec.PLAN_STAGE`, роль `lead`). Поле среза `added_by` называет автора фактом
+# графа, а не догадкой поверхности по имени этапа.
+PLAN_ADDED_BY = "lead"
+
 # Живость попытки: три ответа, а не два. `None` — журнал не записал срок лизинга
 # (старая запись или событие без `lease_expires`), и тогда «жив» было бы догадкой.
 LIVE = "live"
@@ -610,12 +615,19 @@ def stages(spec: Any, events: Iterable[Any], now: Any) -> list[dict[str, Any]]:
     появиться на экране без перечитывания файла (`docs/ENGINE-1.0.md`, раздел 7).
     Спека на диске остаётся seed-ом, и экран с движком видят один граф.
 
+    `added_by` и `parallel_with` — факты графа, а не догадка поверхности: этап,
+    которого нет в seed-спеке, добавлен лидом (`PLAN_ADDED_BY`), а параллель
+    объявлена в `needs`-соседе тем же планом или спекой. Без этих полей экран
+    рисовал бы «добавлен лидом» по имени этапа и параллель — по совпадению
+    времени старта.
+
     Парковка читается из журнала (`journal.parked_of`): у неё нет состояния этапа,
     потому что исчерпанный этап в графе `failed`, — а ждёт он человека.
     """
     moment = _int(now)
     events = list(events or ())
     graph = graph_of(spec, events)
+    seeded = {stage.id for stage in getattr(spec, "stages", ()) or ()}
     states = transit.stage_states(spec, events)
     rows = [_public(row, moment) for row in _attempts(events)]
     parked = journal.parked_of(events)
@@ -634,6 +646,8 @@ def stages(spec: Any, events: Iterable[Any], now: Any) -> list[dict[str, Any]]:
                 "attempt": state.attempt,
                 "rounds": state.rounds,
                 "needs": list(state.needs),
+                "parallel_with": [str(other) for other in getattr(stage, "parallel_with", ()) or ()],
+                "added_by": "" if stage.id in seeded else PLAN_ADDED_BY,
                 "reason": state.reason,
                 "failures": {kind: count for kind, count in state.failures},
                 "waits": _waits(

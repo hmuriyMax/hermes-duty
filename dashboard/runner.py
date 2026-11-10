@@ -1247,10 +1247,15 @@ def plan_payload(spec: Any, events: Iterable[Any]) -> dict[str, Any]:
     # Отказы прошлого предложения — в контракте, а не только в журнале: попытка
     # реплана стартует вслепую и без них повторяет те же ошибки формы, сжигая
     # попытку за попыткой (кейс d_bdf8edfb: 9 ревизий с одной и той же прозой
-    # в evidence). Лид обязан видеть, ЧТО именно отклонил валидатор.
+    # в evidence). Лид обязан видеть, ЧТО именно отклонил валидатор. Скан идёт
+    # от свежих событий: берём ПЕРВЫЙ отказ с issues (новейший) — перезапись
+    # более старыми отказами оставляла в контракте самую древнюю отбраковку,
+    # и лид повторял отвергнутую форму, не видя свежих причин (кейс d_c8551c18:
+    # ревизии 4–7 отклонялись за «close уже начат» и пустой evidence, а в брифе
+    # жил отказ ревизии 2 про kind.cmd).
     for event in reversed(events):
         kind_name = str(event.get("kind") or "")
-        if kind_name == "plan_rejected":
+        if kind_name == "plan_rejected" and "last_rejected" not in out:
             rejected = journal.payload_of(event)
             if rejected.get("issues"):
                 out["last_rejected"] = {

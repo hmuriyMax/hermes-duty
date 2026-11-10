@@ -1070,6 +1070,48 @@ def test_plan_contract_carries_the_last_rejection_issues(tmp_path: Path) -> None
     assert any("evidence" in issue for issue in last["issues"])
 
 
+def test_plan_contract_carries_the_newest_rejection_not_the_oldest(
+    tmp_path: Path,
+) -> None:
+    """Несколько отбраковок в журнале — лид видит ПОСЛЕДНЮЮ, а не первую.
+
+    Кейс d_c8551c18: ревизии 4–7 отклонялись за «close уже начат» и пустой
+    evidence, а в бриф каждой следующей попытки уезжал отказ ревизии 2 про
+    kind.cmd — скан журнала перезаписывал `last_rejected` более старыми
+    отказами, и лид повторял отвергнутую форму вслепую.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = plan_spec(tmp_path)
+
+    def rejection(rev, why, issue, ts):
+        return {
+            "ts": ts,
+            "recorded_at": ts,
+            "deal_id": str(deal["id"]),
+            "kind": "plan_rejected",
+            "payload": {"rev": rev, "why": why, "issues": [issue]},
+            "source": "engine",
+            "idempotency_key": f"test:plan_rejected:{rev}",
+        }
+
+    journal.append(
+        conn,
+        [
+            rejection(1, "план ревизии 1 отклонён: отказов 1", "kind.cmd: старый отказ", 1794300000),
+            rejection(4, "план ревизии 4 отклонён: отказов 1", "plan.reorder: свежий отказ", 1794300100),
+        ],
+    )
+
+    run_stage(conn, spec, deal, home, Fake(result=None, exit_code=0, lines=[]))
+    contract_file = runner.contract_path(runner.attempt_dir(home, deal, "plan", 1), "plan", 1)
+    contract = json.loads(contract_file.read_text(encoding="utf-8"))
+    last = contract["plan"]["last_rejected"]
+    assert "ревизии 4" in last["why"]
+    assert any("plan.reorder" in issue for issue in last["issues"])
+
+
 def test_contract_tells_how_to_deliver_the_report_without_write_file(
     tmp_path: Path,
 ) -> None:

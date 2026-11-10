@@ -414,7 +414,8 @@ td.stage-now::before { content: '● '; font-size: 9px; vertical-align: 2px; }
 .why-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 6px 0 8px; }
 
 .why-evidence {
-  font-size: 12.5px;
+  font-size: 13px;
+  line-height: 1.5;
   color: var(--text);
   background: var(--bg-soft);
   border-left: 3px solid var(--border-strong);
@@ -430,7 +431,7 @@ td.stage-now::before { content: '● '; font-size: 9px; vertical-align: 2px; }
   flex-wrap: wrap;
   margin-top: 9px;
   font-size: 12px;
-  color: var(--text-3);
+  color: var(--text-2);
 }
 
 /* ---------- «дело» ---------- */
@@ -1075,17 +1076,19 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 .duty-kpi { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; }
 .duty-kpi-cell {
   display: grid; grid-auto-flow: column; align-items: baseline; gap: 6px;
-  padding: 5px 10px; border-radius: 7px; border: 1px solid var(--border); background: var(--card);
+  padding: 7px 12px; border-radius: 7px; border: 1px solid var(--border); background: var(--card);
 }
 .duty-kpi-v { font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; }
-.duty-kpi-l { font-size: 10.5px; color: var(--text-3); }
-.duty-kpi-n { font-size: 10px; color: var(--text-3); opacity: .8; }
+/* Подписи под числами — тот же контраст, что у основного текста: 10.5px в
+   --text-3 не читается ни в светлой (3.07:1), ни в тёмной (3.78:1) теме. */
+.duty-kpi-l { font-size: 11px; color: var(--text-2); }
+.duty-kpi-n { font-size: 10.5px; color: var(--text-2); }
 
 /* ---------------------------------------------------------- ряды маркеров */
 /* Маркеры — строками по смыслу: вердикты, вопросы, публикация, засечки. */
 .scale-marks { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 6px; }
 .smk-row { display: grid; grid-template-columns: 186px 1fr; gap: 8px; align-items: center; height: 18px; }
-.smk-name { font-size: 10.5px; color: var(--text-3); text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.smk-name { font-size: 11px; color: var(--text-2); text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .smk-line { position: relative; height: 18px; }
 .smk { position: absolute; top: 50%; transform: translate(-50%, -50%); line-height: 0; }
 .smk i { display: block; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }

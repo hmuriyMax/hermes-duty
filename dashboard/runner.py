@@ -4285,6 +4285,15 @@ def _rethink_park(
             )
         ],
     )
+    # Возврат в очередь: статус `running` без лизинга для диспетчера мёртв —
+    # он поднимает рантаймы только `ready`/`todo`/`wait_slot` (и `blocked`
+    # с вопросом человеку). Дело переосмысления должно ждать рантайма на
+    # план-этапе, иначе диагноз ляжет в журнал и дело зависнет (кейс
+    # d_c8551c18: plan_rethink 19:11, диспетчер больше не стартовал lead).
+    conn.execute(
+        "UPDATE deals SET status = 'ready', updated_at = ? WHERE id = ?",
+        (now, str(deal["id"])),
+    )
     return {
         "reason": "rethink",
         "kind": kind,

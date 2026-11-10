@@ -904,21 +904,40 @@ test('ось: шаг линейки растёт с длиной дела, ме�
     { now: 9000, terminal: false, timeline: [{ kind: 'created', at: 1000, summary: '' }], stages: [] },
     { attempts: [{ stage: 'impl', attempt: 1, started_at: 1000, ended_at: 9000, status: 'done' }] },
   )
-  // 8000 с > часа: шаг 10 минут, промежуточные метки — через 600 с.
+  // 8000 с > часа — полоса листается, метки идут каждые 10 минут (Макс,
+  // 09.11: «чаще метки времени»): ~12 промежуточных на 2,2 часа полосы.
   assert.equal(long.axis.spanSec, 8000)
   const middles = long.axis.ticks.slice(1, -1)
-  assert.ok(middles.length >= 2 && middles.length <= 8, `меток между краями: ${middles.length}`)
+  assert.ok(middles.length >= 8 && middles.length <= 16, `меток между краями: ${middles.length}`)
+  const secOfDay = (clock) => {
+    const [h, m, sec] = clock.split(':').map(Number)
+    return h * 3600 + m * 60 + sec
+  }
+  for (let i = 1; i < middles.length; i += 1) {
+    assert.equal(secOfDay(middles[i].clock) - secOfDay(middles[i - 1].clock), 600, 'шаг меток — не 10 минут')
+  }
   for (const tick of middles) assert.ok(tick.pct > 5 && tick.pct < 95, `метка на краю: ${tick.pct}`)
+
+  // Суточное дело: шаг всё ещё 10 минут — 144 метки на полосу, по шесть на
+  // видимый час; грубеет лестница только на многодневных полосах.
+  const day = shapeDealTime(
+    { now: 90_000, terminal: false, timeline: [{ kind: 'created', at: 1000, summary: '' }], stages: [] },
+    { attempts: [{ stage: 'impl', attempt: 1, started_at: 1000, ended_at: 90_000, status: 'done' }] },
+  )
+  assert.ok(day.axis.ticks.length >= 100 && day.axis.ticks.length <= 170, `суточных меток: ${day.axis.ticks.length}`)
+
+  // Недельное дело: лестница грубеет до 30 минут — полоса не плодит тысячи узлов.
+  const week = shapeDealTime(
+    { now: 8 * 86400, terminal: false, timeline: [{ kind: 'created', at: 1000, summary: '' }], stages: [] },
+    { attempts: [{ stage: 'impl', attempt: 1, started_at: 1000, ended_at: 8 * 86400, status: 'done' }] },
+  )
+  assert.ok(week.axis.ticks.length <= 480, `недельных меток: ${week.axis.ticks.length}`)
 
   const short = shapeDealTime(
     { now: 1500, terminal: false, timeline: [{ kind: 'created', at: 1000, summary: '' }], stages: [] },
     { attempts: [{ stage: 'impl', attempt: 1, started_at: 1000, ended_at: 1400, status: 'done' }] },
   )
   // 500 с: шаг 2 минуты → метки не чаще, чем каждые 120 с.
-  const secOfDay = (clock) => {
-    const [h, m, sec] = clock.split(':').map(Number)
-    return h * 3600 + m * 60 + sec
-  }
   const shortTicks = short.axis.ticks.slice(1, -1)
   assert.equal(shortTicks.length, 4, `меток между краями: ${shortTicks.length}`)
   for (let i = 1; i < shortTicks.length; i += 1) {

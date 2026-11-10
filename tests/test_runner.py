@@ -477,6 +477,11 @@ def test_contract_file_holds_the_attempt_input(tmp_path: Path) -> None:
         "default": "",
     }
     assert contract["boundaries"], "границы попытки обязаны быть названы"
+    # Правило про spillover — у любой роли, не только у ревьюера: большой
+    # Confluence-документ читает и координатор (кейс d_48e01a0e: страница на
+    # 238 КБ уже лежала в spillover-файле, а попытка тянула её повторно).
+    assert any("spillover" in line for line in contract["boundaries"])
+    assert any("url, а не page_id" in line for line in contract["boundaries"])
     assert "answer_this_attempt" not in contract
     # cwd процесса — каталог попытки: дерева у `workspace: none` нет.
     assert fake.calls[0]["cwd"] == workdir

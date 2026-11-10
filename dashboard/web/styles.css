@@ -946,6 +946,20 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 .tl-band.t-red { background: color-mix(in srgb, var(--danger) 15%, transparent); border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
 .tl-band.t-yellow { background: color-mix(in srgb, var(--warn) 13%, transparent); border-color: color-mix(in srgb, var(--warn) 38%, transparent); }
 .tl-band.t-blue { background: color-mix(in srgb, var(--accent) 12%, transparent); border-color: color-mix(in srgb, var(--accent) 34%, transparent); }
+
+/* Тишина внутри попытки: ни вызова, ни слова. Рисуется редкой штриховкой поверх
+ * полосы — «шло время, но ничего не происходило» видно, не читая подсказку. */
+.tl-silence {
+  position: absolute; top: 0; bottom: 0;
+  background: repeating-linear-gradient(90deg, color-mix(in srgb, var(--text-3) 22%, transparent) 0 2px, transparent 2px 7px);
+  pointer-events: auto;
+}
+/* Сказанное агентом: точка на верхней кромке строки. Ответ на вопрос «думал или
+ * молчало» — поэтому это факт, а не декор. */
+.tl-say {
+  position: absolute; top: -3px; width: 3px; height: 3px; margin-left: -1.5px;
+  border-radius: 50%; background: color-mix(in srgb, var(--text) 70%, transparent);
+}
 /* Провалившаяся попытка: красная кромка в подписи и «провал» жирным — строка
  * находится глазом даже когда тонов на дорожке много. */
 .tl-row.is-failed .tl-lbl { border-left: 2px solid var(--danger); padding-left: 6px; margin-left: -8px; }

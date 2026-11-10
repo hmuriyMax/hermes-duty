@@ -1158,6 +1158,48 @@ def test_tool_events_become_progress_events(tmp_path: Path) -> None:
     assert folded["reason"] == "no_live_fact" and folded["state"] is None
 
 
+def test_text_deltas_become_one_say_event_per_phrase(tmp_path: Path) -> None:
+    """Дельты текста — один факт на фразу: видно, что агент говорил, а не молчал.
+
+    Поток отдаёт `text` по дельте на токен. Если писать их в журнал как есть, одна
+    фраза станет тысячей строк, и «думал» утонет в собственном весе. Раннер копит
+    дельты и пишет одно событие: превью первой строкой и длительность куска.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = none_spec(tmp_path)
+    fake = Fake(
+        lines=[
+            {"type": "system", "subtype": "init", "session_id": ""},
+            {"type": "text", "text": "Сначала "},
+            {"type": "text", "text": "посмотрю\nфайл."},
+            {"type": "tool_use", "name": "read_file", "tool_call_id": "1"},
+            {"type": "tool_result", "name": "read_file", "tool_call_id": "1", "duration_ms": 5},
+            {"type": "text", "text": "Готово: правка на месте."},
+            {"type": "result", "session_id": "local-888", "tokens": {"total": 10}},
+        ],
+        result={"status": "done"},
+        pack=True,
+    )
+    run(conn, spec, deal, home, fake)
+
+    progress = [event for event in events(conn, deal) if event["kind"] == "attempt_progress"]
+    says = [event["payload"] for event in progress if event["payload"].get("phase") == "say"]
+    assert [payload["preview"] for payload in says] == ["Сначала посмотрю файл.", "Готово: правка на месте."]
+    assert all("duration_ms" in payload for payload in says), "кусок текста измеряется временем"
+    # Фраза не съедает вызов: инструмент считается отдельно и остаётся один.
+    folded = journal.fold(events(conn, deal), now=NOW)
+    assert folded["progress"]["tools"] == 1
+    # Сказанное двигает живость: молчащая попытка и думающая вслух — разные вещи.
+    assert folded["progress"]["last_at"] == NOW
+
+    # Превью короткое: журнал отвечает «думал или молчало», а не пересказывает.
+    long_say = runner._say_event(deal, "impl", 1, 9, "слово " * 200, 1000, NOW)
+    assert len(long_say["payload"]["preview"]) <= runner.SAY_PREVIEW_CHARS
+    assert "\n" not in long_say["payload"]["preview"]
+
+
 def test_progress_does_not_change_state_after_end(tmp_path: Path) -> None:
     """Поздний прогресс закрытое дело не воскрешает и состояние не меняет."""
     home = make_home(tmp_path)

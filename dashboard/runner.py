@@ -1507,6 +1507,11 @@ def _int(value: Any) -> Optional[int]:
         return None
 
 
+# Сколько слов агента уходит в журнал: хватает, чтобы отличить «думал» от
+# «молчало», и мало, чтобы журнал не стал логом.
+SAY_PREVIEW_CHARS = 120
+
+
 def _event(
     deal: Any, kind: str, payload: dict[str, Any], args: dict[str, Any], now: int, source: str = ENGINE_SOURCE
 ) -> dict[str, Any]:
@@ -1554,6 +1559,38 @@ def _progress_event(
         "attempt_progress",
         payload,
         {"stage": stage, "attempt": int(attempt), "seq": int(seq), "phase": phase},
+        now,
+    )
+
+
+def _say_event(
+    deal: Any, stage: str, attempt: int, seq: int, text: str, duration_ms: Optional[int], now: int
+) -> dict[str, Any]:
+    """Сказанное агентом за один непрерывный кусок текста.
+
+    Поток отдаёт `text` по дельте на токен — в журнал такое лить нельзя. Раннер
+    копит дельты и пишет один факт: сколько это длилось и первые
+    `SAY_PREVIEW_CHARS` символов одной строкой. Превью — слова самого агента, а
+    не содержимое файлов: журнал отвечает «думал или молчало», а не «что он
+    прочитал». Пустая строка после нормализации — не факт: молчание молчанием.
+    """
+    collapsed = " ".join(str(text or "").split())
+    payload: dict[str, Any] = {
+        "stage": stage,
+        "attempt": int(attempt),
+        "seq": int(seq),
+        "phase": "say",
+        "name": "",
+        "preview": collapsed[:SAY_PREVIEW_CHARS],
+        "ts": now,
+    }
+    if duration_ms is not None:
+        payload["duration_ms"] = int(duration_ms)
+    return _event(
+        deal,
+        "attempt_progress",
+        payload,
+        {"stage": stage, "attempt": int(attempt), "seq": int(seq), "phase": "say"},
         now,
     )
 
@@ -1609,13 +1646,43 @@ def follow(
     renew_every = max(float(ttl) / RENEW_DIVISOR, POLL_SEC)
     pid = int(process.pid)
 
+    # Кусок сказанного: дельты текста копятся здесь и становятся одним фактом,
+    # когда агент замолчал (взялся за инструмент или закончил). Иначе журнал
+    # получал бы десятки тысяч строк на одну фразу.
+    text_parts: list[str] = []
+    text_started: list[float] = []
+
+    def flush_say() -> None:
+        """Записать накопленный текст одним событием и очистить буфер."""
+        nonlocal seq
+        if not text_parts:
+            return
+        text = "".join(text_parts)
+        started = text_started[0] if text_started else None
+        text_parts.clear()
+        text_started.clear()
+        if not text.strip():
+            return
+        seq += 1
+        now = _now_sec(int(clock()))
+        duration = None if started is None else max(0, int(round(now - started)))
+        journal.append(conn, [_say_event(deal, stage.id, attempt, seq, text, duration, now)])
+
     def handle(line: str) -> None:
         nonlocal seq
         data = _stream_line(line)
         if data is None:
             return
         kind = str(data.get("type") or "")
+        if kind == "text":
+            text = data.get("text")
+            if isinstance(text, str) and text:
+                if not text_parts:
+                    text_started.append(clock())
+                text_parts.append(text)
+            return
         if kind in ("tool_use", "tool_result"):
+            flush_say()
             seq += 1
             if kind == "tool_use":
                 state.tools += 1
@@ -1623,6 +1690,7 @@ def follow(
             return
         if kind != "result":
             return
+        flush_say()
         session = data.get("session_id")
         if isinstance(session, str) and session:
             state.session_id = session
@@ -1668,6 +1736,8 @@ def follow(
         if line is None:
             break
         handle(line)
+    # Последняя фраза перед выходом: без этого она терялась бы ровно на финише.
+    flush_say()
     return state
 
 

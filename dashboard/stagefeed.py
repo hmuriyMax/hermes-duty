@@ -79,6 +79,10 @@ ATTEMPT_PROGRESS = "attempt_progress"
 # длинной попытки их тысячи. Обрезанное число честно называется в `calls_omitted`,
 # а не прячется: экран рисует ровно то, что отдал журнал.
 MAX_CALLS = 800
+# Потолок сказанного на попытку. Куски текста короче вызовов (раннер сводит
+# дельты в один факт), но у длинной попытки их тоже сотни: `says_omitted` честно
+# называет, сколько не поместилось.
+MAX_SAYS = 200
 # Факт публикации (0.0.5): что ушло в origin и чем это подтверждено. Ложится в
 # строку своей попытки — «опубликовано» видно там же, где вердикт этапа.
 PUBLISHED = "published"
@@ -183,6 +187,7 @@ def _attempts(
     progress: dict[tuple[str, int], int] = {}
     published: dict[tuple[str, int], dict[str, Any]] = {}
     raw_calls: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    raw_says: dict[tuple[str, int], list[dict[str, Any]]] = {}
     for event in sorted(
         (item for item in events or () if isinstance(item, dict)),
         key=lambda item: _int(item.get("id")),
@@ -193,7 +198,10 @@ def _attempts(
         if kind == ATTEMPT_PROGRESS:
             key = (str(payload.get("stage") or ""), _int(payload.get("attempt")))
             progress[key] = progress.get(key, 0) + 1
-            raw_calls.setdefault(key, []).append(payload)
+            if str(payload.get("phase") or "") == "say":
+                raw_says.setdefault(key, []).append(payload)
+            else:
+                raw_calls.setdefault(key, []).append(payload)
         elif kind == PUBLISHED:
             # Публикация — факт попытки, а не отдельная попытка: она ложится в ту
             # строку, чей этап её записал (`runner._published_event`).
@@ -214,6 +222,10 @@ def _attempts(
     omitted: dict[tuple[str, int], int] = {}
     for key, payloads in raw_calls.items():
         calls[key], omitted[key] = _calls(payloads)
+    says: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    says_omitted: dict[tuple[str, int], int] = {}
+    for key, payloads in raw_says.items():
+        says[key], says_omitted[key] = _says(payloads)
     for run_id in order:
         item = started[run_id]
         start, start_payload = item["start"], item["start_payload"]
@@ -255,12 +267,36 @@ def _attempts(
                 "progress": progress.get((stage, number), 0),
                 "calls": calls.get((stage, number), []),
                 "calls_omitted": omitted.get((stage, number), 0),
+                "says": says.get((stage, number), []),
+                "says_omitted": says_omitted.get((stage, number), 0),
                 "evidence": _records(end_payload.get("result")),
                 "published": published.get((stage, number)),
                 "end": end is not None,
             }
         )
     return rows
+
+
+def _says(payloads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """Сказанное агентом: когда, сколько длилось и первые слова.
+
+    `text`-поток раннер сводит в один факт на непрерывный кусок (`runner._say_event`),
+    поэтому здесь не дельты, а фразы. Текст уже обрезан при записи
+    (`SAY_PREVIEW_CHARS`) — журнал отвечает «думал или молчало», а не пересказывает
+    работу. Куски без превью не выдумываются: пустой текст — не сказанное.
+    """
+    out: list[dict[str, Any]] = []
+    for item in sorted(payloads, key=lambda row: _int(row.get("seq"))):
+        text = str(item.get("preview") or "").strip()
+        if not text:
+            continue
+        at = _int(item.get("ts"))
+        ms = _maybe_int(item.get("duration_ms"))
+        start = at if ms is None else round(at - ms / 1000.0, 3)
+        out.append({"seq": _int(item.get("seq")), "at": start, "ms": ms, "text": text})
+    out.sort(key=lambda row: (row["at"], row["seq"]))
+    omitted = max(0, len(out) - MAX_SAYS)
+    return out[:MAX_SAYS], omitted
 
 
 def _calls(payloads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
@@ -387,6 +423,11 @@ def _public(row: dict[str, Any], now: int) -> dict[str, Any]:
         # потолком `MAX_CALLS`: экран называет это числом, а не молчит.
         "calls": row["calls"],
         "calls_omitted": row["calls_omitted"],
+        # Сказанное агентом: `[{seq, at, ms, text}]`, `text` — первые слова куска
+        # (обрезано при записи). Рядом с вызовами, потому что отвечает на соседний
+        # вопрос: не «что делал», а «думал он или молчало».
+        "says": row.get("says") or [],
+        "says_omitted": row.get("says_omitted") or 0,
         "live": alive["live"],
         "dead": alive["dead"],
         "lease": alive["lease"],

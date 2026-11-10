@@ -39,6 +39,8 @@ import {
   finishedStatusMeta,
   shapeAttempts,
   shapeCalls,
+  shapeSays,
+  shapeSilences,
   shapeDeal,
   shapeDealTime,
   shapeFinished,
@@ -2775,4 +2777,97 @@ test('мини-таймлайн: на суточном окне деления �
     const expected = ((tick.at - from) / (TL_NOW - from)) * 100
     assert.ok(Math.abs(tick.leftPct - expected) < 0.05, `деление смещено: ${tick.leftPct} vs ${expected}`)
   }
+})
+
+/* ---------------------------------------- сказанное агентом и тишина (0.1.0) */
+
+/** Дело с одной попыткой, у которой есть и вызовы, и сказанное. */
+function withSays({ start, end, calls, says }) {
+  const deal = {
+    now: end,
+    terminal: true,
+    timeline: [{ kind: 'created', at: start, summary: '' }],
+    stages: [{ id: 'impl', needs: [] }],
+  }
+  const attempts = {
+    attempts: [
+      {
+        stage: 'impl',
+        attempt: 1,
+        start,
+        end,
+        status: 'completed',
+        outcome: 'done',
+        calls,
+        says,
+      },
+    ],
+  }
+  return shapeDealTime(deal, attempts)
+}
+
+test('сказанное — отдельная полка: точка на строке и фраза в счётчике', () => {
+  // Попытка 30 минут: вызов в начале, фраза в середине. Фраза не должна стать
+  // вызовом ни в чипах, ни в счётчике — это разные виды работы.
+  const scale = withSays({
+    start: 1_000,
+    end: 2_800,
+    calls: [{ seq: 1, name: 'read_file', at: 1_010, ms: 200 }],
+    says: [{ seq: 2, at: 1_900, ms: 60_000, text: 'Смотрю, где ломается гейт.' }],
+  })
+  const view = attemptView(scale.bars[0], scale)
+  assert.equal(view.chips.length, 1, 'фраза попала в чипы вызовов')
+  assert.equal(view.sayTicks.length, 1)
+  assert.match(view.sayTicks[0].tip, /Смотрю, где ломается гейт/)
+  assert.match(view.sayTicks[0].tip, /1 мин/, 'длительность фразы потеряна')
+  assert.match(view.badge, /1 вызов/)
+  assert.match(view.badge, /1 фраза/)
+})
+
+test('тишина: зазор без вызовов и без слов называется тишиной', () => {
+  // Ровно кейс «сети не было»: вызов в начале, вызов в конце, между ними ничего.
+  const scale = withSays({
+    start: 1_000,
+    end: 3_000,
+    calls: [
+      { seq: 1, name: 'read_file', at: 1_010, ms: 200 },
+      { seq: 2, name: 'terminal', at: 2_600, ms: 300 },
+    ],
+    says: [],
+  })
+  const view = attemptView(scale.bars[0], scale)
+  const silences = view.silences
+  assert.equal(silences.length, 2, `ожидались две тишины (между вызовами и хвост), получено ${silences.length}`)
+  // Та самая дыра между вызовами: 26 минут без вызова и без слова. Хвост (6 минут
+  // после последнего вызова до конца попытки) — тоже тишина, но короткая.
+  const hole = silences.reduce((best, item) => (item.sec > best.sec ? item : best))
+  assert.ok(hole.sec > 1_500 && hole.sec < 1_700, `дыра посчитана как ${hole.sec} с`)
+  assert.ok(hole.widthPct > 0, 'тишина нулевой ширины не видна')
+})
+
+test('тишина не рисуется на нормальных паузах', () => {
+  // Вызовы идут вплотную: молчания длиннее трёх минут нет, и штриховки быть не
+  // должно — иначе «шумит» каждая попытка.
+  const calls = []
+  for (let i = 0; i < 8; i += 1) calls.push({ seq: i + 1, name: 'read_file', at: 1_000 + i * 120, ms: 5_000 })
+  const scale = withSays({ start: 1_000, end: 1_700, calls, says: [] })
+  const view = attemptView(scale.bars[0], scale)
+  assert.deepEqual(view.silences, [])
+})
+
+test('сказанное держит попытку живой: молчание и речь дают разные зазоры', () => {
+  // Те же два вызова, но между ними агент говорил — дыра перестаёт быть тишиной
+  // на всю длину и распадается на две короткие.
+  const scale = withSays({
+    start: 1_000,
+    end: 3_000,
+    calls: [
+      { seq: 1, name: 'read_file', at: 1_010, ms: 200 },
+      { seq: 2, name: 'terminal', at: 2_600, ms: 300 },
+    ],
+    says: [{ seq: 3, at: 1_800, ms: 900_000, text: 'Долго объясняю, что делаю.' }],
+  })
+  const view = attemptView(scale.bars[0], scale)
+  const longest = view.silences.reduce((best, item) => (item.sec > (best ? best.sec : 0) ? item : best), null)
+  assert.ok(!longest || longest.sec < 900, `молчание не распалось: ${longest && longest.tip}`)
 })

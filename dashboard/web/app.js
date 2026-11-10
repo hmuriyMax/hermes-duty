@@ -1617,7 +1617,7 @@ const rowOpen = (overrides, shown, key, byDefault) =>
  * подсказка — один элемент в `body`, положение считается от прямоугольника
  * хоста: над ним, а если сверху не влезла — под ним; по горизонтали прижимается
  * к краю окна. Наведение ловится делегированием: автообновление меняет узлы. */
-const TIP_HOSTS = '.tl-call, .tl-band, .tl-lbl, .tl-mark, .tl-wait'
+const TIP_HOSTS = '.tl-call, .tl-band, .tl-lbl, .tl-mark, .tl-wait, .tl-say, .tl-silence'
 
 let tipEl = null
 let tipHost = null
@@ -2004,6 +2004,18 @@ function attemptRowNode(view, key) {
       }),
     )
   }
+  // Тишина: зазор, где не было ни вызова, ни слова. Полоса попытки остаётся на
+  // месте — тишина рисуется поверх неё, иначе «шло» и «молчало» слились бы вновь.
+  for (const silence of view.silences || []) {
+    track.append(
+      h('span', {
+        class: 'tl-silence',
+        style: `left:${silence.leftPct}%;width:${silence.widthPct}%`,
+        'data-tip': silence.tip,
+        'data-key': `silence:${silence.leftPct}`,
+      }),
+    )
+  }
   // Пауза «вопрос → ответ» — подсветка времени, которое дело стояло на человеке.
   for (const wait of view.waits) {
     track.append(
@@ -2030,6 +2042,19 @@ function attemptRowNode(view, key) {
         tabindex: '-1',
         'aria-label': chip.tip,
         'data-call-id': chip.id,
+      }),
+    )
+  }
+  // Сказанное агентом: точки на верхней кромке строки. Вопрос, на который они
+  // отвечают, — «он думал или просто ничего не приходило», поэтому точка это
+  // факт телеметрии, а не украшение.
+  for (const say of view.sayTicks || []) {
+    track.append(
+      h('span', {
+        class: 'tl-say',
+        style: `left:${say.leftPct}%`,
+        'data-tip': say.tip,
+        'data-key': `say:${say.id}`,
       }),
     )
   }

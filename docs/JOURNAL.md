@@ -51,7 +51,7 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 | `claimed` | появился лизинг (`claim_lock`/`claim_expires`) | `claim_lock`, `claim_expires` |
 | `lease_lost` | лизинг исчез без завершения | `previous_expires` |
 | `attempt_started` | открылся ран в `task_runs` (движок: попытка заспавнена) | `run_id`, `pid`, `stage`, `attempt`, `cmd`, `stage_kind` (только у `kind: shell` — `shell`; отсутствие ключа читается как `agent`), `shell_cmd` (у `shell` — строка `cmd` из спеки), `cwd`, `workdir`, `tree`, `base` (фактическая база дерева — коммит, от которого этап отведён), `lease_expires`, `contract` — фактическая команда и вход целиком |
-| `attempt_progress` | шаг попытки движка: вызов инструмента или его результат (телеметрия, состояние дела не меняет) | `stage`, `attempt`, `seq`, `phase` (`tool_use`/`tool_result`), `name`, `duration_ms` (только у результата), `ts` |
+| `attempt_progress` | шаг попытки движка: вызов инструмента, его результат или сказанное агентом (телеметрия, состояние дела не меняет) | `stage`, `attempt`, `seq`, `phase` (`tool_use`/`tool_result`/`say`), `name`, `duration_ms` (у результата и у `say`), `preview` (только у `say`, ≤ 120 символов), `ts` |
 | `tree_reused` | повтор попытки продолжается в дереве прошлой попытки, а не с базы: движок уберёг его как `tree_kept`, и начинать заново значило бы выбросить работу | `stage`, `attempt`, `from` (путь сохранённого дерева) |
 | `attempt_ended` | ран закрыт (движок: попытка отчиталась, не отчиталась или упала; `done` — только при принятом evidence-пакете; `reaped: true` — попытку закрыл `reaper.sweep`, отчёта от неё не было; `refused: true` в `details` — попытку не поднимали вовсе: потолок дела исчерпан (`details.budget`: `{kind, used, limit}`) или нет «ок» человека на это дерево (`details.publish`); у `shell`-попытки в `details` — `exit_code`, `duration_sec`, `must`, `timed_out`, хвосты `stdout_tail`/`stderr_tail`; у гейта — `stage_kind: gate`, `question_id`, `answer`, `allow`) | `run_id`, `stage`, `attempt`, `outcome` (`done`/`failed`), `kind` (`infra`/`contract`/`capability`/`null`), `reason`, `base` (база дерева попытки), `commit` (что произвела принятая попытка — коммит движка в её дереве или коммит исполнителя; от него отводится дерево следующего этапа; `null` — произвести было нечего), `details` (в том числе `witness` — принятый свидетель пакета: `commit\|artifacts` / `verdict` / `published`; `verdict`: вердикт гейта с `details`; `branch` — ветка дела `duty/<deal_id>`, на которую движок поставил коммит попытки, `branch_error` — причина, если поставить не удалось; `tree_kept` — путь сохранённого дерева упавшей попытки с незакоммиченной работой), `result` (если отчёт разобран), `reaped` (только у убранных), `pid` (у убранных — из `attempt_started`) |
 | `released` | движок отпустил дело, оставившееся `running`: попытка закончилась, а продолжения не было (таймаут, `--once`, предел шагов, Ctrl-C, прогон, убитый между шагом и решением). Пишет `dashboard/release.py` — проход, материализующий ответ `transit`: `run`/`wait(retry)` → этот факт и строка `ready`/`todo`; `done`/`failed`/`park` пишутся своими фактами (`completed`, `blocked`), а не `released` | `run_id`, `stage`, `attempt`, `decision` (`run`/`wait`), `wait` (`retry` или `null`), `idle_sec` (сколько журнал молчал), `from`/`to` (строка до и после), `reason` |
@@ -102,6 +102,14 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 У `gate_opened` два писателя: та же мутация родителя и `create` — когда ребёнок заводится
 при уже закрытых родителях, переход пишется сразу (`cause: "created"`), иначе снимок
 `created` выглядел бы как незакрытый гейт.
+
+Фаза `say` (0.1.0) — кусок текста агента между инструментами. Поток отдаёт
+`text` по дельте на токен, поэтому раннер копит дельты и пишет **один** факт на
+фразу: `duration_ms` (сколько длился кусок) и `preview` (первая строка, ≤ 120
+символов). Смысл ровно один: отличить «модель думала и говорила» от «двадцать
+минут ничего не приходило». Превью — слова самого агента, а не содержимое
+файлов: журнал отвечает «думал или молчало», а не пересказывает работу.
+`say` двигает живость попытки (`progress.last_at`), но не счётчик инструментов.
 
 `attempt_progress` заведён движком 0.0.4 (`dashboard/runner.py`): по каждому
 `tool_use`/`tool_result` потока попытки пишется один факт. Без него по журналу видно

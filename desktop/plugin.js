@@ -1167,6 +1167,11 @@ function shapeAttempts(payload) {
       toolsText: attempt.tools === null || attempt.tools === undefined ? '' : `инструментов ${fmtCount(attempt.tools)}`,
       calls: shapeCalls(attempt.calls),
       callsOmitted: numOrNull(attempt.calls_omitted) || 0,
+      // Сказанное агентом (`phase: say`): превью фразы и её длительность. Не
+      // вызов и не событие — отдельная полка, потому что отвечает на другой
+      // вопрос: «думал он или молчало».
+      says: shapeSays(attempt.says),
+      saysOmitted: numOrNull(attempt.says_omitted) || 0,
       outcome: String(attempt.outcome || ''),
       outcomeTone: outcomeTone(attempt.outcome, attempt.status, crashes),
       error: String(attempt.error || ''),
@@ -1932,6 +1937,68 @@ function shapeCalls(raw) {
 }
 
 /**
+ * Сказанное агентом в форме шкалы: когда, сколько длилось, первые слова.
+ *
+ * Это не вызов и не событие дела: строки самого агента между инструментами. Нужны
+ * ровно затем, чтобы отличить «модель думала и говорила» от «двадцать минут
+ * ничего не приходило» — на полосе попытки оба случая выглядят одинаково пусто.
+ */
+function shapeSays(raw) {
+  const list = Array.isArray(raw) ? raw : []
+  const says = []
+  for (const item of list) {
+    const say = item && typeof item === 'object' ? item : {}
+    const at = numOrNull(say.at)
+    if (at === null) continue
+    const text = String(say.text || '').trim()
+    if (!text) continue
+    const ms = numOrNull(say.ms)
+    // Длительность фразы — окно, в котором приходил текст. Модель часто отдаёт
+    // всю фразу одним куском, и тогда это окно равно нулю: печатать «0 сек» рядом
+    // с фразой значило бы сообщать факт о стриме, а не о работе. Поэтому короче
+    // секунды — прочерк, а сам факт «здесь агент говорил» держит метка времени.
+    const msText = ms === null || ms < 1000 ? '' : fmtDuration(Math.max(0, Math.round(ms / 1000)))
+    says.push({ seq: numOrNull(say.seq), at, ms, text, clock: fmtClock(at), msText })
+  }
+  return says
+}
+
+/**
+ * Тихое время внутри попытки: зазоры, где не было ни вызова, ни слова.
+ *
+ * Считается по фактам телеметрии, а не по «сколько шло»: вызов занимает своё
+ * время (`at … at+ms`), сказанное — своё, а промежутки между ними и есть тишина.
+ * Порог (`TL.silenceMinSec`) отсекает обычные паузы: зазор в полминуты — это
+ * нормальная работа, а не простой, и рисовать его значило бы шуметь.
+ */
+function shapeSilences(calls, says, from, to) {
+  const start = numOrNull(from)
+  const stop = numOrNull(to)
+  if (start === null || stop === null || stop <= start) return []
+  const busy = []
+  const push = (item) => {
+    const at = numOrNull(item.at)
+    if (at === null) return
+    const ms = numOrNull(item.ms)
+    // Незакрытый вызов держит время до конца попытки: он не «мгновенный», у него
+    // просто нет длительности.
+    const end = ms === null ? at : at + Math.max(0, ms) / 1000
+    busy.push([Math.max(start, at), Math.min(stop, Math.max(at, end))])
+  }
+  ;(Array.isArray(calls) ? calls : []).forEach(push)
+  ;(Array.isArray(says) ? says : []).forEach(push)
+  busy.sort((left, right) => left[0] - right[0])
+  const gaps = []
+  let cursor = start
+  for (const [a, b] of busy) {
+    if (a - cursor >= TL.silenceMinSec) gaps.push([cursor, a])
+    cursor = Math.max(cursor, b)
+  }
+  if (stop - cursor >= TL.silenceMinSec) gaps.push([cursor, stop])
+  return gaps
+}
+
+/**
  * Раскладка вызовов на дорожке попытки: где чип, какой ширины, на каком уровне.
  *
  * Ширина чипа — логарифм длительности (`3 + 11·log10(1+ms/100)/log10(1+12000/100)`):
@@ -2038,7 +2105,16 @@ const SPEC_PAD = 2
 // занимает 8 %, половина подписи метки — ещё 2.7 %.
 const TICK_EDGE_RESERVE_PCT = 12
 
-const TL = { collapsed: 20, levelH: 12, top: 6, maxLevels: 5, pad: 8 }
+const TL = {
+  collapsed: 20,
+  levelH: 12,
+  top: 6,
+  maxLevels: 5,
+  pad: 8,
+  // Зазор, с которого молчание стоит называть тишиной: полминуты — обычная
+  // пауза между вызовами, а не простой, и рисовать её значило бы шуметь.
+  silenceMinSec: 180,
+}
 
 // Тон вызова — семантический ключ («чтение», «правка», «запуск», «внешнее»), а не
 // CSS-цвет: палитры у поверхностей разные, а вид работы — общий факт.
@@ -2107,8 +2183,11 @@ function attemptView(bar, scale) {
       })
     : { chips: [], height: TL.top + TL.levelH, clipped: 0 }
   const omitted = numOrNull(b.callsOmitted) || 0
+  const says = Array.isArray(b.says) ? b.says : []
+  const saysOmitted = numOrNull(b.saysOmitted) || 0
   const total = calls.length + omitted
   const notes = []
+  if (saysOmitted) notes.push(`ещё ${fmtCount(saysOmitted)} ${plural(saysOmitted, 'фраза', 'фразы', 'фраз')} не показано (потолок)`)
   if (omitted) notes.push(`ещё ${fmtCount(omitted)} ${plural(omitted, 'вызов', 'вызова', 'вызовов')} не показано (потолок)`)
   const chips = layout.chips.map((chip) => {
     const call = chip.call || {}
@@ -2135,6 +2214,40 @@ function attemptView(bar, scale) {
     }
   })
   const status = b.outcomeText || (b.open ? b.leaseText : b.outcome || b.status || b.durationText)
+
+  // Сказанное и тишина — на той же кусочной карте оси, что чипы и маркеры: одна
+  // формула на обе поверхности, иначе точка «агент сказал» съедет относительно
+  // вызова из того же мгновения.
+  const axisPct = scale && typeof scale.pctOf === 'function' ? scale.pctOf : null
+  const toPct = (at) => (axisPct ? Math.max(0, Math.min(100, Number(axisPct(at)) || 0)) : 0)
+  const sayTicks = says.map((say) => ({
+    id: `${b.stage || '—'}:${b.number || '—'}:say:${say.seq === null || say.seq === undefined ? '—' : say.seq}`,
+    leftPct: toPct(say.at),
+    clock: say.clock,
+    text: say.text,
+    msText: say.msText,
+    tip: [say.clock, say.msText, say.text].filter(Boolean).join(' · '),
+  }))
+  const silences = shapeSilences(
+    calls,
+    says,
+    b.start,
+    b.end === null || b.end === undefined ? (axis && axis.end) || null : b.end,
+  ).map(([from, to]) => {
+    const left = toPct(from)
+    const right = toPct(to)
+    const sec = Math.max(0, Math.round(to - from))
+    const seconds = fmtDuration(sec)
+    return {
+      leftPct: left,
+      widthPct: Math.max(0.4, Math.round(Math.max(0, right - left) * 10) / 10),
+      sec,
+      durationText: seconds,
+      // Подсказка говорит, чего именно не было: тишина — это «ни вызова, ни слова»,
+      // а не «попытка не шла». Полоса попытки при этом остаётся на месте.
+      tip: `тишина ${seconds}: ни вызова инструмента, ни слова агента`,
+    }
+  })
 
   // Фон попытки: длительность видна полосой, а не только по чипам вызовов.
   // Кромка не бывает уже 0.6% — иначе короткая попытка исчезла бы с экрана.
@@ -2224,9 +2337,18 @@ function attemptView(bar, scale) {
     chips,
     marks,
     waits,
+    // Сказанное агентом и тишина: две вещи, которые на пустой полосе выглядели
+    // одинаково, а означают разное — «думал и говорил» против «ничего не шло».
+    sayTicks,
+    silences,
     // Надбавка на экране: суммарное число вызовов попытки. `badgeCut` — у части
     // вызовов чипа нет (потолок данных), и это единственное, что стоит выделять.
-    badge: total ? `${fmtCount(total)} ${plural(total, 'вызов', 'вызова', 'вызовов')}` : '',
+    badge: [
+      total ? `${fmtCount(total)} ${plural(total, 'вызов', 'вызова', 'вызовов')}` : '',
+      says.length ? `${fmtCount(says.length)} ${plural(says.length, 'фраза', 'фразы', 'фраз')}` : '',
+    ]
+      .filter(Boolean)
+      .join(' · '),
     badgeCut: Boolean(omitted),
     note: notes.join(' · '),
     title: [b.title || '', notes.join(' · ')].filter(Boolean).join(' · '),
@@ -2349,6 +2471,8 @@ function attemptBar(attempt, crashes) {
     // и разницу называет `callsText`.
     calls: shapeCalls(a.calls),
     callsOmitted: numOrNull(a.calls_omitted) || 0,
+    says: shapeSays(a.says),
+    saysOmitted: numOrNull(a.says_omitted) || 0,
     // Израсходовано токенов, если телеметрия их записала: `null` — не «ноль».
     tokens: numOrNull(a.tokens),
     callsText: '',
@@ -3214,7 +3338,7 @@ function dutyToneVar(tone) {
  * `overflow`, а соседние строки со своим контекстом наложения оказываются выше
  * любого `z-index` у хоста. Подсказка — один узел в `body`, наведение ловится
  * делегированием, потому что обновление страницы подменяет узлы. */
-const DUTY_TIP_HOSTS = '.duty-tl-call, .duty-tl-band, .duty-tl-lbl, .duty-tl-mark, .duty-tl-wait'
+const DUTY_TIP_HOSTS = '.duty-tl-call, .duty-tl-band, .duty-tl-lbl, .duty-tl-mark, .duty-tl-wait, .duty-tl-say, .duty-tl-silence'
 
 let dutyTipBound = false
 let dutyTipNode = null
@@ -3316,6 +3440,17 @@ function DutyAttemptRow({ view, callSel, onSelectCall, toolFilter }) {
       }),
     )
   }
+  // Тишина: зазор, где не было ни вызова, ни слова — поверх полосы попытки.
+  for (const [i, silence] of (view.silences || []).entries()) {
+    track.push(
+      h('span', {
+        key: `silence-${i}`,
+        className: 'duty-tl-silence',
+        style: { left: `${silence.leftPct}%`, width: `${silence.widthPct}%` },
+        'data-tip': silence.tip,
+      }),
+    )
+  }
   for (const [i, wait] of view.waits.entries()) {
     track.push(
       h('span', {
@@ -3323,6 +3458,17 @@ function DutyAttemptRow({ view, callSel, onSelectCall, toolFilter }) {
         className: 'duty-tl-wait',
         style: { left: `${wait.fromPct}%`, width: `${wait.widthPct}%` },
         'data-tip': wait.title,
+      }),
+    )
+  }
+  // Сказанное агентом: точки на верхней кромке строки.
+  for (const [i, say] of (view.sayTicks || []).entries()) {
+    track.push(
+      h('span', {
+        key: `say-${i}`,
+        className: 'duty-tl-say',
+        style: { left: `${say.leftPct}%` },
+        'data-tip': say.tip,
       }),
     )
   }
@@ -3608,6 +3754,10 @@ const CSS = `
 .duty-tl-track{position:relative;min-height:20px}
 /* Фон попытки: длительность видна полосой, а не только по чипам вызовов. */
 .duty-tl-band{position:absolute;top:1px;bottom:1px;border-radius:4px;background:color-mix(in srgb, var(--ui-text-tertiary) 13%, transparent);border:1px solid color-mix(in srgb, var(--ui-text-tertiary) 22%, transparent)}
+/* Тишина внутри попытки: ни вызова, ни слова — редкая штриховка поверх полосы. */
+.duty-tl-silence{position:absolute;top:0;bottom:0;background:repeating-linear-gradient(90deg, color-mix(in srgb, var(--ui-text-tertiary) 22%, transparent) 0 2px, transparent 2px 7px)}
+/* Сказанное агентом: точка на верхней кромке строки. */
+.duty-tl-say{position:absolute;top:-3px;width:3px;height:3px;margin-left:-1.5px;border-radius:50%;background:color-mix(in srgb, var(--ui-text-primary) 70%, transparent)}
 /* Тон исхода: провал читается полосой на дорожке, а не только словом слева. */
 .duty-tl-band.t-red{background:color-mix(in srgb, var(--ui-red) 15%, transparent);border-color:color-mix(in srgb, var(--ui-red) 45%, transparent)}
 .duty-tl-band.t-yellow{background:color-mix(in srgb, var(--ui-yellow) 13%, transparent);border-color:color-mix(in srgb, var(--ui-yellow) 38%, transparent)}

@@ -619,6 +619,35 @@ def test_calls_pair_start_with_result_and_keep_duration():
     assert row["calls_omitted"] == 0
 
 
+def test_says_are_kept_apart_from_calls():
+    """Сказанное — не вызов: своя полка, свой потолок, свой смысл.
+
+    Раннер сводит дельты текста в один факт на фразу (`phase: say`). Если свалить
+    их в `calls`, поверхность нарисует несуществующие инструменты с пустым именем,
+    а счётчик вызовов начнёт врать. Поэтому рядом: `says` — что агент говорил,
+    `calls` — что он трогал.
+    """
+    events = _attempt("impl", 1, NOW - 100, NOW - 10)
+    events += [
+        _progress("impl", 1, 1, "say", "", NOW - 95, ms=4000),
+        _progress("impl", 1, 2, "tool_use", "read_file", NOW - 90),
+        _progress("impl", 1, 3, "tool_result", "read_file", NOW - 88, ms=1900),
+    ]
+    events[2]["payload"]["preview"] = "Сначала посмотрю файл."
+    row = stagefeed.attempts(events, NOW)[0]
+    assert [call["name"] for call in row["calls"]] == ["read_file"]
+    assert row["says"] == [{"seq": 1, "at": NOW - 99, "ms": 4000, "text": "Сначала посмотрю файл."}]
+    assert row["says_omitted"] == 0
+
+
+def test_say_without_preview_is_not_a_fact():
+    """Пустое сказанное — не сказанное: молчание не притворяется фразой."""
+    events = _attempt("impl", 1, NOW - 100, NOW - 10)
+    events += [_progress("impl", 1, 1, "say", "", NOW - 95, ms=1000)]
+    row = stagefeed.attempts(events, NOW)[0]
+    assert row["says"] == []
+
+
 def test_call_without_result_keeps_its_start_and_null_duration():
     """Вызов, чей результат не пришёл (попытка оборвалась) — `ms: null`, но виден.
 

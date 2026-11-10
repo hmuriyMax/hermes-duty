@@ -477,8 +477,8 @@ hermes plugins enable hermes-duty     # или Capabilities → Plugins в де�
 Из каталога плагина (`cd ~/.hermes/plugins/hermes-duty`):
 
 ```bash
-~/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q  # 909 passed, 1 skipped
-node --test tests/*.test.mjs                              # 166 pass (модель, поверхности, шейпер)
+~/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q  # 931 passed, 1 skipped
+node --test tests/*.test.mjs                              # 177 pass (модель, поверхности, шейпер)
 bin/duty-model-sync --check                                # OK
 bin/duty-version check                                     # OK
 HERMES_HOME=~/.hermes bin/duty now                         # таблица дел, код 0

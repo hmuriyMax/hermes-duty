@@ -886,6 +886,10 @@ def _progress(ordered: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
     `payload` не роняет сверку: неизвестная фаза пропускается, как и в остальных
     правилах fold. `last_at` — метка времени последнего факта телеметрии, а не
     текущее время.
+
+    `say` (агент говорил) двигает `last_at`, но не `tools`: это не вызов
+    инструмента, зато честный признак, что попытка жива и работает, — модель,
+    которая десять минут думает вслух, не должна выглядеть зависшей.
     """
     tools = 0
     last_tool = ""
@@ -895,7 +899,7 @@ def _progress(ordered: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
             continue
         payload = _payload(event)
         phase = str(payload.get("phase") or "")
-        if phase not in ("tool_use", "tool_result"):
+        if phase not in ("tool_use", "tool_result", "say"):
             continue
         if phase == "tool_use":
             tools += 1

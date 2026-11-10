@@ -2425,6 +2425,36 @@ test('раскладка вызовов: потолок уровней не те
   assert.ok(layout.clipped > 0)
 })
 
+test('раскладка вызовов: тело чипа не вылезает за конец своей полосы', () => {
+  // Мгновение — настоящее, но квадратик не имеет права свисать за правый конец
+  // сосиски попытки (Макс, 10.11: «квадратики торчат правее конца своей полосы»).
+  const calls = shapeCalls([
+    { seq: 1, name: 'a', at: 4, ms: 50 },
+    { seq: 3, name: 'b', at: 9.999, ms: 4000 },
+  ])
+  const layout = layoutCalls(calls, {
+    from: 0,
+    to: 10,
+    width: 700,
+    levelH: 12,
+    top: 6,
+    clamp: { leftPct: 20, rightPct: 80 },
+  })
+  const rightPx = (80 / 100) * 700
+  const last = layout.chips[1]
+  assert.ok(last.left + last.width <= rightPx + 0.01, 'чип свисает за правый конец полосы')
+  // Внутри полосы положение не трогаем: сдвиг только на краю.
+  assert.ok(Math.abs(layout.chips[0].left - (4 / 10) * 700) < 1, 'сдвинулся чип в середине полосы')
+  // Слева — та же граница.
+  const left = layoutCalls(shapeCalls([{ seq: 1, name: 'a', at: 0.001, ms: 50 }]), {
+    from: 0,
+    to: 10,
+    width: 700,
+    clamp: { leftPct: 20, rightPct: 80 },
+  }).chips[0]
+  assert.ok(left.left >= (20 / 100) * 700 - 0.01, 'чип вылез за левый конец полосы')
+})
+
 test('раскладка вызовов: без оси рисовать нечего, а ширина — виртуальная', () => {
   const calls = shapeCalls([{ name: 'a', at: 1, ms: 5 }])
   assert.deepEqual(layoutCalls([], { from: 0, to: 10, width: 700 }).chips, [])

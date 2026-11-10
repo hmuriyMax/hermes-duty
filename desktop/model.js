@@ -2204,6 +2204,13 @@ function layoutCalls(calls, options) {
     const pct = toPct ? Math.max(0, Math.min(100, Number(toPct(at)) || 0)) : ((at - from) / span) * 100
     return (pct / 100) * width
   }
+  // Границы своей полосы на той же карте оси: тело чипа не имеет права
+  // вылезать за сосиску попытки (Макс, 10.11: «квадратики торчат правее конца
+  // своей полосы»). Само мгновение остаётся настоящим — чип, пришедший на самый
+  // край, сдвигается влево ровно на свою ширину.
+  const clampPct = opts.clamp && typeof opts.clamp === 'object' ? opts.clamp : null
+  const clampLeftPx = clampPct && numOrNull(clampPct.leftPct) !== null ? (Math.max(0, Math.min(100, numOrNull(clampPct.leftPct))) / 100) * width : null
+  const clampRightPx = clampPct && numOrNull(clampPct.rightPct) !== null ? (Math.max(0, Math.min(100, numOrNull(clampPct.rightPct))) / 100) * width : null
   const list = Array.isArray(calls) ? calls : []
   if (!list.length || width <= 0 || span <= 0) {
     return { chips: [], levels: 0, height: top + levelH, clipped: 0 }
@@ -2220,12 +2227,20 @@ function layoutCalls(calls, options) {
   const chips = []
   let clipped = 0
   for (const call of list) {
-    const px = Math.max(0, Math.min(width, pxOf(call.at)))
+    let px = Math.max(0, Math.min(width, pxOf(call.at)))
     const unfinished = call.ms === null || call.ms === undefined
     const size = unfinished ? UNFINISHED_W : chipWidth(call.ms)
+    if (clampRightPx !== null && px + size > clampRightPx) {
+      px = Math.max(clampLeftPx !== null ? clampLeftPx : 0, clampRightPx - size)
+    }
+    if (clampLeftPx !== null && px < clampLeftPx) {
+      px = Math.min(clampLeftPx, clampRightPx !== null ? clampRightPx : width)
+    }
     // Линейная ширина — та же карта оси: пиксели между началом и концом вызова.
     // Пол минимальной ширины у коротких вызовов не «0 мс», а предел точности.
-    const linEnd = unfinished || call.ms === null ? px : Math.max(px, Math.min(width, pxOf(call.at + Math.max(0, Number(call.ms)) / 1000)))
+    const linEnd = unfinished || call.ms === null
+      ? px
+      : Math.max(px, Math.min(clampRightPx !== null ? clampRightPx : width, pxOf(call.at + Math.max(0, Number(call.ms)) / 1000)))
     const linSize = unfinished ? UNFINISHED_W : Math.max(2, Math.round(linEnd - px))
     let level = lastEnd.findIndex((end) => px - end >= gap)
     if (level < 0) {
@@ -2373,6 +2388,9 @@ function attemptView(bar, scale) {
         // сжатом простое линейная пропорция сдвинула бы вызов относительно
         // маркера того же мгновения на четверть ширины.
         toPct: scale && typeof scale.pctOf === 'function' ? scale.pctOf : null,
+        // Тело чипа держим внутри сосиски этой попытки: крайние вызовы иначе
+        // свисали за правый конец полосы.
+        clamp: { leftPct: b.leftPct, rightPct: b.endPct },
         levelH: TL.levelH,
         top: TL.top,
         maxLevels: TL.maxLevels,

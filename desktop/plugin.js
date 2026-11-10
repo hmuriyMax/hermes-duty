@@ -2200,10 +2200,14 @@ function shapeSilences(calls, says, from, to) {
 /**
  * Раскладка вызовов на дорожке попытки: где чип, какой ширины, на каком уровне.
  *
- * Ширина чипа — логарифм длительности (`3 + 11·log10(1+ms/100)/log10(1+12000/100)`):
- * линейная шкала превратила бы 136 мс в точку, а 11.5 с — в половину дорожки, и
- * таймлайн перестал бы читаться. Уровни нужны, потому что чипы идут вплотную:
- * сосед занят — берём следующий уровень, дорожка растёт вниз.
+ * Развёрнутая строка: ширина чипа — логарифм длительности
+ * (`3 + 11·log10(1+ms/100)/log10(1+12000/100)`): линейная шкала превратила бы
+ * 136 мс в точку, а 11.5 с — в половину дорожки. Свёрнутая — линейная
+ * (`widthLinPct`): там уровней нет, нахлёст и есть единственная правда строки,
+ * и плотность цвета должна читаться как реальное время, потраченное на вызов
+ * (Макс, 09.11: «в свернутом виде рисовать тулы линейно»). Уровни нужны, потому
+ * что чипы идут вплотную: сосед занят — берём следующий уровень, дорожка растёт
+ * вниз.
  *
  * Арифметика общая для веб-страницы и десктопа: разъехавшиеся формулы дали бы две
  * несравнимые картинки одного и того же дела.
@@ -2249,6 +2253,10 @@ function layoutCalls(calls, options) {
     const px = Math.max(0, Math.min(width, pxOf(call.at)))
     const unfinished = call.ms === null || call.ms === undefined
     const size = unfinished ? UNFINISHED_W : chipWidth(call.ms)
+    // Линейная ширина — та же карта оси: пиксели между началом и концом вызова.
+    // Пол минимальной ширины у коротких вызовов не «0 мс», а предел точности.
+    const linEnd = unfinished || call.ms === null ? px : Math.max(px, Math.min(width, pxOf(call.at + Math.max(0, Number(call.ms)) / 1000)))
+    const linSize = unfinished ? UNFINISHED_W : Math.max(2, Math.round(linEnd - px))
     let level = lastEnd.findIndex((end) => px - end >= gap)
     if (level < 0) {
       if (lastEnd.length >= maxLevels) {
@@ -2267,6 +2275,7 @@ function layoutCalls(calls, options) {
       width: size,
       leftPct: Math.round((px / width) * 10000) / 100,
       widthPct: Math.round((size / width) * 10000) / 100,
+      widthLinPct: Math.round((linSize / width) * 10000) / 100,
       level,
       top: top + level * levelH,
       unfinished,
@@ -2414,6 +2423,7 @@ function attemptView(bar, scale) {
       attempt: b.number || '—',
       leftPct: chip.leftPct,
       widthPct: chip.widthPct,
+      widthLinPct: chip.widthLinPct,
       top: chip.top,
       level: chip.level,
       tone: toolTone(call.name),
@@ -3742,8 +3752,8 @@ function DutyAttemptRow({ view, callSel, onSelectCall, toolFilter }) {
         'aria-label': chip.tip || chip.title,
         onClick: onSelectCall ? (event) => { event.stopPropagation(); onSelectCall(chip.id) } : undefined,
         style: chip.unfinished
-          ? { left: `${chip.leftPct}%`, width: `${chip.widthPct}%`, top: `${chip.top}px`, color: dutyToneVar(chip.tone) }
-          : { left: `${chip.leftPct}%`, width: `${chip.widthPct}%`, top: `${chip.top}px`, background: dutyToneVar(chip.tone) },
+          ? { left: `${chip.leftPct}%`, '--w-log': `${chip.widthPct}%`, '--w-lin': `${chip.widthLinPct ?? chip.widthPct}%`, width: 'var(--w-lin)', top: `${chip.top}px`, color: dutyToneVar(chip.tone) }
+          : { left: `${chip.leftPct}%`, '--w-log': `${chip.widthPct}%`, '--w-lin': `${chip.widthLinPct ?? chip.widthPct}%`, width: 'var(--w-lin)', top: `${chip.top}px`, background: dutyToneVar(chip.tone) },
       }),
     )
   }
@@ -4076,6 +4086,7 @@ const CSS = `
 /* Свёрнутая строка: все вызовы на одной линии, внахлёст и вполсилы — плотность
  * работы, а не россыпь квадратиков; наведение раскрывает строку, и чипы
  * доезжают на свои уровни. */
+.duty-tl-row:hover .duty-tl-call,.duty-tl-row:focus-visible .duty-tl-call{width:var(--w-log)}
 .duty-tl-row:not(:hover):not(:focus-visible) .duty-tl-call{top:0!important;opacity:.45}
 .duty-tl-row:not(:hover):not(:focus-visible) .duty-tl-call.duty-tl-unfinished,
 .duty-tl-row:not(:hover):not(:focus-visible) .duty-tl-call.duty-tl-sel{opacity:1}

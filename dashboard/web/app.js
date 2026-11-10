@@ -2151,8 +2151,8 @@ function attemptRowNode(view, key) {
         'data-tone': chip.tone,
         'data-key': `call:${chip.id}`,
         style: chip.unfinished
-          ? `left:${chip.leftPct}%;top:${chip.top}px;width:${chip.widthPct}%;color:${toneVar(chip.tone)}`
-          : `left:${chip.leftPct}%;top:${chip.top}px;width:${chip.widthPct}%;background:${toneVar(chip.tone)}`,
+          ? `left:${chip.leftPct}%;top:${chip.top}px;--w-log:${chip.widthPct}%;--w-lin:${chip.widthLinPct ?? chip.widthPct}%;width:var(--w-lin);color:${toneVar(chip.tone)}`
+          : `left:${chip.leftPct}%;top:${chip.top}px;--w-log:${chip.widthPct}%;--w-lin:${chip.widthLinPct ?? chip.widthPct}%;width:var(--w-lin);background:${toneVar(chip.tone)}`,
         'data-tip': chip.tip,
         role: 'button',
         tabindex: '-1',

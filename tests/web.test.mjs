@@ -25,6 +25,19 @@ const app = read('dashboard/web/app.js')
 const api = read('dashboard/plugin_api.py')
 const pluginSource = read('desktop/plugin.js')
 
+test('свёрнутая строка: чипы линейной ширины, развёрнутая — логарифм', () => {
+  const css = read('dashboard/web/styles.css')
+  // В нахлёсте уровней нет: плотность цвета — единственная правда строки, и она
+  // должна читаться как реальное время (Макс, 09.11). Логарифм возвращается при
+  // развороте, иначе короткие вызовы становились бы точками.
+  assert.match(app, /--w-log:\$\{chip\.widthPct\}%/, 'веб: у чипа нет лог-ширины')
+  assert.match(app, /--w-lin:\$\{chip\.widthLinPct/, 'веб: у чипа нет линейной ширины')
+  assert.match(css, /\.tl-row:hover \.tl-call, \.tl-row:focus-visible \.tl-call \{ width: var\(--w-log\)/, 'веб: развёрнутая не возвращает лог')
+  assert.match(app, /width:var\(--w-lin\)/, 'веб: свёрнутая не линейна')
+  assert.match(read('desktop/plugin.js'), /width: 'var\(--w-lin\)'/, 'десктоп: свёрнутая не линейна')
+  assert.match(read('desktop/plugin.js'), /\.duty-tl-row:hover \.duty-tl-call,\.duty-tl-row:focus-visible \.duty-tl-call\{width:var\(--w-log\)\}/, 'десктоп: развёрнутая не возвращает лог')
+})
+
 test('палитра инструментов: интеграции и служебные не серые', () => {
   const css = read('dashboard/web/styles.css')
   // Серый — только «не знаю»: mcp-коннекторы (jira/gitlab/goland) и служебные

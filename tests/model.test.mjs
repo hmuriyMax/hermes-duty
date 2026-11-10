@@ -863,6 +863,27 @@ test('легенда инструментов: семейства с числа�
   assert.equal(known, all - 1, `в легенде ${known}, вызовов ${all}`)
 })
 
+test('ширина чипа: свёрнутая строка линейна, развёрнутая логарифмична', () => {
+  const view = attemptView(
+    bar([
+      { name: 'terminal', at: 1, ms: 400 },
+      { name: 'terminal', at: 1.5, ms: 800 },
+      { name: 'terminal', at: 2, ms: 4_000 },
+    ], { tone: 'green' }),
+    axis,
+  )
+  const chips = view.chips
+  const lin = chips.map((c) => c.widthLinPct)
+  const log = chips.map((c) => c.widthPct)
+  // Линейная: 800 мс вдвое шире 400 мс, 4000 мс — вдесятеро.
+  assert.ok(lin[1] > lin[0] * 1.8 && lin[1] < lin[0] * 2.2, `800 мс не вдвое шире 400 мс: ${lin}`)
+  assert.ok(lin[2] > lin[0] * 9, `4 с не вдесятеро шире 0.4 с: ${lin}`)
+  // Логарифм: рост на порядок даёт прибавку, а не десятикратную ширину.
+  assert.ok(log[2] < log[0] * 2.5, `логарифм сломан: ${log}`)
+  // Незавершённый вызов обеих ширин не рисует «0 мс».
+  assert.ok(chips.every((c) => c.widthLinPct > 0 && c.widthLinPct >= 2 / 1000))
+})
+
 test('ось: шаг линейки растёт с длиной дела, метки не липнут к краям', () => {
   const long = shapeDealTime(
     { now: 9000, terminal: false, timeline: [{ kind: 'created', at: 1000, summary: '' }], stages: [] },

@@ -239,10 +239,6 @@ INGEST_EVENT_KINDS = ("created", "claimed", "blocked", "unblocked", "completed",
 KIND_ORDER = (
     "created",
     "patched",
-    "plan_proposed",
-    "plan_gate",
-    "plan_accepted",
-    "plan_rejected",
     "claimed",
     "attempt_started",
     # Прогресс — сразу после начала попытки и до её конца: с одинаковым `ts`
@@ -256,6 +252,17 @@ KIND_ORDER = (
     "attached",
     "review_requested",
     "attempt_ended",
+    # Факт плана — решение по отчёту попытки, а не её пролог: применяется после
+    # конца той попытки, которая его принесла. Пока он стоял раньше, отказ
+    # `plan_rejected` (этап плана возвращается в работу) стирался следующим за ним
+    # `attempt_ended(done)` — дело `d_1cae95b3` закрылось «все этапы пройдены»,
+    # отвергнув собственный план и не запустив ни одного предложенного этапа.
+    # Следующей попытке граф по-прежнему виден: она начинается отдельным фактом с
+    # бо́льшим `ts`, а не тем же пакетом.
+    "plan_proposed",
+    "plan_gate",
+    "plan_accepted",
+    "plan_rejected",
     "changes_requested",
     "collected",
     "gate_opened",

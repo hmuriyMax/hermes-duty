@@ -581,10 +581,12 @@ def test_plan_facts_are_a_closed_set_and_ordered_before_stage_facts(home: Path) 
 
     for kind in ("plan_proposed", "plan_accepted", "plan_rejected", "plan_gate"):
         assert kind in journal.EVENT_KINDS
-    # Граф обязан существовать раньше, чем по нему пойдёт срез: при равном `ts`
-    # факты плана применяются до фактов этапа.
+    # Решение по плану — суд над отчётом попытки, поэтому применяется после её
+    # конца. Обратный порядок (план раньше `attempt_ended`) стирал отказ плана
+    # фактом `done` той же попытки: дело d_1cae95b3 закрылось «все этапы
+    # пройдены», не запустив ни одного предложенного этапа.
     for kind in ("plan_proposed", "plan_accepted", "plan_rejected", "plan_gate"):
-        assert journal.KIND_ORDER.index(kind) < journal.KIND_ORDER.index("attempt_started")
+        assert journal.KIND_ORDER.index(kind) > journal.KIND_ORDER.index("attempt_ended")
 
 
 def test_state_changing_kind_after_completed_reopens_honestly() -> None:

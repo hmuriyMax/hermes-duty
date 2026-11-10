@@ -716,6 +716,49 @@ def test_plan_stage_grows_the_graph_through_the_engine(tmp_path: Path) -> None:
     assert closed["stages"] == ["plan", "close", "research"]
 
 
+def test_a_rejected_plan_is_not_erased_by_the_attempt_that_proposed_it(tmp_path: Path) -> None:
+    """Отказ плана переживает конец собственной попытки — и этап идёт на реплан.
+
+    Живой кейс 10.11 (`d_1cae95b3`): этап плана предложил граф с двумя shell-этапами
+    без `cmd`, валидатор отказал (`plan_rejected`, два `issues`), и **в тот же
+    пакет** лёг `attempt_ended(done)` — процесс-то закончился успешно. Канонический
+    порядок журнала ставил факты плана раньше конца попытки, поэтому `done` ложился
+    поверх `pending`: дело закрылось «все этапы пройдены» через 39 секунд, ни один
+    предложенный этап не запустился, а хартия разрешала ещё два реплана.
+
+    Здесь проверяется следствие, а не порядок сам по себе: после отказа этап плана
+    снова `pending` с раундом 1, и следующий шаг движка — попытка `plan#2`.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, SEED.replace("min_stages: 4", "min_stages: 0").replace("max_rounds_replan: 1", "max_rounds_replan: 2"), name="replan.yaml")
+    deal = make_deal(conn, home, spec)
+    # Ровно то, что вернул живой этап: shell-этап без команды — отказ `kind.cmd`.
+    broken = [{"id": "check", "kind": "shell", "needs": ["plan"]}]
+    planned = runner.run_stage(
+        conn,
+        spec,
+        deal,
+        "plan",
+        1,
+        home=home,
+        spawn=Fake(result={"status": "done", "plan": {"stages": broken, "reason": "проверка"}, "summary": "план"}, pack=True),
+        clock=lambda: NOW,
+    )
+    assert planned["outcome"] == "done", (planned.get("kind"), planned.get("reason"))
+
+    events_in_journal = journal.read_events(conn, str(deal["id"]))
+    kinds = [str(event["kind"]) for event in events_in_journal]
+    assert kinds.index("plan_rejected") > kinds.index("attempt_ended"), kinds
+    states = transit.stage_states(spec, events_in_journal)
+    assert states["plan"].state == "pending", states["plan"]
+    assert states["plan"].rounds == 1
+    nxt = transit.next_stage(spec, events_in_journal, NOW)
+    assert nxt.pair == [("plan", 2)], nxt.pair
+    # Граф не вырос: предложение не стало планом ни одним этапом.
+    assert tuple(stage.id for stage in transit.graph(spec, events_in_journal)) == ("plan", "close")
+
+
 def test_driver_waits_for_the_plan_gate(tmp_path: Path) -> None:
     """Цикл движка на открытом гейте плана: вопрос, ожидание, дело не тронуто.
 
@@ -749,4 +792,7 @@ def test_plan_events_are_journal_facts(tmp_path: Path) -> None:
     assert "plan_rejected" not in journal.NON_STATE_KINDS
     assert "plan_gate" not in journal.NON_STATE_KINDS
     order = journal.KIND_ORDER
-    assert order.index("plan_proposed") < order.index("attempt_started")
+    # Предложение — часть суда над попыткой, а не её пролог: применяется после
+    # `attempt_ended`, иначе отказ плана тонет в `done` той же попытки.
+    assert order.index("plan_proposed") > order.index("attempt_ended")
+    assert order.index("plan_proposed") < order.index("plan_accepted")

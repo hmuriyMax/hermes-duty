@@ -25,6 +25,19 @@ const app = read('dashboard/web/app.js')
 const api = read('dashboard/plugin_api.py')
 const pluginSource = read('desktop/plugin.js')
 
+test('маркеры: центр палки точно на своём моменте', () => {
+  // Сдвиги якорей в стороны оставляли щели: из под палок выглядывала кромка
+  // полосы (Макс, 09.11). Центр палки — на моменте, якорь — только семантика.
+  const css = read('dashboard/web/styles.css')
+  const plugin = read('desktop/plugin.js')
+  for (const [name, text, cls] of [['веб', css, '.tl-mark'], ['десктоп', plugin, '.duty-tl-mark']]) {
+    assert.doesNotMatch(text, new RegExp(`${cls}\\.anchor-end\\s*{[^}]*-100%`), `${name}: палка вывода сдвинута`)
+    assert.doesNotMatch(text, new RegExp(`${cls}\\.anchor-start\\s*{[^}]*translateX\\(1px`), `${name}: палка вопроса сдвинута`)
+  }
+  assert.match(css, /\.tl-mark\.anchor-end, \.tl-mark\.anchor-start \{ transform: translateX\(-50%\)/)
+  assert.match(plugin, /\.duty-tl-mark\.anchor-end,\.duty-tl-mark\.anchor-start\{transform:translateX\(-50%\)\}/)
+})
+
 test('свёрнутая строка: чипы линейной ширины, развёрнутая — логарифм', () => {
   const css = read('dashboard/web/styles.css')
   // В нахлёсте уровней нет: плотность цвета — единственная правда строки, и она

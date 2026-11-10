@@ -3405,6 +3405,27 @@ def test_reviewer_contract_warns_against_gitlab_crawl(tmp_path: Path) -> None:
     home = make_home(tmp_path)
     conn = open_store(home)
     deal = make_deal(conn)
+    spec = write_spec(
+        tmp_path,
+        """
+        duty: probe
+        stages:
+          - id: review
+            role: reviewer
+        """,
+    )
+    runner.run_stage(conn, spec, deal, "review", 1, home=home, clock=lambda: NOW, spawn=Fake(result=None, exit_code=0, lines=[]))
+    contract_file = runner.contract_path(runner.attempt_dir(home, deal, "review", 1), "review", 1)
+    boundaries = "\n".join(json.loads(contract_file.read_text(encoding="utf-8"))["boundaries"])
+    assert "GitLab API пофайлово" in boundaries
+    assert "команды evidence прогоняются первыми" in boundaries
+    assert "evidence.stale" in boundaries
+
+
+def test_lead_plan_contract_does_not_carry_reviewer_boundaries(tmp_path: Path) -> None:
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
     spec = plan_spec(tmp_path)
     run_stage(conn, spec, deal, home, Fake(result=None, exit_code=0, lines=[]))
     contract_file = runner.contract_path(runner.attempt_dir(home, deal, "plan", 1), "plan", 1)

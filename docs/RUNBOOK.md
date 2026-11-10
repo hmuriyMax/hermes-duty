@@ -727,6 +727,19 @@ heartbeat движка). Живой случай: попытка погибла 
 - не отдавать `added_by`/`parallel_with` в срезе (`stagefeed.stages`) — падают
   `test_stage_slice_names_the_author_and_the_parallel_of_added_stages` и тест
   шейпера «параллель и автор этапа — из графа, а не догадка экрана».
+- следить за попытками пачки по одной сразу (в `runner.step` закрывать попытку в том
+  же проходе, где подняли) — падают
+  `test_two_stages_declared_parallel_start_in_one_step_with_both_leases` (второй этап
+  стартует только после смерти первого: лизинга первого уже нет) и
+  `test_the_slice_shows_both_stages_running` (в срезе `done` вместо `running`);
+- снять предел пачки (`MAX_PARALLEL` в `transit._batch`) — падает
+  `test_the_parallel_limit_is_respected`: третьим шагом поехали бы три процесса;
+- не продлевать лизинг соседей по пачке (убрать `others` из `runner.follow`) —
+  падает `test_a_sibling_keeps_its_lease_while_the_engine_watches_the_first`: живая
+  вторая попытка протухла бы на сроке этапа;
+- выкинуть shell-этап из пачки (`start_shell_stage` мимо `_Live`) — падает
+  `test_a_shell_stage_and_an_agent_stage_stand_together`: команда и агент пошли бы
+  по очереди.
 
 ## 11. Одно дело руками: от спеки до закрытых этапов
 
@@ -1366,7 +1379,7 @@ bin/duty attempts d_a7040118
 |---|---|
 | S1 | сверка с `must` держит всю классификацию исхода shell-попытки: соседний кейс — `test_shell_must_accepts_its_own_code` (команда с кодом `must` обязана проходить) |
 | S2 | `test_gate_allow_defaults_to_every_option`, `test_gate_answer_outside_allow_stops_the_deal` |
-| S3 | `test_refused_shell_attempt_names_deal_minutes` — та же сверка в `run_shell_stage`: отказ обязан называть числа и у этапа-команды |
+| S3 | `test_refused_shell_attempt_names_deal_minutes` — та же сверка в `start_shell_stage`: отказ обязан называть числа и у этапа-команды |
 | S4/FIX-S4a | `test_publish_claim_by_a_short_sha_is_confirmed_by_origin`, `test_approval_of_a_short_gate_commit_is_ok` (обе — `same_commit` на уровне прогона), `test_publish_claim_of_an_ambiguous_sha_is_contract`: без сверки по префиксу неоднозначность тоже перестаёт ловиться |
 | FIX-V | `test_review_changes_returns_to_the_named_stage` (приговор `changes` тоже обязан стать фактом, иначе возврат на доработку не читается), `test_review_without_verdict_is_contract` (`done` без приговора остаётся `done` — тишина вместо отказа) |
 

@@ -264,6 +264,12 @@ PLAN_STAGE = spec_module.PLAN_STAGE
 APPROVE = "approve"
 CHANGES = "changes"
 
+# Сколько этапов движок ведёт одновременно (`_batch`, `runner.step`). Предел —
+# здесь, рядом с остальными лимитами слоя, и он же назван в `docs/SPEC.md` и
+# `docs/ENGINE-1.0.md`: больше двух попыток пачки — это два процесса модели, два
+# дерева и два лизинга на один шаг, и остальные этапы ждут своей пачки.
+MAX_PARALLEL = 2
+
 
 # ------------------------------------------------------------------- структуры
 
@@ -1404,9 +1410,14 @@ def _batch(spec: Any, runnable: list[Any]) -> tuple[str, ...]:
     Одновременно идёт только объявленное (правило 3): два готовых этапа без
     `parallel_with` запускаются по одному, иначе слой сам придумал бы параллелизм,
     которого спека не просила. Порядок внутри пачки — объявления в спеке.
+
+    Размер пачки ограничен `MAX_PARALLEL`: остальные объявленные параллельными
+    этапы ждут своей пачки и попадут в следующий шаг, когда место освободится.
     """
     picked: list[Any] = []
     for stage in runnable:
+        if len(picked) >= MAX_PARALLEL:
+            break
         if all(_parallel(stage, other) for other in picked):
             picked.append(stage)
     return tuple(stage.id for stage in picked)

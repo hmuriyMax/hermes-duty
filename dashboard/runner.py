@@ -35,7 +35,8 @@
    `tokens` → превышение по `usage` из потока останавливает попытку.
    У этапа `kind: shell` (`docs/SPEC.md`) процесса роли нет вовсе: вместо спавна
    запускается `sh -c <cmd>` в том же дереве, а договор результата — код возврата
-   `must` и объявленные `artifacts`, а не `result.json` (`run_shell_stage`).
+   `must` и объявленные `artifacts`, а не `result.json` (`start_shell_stage` →
+   `finish_shell_stage`).
 5. **Телеметрия**: каждый `tool_use`/`tool_result` потока — событие
    `attempt_progress` (фаза, имя инструмента, длительность). Журнал отвечает
    «что делается прямо сейчас» без ps и хвостов логов.
@@ -72,6 +73,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -1544,12 +1546,17 @@ def follow(
     budget_tokens: Optional[int],
     monotonic: Callable[[], float],
     clock: Callable[[], float],
+    others: Iterable[tuple[str, int, int]] = (),
 ) -> Followed:
     """Читать поток до конца, писать телеметрию, держать лизинг и бюджет.
 
     Три вещи делаются по ходу, а не после: heartbeat лизинга (не реже TTL/3),
     проверка бюджета токенов по `usage` из `result` и таймаут. Иначе «процесс
     идёт» и «процесс висит» отличались бы только по ps.
+
+    `others` — лизинги соседей по пачке (`этап, pid, срок`): они продлеваются тем
+    же heartbeat'ом. Второй процесс пачки живой, пока за первым смотрят, и без
+    этого его лизинг протух бы на сроке этапа.
     """
     state = Followed()
     seq = 0
@@ -1591,6 +1598,15 @@ def follow(
                 ttl=ttl,
                 now=_now_sec(int(clock())),
             )
+            for other_stage, other_pid, other_ttl in others:
+                renew(
+                    conn,
+                    deal=deal,
+                    stage=other_stage,
+                    pid=other_pid,
+                    ttl=other_ttl,
+                    now=_now_sec(int(clock())),
+                )
             last_renew = monotonic()
         line = process.next_line(POLL_SEC)
         if line is None:
@@ -1729,6 +1745,7 @@ def follow_shell(
     deadline: float,
     monotonic: Callable[[], float],
     clock: Callable[[], float],
+    others: Iterable[tuple[str, int, int]] = (),
 ) -> ShellRun:
     """Довести команду этапа до конца: heartbeat лизинга, таймаут, хвост stdout.
 
@@ -1736,6 +1753,9 @@ def follow_shell(
     `logs`): журнал отвечает «чем кончилось», файл — «что было написано».
     Таймаут — наш собственный факт, поэтому проверяется по часам шага, а не по
     коду возврата: убитый по сроку процесс тоже вернёт код сигнала.
+
+    `others` — лизинги соседей по пачке: продлеваются тем же heartbeat'ом, иначе
+    вторая команда пачки потеряла бы лизинг, пока движок смотрит за первой.
     """
     state = ShellRun()
     last_renew = monotonic()
@@ -1744,6 +1764,15 @@ def follow_shell(
     while True:
         if monotonic() - last_renew >= renew_every:
             renew(conn, deal=deal, stage=stage.id, pid=pid, ttl=ttl, now=_now_sec(int(clock())))
+            for other_stage, other_pid, other_ttl in others:
+                renew(
+                    conn,
+                    deal=deal,
+                    stage=other_stage,
+                    pid=other_pid,
+                    ttl=other_ttl,
+                    now=_now_sec(int(clock())),
+                )
             last_renew = monotonic()
         line = process.next_line(POLL_SEC)
         if line is None:
@@ -1896,7 +1925,40 @@ def refuse_budget(
     }
 
 
-def run_shell_stage(
+@dataclasses.dataclass
+class _Live:
+    """Поднятая попытка, за которой ещё не следили: `start_stage` → `finish_stage`.
+
+    Подъём и слежение разделены ради пачки (`docs/ENGINE-1.0.md`, раздел 3): два
+    этапа одной пачки обязаны идти одновременно, а `follow` держит один процесс до
+    его смерти. Шаг поднимает все попытки пачки — у каждой свой лизинг и свой факт
+    `attempt_started` — и только потом следит за каждой.
+    """
+
+    spec: Any
+    stage: Any
+    attempt: int
+    run_id: str
+    workdir: Path
+    tree: Optional[Path]
+    cwd: Path
+    base: str
+    process: Any
+    pid: int
+    ttl: int
+    deadline_sec: int
+    began: float
+    started_at: int
+    kind: str = STAGE_KIND_AGENT
+    session_id: str = ""
+    result_file: Optional[Path] = None
+    previous: Any = ()
+    events: Any = ()
+    approval: Optional[Any] = None
+    budget_tokens: Optional[int] = None
+
+
+def start_shell_stage(
     conn: sqlite3.Connection,
     spec: Any,
     deal: Any,
@@ -1908,7 +1970,11 @@ def run_shell_stage(
     clock: Optional[Callable[[], float]] = None,
     monotonic: Optional[Callable[[], float]] = None,
 ) -> dict[str, Any]:
-    """Одна попытка shell-этапа: лизинг, дерево, команда, факты в журнал.
+    """Поднять попытку shell-этапа: лизинг, дерево, команда, `attempt_started`.
+
+    Ответ — `{"live": _Live, "result": None}`, когда команда пошла и за ней ещё
+    предстоит следить, и `{"live": None, "result": {...}}`, когда шаг закрыт сразу:
+    исчерпанный потолок, занятый лизинг или сбой дерева отдают прежний отчёт шага.
 
     Договор результата — код возврата и артефакты, а не `result.json`: команда не
     отчитывается, она либо сходится с `must`, либо нет. Вопросов человеку этап не
@@ -1939,16 +2005,19 @@ def run_shell_stage(
     spent = budget.refusal(spec, journal.read_events(conn, str(deal["id"])))
     refused = refuse_budget(conn, spec, deal, stage, attempt, spent, clock=clock)
     if refused is not None:
-        return refused
+        return {"live": None, "result": refused}
 
     held_at = _now_sec(int(clock()))
     if not lease(conn, deal=deal, stage=stage_id, attempt=attempt, pid=engine_pid, ttl=ttl, now=held_at):
         held = lease_of(conn, deal, stage_id) or {}
         return {
-            "started": False,
-            "stage": stage_id,
-            "attempt": attempt,
-            "reason": f"этап уже за процессом pid={held.get('pid')}, срок до {held.get('expires_at')}",
+            "live": None,
+            "result": {
+                "started": False,
+                "stage": stage_id,
+                "attempt": attempt,
+                "reason": f"этап уже за процессом pid={held.get('pid')}, срок до {held.get('expires_at')}",
+            },
         }
 
     stage_base = str(spec.base or "")
@@ -1980,16 +2049,19 @@ def run_shell_stage(
         journal.append(conn, [event])
         park = park_exhausted(conn, spec, deal, stage, attempt, kind, str(exc), home=home, clock=clock)
         return {
-            "started": True,
-            "stage": stage_id,
-            "attempt": attempt,
-            "outcome": OUTCOME_FAILED,
-            "kind": kind,
-            "reason": str(exc),
-            "workdir": str(workdir),
-            "tree": None,
-            "base": stage_base,
-            "park": park,
+            "live": None,
+            "result": {
+                "started": True,
+                "stage": stage_id,
+                "attempt": attempt,
+                "outcome": OUTCOME_FAILED,
+                "kind": kind,
+                "reason": str(exc),
+                "workdir": str(workdir),
+                "tree": None,
+                "base": stage_base,
+                "park": park,
+            },
         }
 
     actual_base = stage_base
@@ -2042,26 +2114,72 @@ def run_shell_stage(
             release(conn, deal=deal, stage=stage_id, pid=engine_pid)
         raise
 
-    began = monotonic()
+    return {
+        "live": _Live(
+            spec=spec,
+            stage=stage,
+            attempt=attempt,
+            run_id=run_id,
+            workdir=workdir,
+            tree=tree,
+            cwd=cwd,
+            base=actual_base,
+            process=process,
+            pid=pid,
+            ttl=ttl,
+            deadline_sec=deadline_sec,
+            began=monotonic(),
+            started_at=int(started["ts"]),
+            kind=STAGE_KIND_SHELL,
+        ),
+        "result": None,
+    }
+
+
+def finish_shell_stage(
+    conn: sqlite3.Connection,
+    deal: Any,
+    live: _Live,
+    *,
+    home: Path,
+    others: Iterable[tuple[str, int, int]] = (),
+    clock: Optional[Callable[[], float]] = None,
+    monotonic: Optional[Callable[[], float]] = None,
+) -> dict[str, Any]:
+    """Довести поднятую команду до факта: поток, код возврата, `attempt_ended`.
+
+    `others` — лизинги соседей по пачке: пока движок смотрит за этой командой, их
+    срок тоже продлевается, иначе живая попытка потеряла бы лизинг.
+    """
+    clock = clock or time.time
+    monotonic = monotonic or time.monotonic
+    spec = live.spec
+    stage, attempt, run_id = live.stage, live.attempt, live.run_id
+    stage_id = stage.id
+    workdir, tree, cwd = live.workdir, live.tree, live.cwd
+    pid, ttl, deadline_sec = live.pid, live.ttl, live.deadline_sec
+    actual_base = live.base
+    began = live.began
     try:
         followed = follow_shell(
             conn,
-            process,
+            live.process,
             deal=deal,
             stage=stage,
             attempt=attempt,
             ttl=ttl,
             deadline=began + deadline_sec,
+            others=others,
             monotonic=monotonic,
             clock=clock,
         )
     except sqlite3.Error:
-        process.stop()
+        live.process.stop()
         release(conn, deal=deal, stage=stage_id, pid=pid)
         raise
-    exit_code = process.exit_code if process.exit_code is not None else process.wait(KILL_GRACE_SEC)
+    exit_code = live.process.exit_code if live.process.exit_code is not None else live.process.wait(KILL_GRACE_SEC)
     duration = max(0.0, monotonic() - began)
-    process.close_logs()
+    live.process.close_logs()
     outcome, kind, reason = classify_shell(
         exit_code=exit_code, timed_out=followed.timed_out, must=int(getattr(stage, "must", 0)), timeout_sec=deadline_sec
     )
@@ -2079,7 +2197,7 @@ def run_shell_stage(
                 result,
                 stage,
                 workdir,
-                attempt_started_at=int(started["ts"]),
+                attempt_started_at=live.started_at,
                 now=now,
                 root=cwd,
                 base=spec.base,
@@ -3204,7 +3322,7 @@ def _gate_expired(answer: dict[str, Any]) -> bool:
 # ---------------------------------------------------------------------- шаг
 
 
-def run_stage(
+def start_stage(
     conn: sqlite3.Connection,
     spec: Any,
     deal: Any,
@@ -3217,11 +3335,13 @@ def run_stage(
     clock: Optional[Callable[[], float]] = None,
     monotonic: Optional[Callable[[], float]] = None,
 ) -> dict[str, Any]:
-    """Одна попытка этапа: лизинг, дерево, контракт, процесс, факты в журнал.
+    """Поднять попытку: лизинг, дерево, контракт, процесс, `attempt_started`.
 
-    Возвращает отчёт о шаге: `started` (попытка действительно пошла),
-    `outcome`/`kind`/`reason` — как в событии, `question_id` — если попытка
-    задала вопрос, `workdir`/`tree` — где она работала.
+    Ответ — `{"live": _Live, "result": None}`, когда попытка пошла и за ней ещё
+    предстоит следить, и `{"live": None, "result": {...}}`, когда шаг закрыт сразу:
+    гейт идёт своим путём (у него нет ни процесса, ни лизинга), shell-этап — тоже
+    (`start_shell_stage`), а отказ публикации, исчерпанный потолок, занятый лизинг
+    и сбой дерева отдают прежние отчёты шага.
 
     `answer` — ответ человека на вопрос прошлой попытки: с ним процесс
     продолжается резюмом (`RESUME-OK`), без него начинается новая сессия.
@@ -3240,15 +3360,19 @@ def run_stage(
         raise RunnerError(f"номер попытки {attempt}: попытки считаются с 1")
     if getattr(stage, "kind", STAGE_KIND_AGENT) == STAGE_KIND_SHELL:
         # Вид этапа — выбор спеки, а не режим движка: попытку исполняет команда,
-        # и её шаг живёт отдельной функцией (`run_shell_stage`), чтобы ветка
-        # агента осталась ровно той же, что была до 0.0.5.
-        return run_shell_stage(
+        # и её шаг живёт отдельной функцией (`start_shell_stage` →
+        # `finish_shell_stage`), чтобы ветка агента осталась ровно той же, что была
+        # до 0.0.5.
+        return start_shell_stage(
             conn, spec, deal, stage_id, attempt, home=home, spawn=spawn, clock=clock, monotonic=monotonic
         )
     if getattr(stage, "kind", STAGE_KIND_AGENT) == STAGE_KIND_GATE:
         # Гейт — тоже отдельная ветка: ни процесса, ни дерева, ни лизинга у него
         # нет, и общий путь агента для него был бы неверен в каждой строке.
-        return run_gate_stage(conn, spec, deal, stage_id, attempt, home=home, clock=clock)
+        return {
+            "live": None,
+            "result": run_gate_stage(conn, spec, deal, stage_id, attempt, home=home, clock=clock),
+        }
     ttl = ttl_sec(stage)
     deadline_sec = ttl
     engine_pid = os.getpid()
@@ -3269,7 +3393,7 @@ def run_stage(
             approval = publish.approval(events, gates, current=current)
         refused = refuse_publish(conn, deal, stage, attempt, approval, clock=clock)
         if refused is not None:
-            return refused
+            return {"live": None, "result": refused}
 
     # Потолок дела целиком (0.0.5) проверяется до лизинга и до спавна: расход
     # считается по журналу (`dashboard/budget.py`), поэтому переживает рестарт и
@@ -3278,7 +3402,7 @@ def run_stage(
     spent = budget.refusal(spec, journal.read_events(conn, str(deal["id"])))
     refused = refuse_budget(conn, spec, deal, stage, attempt, spent, clock=clock)
     if refused is not None:
-        return refused
+        return {"live": None, "result": refused}
 
     held_at = _now_sec(int(clock()))
     if not lease(
@@ -3286,10 +3410,13 @@ def run_stage(
     ):
         held = lease_of(conn, deal, stage_id) or {}
         return {
-            "started": False,
-            "stage": stage_id,
-            "attempt": attempt,
-            "reason": f"этап уже за процессом pid={held.get('pid')}, срок до {held.get('expires_at')}",
+            "live": None,
+            "result": {
+                "started": False,
+                "stage": stage_id,
+                "attempt": attempt,
+                "reason": f"этап уже за процессом pid={held.get('pid')}, срок до {held.get('expires_at')}",
+            },
         }
 
     stage_base = str(spec.base or "")
@@ -3328,16 +3455,19 @@ def run_stage(
             conn, spec, deal, stage, attempt, kind, str(exc), home=home, clock=clock
         )
         return {
-            "started": True,
-            "stage": stage_id,
-            "attempt": attempt,
-            "outcome": OUTCOME_FAILED,
-            "kind": kind,
-            "reason": str(exc),
-            "workdir": str(workdir),
-            "tree": None,
-            "base": stage_base,
-            "park": park,
+            "live": None,
+            "result": {
+                "started": True,
+                "stage": stage_id,
+                "attempt": attempt,
+                "outcome": OUTCOME_FAILED,
+                "kind": kind,
+                "reason": str(exc),
+                "workdir": str(workdir),
+                "tree": None,
+                "base": stage_base,
+                "park": park,
+            },
         }
 
     # Фактическая база дерева: `git rev-parse HEAD` после отвода. База в спеке
@@ -3444,17 +3574,96 @@ def run_stage(
             release(conn, deal=deal, stage=stage_id, pid=engine_pid)
         raise
 
-    budget_tokens = getattr(getattr(stage, "budget", None), "tokens", None)
+    return {
+        "live": _Live(
+            spec=spec,
+            stage=stage,
+            attempt=attempt,
+            run_id=run_id,
+            workdir=workdir,
+            tree=tree,
+            cwd=cwd,
+            base=actual_base,
+            process=process,
+            pid=pid,
+            ttl=ttl,
+            deadline_sec=deadline_sec,
+            began=monotonic(),
+            started_at=int(started["ts"]),
+            session_id=session_id,
+            result_file=result_file,
+            previous=previous,
+            events=events,
+            approval=approval,
+            budget_tokens=getattr(getattr(stage, "budget", None), "tokens", None),
+        ),
+        "result": None,
+    }
+
+
+def finish_stage(
+    conn: sqlite3.Connection,
+    deal: Any,
+    live: _Live,
+    *,
+    home: Path,
+    others: Iterable[tuple[str, int, int]] = (),
+    spawn: Optional[Callable[..., Any]] = None,
+    clock: Optional[Callable[[], float]] = None,
+    monotonic: Optional[Callable[[], float]] = None,
+) -> dict[str, Any]:
+    """Довести поднятую попытку до факта: поток, классификация, `attempt_ended`.
+
+    Один вход на оба вида этапов: чем следить за процессом, решает `_Live.kind`,
+    а не вызывающий. `others` — лизинги соседей по пачке (`этап, pid, срок`):
+    пока движок смотрит за этим процессом, их срок тоже продлевается, иначе
+    живая попытка потеряла бы лизинг, ни разу не провинившись.
+    """
+    if live.kind == STAGE_KIND_SHELL:
+        return finish_shell_stage(conn, deal, live, home=home, others=others, clock=clock, monotonic=monotonic)
+    return finish_agent_stage(
+        conn, deal, live, home=home, others=others, spawn=spawn, clock=clock, monotonic=monotonic
+    )
+
+
+def finish_agent_stage(
+    conn: sqlite3.Connection,
+    deal: Any,
+    live: _Live,
+    *,
+    home: Path,
+    others: Iterable[tuple[str, int, int]] = (),
+    spawn: Optional[Callable[..., Any]] = None,
+    clock: Optional[Callable[[], float]] = None,
+    monotonic: Optional[Callable[[], float]] = None,
+) -> dict[str, Any]:
+    """Слежение за попыткой агента: поток, гейты, приговор, `attempt_ended`."""
+    spawner = spawn or spawn_process
+    clock = clock or time.time
+    monotonic = monotonic or time.monotonic
+    spec = live.spec
+    stage, attempt, run_id = live.stage, live.attempt, live.run_id
+    stage_id = stage.id
+    workdir, tree, cwd = live.workdir, live.tree, live.cwd
+    pid, ttl, deadline_sec = live.pid, live.ttl, live.deadline_sec
+    actual_base = live.base
+    session_id = live.session_id
+    result_file = live.result_file
+    approval = live.approval
+    budget_tokens = live.budget_tokens
+    events = live.events
+    previous = live.previous
     try:
         followed = follow(
             conn,
-            process,
+            live.process,
             deal=deal,
             stage=stage,
             attempt=attempt,
             ttl=ttl,
-            deadline=monotonic() + deadline_sec,
+            deadline=live.began + live.deadline_sec,
             budget_tokens=budget_tokens,
+            others=others,
             monotonic=monotonic,
             clock=clock,
         )
@@ -3462,10 +3671,10 @@ def run_stage(
         # Журнал не пишется — попытку не бросаем без присмотра: процесс гасим,
         # лизинг отпускаем, отказ идёт вызывающему. Иначе «шаг упал» оставил бы
         # живой процесс и занятый этап.
-        process.stop()
+        live.process.stop()
         release(conn, deal=deal, stage=stage_id, pid=pid)
         raise
-    exit_code = process.exit_code if process.exit_code is not None else process.wait(KILL_GRACE_SEC)
+    exit_code = live.process.exit_code if live.process.exit_code is not None else live.process.wait(KILL_GRACE_SEC)
     result, result_error = read_result(result_file)
     outcome, kind, reason = classify(
         result=result,
@@ -3476,7 +3685,7 @@ def run_stage(
     )
     status = str((result or {}).get("status") or "").strip().lower()
     parked = outcome == OUTCOME_DONE and status in BLOCKED_STATUSES
-    stderr_file = write_stderr(workdir, process.stderr_text)
+    stderr_file = write_stderr(workdir, live.process.stderr_text)
 
     # Гейт пакета: слово «готово» принимается только вместе с проверяемыми
     # доказательствами. Запускается после смерти процесса и до записи
@@ -3488,7 +3697,7 @@ def run_stage(
             result,
             stage,
             workdir,
-            attempt_started_at=int(started["ts"]),
+            attempt_started_at=live.started_at,
             now=now,
             root=cwd,
             base=spec.base,
@@ -3686,6 +3895,36 @@ def run_stage(
         "verdict": verdict.as_payload() if verdict is not None else None,
         "park": park,
     }
+
+
+def run_stage(
+    conn: sqlite3.Connection,
+    spec: Any,
+    deal: Any,
+    stage_id: str,
+    attempt: int,
+    *,
+    home: Path,
+    answer: Optional[str] = None,
+    spawn: Optional[Callable[..., Any]] = None,
+    clock: Optional[Callable[[], float]] = None,
+    monotonic: Optional[Callable[[], float]] = None,
+) -> dict[str, Any]:
+    """Одна попытка этапа: лизинг, дерево, контракт, процесс, факты в журнал.
+
+    Возвращает отчёт о шаге: `started` (попытка действительно пошла),
+    `outcome`/`kind`/`reason` — как в событии, `question_id` — если попытка
+    задала вопрос, `workdir`/`tree` — где она работала.
+
+    `answer` — ответ человека на вопрос прошлой попытки: с ним процесс
+    продолжается резюмом (`RESUME-OK`), без него начинается новая сессия.
+    """
+    launched = start_stage(
+        conn, spec, deal, stage_id, attempt, home=home, answer=answer, spawn=spawn, clock=clock, monotonic=monotonic
+    )
+    if launched["live"] is None:
+        return launched["result"]
+    return finish_stage(conn, deal, launched["live"], home=home, spawn=spawn, clock=clock, monotonic=monotonic)
 
 
 def park_exhausted(
@@ -4484,6 +4723,10 @@ def step(
     решает не этот слой, и выдумывать здесь шаг нельзя. `answer` относится к
     продолжению после вопроса и передаётся в каждую попытку этого шага.
 
+    Пачка (`decision.pair` длиннее одного) поднимается целиком и только потом
+    рассматривается: попытки идут одновременно, и падение одной не отменяет
+    вторую — у каждой свой лизинг, свой процесс и свой факт конца.
+
     Перед попытками движок закрывает блок, который ждал ответа
     (`close_answered_block`): ответ человека — уже факт журнала, а открытый
     `blocked` держал бы дело в `wait_human`, хотя движок снова взялся за работу.
@@ -4492,20 +4735,39 @@ def step(
     if kind != DECISION_RUN:
         return {"started": 0, "skipped": f"решение {kind or '—'} не запускает попыток", "runs": []}
     close_answered_block(conn, deal, clock=clock)
-    runs: list[dict[str, Any]] = []
+    runs: list[Optional[dict[str, Any]]] = []
+    live: list[tuple[int, _Live]] = []
     for stage_id, attempt in getattr(decision, "pair", []) or []:
-        runs.append(
-            run_stage(
-                conn,
-                spec,
-                deal,
-                str(stage_id),
-                int(attempt),
-                home=home,
-                answer=answer,
-                spawn=spawn,
-                clock=clock,
-                monotonic=monotonic,
-            )
+        launched = start_stage(
+            conn,
+            spec,
+            deal,
+            str(stage_id),
+            int(attempt),
+            home=home,
+            answer=answer,
+            spawn=spawn,
+            clock=clock,
+            monotonic=monotonic,
         )
-    return {"started": sum(1 for run in runs if run.get("started")), "runs": runs}
+        runs.append(launched["result"])
+        if launched["live"] is not None:
+            live.append((len(runs) - 1, launched["live"]))
+    # Слежение — после подъёма всей пачки: два этапа пачки идут одновременно, а не
+    # один за другим. Каждая попытка закрывается своим фактом (`attempt_ended`),
+    # поэтому «шаг закрыт» — это столько закрытий, сколько попыток в решении.
+    for index, attempt_live in live:
+        others = tuple(
+            (item.stage.id, item.pid, item.ttl) for number, item in live if number != index
+        )
+        runs[index] = finish_stage(
+            conn,
+            deal,
+            attempt_live,
+            home=home,
+            others=others,
+            spawn=spawn,
+            clock=clock,
+            monotonic=monotonic,
+        )
+    return {"started": sum(1 for run in runs if run.get("started")), "runs": list(runs)}

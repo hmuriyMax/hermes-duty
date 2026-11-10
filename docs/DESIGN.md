@@ -159,6 +159,13 @@ failures.classify → policy → decide_park
 одного правила перехода: спрашивает `transit`, отдаёт `runner`, снова читает
 журнал. Поэтому `bin/duty run`, убитый после `impl`, продолжает с `verify`.
 
+Шаг может вести **две попытки сразу** — только если граф объявил их параллельными
+(`transit._batch`, не больше `MAX_PARALLEL` = 2). Поэтому шаг разделён надвое:
+`start_stage` поднимает попытку (лизинг, дерево, контракт, процесс, `attempt_started`),
+`finish_stage` доводит её до факта (поток, гейты, приговор, `attempt_ended`), а
+`runner.step` сначала поднимает всю пачку и только потом следит за каждой попыткой.
+Своего состояния у пачки нет: две открытые попытки в журнале и есть «два этапа идут».
+
 **«Все этапы закрыты» — факт журнала, а не строка вывода.** `transit` отвечает
 `done`, и драйвер пишет это тем же путём, что `bin/duty close`: `completed` с
 `cause` и списком пройденных этапов, одной транзакцией со строкой дела. Причину и
@@ -187,7 +194,7 @@ failures.classify → policy → decide_park
 | Можно ли вообще запускать это дело? | `validate_spec()`: формат, ключи, граф, гейты, `review-gate` | `dashboard/spec.py` (контракт — `docs/SPEC.md`) |
 | Что делать дальше: `run`, `wait`, `done`, `failed`, `park`? | `next_stage(spec, events, now)` — чистая функция, ни БД, ни сети, ни часов | `dashboard/transit.py` |
 | В каком состоянии каждый этап и какая у него попытка? | `stage_states(spec, events)` — тот же свёрточный проход, что у решения | `dashboard/transit.py` |
-| Как поднять попытку: лизинг, дерево, контракт, спавн, поток? | `run_stage()` / `step()` | `dashboard/runner.py` |
+| Как поднять попытку: лизинг, дерево, контракт, спавн, поток? | `start_stage()` / `finish_stage()` (`run_stage()` — тот же путь для одного этапа) и `step()` | `dashboard/runner.py` |
 | От чего отводится дерево этапа и кто коммитит принятую работу? | `base_of_stage(spec, stage, events)` — база **этапа** (`spec.base` у входа, коммит последней успешной попытки предшественника у следующего; предшественник, не произведший коммита (`workspace: dir`/`none`), базой не становится — берётся `spec.base`; расходящиеся коммиты предшественников — `BaseError` = `failed(contract)`); `commit_tree(tree, …)` — `git add -A` и коммит `duty: <deal> <stage> attempt <n>` в дереве попытки (detached HEAD: дерево попытки ветку не занимает), а `anchor_commit(tree, deal, commit)` ставит на этот коммит ветку дела `duty/<deal_id>` — иначе работа живёт до первого `git gc` | `dashboard/runner.py` |
 | Где лизинг этапа и сколько он живёт? | таблица `leases` в своей `duty/duty.db`, TTL из `budget.minutes` | `dashboard/runner.py` |
 | «Что делается прямо сейчас»? | `attempt_progress` на каждый `tool_use`/`tool_result`; `fold` копит `progress: {tools, last_tool, last_at}` | `dashboard/runner.py` → `dashboard/journal.py` |

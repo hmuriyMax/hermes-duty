@@ -1836,3 +1836,16 @@ def test_own_deal_without_attempts_still_says_the_engine_never_started(
     assert "шага движка ещё не было" in evidence
     assert "попыток в журнале" not in evidence
     assert "bin/duty run" in evidence
+
+
+def test_repo_of_canonicalizes_path_and_name_to_one_group() -> None:
+    """Путь и имя — одна группа: канонизация по последнему компоненту пути.
+
+    Кейс d_99c2003f против d_2fc749fb: `/Users/.../payout-sx-widgets-api` и
+    `payout-sx-widgets-api` дали в `duty deals` две группы одного проекта.
+    """
+    assert deals.repo_of("/Users/mshchemilkin/GolandProjects/payout-sx-widgets-api") == "payout-sx-widgets-api"
+    assert deals.repo_of("payout-sx-widgets-api") == "payout-sx-widgets-api"
+    assert deals.repo_of("~/GolandProjects/payout-sx-widgets-api/") == "payout-sx-widgets-api"
+    assert deals.repo_of("") is None
+    assert deals.repo_of(None) is None

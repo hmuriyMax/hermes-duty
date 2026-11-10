@@ -436,21 +436,24 @@ def new_id() -> str:
 
 
 def repo_of(value: Any) -> Optional[str]:
-    """Репозиторий дела: путь как есть (с `~` развёрнутым), `None` — не назван.
+    """Репозиторий дела: каноничное имя для группировки, `None` — не назван.
 
     Источник один на оба входа (`create` API и `cli`): `spec.repo`, иначе явный
     `--repo`. Значение не проверяется на существование: группировка не обязана
     быть живым каталогом, а «репозиторий объявлен, но его нет на диске» — дело
-    спеки (`duty spec check`), а не отказ создания. Нормализация ровно одна —
-    `~` разворачивается, иначе один и тот же репозиторий, записанный двумя
-    способами, дал бы две группы.
+    спеки (`duty spec check`), а не отказ создания. Канонизация — последний
+    компонент пути (`~` разворачивается, хвостовые слэши гасятся): одно и то же
+    репо, записанное путём и именем, — одна группа, а не две. Кейс d_99c2003f
+    против d_2fc749fb: `/Users/.../payout-sx-widgets-api` и
+    `payout-sx-widgets-api` дали в `duty deals` две группы одного проекта.
     """
     if value is None:
         return None
     text = str(value).strip()
     if not text:
         return None
-    return str(Path(text).expanduser())
+    path = Path(text).expanduser()
+    return path.name or str(path)
 
 
 def external_ref_of(value: Any) -> Optional[str]:

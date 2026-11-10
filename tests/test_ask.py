@@ -222,6 +222,19 @@ def ask_once(home: Path, **kwargs: Any) -> ask.AskResult:
         conn.close()
 
 
+def answer_pool_question(home: Path, question_id: int, answer: str) -> None:
+    """Закрыть вопрос пула как отвеченный человек (руками, как делает мост)."""
+    pool = sqlite3.connect(home / "messaging" / "pool.db")
+    try:
+        pool.execute(
+            "UPDATE questions SET status = 'answered', answer = ? WHERE id = ?",
+            (answer, int(question_id)),
+        )
+        pool.commit()
+    finally:
+        pool.close()
+
+
 def waiting_now(client: TestClient) -> dict[str, Any]:
     """`waiting` единственного дела из `/now`."""
     return client.get("/now").json()["deals"][0]["waiting"]
@@ -279,6 +292,27 @@ def test_second_ask_returns_same_question_without_duplicate(home: Path) -> None:
     assert len(rows) == 1
     assert rows[0]["text"] == "Первый вопрос"
     assert [event["kind"] for event in journal_events(home)] == ["question_asked"]
+
+
+def test_answered_question_does_not_suppress_a_new_ask(home: Path) -> None:
+    """Ответ израсходован — тот же текст задаётся заново, а не дедупится.
+
+    Кейс d_bdf8edfb: парковка задаёт детерминированный текст («Попытки
+    исчерпаны: 0/1…» — счётчик после continue сброшен), антидубль пула
+    возвращал id отвеченного вопроса, движок парковался с `question_id`
+    чужого ответа, и в пуле не было открытого вопроса — дело зависало
+    в «решает человек» без вопроса. Дедуп перекрывает только живой вопрос.
+    """
+    first = ask_once(home, text="Попытки исчерпаны. Продолжать?")
+    answer_pool_question(home, first.question_id, answer="continue")
+
+    second = ask_once(home, text="Попытки исчерпаны. Продолжать?")
+
+    assert second.created is True
+    assert second.question_id != first.question_id
+    rows = pool_rows(home)
+    assert len(rows) == 2
+    assert sorted(row["status"] for row in rows) == ["answered", "pending"]
 
 
 def test_ask_adopts_foreign_live_question_without_journal_fact(home: Path) -> None:

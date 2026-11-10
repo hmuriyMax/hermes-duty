@@ -4219,11 +4219,12 @@ def park_exhausted(
     if rule == failures.REASON_TOO_MANY:
         headline = (
             f"Попытки исчерпаны: у дела {total} упавших попыток из "
-            f"{failures.MAX_ROUNDS_PER_DEAL} (последний класс — {kind} на этапе {stage.id})."
+            f"{failures.MAX_ROUNDS_PER_DEAL} (последний класс — {kind} "
+            f"на этапе {stage.id}, попытка {attempt})."
         )
     else:
         headline = (
-            f"Попытки исчерпаны: {counter} на этапе {stage.id} "
+            f"Попытки исчерпаны: {counter} на этапе {stage.id}, попытка {attempt} "
             f"(политика этапа: max={policy.max}, on=[{', '.join(policy.on) or '—'}])."
         )
     question = (

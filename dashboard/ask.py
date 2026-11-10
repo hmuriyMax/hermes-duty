@@ -492,12 +492,22 @@ ASK_DEDUPE_HOURS = 24.0
 
 
 def _recent_same_question(conn: sqlite3.Connection, key: str, text: str) -> Optional[int]:
-    """id недавнего вопроса того же дела с тем же текстом (антидубль), иначе None."""
+    """id живого вопроса того же дела с тем же текстом (антидубль), иначе None.
+
+    Живой — `pending`/`sent`: дедуп не даёт задваить вопрос, на который человек
+    ещё не ответил. Отвеченный или истёкший вопрос дедупом не перекрывается:
+    его ответ уже израсходован, и та же ситуация — новый вопрос, а не дубль.
+    Кейс d_bdf8edfb: парковка задаёт детерминированный текст («Попытки
+    исчерпаны: 0/1…» — счётчик после continue сброшен), дедуп возвращал id
+    отвеченного вопроса, движок парковался с чужим ответом, и в пуле не было
+    открытого вопроса — дело зависало в «решает человек» без вопроса.
+    """
     norm = " ".join((text or "").split()).strip().lower()
     if not norm or ASK_DEDUPE_HOURS <= 0:
         return None
     row = conn.execute(
         "SELECT id, text FROM questions WHERE session_key = ? AND origin = ? "
+        "AND status IN ('pending', 'sent') "
         "AND created_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now', ?) "
         "ORDER BY id DESC LIMIT 20",
         (key, ASK_ORIGIN, f"-{ASK_DEDUPE_HOURS:g} hours"),

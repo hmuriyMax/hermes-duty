@@ -80,6 +80,31 @@ test('веб создаёт svg в SVG-namespace, а не через createEleme
   assert.doesNotMatch(app, /el\.className\s*=/, 'класс у svg ставится setAttribute, а не className')
 })
 
+test('группа маркеров: класс в разметке и правило в CSS на обеих поверхностях', () => {
+  // Регрессия 0.1.0: шейпер сводит маркеры одной точки оси в группу. Если
+  // поверхность рисует голову группы одной палкой — «приговор + закрытие» снова
+  // выглядит одним событием, а если у палок группы нет своих тонов, — все палки
+  // цвета головы, и группа неотличима от одиночного маркера.
+  const web = read('../dashboard/web/app.js')
+  const webCss = cssRules(read('../dashboard/web/styles.css'))
+  assert.match(web, /is-grouped/, 'веб: разметка не помечает группу маркеров')
+  assert.match(ruleBody(webCss, '.tl-mark.is-grouped'), /display:\s*flex/, 'веб: палки группы не раскладываются столбиком')
+
+  const serialized = read('../desktop/plugin.js').replace(/\/\/ duty:model-start[\s\S]*?\/\/ duty:model-end/, '')
+  const pluginCss = cssRules(serialized)
+  assert.match(serialized, /is-grouped/, 'десктоп: разметка не помечает группу маркеров')
+  assert.match(ruleBody(pluginCss, '.duty-tl-mark.is-grouped'), /display:\s*flex/, 'десктоп: палки группы не раскладываются столбиком')
+
+  for (const tone of ['green', 'red', 'yellow', 'blue', 'gray']) {
+    assert.match(ruleBody(webCss, `.tl-mark i.t-${tone}`), /color:/, `веб: у палки группы нет своего тона ${tone}`)
+    assert.match(
+      ruleBody(pluginCss, `.duty-tl-mark i.t-${tone}`),
+      /color:/,
+      `десктоп: у палки группы нет своего тона ${tone}`,
+    )
+  }
+})
+
 /**
  * Каждый тег, который разметка создаёт через `h('<tag>')`, обязан быть
  * классифицирован: либо он в `SVG_TAGS` (тогда namespace правильный), либо в

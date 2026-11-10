@@ -3660,12 +3660,16 @@ function DutyAttemptRow({ view, callSel, onSelectCall, toolFilter }) {
             'span',
             {
               key: `mark-${i}`,
-              className: `duty-tl-mark t-${mark.tone} anchor-${mark.anchor || 'middle'}`,
+              // Группа — столбик палок на одном `pct`: по палке на участника,
+              // своим тоном. Время у группы одно, поэтому сдвига нет.
+              className: `duty-tl-mark t-${mark.tone} anchor-${mark.anchor || 'middle'}${mark.grouped ? ' is-grouped' : ''}`,
               style: { left: `${mark.pct}%` },
               'data-tip': mark.title,
               'aria-label': mark.ariaLabel,
             },
-            h('i', null),
+            ...(mark.grouped && mark.members.length
+              ? mark.members.map((member, j) => h('i', { key: `member-${j}`, className: `t-${member.tone}` }))
+              : [h('i', { key: 'bar' })]),
           ),
         ),
       ),
@@ -3949,6 +3953,16 @@ const CSS = `
 .duty-tl-mark.t-yellow{color:var(--ui-yellow)}
 .duty-tl-mark.t-blue{color:var(--ui-blue)}
 .duty-tl-mark.t-gray{color:var(--ui-text-tertiary)}
+/* Группа маркеров одной точки оси: у группы несколько типов, поэтому палка на
+ * каждого участника — столбиком на том же left. Время одно: сдвиг палок соврал
+ * бы про журнал. */
+.duty-tl-mark.is-grouped{width:auto;display:flex;gap:1px}
+.duty-tl-mark.is-grouped i{width:2px;flex:none}
+.duty-tl-mark i.t-green{color:var(--ui-green)}
+.duty-tl-mark i.t-red{color:var(--ui-red)}
+.duty-tl-mark i.t-yellow{color:var(--ui-yellow)}
+.duty-tl-mark i.t-blue{color:var(--ui-blue)}
+.duty-tl-mark i.t-gray{color:var(--ui-text-tertiary)}
 .duty-tl-call{position:absolute;height:10px;border-radius:2px;cursor:pointer;box-shadow:inset 0 0 0 1px rgba(0,0,0,.22)}
 .duty-tl-row:hover .duty-tl-call{box-shadow:inset 0 0 0 1px rgba(0,0,0,.45)}
 /* Подсказка — общий слой для чипа, полосы попытки, подписи и маркера. */
@@ -4825,8 +4839,16 @@ function ScalePanel({ scale, callSel, onSelectCall, toolFilter, onToggleTool }) 
   }
   const kinds = []
   for (const marker of scale.markers) {
-    if (marker.tick || kinds.some((item) => item.type === marker.type)) continue
-    kinds.push(marker)
+    if (marker.tick) continue
+    // Группа называет все свои виды: у дела, закрытого приговором, «закрыто»
+    // иначе пропало бы из легенды — а его человек и ищет.
+    const types = marker.grouped && marker.types.length ? marker.types : [marker.type]
+    const labels = marker.grouped && marker.labels.length ? marker.labels : [marker.label]
+    for (const [i, type] of types.entries()) {
+      if (kinds.some((item) => item.type === type)) continue
+      const tone = marker.grouped && marker.members[i] ? marker.members[i].tone : marker.tone
+      kinds.push({ type, tone, label: labels[i] || marker.label })
+    }
   }
   // Шкала: дорожки слева, легенда семейств — правой колонкой, как в макете
   // `d-merge`. Ось стоит ровно над дорожками: слева пустая колонка шириной

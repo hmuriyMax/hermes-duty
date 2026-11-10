@@ -2308,10 +2308,9 @@ function scalePanel(scale) {
             h('span', { class: 'scale-grid-line', style: `left:${tick.pct}%`, 'data-key': `grid:${tick.pct}` }),
           ),
         ),
-        // Сжатые промежутки оси: штрихованная полоса, знаки разрыва по краям и
-        // пилюля со временем. Ось сжимает пустое время — это должно читаться как
-        // «здесь шкала рвётся», а не как дыра в данных (`idle.gaps` считает
-        // шейпер, здесь только DOM).
+        // Сжатые промежутки оси: штрихованная полоса и пилюля со временем. Ось
+        // сжимает пустое время — это должно читаться как «здесь шкала рвётся», а
+        // не как дыра в данных (`idle.gaps` считает шейпер, здесь только DOM).
         scale.idle.gaps.length
           ? h(
               'div',
@@ -2326,8 +2325,6 @@ function scalePanel(scale) {
                     title: gap.title,
                   },
                   h('span', { class: 'tl-idle-band' }),
-                  h('span', { class: 'tl-idle-cut is-left' }),
-                  h('span', { class: 'tl-idle-cut is-right' }),
                   gap.labeled ? h('span', { class: 'tl-idle-pill' }, `≈ ${gap.short}`) : null,
                 ),
               ),

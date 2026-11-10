@@ -845,8 +845,8 @@ pre.body {
    понятно, что таймлайн тут схлопывается»). */
 .tl-idle-layer { position: absolute; top: -2px; left: calc(var(--tl-gutter) + var(--tl-gap)); width: calc(100% - var(--tl-gutter) - var(--tl-gap)); height: calc(100% + 2px); z-index: 0; pointer-events: none }
 .tl-idle-gap { position: absolute; top: 0; bottom: 0; }
-/* Штрихование: диагональ в тон сетке, гаснет к краям — полоса читается как
-   «здесь время сжато», а не как ещё одна заливка данных. */
+/* Штриховка — единственный знак, что здесь из шкалы вырезано время: диагональ
+   в тон сетке, гаснущая к краям, чтобы не спорить с дорожками этапов. */
 .tl-idle-band {
   position: absolute;
   inset: 0;
@@ -855,24 +855,6 @@ pre.body {
   mask-image: linear-gradient(to right, transparent, #000 6px, #000 calc(100% - 6px), transparent);
   opacity: .8;
 }
-/* Знак разрыва — две наклонные линии вместо пунктира: так рвут ось на графиках.
-   Стоит вплотную к краю промежутка и заметно контрастнее штриховки: это не
-   декорация, а пометка «здесь из шкалы вырезано время». */
-.tl-idle-cut { position: absolute; top: 0; bottom: 0; width: 8px; z-index: 1 }
-.tl-idle-cut::before,
-.tl-idle-cut::after {
-  content: '';
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  width: 1.5px;
-  background: color-mix(in srgb, var(--text) 55%, transparent);
-  transform: skewX(-14deg);
-}
-.tl-idle-cut::before { left: 1px; }
-.tl-idle-cut::after { left: 5px; }
-.tl-idle-cut.is-left { left: -2px; }
-.tl-idle-cut.is-right { right: -2px; }
 .tl-idle-pill {
   position: absolute;
   top: 50%;

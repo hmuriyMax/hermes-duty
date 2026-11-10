@@ -566,7 +566,7 @@ test('веб: сжатый простой подписан на оси, без �
   const squeezed = await renderDealPanel(detail(45 * 60), attempts(45 * 60))
   const gapEl = squeezed.querySelectorAll('.tl-idle-gap')
   assert.equal(gapEl.length, 1, `промежутков ${gapEl.length}, а не один`)
-  assert.equal(squeezed.querySelectorAll('.tl-idle-cut').length, 2, 'знаков разрыва не пара')
+  assert.equal(squeezed.querySelectorAll('.tl-idle-cut').length, 0, 'вернулись засечки разрыва')
   assert.ok(squeezed.querySelector('.tl-idle-band'), 'нет штрихования промежутка')
   const pill = squeezed.querySelector('.tl-idle-pill')
   assert.ok(pill, 'на полосе нет пилюли со временем')
@@ -576,11 +576,12 @@ test('веб: сжатый простой подписан на оси, без �
   assert.ok(tip.includes('простой 45 мин'), `подсказка простоя: ${tip}`)
   assert.ok(gapEl[0].className.includes('is-pause'), 'простой между этапами не назван')
 
-  // Штрихование, знак разрыва и пилюля — из styles.css: класс есть, правило
-  // есть, вместе они говорят «здесь время сжато», а не рисуют границу полосы.
+  // Штриховка и пилюля — из styles.css: класс есть, правило есть, вместе они
+  // говорят «здесь время сжато», а не рисуют границу полосы. Двойные засечки
+  // по краям убраны: крупные и грязные (09.11, Макс).
   const css = read('dashboard/web/styles.css')
-  assert.match(css, /\.tl-idle-band \{[^}]*repeating-linear-gradient/, 'нет штрихования у промежутка')
-  assert.match(css, /\.tl-idle-cut::before,/, 'знак разрыва не нарисован')
+  assert.match(css, /\.tl-idle-band \{[^}]*repeating-linear-gradient/, 'нет штриховки у промежутка')
+  assert.doesNotMatch(css, /tl-idle-cut/, 'в CSS остались засечки разрыва')
   assert.match(css, /\.tl-idle-pill \{[^}]*border-radius: 5px/s, 'нет пилюли со временем')
 
   // Пауза в три минуты не сжимается — ни одного элемента сжатия на странице.

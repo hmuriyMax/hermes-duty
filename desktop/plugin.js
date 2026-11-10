@@ -3779,17 +3779,11 @@ const CSS = `
 .duty-scale-grid-line{position:absolute;top:0;bottom:0;border-left:1px dashed color-mix(in srgb, var(--ui-text-tertiary) 34%, transparent)}
 /* Сжатый промежуток оси: два пунктира по краям и подпись посередине — иначе
  * смена масштаба читается как ошибка данных. */
-/* Сжатый простой: штрихованная полоса и знаки разрыва по краям — «здесь шкала
-   рвётся». Пунктир читался как граница, а не как вырезанное время. */
+/* Сжатый простой: штрихованная полоса — «здесь шкала рвётся, время вырезано».
+   Пунктир по краям читался как граница полосы, двойные засечки — как грязь. */
 .duty-tl-idle-layer{position:absolute;top:-2px;left:calc(var(--duty-tl-gutter, 186px) + var(--duty-tl-gap, 8px));width:calc(100% - var(--duty-tl-gutter, 186px) - var(--duty-tl-gap, 8px));height:calc(100% + 2px);z-index:0;pointer-events:none}
 .duty-tl-idle-gap{position:absolute;top:0;bottom:0}
 .duty-tl-idle-band{position:absolute;inset:0;background:repeating-linear-gradient(135deg,color-mix(in srgb,var(--ui-text-tertiary) 38%,transparent) 0 2px,transparent 2px 7px);-webkit-mask-image:linear-gradient(to right,transparent,#000 6px,#000 calc(100% - 6px),transparent);mask-image:linear-gradient(to right,transparent,#000 6px,#000 calc(100% - 6px),transparent);opacity:.8}
-.duty-tl-idle-cut{position:absolute;top:0;bottom:0;width:8px;z-index:1}
-.duty-tl-idle-cut:before,.duty-tl-idle-cut:after{content:'';position:absolute;top:0;bottom:0;width:1.5px;background:color-mix(in srgb,var(--ui-text-primary) 55%,transparent);transform:skewX(-14deg)}
-.duty-tl-idle-cut:before{left:1px}
-.duty-tl-idle-cut:after{left:5px}
-.duty-tl-idle-cut.is-left{left:-2px}
-.duty-tl-idle-cut.is-right{right:-2px}
 .duty-tl-idle-pill{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);white-space:nowrap;font-size:9px;line-height:1.3;letter-spacing:.02em;font-variant-numeric:tabular-nums;color:var(--ui-text-secondary);background:var(--ui-surface-background);border:1px solid var(--ui-stroke-secondary);border-radius:5px;padding:1px 4px}
 .duty-tl-lanes{position:relative;z-index:1;display:flex;flex-direction:column;gap:10px}
 .duty-tl-lane{display:flex;flex-direction:column;gap:4px}
@@ -4780,9 +4774,9 @@ function ScalePanel({ scale, callSel, onSelectCall, toolFilter, onToggleTool }) 
               h('span', { key: `grid-${tick.pct}`, className: 'duty-scale-grid-line', style: { left: `${tick.pct}%` } }),
             ),
           ),
-          // Сжатые промежутки оси: штрихованная полоса, знаки разрыва по краям и
-          // пилюля со временем — «здесь шкала рвётся», а не дыра в данных
-          // (`idle.gaps` считает шейпер, поверхность ничего не досчитывает).
+          // Сжатые промежутки оси: штрихованная полоса и пилюля со временем —
+          // «здесь шкала рвётся», а не дыра в данных (`idle.gaps` считает
+          // шейпер, поверхность ничего не досчитывает).
           scale.idle.gaps.length
             ? h(
                 'div',
@@ -4797,8 +4791,6 @@ function ScalePanel({ scale, callSel, onSelectCall, toolFilter, onToggleTool }) 
                       title: gap.title,
                     },
                     h('span', { className: 'duty-tl-idle-band' }),
-                    h('span', { className: 'duty-tl-idle-cut is-left' }),
-                    h('span', { className: 'duty-tl-idle-cut is-right' }),
                     gap.labeled ? h('span', { className: 'duty-tl-idle-pill' }, `≈ ${gap.short}`) : null,
                   ),
                 ),

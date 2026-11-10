@@ -1194,10 +1194,14 @@ def test_text_deltas_become_one_say_event_per_phrase(tmp_path: Path) -> None:
     # Сказанное двигает живость: молчащая попытка и думающая вслух — разные вещи.
     assert folded["progress"]["last_at"] == NOW
 
-    # Превью короткое: журнал отвечает «думал или молчало», а не пересказывает.
-    long_say = runner._say_event(deal, "impl", 1, 9, "слово " * 200, 1000, NOW)
+    # Превью короткое, но обрезка названа числом: «фраза была ровно 120 символов»
+    # и «фраза обрезана до 120» — разные факты, и молчать о разнице нельзя.
+    text = "слово " * 200
+    long_say = runner._say_event(deal, "impl", 1, 9, text, 1000, NOW)
     assert len(long_say["payload"]["preview"]) <= runner.SAY_PREVIEW_CHARS
     assert "\n" not in long_say["payload"]["preview"]
+    assert long_say["payload"]["len"] == len(" ".join(text.split()))
+    assert long_say["payload"]["len"] > len(long_say["payload"]["preview"])
 
 
 def test_progress_does_not_change_state_after_end(tmp_path: Path) -> None:

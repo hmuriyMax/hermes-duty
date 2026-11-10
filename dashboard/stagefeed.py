@@ -293,7 +293,18 @@ def _says(payloads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
         at = _int(item.get("ts"))
         ms = _maybe_int(item.get("duration_ms"))
         start = at if ms is None else round(at - ms / 1000.0, 3)
-        out.append({"seq": _int(item.get("seq")), "at": start, "ms": ms, "text": text})
+        # Длина всей фразы: `text` обрезан при записи, и по этому числу видно, что
+        # фраза была длиннее, а не ровно такой.
+        full = _maybe_int(item.get("len"))
+        out.append(
+            {
+                "seq": _int(item.get("seq")),
+                "at": start,
+                "ms": ms,
+                "text": text,
+                "len": full if full is not None else len(text),
+            }
+        )
     out.sort(key=lambda row: (row["at"], row["seq"]))
     omitted = max(0, len(out) - MAX_SAYS)
     return out[:MAX_SAYS], omitted

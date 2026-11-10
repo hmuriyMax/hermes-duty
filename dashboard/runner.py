@@ -1575,6 +1575,9 @@ def _say_event(
     прочитал». Пустая строка после нормализации — не факт: молчание молчанием.
     """
     collapsed = " ".join(str(text or "").split())
+    # Полная длина едет рядом с обрезанным превью: обрезка названа числом, а не
+    # сделана молча — иначе «фраза была ровно в 120 символов» и «фраза обрезана»
+    # выглядели бы одинаково.
     payload: dict[str, Any] = {
         "stage": stage,
         "attempt": int(attempt),
@@ -1582,6 +1585,7 @@ def _say_event(
         "phase": "say",
         "name": "",
         "preview": collapsed[:SAY_PREVIEW_CHARS],
+        "len": len(collapsed),
         "ts": now,
     }
     if duration_ms is not None:

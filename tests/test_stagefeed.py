@@ -636,7 +636,7 @@ def test_says_are_kept_apart_from_calls():
     events[2]["payload"]["preview"] = "Сначала посмотрю файл."
     row = stagefeed.attempts(events, NOW)[0]
     assert [call["name"] for call in row["calls"]] == ["read_file"]
-    assert row["says"] == [{"seq": 1, "at": NOW - 99, "ms": 4000, "text": "Сначала посмотрю файл."}]
+    assert row["says"] == [{"seq": 1, "at": NOW - 99, "ms": 4000, "text": "Сначала посмотрю файл.", "len": 22}]
     assert row["says_omitted"] == 0
 
 

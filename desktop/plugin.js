@@ -1958,7 +1958,20 @@ function shapeSays(raw) {
     // с фразой значило бы сообщать факт о стриме, а не о работе. Поэтому короче
     // секунды — прочерк, а сам факт «здесь агент говорил» держит метка времени.
     const msText = ms === null || ms < 1000 ? '' : fmtDuration(Math.max(0, Math.round(ms / 1000)))
-    says.push({ seq: numOrNull(say.seq), at, ms, text, clock: fmtClock(at), msText })
+    // Полная длина фразы: превью обрезано при записи, и «ещё N символов» — это
+    // факт из журнала, а не украшение подсказки.
+    const full = numOrNull(say.len)
+    const rest = full === null ? 0 : Math.max(0, full - text.length)
+    says.push({
+      seq: numOrNull(say.seq),
+      at,
+      ms,
+      text,
+      len: full === null ? text.length : full,
+      rest,
+      clock: fmtClock(at),
+      msText,
+    })
   }
   return says
 }
@@ -2226,7 +2239,14 @@ function attemptView(bar, scale) {
     clock: say.clock,
     text: say.text,
     msText: say.msText,
-    tip: [say.clock, say.msText, say.text].filter(Boolean).join(' · '),
+    tip: [
+      say.clock,
+      say.msText,
+      say.text,
+      say.rest ? `… ещё ${fmtCount(say.rest)} ${plural(say.rest, 'символ', 'символа', 'символов')}` : '',
+    ]
+      .filter(Boolean)
+      .join(' · '),
   }))
   const silences = shapeSilences(
     calls,

@@ -884,7 +884,8 @@ def test_park_returns_deal_to_lead_for_rethink(tmp_path: Path) -> None:
     assert "plan_rethink" in kinds
     assert "question_asked" not in kinds
     assert "blocked" not in kinds
-    assert deals.deal_row(conn, deal["id"])["status"] != "blocked"
+    # возврат в очередь: диспетчер поднимает рантайм только ready/todo/wait_slot
+    assert deals.deal_row(conn, deal["id"])["status"] == "ready"
     # граф видит этап плана в работе: решение движка — снова план
     states = transit.stage_states(spec, journal.read_events(conn, str(deal["id"])))
     assert states["plan"].state == transit.PENDING

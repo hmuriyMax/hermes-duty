@@ -476,6 +476,32 @@ def test_repeat_unblock_is_idempotent_and_foreign_unblock_is_error(
     assert "не в blocked" in response.json()["errors"][0]["reason"]
 
 
+def test_second_park_and_decide_cycle_is_not_swallowed_by_the_first(
+    home: Path, client: TestClient
+) -> None:
+    """Второй цикл «парковка → решение» пишет свои факты, а не «повтор первого».
+
+    Кейс d_2fc749fb: дело запарковалось на вопросе #461, человек ответил,
+    `decide` снял парковку; дело запарковалось снова на вопросе #464, ответ
+    снова «continue» — и `decide` вернул `idempotent: true`, 0 событий: ключ
+    `unblocked` считался от одних аргументов (kind+author) и совпал с ключом
+    первого снятия. Решение не записывалось, дело оставалось в `blocked`.
+    """
+    deal = create(client)
+    for _ in range(2):
+        mutate(client, "POST", f"/deals/{deal['id']}/block", json={"kind": "parked", "reason": "исчерпаны"})
+        mutate(client, "POST", f"/deals/{deal['id']}/unblock", json={})
+
+    assert kinds(home, deal["id"]) == ["created", "blocked", "unblocked", "blocked", "unblocked"]
+    keys = [event["idempotency_key"] for event in events(home, deal["id"])]
+    assert len(set(keys)) == len(keys), "переходы одного класса не должны делить ключ"
+
+    # Ретрай того же вызова всё ещё честная идемпотентность: голова не двинулась.
+    again = mutate(client, "POST", f"/deals/{deal['id']}/unblock", json={})
+    assert again["mutation"] == {"events": 0, "idempotent": True}
+    assert kinds(home, deal["id"]) == ["created", "blocked", "unblocked", "blocked", "unblocked"]
+
+
 def test_archived_deal_is_not_reopened_by_commands(home: Path, client: TestClient) -> None:
     """`archived` — конечное состояние: команды жизни его не воскрешают."""
     deal = create(client)

@@ -607,6 +607,28 @@ def gate_open(conn: sqlite3.Connection, deal_id: str) -> bool:
 # ------------------------------------------------------------------- события
 
 
+def _anchor_fact_id(conn: sqlite3.Connection, deal_id: str, kind: str) -> str:
+    """Якорь переходного факта: последний факт НЕ своего же класса.
+
+    Идёт в материал ключа переходных фактов (`blocked`/`unblocked`). Повтор
+    вызова (ретрай без эффекта) видит тот же якорь — тот же ключ, `INSERT OR
+    IGNORE` отбрасывает дубликат. А повтор ЦИКЛА («парковка → решение» второй
+    раз) проходит через чужой факт (`unblocked` между парковками), якорь
+    меняется — и второй цикл пишет свои факты, а не схлопывается с первым.
+    Кейс d_2fc749fb: `decide` по вопросу #464 возвращал `idempotent: true`,
+    потому что ключ `unblocked` (kind+author) совпал с ключом снятия от
+    вопроса #461, и решение молча не записывалось.
+    """
+    rows = conn.execute(
+        "SELECT id, kind FROM events WHERE deal_id = ? ORDER BY id DESC LIMIT 32",
+        (deal_id,),
+    ).fetchall()
+    for row in rows:
+        if str(row[1]) != kind:
+            return str(row[0])
+    return ""
+
+
 def event_key(source: str, deal_id: str, kind: str, args: dict[str, Any]) -> str:
     """`idempotency_key` мутации: факт аргументов, а не время (контракт журнала).
 
@@ -1059,7 +1081,7 @@ def set_blocked(
         "blocked",
         payload,
         source,
-        {"kind": block_kind, "reason": text, "author": author, **extra},
+        {"kind": block_kind, "reason": text, "author": author, "anchor": _anchor_fact_id(conn, str(deal["id"]), "blocked"), **extra},
         now,
     )
     return _apply(conn, deal, [event], "blocked", now)
@@ -1094,7 +1116,7 @@ def set_unblocked(
         "unblocked",
         {"previous_kind": previous, "author": author},
         source,
-        {"previous_kind": previous, "author": author},
+        {"previous_kind": previous, "author": author, "anchor": _anchor_fact_id(conn, str(deal["id"]), "unblocked")},
         now,
     )
     if str(deal["status"]) != "blocked":

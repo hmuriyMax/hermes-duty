@@ -2578,6 +2578,100 @@ test('палка маркера несёт тот же якорь, что и м�
 })
 
 
+/* --------- маркеры одной точки оси сводятся в группу (0.1.0) -------------- */
+
+// Дело закрывается приговором: `collected` и `completed` пишутся в одну
+// секунду, `pctOf(event.at)` у обоих одинаковый — до 0.1.0 верхняя палка
+// прятала нижнюю, и по ленте нельзя было понять, что дело закрыл приговор.
+const VERDICT_EVENT = { kind: 'collected', at: 2_000, summary: 'review → next' }
+const CLOSE_EVENT = {
+  kind: 'completed',
+  at: 2_000,
+  summary: '{"cause": "all_stages_done"}',
+  cause: 'all_stages_done',
+}
+
+function instantScale(events) {
+  return shapeDealTime(
+    {
+      terminal: true,
+      timeline: [
+        { kind: 'created', at: 900, summary: 'ready' },
+        { kind: 'attempt_started', at: 1_000, summary: '{"stage": "check"}' },
+        ...events,
+      ],
+      stages: [{ id: 'check', needs: [] }],
+    },
+    { attempts: [{ stage: 'check', attempt: 1, start: 1_000, end: 2_000, status: 'done', outcome: 'done' }] },
+  )
+}
+
+test('группа: приговор и закрытие в одну секунду — один маркер, подпись называет всех', () => {
+  const scale = instantScale([VERDICT_EVENT, CLOSE_EVENT])
+  const group = scale.markers.find((marker) => marker.grouped)
+  assert.ok(group, 'приговор и закрытие не свелись в группу')
+  // Набор видов и подписей — у группы; итог называет все события точки.
+  assert.deepEqual(group.types, ['verdict', 'closed'])
+  assert.equal(group.count, 2)
+  assert.equal(group.label, 'вердикт + закрыто')
+  assert.match(group.title, /вердикт \+ закрыто/)
+  assert.match(group.title, /review → next/)
+  assert.match(group.title, /все этапы пройдены/)
+  // Участники остаются собой: поверхность рисует по ним столбик и легенду.
+  assert.deepEqual(group.members.map((member) => member.type), ['verdict', 'closed'])
+  assert.match(group.members[1].title, /закрыто — все этапы пройдены/)
+  assert.equal(group.ariaLabel, group.title)
+})
+
+test('группа: время маркеров не двигается — pct тот же, что у одиночного события', () => {
+  // Ось — факт журнала. Если бы группа раздвигала участников по секундам,
+  // `pct` разошёлся бы с координатой самого события.
+  const pair = instantScale([VERDICT_EVENT, CLOSE_EVENT])
+  const alone = instantScale([VERDICT_EVENT])
+  const group = pair.markers.find((marker) => marker.grouped)
+  const single = alone.markers.find((marker) => marker.type === 'verdict')
+  assert.equal(group.pct, single.pct, 'pct группы уехал от координаты события')
+  assert.equal(single.pct, 100)
+  assert.equal(group.at, 2_000, 'время группы не совпало с журналом')
+  assert.equal(group.clock, single.clock)
+})
+
+test('одиночный маркер не переучивается: полей группы у него нет', () => {
+  const alone = instantScale([VERDICT_EVENT])
+  const single = alone.markers.find((marker) => marker.type === 'verdict')
+  assert.ok(single, 'одиночный вердикт потерялся')
+  assert.equal('grouped' in single, false)
+  assert.equal('types' in single, false)
+  assert.equal('members' in single, false)
+  assert.equal(alone.markers.filter((marker) => marker.grouped).length, 0)
+})
+
+test('засечки попытки в группу не входят, а числа шапки считают факты журнала', () => {
+  const scale = instantScale([
+    VERDICT_EVENT,
+    CLOSE_EVENT,
+    { kind: 'attempt_ended', at: 2_000, summary: 'готово' },
+  ])
+  const tick = scale.markers.find((marker) => marker.tick)
+  assert.ok(tick, 'засечка конца попытки потерялась')
+  assert.equal(tick.grouped, undefined, 'засечка попытки свелась с событием дела')
+  // `counts.markers` — сколько фактов журнала, а не сколько палок на оси.
+  assert.equal(scale.counts.markers, 4)
+  assert.equal(scale.markers.length, 3)
+})
+
+test('палка попытки несёт группу целиком: один pct, набор видов, подпись-итог', () => {
+  const scale = instantScale([VERDICT_EVENT, CLOSE_EVENT])
+  const view = attemptView(scale.bars[0], scale)
+  const mark = view.marks.find((item) => item.grouped)
+  assert.ok(mark, 'группа не попала в палки попытки')
+  assert.equal(mark.pct, 100)
+  assert.deepEqual(mark.types, ['verdict', 'closed'])
+  assert.equal(mark.count, 2)
+  assert.equal(mark.members.length, 2)
+  assert.match(mark.title, /вердикт \+ закрыто/)
+})
+
 /* ------------------------------------------------------------ мини-таймлайн */
 
 const TL_NOW = 1_792_500_000

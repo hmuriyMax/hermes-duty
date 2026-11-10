@@ -3076,10 +3076,11 @@ function shapeDealTime(detail, attemptsPayload) {
     compressedPct: Math.round(idleCompressedPct * 10) / 10,
   }
 
-  // Дорожки: сначала этапы графа в его порядке (`stages[]` ответа `/deal`) —
-  // тогда дорожек столько же, сколько этапов, и видно, какой этап ещё не
-  // начинался; потом этапы, которых в графе нет (попытка без спеки, дело
-  // kanban), в порядке появления на оси.
+  // Дорожки: в порядке работы (Макс, 09.11: «располагай на шкале времени этапы
+  // в порядке их работы, как на графе спеки») — дорожка этапа встаёт по моменту
+  // его первой попытки, а не по порядку спеки в файле. Параллельные этапы
+  // стартуют в одну секунду: среди равных побеждает порядок графа. Этапы без
+  // работы и вне графа — в хвосте, в порядке графа и появления на оси.
   const lanes = []
   const laneIndex = new Map()
   const addLane = (key) => {
@@ -3087,11 +3088,30 @@ function shapeDealTime(detail, attemptsPayload) {
     laneIndex.set(key, lanes.length)
     lanes.push({ key, label: key, count: 0 })
   }
-  for (const stage of Array.isArray(d.stages) ? d.stages : []) addLane(String((stage && stage.id) || ''))
+  const graphKeys = (Array.isArray(d.stages) ? d.stages : []).map((stage) => String((stage && stage.id) || ''))
+  const firstStart = new Map()
+  for (const bar of bars) {
+    if (!bar.laneKey) continue
+    const start = bar.start === null || bar.start === undefined ? Infinity : bar.start
+    const seen = firstStart.get(bar.laneKey)
+    if (seen === undefined || start < seen) firstStart.set(bar.laneKey, start)
+  }
+  const laneOrder = [...graphKeys]
   for (const bar of [...bars].sort((left, right) => (left.start || 0) - (right.start || 0))) {
-    addLane(bar.laneKey)
-    bar.lane = laneIndex.get(bar.laneKey)
-    lanes[bar.lane].count += 1
+    if (bar.laneKey && !laneOrder.includes(bar.laneKey)) laneOrder.push(bar.laneKey)
+  }
+  const graphPos = new Map(graphKeys.map((key, index) => [key, index]))
+  laneOrder.sort((left, right) => {
+    const leftStart = firstStart.has(left) ? firstStart.get(left) : Infinity
+    const rightStart = firstStart.has(right) ? firstStart.get(right) : Infinity
+    if (leftStart !== rightStart) return leftStart - rightStart
+    // Равный старт (параллельные) и никогда не работавшие — в порядке графа.
+    return (graphPos.has(left) ? graphPos.get(left) : graphKeys.length) - (graphPos.has(right) ? graphPos.get(right) : graphKeys.length)
+  })
+  for (const key of laneOrder) addLane(key)
+  for (const bar of bars) {
+    bar.lane = laneIndex.get(bar.laneKey) ?? 0
+    if (lanes[bar.lane]) lanes[bar.lane].count += 1
   }
   if (!lanes.length) bars.forEach((bar) => { bar.lane = 0 })
 

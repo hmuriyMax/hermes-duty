@@ -930,6 +930,43 @@ test('шкала времени: смещение полосы — от нача
   assert.equal(scale.bars[0].ariaLabel, scale.bars[0].title)
 })
 
+test('шкала времени: дорожки в порядке работы, а не в порядке спеки', () => {
+  // Спека перечисляет plan → impl → review, но работа шла impl → review → plan:
+  // дорожка этапа встаёт по моменту первой попытки (Макс, 09.11: «располагай на
+  // шкале времени этапы в порядке их работы, как на графе спеки»).
+  const detail = {
+    now: 900,
+    status: 'running',
+    terminal: false,
+    timeline: [{ kind: 'created', at: 100, summary: '' }],
+    stages: [{ id: 'plan' }, { id: 'impl' }, { id: 'review' }],
+  }
+  const attempts = {
+    attempts: [
+      { run_id: 'impl#1', stage: 'impl', start: 300, end: 400, outcome: 'done', calls: [] },
+      { run_id: 'review#1', stage: 'review', start: 420, end: 500, outcome: 'failed', calls: [] },
+      { run_id: 'plan#1', stage: 'plan', start: 550, end: 650, outcome: 'done', calls: [] },
+    ],
+  }
+  const scale = shapeDealTime(detail, attempts)
+  assert.deepEqual(scale.lanes.map((lane) => lane.key), ['impl', 'review', 'plan'])
+  // Этап, который ещё не начинался, виден дорожкой — но в хвосте, в порядке графа:
+  // дорожек столько, сколько этапов, и «не начинался» — факт, а не отсутствие.
+  const idle = shapeDealTime({ ...detail, stages: [{ id: 'plan' }, { id: 'impl' }, { id: 'later' }] }, attempts)
+  assert.deepEqual(idle.lanes.map((lane) => lane.key), ['impl', 'review', 'plan', 'later'])
+  // Параллельные этапы стартуют в одну секунду: равные — в порядке графа.
+  const parallel = shapeDealTime(
+    { ...detail, stages: [{ id: 'review' }, { id: 'impl' }] },
+    {
+      attempts: [
+        { run_id: 'impl#1', stage: 'impl', start: 300, end: 400, outcome: 'done', calls: [] },
+        { run_id: 'review#1', stage: 'review', start: 300, end: 400, outcome: 'failed', calls: [] },
+      ],
+    },
+  )
+  assert.deepEqual(parallel.lanes.map((lane) => lane.key), ['review', 'impl'], 'при равном старте порядок графа не удержан')
+})
+
 test('шкала времени: перекрывающиеся этапы — на разных дорожках, дорожек по числу этапов', () => {
   const scale = shapeDealTime(TIME_DETAIL, TIME_ATTEMPTS)
   assert.deepEqual(

@@ -455,12 +455,12 @@ def test_release_reads_plan_stages_the_file_does_not_know(tmp_path: Path) -> Non
     rethinks = [event for event in events(conn, deal) if str(event["kind"]) == "plan_rethink"]
     assert len(rethinks) == 1
     assert journal.payload_of(rethinks[0])["failed_stage"] == "review"
-    # Следующий проход читает новый граф: дело возвращено лиду.
-    second = release.sweep(conn, NOW + 600, home=home)
-    assert len(second) == 1
-    assert second[0]["action"] == "released"
-    assert second[0]["to"] == "ready"
+    # Дело сразу в очереди: `running` без лизинга диспетчер не поднимает, а
+    # второй проход отпуска не существует в живом цикле — `sweep` зовёт только
+    # рантайм своего дела. Отпускание и запись факта — один проход.
     assert row_of(conn, deal)["status"] == "ready"
+    second = release.sweep(conn, NOW + 600, home=home)
+    assert second == [], "дело уже в очереди — второму проходу нечего отпускать"
 
 
 # ------------------------------- 2. дело, которое держит человек, не трогается

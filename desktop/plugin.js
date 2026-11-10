@@ -3978,7 +3978,7 @@ const CSS = `
 /* Плавность дела: чипы и метки доезжают до новых процентов, дорожки и этапы —
  * вход/уход. Значение одно на все движения, чтобы панель не дышала вразнобой.
  * Обновления прилетают раз в 5 с: без переходов шкала дёргалась бы на каждом тике. */
-.duty-scale-tick,.duty-scale-grid-line,.duty-tl-idle-gap,.duty-tl-call,.duty-tl-wait,.duty-tl-say{transition:left .32s ease,width .32s ease,top .32s ease,background-color .32s ease}
+.duty-scale-tick,.duty-scale-grid-line,.duty-tl-idle-gap,.duty-tl-wait,.duty-tl-say{transition:left .32s ease,width .32s ease,top .32s ease}
 .duty-tl-lane,.duty-tl-row,.duty-stage-block,.duty-att-row{transition:opacity .28s ease,height .28s ease}
 .duty-stage-block.is-leaving,.duty-tl-lane.is-leaving{height:0!important;opacity:0;overflow:hidden;pointer-events:none}
 @keyframes duty-fade-in{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
@@ -3998,8 +3998,8 @@ const CSS = `
 .duty-tl-row:hover,.duty-tl-row:focus-visible{height:var(--duty-tl-full, 20px)}
 /* Глубокие уровни вызовов видны только в раскрытой строке: visibility, а не display —
  * чипы позиционированы абсолютно, разметка не прыгает, подсказки не обрезаются. */
-.duty-tl-call[data-level]:not([data-level="0"]){visibility:hidden}
-.duty-tl-row:hover .duty-tl-call[data-level],.duty-tl-row:focus-visible .duty-tl-call[data-level]{visibility:visible}
+/* Глубокие уровни в свёрнутой строке лежат внахлёст с остальными: прятать их
+ * не нужно, а на hover-развороте чипы доезжают на свои уровни. */
 .duty-tl-row:focus-visible{outline:2px solid var(--ui-accent);outline-offset:1px}
 /* Колонки подписи фиксированы: иначе статус разной ширины двигал время в каждой строке. */
 .duty-tl-lbl{display:grid;grid-template-columns:26px 1fr auto;align-self:center;align-items:center;gap:6px;line-height:20px;white-space:nowrap;font-variant-numeric:tabular-nums}
@@ -4058,8 +4058,16 @@ const CSS = `
 .duty-tl-mark i.t-yellow{color:var(--ui-yellow)}
 .duty-tl-mark i.t-blue{color:var(--ui-blue)}
 .duty-tl-mark i.t-gray{color:var(--ui-text-tertiary)}
-.duty-tl-call{position:absolute;height:10px;border-radius:2px;cursor:pointer;box-shadow:inset 0 0 0 1px rgba(0,0,0,.22)}
-.duty-tl-row:hover .duty-tl-call{box-shadow:inset 0 0 0 1px rgba(0,0,0,.45)}
+/* Чип без рамки: перекрытие читается плотностью цвета, а не контуром — и на
+ * каждом тике квадратики не перерисовываются заново. */
+.duty-tl-call{position:absolute;height:10px;border-radius:2px;cursor:pointer;transition:left .32s ease,width .32s ease,top .32s ease,background-color .32s ease,opacity .32s ease}
+/* Свёрнутая строка: все вызовы на одной линии, внахлёст и вполсилы — плотность
+ * работы, а не россыпь квадратиков; наведение раскрывает строку, и чипы
+ * доезжают на свои уровни. */
+.duty-tl-row:not(:hover):not(:focus-visible) .duty-tl-call{top:0!important;opacity:.45}
+.duty-tl-row:not(:hover):not(:focus-visible) .duty-tl-call.duty-tl-unfinished,
+.duty-tl-row:not(:hover):not(:focus-visible) .duty-tl-call.duty-tl-sel{opacity:1}
+.duty-tl-row:not(:hover):not(:focus-visible) .duty-tl-call.duty-tl-dim{opacity:.18}
 /* Подсказка — общий слой для чипа, полосы попытки, подписи и маркера. */
 .duty-tl-tip{position:fixed;left:0;top:0;z-index:9999;padding:3px 7px;border-radius:5px;white-space:normal;max-width:280px;width:max-content;text-align:left;background:var(--ui-surface-raised, var(--ui-surface-background));color:var(--ui-text-primary);border:1px solid var(--ui-stroke-tertiary);box-shadow:0 8px 20px rgba(0,0,0,.38);font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:10.5px;line-height:1.5;opacity:0;pointer-events:none;transition:opacity .09s ease}
 .duty-tl-call,.duty-tl-band,.duty-tl-lbl,.duty-tl-mark,.duty-tl-wait{cursor:pointer}

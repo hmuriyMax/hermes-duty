@@ -919,10 +919,9 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
   transition: height .12s ease;
 }
 .tl-row:hover, .tl-row:focus-visible { height: var(--tl-full, 20px); }
-/* Глубокие уровни вызовов видны только в раскрытой строке. visibility, а не
- * display: чипы позиционированы абсолютно, разметка не прыгает. */
-.tl-call[data-level]:not([data-level="0"]) { visibility: hidden; }
-.tl-row:hover .tl-call[data-level], .tl-row:focus-visible .tl-call[data-level] { visibility: visible; }
+/* Глубокие уровни в свёрнутой строке лежат внахлёст с остальными (см. правило
+ * «свёрнутая строка» выше): прятать их не нужно, а наhover-развороте чипы
+ * доезжают на свои уровни. */
 .tl-row:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* Колонки подписи фиксированы: номер, статус, время, надбавка. Иначе «готово»
@@ -1029,11 +1028,22 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 .tl-mark i.t-blue { color: var(--accent); }
 .tl-mark i.t-gray { color: var(--text-3); }
 
+/* Чип без рамки: перекрытие читается плотностью цвета, а не контуром — и
+ * на каждом тике квадратики не перерисовываются заново. */
 .tl-call {
   position: absolute; height: 10px; border-radius: 2px; cursor: pointer;
-  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .22);
+  transition: left .32s ease, width .32s ease, top .32s ease, background-color .32s ease, opacity .32s ease;
 }
-.tl-row:hover .tl-call { box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .45); }
+/* Свёрнутая строка: все вызовы на одной линии, внахлёст и вполсилы — плотность
+ * работы, а не россыпь квадратиков; глубокие уровни не прячутся, а лежат
+ * поверх. Наведение раскрывает строку, и чипы доезжают на свои уровни. */
+.tl-row:not(:hover):not(:focus-visible) .tl-call {
+  top: 0 !important;
+  opacity: .45;
+}
+.tl-row:not(:hover):not(:focus-visible) .tl-call.tl-unfinished,
+.tl-row:not(:hover):not(:focus-visible) .tl-call.tl-sel { opacity: 1; }
+.tl-row:not(:hover):not(:focus-visible) .tl-call.tl-dim { opacity: .18; }
 
 .tl-row-empty { font-size: 11.5px; color: var(--text-3); }
 
@@ -1041,7 +1051,6 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
  * Страница патчится на месте (morph), поэтому движение можно отдать CSS:
  * чипы и метки едут к новым процентам, дорожки и строки — вход и уход.
  */
-.tl-call { transition: left .32s ease, width .32s ease, top .32s ease, background-color .32s ease; }
 .scale-tick, .scale-grid-line, .tl-idle-gap, .tl-silence, .tl-wait { transition: left .32s ease, width .32s ease; }
 .tl-lane, .tl-row, .stage-row, .att-row { transition: opacity .28s ease, height .28s ease; }
 .is-new { animation: duty-row-in .32s ease both; }

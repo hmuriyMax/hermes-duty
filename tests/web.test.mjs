@@ -36,7 +36,7 @@ test('плавность дела: вход, уход и переезд стро
   assert.match(app, /`tick:\$\{tick\.at/, 'метки оси не имеют устойчивого ключа')
   // Стили: переходы геометрии + вход/уход, при reduced-motion — всё выключено.
   const css = read('dashboard/web/styles.css')
-  assert.match(css, /\.tl-call \{ transition: left/, 'чипы не переезжают плавно')
+  assert.match(css, /\.tl-call \{[\s\S]*?transition: left/, 'чипы не переезжают плавно')
   assert.match(css, /@keyframes duty-row-in/, 'нет анимации входа')
   assert.match(css, /\.is-gone \{/, 'нет схлопывания ухода')
   assert.match(css, /prefers-reduced-motion[\s\S]*\.is-new \{ animation: none/, ' reduced-motion не гасит вход')
@@ -210,7 +210,12 @@ test('разворот строки и правки экрана дела: пр�
   for (const [name, text, collapsed, full] of surfaces) {
     assert.match(text, new RegExp(`height:\\s*var\\(${collapsed}`), `${name}: нет свёрнутой высоты строки`)
     assert.match(text, new RegExp(`:hover[^{]*\\{[^}]*height:\\s*var\\(${full}`), `${name}: наведение не раскрывает строку`)
-    assert.match(text, /data-level\]:not\(\[data-level="0"\]\)[^{]*\{[^}]*visibility:\s*hidden/, `${name}: глубокие чипы не прячутся`)
+    // Свёрнутая строка — нахлёст, а не прятание: все чипы на одной линии и
+    // вполсилы, глубокие уровни лежат поверх (Макс, 09.11: «в свернутом виде
+    // будем рисовать все квадратики с наложением… прозрачностью»). Рамки у
+    // чипов больше нет: перекрытие читается плотностью цвета.
+    assert.doesNotMatch(text, /box-shadow:\s*inset\s+0\s+0\s+0\s+1px\s+rgba\(0,\s*0,\s*0,\s*\.22\)/, `${name}: рамка чипа вернулась`)
+    assert.match(text, /:not\(:hover\):not\(:focus-visible\)\s+[^{]*tl-call[^{]*\{[^}]*top:\s*0[^}]*opacity:\s*\.45/, `${name}: свёрнутая строка не рисуется нахлёстом`)
   }
   assert.match(app, /'data-level':\s*String\(chip\.level/, 'веб не отдаёт уровень чипа в разметку')
   assert.match(plugin, /'data-level':\s*String\(chip\.level/, 'десктоп не отдаёт уровень чипа в разметку')

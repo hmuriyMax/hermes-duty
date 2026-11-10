@@ -292,6 +292,32 @@ def run(conn, spec, deal, home, fake, **kwargs):
     return runner.run_stage(conn, spec, deal, "impl", 1, home=home, **kwargs)
 
 
+class Answering(Fake):
+    """Спавн роли-адресата: на контракт ответа (`answer_report`) отвечает `answer`.
+
+    Вопрос этапа, адресованный роли, — отдельный процесс (`runner.ask_role`), и
+    его отчёт формата попытки не совпадает: у него `question`/`asked` и нет
+    evidence. Один фейк на два спавна отвечает по контракту, а не по порядку
+    вызовов: попытка этапа получает `result`, роль — `answer`.
+    """
+
+    def __init__(self, *, answer: Any = None, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.answer = {"answer": {"text": "в db/migrations"}} if answer is None else answer
+
+    def _report(self, query_file: Path, cwd: Path) -> None:
+        try:
+            contract = json.loads(query_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            contract = {}
+        if not isinstance(contract, dict) or not contract.get("answer_report"):
+            super()._report(query_file, cwd)
+            return
+        target = Path(str(contract.get("report_to") or (query_file.parent / "result.json")))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(self.answer, ensure_ascii=False), encoding="utf-8")
+
+
 def events(conn: sqlite3.Connection, deal: dict[str, Any]) -> list[dict[str, Any]]:
     return journal.read_events(conn, str(deal["id"]))
 
@@ -946,13 +972,16 @@ def test_factual_question_is_addressed_to_the_declared_role(tmp_path: Path) -> N
 
     Решает спека, а не модель: в контракте попытки адрес объявлен, и тот же адрес
     попадает в `question_asked.payload.routing` — иначе через месяц никто не
-    скажет, почему вопрос ушёл роли, а не человеку.
+    скажет, почему вопрос ушёл роли, а не человеку. С 0.1.0 вопрос роли идёт
+    **движком** (`ask_role`): пул не участвует, дело не паркуется, а ответ роли
+    ложится в журнал фактом с автором (`tests/test_ask_role.py`).
     """
     home = make_home(tmp_path)
     conn = open_store(home)
     deal = make_deal(conn)
     spec = asking_spec(tmp_path, "{allowed: [researcher], to_human: decisions_only, max_hops: 2}")
-    report = run(conn, spec, deal, home, blocked({"text": "где лежат миграции?", "kind": "fact"}))
+    fake = Answering(result={"status": "blocked", "summary": "нужен ответ", "question": {"text": "где лежат миграции?", "kind": "fact"}})
+    report = run(conn, spec, deal, home, fake)
 
     assert report["question_target"] == "role:researcher"
     assert report["question_reason"] == "declared_role"
@@ -961,9 +990,20 @@ def test_factual_question_is_addressed_to_the_declared_role(tmp_path: Path) -> N
         "reason": "declared_role",
         "stage": "impl",
         "attempt": 1,
+        "hops": 1,
     }
-    block = only(conn, deal, "blocked")["payload"]
-    assert "role:researcher" in block["reason"], "причина блока обязана называть адрес"
+    assert [call["cmd"][call["cmd"].index("-p") + 1] for call in fake.calls] == [
+        "implementer",
+        "researcher",
+    ], "вопрос задаёт роль из `ask.allowed`, а не человек"
+    assert "blocked" not in kinds(conn, deal), "вопрос роли дело не паркует"
+    pool = sqlite3.connect(home / "messaging" / "pool.db")
+    try:
+        assert pool.execute("SELECT count(*) FROM questions").fetchone()[0] == 0, (
+            "вопрос роли в пул не пишется: второго канала нет"
+        )
+    finally:
+        pool.close()
 
 
 def test_factual_question_without_roles_is_routing_failed(tmp_path: Path) -> None:

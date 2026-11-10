@@ -665,12 +665,22 @@ def fold(
 
     # 6. Вопрос человеку: `question_asked` без ответа. Это и есть «ждёт ответа» —
     #    блокировка без вопроса даёт тот же wait_human, но с human_kind=status.
+    #    У вопроса роли номера пула нет, и его называет адресат (`routing.target`):
+    #    «вопрос #—» говорил бы о потерянном номере там, где номера не было.
     if question is not None:
         payload = _payload(question[1])
-        facts.setdefault("wait_human", []).append(
-            f"вопрос #{payload.get('question_id') or '—'} задан {_ago(question[1].get('ts'), now_sec)}, "
-            f"ответа нет (session_key {payload.get('session_key') or '—'})"
-        )
+        number = payload.get("question_id")
+        if number:
+            asked = (
+                f"вопрос #{number} задан {_ago(question[1].get('ts'), now_sec)}, "
+                f"ответа нет (session_key {payload.get('session_key') or '—'})"
+            )
+        else:
+            asked = (
+                f"вопрос {_question_address(payload)} задан {_ago(question[1].get('ts'), now_sec)}, "
+                f"ответа нет (пул не участвует: вопрос роли)"
+            )
+        facts.setdefault("wait_human", []).append(asked)
 
     # 3. Блок без последующего `unblocked`. Доступ/права — отдельное состояние
     #    `capability`, как в 0.0.2: это не «человек решает», а «человек даёт доступ».
@@ -918,7 +928,14 @@ def _evidence(facts: dict[str, list[str]], state: str) -> str:
 
 
 def _open_question(ordered: list[dict[str, Any]]) -> Optional[tuple[int, dict[str, Any]]]:
-    """Последний вопрос без ответа: `question_answered` снимает вопрос по `question_id`."""
+    """Последний вопрос без ответа: `question_answered` снимает вопрос по `question_id`.
+
+    У вопроса роли (`dashboard/runner.ask_role`) номера пула нет — строки пула у
+    него не существует, — и пара закрывается по порядку журнала: ответ без номера
+    снимает последний открытый вопрос без номера. Иначе вопрос роли, на который
+    уже ответили, висел бы «без ответа» до конца жизни дела, и состояние
+    `wait_human` стало бы постоянным.
+    """
     open_questions: dict[str, tuple[int, dict[str, Any]]] = {}
     for index, event in enumerate(ordered):
         kind = str(event.get("kind") or "")
@@ -927,11 +944,24 @@ def _open_question(ordered: list[dict[str, Any]]) -> Optional[tuple[int, dict[st
         question_id = str(_payload(event).get("question_id") or "")
         if kind == "question_asked":
             open_questions[question_id or f"#{index}"] = (index, event)
-        elif question_id:
+            continue
+        if question_id:
             open_questions.pop(question_id, None)
+            continue
+        without_number = [key for key in open_questions if key.startswith("#")]
+        if without_number:
+            open_questions.pop(without_number[-1], None)
     if not open_questions:
         return None
     return max(open_questions.values(), key=lambda item: item[0])
+
+
+def _question_address(payload: dict[str, Any]) -> str:
+    """Адрес вопроса из `payload.routing`: `role:lead` и т. п.; пусто — «адресату»."""
+    routing = payload.get("routing")
+    if not isinstance(routing, dict):
+        return "адресату"
+    return str(routing.get("target") or "") or "адресату"
 
 
 def _open_block(ordered: list[dict[str, Any]]) -> Optional[tuple[int, dict[str, Any]]]:

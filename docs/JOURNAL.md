@@ -65,8 +65,8 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 | `patched` | правка спецификации своего дела (`title`/`body`/`assignee`) через `PATCH`; `status` этим видом не меняется (архив — отдельный `completed`) | `fields` |
 | `commented` | человек оставил комментарий в деле | `author`, `len` |
 | `attached` | в деле появились метаданные вложения | `filename`, `size_bytes`, `content_type` |
-| `question_asked` | `ask()` создал вопрос в пуле | `question_id`, `session_key`, `critical`, `timeout`, `routing` (`{target, reason, stage, attempt}` — если вопрос адресовал движок) |
-| `question_answered` | ответ найден в пуле — или у вопроса вышел срок (`answered_via='expired'`): закрытие по TTL снимает факт так же, как ответ | `question_id`, `answer_len`, `answered_via` |
+| `question_asked` | вопрос задан: `ask()` создал его в пуле — или движок отдал его роли (`runner.ask_role`, 1.0). У вопроса роли пула нет: `question_id`/`session_key` не пишутся, текст едет полем `text`, а адрес — тем же `routing` с `hops` | `question_id`, `session_key`, `critical`, `timeout`, `text` (у вопроса роли), `routing` (`{target, reason, stage, attempt}` и `hops` у вопроса роли — если вопрос адресовал движок) |
+| `question_answered` | ответ найден в пуле — или у вопроса вышел срок (`answered_via='expired'`), или ответила роль (`by`, `answer`) — либо передача роли закрылась без ответа (`answered_via='redirected'`/`'failed'`): вопрос ушёл человеку | `question_id`, `answer_len`, `answered_via`; у ответа роли — `by`, `hops`, `answer`, `routing` (`{stage, attempt}`), `reason` у переадресации и провала |
 | `published` | публикующий этап отчитался, и движок **подтвердил** факт: `git ls-remote origin` видит заявленный sha (сверка по префиксу: сокращённый sha законен, пока однозначен). Пишет движок (`dashboard/runner.published_claim`), а не исполнитель: `published` в `result.json` — заявка | `stage`, `attempt`, `sha` (полный, из `ls-remote`), `claimed_sha` (что сказал исполнитель), `branch`, `mr_url` (заявка — GitLab движку не виден), `ref` (что нашлось в origin), `verified_by` (`git ls-remote`) |
 | `plan_proposed` | этап плана отчитался предложением: `plan: {stages, reason}` в `result.json` стал фактом. Граф **не меняет** — предложение ещё не план (правило 12) | `rev`, `stages[]`, `reason`, `source_stage`, `attempt` |
 | `plan_accepted` | предложение стало графом: предложение прошло `spec.parse_plan` по хартии (или человек ответил «принять» на гейте плана) | `rev`, `by` (`engine`\|`human`) |
@@ -188,7 +188,7 @@ approved_commit}`.
 | метрика | какие факты нужны | чего не хватает, если факта нет |
 |---|---|---|
 | этапы с первой попытки | `attempt_started` (пара `deal_id` + `stage`) и закрывающий `attempt_ended` с `outcome=done`; повторный `attempt_started` того же этапа убирает его из числителя | этап без закрытой попытки в знаменатель не идёт; знаменатель 0 — доля `null`, а не «100 %» |
-| ожидание человека | `question_asked` и `question_answered` с общим `question_id` | вопрос без ответа — не «ждали 0», его в выборке нет |
+| ожидание человека | `question_asked` и `question_answered` с общим `question_id` | вопрос без ответа — не «ждали 0», его в выборке нет; вопрос роли (1.0, без `question_id`) в эту метрику не входит: ждали роль, а не человека |
 | ожидание до первой попытки этапа | `attempt_started.ts` и `created_at` дела (`created`) | нет `attempt_started` — ожидания нет, а не «ноль секунд» |
 | отказы контракта | `attempt_ended` с классом `contract` в `kind` (старые записи — `details.class`) и текстом `reason` | без `reason` и `details.rule` правило ответа — `без правила` |
 | токены за окно | `attempt_ended.details.usage_tokens` (`agent`-попытки; у `shell` его нет по устройству) | ни одной записи — `tokens.total = null` и `warnings`, а не 0 |
@@ -301,7 +301,11 @@ approved_commit}`.
    (`docs/PROBES.md`).
 6. `question_asked` без `question_answered` → `wait_human` с `human_kind="question"`;
    это и закрывает п.5 заметки 0.0.2: «ждёт ответа» считается по вопросам, а блокировка
-   без вопроса имеет `human_kind="status"`.
+   без вопроса имеет `human_kind="status"`. У вопроса роли (1.0) номера пула нет, и
+   пара «вопрос → ответ» закрывается **по порядку журнала**: ответ без `question_id`
+   снимает последний открытый такой вопрос. Иначе вопрос, на который роль уже
+   ответила, висел бы «без ответа» до конца жизни дела, и `wait_human` стал бы
+   постоянным.
 7. Журнал без единого события по делу (события есть у других дел, а у этого нет) →
    состояние берётся из `deals.status` поверхностью (`OWN_WAITING_FALLBACK`), а
    `evidence` честно говорит, что живых фактов журнала нет. Прохода из kanban,
@@ -436,6 +440,37 @@ approved_commit}`.
   лечит)», а не 500 без подробностей: строка пула уже есть, и это должно быть сказано.
   Нулевой `question_id` от вставки — тоже `AskError`: ключ `ask:0:*` в журнале
   заглушил бы все будущие `question_asked`.
+
+### Вопрос роли (1.0): журнал вместо пула
+
+Фактовый вопрос этапа (`ask.allowed`, разметка `kind: fact`) пул не трогает вовсе:
+строку вопроса создаёт не `ask()`, а движок (`runner.ask_role`) — сначала факт
+`question_asked` без `question_id`, потом спавн роли, потом её ответ фактом
+`question_answered` с `by=<роль>` и `hops=<n+1>`. Это те же два вида событий и та
+же пара, что у человеческого вопроса, — «второй канал» не появляется, а
+`question_answered` у ответа роли закрывает вопрос **по порядку журнала** (номера
+нет, потому что нет строки). Пул остаётся единственным каналом для человека, и
+`ask()` — единственный, кто в него пишет.
+
+- `authority: true` в ответе роли — «это не мне решать»: передача закрывается
+  `question_answered` с `answered_via="redirected"` и причиной, а тот же текст
+  уходит человеку обычным `question_asked` с причиной `role_redirected`;
+- провал попытки ответа (`infra`/`contract`) — `answered_via="failed"` с причиной
+  отказа и вопрос человеку с причиной `role_answer_failed`: вопрос не сгорает;
+- движок, ушедший между вопросом и ответом, — тот же `answered_via="failed"`, но
+  причину называет восстановление: `runner.recover_role_questions` (вызывается
+  драйвером перед решением) закрывает передачу и уводит вопрос человеку, а не
+  ждёт ответа, которого уже не будет;
+- `redirected`/`failed` — **не срок**: `transit._expired` читает пустой
+  `answer_len` как `expired` только у ответа человека, иначе переадресованный
+  вопрос читался бы как истёкший и дело парковалось бы мимо живого вопроса;
+- `text` вопроса у роли живёт в журнале (`payload.text`) — в контракт роли он
+  попадает оттуда же, и разбор «что спросили и что ответили» не требует пула.
+
+В ожидание человека (`waiting_human_sec` в `/stats`) вопросы роли не входят: пара
+без `question_id` в выборку по номеру пула не попадает, и это правда — ждали
+роль, а не человека. Остаток пар в списке дел (`questions.waiting`) считает оба
+вида: порядок пар не зависит от номера.
 
 Кто и когда зовёт: явный путь `POST /ask/{deal_id}` (тело
 `{"text", "text_full", "options", "critical"}`) — вопрос задаёт человек или

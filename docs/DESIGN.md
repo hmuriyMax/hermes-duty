@@ -371,7 +371,7 @@ failures.classify → policy → decide_park
 
 | # | состояние | какой факт журнала его даёт |
 |---|---|---|
-| 1 | `wait_human` | `question_asked` без `question_answered` (живой вопрос пула); `blocked` без `unblocked` с `block_kind≠capability` (в том числе `parked` — попытки исчерпаны); `review_requested` без `collected`/`changes_requested` |
+| 1 | `wait_human` | `question_asked` без `question_answered` (живой вопрос: пула — пара по `question_id`, роли — пара по порядку журнала); `blocked` без `unblocked` с `block_kind≠capability` (в том числе `parked` — попытки исчерпаны); `review_requested` без `collected`/`changes_requested` |
 | 2 | `capability` | `blocked` без `unblocked`, где `block_kind='capability'` или причина блока содержит слово из `CAPABILITY_WORDS` (доступ, права, разрешение, `permission`, `access`, `credential`, `token`, `forbidden`, `403`) |
 | 3 | `dead_lease` | `claimed` со сроком `claim_expires`, который прошёл, и без `attempt_started` за ним |
 | 4 | `crashed` | `attempt_started` без `attempt_ended`, а записанный `pid` мёртв |
@@ -540,7 +540,8 @@ failures.classify → policy → decide_park
 - `first_try.closed = 0` — это «считать не по чему» (`share: null`), а не «сто
   процентов»;
 - `waiting_human_sec` и `waiting_sec` — **разные величины**: первая меряет
-  `question_asked` → `question_answered` (сколько ждал человек), вторая — `created` →
+  `question_asked` → `question_answered` по номеру пула (сколько ждал человек; вопрос
+  роли номера не имеет и в неё не входит — ждали роль), вторая — `created` →
   первая попытка этапа (сколько ждал движок). Подменять одну другой нельзя;
 - `contract_refusals` считается по классу `contract` (`attempt_ended.kind`, старые
   записи — `details.class`) и разбивается по правилу: `details.rule`, иначе код

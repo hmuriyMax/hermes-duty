@@ -81,6 +81,18 @@ Python — то есть гейт «дело проходит impl → verify �
    не заметит человек (живое дело `d_eb4ad2bb`: 7.5 часа). Ошибки прохода
    (дело решить нечем: спеки нет, правила разошлись) не глотаются — они в
    `release_errors` отчёта.
+12. **Вопрос роли не сгорает, даже если движок ушёл.** Вопрос этапа,
+   адресованный роли (`ask.allowed`), задаётся и получается одним вызовом, и
+   пара `question_asked` → `question_answered` пишется одним шагом. Значит
+   открытый вопрос роли, до которого дожил проход по журналу, никто не
+   дожидается: движка, который его задал, уже нет. Перед решением (сразу после
+   `ask.sync_answers`) драйвер зовёт `runner.recover_role_questions`: передача
+   закрывается фактом `answered_via='failed'`, а вопрос уходит человеку тем же
+   путём, что упавшая попытка ответа (`ask()` плюс `blocked needs_input`).
+   Без этого дело стояло бы в `wait(question)` вечно — ответить нечем (строки
+   пула нет), а спавна роли больше не будет (попытка закрыта) — и работа
+   терялась бы. Восстановленные вопросы попадают в отчёт (`recovered`) и в
+   вывод прогона, а не срабатывают молча.
 
 ## Коды возврата — контракт `bin/duty run`
 
@@ -370,6 +382,7 @@ def _report(
     parked: Optional[dict[str, Any]] = None,
     released: int = 0,
     release_errors: Optional[list[dict[str, Any]]] = None,
+    recovered: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """Отчёт прогона: шаги, уборка, ответы пула, финальное решение, исход и код.
 
@@ -392,6 +405,9 @@ def _report(
     `release_errors` — дела, которые проход решить не смог (спеки нет, правила
     разошлись): пустой список вместо тишины, иначе «дело не отпущено» читалось бы
     как «отпускать было нечего».
+    `recovered` — вопросы роли, которые движок нашёл открытыми и увёл человеку
+    (`runner.recover_role_questions`): по строке на вопрос. Пустой список — таких
+    вопросов не было, и это факт прогона, а не отсутствие поля.
     """
     return {
         "deal": str(deal.get("id") or ""),
@@ -407,6 +423,7 @@ def _report(
         "parked": None if parked is None else dict(parked),
         "released": int(released or 0),
         "release_errors": list(release_errors or ()),
+        "recovered": list(recovered or ()),
         "exit_code": EXIT_CODES[outcome],
     }
 
@@ -625,6 +642,7 @@ def run(
     on_step: Optional[Callable[[dict[str, Any]], None]] = None,
     on_reap: Optional[Callable[[dict[str, Any]], None]] = None,
     on_answer_error: Optional[Callable[[dict[str, Any]], None]] = None,
+    on_recover: Optional[Callable[[dict[str, Any]], None]] = None,
     on_release: Optional[Callable[[dict[str, Any]], None]] = None,
     on_release_error: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> dict[str, Any]:
@@ -653,6 +671,7 @@ def run(
     answers_errors: list[dict[str, Any]] = []
     released: list[dict[str, Any]] = []
     release_errors: list[dict[str, Any]] = []
+    recovered: list[dict[str, Any]] = []
     made = 0
     outcome = ""
     note = ""
@@ -700,6 +719,12 @@ def run(
         Отпускание идёт последним и **до** решения (правило 11): строка `running`
         без живого факта — это тот же недостающий факт, что и осиротевшая
         попытка, и решение по журналу обязано читаться уже по полному журналу.
+
+        Восстановление вопроса роли (правило 12) — тоже до решения и сразу после
+        ответов пула: открытый вопрос роли означает, что движка, который его
+        задал, уже нет, и без этого факта решение прочитало бы `wait(question)`
+        навсегда. Между ответами пула и отпусканием: сначала факты канала
+        вопросов, потом «строка дела не сходится с журналом».
         """
         for row in reaper.sweep(conn, int(tick()), spec=spec):
             reaped.append(row)
@@ -714,6 +739,10 @@ def run(
             answers_errors.append(row)
             if on_answer_error is not None:
                 on_answer_error(row)
+        for row in runner.recover_role_questions(conn, deal, home=home, clock=tick):
+            recovered.append(row)
+            if on_recover is not None:
+                on_recover(row)
         release_pass()
         return _decide(conn, deal, spec, tick)
 
@@ -853,6 +882,7 @@ def run(
         parked=parked,
         released=len(released),
         release_errors=release_errors,
+        recovered=recovered,
     )
 
 
@@ -901,6 +931,7 @@ def drive(
     on_step: Optional[Callable[[dict[str, Any]], None]] = None,
     on_reap: Optional[Callable[[dict[str, Any]], None]] = None,
     on_answer_error: Optional[Callable[[dict[str, Any]], None]] = None,
+    on_recover: Optional[Callable[[dict[str, Any]], None]] = None,
     on_release: Optional[Callable[[dict[str, Any]], None]] = None,
     on_release_error: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> dict[str, Any]:
@@ -938,6 +969,7 @@ def drive(
             on_step=on_step,
             on_reap=on_reap,
             on_answer_error=on_answer_error,
+            on_recover=on_recover,
             on_release=on_release,
             on_release_error=on_release_error,
         )

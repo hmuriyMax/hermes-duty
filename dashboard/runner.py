@@ -216,6 +216,12 @@ WORKSPACES_SUBDIR = ("kanban", "boards", "duty")
 # Служебный каталог попытки рядом с деревом: контракт и отчёт.
 DUTY_SUBDIR = ".duty"
 
+# Подкаталог рабочего каталога попытки, где работает отвечающая роль: вопрос
+# этапа адресован роли (`ask.allowed`), и её ответ — отдельный процесс со своим
+# контрактом и отчётом. Дерева и лизинга у него нет: роль ничего не сдаёт, она
+# отвечает на вопрос (`dashboard/runner.py`, `ask_role`).
+ASK_ROLE_SUBDIR = "ask"
+
 # Сколько ждать `git worktree add`/`remove`: checkout большого репозитория — не
 # мгновенный, но и не бесконечный.
 WORKTREE_TIMEOUT_SEC = 300
@@ -3299,6 +3305,11 @@ def run_stage(
 
     previous = previous_reports(conn, deal, spec, stage_id, events=events)
 
+    if answer is None:
+        # Ответ роли на вопрос прошлой попытки: строки пула у такого вопроса нет,
+        # текст ответа живёт в журнале, и продолжение берёт его оттуда — иначе
+        # лид ответил бы, а этап продолжил бы работу, не увидев ответа.
+        answer = role_answer_before(events, stage_id, attempt)
     session_id = last_session(conn, deal, stage_id) if answer is not None else ""
     contract = build_contract(
         spec,
@@ -3587,7 +3598,18 @@ def run_stage(
     question_target = ""
     question_reason = ""
     if parked:
-        question_id, address = _parked(conn, deal, stage, attempt, result or {}, home, clock)
+        question_id, address = _parked(
+            conn,
+            deal,
+            stage,
+            attempt,
+            result or {},
+            home,
+            clock,
+            spec=spec,
+            spawn=spawner,
+            previous=previous,
+        )
         question_target, question_reason = address.address, address.reason
 
     # Политика ретраев: если этот класс больше не повторяется (или дело набрало
@@ -3773,6 +3795,350 @@ def hops_done(conn: sqlite3.Connection, deal: Any, stage_id: str) -> int:
     return count
 
 
+def ask_role(
+    conn: sqlite3.Connection,
+    spec: Any,
+    deal: Any,
+    stage: Any,
+    attempt: int,
+    question: dict[str, Any],
+    address: Any,
+    *,
+    home: Path,
+    report: Optional[dict[str, Any]] = None,
+    previous: Iterable[dict[str, Any]] = (),
+    spawn: Optional[Callable[..., Any]] = None,
+    clock: Optional[Callable[[], float]] = None,
+) -> dict[str, Any]:
+    """Спросить роль за ответом на вопрос этапа: контракт, процесс, отчёт.
+
+    Фактовый вопрос из `ask.allowed` пул не трогает (`docs/JOURNAL.md`: «второй
+    канал не заводится»): отвечает роль, и её ответ — такой же факт журнала, как
+    ответ человека, только с автором-ролью. Поэтому здесь нет ни `ask()`, ни
+    строки пула: движок собирает контракт ответа (`build_contract` — тот же
+    формат входа, что у попытки), спавнит роль (`spawn_command` с профилем
+    адресата) и читает её `result.json`.
+
+    Контракт отличается от контракта попытки в трёх местах, и все три — правда о
+    том, что делает роль: `role` — адресат, а не роль этапа; в `question` едет
+    сам вопрос, а в `asked` — отчёт попытки, которая его задала (`summary` и
+    `result.json` целиком: без него «отвечает на вопрос» = «угадывает
+    контекст»); `evidence_to_produce` пуст и схема отчёта — `{answer}`, потому
+    что роль ничего не сдаёт и гейт пакета к ней не применяется.
+
+    Ответ — `{ok, answer, authority, kind, reason, role, workdir, exit_code}`.
+    `authority: true` в отчёте значит «это не мне решать»: вопрос уходит
+    человеку, и это не отказ роли. Провал попытки ответа (`infra`/`contract`) —
+    тоже не потеря вопроса: `_parked` отправляет его человеку с причиной.
+    """
+    spawner = spawn or spawn_process
+    clock = clock or time.time
+    workdir = attempt_dir(home, deal, stage.id, attempt) / ASK_ROLE_SUBDIR
+    workdir.mkdir(parents=True, exist_ok=True)
+    deadline_sec = ttl_sec(stage)
+    events = journal.read_events(conn, str(deal["id"]))
+    contract = build_contract(
+        spec,
+        deal,
+        stage,
+        attempt,
+        workdir=workdir,
+        tree=None,
+        cwd=workdir,
+        previous=list(previous),
+        deadline_sec=deadline_sec,
+        events=events,
+    )
+    contract["role"] = str(address.value)
+    contract["question"] = dict(question)
+    contract["asked"] = {
+        "stage": stage.id,
+        "attempt": int(attempt),
+        "summary": str((report or {}).get("summary") or ""),
+        "report": dict(report or {}),
+    }
+    contract["answer_report"] = {
+        "answer": {
+            "text": "твой ответ одной фразой — с ним этап продолжит работу",
+            "authority": "true — это не мне решать: вопрос уйдёт человеку",
+        }
+    }
+    contract["evidence_to_produce"] = []
+    contract["report_schema"] = {"answer": contract["answer_report"]["answer"]}
+    contract_file = write_contract(contract_path(workdir, stage.id, attempt), contract)
+    answer_file = result_path(workdir)
+    if answer_file.exists():
+        # Свой отчёт пишет только эта попытка ответа: остаток прошлой читался бы
+        # как её ответ.
+        answer_file.unlink()
+    try:
+        process = spawner(spawn_command(str(address.value), contract_file), workdir)
+    except OSError as exc:
+        return _role_failed(address, workdir, FAIL_INFRA, f"роль {address.value} не поднялась: {exc}")
+    code = process.wait(float(deadline_sec))
+    if code is None:
+        process.stop()
+    write_stderr(workdir, getattr(process, "stderr_text", ""))
+    result, error = read_result(answer_file)
+    text, authority = _role_answer_of(result)
+    if code is None:
+        return _role_failed(
+            address, workdir, FAIL_INFRA, f"роль {address.value} не ответила за {deadline_sec}с"
+        )
+    if result is None and code != 0:
+        return _role_failed(
+            address, workdir, FAIL_INFRA, f"роль {address.value} вышла кодом {code} без ответа"
+        )
+    if result is None:
+        return _role_failed(address, workdir, FAIL_CONTRACT, error)
+    if not text and not authority:
+        return _role_failed(
+            address,
+            workdir,
+            FAIL_CONTRACT,
+            f"роль {address.value} не назвала answer.text: {answer_file}",
+        )
+    return {
+        "ok": True,
+        "answer": text,
+        "authority": authority,
+        "kind": "",
+        "reason": "",
+        "role": str(address.value),
+        "workdir": str(workdir),
+        "exit_code": code,
+    }
+
+
+def _role_failed(address: Any, workdir: Path, kind: str, reason: str) -> dict[str, Any]:
+    """Попытка ответа роли не удалась — отказ с классом, а не пустой ответ.
+
+    Класс считается по тем же источникам, что у попытки этапа (`dashboard/
+    failures.py`): не поднялась/не ответила за срок/вышла ненулевым кодом без
+    отчёта — `infra`, отчёт есть, а ответа в нём нет — `contract`.
+    """
+    return {
+        "ok": False,
+        "answer": "",
+        "authority": False,
+        "kind": kind,
+        "reason": reason,
+        "role": str(address.value),
+        "workdir": str(workdir),
+        "exit_code": None,
+    }
+
+
+def _role_answer_of(result: Optional[dict[str, Any]]) -> tuple[str, bool]:
+    """Ответ роли из отчёта: текст и «это не мне решать».
+
+    `answer` бывает строкой (короткая форма) или словарём `{text, authority}`.
+    `authority` — только явное `true`: `"true"` строкой и прочие значения
+    властным ответом не считаются, иначе опечатка в отчёте решала бы за человека.
+    """
+    raw = (result or {}).get("answer")
+    if isinstance(raw, str):
+        return raw.strip(), False
+    if not isinstance(raw, dict):
+        return "", False
+    return str(raw.get("text") or "").strip(), raw.get("authority") is True
+
+
+def _role_question_fact(
+    deal: Any,
+    stage: Any,
+    attempt: int,
+    text: str,
+    question: dict[str, Any],
+    address: Any,
+    hops: int,
+    now: int,
+) -> dict[str, Any]:
+    """Вопрос, ушедший роли: `question_asked` без пула.
+
+    Номер пула и `session_key` у такого вопроса пусты — это не «потерянные
+    поля», а правда: строки пула не существует, вопрос прочитает роль из своего
+    контракта, а журнал хранит его текст и адрес. `routing.hops` — номер
+    передачи по цепочке (`max_hops`): он же потом считается `hops_done`.
+    """
+    payload: dict[str, Any] = {
+        "routing": {
+            **address.as_payload(),
+            "stage": stage.id,
+            "attempt": int(attempt),
+            "hops": int(hops) + 1,
+        },
+        "text": text,
+    }
+    text_full = question.get("text_full")
+    if isinstance(text_full, str) and text_full.strip():
+        payload["text_full"] = text_full.strip()
+    return _event(
+        deal,
+        "question_asked",
+        payload,
+        {"stage": stage.id, "attempt": int(attempt), "role": str(address.value)},
+        now,
+    )
+
+
+def _role_answer_fact(
+    deal: Any,
+    stage_id: str,
+    attempt: int,
+    role: str,
+    hops: int,
+    answer: str,
+    via: str,
+    now: int,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Ответ роли: `question_answered` с автором-ролью, а не с пулом.
+
+    Текст едет в журнале (`answer`), потому что пула у вопроса роли нет — там
+    его читать негде. `answer_len` остаётся у всех ответов: у ответа человека он
+    единственное, что есть, и одна форма на два источника не должна терять поле.
+    `hops` — номер передачи, которая этим фактом закрывается (`routing.hops`
+    вопроса плюс один, либо тот же, что записан в вопросе при восстановлении:
+    передача была одна, и номер у вопроса и ответа обязан совпасть).
+    `via` — чем кончилась передача, когда ответа нет: `redirected` («дальше
+    человек») или `failed` (попытка ответа упала) — по ним `transit` отличает
+    закрытие вопроса роли от ответа по сроку (`expired`).
+    """
+    payload: dict[str, Any] = {
+        "by": role,
+        "hops": int(hops),
+        "answer_len": len(answer),
+        "routing": {"stage": stage_id, "attempt": int(attempt)},
+    }
+    if answer:
+        payload["answer"] = answer
+    if via:
+        payload["answered_via"] = via
+    if reason:
+        payload["reason"] = reason
+    return _event(
+        deal,
+        "question_answered",
+        payload,
+        {"stage": stage_id, "attempt": int(attempt), "role": role, "via": via},
+        now,
+    )
+
+
+def role_answer_before(events: Iterable[Any], stage_id: str, attempt: int) -> Optional[str]:
+    """Ответ роли на вопрос попытки `attempt - 1` — вход этой попытки.
+
+    Ответа человека здесь нет и быть не может: у вопроса роли нет строки пула,
+    и текст живёт только в журнале. Ответ берётся у **сразу предыдущей** попытки
+    (`routing.attempt`), а не «последний известный»: иначе устаревший ответ
+    подставлялся бы в третью попытку после падения второй. `None` — роль эту
+    попытку не поднимала, и продолжение идёт как обычно.
+    """
+    for event in reversed(list(events)):
+        if not isinstance(event, dict) or str(event.get("kind") or "") != "question_answered":
+            continue
+        payload = journal.payload_of(event)
+        if not str(payload.get("by") or ""):
+            continue
+        routing_ = payload.get("routing")
+        if not isinstance(routing_, dict):
+            continue
+        if str(routing_.get("stage") or "") != stage_id:
+            continue
+        if _int(routing_.get("attempt")) != int(attempt) - 1:
+            continue
+        text = str(payload.get("answer") or "").strip()
+        return text or None
+    return None
+
+
+def _asked_role(
+    conn: sqlite3.Connection,
+    spec: Any,
+    deal: Any,
+    stage: Any,
+    attempt: int,
+    text: str,
+    question: dict[str, Any],
+    address: Any,
+    hops: int,
+    *,
+    result: dict[str, Any],
+    previous: Iterable[dict[str, Any]],
+    home: Path,
+    spawn: Optional[Callable[..., Any]],
+    clock: Callable[[], float],
+) -> tuple[Any, str]:
+    """Вопрос адресован роли: журнал вместо пула, спавн роли вместо парковки.
+
+    Вопрос пишется в журнал **до** спавна: пока роль отвечает, дело стоит в
+    `wait_human` (`transit`, правило 7 — вопроса без ответа другого состояния
+    нет), и это верное состояние, а не «попытка идёт». Ответ ложится той же
+    парой `question_asked` → `question_answered`, и этап поднимается **новой**
+    попыткой (`role_answer_before` отдаёт ей текст ответа).
+
+    Возвращает адрес, по которому вопрос идёт дальше, и причину переадресации:
+    `role:<имя>` — роль ответила, пул не нужен; `human` — роль переадресовала
+    (`authority: true`) или не ответила, и вопрос уходит человеку обычным путём.
+    """
+    now = _now_sec(int(clock()))
+    journal.append(conn, [_role_question_fact(deal, stage, attempt, text, question, address, hops, now)])
+    answer = ask_role(
+        conn,
+        spec,
+        deal,
+        stage,
+        attempt,
+        {**question, "text": text},
+        address,
+        home=home,
+        report=result,
+        previous=previous,
+        spawn=spawn,
+        clock=clock,
+    )
+    after = _now_sec(int(clock()))
+    if answer["ok"] and not answer["authority"]:
+        journal.append(
+            conn,
+            [
+                _role_answer_fact(
+                    deal, stage.id, attempt, str(address.value), hops + 1, answer["answer"], "", after
+                )
+            ],
+        )
+        return address, ""
+    # Вопрос не сгорает: и переадресация, и провал ответа ведут его человеку.
+    # Факт закрывает передачу роли (`redirected`/`failed`), причина едет рядом —
+    # иначе «почему спросили человека» разбиралось бы по коду.
+    why = (
+        f"роль {address.value} переадресовала вопрос человеку: authority"
+        if answer["ok"]
+        else answer["reason"]
+    )
+    journal.append(
+        conn,
+        [
+            _role_answer_fact(
+                deal,
+                stage.id,
+                attempt,
+                str(address.value),
+                hops + 1,
+                "",
+                transit.ROLE_ANSWER_REDIRECTED if answer["ok"] else transit.ROLE_ANSWER_FAILED,
+                after,
+                reason=why,
+            )
+        ],
+    )
+    return routing.Target(
+        routing.HUMAN,
+        reason=routing.REASON_REDIRECTED if answer["ok"] else routing.REASON_ROLE_FAILED,
+    ), why
+
+
 def _parked(
     conn: sqlite3.Connection,
     deal: Any,
@@ -3781,20 +4147,25 @@ def _parked(
     result: dict[str, Any],
     home: Path,
     clock: Callable[[], float],
-) -> tuple[int, Any]:
-    """Попытка задала вопрос: единственный канал `ask()` и дело в `wait_human`.
+    *,
+    spec: Any,
+    spawn: Optional[Callable[..., Any]] = None,
+    previous: Iterable[dict[str, Any]] = (),
+) -> tuple[Optional[int], Any]:
+    """Попытка задала вопрос: адрес решает `routing.route`, канал — адрес.
 
     `clarify` внутри `--oneshot` ответа не получает (`undelivered`,
     `docs/PROBES.md`), поэтому вопрос задаёт движок, а не процесс; текст вопроса
     приходит в `result.json` полем `question`.
 
-    Адрес вопроса решает `routing.route()` — без модели и по объявлениям спеки:
-    фактовый вопрос — роли из `ask.allowed`, властный и неразмеченный — человеку,
-    исчерпанная цепочка — человеку, несуществующий адресат — человеку с
-    `routing_failed`. Здесь только исполнение: факт в пул и адрес в журнал.
+    Два канала, и выбор между ними — адрес: роль из `ask.allowed` получает
+    вопрос движком (`_asked_role`: журнал и спавн роли), а всё остальное —
+    властный или неразмеченный вопрос, исчерпанная цепочка, несуществующий
+    адресат — идёт человеку пул-каналом `ask()` с парковкой `needs_input`, как
+    до 0.1.0. `route()` уже отправил вопрос человеку, если цепочка исчерпана,
+    поэтому спавн роли случается только внутри `max_hops`.
     """
     question = result.get("question")
-    address = routing.route(stage, question, hops_done(conn, deal, stage.id))
     if isinstance(question, str):
         question = {"text": question}
     text = ""
@@ -3808,6 +4179,28 @@ def _parked(
         text = str(result.get("summary") or "").strip()
     if not text:
         text = f"попытка {stage.id}#{attempt} просит решения: текста вопроса в отчёте нет"
+    hops = hops_done(conn, deal, stage.id)
+    address = routing.route(stage, question, hops)
+    note = ""
+    if address.kind == routing.ROLE:
+        address, note = _asked_role(
+            conn,
+            spec,
+            deal,
+            stage,
+            attempt,
+            text,
+            question if isinstance(question, dict) else {"text": text},
+            address,
+            hops,
+            result=result,
+            previous=previous,
+            home=home,
+            spawn=spawn,
+            clock=clock,
+        )
+        if address.kind == routing.ROLE:
+            return None, address
     asked = ask.ask(
         conn,
         {**deal, "home": Path(home)},
@@ -3823,6 +4216,7 @@ def _parked(
         reason=(
             f"попытка {stage.id}#{attempt}: вопрос #{asked.question_id} "
             f"адресован {address.address} ({address.reason}) — без ответа"
+            + (f"; ответ роли: {note}" if note else "")
         ),
         author=ENGINE_SOURCE,
         source=ENGINE_SOURCE,
@@ -3890,6 +4284,140 @@ def _answered_needs_input(conn: sqlite3.Connection, deal: Any) -> bool:
     if opened is None or not answered:
         return False
     return str(journal.payload_of(opened).get("block_kind") or "") == "needs_input"
+
+
+def recover_role_questions(
+    conn: sqlite3.Connection,
+    deal: Any,
+    *,
+    home: Path,
+    clock: Optional[Callable[[], float]] = None,
+) -> list[dict[str, Any]]:
+    """Открытый вопрос роли, которого уже никто не ждёт, — человеку, а не в вечность.
+
+    Вопрос роли движок задаёт и получает ответ **одним вызовом** (`_asked_role`):
+    пара `question_asked` → `question_answered` пишется одним шагом, и пока роль
+    отвечает, дело стоит в `wait_human` — другого состояния у вопроса нет. Значит
+    открытый вопрос роли, до которого дожил проход по журналу, никто не
+    дожидается: движка, который его задал, уже нет (SIGKILL, разрыв гейтвея, сбой
+    записи между двумя фактами).
+
+    Без этого прохода такой вопрос висел бы вечно, и дело было бы живым только до
+    `bin/duty close`, то есть работа терялась бы: строки пула у вопроса роли нет —
+    ответить человеку нечем, — а спавна роли больше не будет (попытка уже
+    закрыта `attempt_ended`, и `_runnable` поднимает только `pending`).
+
+    Поэтому передача закрывается фактом `question_answered` с
+    `answered_via='failed'`, а вопрос уходит человеку **тем же путём**, что у
+    упавшей попытки ответа: `ask()` (единственный канал пула) плюс `blocked` с
+    `block_kind='needs_input'`. Вопрос не сгорает, и следующий прогон двигает
+    дело дальше, как только человек ответит. Саму роль не переспрашиваем: ответ
+    ждал тот же движок, который ушёл, и «переспросить» значило бы надеяться, что
+    он не уйдёт снова.
+
+    Возвращает строки восстановления — по одной на вопрос: этап, попытка, роль,
+    номер вопроса в пуле и причина. Пустой список — восстанавливать нечего.
+    """
+    events = journal.read_events(conn, str(deal["id"]))
+    question = _open_role_question(events)
+    if question is None:
+        return []
+    payload = journal.payload_of(question)
+    routing_ = payload.get("routing")
+    address_of = routing_ if isinstance(routing_, dict) else {}
+    target = str(address_of.get("target") or "")
+    stage_id = str(address_of.get("stage") or "")
+    attempt = int(_int(address_of.get("attempt")) or 0)
+    hops = int(_int(address_of.get("hops")) or 0)
+    role = target.split(":", 1)[1] if ":" in target else target
+    text = str(payload.get("text") or "").strip() or (
+        f"попытка {stage_id}#{attempt} просит решения: текста вопроса в журнале нет"
+    )
+    now = _now_sec(int((clock or time.time)()))
+    why = (
+        f"вопрос роли {role} остался без ответа: движок, который его задал, "
+        "ответ не записал — вопрос уходит человеку"
+    )
+    journal.append(
+        conn,
+        [
+            _role_answer_fact(
+                deal, stage_id, attempt, role, hops, "", transit.ROLE_ANSWER_FAILED, now, reason=why
+            )
+        ],
+    )
+    address = routing.Target(routing.HUMAN, reason=routing.REASON_ROLE_FAILED)
+    asked = ask.ask(
+        conn,
+        {**deal, "home": Path(home)},
+        text,
+        str(payload.get("text_full") or "") or None,
+        None,
+        routing={**address.as_payload(), "stage": stage_id, "attempt": attempt},
+    )
+    deals.set_blocked(
+        conn,
+        str(deal["id"]),
+        kind="needs_input",
+        reason=f"попытка {stage_id}#{attempt}: {why} (вопрос #{asked.question_id})",
+        author=ENGINE_SOURCE,
+        source=ENGINE_SOURCE,
+        now=now,
+    )
+    return [
+        {
+            "stage": stage_id,
+            "attempt": attempt,
+            "role": role,
+            "question_id": int(asked.question_id),
+            "reason": why,
+        }
+    ]
+
+
+def _open_role_question(events: Iterable[Any]) -> Optional[dict[str, Any]]:
+    """Последний вопрос роли без ответа, чья попытка уже закрыта.
+
+    У вопроса роли нет `question_id` — строки пула не существует, — поэтому пара
+    «вопрос → ответ» держится порядком журнала: ответ без номера снимает
+    последний открытый вопрос без номера (ровно так же, как `journal.fold`,
+    `_open_question`). Вопросы человека сюда не попадают: у них номер есть, и
+    ждёт их человек, а не движок — переспрашивать за него нечего.
+
+    Третье условие — `attempt_ended` той же попытки **до** вопроса: вопрос роли
+    задаётся по закрытой попытке (`_parked` пишет его после `attempt_ended`),
+    поэтому «попытка ещё идёт» означало бы, что спрашивать рано и вопрос, может
+    быть, ещё дождётся своего ответа.
+    """
+    closed: set[tuple[str, int]] = set()
+    opened: Optional[dict[str, Any]] = None
+    asked_by_closed = False
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        kind = str(event.get("kind") or "")
+        payload = journal.payload_of(event)
+        if kind == "attempt_ended":
+            closed.add((str(payload.get("stage") or ""), int(_int(payload.get("attempt")) or 0)))
+            continue
+        if kind not in ("question_asked", "question_answered") or _question_id(payload) is not None:
+            continue
+        if kind == "question_answered":
+            opened, asked_by_closed = None, False
+            continue
+        routing_ = payload.get("routing")
+        target = str(routing_.get("target") or "") if isinstance(routing_, dict) else ""
+        if not target.startswith(f"{routing.ROLE}:"):
+            opened, asked_by_closed = None, False
+            continue
+        opened = event
+        asked_by_closed = (
+            str(routing_.get("stage") or ""),
+            int(_int(routing_.get("attempt")) or 0),
+        ) in closed
+    if opened is None or not asked_by_closed:
+        return None
+    return opened
 
 
 def step(

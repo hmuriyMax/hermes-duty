@@ -674,7 +674,39 @@ heartbeat движка). Живой случай: попытка погибла 
 - не писать `cause` в `completed` от человека — падает
   `test_close_writes_completed_with_human_cause`;
 - разрешить перезакрытие другим `reason` — падает
-  `test_close_refuses_to_rewrite_another_close`.
+  `test_close_refuses_to_rewrite_another_close`;
+- пустить вопрос роли пулом (вернуть `_parked` к одному каналу, без `_asked_role`) —
+  падают `test_the_lead_answers_the_stage_question_and_the_answer_is_a_fact` и
+  `test_factual_question_is_addressed_to_the_declared_role` (второй ждёт спавна
+  `researcher` и пустой пул);
+- считать `authority: true` обычным ответом роли (снять проверку в `_role_answer_of`
+  или в `_asked_role`) — падает
+  `test_authority_in_the_role_answer_sends_the_question_to_the_human`: вопрос,
+  который роль переадресовала, остался бы у неё;
+- отправить провал попытки ответа роли назад роли вместо человека — падают
+  `test_a_failed_answer_attempt_hands_the_question_to_the_human` и
+  `test_a_role_that_left_without_a_report_does_not_burn_the_question`: вопрос
+  сгорел бы вместе с упавшей ролью;
+- не отдавать ответ роли новой попытке (убрать `role_answer_before` из `run_stage`)
+  — падает `test_the_answered_stage_runs_again_with_the_answer_in_the_contract`:
+  этап спросил бы то же самое второй раз;
+- не закрывать вопрос без номера в `fold` (снимать только по `question_id`) — падает
+  `test_while_the_role_answers_the_deal_waits_human` (состояние `wait_human` стало
+  бы вечным);
+- снять вызов `runner.recover_role_questions` из `driver.decide` — падает
+  `test_a_lost_role_answer_does_not_leave_the_deal_waiting_forever`: дело стоит в
+  ожидании ответа, которого уже не будет, и следующий прогон никуда не идёт;
+- читать пустой `answer_len` как срок и у передачи роли (убрать `ROLE_ANSWER_KINDS`
+  из `transit._expired`) — падают три: `test_authority_in_the_role_answer_sends_the_question_to_the_human`,
+  `test_a_failed_answer_attempt_hands_the_question_to_the_human` и
+  `test_a_lost_role_answer_does_not_leave_the_deal_waiting_forever` (вопрос человеку
+  есть, а этап запаркован «по сроку без ответа»);
+- снять гард «попытка уже закрыта» (`asked_by_closed` в `runner._open_role_question`) —
+  падает `test_an_open_attempt_is_not_recovered`: вопрос отнят у живой роли;
+- пустить восстановление на вопрос человека (снять в `_open_role_question` фильтр
+  `routing.target` и проверку `question_id`) — падает
+  `test_a_human_question_is_not_recovered_as_a_lost_role_one`: у дела отнят
+  единственный живой канал ответа.
 
 ## 11. Одно дело руками: от спеки до закрытых этапов
 

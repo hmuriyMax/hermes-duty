@@ -36,7 +36,7 @@
 | `changes_requested` | `stage`, `target`, `reason` | приговор `changes`: возврат на `target` |
 | `completed` | без `stage` | дело закрыто целиком |
 | `question_asked` | без `stage` (так пишет `ask()`), адрес — в `routing.stage`/`routing.attempt` | вопрос этого этапа → `wait_human`; адреса нет — последней попытки |
-| `question_answered` | без `stage` | ответ на этот вопрос → новая попытка того же этапа |
+| `question_answered` | без `stage`; у вопроса роли ещё `by` — номера пула нет | ответ на этот вопрос → новая попытка того же этапа |
 | `blocked` | `block_kind='parked'`, `kind`, `stage`, `attempts`, `limit`, `reason` | дело запарковано: `wait(parked)`, подъёма нет |
 | `unblocked` | `previous_kind='parked'` | человек решил продолжать: счётчики класса сброшены, этап снова `pending` |
 
@@ -203,6 +203,17 @@ UNCLASSIFIED = failures.UNCLASSIFIED
 # плагин — им же движок заполняет `verdict.target` по умолчанию
 # (`dashboard/runner.report_verdict`), а не своей копией.
 NEXT = journal.VERDICT_NEXT
+
+# Чем закрывается передача вопроса роли, когда ответа нет: `redirected` — роль
+# переадресовала вопрос человеку (`authority: true`), `failed` — попытка ответа не
+# удалась (в том числе потому, что движок ушёл между вопросом и ответом:
+# `runner.recover_role_questions`). Вопрос при этом **жив** — он ушёл дальше, — и
+# пустой `answer_len` у такой пары сроком не считается (`_expired`): иначе
+# переадресованный вопрос читался бы как истёкший, и дело парковалось бы мимо
+# человека, который этот вопрос и должен получить.
+ROLE_ANSWER_REDIRECTED = "redirected"
+ROLE_ANSWER_FAILED = "failed"
+ROLE_ANSWER_KINDS = (ROLE_ANSWER_REDIRECTED, ROLE_ANSWER_FAILED)
 
 # Виды событий, которые срез этапа не меняют. Набор — журнальный
 # `NON_STATE_KINDS`, минус `question_answered`: для дела ответ закрывающий факт,
@@ -591,9 +602,16 @@ def _expired(payload: dict[str, Any]) -> bool:
     Это факт журнала (`docs/JOURNAL.md`): TTL снимает вопрос так же, как ответ, но
     входа у этапа не появляется — перезапускать попытку по пустому ответу значило
     бы выдать тишину за решение.
+
+    Пустой `answer_len` — срок только у ответа человека. Передача роли без ответа
+    (`redirected`/`failed`) закрывает **передачу**, а не вопрос: он ушёл дальше, и
+    читать его как истёкший значило бы парковать дело мимо живого вопроса.
     """
-    if str(payload.get("answered_via") or "").strip().lower() == "expired":
+    via = str(payload.get("answered_via") or "").strip().lower()
+    if via == "expired":
         return True
+    if via in ROLE_ANSWER_KINDS:
+        return False
     return _int(payload.get("answer_len")) == 0
 
 
@@ -793,25 +811,43 @@ def _deal_question(board: _Board, spec: Any, payload: dict[str, Any]) -> None:
     движка (`POST /ask`) и для фактов до W5. Без адресации этап, у которого
     попытка закончилась вопросом, не `done`, а `wait_human`: работа не сделана,
     её ждёт человек, и после ответа нужна **новая** попытка (правило 5).
+
+    Вопрос без `question_id` — вопрос **роли** (`dashboard/runner.ask_role`):
+    строки пула у него нет, поэтому пара «вопрос → ответ» держится адресом
+    (`routing.stage`/`routing.attempt`), а не номером. Ожидание у него то же
+    (`wait_human`): пока роль отвечает, работа не сделана, и это сказано
+    адресатом, а не пустым номером.
     """
     question_id = _question_id(payload)
     stage_id, attempt = _addressed(board, payload)
     board.question = (stage_id, question_id or "")
     node = board.stages.get(stage_id)
-    if node is None or question_id is None:
+    if node is None:
         return
-    node.question_id = question_id
+    if question_id is not None:
+        node.question_id = question_id
     node.attempt = max(node.attempt, attempt)
     if node.state in (FAILED, PARKED) or board.parked is not None:
         # Вопрос запаркованного дела — факт парковки, а не повод поднять этап:
         # исчерпанный этап остаётся `failed`, а дело — ждёт решения человека.
         return
     node.state = WAIT_HUMAN
+    if question_id is None:
+        node.reason = f"вопрос ушёл {_address_of(payload) or 'адресату'}: ответа нет"
+        return
     node.reason = (
         f"гейт: вопрос #{question_id} человеку — ждёт ответа"
         if _is_gate(spec, stage_id)
         else f"попытка {node.attempt} закончилась вопросом #{question_id}"
     )
+
+
+def _address_of(payload: dict[str, Any]) -> str:
+    """Адрес вопроса из `payload.routing` — для причины ожидания; пусто — не назван."""
+    routing_ = payload.get("routing")
+    if not isinstance(routing_, dict):
+        return ""
+    return str(routing_.get("target") or "")
 
 
 def _addressed(board: _Board, payload: dict[str, Any]) -> tuple[str, int]:
@@ -832,36 +868,46 @@ def _addressed(board: _Board, payload: dict[str, Any]) -> tuple[str, int]:
 
 
 def _deal_answer(board: _Board, spec: Any, payload: dict[str, Any]) -> None:
-    """Ответ или срок по вопросу дела: новая попытка того же этапа либо `park`."""
+    """Ответ или срок по вопросу дела: новая попытка того же этапа либо `park`.
+
+    Пара «вопрос → ответ» сверяется номером пула, а у вопроса роли номера нет —
+    тогда её держит адрес (вопрос без `question_id` отвечается ответом без
+    `question_id`). Смешивать нельзя: у вопроса с номером ответ без номера —
+    ответ **не** на него, и наоборот.
+    """
     stage_id, asked = board.question
     question_id = _question_id(payload)
-    if not asked or (question_id and question_id != asked):
+    if asked != (question_id or ""):
         return  # ответ на чужой/уже снятый вопрос: снимать нечего
     board.question = ("", "")
     node = board.stages.get(stage_id)
     if node is None or node.state in TERMINAL_STATES:
         return
+    number = f"#{asked}" if asked else ""
     if _expired(payload):
         node.state = PARKED
         node.reason = (
             _gate_park_reason(spec, stage_id, asked)
             if _is_gate(spec, stage_id)
-            else f"вопрос #{asked} закрыт по сроку без ответа"
+            else f"вопрос {number or '—'} закрыт по сроку без ответа"
         )
         return
     node.question_id = None
     if board.parked is not None:
         # Парковка: ответ на вопрос — ещё не решение продолжать. Подъём только
         # явным `unblocked` (`continue`), иначе дело крутилось бы само.
-        node.reason = f"ответ #{asked}: дело запарковано — ждёт решения человека"
+        node.reason = f"ответ {number or '—'}: дело запарковано — ждёт решения человека"
         return
     node.state = PENDING
     # У гейта следующая передача не «новая попытка процесса», а суд над ответом:
     # ответ человека — вход этапа, и это сказано словами, а не номером попытки.
+    # У ответа роли номер пула пуст, и её называет автор (`by`): «ответ роли lead».
+    by = str(payload.get("by") or "").strip()
+    who = f"роли {by}" if by else (number or "—")
     node.reason = (
-        f"гейт: ответ #{asked} получен — этап судит его по allow"
-        if _is_gate(spec, stage_id)
-        else f"ответ #{asked}: новая попытка {node.attempt + 1}"
+        f"гейт: ответ {who} получен — этап судит его по allow"
+        if _is_gate(spec, stage_id) and asked
+        else f"ответ {who}: новая попытка {node.attempt + 1}"
     )
 
 

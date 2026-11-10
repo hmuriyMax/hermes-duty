@@ -1024,8 +1024,50 @@ def test_plan_contract_teaches_the_proposal_form(tmp_path: Path) -> None:
     assert "непустой" in boundaries
     assert "приговор выносит close своим вердиктом" in boundaries
     assert "не называется вовсе" in boundaries
+    assert "список команд [{cmd" in boundaries
     # Хвост этапа-плана: хартия и граф в контракте, как и было.
     assert "charter" in contract and "plan" in contract
+
+
+def test_plan_contract_carries_the_last_rejection_issues(tmp_path: Path) -> None:
+    """Попытка реплана видит отказы прошлого предложения — и не повторяет их вслепую.
+
+    Кейс d_bdf8edfb: девять ревизий с одной и той же прозой в evidence — каждая
+    попытка стартовала, не зная, что именно отклонил валидатор. Теперь
+    `plan.last_rejected` в контракте несёт `why` и `issues[]` последнего отказа.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = plan_spec(tmp_path)
+    journal.append(
+        conn,
+        [
+            {
+                "ts": 1794300000,
+                "recorded_at": 1794300000,
+                "deal_id": str(deal["id"]),
+                "kind": "plan_rejected",
+                "payload": {
+                    "rev": 1,
+                    "why": "план ревизии 1 отклонён: отказов 2",
+                    "issues": [
+                        "evidence: evidence — список доказательств",
+                        "budget: budget — словарь {tokens, minutes}",
+                    ],
+                },
+                "source": "engine",
+                "idempotency_key": "test:plan_rejected:1",
+            }
+        ],
+    )
+
+    run_stage(conn, spec, deal, home, Fake(result=None, exit_code=0, lines=[]))
+    contract_file = runner.contract_path(runner.attempt_dir(home, deal, "plan", 1), "plan", 1)
+    contract = json.loads(contract_file.read_text(encoding="utf-8"))
+    last = contract["plan"]["last_rejected"]
+    assert "отказов 2" in last["why"]
+    assert any("evidence" in issue for issue in last["issues"])
 
 
 def test_contract_tells_how_to_deliver_the_report_without_write_file(

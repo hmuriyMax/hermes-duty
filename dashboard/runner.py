@@ -1225,7 +1225,7 @@ def plan_payload(spec: Any, events: Iterable[Any]) -> dict[str, Any]:
     events = list(events or ())
     graph = transit.graph(spec, events)
     started = transit.started_stages(events)
-    return {
+    out = {
         "graph": [
             {
                 "id": stage.id,
@@ -1244,6 +1244,21 @@ def plan_payload(spec: Any, events: Iterable[Any]) -> dict[str, Any]:
             "cost: {tokens}, reason}"
         ),
     }
+    # Отказы прошлого предложения — в контракте, а не только в журнале: попытка
+    # реплана стартует вслепую и без них повторяет те же ошибки формы, сжигая
+    # попытку за попыткой (кейс d_bdf8edfb: 9 ревизий с одной и той же прозой
+    # в evidence). Лид обязан видеть, ЧТО именно отклонил валидатор.
+    for event in reversed(events):
+        if str(event.get("kind") or "") != "plan_rejected":
+            continue
+        rejected = journal.payload_of(event)
+        if rejected.get("issues"):
+            out["last_rejected"] = {
+                "why": rejected.get("why"),
+                "issues": [str(issue) for issue in rejected.get("issues") or ()],
+            }
+        break
+    return out
 
 
 def build_contract(
@@ -1341,7 +1356,10 @@ def build_contract(
                 "поля role/kind/evidence/budget переписывают этап, план отклонят",
                 "этап, у которого уже есть попытки (начат), в плане не называется вовсе: "
                 "он выполняется, перестановке не подлежит — попытка plan#7 d_2fc749fb",
-                "новый этап — полный словарь {id, role, kind, needs, evidence, budget}",
+                "новый этап — полный словарь {id, role, kind, needs, evidence, budget}: "
+                "evidence — список команд [{cmd: \"go test ./...\", must: 0}] "
+                "(must — код возврата), budget — словарь {tokens, minutes}; "
+                "проза вместо этих словарей отклоняет план целиком",
                 "«работы нет» — не пустой список: назови минимальный хвост графа "
                 "(ещё не начатый close), а приговор выносит close своим вердиктом",
             ]

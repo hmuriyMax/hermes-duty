@@ -586,6 +586,53 @@ def test_resume_attempt_answers_with_session(tmp_path: Path) -> None:
     assert report["session_id"] == "local-abc123"
 
 
+def test_close_attempt_resumes_the_coordinator_session(tmp_path: Path) -> None:
+    """Дело закрывает тот же координатор: close продолжает разговор входного этапа.
+
+    Кейс d_48e01a0e: `close` шёл отдельной попыткой с чистым контекстом — роль та
+    же (coordinator), а разговор другой. Решение 11.11: «close делает тот же
+    координатор, что вёл дело»; значит сессия берётся у этапа плана.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = write_spec(
+        tmp_path,
+        """
+        duty: probe
+        stages:
+          - id: plan
+            role: coordinator
+            workspace: none
+          - id: close
+            role: coordinator
+            needs: [plan]
+            workspace: none
+        """,
+    )
+    seed(
+        conn,
+        deal,
+        "attempt_started",
+        {"stage": "plan", "attempt": 1, "run_id": "plan#1", "pid": 1},
+        key="test:plan:started",
+    )
+    seed(
+        conn,
+        deal,
+        "attempt_ended",
+        {"stage": "plan", "attempt": 1, "outcome": "done", "details": {"session_id": "local-coord-9"}},
+        key="test:plan:ended",
+    )
+    fake = Fake(result={"status": "done", "summary": "дело закрыто", "verdict": {"action": "approve", "target": "", "reason": "готово"}})
+    runner.run_stage(conn, spec, deal, "close", 1, home=home, spawn=fake, clock=lambda: NOW)
+
+    command = fake.calls[0]["cmd"]
+    assert "--resume" in command and "local-coord-9" in command
+    query_file = Path(command[command.index("--query-file") + 1])
+    assert query_file.name == "in-close-1.json"
+
+
 # --------------------------------------------------------------------- дерево
 
 
@@ -634,7 +681,7 @@ def test_plan_attempt_resumes_its_own_session(tmp_path: Path) -> None:
 
 
 def test_other_stages_do_not_resume_without_an_answer(tmp_path: Path) -> None:
-    """Резюм без ответа — привилегия этапа плана, не всех этапов."""
+    """Резюм без ответа — привилегия координатора (план и close), не всех этапов."""
     home = make_home(tmp_path)
     conn = open_store(home)
     deal = make_deal(conn)

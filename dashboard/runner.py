@@ -1009,6 +1009,28 @@ def is_plan_stage(stage: Any) -> bool:
     )
 
 
+def _is_close_stage(stage: Any) -> bool:
+    """Закрывающий этап дела: id `close` (сид), а не роль — роль у него та же,
+    что у координатора, и по роли его не отличить от этапа плана."""
+    return str(getattr(stage, "id", "")) == spec_module.CLOSE_STAGE
+
+
+def _resume_stage_id(spec: Any, stage: Any, events: Iterable[Any]) -> str:
+    """Чью сессию резюмит этап: свою (план) или координатора (close).
+
+    Решение 11.11: дело закрывает **тот же координатор**, что его вёл, — значит
+    `close` продолжает разговор входного этапа, а не начинает новый. Свежий
+    процесс на закрытии терял всё, что координатор выяснил по ходу дела
+    (кейс d_48e01a0e: close отдельной попыткой с чистым контекстом).
+    """
+    if not _is_close_stage(stage):
+        return str(getattr(stage, "id", ""))
+    for item in transit.graph(spec, events or ()):
+        if is_plan_stage(item):
+            return str(getattr(item, "id", ""))
+    return str(getattr(stage, "id", ""))
+
+
 def _plan_issues(issues: Iterable[Any]) -> list[str]:
     """Отказы плана словами: `правило: текст` без псевдопути `<plan>:1`.
 
@@ -3789,8 +3811,8 @@ def start_stage(
     # что помнили только контракт, а не собственные прошлые ходы). Журнал остаётся
     # источником истины: входом резюма служит новый контракт (last_rejected,
     # rethink), а не память модели.
-    resume = answer is not None or is_plan_stage(stage)
-    session_id = last_session(conn, deal, stage_id) if resume else ""
+    resume = answer is not None or is_plan_stage(stage) or _is_close_stage(stage)
+    session_id = last_session(conn, deal, _resume_stage_id(spec, stage, events)) if resume else ""
     contract = build_contract(
         spec,
         deal,

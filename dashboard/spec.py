@@ -153,6 +153,14 @@ PUBLISHING_ROLES = ("publisher", "deployer")
 # делает «гейти PUB на RV, а не на IMP» проверкой, а не договорённостью в скилле.
 REVIEWING_ROLE = "reviewer"
 
+# Роли без терминала: их профили не запускают команд (`terminal` в
+# disabled_toolsets). Такие этапы доказывают себя отчётом и приговором, а не
+# кодом возврата, и требовать от них `evidence {cmd, must}` — заведомо
+# невыполнимое требование. Цена ошибки видна на деле d_48e01a0e: лид не смог
+# запланировать исследовательский этап (валидатор требовал evidence) и сделал
+# всю сверку кода с докой сам в этапе координатора, а в граф вынес только close.
+EVIDENCE_FREE_ROLES = (REVIEWING_ROLE, "researcher")
+
 # Команды, которые сами меняют мир: это действие, а не доказательство. Спека
 # принимает только то, что можно проверить повторным запуском, — поэтому такие
 # `cmd` отказывают до запуска, а не после публикации.
@@ -2397,9 +2405,13 @@ def parse_plan(
         # «Что-то производит» — тот же признак, по которому `evidence.witness`
         # выбирает свидетеля: этап-агент без приговора и не публикующий. Приговор —
         # не работа в дереве, у гейта работы нет вовсе, а команда доказывает себя
-        # кодом возврата `must`.
+        # кодом возврата `must`. Роли без терминала (ресерчер, ревьюер) не
+        # производят: их работа — отчёт, и требовать с них команду нельзя.
         produces = (
-            stage.kind == DEFAULT_STAGE_KIND and stage.verdict is None and stage.role not in PUBLISHING_ROLES
+            stage.kind == DEFAULT_STAGE_KIND
+            and stage.verdict is None
+            and stage.role not in PUBLISHING_ROLES
+            and stage.role not in EVIDENCE_FREE_ROLES
         )
         if produces and not any(evidence.cmd.strip() for evidence in stage.evidence):
             issues.append(

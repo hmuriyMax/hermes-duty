@@ -150,6 +150,22 @@ function stateMeta(state, humanKind) {
   return meta
 }
 
+
+/**
+ * Подпись профиля этапа: роль, а если спавнится другим профилем — пара.
+ *
+ * `coordinator` в Hermes не существует: он живёт под профилем `lead`
+ * (spec.PROFILE_ALIASES). Показывать только роль значило бы обещать профиль,
+ * которого нет, — подпись называет оба: `coordinator (профиль lead)`.
+ */
+function profileText(stage) {
+  const role = String((stage && stage.role) || '').trim()
+  const profile = String((stage && stage.profile) || '').trim()
+  if (!role && !profile) return 'профиль'
+  if (!profile || profile === role) return role || profile
+  return `${role} (профиль ${profile})`
+}
+
 /** Русская форма числа: `1 вопрос`, `2 вопроса`, `5 вопросов`. */
 function plural(n, one, few, many) {
   const tail = Math.abs(Number(n) || 0) % 100
@@ -1649,8 +1665,10 @@ function compactStageView(stage) {
   return {
     id,
     // Вид этапа: у агентских — роль (`implementer`), у остальных — сам вид
-    // (`shell`, `gate`) из спеки. Та же подпись, что у дорожки шкалы.
-    kindText: kind === 'agent' ? String(s.role || 'профиль') : kind,
+    // (`shell`, `gate`) из спеки. Та же подпись, что у дорожки шкалы. Если роль
+    // спавнится чужим профилем (`coordinator` → `lead`), называем оба: иначе
+    // «профиль coordinator» ищут в Hermes и не находят.
+    kindText: kind === 'agent' ? profileText(s) : kind,
     attemptsText: count ? `${count} ${plural(count, 'попытка', 'попытки', 'попыток')}` : 'попыток нет',
     stateLabel: meta.label,
     tone: meta.tone,
@@ -2662,7 +2680,7 @@ function laneView(lane, bars, scale) {
   return {
     name: String((lane && lane.label) || '—'),
     kind: first ? String(first.kind || 'agent') : '',
-    kindText: first ? (first.kind === 'agent' ? String(first.role || 'профиль') : String(first.kind)) : '',
+    kindText: first ? (first.kind === 'agent' ? profileText(first) : String(first.kind)) : '',
     icon: first ? KIND_ICON[first.kind] || KIND_ICON.shell : '',
     meta,
     empty: list.length === 0,

@@ -642,6 +642,11 @@ def stages(spec: Any, events: Iterable[Any], now: Any) -> list[dict[str, Any]]:
                 "id": stage.id,
                 "kind": getattr(stage, "kind", STAGE_KIND_AGENT),
                 "role": stage.role,
+                # Профиль Hermes, под которым этап реально спавнится: роль
+                # `coordinator` живёт под профилем `lead` (spec.PROFILE_ALIASES),
+                # и без этой пары UI показывал «профиль coordinator», которого
+                # в Hermes нет.
+                "profile": spec_module.spawn_profile(str(stage.role or "")),
                 "state": state.state,
                 "attempt": state.attempt,
                 "rounds": state.rounds,

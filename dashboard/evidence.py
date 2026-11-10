@@ -145,6 +145,13 @@ WITNESS_PUBLISHED = "published"
 # работа (`docs/ENGINE-1.0.md`, раздел 4). Смысл предложения проверяет не гейт
 # пакета, а `spec.parse_plan` в движке (`runner.report_plan`).
 WITNESS_PLAN = "plan"
+# Этап без терминала (ресерчер, ревьюер без приговора): он не запускает команд и
+# не пишет в дерево — его работа это отчёт. Свидетель — непустой `summary` с
+# находками; требовать commit/artifacts значило бы требовать ложь. Кейс
+# d_48e01a0e: исследовательский этап нельзя было ни запланировать (evidence),
+# ни закрыть (свидетель работы) — поэтому лид делал сверку сам в этапе
+# координатора.
+WITNESS_REPORT = "report"
 
 # Имя отчёта в тексте отказа: `result.json:evidence[0].exit` читается как
 # `file:line` спеки, только «строка» здесь — путь внутри отчёта.
@@ -353,6 +360,10 @@ def witness(stage: Any) -> str:
         and str(getattr(stage, "kind", spec_module.DEFAULT_STAGE_KIND)) == spec_module.DEFAULT_STAGE_KIND
     ):
         return WITNESS_PLAN
+    if str(getattr(stage, "role", "") or "") in spec_module.EVIDENCE_FREE_ROLES:
+        # Роль без терминала: команд не запускает, дерево не меняет — её работа
+        # это отчёт, и свидетель у неё один и тот же (`WITNESS_REPORT`).
+        return WITNESS_REPORT
     return WITNESS_WORK
 
 
@@ -391,6 +402,16 @@ def _witness_problem(kind: str, result: dict[str, Any]) -> Optional[Issue]:
             RULE_REQUIRED,
             "этап плана: нужен plan {stages: [...], reason}; commit/artifacts не требуются — "
             "предложение проверяет движок (spec.parse_plan), а не гейт пакета",
+        )
+    if kind == WITNESS_REPORT:
+        summary = result.get("summary")
+        if isinstance(summary, str) and summary.strip():
+            return None
+        return Issue(
+            _where(WITNESS_REPORT),
+            RULE_REQUIRED,
+            "этап без терминала: нужен summary с находками; commit/artifacts "
+            "не требуются — работа такого этапа это отчёт",
         )
     commit = result.get("commit")
     claimed_commit = commit.strip() if isinstance(commit, str) else ""
@@ -813,6 +834,10 @@ def report_schema(stage: Any) -> dict[str, Any]:
     ]
     wanted = witness(stage)
     required = [wanted, "evidence", "summary"]
+    if wanted == WITNESS_REPORT:
+        # Отчёт и есть свидетель: `evidence` у роли без терминала пуст, а
+        # `commit|artifacts` взять неоткуда — требование повторяло бы witness.
+        required = [WITNESS_REPORT, "summary"]
     verdict: dict[str, str] = {}
     if wanted == WITNESS_VERDICT:
         verdict = {

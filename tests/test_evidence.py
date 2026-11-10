@@ -254,6 +254,27 @@ def test_witness_is_chosen_by_the_stage_not_one_for_all(tmp_path: Path) -> None:
     assert evidence.witness(make_stage(role="deployer")) == evidence.WITNESS_PUBLISHED
 
 
+def test_researcher_witness_is_the_report(tmp_path: Path) -> None:
+    """У роли без терминала свидетель — отчёт, a не коммит: коммита ей взять неоткуда.
+
+    Кейс d_48e01a0e: исследовательский этап нельзя было запланировать (evidence) —
+    и, даже пройди он гейт плана, гейт отчёта требовал бы `commit|artifacts`,
+    которых у read-only роли не бывает.
+    """
+    stage = make_stage(role="researcher")
+    assert evidence.witness(stage) == evidence.WITNESS_REPORT
+    schema = evidence.report_schema(stage)
+    assert "commit|artifacts" not in schema["required_for_done"]
+    assert evidence.WITNESS_REPORT in schema["required_for_done"]
+
+    ok = verify({"status": "done", "evidence": [], "summary": "сверка кода с докой: расхождений нет"}, stage, tmp_path)
+    assert ok.ok is True, [str(issue) for issue in ok.errors]
+
+    empty = verify({"status": "done", "evidence": [], "summary": "  "}, stage, tmp_path)
+    assert empty.ok is False
+    assert empty.errors[0].where == "result.json:report"
+
+
 def test_done_without_summary_is_refused(tmp_path: Path) -> None:
     """`done` без `summary`: итог не назван, проверять нечего."""
     built = report(tmp_path, summary="   ")

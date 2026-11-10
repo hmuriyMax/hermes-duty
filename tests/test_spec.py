@@ -1993,6 +1993,20 @@ def test_parse_plan_producing_stage_needs_evidence():
     assert "plan.evidence" in {issue.rule for issue in found}
 
 
+def test_parse_plan_researcher_needs_no_evidence():
+    """Ресерчер команд не запускает — требовать с него evidence значит требовать ложь.
+
+    Кейс d_48e01a0e: лид не смог запланировать исследовательский этап (валидатор
+    требовал `evidence {cmd, must}`, а у профиля researcher нет терминала) и
+    сделал всю сверку кода с докой сам в этапе координатора.
+    """
+    _, found = plan([{"id": "research", "role": "researcher", "workspace": "none"}])
+    assert "plan.evidence" not in {issue.rule for issue in found}
+    # Остальным производящим этапам evidence по-прежнему обязателен.
+    _, found_impl = plan([{"id": "impl", "role": "implementer", "workspace": "worktree"}])
+    assert "plan.evidence" in {issue.rule for issue in found_impl}
+
+
 def test_parse_plan_reviewer_and_gate_need_no_evidence():
     """Ревьюер предъявляет приговор, гейт — ответ человека: evidence им не нужен."""
     _, found = plan([

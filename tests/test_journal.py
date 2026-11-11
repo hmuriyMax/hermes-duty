@@ -476,10 +476,11 @@ def test_fold_closed_deal_is_not_reopened_by_non_state_kinds() -> None:
     # решением о закрытости и есть правило 2.
     assert folded["last_kind"] == "patched"
     # Набор «не открывающих живое ожидание» видов назван в одном месте и ровно этими
-    # восьмью: ответ на вопрос — закрывающий факт, телеметрия попытки — не факт о деле,
+    # десятью: ответ на вопрос — закрывающий факт, телеметрия попытки — не факт о деле,
     # публикация — факт о дереве (этап закрыт своим `attempt_ended`), предложение
     # плана — факт о графе, а не о состоянии (в граф оно не входит), продолжение в
-    # сохранённом дереве — факт о дереве попытки (о её начале говорит `attempt_started`).
+    # сохранённом дереве — факт о дереве попытки (о её начале говорит `attempt_started`),
+    # жизнь сессии лида — факт о лиде, а не о деле (`docs/ENGINE-2.0.md`, раздел 10).
     assert journal.NON_STATE_KINDS == (
         "commented",
         "attached",
@@ -489,6 +490,8 @@ def test_fold_closed_deal_is_not_reopened_by_non_state_kinds() -> None:
         "tree_reused",
         "published",
         "plan_proposed",
+        "lead_started",
+        "lead_exited",
     )
 
 

@@ -97,9 +97,10 @@ LEAD_STAGE = "@lead"
 PROFILE = "lead"
 SKILL = "project-delivery"
 
-# Сколько живёт один заход лида и сколько сверх него держится лизинг: заход
-# завершается сам по `--run-budget` (`docs/ENGINE-2.0.md`, раздел 11), а запас
-# лизинга нужен, чтобы штатный выход не выглядел падением.
+# Сколько живёт один заход лида и сколько сверх него держится лизинг: бюджет
+# держит супервизор по часам — ребенок не умеет ограничивать себя сам, потому что
+# `hermes chat` через живой гейтвей отказывает `--run-budget` (`docs/ENGINE-2.0.md`,
+# раздел 11). Запас лизинга нужен, чтобы штатный выход не выглядел падением.
 DEFAULT_RUN_BUDGET_SEC = 1800
 LEASE_GRACE_SEC = 300
 
@@ -584,7 +585,9 @@ def digest(
     lines = _head_block(deal, st, spec, resume_limit)
     lines.append(f"- бюджет дела: {_budget_line(spec, events)}")
     if run_budget:
-        lines.append(f"- бюджет этого захода: {int(run_budget)} с, после чего сессия завершится штатно и будет поднята резюмом")
+        lines.append(
+            f"- бюджет этого захода: {int(run_budget)} с, после чего сторож остановит заход и поднимет резюм"
+        )
     lines += ["", f"## Что произошло после курсора сессии ({cursor})"]
     facts, omitted = _facts_lines(events, cursor, moment)
     if omitted:
@@ -625,7 +628,9 @@ def brief(
     lines = _head_block(deal, st, spec, resume_limit)
     lines.append(f"- бюджет дела: {_budget_line(spec, events)}")
     if run_budget:
-        lines.append(f"- бюджет этого захода: {int(run_budget)} с, после чего сессия завершится штатно и будет поднята резюмом")
+        lines.append(
+            f"- бюджет этого захода: {int(run_budget)} с, после чего сторож остановит заход и поднимет резюм"
+        )
     body = _short(deal.get("body") or "", BRIEF_BODY_LIMIT)
     lines += ["", "## Что за дело", body or "(тело дела не записано)"]
     if spec is not None:
@@ -668,9 +673,7 @@ def brief(
 # ---------------------------------------------------------------- команда
 
 
-def command(
-    mode: str, *, session_id: str, query_file: Path, run_budget: int
-) -> list[str]:
+def command(mode: str, *, session_id: str, query_file: Path) -> list[str]:
     """Команда захода: ровно те ключи, что сверены с `hermes chat --help`.
 
     Первый заход поднимает скилл `project-delivery` (`-s`) — он и есть правила
@@ -678,6 +681,12 @@ def command(
     повторяется (`docs/ENGINE-2.0.md`, раздел 2). `--format stream-json` нужен не
     для человека, а для факта: из потока берётся `session_id`, без которого
     резюм невозможен.
+
+    Бюджета захода в команде нет намеренно: `hermes chat` через живой гейтвей
+    отказывает `--run-budget` (он переехал в `agent.run_budget_seconds`, а это
+    настройка процесса, а не сессии). Держит бюджет сам супервизор: он ждёт
+    ребёнка по часам и на `overrun` останавливает его так же, как по выходу, —
+    факт `lead_exited(overrun)` и резюм.
     """
     cmd = [runner.HERMES_BIN, "chat", "-p", PROFILE]
     if mode == MODE_FIRST:
@@ -686,23 +695,13 @@ def command(
         if not session_id:
             raise LeadError("resume: session_id не назван — продолжать нечего, это первый заход")
         cmd.extend(["--resume", str(session_id)])
-    cmd.extend(
-        [
-            "--query-file",
-            str(query_file),
-            "--format",
-            "stream-json",
-            "--oneshot",
-            "--run-budget",
-            str(int(run_budget)),
-        ]
-    )
+    cmd.extend(["--query-file", str(query_file), "--format", "stream-json", "--oneshot"])
     return cmd
 
 
-def command_line(mode: str, *, session_id: str, query_file: Path, run_budget: int) -> str:
+def command_line(mode: str, *, session_id: str, query_file: Path) -> str:
     """Команда захода строкой — для отчёта карточки и разбора «чем поднимали»."""
-    return " ".join(command(mode, session_id=session_id, query_file=query_file, run_budget=run_budget))
+    return " ".join(command(mode, session_id=session_id, query_file=query_file))
 
 
 # ------------------------------------------------------------------ файлы
@@ -848,7 +847,7 @@ def run(
                 else digest(deal, events, st, spec=spec, resume_limit=resume_limit, now=moment, run_budget=budget_sec)
             ),
         )
-        cmd = command(mode, session_id=str(st["session_id"]), query_file=path, run_budget=budget_sec)
+        cmd = command(mode, session_id=str(st["session_id"]), query_file=path)
         try:
             process = spawner(cmd, Path(home))
         except OSError as exc:
@@ -1028,6 +1027,17 @@ def _live_runtime(
         "stage": str(payload.get("stage") or ""),
         "pid": pid,
     }
+
+
+def _legacy_driven(events: list[dict[str, Any]]) -> bool:
+    """Дело ведёт рантайм старого движка, а не лид 2.0.
+
+    Признак один и он в журнале: у дела 2.0 заведена хартия (`created.payload.spec`),
+    у дел 0.1.x её нет вовсе — этапность жила в самой спеке, и поднимал их
+    `bin/duty run`. Такое дело сторож не трогает ни с живым, ни с мёртвым pid:
+    два движка на одном деле дали бы двойную работу и две правды в журнале.
+    """
+    return not stagefeed.spec_of(events)
 
 
 def _not_led(deal: dict[str, Any], events: list[dict[str, Any]]) -> str:
@@ -1240,6 +1250,14 @@ def supervise(
                 "lead": {**st, "live": True, "mode": "runtime", "pid": runtime["pid"]},
                 "limit": limit,
                 "runtime": runtime,
+            }
+        if _legacy_driven(events):
+            return {
+                "deal": str(deal["id"]),
+                "action": "skipped",
+                "reason": "дело ведёт рантайм старого движка: попытки есть, фактов лида нет",
+                "lead": st,
+                "limit": limit,
             }
         recovered = _close_dead(conn, deal, events, st, now=moment) if write else None
         if _int(st["resumes"]) >= limit:

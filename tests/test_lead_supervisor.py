@@ -4,7 +4,9 @@
 журнале и в командной строке захода, а не обещания docstring:
 
 1. нет сессии → заход собирает команду **первого** запуска с брифом
-   (`-p lead -s project-delivery --query-file <бриф> --run-budget 1800`);
+   (`-p lead -s project-delivery --query-file <бриф> --format stream-json`);
+   бюджет захода держит сам супервизор: `hermes chat` через живой гейтвей
+   отказывает `--run-budget`;
 2. `kill` процесса лида посреди дела → следующий тик поднимает **резюм**
    (`--resume <session_id>`) с дайджестом фактов после курсора: курсор не теряется,
    второй попытки той же работы не появляется;
@@ -261,9 +263,9 @@ def test_first_start_builds_brief_command_and_records_facts(tmp_path: Path) -> N
     """Нет сессии → команда первого запуска с брифом, `lead_started`/`lead_exited`.
 
     `docs/ENGINE-2.0.md`, раздел 2: первый заход поднимается скиллом
-    `project-delivery` и брифом; заход ограничен `--run-budget` (по умолчанию
-    1800 с). Факт начала несёт pid процесса и курсор — то, на чём потом стоит
-    резюм.
+    `project-delivery` и брифом; бюджет захода (1800 с) держит супервизор по
+    часам — флага в команде нет, потому что живой гейтвей его отвергает. Факт
+    начала несёт pid процесса и курсор — то, на чём потом стоит резюм.
     """
     home = make_home(tmp_path)
     spec = write_spec(tmp_path)
@@ -288,10 +290,11 @@ def test_first_start_builds_brief_command_and_records_facts(tmp_path: Path) -> N
     assert cmd[0].endswith("hermes")
     assert cmd[1:6] == ["chat", "-p", "lead", "-s", "project-delivery"]
     assert "--resume" not in cmd
-    assert cmd[cmd.index("--run-budget") + 1] == "1800"
     assert cmd[cmd.index("--format") + 1] == "stream-json"
     brief_path = Path(cmd[cmd.index("--query-file") + 1])
     brief = brief_path.read_text(encoding="utf-8")
+    assert "--run-budget" not in cmd
+    assert "бюджет этого захода: 1800 с" in brief
     # Бриф — про это дело, с путём к контракту движка и к спеке дела.
     assert "Супервизор лида" in brief
     assert str(lead.ENGINE_DOC) in brief
@@ -669,16 +672,19 @@ def test_deal_waiting_for_human_is_not_led(tmp_path: Path) -> None:
 
 
 def test_live_legacy_runtime_is_not_raised_twice(tmp_path: Path) -> None:
-    """Дело ведёт рантайм 0.1.x → сторож не поднимает свой заход поверх него.
+    """Дело старого движка сторож не трогает ни с живым, ни с мёртвым pid.
 
-    У дела старого движка нет фактов `lead_started`: работу ведёт `bin/duty run`
-    открытой попыткой, и живой pid этой попытки — тот же «лид жив». Мёртвый pid,
-    наоборот, отдаёт дело обычному пути сторожа: первый заход.
+    Признак дела 0.1.x — отсутствие хартии (`created.payload.spec`): работу такого
+    дела ведёт `bin/duty run`. Живой pid открытой попытки — «лид жив»; мёртвый pid
+    между заходами — повод **не** поднимать лида 2.0, а оставить дело старому
+    рантайму: два движка на одном деле дали бы двойную работу.
     """
     home = make_home(tmp_path)
-    spec = write_spec(tmp_path)
+    write_spec(tmp_path)  # спека 1.x живёт в самом деле — хартии у него нет
     conn = open_store(home)
-    deal = make_deal(conn, spec)
+    created = deals.create_deal(conn, repo="duty", title="Старое дело", body="b", now=NOW)
+    deal = deals.deal_row(conn, str(created["deal"]["id"]))
+    assert deal is not None
     append(
         conn,
         deal,
@@ -702,7 +708,7 @@ def test_live_legacy_runtime_is_not_raised_twice(tmp_path: Path) -> None:
     assert tick["runtime"]["run_id"] == "implement#1"
     assert spawned == []
 
-    # Того же дела журнал, но процесса попытки уже нет → сторож поднимает заход.
+    # Тот же журнал, но процесс попытки уже мёртв → не поднимаем лида 2.0.
     tick = lead.supervise(
         home,
         str(deal["id"]),
@@ -710,5 +716,6 @@ def test_live_legacy_runtime_is_not_raised_twice(tmp_path: Path) -> None:
         probe=dead,
         spawn=lambda *args: spawned.append(args[1]) or 1,
     )
-    assert tick["action"] == "started"
-    assert spawned == [str(deal["id"])]
+    assert tick["action"] == "skipped"
+    assert "старого движка" in tick["reason"]
+    assert spawned == []

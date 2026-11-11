@@ -900,16 +900,34 @@ def previous_reports(
         result = payload.get("result")
         result = result if isinstance(result, dict) else {}
         artifacts = result.get("artifacts")
+        # Полный отчёт предшественника — файлом: `summary` это вывод в две
+        # строки, а следующему этапу нужны подробности (кейс d_f50a120f:
+        # research нашёл расхождения D1/D2 с file:line и решением «это к лиду»,
+        # а impl получил только «найдено 2 расхождения» и пошёл править вслепую).
+        report_path = _report_file_of(payload)
+        report = result.get("report")
         out.append(
             {
                 "stage": stage.id,
                 "commit": attempt_commit(payload),
                 "artifacts": artifacts if isinstance(artifacts, list) else [],
                 "summary": str(result.get("summary") or ""),
+                "report": report if isinstance(report, str) else "",
+                "report_path": str(report_path) if report_path else "",
                 "verdict": verdicts.get(stage.id),
             }
         )
     return out
+
+
+def _report_file_of(payload: Any) -> Optional[Path]:
+    """`result.json` попытки из её записи в журнале: файл, а не пересказ отчёта."""
+    details = (payload or {}).get("details") if isinstance(payload, dict) else None
+    workdir = details.get("workdir") if isinstance(details, dict) else None
+    if not isinstance(workdir, str) or not workdir:
+        return None
+    path = Path(workdir) / ".duty" / "result.json"
+    return path if path.is_file() else None
 
 
 def report_verdict(
@@ -1435,6 +1453,12 @@ def build_contract(
         boundaries.append(
             "прошлые попытки этого этапа упали — причины в previous_failures: "
             "чини причину, а не повторяй тот же отчёт"
+        )
+    if any(item.get("report_path") for item in previous):
+        boundaries.append(
+            "подробности отчёта предшественника — в previous[].report_path "
+            "(файл result.json): summary это вывод, а не весь отчёт — "
+            "читай файл, прежде чем править код"
         )
     contract: dict[str, Any] = {
         "deal": str(deal["id"]),

@@ -535,6 +535,10 @@ def test_contract_carries_previous_artifacts(tmp_path: Path) -> None:
             "commit": "",
             "artifacts": ["/tmp/diff.patch"],
             "summary": "поправил шапку",
+            # Полного текста отчёта в факте нет — значит и в контракте пусто;
+            # файла result.json у этой фикстуры тоже нет (workdir не записан).
+            "report": "",
+            "report_path": "",
             "verdict": None,
         },
         {
@@ -542,9 +546,68 @@ def test_contract_carries_previous_artifacts(tmp_path: Path) -> None:
             "commit": "",
             "artifacts": [],
             "summary": "тесты зелёные",
+            "report": "",
+            "report_path": "",
             "verdict": "changes",
         },
     ]
+
+
+def test_previous_report_path_points_at_the_predecessor_result(tmp_path: Path) -> None:
+    """Подробности отчёта предшественника доезжают файлом, а не пересказом summary.
+
+    Кейс d_f50a120f: research нашёл расхождения D1/D2 с file:line и выводом
+    «решение за лидом», а impl получил только «найдено 2 расхождения» — правил
+    бы вслепую. Контракт следующего этапа несёт `report_path` — файл result.json
+    предшественника.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = write_spec(
+        tmp_path,
+        """
+        duty: probe
+        stages:
+          - id: research
+            role: researcher
+            workspace: none
+          - id: impl
+            role: implementer
+            needs: [research]
+        """,
+    )
+    workdir = tmp_path / "research-1"
+    (workdir / ".duty").mkdir(parents=True)
+    report = {"status": "done", "summary": "нашёл D1/D2", "report": "D1: ... D2: ..."}
+    (workdir / ".duty" / "result.json").write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+    seed(
+        conn,
+        deal,
+        "attempt_ended",
+        {
+            "stage": "research",
+            "attempt": 1,
+            "outcome": "done",
+            "result": report,
+            "details": {"workdir": str(workdir)},
+        },
+        key="test:research:ended",
+    )
+
+    previous = runner.previous_reports(conn, deal, spec, "impl")
+    assert previous[0]["report_path"] == str(workdir / ".duty" / "result.json")
+    assert previous[0]["report"] == "D1: ... D2: ..."
+
+    # Границы попытки называют файл отчёта: контракт собирается здесь же, без
+    # живого процесса — проверяем сборку, а не рантайм.
+    contract = runner.build_contract(
+        spec, deal, next(s for s in spec.stages if s.id == "impl"), 1,
+        workdir=tmp_path / "impl-1", tree=None, cwd=tmp_path,
+        previous=previous, deadline_sec=60, events=[],
+    )
+    assert contract["previous"][0]["report_path"].endswith("result.json")
+    assert any("report_path" in line for line in contract["boundaries"])
 
 
 def test_resume_attempt_answers_with_session(tmp_path: Path) -> None:

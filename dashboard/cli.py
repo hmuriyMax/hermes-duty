@@ -2212,15 +2212,23 @@ def lead_modes() -> dict[str, str]:
 
 
 def render_lead_run(report: dict[str, Any]) -> str:
-    """Итог `--wait`: чем кончился заход (режим, pid, код выхода, сессия)."""
+    """Итог `--wait`: чем кончился заход (режим, pid, код выхода, сессия, лог).
+
+    Путь к потоку сессии печатается отдельной строкой, потому что это
+    единственное место, где видно **слова** лида: факт журнала называет, что
+    заход был, а не что он сказал (`dashboard/lead.py`, `stream_dir`).
+    """
     if not report.get("started"):
         return f"ЛИД · {report.get('deal') or '—'} · заход не поднят: {report.get('reason') or '—'}"
     code = report.get("exit_code")
-    return (
+    lines = [
         f"ЛИД · {report.get('deal') or '—'} · заход кончился: {report.get('reason') or '—'}"
         f"{'' if code is None else f' (код {code})'} · pid {report.get('pid') or '—'} · "
         f"сессия {report.get('session_id') or '—'} · токенов {report.get('usage_tokens') or 0}"
-    )
+    ]
+    if report.get("session_log"):
+        lines.append(f"  поток сессии: {report['session_log']}/stdout.log")
+    return "\n".join(lines)
 
 
 def render_reap_row(row: dict[str, Any]) -> str:

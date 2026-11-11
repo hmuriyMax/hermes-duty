@@ -2260,6 +2260,12 @@ function layoutCalls(calls, options) {
   const clampPct = opts.clamp && typeof opts.clamp === 'object' ? opts.clamp : null
   const clampLeftPx = clampPct && numOrNull(clampPct.leftPct) !== null ? (Math.max(0, Math.min(100, numOrNull(clampPct.leftPct))) / 100) * width : null
   const clampRightPx = clampPct && numOrNull(clampPct.rightPct) !== null ? (Math.max(0, Math.min(100, numOrNull(clampPct.rightPct))) / 100) * width : null
+  // Ширина самой полосы: у короткой попытки (минуты на восьмичасовой оси) она
+  // уже квадратика, и сдвигом внутрь такую полосу не закрыть — чип приходится
+  // ещё и подрезать по её ширине. Иначе «сдвиг на свою ширину» упирается в левый
+  // край и всё равно свисает справа (Макс, 11.11: «выходы за границу»).
+  const clampBandPx =
+    clampLeftPx !== null && clampRightPx !== null ? Math.max(1, clampRightPx - clampLeftPx) : null
   const list = Array.isArray(calls) ? calls : []
   if (!list.length || width <= 0 || span <= 0) {
     return { chips: [], levels: 0, height: top + levelH, clipped: 0 }
@@ -2278,19 +2284,21 @@ function layoutCalls(calls, options) {
   for (const call of list) {
     let px = Math.max(0, Math.min(width, pxOf(call.at)))
     const unfinished = call.ms === null || call.ms === undefined
-    const size = unfinished ? UNFINISHED_W : chipWidth(call.ms)
+    const rawSize = unfinished ? UNFINISHED_W : chipWidth(call.ms)
+    const size = clampBandPx === null ? rawSize : Math.min(rawSize, clampBandPx)
     if (clampRightPx !== null && px + size > clampRightPx) {
       px = Math.max(clampLeftPx !== null ? clampLeftPx : 0, clampRightPx - size)
     }
     if (clampLeftPx !== null && px < clampLeftPx) {
-      px = Math.min(clampLeftPx, clampRightPx !== null ? clampRightPx : width)
+      px = Math.min(clampLeftPx, (clampRightPx !== null ? clampRightPx : width) - size)
     }
     // Линейная ширина — та же карта оси: пиксели между началом и концом вызова.
     // Пол минимальной ширины у коротких вызовов не «0 мс», а предел точности.
     const linEnd = unfinished || call.ms === null
       ? px
       : Math.max(px, Math.min(clampRightPx !== null ? clampRightPx : width, pxOf(call.at + Math.max(0, Number(call.ms)) / 1000)))
-    const linSize = unfinished ? UNFINISHED_W : Math.max(2, Math.round(linEnd - px))
+    const rawLinSize = unfinished ? UNFINISHED_W : Math.max(2, Math.round(linEnd - px))
+    const linSize = clampBandPx === null ? rawLinSize : Math.min(rawLinSize, clampBandPx)
     let level = lastEnd.findIndex((end) => px - end >= gap)
     if (level < 0) {
       if (lastEnd.length >= maxLevels) {

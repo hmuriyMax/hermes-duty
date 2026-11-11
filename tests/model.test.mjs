@@ -2455,6 +2455,29 @@ test('раскладка вызовов: тело чипа не вылезает
   assert.ok(left.left >= (20 / 100) * 700 - 0.01, 'чип вылез за левый конец полосы')
 })
 
+test('раскладка вызовов: полоса уже чипа — чип подрезается по полосе, а не свисает', () => {
+  // Короткая попытка на восьмичасовой оси бывает уже квадратика (check: 0.4 %
+  // против чипа в 1.4 %). Сдвигом внутрь такую полосу не закрыть — если не
+  // подрезать ширину, чип упирается в левый край и всё равно свисает справа
+  // (Макс, 11.11: «выходы за границу» в свёрнутом и развёрнутом виде).
+  const calls = shapeCalls(
+    Array.from({ length: 8 }, (_, i) => ({ seq: i * 2 + 1, name: 'read_file', at: 5 + i * 0.05, ms: 4000 })),
+  )
+  const layout = layoutCalls(calls, {
+    from: 0,
+    to: 10,
+    width: 1000,
+    clamp: { leftPct: 50, rightPct: 50.4 },
+  })
+  const bandLeft = 500
+  const bandRight = 504
+  for (const chip of layout.chips) {
+    assert.ok(chip.left >= bandLeft - 0.01, 'чип вылез за левый край узкой полосы')
+    assert.ok(chip.left + chip.width <= bandRight + 0.01, 'чип свисает за правый край узкой полосы')
+    assert.ok((chip.widthLinPct / 100) * 1000 <= bandRight - bandLeft + 0.01, 'линейная ширина шире полосы')
+  }
+})
+
 test('раскладка вызовов: без оси рисовать нечего, а ширина — виртуальная', () => {
   const calls = shapeCalls([{ name: 'a', at: 1, ms: 5 }])
   assert.deepEqual(layoutCalls([], { from: 0, to: 10, width: 700 }).chips, [])

@@ -1304,6 +1304,43 @@ def plan_payload(spec: Any, events: Iterable[Any]) -> dict[str, Any]:
     return out
 
 
+def _attempt_failures(events: Optional[Iterable[Any]], stage_id: str, attempt: int) -> list[dict[str, Any]]:
+    """Отказы прошлых попыток этого этапа: `[{attempt, outcome, kind, reason}]`.
+
+    Берутся только те, что случились до текущей попытки: причина нужна брифу,
+    чтобы повтор не повторил ошибку (`contract` — «result.json нет», `budget`,
+    `infra`). Источник — журнал, а не память процесса: рантайм между попытками
+    может умереть и подняться заново.
+    """
+    found: list[dict[str, Any]] = []
+    for event in events or ():
+        if not isinstance(event, dict):
+            continue
+        payload = event.get("payload") or {}
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("stage") or "") != str(stage_id):
+            continue
+        if str(event.get("kind") or "") != "attempt_ended":
+            continue
+        number = payload.get("attempt")
+        if not isinstance(number, int) or number >= int(attempt):
+            continue
+        outcome = str(payload.get("outcome") or "")
+        if outcome == "done":
+            # Приговор или ответ — не отказ: брифу нечего чинить.
+            continue
+        found.append(
+            {
+                "attempt": number,
+                "outcome": outcome,
+                "kind": str(payload.get("kind") or ""),
+                "reason": str(payload.get("reason") or ""),
+            }
+        )
+    return found
+
+
 def build_contract(
     spec: Any,
     deal: Any,
@@ -1389,6 +1426,16 @@ def build_contract(
     body = str(deal.get("body") or "").strip()
     if body:
         goal = f"{goal}\n\n{body}" if goal else body
+    # Провал прошлой попытки — в контракт, а не только в журнал: повтор без
+    # причины повторяет и ошибку. Кейс d_f50a120f research#1: отчёт был написан
+    # текстом, но JSON не разобрался (unescaped quote), гейт честно отказал, а
+    # бриф второй попытки об этом молчал — роль не знала, что чинить.
+    failures = _attempt_failures(events, stage.id, attempt)
+    if failures:
+        boundaries.append(
+            "прошлые попытки этого этапа упали — причины в previous_failures: "
+            "чини причину, а не повторяй тот же отчёт"
+        )
     contract: dict[str, Any] = {
         "deal": str(deal["id"]),
         "stage": stage.id,
@@ -1403,6 +1450,8 @@ def build_contract(
         "report_schema": evidence_module.report_schema(stage),
         "questions": questions,
     }
+    if failures:
+        contract["previous_failures"] = failures
     if answer is not None:
         contract["answer_this_attempt"] = answer
     if approved is not None:

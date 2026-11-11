@@ -685,6 +685,63 @@ def test_plan_attempt_resumes_its_own_session(tmp_path: Path) -> None:
     assert "answer_this_attempt" not in contract
 
 
+def test_retry_brief_carries_the_previous_failure(tmp_path: Path) -> None:
+    """Повтор знает, чем упала прошлая попытка: причина — в контракте, не только в журнале.
+
+    Кейс d_f50a120f research#1: отчёт был написан текстом, но JSON в финальном
+    ответе не разобрался (unescaped quote), гейт отказал контрактом
+    «result.json нет», а бриф второй попытки об этом молчал — роль не знала,
+    что чинить, и повторила бы тот же битый отчёт.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = none_spec(tmp_path)
+    seed(
+        conn,
+        deal,
+        "attempt_started",
+        {"stage": "impl", "attempt": 1, "run_id": "impl#1", "pid": 1},
+        key="test:impl1:started",
+    )
+    seed(
+        conn,
+        deal,
+        "attempt_ended",
+        {
+            "stage": "impl",
+            "attempt": 1,
+            "outcome": "failed",
+            "kind": "contract",
+            "reason": "result.json нет",
+        },
+        key="test:impl1:ended",
+    )
+    fake = Fake(result={"status": "done", "summary": "готово", "commit": "abc123"})
+    runner.run_stage(conn, spec, deal, "impl", 2, home=home, spawn=fake, clock=lambda: NOW)
+
+    command = fake.calls[0]["cmd"]
+    contract = json.loads(Path(command[command.index("--query-file") + 1]).read_text(encoding="utf-8"))
+    assert contract["previous_failures"] == [
+        {"attempt": 1, "outcome": "failed", "kind": "contract", "reason": "result.json нет"}
+    ]
+    assert any("previous_failures" in line for line in contract["boundaries"])
+
+
+def test_first_attempt_brief_has_no_failures(tmp_path: Path) -> None:
+    """Первый заход не рассказывает об отказах, которых не было."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = none_spec(tmp_path)
+    fake = Fake(result={"status": "done", "summary": "готово", "commit": "abc123"})
+    runner.run_stage(conn, spec, deal, "impl", 1, home=home, spawn=fake, clock=lambda: NOW)
+
+    command = fake.calls[0]["cmd"]
+    contract = json.loads(Path(command[command.index("--query-file") + 1]).read_text(encoding="utf-8"))
+    assert "previous_failures" not in contract
+
+
 def test_other_stages_do_not_resume_without_an_answer(tmp_path: Path) -> None:
     """Резюм без ответа — привилегия координатора (план и close), не всех этапов."""
     home = make_home(tmp_path)

@@ -2725,7 +2725,12 @@ def deals_unblock(
             conn,
             home,
             deals.set_unblocked(
-                conn, deal_id, author=str(payload.get("author") or "max"), source=source
+                conn,
+                deal_id,
+                author=str(payload.get("author") or "max"),
+                source=source,
+                reason=str(payload.get("reason") or ""),
+                answer_of=lambda question_id: ask.answer_of(home, question_id),
             ),
         )
     finally:
@@ -2840,6 +2845,7 @@ def deals_decide(
                 reason=reason,
                 author=str(payload.get("author") or "max"),
                 source=source,
+                answer_of=lambda question_id: ask.answer_of(home, question_id),
             ),
         )
     finally:

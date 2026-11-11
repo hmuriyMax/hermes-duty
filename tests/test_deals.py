@@ -502,6 +502,62 @@ def test_second_park_and_decide_cycle_is_not_swallowed_by_the_first(
     assert kinds(home, deal["id"]) == ["created", "blocked", "unblocked", "blocked", "unblocked"]
 
 
+def test_decide_continue_records_the_pool_answer_as_a_fact(home: Path, client: TestClient) -> None:
+    """`decide continue` пишет ответ пула в журнал — иначе парковка не снимается.
+
+    Красная проба (d_2185bd17): человек ответил на вопрос пула, `decide
+    continue` дописал только `unblocked`, а парковку по вопросу снимает
+    `question_answered` — дело осталось `blocked`, и со стороны это выглядело
+    как «ответ не подхватился». Текст ответа читается из пула, потому что в
+    журнале живёт только его длина.
+    """
+    deal_id, question_id = own_deal_with_question(client)
+    park_on_question(home, deal_id, question_id)
+    assert deal_rows(home)[0]["status"] == "blocked"
+    answer = "импортируй контракты по ветке и потом регени"
+    close_pool_question(home, question_id, answer=answer)
+
+    mutate(client, "POST", f"/deals/{deal_id}/decide", json={"decision": "continue"})
+
+    # Порядок внутри одной пачки задаёт `KIND_ORDER`: факты вопроса идут после
+    # `blocked`/`unblocked`, поэтому проверяем состав пачки, а не соседство.
+    assert {"question_answered", "unblocked"} <= set(kinds(home, deal_id)[-3:])
+    fact = next(event for event in events(home, deal_id) if event["kind"] == "question_answered")
+    assert fact["payload"]["question_id"] == question_id
+    assert fact["payload"]["answer_len"] == len(answer)
+    assert fact["payload"]["answered_via"] == "manual"
+    assert deal_rows(home)[0]["status"] == "ready"
+
+
+def test_decide_continue_without_a_pool_answer_takes_the_human_words(
+    home: Path, client: TestClient
+) -> None:
+    """Тишина — не решение: без ответа в пуле нужны слова человека.
+
+    Парковка снимается только ответом, поэтому «продолжить» без ответа и без
+    слов — отказ входа, а не снятие «на всякий случай». Слова решения
+    (`--reason`) годятся: человек сказал их здесь и сейчас.
+    """
+    deal_id, question_id = own_deal_with_question(client)
+    park_on_question(home, deal_id, question_id)
+
+    silent = client.post(f"/deals/{deal_id}/decide", json={"decision": "continue"})
+    assert silent.status_code == 400
+    assert "ответа нет" in silent.json()["errors"][0]["reason"]
+    assert kinds(home, deal_id)[-1] == "blocked", "отказ не пишет фактов"
+
+    mutate(
+        client,
+        "POST",
+        f"/deals/{deal_id}/decide",
+        json={"decision": "continue", "reason": "по ветке release/RP-14279"},
+    )
+    assert {"question_answered", "unblocked"} <= set(kinds(home, deal_id)[-3:])
+    answered = next(event for event in events(home, deal_id) if event["kind"] == "question_answered")
+    assert answered["payload"]["answer_len"] == len("по ветке release/RP-14279")
+    assert deal_rows(home)[0]["status"] == "ready"
+
+
 def test_archived_deal_is_not_reopened_by_commands(home: Path, client: TestClient) -> None:
     """`archived` — конечное состояние: команды жизни его не воскрешают."""
     deal = create(client)
@@ -908,6 +964,27 @@ def close_pool_question(home: Path, question_id: int, *, answer: str | None) -> 
                 (answer, question_id),
             )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def park_on_question(home: Path, deal_id: str, question_id: int, *, stage: str = "implement") -> None:
+    """Запарковать дело вопросом пула — так, как это делает движок.
+
+    Парковка отличается от обычного блока: `block_kind='parked'` и `question_id`
+    в факте. Снимает её только `question_answered`, поэтому тест обязан завести
+    именно эту форму, а не `needs_input`.
+    """
+    conn = journal.open_journal(home)
+    assert conn is not None
+    try:
+        deals.set_blocked(
+            conn,
+            deal_id,
+            kind="parked",
+            reason="нужен человек",
+            details={"question_id": question_id, "stage": stage},
+        )
     finally:
         conn.close()
 

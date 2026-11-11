@@ -45,7 +45,7 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 # `dashboard/journal.py` рядом: плагин грузит модули по пути, пакета нет, поэтому
 # журнал берём из `sys.modules` под тем же именем, что и остальной код, — второй
@@ -1089,12 +1089,56 @@ def set_blocked(
     return _apply(conn, deal, [event], "blocked", now)
 
 
+def _parked_answer_fact(
+    conn: sqlite3.Connection,
+    deal: dict[str, Any],
+    *,
+    reason: str,
+    source: str,
+    now: int,
+    answer_of: Optional[Callable[[Any], Optional[str]]] = None,
+) -> Optional[dict[str, Any]]:
+    """Факт ответа на вопрос открытой парковки — если его ещё нет в журнале.
+
+    Парковку по вопросу снимает только `question_answered`: ответ человека живёт
+    в пуле, а не в журнале, и «снять блок» без этого факта оставлял дело
+    запаркованным — со стороны это выглядело как «ответ не подхватился»
+    (живой случай d_2185bd17: ответ получен, дело стоит).
+
+    Текст берётся из пула; слова решения (`--reason`) годятся, только когда пула
+    нет или ответ в нём не читается. Ни пула, ни слов — отказ входа: тишина не
+    решение, и снимать парковку «на всякий случай» нельзя.
+    """
+    events = journal.read_events(conn, str(deal["id"]))
+    parked = journal.parked_of(events) or {}
+    question_id = parked.get("question_id")
+    if question_id is None or bool(parked.get("answered")):
+        return None
+    pool_text = answer_of(question_id) if answer_of is not None else None
+    text = " ".join(str(pool_text or "").split()) or " ".join(str(reason or "").split())
+    if not text:
+        raise DealError(
+            f"дело {deal['id']} запарковано вопросом #{question_id}, а ответа нет: "
+            "ответь на вопрос в пуле или передай слова решения (--reason)"
+        )
+    payload = {
+        "question_id": question_id,
+        "answer_len": len(text),
+        "answered_via": "manual",
+        "answer": text,
+    }
+    args = {"question_id": question_id, "stage": str(parked.get("stage") or ""), "via": "manual"}
+    return _event(deal, "question_answered", payload, source, args, now)
+
+
 def set_unblocked(
     conn: sqlite3.Connection,
     deal_id: str,
     *,
     author: str = "max",
     source: str = "cli",
+    reason: str = "",
+    answer_of: Optional[Callable[[Any], Optional[str]]] = None,
     now: Optional[int] = None,
 ) -> dict[str, Any]:
     """Снять блокировку: событие `unblocked` и возврат дела в очередь.
@@ -1139,7 +1183,11 @@ def set_unblocked(
             f"unblock: дело {deal['id']} не в blocked (status={deal['status']}) — снимать нечего"
         )
     target = "ready" if gate_open(conn, str(deal["id"])) else "todo"
-    return _apply(conn, deal, [event], target, now)
+    answer = _parked_answer_fact(
+        conn, deal, reason=reason, source=source, now=now, answer_of=answer_of
+    )
+    facts = [answer, event] if answer is not None else [event]
+    return _apply(conn, deal, facts, target, now)
 
 
 def claim_deal(
@@ -1496,6 +1544,7 @@ def decide_deal(
     reason: str = "",
     author: str = "max",
     source: str = "cli",
+    answer_of: Optional[Callable[[Any], Optional[str]]] = None,
     now: Optional[int] = None,
 ) -> dict[str, Any]:
     """Одно решение человека по делу, которое его ждёт: `continue` или `stop`.
@@ -1553,7 +1602,15 @@ def decide_deal(
             expired_leases_at=now,
         )
     if choice == DECISION_CONTINUE:
-        return set_unblocked(conn, deal_id, author=author, source=source, now=now)
+        return set_unblocked(
+            conn,
+            deal_id,
+            author=author,
+            source=source,
+            reason=reason,
+            answer_of=answer_of,
+            now=now,
+        )
     return close_deal(
         conn, str(deal["id"]), reason=reason, cause=CLOSE_CAUSE_STOP, source=source, now=now
     )

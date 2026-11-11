@@ -1,16 +1,70 @@
 """Hermes Duty — агентная половина плагина.
 
-P0 намеренно ничего не регистрирует: консоль наблюдаемости живёт целиком в
-dashboard-половине (`dashboard/plugin_api.py`) и работает только на чтение.
+С 0.2.0 плагин отдаёт инструменты лиду (`docs/ENGINE-2.0.md`, раздел 4): тулсет
+`duty` — `duty_plan`, `duty_start`, `duty_wait`, `duty_close`. Шедулером дела
+становится лид, поэтому инструменты живут здесь, а обработчики — в
+`dashboard/tools.py`: они работают с журналом дел и спекой, а не с карточками
+kanban.
 
-Здесь появятся инструменты и хуки, когда движок начнёт исполнять дела:
-`duty_run` (поднять дело), `duty_status` (свернуть журнал), хуки
-`on_duty_attempt_*` — они пишут в собственный журнал плагина, а не в kanban.
+Профилю `lead` тулсет включается ключом `duty` в `platform_toolsets`: у роли
+whitelist, и без этого ключа инструменты не поднимутся.
 """
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
+from typing import Any
 
 __version__ = "0.2.0"
 
+# Пакета у `dashboard/` нет (плагин грузит модули по пути), поэтому обработчики
+# берём тем же способом и под стабильным именем: второй загрузки в процессе не
+# будет.
+TOOLS_MODULE_NAME = "hermes_duty_tools"
 
-def register(ctx):  # noqa: ARG001 - контракт плагина Hermes
-    """Точка входа. Пока пустая: P0 не добавляет инструментов и хуков."""
-    return None
+# Инструменты тулсета: имя, схема, обработчик, значок. Порядок — порядок турна
+# лида (`docs/ENGINE-2.0.md`, раздел 5): план, этап, ожидание, закрытие.
+_TOOLS = (
+    ("duty_plan", "PLAN_SCHEMA", "handle_plan", "🗺"),
+    ("duty_start", "START_SCHEMA", "handle_start", "▶"),
+    ("duty_wait", "WAIT_SCHEMA", "handle_wait", "⏳"),
+    ("duty_close", "CLOSE_SCHEMA", "handle_close", "🏁"),
+)
+
+
+def tools_module() -> Any:
+    """`dashboard/tools.py` — модуль обработчиков, один на процесс."""
+    loaded = sys.modules.get(TOOLS_MODULE_NAME)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / "dashboard" / "tools.py"
+    spec = importlib.util.spec_from_file_location(TOOLS_MODULE_NAME, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise ImportError(f"tools module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[TOOLS_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def register(ctx) -> None:
+    """Точка входа плагина: четыре инструмента лида в тулсете `duty`.
+
+    `ctx.register_tool` — единственный путь: список `provides_tools` в
+    `plugin.yaml` объявляет ровно то, что регистрируется здесь, и `hermes plugins
+    validate` сверяет одно с другим.
+    """
+    module = tools_module()
+    for name, schema, handler, emoji in _TOOLS:
+        ctx.register_tool(
+            name=name,
+            toolset=module.TOOLSET,
+            schema=getattr(module, schema),
+            handler=getattr(module, handler),
+            emoji=emoji,
+        )
+
+
+__all__ = ["register", "tools_module"]

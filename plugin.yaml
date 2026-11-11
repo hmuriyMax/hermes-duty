@@ -3,13 +3,13 @@ version: "0.2.0"
 manifest_version: 2
 description: >-
   Hermes Duty — «дело» вместо карточки: этапы, попытки, доказательства и вопросы.
-  P0 — read-only наблюдаемость: лизинги и события из живых источников, экран
-  «кто держит задачу и что делает прямо сейчас». Не трогает ядро kanban и не
-  пишет в существующие БД.
+  С 0.2.0 отдаёт лиду тулсет `duty` (план, запуск этапа, ожидание фактов,
+  закрытие): шедулером дела становится лид, а движок остаётся исполнителем.
+  Экраны по-прежнему только читают источники и не пишут в чужие БД.
 author: "mshchemilkin"
 kind: standalone
 license: MIT
 tags: [orchestration, observability, desktop, duty]
-provides_tools: []
+provides_tools: [duty_plan, duty_start, duty_wait, duty_close]
 provides_hooks: []
 requires_env: []

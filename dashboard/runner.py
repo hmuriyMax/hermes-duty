@@ -2373,6 +2373,7 @@ def start_shell_stage(
     attempt: int,
     *,
     home: Path,
+    idem: str = "",
     spawn: Optional[Callable[..., Any]] = None,
     clock: Optional[Callable[[], float]] = None,
     monotonic: Optional[Callable[[], float]] = None,
@@ -2490,24 +2491,30 @@ def start_shell_stage(
         raise RunnerError(f"запуск команды этапа не удался: {exc}") from exc
 
     pid = int(process.pid)
+    # Ключ вызова лида — тем же правилом, что у попытки агента (см. `start_stage`).
+    started_args: dict[str, Any] = {"stage": stage_id, "attempt": attempt}
+    started_payload: dict[str, Any] = {
+        "run_id": run_id,
+        "stage": stage_id,
+        "attempt": attempt,
+        "pid": pid,
+        "cmd": command,
+        "shell_cmd": stage.cmd,
+        "stage_kind": STAGE_KIND_SHELL,
+        "cwd": str(cwd),
+        "workdir": str(workdir),
+        "tree": str(tree) if tree is not None else None,
+        "base": actual_base,
+        "lease_expires": now + ttl,
+    }
+    if idem:
+        started_args["idem"] = idem
+        started_payload["idem"] = idem
     started = _event(
         deal,
         "attempt_started",
-        {
-            "run_id": run_id,
-            "stage": stage_id,
-            "attempt": attempt,
-            "pid": pid,
-            "cmd": command,
-            "shell_cmd": stage.cmd,
-            "stage_kind": STAGE_KIND_SHELL,
-            "cwd": str(cwd),
-            "workdir": str(workdir),
-            "tree": str(tree) if tree is not None else None,
-            "base": actual_base,
-            "lease_expires": now + ttl,
-        },
-        {"stage": stage_id, "attempt": attempt},
+        started_payload,
+        started_args,
         now,
         SHELL_SOURCE,
     )
@@ -3741,6 +3748,7 @@ def start_stage(
     *,
     home: Path,
     answer: Optional[str] = None,
+    idem: str = "",
     spawn: Optional[Callable[..., Any]] = None,
     clock: Optional[Callable[[], float]] = None,
     monotonic: Optional[Callable[[], float]] = None,
@@ -3755,6 +3763,10 @@ def start_stage(
 
     `answer` — ответ человека на вопрос прошлой попытки: с ним процесс
     продолжается резюмом (`RESUME-OK`), без него начинается новая сессия.
+
+    `idem` — ключ вызова лида (`duty_start`, 2.0): повтор инструмента находит по
+    нему эту же попытку в журнале и второго процесса не поднимает. У движка ключа
+    нет, поле не пишется, и ключи прежних фактов не меняются.
     """
     spawner = spawn or spawn_process
     clock = clock or time.time
@@ -3774,7 +3786,7 @@ def start_stage(
         # `finish_shell_stage`), чтобы ветка агента осталась ровно той же, что была
         # до 0.0.5.
         return start_shell_stage(
-            conn, spec, deal, stage_id, attempt, home=home, spawn=spawn, clock=clock, monotonic=monotonic
+            conn, spec, deal, stage_id, attempt, home=home, idem=idem, spawn=spawn, clock=clock, monotonic=monotonic
         )
     if getattr(stage, "kind", STAGE_KIND_AGENT) == STAGE_KIND_GATE:
         # Гейт — тоже отдельная ветка: ни процесса, ни дерева, ни лизинга у него
@@ -3967,29 +3979,31 @@ def start_stage(
         raise RunnerError(f"спавн попытки не удался: {exc}") from exc
 
     pid = int(process.pid)
-    started = _event(
-        deal,
-        "attempt_started",
-        {
-            "run_id": run_id,
-            "stage": stage_id,
-            "attempt": attempt,
-            "pid": pid,
-            "cmd": command,
-            "cwd": str(cwd),
-            "workdir": str(workdir),
-            "tree": str(tree) if tree is not None else None,
-            # Фактическая база дерева (rev): от чего этап работал. Без неё разбор
-            # «второй этап не увидел работу первого» снова требовал бы чтения кода.
-            "base": actual_base,
-            "lease_expires": now + ttl,
-            "contract_path": str(contract_file),
-            "contract": contract,
-            "session_id": session_id or None,
-        },
-        {"stage": stage_id, "attempt": attempt},
-        now,
-    )
+    # Ключ вызова лида едет в факт и в ключ события: повтор `duty_start` находит
+    # эту попытку по нему, а не поднимает вторую. У движка ключа нет, и его факты
+    # остаются с прежним ключом.
+    started_args: dict[str, Any] = {"stage": stage_id, "attempt": attempt}
+    started_payload: dict[str, Any] = {
+        "run_id": run_id,
+        "stage": stage_id,
+        "attempt": attempt,
+        "pid": pid,
+        "cmd": command,
+        "cwd": str(cwd),
+        "workdir": str(workdir),
+        "tree": str(tree) if tree is not None else None,
+        # Фактическая база дерева (rev): от чего этап работал. Без неё разбор
+        # «второй этап не увидел работу первого» снова требовал бы чтения кода.
+        "base": actual_base,
+        "lease_expires": now + ttl,
+        "contract_path": str(contract_file),
+        "contract": contract,
+        "session_id": session_id or None,
+    }
+    if idem:
+        started_args["idem"] = idem
+        started_payload["idem"] = idem
+    started = _event(deal, "attempt_started", started_payload, started_args, now)
     try:
         # Одна транзакция: лизинг переезжает к процессу, дело становится
         # `running`, событие ложится рядом. Сбой записи откатывает всё — тогда
@@ -4353,6 +4367,7 @@ def run_stage(
     *,
     home: Path,
     answer: Optional[str] = None,
+    idem: str = "",
     spawn: Optional[Callable[..., Any]] = None,
     clock: Optional[Callable[[], float]] = None,
     monotonic: Optional[Callable[[], float]] = None,
@@ -4365,9 +4380,11 @@ def run_stage(
 
     `answer` — ответ человека на вопрос прошлой попытки: с ним процесс
     продолжается резюмом (`RESUME-OK`), без него начинается новая сессия.
+    `idem` — ключ вызова лида: он едет в `attempt_started`, и повтор инструмента
+    находит по нему эту же попытку (см. `start_stage`).
     """
     launched = start_stage(
-        conn, spec, deal, stage_id, attempt, home=home, answer=answer, spawn=spawn, clock=clock, monotonic=monotonic
+        conn, spec, deal, stage_id, attempt, home=home, answer=answer, idem=idem, spawn=spawn, clock=clock, monotonic=monotonic
     )
     if launched["live"] is None:
         return launched["result"]

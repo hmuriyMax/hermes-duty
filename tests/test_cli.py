@@ -1706,3 +1706,26 @@ def test_deals_bad_status_is_a_source_error(home, frozen_now, capsys):
     assert code == cli.EXIT_SOURCE
     assert out == ""
     assert "/now" in err
+
+
+def test_lead_tick_of_a_blocked_deal_says_it_is_not_for_the_lead(home, deal, capsys):
+    """`duty lead <id>` по делу, которое ждёт человека: «не для лида», без спавна.
+
+    Терминал ничего не решает сам: ответ приходит из `dashboard/lead.py`
+    (`docs/ENGINE-2.0.md`, раздел 10), и тест держит стык «подкоманда → модуль →
+    форма ответа». Дело фикстуры запарковано, поэтому настоящий заход лида не
+    поднимается: `skipped` — единственный ответ, который здесь законен.
+    """
+    code, out, _ = run(["lead", deal, "--json"], capsys)
+
+    assert code == cli.EXIT_OK
+    payload = json.loads(out)
+    assert payload["deal"] == deal
+    assert payload["action"] == "skipped"
+    assert "человека" in payload["reason"]
+
+    code, out, _ = run(["lead", deal], capsys)
+
+    assert code == cli.EXIT_OK
+    assert "не для лида" in out
+

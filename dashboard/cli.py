@@ -131,6 +131,9 @@ RELEASE_MODULE_NAME = "hermes_duty_release"
 # собираются там, а CLI только печатает ответ роута — второй проекции журнала нет.
 LEADFEED_MODULE_NAME = "hermes_duty_leadfeed"
 
+# Супервизор лида: `lead` зовёт его тик, а не собирает «жив ли лид» в терминале.
+LEAD_MODULE_NAME = "hermes_duty_lead"
+
 
 def _load_demo() -> Any:
     """Загрузить `dashboard/demo.py` — прогон задачи по спеке (не роут)."""
@@ -279,6 +282,22 @@ def _load_leadfeed() -> Any:
         raise SourceFailure(f"leadfeed module not found: {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[LEADFEED_MODULE_NAME] = module
+
+def _load_lead() -> Any:
+    """Загрузить `dashboard/lead.py` — супервизор лида (`docs/ENGINE-2.0.md`, разделы 2 и 10).
+
+    `lead` не решает у себя, жив ли лид: лизинг, курсор сессии и счётчик резюмов
+    живут в супервизоре, а терминал только показывает его ответ.
+    """
+    loaded = sys.modules.get(LEAD_MODULE_NAME)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / "lead.py"
+    spec = importlib.util.spec_from_file_location(LEAD_MODULE_NAME, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise SourceFailure(f"lead module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[LEAD_MODULE_NAME] = module
     spec.loader.exec_module(module)
     return module
 
@@ -515,6 +534,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="показать, что было бы закрыто, ничего не записывая",
+    )
+
+    # Супервизор лида (`docs/ENGINE-2.0.md`, разделы 2 и 10): тик сторожа по
+    # одному делу. Диспетчер зовёт эту же команду раз в минуту — второго пути
+    # «поднять лида» нет. `--wait` держит заход в терминале: так его видно
+    # руками, а диспетчер поднимает его отсоединённым.
+    lead = command(
+        "lead",
+        "супервизор лида дела: жив → ничего, умер → резюм с дайджестом, резюмы исчерпаны → парковка",
+    )
+    lead.add_argument("deal_id", help="id своего дела (d_<hex>)")
+    lead.add_argument(
+        "--run-budget",
+        type=int,
+        help="секунд на один заход сессии (по умолчанию 1800 — DEFAULT_RUN_BUDGET_SEC)",
+    )
+    lead.add_argument(
+        "--max-resumes",
+        type=int,
+        help="сколько раз поднимать упавшего лида (по умолчанию charter.max_lead_resumes, иначе 6)",
+    )
+    lead.add_argument(
+        "--wait",
+        action="store_true",
+        help="держать заход в этом процессе и показать его итог (по умолчанию — отсоединённый)",
     )
 
     # Мутации своего дела (`docs/OWNERSHIP.md`): те же функции, что у роутов
@@ -2108,6 +2152,76 @@ def render_run_step(row: dict[str, Any]) -> str:
     return f"{stage} · попытка {attempt} · {detail}"
 
 
+def render_lead(report: dict[str, Any]) -> str:
+    """Ответ `bin/duty lead <id>`: что сторож решил по делу и на чём это стоит.
+
+    Четыре ответа и три разных смысла: `alive` — лид уже идёт (поднимать нечего),
+    `started` — поднят заход (бриф или резюм; pid и режим названы), `parked` —
+    резюмы исчерпаны и дело спрашивает человека, `skipped` — дело не для лида
+    (закрыто, ждёт человека, ждёт родителей). Строкой «лид: …» печатается
+    состояние, на котором решение принято: сессия, резюмы, cursor.
+    """
+    lead = report.get("lead") or {}
+    action = str(report.get("action") or "")
+    deal = str(report.get("deal") or "—")
+    lines = [f"ЛИД · {deal} · {action or '—'}"]
+    if action == "alive":
+        lines.append(
+            f"  лид жив: сессия {lead.get('session_id') or '—'}, pid {lead.get('pid') or '—'}, "
+            f"резюмов {lead.get('resumes') or 0} из {report.get('limit') or '—'} — поднимать нечего"
+        )
+    elif action in ("started", "would_start"):
+        mode = "резюм" if report.get("mode") == lead_modes().get("resume") else "первый заход"
+        lines.append(
+            f"  лид поднят ({mode}): процесс захода pid {report.get('pid') or '—'}, "
+            f"сессия {report.get('session_id') or 'новая'}, резюмов {lead.get('resumes') or 0} "
+            f"из {report.get('limit') or '—'}"
+        )
+        if report.get("recovered_exit"):
+            lines.append("  за прошлым заходом дописан недостающий lead_exited (process_gone)")
+        if report.get("query_path"):
+            lines.append(f"  вход сессии: {report.get('query_path')}")
+    elif action == "parked":
+        question = report.get("question") or {}
+        lines.append(
+            f"  резюмы исчерпаны: {question.get('resumes') or lead.get('resumes') or 0} "
+            f"из {report.get('limit') or '—'} — дело запарковано"
+            + (f", вопрос #{question.get('question_id')}" if question.get("question_id") else "")
+        )
+        if question.get("reason"):
+            lines.append(f"  последний выход лида: {question.get('reason')}")
+    elif action == "skipped":
+        lines.append(f"  не для лида: {report.get('reason') or '—'}")
+    last_exit = lead.get("last_exit") or {}
+    if last_exit:
+        lines.append(
+            f"  прошлый заход: {last_exit.get('reason') or '—'} "
+            f"(код {last_exit.get('exit_code')}, id {last_exit.get('ts') or '—'})"
+        )
+    lines.append(
+        f"  журнал лида: подъёмов {lead.get('starts') or 0}, курсор сессии {lead.get('session_cursor') or 0}"
+    )
+    return "\n".join(lines)
+
+
+def lead_modes() -> dict[str, str]:
+    """Режимы захода лида из модуля супервизора: имена не дублируются в CLI."""
+    module = _load_lead()
+    return {"first": module.MODE_FIRST, "resume": module.MODE_RESUME}
+
+
+def render_lead_run(report: dict[str, Any]) -> str:
+    """Итог `--wait`: чем кончился заход (режим, pid, код выхода, сессия)."""
+    if not report.get("started"):
+        return f"ЛИД · {report.get('deal') or '—'} · заход не поднят: {report.get('reason') or '—'}"
+    code = report.get("exit_code")
+    return (
+        f"ЛИД · {report.get('deal') or '—'} · заход кончился: {report.get('reason') or '—'}"
+        f"{'' if code is None else f' (код {code})'} · pid {report.get('pid') or '—'} · "
+        f"сессия {report.get('session_id') or '—'} · токенов {report.get('usage_tokens') or 0}"
+    )
+
+
 def render_reap_row(row: dict[str, Any]) -> str:
     """Строка уборки: что именно закрыл движок — и что это был он, а не исполнитель.
 
@@ -2419,6 +2533,31 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "release_errors": released.get("errors") or [],
                 }
             _emit_json(report, out) if args.json else print(render_reap(report), file=out)
+            return EXIT_OK
+        if args.command == "lead":
+            # Супервизор лида (`docs/ENGINE-2.0.md`, разделы 2 и 10): решение «жив /
+            # резюм / парковка» принимает модуль, терминал показывает его ответ.
+            # `--wait` держит заход здесь же — для ручной проверки и отладки.
+            module = _load_lead()
+            home = api().hermes_home()
+            try:
+                if args.wait:
+                    report = module.run(
+                        home,
+                        args.deal_id,
+                        run_budget=args.run_budget,
+                    )
+                    _emit_json(report, out) if args.json else print(render_lead_run(report), file=out)
+                    return EXIT_OK if report.get("started") else EXIT_SOURCE
+                report = module.supervise(
+                    home,
+                    args.deal_id,
+                    run_budget=args.run_budget,
+                    max_resumes_override=args.max_resumes,
+                )
+            except module.LeadError as exc:
+                raise SourceFailure(str(exc)) from exc
+            _emit_json(report, out) if args.json else print(render_lead(report), file=out)
             return EXIT_OK
         if args.command == "demo":
             report = _load_demo().run_demo(

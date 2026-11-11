@@ -361,8 +361,8 @@ def witness(stage: Any) -> str:
     ):
         return WITNESS_PLAN
     if str(getattr(stage, "role", "") or "") in spec_module.EVIDENCE_FREE_ROLES:
-        # Роль без терминала: команд не запускает, дерево не меняет — её работа
-        # это отчёт, и свидетель у неё один и тот же (`WITNESS_REPORT`).
+        # Роль без терминала или пишущая документ, а не код: дерево она не меняет,
+        # её работа — отчёт, и свидетель у неё один и тот же (`WITNESS_REPORT`).
         return WITNESS_REPORT
     return WITNESS_WORK
 

@@ -2007,6 +2007,21 @@ def test_parse_plan_researcher_needs_no_evidence():
     assert "plan.evidence" in {issue.rule for issue in found_impl}
 
 
+def test_parse_plan_documenter_needs_no_evidence():
+    """Документер пишет документ, а не код — от него тоже нельзя требовать evidence.
+
+    `docs/ENGINE-1.0.md` §9 ставит `docs (documenter)` последним рабочим этапом
+    («что изменилось и как это проверять»): его результат — заметка тикета и
+    отчёт, дерева репозитория он не меняет. Требование `evidence {cmd, must}` от
+    плана означало бы, что такой этап невозможно добавить туда, где он и нужен —
+    в конец дела.
+    """
+    _, found = plan([{"id": "docs", "role": "documenter", "workspace": "none"}])
+    assert "plan.evidence" not in {issue.rule for issue in found}
+    _, found_impl = plan([{"id": "impl", "role": "implementer", "workspace": "worktree"}])
+    assert "plan.evidence" in {issue.rule for issue in found_impl}
+
+
 def test_parse_plan_reviewer_and_gate_need_no_evidence():
     """Ревьюер предъявляет приговор, гейт — ответ человека: evidence им не нужен."""
     _, found = plan([

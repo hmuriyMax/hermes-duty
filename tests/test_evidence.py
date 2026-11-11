@@ -275,6 +275,51 @@ def test_researcher_witness_is_the_report(tmp_path: Path) -> None:
     assert empty.errors[0].where == "result.json:report"
 
 
+def test_documenter_witness_is_the_report(tmp_path: Path) -> None:
+    """Документер доказывает себя отчётом: коммита в дереве у него не бывает.
+
+    Дело доказывается документом, а документ лежит вне дерева попытки (заметка
+    тикета). Требовать `commit|artifacts` от `docs`-этапа — значит требовать
+    коммит документа в репозиторий, которого никто не просил (`ENGINE-1.0.md`
+    §9: «docs (documenter) → что изменилось и как это проверять»).
+    """
+    stage = make_stage(role="documenter")
+    assert evidence.witness(stage) == evidence.WITNESS_REPORT
+    assert "commit|artifacts" not in evidence.report_schema(stage)["required_for_done"]
+
+    ok = verify({"status": "done", "evidence": [], "summary": "записал итог v35 в заметку RP-14080"}, stage, tmp_path)
+    assert ok.ok is True, [str(issue) for issue in ok.errors]
+
+    silent = verify({"status": "done", "evidence": [], "summary": " "}, stage, tmp_path)
+    assert silent.ok is False
+
+
+def test_documenter_evidence_command_still_runs(tmp_path: Path) -> None:
+    """Команда-доказательство по документу проверяется, даже если роль без дерева.
+
+    Документер пишет заметку; «задокументировал» без проверки — это слово, а не
+    факт. Спека вправе попросить `test -s`/`grep -q` по самому документу; гейт
+    сверяет заявленный код возврата с `must` (`verify` команд не перезапускает —
+    их запускает попытка и записывает `exit`).
+    """
+    note = tmp_path / "index.md"
+    note.write_text("## Итог валидации v35\n", encoding="utf-8")
+    cmd = f"grep -q 'v35' {note}"
+    stage = make_stage(role="documenter", evidence_items=((cmd, 0),))
+
+    ok = verify({"status": "done", "summary": "записал",
+                 "evidence": [{"cmd": cmd, "exit": 0, "started_at": STARTED + 5}]}, stage, tmp_path)
+    assert ok.ok is True, [str(issue) for issue in ok.errors]
+
+    failed = verify({"status": "done", "summary": "записал",
+                     "evidence": [{"cmd": cmd, "exit": 1, "started_at": STARTED + 5}]}, stage, tmp_path)
+    assert failed.ok is False
+
+    # Молчание про команду — тоже отказ: доказательство объявлено, а не предъявлено.
+    missing = verify({"status": "done", "summary": "записал", "evidence": []}, stage, tmp_path)
+    assert missing.ok is False
+
+
 def test_done_without_summary_is_refused(tmp_path: Path) -> None:
     """`done` без `summary`: итог не назван, проверять нечего."""
     built = report(tmp_path, summary="   ")

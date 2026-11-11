@@ -2247,7 +2247,7 @@ function layoutCalls(calls, options) {
   // Позиция вызова — та же карта оси, что у полос и маркеров (`pctOf` из
   // `shapeDealTime`): сжатие простоя меняет масштаб, и вторая линейная формула
   // развела бы чип и маркер одного и того же мгновения. Ширины чипов и уровни
-  // остаются в виртуальных пикселях — их задаёт логарифм длительности.
+  // остаются в виртуальных пикселях — их задаёт длина вызова на этой карте.
   const toPct = typeof opts.toPct === 'function' ? opts.toPct : null
   const pxOf = (at) => {
     const pct = toPct ? Math.max(0, Math.min(100, Number(toPct(at)) || 0)) : ((at - from) / span) * 100
@@ -2270,10 +2270,12 @@ function layoutCalls(calls, options) {
   if (!list.length || width <= 0 || span <= 0) {
     return { chips: [], levels: 0, height: top + levelH, clipped: 0 }
   }
-  const chipWidth = (ms) => {
-    const value = Math.max(0, Number(ms) || 0)
-    return Math.round(3 + (11 * Math.log10(1 + value / 100)) / Math.log10(1 + 12000 / 100))
-  }
+  // Ширина чипа — честная длительность вызова на карте оси, с полом 2 px:
+  // «мгновенный» вызов всё равно должен быть виден, но не притворяться долгим
+  // (Макс, 11.11: «почему просто не рисовать четную ширину по длине тулкола»).
+  // Пол — предел точности, а не выдуманная длина: подавляющее большинство
+  // вызовов агента короче секунды и при 1 px = 29 с иначе были бы субпикселем.
+  const LIN_FLOOR = 2
   // `ms: null` — вызов без результата. Рисовать его минимальной шириной значило
   // бы утверждать «0 мс»: длительности нет, а не она нулевая. Отдельная ширина и
   // флаг `unfinished` дают поверхности возможность показать это иначе.
@@ -2284,7 +2286,11 @@ function layoutCalls(calls, options) {
   for (const call of list) {
     let px = Math.max(0, Math.min(width, pxOf(call.at)))
     const unfinished = call.ms === null || call.ms === undefined
-    const rawSize = unfinished ? UNFINISHED_W : chipWidth(call.ms)
+    // Линейная ширина — та же карта оси: пиксели между началом и концом вызова.
+    const linEnd = unfinished || call.ms === null
+      ? px
+      : Math.max(px, Math.min(clampRightPx !== null ? clampRightPx : width, pxOf(call.at + Math.max(0, Number(call.ms)) / 1000)))
+    const rawSize = unfinished ? UNFINISHED_W : Math.max(LIN_FLOOR, Math.round(linEnd - px))
     const size = clampBandPx === null ? rawSize : Math.min(rawSize, clampBandPx)
     if (clampRightPx !== null && px + size > clampRightPx) {
       px = Math.max(clampLeftPx !== null ? clampLeftPx : 0, clampRightPx - size)
@@ -2292,13 +2298,7 @@ function layoutCalls(calls, options) {
     if (clampLeftPx !== null && px < clampLeftPx) {
       px = Math.min(clampLeftPx, (clampRightPx !== null ? clampRightPx : width) - size)
     }
-    // Линейная ширина — та же карта оси: пиксели между началом и концом вызова.
-    // Пол минимальной ширины у коротких вызовов не «0 мс», а предел точности.
-    const linEnd = unfinished || call.ms === null
-      ? px
-      : Math.max(px, Math.min(clampRightPx !== null ? clampRightPx : width, pxOf(call.at + Math.max(0, Number(call.ms)) / 1000)))
-    const rawLinSize = unfinished ? UNFINISHED_W : Math.max(2, Math.round(linEnd - px))
-    const linSize = clampBandPx === null ? rawLinSize : Math.min(rawLinSize, clampBandPx)
+    const linSize = size
     let level = lastEnd.findIndex((end) => px - end >= gap)
     if (level < 0) {
       if (lastEnd.length >= maxLevels) {

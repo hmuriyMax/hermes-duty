@@ -480,6 +480,8 @@ def test_fold_closed_deal_is_not_reopened_by_non_state_kinds() -> None:
     # публикация — факт о дереве (этап закрыт своим `attempt_ended`), предложение
     # плана — факт о графе, а не о состоянии (в граф оно не входит), продолжение в
     # сохранённом дереве — факт о дереве попытки (о её начале говорит `attempt_started`).
+    # Отмена этапа и факты лида (2.0) — тоже не состояние **дела**: отменённый этап
+    # закрыт своим `attempt_ended`, а `lead_*` говорят, где лид, а не что делает работа.
     assert journal.NON_STATE_KINDS == (
         "commented",
         "attached",
@@ -489,6 +491,10 @@ def test_fold_closed_deal_is_not_reopened_by_non_state_kinds() -> None:
         "tree_reused",
         "published",
         "plan_proposed",
+        "stage_cancelled",
+        "lead_started",
+        "lead_resumed",
+        "lead_exited",
     )
 
 
@@ -1091,6 +1097,9 @@ def test_now_deal_shape_is_pinned(home: Path, client: TestClient) -> None:
         # 0.0.5: публикация по журналу (`dashboard/publish.py`); `null` — не
         # публиковали.
         "published",
+        # 2.0: состояние лида по журналу (`dashboard/leadfeed.py`): жив,
+        # отсутствует или поднят резюмом N из M.
+        "lead",
         "waiting",
     ]
     assert list(deal["attempt"]) == [

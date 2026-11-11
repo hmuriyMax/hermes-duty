@@ -189,6 +189,18 @@ NOW_KEYS = {
     "deals[].stage.since",
     "deals[].stage.live",
     "deals[].budget",
+    # 2.0: состояние лида по журналу (`dashboard/leadfeed.py`) — «лид: жив /
+    # отсутствует / резюм 2 из 6». Живая сессия не спрашивается, поэтому поля
+    # берутся из фактов `lead_*`.
+    "deals[].lead",
+    "deals[].lead.state",
+    "deals[].lead.resumes",
+    "deals[].lead.cap",
+    "deals[].lead.since",
+    "deals[].lead.last",
+    "deals[].lead.reason",
+    "deals[].lead.text",
+    "deals[].lead.evidence",
     "deals[].published",
     "deals[].published.stage",
     "deals[].published.attempt",

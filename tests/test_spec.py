@@ -212,10 +212,31 @@ def test_missing_duty_rejected(tmp_path: Path):
     assert caught.value.rule == "duty"
 
 
-def test_empty_stages_rejected(tmp_path: Path):
+def test_empty_stages_is_a_charter_only_spec(tmp_path: Path):
+    """`stages: []` — спека «только хартия» (2.0): этапов нет, их создаст лид.
+
+    Правило 1.x требовало непустой список. В 2.0 отсутствие этапов — норма
+    (`docs/ENGINE-2.0.md`, раздел 3), и явный пустой список читается так же, как
+    отсутствующий ключ: различать «нет ключа» и «пустой список» значило бы
+    запрещать ровно ту форму, ради которой срез сделан.
+    """
+    loaded = spec_module.load_spec(write(tmp_path, "duty: probe\nstages: []\n"))
+    assert loaded.stages == () and loaded.raw_stages == ()
+    assert spec_module.errors(spec_module.validate_spec(loaded, profiles=PROFILES)) == []
+
+
+@pytest.mark.parametrize("value", ["impl", "{impl: 1}", "42"])
+def test_stages_that_are_not_a_list_are_rejected(tmp_path: Path, value: str):
+    """Мусор на месте `stages` — спека не читается.
+
+    `stages: {…}` отличается от пустого списка: словарь верхнего уровня — не
+    «один этап». Одиночную запись принимает `parse_plan` (её присылает
+    `duty_start`), а файл объявляет этапы списком или не объявляет вовсе.
+    """
     with pytest.raises(SpecError) as caught:
-        spec_module.load_spec(write(tmp_path, "duty: probe\nstages: []\n"))
+        spec_module.load_spec(write(tmp_path, f"duty: probe\nstages: {value}\n"))
     assert caught.value.rule == "spec"
+    assert "stages" in caught.value.message
 
 
 # ------------------------------------------------------------------------- роли

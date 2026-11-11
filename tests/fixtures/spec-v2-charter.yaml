@@ -1,0 +1,18 @@
+# Спека 2.0: только хартия (`docs/ENGINE-2.0.md`, раздел 3, `docs/SPEC.md`).
+#
+# `stages` здесь нет намеренно: этапы создаёт лид инструментом `duty_plan`, а
+# файл объявляет границы, в которых он вправе это делать. Пример повторяет
+# контракт целиком — включая `max_attempts`, `max_lead_resumes` и `publish`.
+duty: sx-widgets-tristate
+repo: ~/GolandProjects/sx-widgets-api
+base: origin/master
+budget: {tokens: 3000000, minutes: 480}
+
+charter:
+  allowed_roles: [researcher, planner, implementer, tester, reviewer, documenter, publisher, staging-tester]
+  allowed_kinds: [agent, shell, gate]
+  max_stages: 12          # потолок плана
+  max_attempts: 3         # попыток на этап (включая авто-повторы)
+  max_lead_resumes: 6     # сколько раз супервизор поднимает упавшего лида
+  plan_gate: {min_stages: 5, budget_share: 0.3}
+  publish: {human_gate: true, reviewer_role: reviewer}

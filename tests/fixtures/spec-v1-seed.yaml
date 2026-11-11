@@ -1,0 +1,26 @@
+# Спека 1.x: `stages` — ещё граф дела. Такие файлы остаются валидными в 2.0
+# (`docs/ENGINE-2.0.md`, раздел 12): лид получает эти этапы в брифе
+# seed-подсказкой («вот как дело задумывали») и вправе переписать их планом.
+duty: "1.x: seed-план, а не приговор"
+budget: {minutes: 120}
+
+charter:
+  max_stages: 6
+  max_rounds_replan: 2
+  plan_gate: {min_stages: 0, budget_share: 0}
+  max_attempts: 3
+  max_lead_resumes: 6
+
+stages:
+  - id: plan
+    role: implementer
+    workspace: none
+  - id: verify
+    role: tester
+    needs: [plan]
+    workspace: none
+  - id: review
+    role: reviewer
+    needs: [verify]
+    workspace: none
+    verdict: {approve: next, changes: verify, max_rounds: 1}

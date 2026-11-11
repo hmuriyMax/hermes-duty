@@ -69,8 +69,23 @@ VERDICT_KEYS = ("approve", "changes", "max_rounds")
 # этапов, сколько раз план может быть возвращён на реплан, кем и какими видами
 # этапов план вправе расти, когда план спрашивает человека. Спека без блока
 # годна: дефолты — это поведение 0.0.8, где план никто не предлагает.
-CHARTER_KEYS = ("max_stages", "max_rounds_replan", "allowed_roles", "allowed_kinds", "plan_gate")
+#
+# 2.0 (`docs/ENGINE-2.0.md`, раздел 3) оставляет в файле **только хартию**: роли,
+# виды, потолки и публикация. Ключи 1.0 (`max_rounds_replan`) остаются в наборе:
+# старые спеки валидны без правки файла (раздел 12 контракта), а `stages` из
+# обязательного поля стало seed-подсказкой лиду.
+CHARTER_KEYS = (
+    "max_stages",
+    "max_rounds_replan",
+    "allowed_roles",
+    "allowed_kinds",
+    "plan_gate",
+    "max_attempts",
+    "max_lead_resumes",
+    "publish",
+)
 PLAN_GATE_KEYS = ("min_stages", "budget_share")
+PUBLISH_KEYS = ("human_gate", "reviewer_role")
 # Что предложение плана вправе сказать про этап, который **уже есть** в графе:
 # только порядок (`needs`) и параллель (`parallel_with`). Остальные поля были бы
 # переписыванием этапа, а этап объявляется спекой (`parse_plan`, правило `plan.id`).
@@ -149,6 +164,12 @@ COORDINATOR_ROLES = ("coordinator", "lead")
 # этап плана может быть переоткрыт отказом, прежде чем дело получит `failed(contract)`.
 DEFAULT_MAX_STAGES = 12
 DEFAULT_MAX_ROUNDS_REPLAN = 3
+# Потолки 2.0 (раздел 3 контракта): попыток на этап, включая авто-повторы, и
+# сколько раз супервизор поднимает упавшего лида. Числа — из контракта, и
+# `max_lead_resumes` совпадает с `lead.DEFAULT_MAX_RESUMES`: иначе спека и
+# супервизор называли бы разные потолки для одного и того же.
+DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_MAX_LEAD_RESUMES = 6
 
 # Код возврата shell-этапа по умолчанию: «команда сходилась» — это 0.
 DEFAULT_SHELL_MUST = 0
@@ -344,6 +365,30 @@ class PlanGate:
 
 
 @dataclass(frozen=True)
+class Publish:
+    """Публикация в хартии 2.0: кто одобряет и спрашивают ли человека.
+
+    Два поля — то, что дело 2.0 объявляет о своей публикации
+    (`docs/ENGINE-2.0.md`, разделы 3 и 8):
+
+    - `reviewer_role` — роль, чью работу дело считает ревью; умолчание —
+      `REVIEWING_ROLE`, поэтому спека без `publish` ведёт себя как 1.x;
+    - `human_gate` — нужен ли вопрос человеку перед публикацией; умолчание
+      `true`, как у 1.x, где публикующий этап требует гейта в предках.
+
+    Гарантия публикации от этих полей не зависит: она живёт в истории фактов
+    (`duty_start` → `dashboard/publish.py`), а не в форме графа и не в хартии
+    (раздел 8: «статически доказать нельзя — можно проверить факты»). Здесь поля
+    только разбираются и проверяются на форму — булево и непустое имя роли, —
+    чтобы `duty spec check` называл мусор в хартии до запуска дела.
+    """
+
+    human_gate: bool = True
+    reviewer_role: str = REVIEWING_ROLE
+    line: int = 0
+
+
+@dataclass(frozen=True)
 class Charter:
     """Хартия дела: границы, в которых лид вправе растить граф (`parse_plan`).
 
@@ -356,7 +401,13 @@ class Charter:
     - `allowed_roles` — роли, которыми плану разрешено добавлять этапы; пусто —
       хартия роль не ограничивает (действует обычная проверка профиля);
     - `allowed_kinds` — виды этапов, которые план вправе добавить;
-    - `plan_gate` — когда план уходит вопросом человеку.
+    - `plan_gate` — когда план уходит вопросом человеку;
+    - `max_attempts` — потолок попыток на этап, включая авто-повторы (2.0, раздел
+      11): дело объявляет его само, а политику повторов внутри потолка задаёт
+      `retry` этапа (`dashboard/failures.py`);
+    - `max_lead_resumes` — сколько раз супервизор поднимает упавшего лида (2.0;
+      читает `lead.max_resumes` этим же полем);
+    - `publish` — роль-ревьюер и вопрос человеку перед публикацией (2.0).
     """
 
     max_stages: int = DEFAULT_MAX_STAGES
@@ -364,6 +415,9 @@ class Charter:
     allowed_roles: tuple[str, ...] = ()
     allowed_kinds: tuple[str, ...] = STAGE_KINDS
     plan_gate: PlanGate = PlanGate()
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS
+    max_lead_resumes: int = DEFAULT_MAX_LEAD_RESUMES
+    publish: Publish = Publish()
 
 
 @dataclass(frozen=True)
@@ -416,9 +470,14 @@ class Spec:
     нет и дело ограничено только этапными бюджетами: спеки 0.0.4 читаются без
     правок и ведут себя как раньше.
 
-    `charter` — границы роста графа (1.0). Спека без блока получает дефолты
-    (`Charter()`), поэтому старые спеки читаются без правок файла, а `stages`
-    остаётся seed-ом: принятый план живёт фактами журнала, а не этим полем.
+    `charter` — границы роста графа (1.0) и потолки 2.0. Спека без блока получает
+    дефолты (`Charter()`), поэтому старые спеки читаются без правок файла.
+
+    `stages` — **seed-план**, а не граф (`docs/ENGINE-2.0.md`, раздел 3): лид
+    получает его в брифе подсказкой и волен переписать `duty_plan`-ом. Пустой
+    кортеж — законная спека 2.0 «только хартия»: этапы создаст лид. `raw_stages`
+    хранит объявленные этапы как есть — `check_seed()` прогоняет их через
+    `parse_plan`, а тот читает сырые словари, а не разобранные `Stage`.
     """
 
     path: Path
@@ -430,6 +489,7 @@ class Spec:
     charter: Charter = Charter()
     lines: dict[str, int] = field(default_factory=dict)
     parse_issues: tuple[Issue, ...] = ()
+    raw_stages: tuple[Any, ...] = ()
 
     @property
     def ids(self) -> tuple[str, ...]:
@@ -777,6 +837,56 @@ def _parse_plan_gate(
     return PlanGate(min_stages=stages, budget_share=float(share), line=line)
 
 
+def _parse_publish(
+    data: dict[str, Any],
+    path: Path,
+    lines: dict[tuple[Any, ...], int],
+    prefix: tuple[Any, ...],
+    issues: list[Issue],
+) -> Publish:
+    """Публикация в хартии 2.0: отсутствие блока — дефолты, мусор внутри — отказ.
+
+    Форма та же, что у остальных необязательных блоков (`_parse_charter`):
+    типы собираются здесь, исполнимость — в `_check_charter`. `human_gate`
+    разбирается через `bool`, но не «на глаз»: строка `"нет"` — это не решение
+    человека, поэтому не-булево значение отказывает, а не превращается в `True`.
+    """
+    raw = data.get("publish")
+    if raw is None:
+        return Publish()
+    line = lines.get(prefix + ("publish",), lines.get(prefix, 1))
+    mapping = _mapping(raw)
+    if mapping is None:
+        issues.append(
+            Issue(path, line, "charter.publish", f"publish — словарь {{{', '.join(PUBLISH_KEYS)}}}")
+        )
+        return Publish()
+    _unknown_keys(mapping, PUBLISH_KEYS, path, lines, prefix + ("publish",), issues)
+    human_gate = mapping.get("human_gate", True)
+    if not isinstance(human_gate, bool):
+        issues.append(
+            Issue(
+                path,
+                lines.get(prefix + ("publish", "human_gate"), line),
+                "charter.publish.human_gate",
+                f"human_gate={human_gate!r}: нужен ли вопрос человеку перед публикацией — true/false",
+            )
+        )
+        human_gate = True
+    reviewer_role = mapping.get("reviewer_role", REVIEWING_ROLE)
+    if not isinstance(reviewer_role, str) or not reviewer_role.strip():
+        issues.append(
+            Issue(
+                path,
+                lines.get(prefix + ("publish", "reviewer_role"), line),
+                "charter.publish.reviewer_role",
+                "reviewer_role — имя роли, чей approve считается ревью публикуемого дерева",
+            )
+        )
+        reviewer_role = REVIEWING_ROLE
+    return Publish(human_gate=human_gate, reviewer_role=str(reviewer_role).strip(), line=line)
+
+
 def _parse_charter(
     data: dict[str, Any],
     path: Path,
@@ -845,12 +955,37 @@ def _parse_charter(
             )
         )
         kinds = STAGE_KINDS
+    max_attempts = mapping.get("max_attempts", DEFAULT_MAX_ATTEMPTS)
+    if _int_or_none(max_attempts) is None:
+        issues.append(
+            Issue(
+                path,
+                lines.get(prefix + ("charter", "max_attempts"), line),
+                "charter.max_attempts",
+                f"max_attempts={max_attempts!r}: потолок попыток на этап — целое число",
+            )
+        )
+        max_attempts = DEFAULT_MAX_ATTEMPTS
+    resumes = mapping.get("max_lead_resumes", DEFAULT_MAX_LEAD_RESUMES)
+    if _int_or_none(resumes) is None:
+        issues.append(
+            Issue(
+                path,
+                lines.get(prefix + ("charter", "max_lead_resumes"), line),
+                "charter.max_lead_resumes",
+                f"max_lead_resumes={resumes!r}: сколько раз поднимать лида — целое число",
+            )
+        )
+        resumes = DEFAULT_MAX_LEAD_RESUMES
     return Charter(
         max_stages=int(max_stages),
         max_rounds_replan=int(rounds),
         allowed_roles=roles,
         allowed_kinds=kinds,
         plan_gate=_parse_plan_gate(mapping, path, lines, prefix + ("charter",), issues),
+        max_attempts=int(max_attempts),
+        max_lead_resumes=int(resumes),
+        publish=_parse_publish(mapping, path, lines, prefix + ("charter",), issues),
     )
 
 
@@ -1001,9 +1136,20 @@ def load_spec(path: str | Path) -> Spec:
     duty = data.get("duty")
     if not isinstance(duty, str) or not duty.strip():
         raise SpecError(spec_path, lines.get(("duty",), 1), "duty", "поле duty обязательно: имя дела строкой")
+    # `stages` в 2.0 не обязано быть вовсе (`docs/ENGINE-2.0.md`, раздел 3): этапы
+    # создаёт лид, а файл объявляет только хартию. Объявленные этапы остаются
+    # seed-подсказкой (`brief`), а не графом, поэтому непустоты от них никто не
+    # требует; мусор на месте списка — по-прежнему «спека не читается».
     raw_stages = data.get("stages")
-    if not isinstance(raw_stages, list) or not raw_stages:
-        raise SpecError(spec_path, lines.get(("stages",), 1), "spec", "поле stages обязательно: непустой список этапов")
+    if raw_stages is None:
+        raw_stages = []
+    if not isinstance(raw_stages, list):
+        raise SpecError(
+            spec_path,
+            lines.get(("stages",), 1),
+            "spec",
+            f"поле stages — список этапов, а не {type(raw_stages).__name__} (нет этапов в файле — не объявляй ключ)",
+        )
 
     repo = data.get("repo")
     base = data.get("base")
@@ -1032,6 +1178,7 @@ def load_spec(path: str | Path) -> Spec:
         charter=_parse_charter(data, spec_path, lines, (), issues),
         lines=_top_lines(lines),
         parse_issues=tuple(issues),
+        raw_stages=tuple(raw_stages),
     )
 
 
@@ -1054,6 +1201,9 @@ def _top_lines(lines: dict[tuple[Any, ...], int]) -> dict[str, int]:
     for name in PLAN_GATE_KEYS:
         if ("charter", "plan_gate", name) in lines:
             found[f"charter.plan_gate.{name}"] = lines[("charter", "plan_gate", name)]
+    for name in PUBLISH_KEYS:
+        if ("charter", "publish", name) in lines:
+            found[f"charter.publish.{name}"] = lines[("charter", "publish", name)]
     return found
 
 
@@ -1282,8 +1432,16 @@ def _check_cycle(spec: Spec) -> list[Issue]:
 
 
 def _check_entry(spec: Spec) -> list[Issue]:
-    """Ровно один вход: этап без `needs`. Два входа — у дела нет начала."""
+    """Ровно один вход: этап без `needs`. Два входа — у дела нет начала.
+
+    Дело без единого этапа — законное состояние 2.0 (`docs/ENGINE-2.0.md`, раздел
+    3): файл объявляет только хартию, а этапы создаст лид первым `duty_plan`.
+    «Входа нет» здесь неоткуда взять, поэтому пустой граф не отказывает — иначе
+    спека «только хартия» не проходила бы `duty spec check`.
+    """
     entries = [stage for stage in spec.stages if not stage.needs]
+    if not spec.stages:
+        return []
     if len(entries) == 1:
         return []
     if not entries:
@@ -1529,6 +1687,27 @@ def _check_charter(spec: Spec, profiles: frozenset[str]) -> list[Issue]:
                 line_of("charter.max_rounds_replan"),
                 "charter.max_rounds_replan",
                 f"max_rounds_replan={charter.max_rounds_replan}: раундов реплана не может быть меньше нуля",
+            )
+        )
+    # Потолки 2.0 (раздел 3): ноль попыток — этап нельзя поднять ни разу, а
+    # отрицательное число подъёмов лида парковало бы дело на первом же падении,
+    # хотя спека этого не имела в виду.
+    if charter.max_attempts < 1:
+        issues.append(
+            Issue(
+                spec.path,
+                line_of("charter.max_attempts"),
+                "charter.max_attempts",
+                f"max_attempts={charter.max_attempts}: попыток на этап — не меньше одной",
+            )
+        )
+    if charter.max_lead_resumes < 0:
+        issues.append(
+            Issue(
+                spec.path,
+                line_of("charter.max_lead_resumes"),
+                "charter.max_lead_resumes",
+                f"max_lead_resumes={charter.max_lead_resumes}: подъёмов лида не может быть меньше нуля",
             )
         )
     for kind in charter.allowed_kinds:
@@ -2228,6 +2407,10 @@ def validate_spec(spec: Spec, *, profiles: Optional[frozenset[str]] = None) -> l
     issues += _check_roles(spec, known)
     issues += _check_refs(spec)
     issues += _check_charter(spec, known)
+    # Seed-этапы 1.x — против той же хартии, что и план лида (`docs/ENGINE-2.0.md`,
+    # раздел 3): файл 2.0 без `stages` здесь ничего не добавляет, а объявленный
+    # seed не гниёт в стороне от правил, по которым дело будет расти дальше.
+    issues += check_seed(spec)
     issues += _check_cycle(spec)
     issues += _check_entry(spec)
     issues += _check_reachable(spec)
@@ -2405,9 +2588,17 @@ def parse_plan(
     вызывающий, у которого есть журнал (`runner.report_plan`): сама проверка
     структуры графа от попыток не зависит, и принятый план, чей этап потом начали,
     остаётся графом.
+
+    **Один этап.** `raw_stages` вправе быть одной записью, а не списком: в 2.0
+    этап проверяется там, где его запускают (`duty_start`), и требований к нему те
+    же, что к этапу плана (раздел 3 контракта). Запись оборачивается в список
+    здесь, а не вторым набором правил у вызывающего: одиночный этап иначе
+    проверялся бы слабее пачки.
     """
     where = Path(path) if path is not None else Path(PLAN_PATH)
     issues: list[Issue] = []
+    if isinstance(raw_stages, dict):
+        raw_stages = [raw_stages]
     if not isinstance(raw_stages, list) or not raw_stages:
         issues.append(Issue(where, 1, "plan.stages", "план — непустой список этапов {id, role, …}"))
         return (), issues
@@ -2660,6 +2851,60 @@ def parse_plan(
             )
         )
     return tuple(stages), issues
+
+
+# ------------------------------------------------------- seed спеки как план
+
+# Что из `parse_plan` применяется к seed-этапам объявленного файла (`check_seed`).
+#
+# Оба правила — те, которых у `validate_spec` нет и которых seed 1.x действительно
+# обязан держаться:
+#
+# - `charter.max_stages` — файл не вправе объявить больше этапов, чем хартия
+#   держит: дело с самого начала стояло бы за собственным потолком;
+# - `plan.evidence.role` — `evidence` роли без терминала не выполнится никогда,
+#   и объявлять его — обещание, которого движок не исполнит.
+#
+# Права плана (`charter.allowed_roles`, `charter.allowed_kinds`) сюда НЕ входят, и
+# это не упущение: хартия говорит, что план вправе **добавить**, а seed объявляет
+# человек (`docs/ENGINE-1.0.md`, раздел 3). Слепое применение этих правил к seed
+# отказывало бы живым спекам: `~/.hermes/duty/specs/rp14349-*.yaml` объявляют вход
+# и `close` ролью координатора, а координатора план не добавляет вовсе
+# (`coordinator.scope`) — то есть в `allowed_roles` его и не должно быть.
+# Правила роста графа (`plan.evidence` — этап, который что-то производит, без
+# доказательств; `plan.publish`, `coordinator.scope`, `plan.reorder`) по той же
+# причине к seed не относятся: seed как раз и объявляет публикующий этап,
+# координатора и вход без evidence.
+#
+# Структуру этапа (`needs`, `kind.cmd`, `evidence.*`, цикл, приговоры) уже
+# проверили `_parse_stage`, `validate_spec` и `check_base` — повторять их здесь
+# значило бы печатать один отказ дважды.
+SEED_RULES = ("charter.max_stages", "plan.evidence.role")
+
+
+def check_seed(spec: Spec) -> list[Issue]:
+    """Seed-этапы 1.x прогоняются через `parse_plan` — чтобы файлы не гнили.
+
+    `stages` в 2.0 больше не граф (`docs/ENGINE-2.0.md`, раздел 3): лид получает
+    их в брифе подсказкой и волен переписать планом. Отсутствие `stages` — норма
+    (`[]`), поэтому проверять нечего. Объявленные этапы идут через тот же
+    валидатор, которым лид проверяет план, и отказы берутся из него, а не из
+    второго набора правил: набор — `SEED_RULES`, и там же сказано, почему прав
+    плана в нём нет.
+
+    Строку отказа называет `parse_plan`: у seed нет «предложения», по которому он
+    считал бы строки, поэтому адрес — `файл:1`, а этап назван по `id`.
+    """
+    if not spec.raw_stages:
+        return []
+    _, issues = parse_plan(
+        list(spec.raw_stages),
+        charter=spec.charter,
+        base_ids=(),
+        repo=spec.repo,
+        path=spec.path,
+    )
+    return [issue for issue in issues if issue.rule in SEED_RULES]
 
 
 # ------------------------------------------------------- база как существующий rev

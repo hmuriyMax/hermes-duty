@@ -1187,6 +1187,10 @@ teal и pink, на обеих поверхностях; в легенде сем
 | `totals.contract_refusals` | отказы контракта числом и разбивкой по правилу | `attempt_ended` с классом `contract` (`kind` события, старые записи — `details.class`); правило — `details.rule`, иначе код причины (`artifact.missing`), иначе первая фраза `reason` |
 | `totals.attempts_by_outcome`, `totals.attempts_by_class` | таксономия исходов и классов отказов | `attempt_ended.outcome` и `attempt_ended.kind` |
 | `totals.tokens` | токены за окно | `sum(attempt_ended.details.usage_tokens)`; ни одна попытка не записала — `null` и `warnings`, а не 0 |
+| `totals.coordination` | координация лида: токены его фактов и их доля в расходе дела (`share`) | `sum(lead_*.usage_tokens)`; ни один факт лида не записал токенов — `null`, а доля без знаменателя (`tokens.total`) — тоже `null` |
+| `totals.question_outcomes` | распределение исходов вопросов по автору ответа | `question_answered.by` (`lead` — ответ лида, иное имя — роль) и `answered_via` (ни `by`, ни признака — человек; `expired` — срок) плюс `waiting` = вопросы с номером пула без ответа |
+| `totals.lead_resumes.deals` | сколько дел упёрлось в `max_lead_resumes` | дела, где `lead_resumed` ≥ потолка из факта (`max`, по умолчанию `6`, `docs/ENGINE-2.0.md` раздел 3) |
+| `totals.deals_closed` / `totals.deals_cancelled` | завершённые и отменённые дела — **двумя** числами | закрывающий `completed.cause`: `lead_cancelled` (или статус `cancelled`) — отмена, любая другая причина — завершение (`docs/ENGINE-2.0.md`, раздел 5: отменённое не считается сделанным) |
 
 Правила, которые нельзя перепутать местами:
 

@@ -62,6 +62,10 @@ VERDICT_DETAILS = 5
 # важнее всей истории, а полная лента — `duty attempts`.
 FAILURE_LOG_LIMIT = 5
 
+# Сколько решений лида печатает экран дела: свежие важнее всей истории. Полная
+# лента живёт в `--json` (`decisions[]` ответа `/deal`).
+DECISION_LINES = 12
+
 # Метка «я уже перезапускался»: без неё неудачный поиск интерпретатора дал бы
 # бесконечную цепочку `execv`.
 # Метка «я уже перезапускался» — АРГУМЕНТ, а не переменная окружения. Переменная
@@ -123,6 +127,9 @@ REAPER_MODULE_NAME = "hermes_duty_reaper"
 # Отпускание дел, оставшихся `running` при ушедшем движке: `reap` зовёт проход,
 # а не решает у себя, что считать отпущенным.
 RELEASE_MODULE_NAME = "hermes_duty_release"
+# Решения лида (`dashboard/leadfeed.py`): лента решений, состояние лида и счётчики
+# собираются там, а CLI только печатает ответ роута — второй проекции журнала нет.
+LEADFEED_MODULE_NAME = "hermes_duty_leadfeed"
 
 
 def _load_demo() -> Any:
@@ -257,6 +264,25 @@ def _load_release() -> Any:
     return module
 
 
+def _load_leadfeed() -> Any:
+    """Загрузить `dashboard/leadfeed.py` — решения лида и его состояние по журналу.
+
+    Терминал не решает у себя, что считать решением лида: те же слова, что на
+    экране дела, считает проекция журнала (`docs/ENGINE-2.0.md`, раздел 9).
+    """
+    loaded = sys.modules.get(LEADFEED_MODULE_NAME)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / "leadfeed.py"
+    spec = importlib.util.spec_from_file_location(LEADFEED_MODULE_NAME, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise SourceFailure(f"leadfeed module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[LEADFEED_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 _API: Any = None
 
 
@@ -266,6 +292,17 @@ def api() -> Any:
     if _API is None:
         _API = _load_plugin_api()
     return _API
+
+
+_LEADFEED: Any = None
+
+
+def leadfeed() -> Any:
+    """Проекция решений лида (`dashboard/leadfeed.py`), грузится один раз."""
+    global _LEADFEED
+    if _LEADFEED is None:
+        _LEADFEED = _load_leadfeed()
+    return _LEADFEED
 
 
 def _route(fn: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -718,6 +755,15 @@ def _refusals(block: Any) -> str:
     return f"{count} · {rules}" if rules != "—" else str(count)
 
 
+def _token_count(value: int) -> str:
+    """Токены компактно: `650`, `12k`, `1.4M` — одно написание на все поверхности."""
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.0f}k"
+    return str(value)
+
+
 def _tokens(block: Any) -> str:
     """Токены за окно: сумма из `attempt_ended`, а не оценка по числу попыток.
 
@@ -731,16 +777,46 @@ def _tokens(block: Any) -> str:
         if not closed:
             return "нет данных (закрытых попыток в окне не было)"
         return f"нет данных (ни одна из {closed} закрытых попыток не записала usage_tokens)"
-    value = int(total)
-    if value >= 1_000_000:
-        shown = f"{value / 1_000_000:.1f}M"
-    elif value >= 1_000:
-        shown = f"{value / 1_000:.0f}k"
-    else:
-        shown = str(value)
     without = int(data.get("without") or 0)
     tail = f", {without} без токенов" if without else ""
-    return f"{shown} (по {int(data.get('count') or 0)} попыткам{tail})"
+    return f"{_token_count(int(total))} (по {int(data.get('count') or 0)} попыткам{tail})"
+
+
+def _coordination(block: Any) -> str:
+    """Доля координации в токенах: расход лида против расхода работы.
+
+    `null` — расход лида в журнале не записан: «лид ничего не тратил» и «расход
+    лида не измерен» — разные факты, и ноль здесь был бы выдумкой. Та же доля без
+    знаменателя (работа не записала токенов) — не доля, поэтому прочерк.
+    """
+    data = block or {}
+    tokens = data.get("tokens")
+    if tokens is None:
+        return "нет данных (факты лида не записали usage_tokens)"
+    share = data.get("share")
+    percent = "—" if share is None else f"{round(float(share) * 100)}%"
+    return (
+        f"{_token_count(int(tokens))} (доля {percent}, "
+        f"фактов лида {int(data.get('count') or 0)})"
+    )
+
+
+def _question_outcomes(block: Any) -> str:
+    """Исходы вопросов: кто ответил — лид, роль или человек, и сколько ждут.
+
+    Распределение, а не счётчик: маршрут вопроса — решение лида (раздел 6
+    контракта 2.0), и по нему видно, куда уходят вопросы на самом деле.
+    """
+    data = block or {}
+    answered = data.get("answered") or {}
+    total = sum(int(count or 0) for count in answered.values())
+    if not int(data.get("asked") or 0) and not total:
+        return "вопросов не было"
+    parts = [f"{name} {int(count)}" for name, count in answered.items() if int(count or 0)]
+    waiting = int(data.get("waiting") or 0)
+    if waiting:
+        parts.append(f"ждут {waiting}")
+    return " · ".join(parts) or "ответов не было"
 
 
 def _window(window: Any) -> str:
@@ -807,7 +883,9 @@ def _notice_lines(payload: dict[str, Any]) -> list[str]:
 NOW_COLUMNS = (
     ("РЕПОЗИТОРИЙ", 40),
     ("ID", 14),
-    ("СОСТОЯНИЕ", 20),
+    # Ширина выбрана по самому длинному состоянию с линией лида:
+    # `wait_human/decision · лид: отсутствует · резюм 2 из 6` (2.0, раздел 9).
+    ("СОСТОЯНИЕ", 50),
     ("ОЖИДАНИЕ", 9),
     ("ВОЗРАСТ", 8),
     ("РАСХОД", 34),
@@ -924,6 +1002,10 @@ def _now_row(deal: dict[str, Any], now: Any) -> list[Any]:
     то число, по которому `/now` сортирует дела. `ВОЗРАСТ` — возраст самого дела.
     `РАСХОД` — «N из M токенов / X из Y минут» рядом с состоянием
     (`dashboard/budget.py`); прочерк — потолка на дело спека не объявляла.
+    `СОСТОЯНИЕ` — состояние ожидания плюс строка лида из журнала
+    (`dashboard/leadfeed.py`): «лид: жив / отсутствует / резюм 2 из 6». Лид ни о
+    чём не спрашивается — это чтение фактов `lead_*`, поэтому у дела 1.x там
+    честное «лид: нет фактов».
     Остальные колонки — вычитание полей ответа, не новые правила.
     """
     waiting = deal.get("waiting") or {}
@@ -932,6 +1014,9 @@ def _now_row(deal: dict[str, Any], now: Any) -> list[Any]:
     human_kind = waiting.get("human_kind")
     if human_kind:
         state = f"{state}/{human_kind}"
+    lead = deal.get("lead") or {}
+    if lead.get("text"):
+        state = f"{state} · {lead['text']}"
     deal_age = _age(deal.get("created_at"), now)
     wait_age = attempt.get("age_sec")
     if wait_age is None:
@@ -1067,6 +1152,19 @@ def render_stats(payload: dict[str, Any]) -> str:
     lines.append(f"исходы попыток: {_counts(totals.get('attempts_by_outcome'))}")
     lines.append(f"классы отказов: {_counts(totals.get('attempts_by_class'))}")
     lines.append(f"статусы дел: {_counts(totals.get('deals_by_status'))}")
+    # 2.0: лид — такой же источник расхода, как попытки, и считается по своим
+    # фактам (`docs/ENGINE-2.0.md`, раздел 9). Доля без знаменателя — прочерк.
+    lines.append(f"координация лида: {_coordination(totals.get('coordination'))}")
+    lines.append(f"исходы вопросов: {_question_outcomes(totals.get('question_outcomes'))}")
+    resumes = totals.get("lead_resumes") or {}
+    lines.append(f"дел упёрлось в max_lead_resumes: {int(resumes.get('deals') or 0)}")
+    # Отмена — не завершение (раздел 5): два числа стоят рядом, но не складываются
+    # в одно «закрыто», иначе провал читался бы как сделанная работа.
+    lines.append(
+        "закрыто дел: {} · отменено: {} (отдельно от завершённых)".format(
+            int(totals.get("deals_closed") or 0), int(totals.get("deals_cancelled") or 0)
+        )
+    )
     if groups:
         lines.append("")
         lines.append(_table(STATS_COLUMNS, [_repo_row(group) for group in groups]))
@@ -1242,6 +1340,61 @@ def _closure_text(closed: dict[str, Any]) -> str:
     return f"completed cause={cause}{tail} в {_fmt_stamp(closed.get('at'))}"
 
 
+def _lead_line(block: Any) -> str:
+    """Строка состояния лида словами проекции: `лид: жив`, `лид: резюм 2 из 6`.
+
+    Текст собирает `dashboard/leadfeed.py` по фактам журнала; здесь — только
+    отступ и доказательство, из какого факта взято состояние.
+    """
+    data = block or {}
+    text = str(data.get("text") or "")
+    if not text:
+        return "  лид: не посчитано (в ответе нет блока lead)"
+    evidence = str(data.get("evidence") or "")
+    return f"  {text}" + (f" — {evidence}" if evidence else "")
+
+
+def _decisions_lines(payload: dict[str, Any]) -> list[str]:
+    """Лента решений лида: план, перезапуски, отмены, ответы, закрытие.
+
+    Одна лента на все поверхности (`docs/ENGINE-2.0.md`, раздел 9): решения
+    строятся из фактов журнала (`plan_accepted`, `attempt_started` после отказа,
+    `stage_cancelled`, `question_answered`, `completed`, `lead_*`), а не из
+    пересказа живой сессии. Автор (`lead|role|human`) печатается там, где его
+    называет факт: у ответа на вопрос — это и есть маршрут, выбранный лидом.
+    """
+    items = payload.get("decisions") or []
+    if not items:
+        return ["решения лида: нет фактов (в журнале нет ни плана, ни ответов, ни отмен)"]
+    lines = [f"РЕШЕНИЯ ЛИДА · {len(items)}"]
+    for item in items[-DECISION_LINES:]:
+        author = str(item.get("author") or "")
+        tag = f"[{author}]  " if author else ""
+        lines.append(f"  {_fmt_clock(item.get('at'))}  {tag}{item.get('text') or '—'}")
+    return lines
+
+
+def _stall_line(payload: dict[str, Any]) -> str:
+    """«Стоит на этапе X с 14:31, пробуждений нет, лид жив» — всё из журнала.
+
+    Три части фразы — три факта: этап и его начало (`stagefeed.current`), число
+    подъёмов лида заново (`leadfeed.status.resumes`) и его состояние. Ни одна из
+    них не спрашивается у процесса: почему дело стоит, видно по фактам, которые
+    уже записаны (`docs/ENGINE-2.0.md`, раздел 9).
+    """
+    shaped = payload.get("deal") or {}
+    lead = shaped.get("lead") or {}
+    stage = shaped.get("stage") or {}
+    wakes = leadfeed().wake_word(lead)
+    word = leadfeed().lead_word(lead)
+    if stage.get("id"):
+        return (
+            f"стоит на этапе {stage['id']} с {_fmt_clock(stage.get('since'))}, "
+            f"{wakes}, лид {word}"
+        )
+    return f"стоит без этапа: в журнале нет ни одной попытки, {wakes}, лид {word}"
+
+
 def _waiting_head(payload: dict[str, Any]) -> str:
     """Строка состояния ожидания: состояние, вид «нужен человек» и приговор журнала."""
     shaped = payload.get("deal")
@@ -1288,6 +1441,10 @@ def render_deal(payload: dict[str, Any], timeline: Optional[dict[str, Any]], tim
         lines.append(f"доказательство: {(shaped.get('waiting') or {}).get('evidence') or 'не записано'}")
         lines.append("")
         lines.extend(_fact_lines(shaped, payload.get("now")))
+    # Лента решений лида — рядом с попытками и для закрытого дела: что решено, это
+    # факт, он не перестаёт быть им после завершения (`docs/ENGINE-2.0.md`, раздел 9).
+    lines.append("")
+    lines.extend(_decisions_lines(payload))
     # Тело карточки — спецификация дела (как на экране «Дело»); в CLI оно не
     # печатается, чтобы карточка оставалась фактами и таймлайном. Целиком оно
     # есть в `--json` того же роута — дословно.
@@ -1344,6 +1501,9 @@ def _fact_lines(shaped: dict[str, Any], now: Any) -> list[str]:
             f"  последний ран: {last_run.get('run_id')} {last_run.get('status') or '—'} "
             f"outcome={last_run.get('outcome') or '—'}"
         )
+    # Состояние лида — факт журнала (`dashboard/leadfeed.py`), а не вопрос процессу:
+    # «дело стоит» и «лида нет» — разные причины, и на экране они рядом.
+    lines.append(_lead_line(shaped.get("lead")))
     lines.append(f"  возраст дела: {_fmt_age(_age(shaped.get('created_at'), now))}")
     return lines
 
@@ -1364,6 +1524,10 @@ def render_why(payload: dict[str, Any]) -> str:
     lines.append(f"заголовок: {payload.get('title') or '—'}")
     lines.append(f"состояние ожидания: {_waiting_head(payload)}")
     shaped = payload.get("deal")
+    if shaped is not None:
+        # «Стоит на этапе X с 14:31, пробуждений нет, лид жив» — ответ на вопрос
+        # «почему оно стоит», собранный из фактов журнала, а не из догадки.
+        lines.append(_stall_line(payload))
     if shaped is None:
         closed = payload.get("closed")
         if isinstance(closed, dict):

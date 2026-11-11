@@ -71,6 +71,8 @@ STAGEFEED_MODULE_NAME = "hermes_duty_stagefeed"
 BUDGET_MODULE_NAME = "hermes_duty_budget"
 # `dashboard/publish.py` — факт публикации дела по журналу (`published`).
 PUBLISH_MODULE_NAME = "hermes_duty_publish"
+# `dashboard/leadfeed.py` — решения лида и его состояние по журналу (2.0, раздел 9).
+LEADFEED_MODULE_NAME = "hermes_duty_leadfeed"
 FAILURES_MODULE_NAME = "hermes_duty_failures"
 
 
@@ -222,6 +224,24 @@ def _load_publish() -> Any:
 
 
 publish = _load_publish()
+
+
+def _load_leadfeed() -> Any:
+    """Загрузить `dashboard/leadfeed.py` — решения лида и его состояние по журналу."""
+    loaded = sys.modules.get(LEADFEED_MODULE_NAME)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / "leadfeed.py"
+    spec = importlib.util.spec_from_file_location(LEADFEED_MODULE_NAME, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise ImportError(f"leadfeed module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[LEADFEED_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+leadfeed = _load_leadfeed()
 
 
 # Один набор заголовков на все ответы: и 200, и ошибки. Кэш промежуточного
@@ -1300,6 +1320,10 @@ def _own_shaped(
         "budget": budget.describe_events(events),
         # Публикация — тот же факт журнала, что у `/deal` (`dashboard/publish.py`).
         "published": publish.published_of(events),
+        # Состояние лида по журналу (`dashboard/leadfeed.py`): жив, отсутствует или
+        # поднят резюмом N из M. Живая сессия не спрашивается — иначе `now`
+        # отвечал бы про процесс, а не про дело (`docs/ENGINE-2.0.md`, раздел 9).
+        "lead": leadfeed.status(events),
         "waiting": _own_waiting(
             folded, question, str(row["status"]), journal_note, pool_note,
             home=home, deal_id=str(row["id"]), attempts=attempts,
@@ -1407,6 +1431,7 @@ def _deal_response(
     closed: Optional[dict[str, Any]] = None,
     budget_block: Optional[dict[str, Any]] = None,
     published_block: Optional[dict[str, Any]] = None,
+    decisions: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """Ответ «одно дело»: одна форма для всех поверхностей.
 
@@ -1465,6 +1490,11 @@ def _deal_response(
         # заявка исполнителя: «не публиковали» и «публикация не подтверждена» —
         # разные факты, и второй живёт в причине отказа попытки.
         "published": published_block,
+        # Лента решений лида (`dashboard/leadfeed.py`): что он сделал с делом —
+        # план, перезапуски этапов, отмены, ответы воркерам, закрытие. Строится по
+        # фактам журнала, поэтому показывается и у закрытого дела: что было —
+        # факт, он не перестаёт быть им после завершения.
+        "decisions": list(decisions or []),
         "errors": list(errors or []),
     }
 
@@ -1528,6 +1558,7 @@ def _own_response(
         closed=journal.closed_fact(events),
         budget_block=budget.describe_events(events),
         published_block=publish.published_of(events),
+        decisions=leadfeed.feed(events),
     )
 
 
@@ -2021,14 +2052,48 @@ def _repo_metrics(
     ended_total = 0
     tokens_total = 0
     tokens_count = 0
+    # 2.0: координация лида, исходы вопросов, отмена. Считаются по тем же фактам
+    # журнала, что и остальные метрики (`dashboard/leadfeed.py`), а не по живым
+    # сессиям: «лид тратил токены» и «расход лида не измерен» — разные факты.
+    lead_tokens = 0
+    lead_token_count = 0
+    question_asked = 0
+    question_waiting = 0
+    question_answered: dict[str, int] = {
+        leadfeed.AUTHOR_LEAD: 0,
+        leadfeed.AUTHOR_ROLE: 0,
+        leadfeed.AUTHOR_HUMAN: 0,
+        leadfeed.AUTHOR_EXPIRED: 0,
+    }
+    deals_hit_resume_cap = 0
+    deals_cancelled = 0
+    deals_closed = 0
     for row in rows:
         status = str(row.get("status") or "—")
         by_status[status] = by_status.get(status, 0) + 1
         deal_id = str(row["id"])
-        events = _window_events(journal_events.get(deal_id, []), since)
+        whole = journal_events.get(deal_id, [])
+        events = _window_events(whole, since)
         if events:
             deals_active += 1
         human_waits.extend(_human_waits(events))
+        # Отмена и потолок резюмов — свойства **дела**, а не окна: дело отменено
+        # или упёрлось в `max_lead_resumes` навсегда, и окно фактов этого не меняет.
+        if leadfeed.is_cancelled(whole, status):
+            deals_cancelled += 1
+        elif leadfeed.closing_cause(whole) is not None:
+            deals_closed += 1
+        if leadfeed.hit_resume_cap(whole):
+            deals_hit_resume_cap += 1
+        spend = leadfeed.token_spend(events)
+        if spend["tokens"] is not None:
+            lead_tokens += int(spend["tokens"])
+            lead_token_count += int(spend["count"])
+        outcomes = leadfeed.question_outcomes(events)
+        question_asked += int(outcomes["asked"])
+        question_waiting += int(outcomes["waiting"])
+        for author, count in (outcomes["answered"] or {}).items():
+            question_answered[author] = question_answered.get(author, 0) + int(count)
         for event in events:
             if str(event.get("kind") or "") != "attempt_ended":
                 continue
@@ -2097,6 +2162,26 @@ def _repo_metrics(
             "count": tokens_count,
             "without": ended_total - tokens_count,
         },
+        # Доля координации: токены фактов лида против токенов работы. `null` —
+        # расход лида не измерен или работы в окне нет: доля без знаменателя не
+        # считается, как и `first_try.share`.
+        "coordination": {
+            "tokens": lead_tokens if lead_token_count else None,
+            "count": lead_token_count,
+            "share": None,
+        },
+        # Исходы вопросов по автору ответа (`lead`/`role`/`human`/`expired`) плюс
+        # те, что ещё ждут: распределение маршрута, а не число вопросов.
+        "question_outcomes": {
+            "asked": question_asked,
+            "answered": question_answered,
+            "waiting": question_waiting,
+        },
+        # Дела, упёршиеся в потолок резюмов, и отдельно отменённые: отмена — не
+        # завершение (`docs/ENGINE-2.0.md`, раздел 5).
+        "lead_resumes": {"deals": deals_hit_resume_cap},
+        "deals_cancelled": deals_cancelled,
+        "deals_closed": deals_closed,
         "_waits": waits,
         "_human_waits": human_waits,
     }
@@ -2192,6 +2277,13 @@ def collect_stats(
     totals["waiting_human_sec"] = _pooled("_human_waits", scoped)
     totals.pop("_waits", None)
     totals.pop("_human_waits", None)
+    # Доля координации считается здесь, а не в группе: знаменатель — токены всей
+    # работы в окне, а не одного репозитория. Токенов работы не записано (или
+    # лида не измеряли) — доля остаётся `null`: доля без знаменателя не доля.
+    coordination = totals["coordination"]
+    work_tokens = totals["tokens"]["total"]
+    if coordination["tokens"] is not None and work_tokens:
+        coordination["share"] = coordination["tokens"] / (coordination["tokens"] + int(work_tokens))
     warnings: list[str] = []
     if totals["tokens"]["count"] == 0 and totals["tokens"]["without"]:
         warnings.append(

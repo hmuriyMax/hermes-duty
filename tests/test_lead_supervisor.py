@@ -753,3 +753,140 @@ def test_deal_driven_by_hand_is_left_to_its_driver(tmp_path: Path) -> None:
     assert tick["action"] == "skipped"
     assert tick["manual_pid"] == 15283
     assert spawned == []
+
+
+# ------------------------------- 9. два корня захода и поток сессии файлом
+
+
+def test_child_env_separates_the_deal_home_from_the_session_root(tmp_path: Path) -> None:
+    """`child_env` называет корень сессии и корень дела по отдельности.
+
+    `hermes chat -p lead` ищет профиль **внутри** экспортированного
+    `HERMES_HOME` (`hermes_cli.profiles.profile_root_for_env_home`), поэтому
+    `HERMES_HOME` обязан быть корнем Hermes, а не корнем профиля и не корнем
+    дела. Инструменты `duty` читают store дела из `$HERMES_DUTY_HOME`
+    (`dashboard/tools.py`, `hermes_home`), иначе профильная сессия искала бы дело
+    в профиле (приёмка 2.0, дело d_eafce375: «дела нет в store» на каждом
+    вызове).
+    """
+    cases = [
+        ("root", tmp_path / "home", tmp_path / "home"),
+        ("profile", tmp_path / "home" / "profiles" / "lead", tmp_path / "home"),
+        ("nested root", tmp_path / "tasks" / "accept", tmp_path / "tasks" / "accept"),
+    ]
+    for name, home, root in cases:
+        env = lead.child_env(home)
+        assert env[lead.HOME_ENV] == str(root), name
+        assert env[lead.DUTY_HOME_ENV] == str(home), name
+
+
+def test_env_names_are_the_same_in_the_tools_and_the_supervisor(tmp_path: Path) -> None:
+    """Имена переменных — один контракт двух модулей, а не два похожих слова.
+
+    Супервизор пишет `child_env`, инструменты читают `hermes_home`: разъехавшееся
+    имя не сломало бы ни один из них по отдельности, и дело молча искалось бы не
+    там. Тест сверяет имена, а не поведение — за поведение отвечают соседние.
+
+    Модуль грузится под каноническим именем (`sys.modules`), как и везде: вторая
+    копия `tools.py` означала бы вторую копию схемы и правил бюджета.
+    """
+    module = sys.modules.get("hermes_duty_tools")
+    if module is None:
+        path = ROOT / "dashboard" / "tools.py"
+        spec = importlib.util.spec_from_file_location("hermes_duty_tools", path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["hermes_duty_tools"] = module
+        spec.loader.exec_module(module)
+    assert (module.HOME_ENV, module.DUTY_HOME_ENV) == (lead.HOME_ENV, lead.DUTY_HOME_ENV)
+    # И инструменты читают корень дела первым: тот же корень, что назвал
+    # супервизор, — это и есть store дела, а не профиль сессии.
+    home = tmp_path / "home"
+    os.environ[lead.DUTY_HOME_ENV] = str(home)
+    try:
+        assert module.hermes_home() == home
+    finally:
+        os.environ.pop(lead.DUTY_HOME_ENV, None)
+
+
+def test_session_stream_is_written_and_named_in_the_fact(tmp_path: Path, monkeypatch) -> None:
+    """Заход пишет поток сессии файлом и называет его в `lead_started`.
+
+    Ключи модели лида собирал `runner.spawn_process` (единственный шов спавна), и
+    до приёмки 2.0 вывод сессии выбрасывался: «покажи, что сказал лид» было
+    нечем выполнить. Теперь настоящий спавн получает каталог лога и окружение, а
+    журнал — путь (`docs/ENGINE-2.0.md`, раздел 9).
+    """
+    home = make_home(tmp_path)
+    spec = write_spec(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    conn.close()
+
+    seen: dict[str, Any] = {}
+
+    def fake_process(cmd: list[str], cwd: Path, env: Any = None, logs: Any = None) -> Any:
+        seen.update({"cmd": list(cmd), "cwd": Path(cwd), "env": env, "logs": Path(logs)})
+        return FakeProcess([stream_result("sess-log")])
+
+    monkeypatch.setattr(lead.runner, "spawn_process", fake_process)
+    report = lead.run(
+        home,
+        str(deal["id"]),
+        now=NOW,
+        clock=lambda: NOW,
+        monotonic=lambda: 0.0,
+    )
+
+    assert report["started"] is True
+    expected = lead.stream_dir(home, str(deal["id"]), lead.MODE_FIRST, NOW)
+    assert seen["logs"] == expected
+    assert report["session_log"] == str(expected)
+    assert seen["env"][lead.DUTY_HOME_ENV] == str(home)
+    assert seen["env"][lead.HOME_ENV] == str(lead.hermes_root(home))
+
+    conn = open_store(home)
+    started = facts_of(conn, deal, lead.LEAD_KIND_STARTED)
+    conn.close()
+    assert started[0]["session_log"] == str(expected)
+
+
+def test_real_spawn_gives_the_child_both_homes_and_keeps_its_stream(tmp_path: Path, monkeypatch) -> None:
+    """Настоящий спавн: ребёнок видит оба корня, поток ложится файлом.
+
+    Единственный тест, где заход идёт через `runner.Process`, а не через фейк:
+    модель заменена скриптом (`tests/fixtures/fake-hermes.sh`), который говорит
+    те же две строки, что живая сессия в `--format stream-json`. Так проверяется
+    стык, который фейк обходит: переменные доезжают до ребёнка, поток пишется в
+    `<home>/duty/lead/…stream/stdout.log`, а `session_id` и расход берутся из
+    `result` — то есть путь из факта `lead_started.session_log` ведёт к словам
+    лида, а не в пустоту.
+    """
+    home = make_home(tmp_path)
+    spec = write_spec(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    conn.close()
+
+    fake = ROOT / "tests" / "fixtures" / "fake-hermes.sh"
+    assert fake.exists() and os.access(fake, os.X_OK)
+    monkeypatch.setattr(lead.runner, "HERMES_BIN", str(fake))
+
+    report = lead.run(home, str(deal["id"]), now=NOW, clock=lambda: NOW, monotonic=lambda: 0.0)
+
+    assert report["started"] is True
+    assert report["session_id"] == "sess-fake"
+    assert report["usage_tokens"] == 7
+    assert report["reason"] == "exit"
+    stream = Path(report["session_log"])
+    text = (stream / "stdout.log").read_text(encoding="utf-8")
+    assert f'"duty_home":"{home}"' in text
+    assert f'"hermes_home":"{lead.hermes_root(home)}"' in text
+
+    conn = open_store(home)
+    started = facts_of(conn, deal, lead.LEAD_KIND_STARTED)
+    exited = facts_of(conn, deal, lead.LEAD_KIND_EXITED)
+    conn.close()
+    assert started[0]["session_log"] == str(stream)
+    assert exited[0]["session_id"] == "sess-fake"
+    assert exited[0]["usage_tokens"] == 7

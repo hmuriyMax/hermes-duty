@@ -92,6 +92,12 @@ LEAD_KIND_EXITED = "lead_exited"
 # встречается, поэтому строка лида не совпадёт со строкой этапа.
 LEAD_STAGE = "@lead"
 
+# Две переменные окружения захода (`child_env`): корень сессии и корень дела.
+# Имена совпадают с `dashboard/tools.py` (`HOME_ENV`/`DUTY_HOME_ENV`) — это один
+# контракт из двух модулей, и тест сверяет имена, чтобы они не разъехались.
+HOME_ENV = "HERMES_HOME"
+DUTY_HOME_ENV = "HERMES_DUTY_HOME"
+
 # Профиль и скилл сессии лида (`docs/ENGINE-2.0.md`, раздел 2). Модель профиля не
 # выбирается здесь: её задаёт `~/.hermes/profiles/lead/config.yaml`.
 PROFILE = "lead"
@@ -722,6 +728,49 @@ def log_path(home: Path, deal_id: str, now: int) -> Path:
     return lead_dir(home) / f"{deal_id}-supervisor-{int(now)}.log"
 
 
+def stream_dir(home: Path, deal_id: str, mode: str, now: int) -> Path:
+    """Каталог потока сессии: `<deal>-<режим>-<метка>.stream/{stdout,stderr}.log`.
+
+    Зачем отдельный каталог, если модель и так говорит. Поток `hermes chat
+    --format stream-json` — единственное место, где видно **слова лида**: что он
+    решил и почему. До приёмки 2.0 (дело d_eafce375) обёртка вычитывала из него
+    только `session_id` и расход, а остальное выбрасывала, и «покажи вывод лида»
+    было нечем выполнить: в журнале оставались факты, а в логах — ничего.
+    Пишет файлы `runner.Process` (`stdout.log`/`stderr.log`), путь факт
+    `lead_started.session_log` и называет — поверхность берёт его оттуда.
+    """
+    return lead_dir(home) / f"{deal_id}-{mode}-{int(now)}.stream"
+
+
+def hermes_root(home: Path) -> Path:
+    """Корень Hermes, внутри которого лежит *home*: `~/.hermes` для профиля.
+
+    Правило одно и то же у ядра (`hermes_cli.profiles.profile_root_for_env_home`)
+    и здесь: `<корень>/profiles/<имя>` — это профиль, его корень на два уровня
+    выше. Нужен он потому, что `hermes chat -p lead` ищет профиль **внутри**
+    экспортированного `HERMES_HOME`, и унаследованный корень дела (`<корень>`)
+    работал случайно: `-p` видел в нём корень и находил профиль.
+    """
+    home = Path(home)
+    return home.parent.parent if home.parent.name == "profiles" else home
+
+
+def child_env(home: Path) -> dict[str, str]:
+    """Окружение сессии лида: корень сессии и корень дела названы по отдельности.
+
+    Два корня — не украшение. Сессия живёт в профиле (`HERMES_HOME` обязан быть
+    корнем Hermes, иначе `-p lead` не найдёт профиль), а инструменты `duty`
+    обязаны писать в store **дела** — отсюда `$HERMES_DUTY_HOME`
+    (`dashboard/tools.py`, `hermes_home`). Пока переменная одна, движок работает
+    только на корне по умолчанию, а в профильной сессии инструменты ищут дело не
+    там (приёмка 2.0, дело d_eafce375).
+    """
+    env = dict(os.environ)
+    env[HOME_ENV] = str(hermes_root(Path(home)))
+    env[DUTY_HOME_ENV] = str(home)
+    return env
+
+
 def write_query(path: Path, text: str) -> Path:
     """Записать вход сессии на диск: процесс читает файл, а не аргументы."""
     path = Path(path)
@@ -801,7 +850,6 @@ def run(
     budget_sec = DEFAULT_RUN_BUDGET_SEC if run_budget is None else max(1, _int(run_budget))
     clock = clock or time.time
     monotonic = monotonic or time.monotonic
-    spawner = spawn or runner.spawn_process
     moment = _now(now, clock)
 
     conn = deals.open_store(home)
@@ -848,8 +896,15 @@ def run(
             ),
         )
         cmd = command(mode, session_id=str(st["session_id"]), query_file=path)
+        # Поток сессии пишется файлом: слова лида — доказательство, а не
+        # телеметрия (`stream_dir`). Шов `spawn` остаётся двухаргументным:
+        # подменённому спавну каталог лога не нужен, у настоящего он есть.
+        logs = stream_dir(home, str(deal["id"]), mode, moment) if spawn is None else None
         try:
-            process = spawner(cmd, Path(home))
+            if spawn is None:
+                process = runner.spawn_process(cmd, Path(home), env=child_env(home), logs=logs)
+            else:
+                process = spawn(cmd, Path(home))
         except OSError as exc:
             runner.release(conn, deal=deal, stage=LEAD_STAGE, pid=os.getpid())
             raise LeadError(f"спавн сессии лида не удался: {exc}") from exc
@@ -866,6 +921,7 @@ def run(
             "resumes": _int(st["resumes"]) + (1 if mode == MODE_RESUME else 0),
             "cmd": cmd,
             "query_path": str(path),
+            "session_log": str(logs) if logs is not None else None,
             "lease_expires": moment + ttl,
         }
         journal.append(
@@ -983,6 +1039,7 @@ def run(
             "exit_code": exit_code,
             "usage_tokens": tokens,
             "query_path": str(path),
+            "session_log": str(logs) if logs is not None else None,
             "cmd": cmd,
         }
     finally:

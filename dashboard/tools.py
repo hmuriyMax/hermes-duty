@@ -47,6 +47,20 @@ TOOLSET = "duty"
 # решение принял лид, а не движок (`docs/ENGINE-2.0.md`, раздел 9 — лента решений).
 SOURCE = "lead"
 
+# Откуда инструмент берёт корень **дела** (`docs/ENGINE-2.0.md`, раздел 4).
+#
+# Корень дела и корень сессии — разные вещи, и до приёмки 2.0 (дело d_eafce375)
+# они молча смешивались в один `HERMES_HOME`. Сессия лида живёт в профиле
+# (`HERMES_HOME=<корень>/profiles/lead`), а journal и store дела — в корне, куда
+# дело заводили (`<корень>/duty/duty.db`). Поэтому супервизор называет корень
+# дела отдельной переменной (`dashboard/lead.py`, `child_env`), а инструмент
+# читает её первой: иначе `duty_plan` искал бы дело в профиле и отвечал «дела
+# нет в store» на каждом вызове.
+DUTY_HOME_ENV = "HERMES_DUTY_HOME"
+# Корень Hermes сессии — второй источник: без `HERMES_DUTY_HOME` поведение
+# прежнее (`bin/duty demo`, тесты, ручные вызовы).
+HOME_ENV = "HERMES_HOME"
+
 # Сколько попыток дела может идти одновременно (`docs/ENGINE-2.0.md`, раздел 11).
 # Число то же, что у пачки движка (`transit.MAX_PARALLEL`), и проверяется здесь,
 # потому что этапы теперь поднимает лид, а не фолд.
@@ -173,16 +187,24 @@ def _key(idempotency_key: Any) -> str:
 
 
 def hermes_home(home: Optional[Path] = None) -> Path:
-    """Корень Hermes: аргумент, `$HERMES_HOME`, иначе `~/.hermes`.
+    """Корень **дела**: аргумент, `$HERMES_DUTY_HOME`, `$HERMES_HOME`, `~/.hermes`.
 
     Одна точка на все инструменты: журнал, store и лизинги живут в одном
     `<home>/duty/duty.db`, и второй способ их найти разошёлся бы с первым.
+
+    `$HERMES_DUTY_HOME` идёт первым, потому что корень сессии — не корень дела:
+    инструменты лида работают внутри сессии профиля (`HERMES_HOME` там
+    `<корень>/profiles/lead`), а дело заведено в корне Hermes. Супервизор
+    называет этот корень переменной перед спавном (`dashboard/lead.py`,
+    `child_env`); без неё инструмент честно падал бы «дела нет в store» на
+    каждом вызове — ровно это и показала приёмка 2.0 (дело d_eafce375).
     """
     if home is not None:
         return Path(home).expanduser()
-    env = os.environ.get("HERMES_HOME")
-    if env:
-        return Path(env).expanduser()
+    for name in (DUTY_HOME_ENV, HOME_ENV):
+        value = os.environ.get(name)
+        if value:
+            return Path(value).expanduser()
     return Path.home() / ".hermes"
 
 

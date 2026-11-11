@@ -663,3 +663,52 @@ def test_deal_waiting_for_human_is_not_led(tmp_path: Path) -> None:
     assert tick["action"] == "skipped"
     assert "человека" in tick["reason"]
     assert spawned == []
+
+
+# ------------------------------------- 7. дело старого движка: жив его рантайм
+
+
+def test_live_legacy_runtime_is_not_raised_twice(tmp_path: Path) -> None:
+    """Дело ведёт рантайм 0.1.x → сторож не поднимает свой заход поверх него.
+
+    У дела старого движка нет фактов `lead_started`: работу ведёт `bin/duty run`
+    открытой попыткой, и живой pid этой попытки — тот же «лид жив». Мёртвый pid,
+    наоборот, отдаёт дело обычному пути сторожа: первый заход.
+    """
+    home = make_home(tmp_path)
+    spec = write_spec(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    append(
+        conn,
+        deal,
+        (
+            "attempt_started",
+            {"run_id": "implement#1", "stage": "implement", "attempt": 1, "pid": 4242},
+        ),
+    )
+    conn.close()
+
+    spawned: list[str] = []
+    tick = lead.supervise(
+        home,
+        str(deal["id"]),
+        now=NOW + 5,
+        probe=alive,
+        spawn=lambda *args: spawned.append(args[1]) or 1,
+    )
+    assert tick["action"] == "alive"
+    assert tick["lead"]["mode"] == "runtime"
+    assert tick["runtime"]["run_id"] == "implement#1"
+    assert spawned == []
+
+    # Того же дела журнал, но процесса попытки уже нет → сторож поднимает заход.
+    tick = lead.supervise(
+        home,
+        str(deal["id"]),
+        now=NOW + 10,
+        probe=dead,
+        spawn=lambda *args: spawned.append(args[1]) or 1,
+    )
+    assert tick["action"] == "started"
+    assert spawned == [str(deal["id"])]

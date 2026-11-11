@@ -1004,6 +1004,32 @@ def _deal(conn: sqlite3.Connection, deal_id: Any) -> dict[str, Any]:
 # -------------------------------------------------------------- супервизор
 
 
+def _live_runtime(
+    events: list[dict[str, Any]], *, probe: Optional[Callable[[Any], Optional[bool]]] = None
+) -> Optional[dict[str, Any]]:
+    """Живой рантайм старого движка на месте лида.
+
+    До 2.0 дело ведёт `bin/duty run`: он поднимает попытки и пишет
+    `attempt_started`, но фактов `lead_started` у такого дела нет вовсе. Считать
+    это «лида нет» нельзя — сторож 2.0 тогда поднял бы свой заход поверх
+    работающего рантайма, и по делу пошла бы двойная работа. Открытая попытка с
+    живым pid — честный признак, что дело уже ведут.
+    """
+    found = journal._open_attempt(events)
+    if not found:
+        return None
+    _, event = found
+    payload = journal.payload_of(event)
+    pid = payload.get("pid")
+    if not (probe or journal.pid_alive)(pid):
+        return None
+    return {
+        "run_id": str(payload.get("run_id") or ""),
+        "stage": str(payload.get("stage") or ""),
+        "pid": pid,
+    }
+
+
 def _not_led(deal: dict[str, Any], events: list[dict[str, Any]]) -> str:
     """Почему лида не поднимают: закрыто, ждёт человека, ждёт родителей.
 
@@ -1202,6 +1228,19 @@ def supervise(
             }
         if st["live"]:
             return {"deal": str(deal["id"]), "action": "alive", "lead": st, "limit": limit}
+        # Дело, которое ведёт рантайм старого движка (0.1.x): у него нет фактов
+        # `lead_started`, но открытая попытка с живым pid — тот же «лид жив».
+        # Без этой проверки сторож поднял бы второй заход поверх работающего
+        # рантайма и удвоил бы работу по делу.
+        runtime = _live_runtime(events, probe=probe)
+        if runtime:
+            return {
+                "deal": str(deal["id"]),
+                "action": "alive",
+                "lead": {**st, "live": True, "mode": "runtime", "pid": runtime["pid"]},
+                "limit": limit,
+                "runtime": runtime,
+            }
         recovered = _close_dead(conn, deal, events, st, now=moment) if write else None
         if _int(st["resumes"]) >= limit:
             known = _existing_park(events, limit)

@@ -241,6 +241,35 @@ def test_close_without_a_verdict_is_refused(tmp_path: Path) -> None:
     assert "close.verdict" in rules(found)
 
 
+# --------------------------------- 1а. координатор ведёт дело, но не работает
+
+
+def test_coordinator_scope_refuses_a_worker_stage(tmp_path: Path) -> None:
+    """Этап-исполнитель с ролью координатора — отказ `coordinator.scope`.
+
+    Кейс d_48e01a0e: план объявил `check` ролью координатора, и сверка доки с
+    кодом легла в контекст координатора вместо этапа `researcher`.
+    """
+    worker = GOOD.replace(
+        "    workspace: none\n  - id: close\n",
+        "    workspace: none\n  - id: audit\n    role: coordinator\n    needs: [impl]\n"
+        "    workspace: none\n  - id: close\n",
+    )
+    found = issues(tmp_path, worker)
+
+    assert "coordinator.scope" in rules(found)
+    assert any("координатор" in issue.message for issue in found if issue.rule == "coordinator.scope")
+
+
+def test_coordinator_scope_allows_entry_and_close(tmp_path: Path) -> None:
+    """Вход и `close` — ровно те две позиции, где координаторская роль законна."""
+    seed = GOOD.replace("  - id: impl\n    role: implementer\n", "  - id: coordinator\n    role: coordinator\n").replace(
+        "    needs: [impl]", "    needs: [coordinator]"
+    ).replace("changes: impl", "changes: coordinator").replace("role: lead", "role: coordinator")
+
+    assert rules(issues(tmp_path, seed)) == set()
+
+
 # ------------------------------------------ 2. approve закрывает дело решением
 
 

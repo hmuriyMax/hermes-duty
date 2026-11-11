@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 
@@ -132,6 +132,16 @@ CLOSE_STAGE = "close"
 # прежняя роль: seed-спеки до переименования валидны и читаются дальше.
 CLOSE_ROLES = ("coordinator", "lead")
 CLOSE_ROLE = "coordinator"
+
+# Роли координатора — те же, что закрывают дело. Правило `coordinator.scope`
+# (решение Макса, 12.11): координаторская роль допустима только на входном этапе
+# (без `needs`) и на `close`. Работу делает роль-исполнитель, а не координатор.
+# Причина не эстетическая: у профиля `lead` есть чтение, Confluence и GitLab, а
+# терминала и записи нет — координатору дешевле прочитать доку самому, чем
+# растить граф. Так дело d_48e01a0e ушло в `check` ролью координатора вместо
+# этапа `researcher`: 5 этапов researcher на 28 предложенных планов и 3 попытки
+# researcher на 61 дело.
+COORDINATOR_ROLES = ("coordinator", "lead")
 
 # Дефолты хартии (`docs/ENGINE-1.0.md`, раздел 5): без блока `charter` дело
 # живёт по ним, и это ровно поведение 0.0.8 — план никто не предлагает, граф не
@@ -2131,6 +2141,37 @@ def _check_gate_kind(spec: Spec, stage: Stage) -> list[Issue]:
     return issues
 
 
+def _check_coordinator_scope(spec: Spec) -> list[Issue]:
+    """Координатор ведёт дело и закрывает — работу делает роль-исполнитель.
+
+    Допустимы ровно две позиции координаторской роли: входной этап (без `needs`)
+    и `close`. Всё остальное — отказ `coordinator.scope`: этап-исполнитель с
+    ролью координатора означает, что исследование, правку или проверку координатор
+    делает сам, и детали работы переезжают в его контекст вместо контракта роли.
+
+    Правило закрывает и seed, и план (`parse_plan` отказывает тем же кодом): план
+    не добавляет координатора-исполнителя, потому что `needs` у добавленного этапа
+    есть всегда, а `close` в графе уже занят.
+    """
+    issues: list[Issue] = []
+    for stage in spec.stages:
+        if stage.role not in COORDINATOR_ROLES:
+            continue
+        if not stage.needs or stage.id == CLOSE_STAGE:
+            continue
+        issues.append(
+            Issue(
+                spec.path,
+                stage.line_of("role"),
+                "coordinator.scope",
+                f"этап {stage.id!r} с ролью {stage.role!r}: координатор ведёт дело и "
+                f"закрывает, а работу делает роль-исполнитель — координаторская роль "
+                f"допустима только на входе (без needs) и на {CLOSE_STAGE!r}",
+            )
+        )
+    return issues
+
+
 def validate_spec(spec: Spec, *, profiles: Optional[frozenset[str]] = None) -> list[Issue]:
     """Все отказы спеки до запуска: структура, граф, доказательства, адрес вопросов.
 
@@ -2150,6 +2191,7 @@ def validate_spec(spec: Spec, *, profiles: Optional[frozenset[str]] = None) -> l
     issues += _check_evidence(spec)
     issues += _check_verdicts(spec)
     issues += _check_close_stage(spec)
+    issues += _check_coordinator_scope(spec)
     issues += _check_review_gate(spec)
     issues += _check_publish_gate(spec)
     issues += _check_workspace(spec)
@@ -2169,6 +2211,41 @@ def validate_spec(spec: Spec, *, profiles: Optional[frozenset[str]] = None) -> l
 # псевдонимом: `<plan>:1` читается как «в предложении», а не как строка чужого
 # файла. Вызывающий может назвать настоящий путь (файл отчёта), передав `path`.
 PLAN_PATH = "<plan>"
+
+
+# Адрес фактовых вопросов по умолчанию у этапа, который добавляет план (решение
+# Макса, 12.11). Пустой `allowed` — это не «спросить некого», а
+# `human_routing_failed`: фактовый вопрос уходит человеку, и пул заполняется тем,
+# что должен был ответить профиль. Так прошли все 58 вопросов журнала — ни одна
+# спека и ни один план блока `ask` не объявляли (0 из 77 добавленных планом
+# этапов). План объявляет адрес сам: фактовый вопрос — исследователю, властный —
+# человеку (`routing.py`, правило 1: `risky` сильнее любого `allowed`).
+DEFAULT_PLAN_ASK_ALLOWED = ("researcher",)
+DEFAULT_PLAN_ASK_HOPS = 2
+
+
+def _with_default_ask(stage: Stage) -> Stage:
+    """Этап плана без `ask` получает объявленный адрес вопросов.
+
+    Своё имя из `allowed` выбрасывается: роль не отвечает на собственный вопрос
+    (`routing._pick`), и объявлять адресом себя значило бы обещать адрес, которого
+    нет, — такой этап остаётся без дефолта, а его вопрос честно идёт человеку с
+    причиной `allowed_empty`.
+    """
+    if stage.kind != DEFAULT_STAGE_KIND or stage.ask is not None:
+        return stage
+    allowed = tuple(name for name in DEFAULT_PLAN_ASK_ALLOWED if name != stage.role)
+    if not allowed:
+        return stage
+    return replace(
+        stage,
+        ask=Ask(
+            allowed=allowed,
+            to_human="decisions_only",
+            max_hops=DEFAULT_PLAN_ASK_HOPS,
+            line=stage.line,
+        ),
+    )
 
 
 def parse_plan_cost(raw: Any, *, path: Optional[Path] = None) -> tuple[Optional[dict[str, int]], list[Issue]]:
@@ -2306,7 +2383,7 @@ def parse_plan(
                 )
             )
             continue
-        stages.append(stage)
+        stages.append(stage if moving else _with_default_ask(stage))
     known = base | {stage.id for stage in stages}
     # Ссылки проверяются у всех записей, включая перестановки: `needs` и
     # `parallel_with` — ровно то, чем перестановка и распоряжается.
@@ -2372,6 +2449,22 @@ def parse_plan(
                     "в seed-спеке и требует ревью в предках — планом она не добавляется",
                 )
             )
+        if stage.role in COORDINATOR_ROLES:
+            # У добавленного планом этапа `needs` есть всегда, а `close` в графе
+            # уже занят (`plan.id`), — значит координаторская роль здесь означает
+            # этап-исполнитель, который координатор делает сам (кейс d_48e01a0e:
+            # `check` ролью координатора вместо этапа `researcher`).
+            issues.append(
+                Issue(
+                    where,
+                    stage.line,
+                    "coordinator.scope",
+                    f"этап {stage.id!r}: план не добавляет координатора-исполнителя — "
+                    f"работа адресуется роли (researcher, implementer, reviewer…), а "
+                    f"координатор ведёт граф и закрывает дело",
+                )
+            )
+            continue
         if stage.kind == SHELL_KIND and not stage.cmd.strip():
             issues.append(
                 Issue(

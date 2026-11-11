@@ -1975,6 +1975,55 @@ def test_parse_plan_cannot_add_publishing_stage():
     assert "plan.publish" in {issue.rule for issue in found}
 
 
+def test_parse_plan_cannot_add_the_coordinator_as_a_worker():
+    """Координатор ведёт граф, а не работу: этап-исполнитель им — отказ.
+
+    Кейс d_48e01a0e: план объявил `check` ролью координатора, и сверка доки с
+    кодом легла в его контекст вместо этапа `researcher`.
+    """
+    _, found = plan([{"id": "check", "role": "coordinator", "workspace": "none"}])
+    assert "coordinator.scope" in {issue.rule for issue in found}
+    assert any("координатор" in issue.message for issue in found if issue.rule == "coordinator.scope")
+
+
+@pytest.mark.parametrize("role", ["coordinator", "lead"])
+def test_parse_plan_coordinator_scope_covers_the_old_role_name(role: str):
+    """`lead` — прежнее имя того же координатора: правило одно на оба."""
+    _, found = plan([{"id": "check", "role": role, "workspace": "none"}])
+    assert "coordinator.scope" in {issue.rule for issue in found}
+
+
+def test_parse_plan_stage_gets_the_default_question_address():
+    """Этап плана без `ask` получает адрес: фактовый вопрос — исследователю.
+
+    Ни одна спека и ни один план блока `ask` не объявляли (0 из 77 этапов), и все
+    58 вопросов журнала ушли человеку с причиной `allowed_empty`.
+    """
+    stages, found = plan([{"id": "impl", "role": "implementer", "workspace": "none",
+                           "evidence": [{"cmd": "go build ./...", "must": 0}]}])
+    assert found == []
+    address = stages[0].ask
+    assert address is not None
+    assert address.allowed == ("researcher",)
+    assert (address.to_human, address.max_hops) == ("decisions_only", 2)
+
+
+def test_parse_plan_keeps_the_declared_question_address():
+    """Объявленный `ask` плана не переписывается умолчанием."""
+    stages, found = plan([{"id": "impl", "role": "implementer", "workspace": "none",
+                           "evidence": [{"cmd": "go build ./...", "must": 0}],
+                           "ask": {"allowed": [], "max_hops": 0}}])
+    assert found == []
+    assert (stages[0].ask.allowed, stages[0].ask.max_hops) == ((), 0)
+
+
+def test_parse_plan_researcher_is_not_asked_its_own_question():
+    """Роль не отвечает на собственный вопрос: себе адреса умолчание не даёт."""
+    stages, _ = plan([{"id": "research", "role": "researcher", "workspace": "none",
+                       "evidence": [{"cmd": "ls docs", "must": 0}]}])
+    assert stages[0].ask is None
+
+
 def test_parse_plan_cannot_add_a_publishing_command():
     """`git push` в команде плана — тот же запрет, что у спеки: действие, не работа."""
     _, found = plan([{"id": "check", "kind": "shell", "cmd": "git push origin HEAD"}])

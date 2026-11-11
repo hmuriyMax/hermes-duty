@@ -109,8 +109,8 @@ charter:
 
 | инструмент | вход | что делает | факт журнала |
 |---|---|---|---|
-| `duty_plan` | `stages[]`, `reason`, `idempotency_key` | валидирует набор через `parse_plan`, пишет предложение | `plan_proposed` → `plan_accepted` / `plan_rejected` |
-| `duty_start` | `stage_id`, `idempotency_key` | проверяет слоты, бюджет, гейты; поднимает попытку | `attempt_started`/`attempt_ended` (как сейчас) |
+| `duty_plan` | `stages[]`, `reason`, `idempotency_key` | валидирует набор через `parse_plan`, пишет предложение; топологические гейты возвращает в `warnings[]` (не отказ) | `plan_proposed` → `plan_accepted` / `plan_rejected` |
+| `duty_start` | `stage_id`, `idempotency_key` | проверяет слоты, бюджет и **историю публикации** (approve ревьюера, ответ человека на рискованном); поднимает попытку | `attempt_started`/`attempt_ended` (как сейчас) |
 | `duty_wait` | `cursor`, `timeout_sec` | **блокирующий** возврат новых фактов по делу | ничего (чтение) |
 | `duty_answer` | `stage_id`, `question_id`, `text`, `idempotency_key` | ответ воркеру: продолжает его сессию с ответом | `question_answered` (`by: lead`) |
 | `duty_ask` | `role`, `question`, `wait` | под-попытка роли, ответ строкой лиду | `question_asked`/`question_answered` (`by: role`) |

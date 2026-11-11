@@ -100,6 +100,7 @@ STAGEFEED_MODULE_NAME = "hermes_duty_stagefeed"
 BUDGET_MODULE_NAME = "hermes_duty_budget"
 ASK_MODULE_NAME = "hermes_duty_ask"
 ROUTING_MODULE_NAME = "hermes_duty_routing"
+PUBLISH_MODULE_NAME = "hermes_duty_publish"
 
 
 def _load(name: str, filename: str) -> Any:
@@ -126,6 +127,7 @@ stagefeed = _load(STAGEFEED_MODULE_NAME, "stagefeed.py")
 budget = _load(BUDGET_MODULE_NAME, "budget.py")
 ask_module = _load(ASK_MODULE_NAME, "ask.py")
 routing = _load(ROUTING_MODULE_NAME, "routing.py")
+publish = _load(PUBLISH_MODULE_NAME, "publish.py")
 
 
 class ToolsError(RuntimeError):
@@ -480,6 +482,12 @@ def plan(
         {"rev": rev, "idem": key},
         moment,
     )
+    # Топология — подсказка, а не отказ (`docs/ENGINE-2.0.md`, раздел 8): граф
+    # пишет тот же лид, что по нему идёт, и может его переписать, а жёсткая
+    # гарантия живёт в `duty_start` по фактам. Поэтому план без ревью перед
+    # публикацией принимается, но лид видит предупреждение сразу, а не узнаёт о
+    # нём отказом `duty_start` через два этапа.
+    warnings = _plan_warnings(spec, events, proposal, accepted)
     written = journal.append(conn, [proposal, accepted])
     return {
         "ok": True,
@@ -488,9 +496,27 @@ def plan(
         "accepted": True,
         "stages": [stage.id for stage in parsed],
         "graph": [stage.id for stage in transit.graph(spec, journal.read_events(conn, str(deal["id"])))],
+        "warnings": warnings,
         "events": [transit.PLAN_PROPOSED, transit.PLAN_ACCEPTED],
         "written": written,
     }
+
+
+def _plan_warnings(
+    spec: Any, events: Iterable[Any], proposal: dict[str, Any], accepted: dict[str, Any]
+) -> list[str]:
+    """Предупреждения топологии на графе, который план только что произвёл.
+
+    Читается тем же `transit.graph`, что и дело: граф «seed плюс принятый план»
+    нельзя собрать вторым способом — он разошёлся бы с тем, по которому пойдут
+    этапы. Факты ещё не записаны, поэтому предложение и решение подставляются в
+    журнал читателя с номерами сразу после последнего (`id` — и есть порядок).
+    """
+    preview = list(events)
+    head = max((_int(event.get("id")) for event in preview), default=0)
+    preview += [{**proposal, "id": head + 1}, {**accepted, "id": head + 2}]
+    graph = transit.graph_spec(spec, preview)
+    return _issues_text(spec_module.gate_warnings(graph))
 
 
 def _plan_repeat(events: Iterable[Any], proposed: dict[str, Any], key: str) -> dict[str, Any]:
@@ -529,6 +555,91 @@ def _plan_repeat(events: Iterable[Any], proposed: dict[str, Any], key: str) -> d
 # ------------------------------------------------------------------ duty_start
 
 
+def _risky(stage: Any) -> bool:
+    """Этап объявлен рискованным: вопрос человеку обязателен (`ask.risky`).
+
+    Признак тот же, по которому спека требовала ревью в предках (`spec._check_review_gate`):
+    рискованная работа не начинается без ответа человека (`docs/ENGINE-2.0.md`,
+    раздел 8 — «нет ответа — нет старта»).
+    """
+    ask_decl = getattr(stage, "ask", None)
+    return bool(getattr(ask_decl, "risky", False)) if ask_decl is not None else False
+
+
+def _ancestor_probe(spec: Any) -> Optional[Callable[[str, str], Optional[bool]]]:
+    """Родство коммитов по репозиторию дела; `None` — спросить не у кого.
+
+    `publish.py` — слой без git, и родство ему подставляют. Подставляется ровно
+    тот же `git merge-base --is-ancestor`, которым движок сравнивает базы этапов:
+    второй способ решать «предок ли» разошёлся бы с первым. Репозитория нет —
+    `None`, и отказ назовёт «проверить нечем», а не выдумает совпадение.
+    """
+    repo_text = str(getattr(spec, "repo", "") or "").strip()
+    if not repo_text:
+        return None
+    repo = Path(repo_text).expanduser()
+    if not repo.is_dir():
+        return None
+    return lambda older, newer: runner._ancestor(repo, older, newer)
+
+
+def _publish_refusal(spec: Any, stage: Any, events: Iterable[Any]) -> Optional[str]:
+    """Отказ публикации по фактам — или `None`, если попытку поднимать можно.
+
+    Жёсткая гарантия 2.0 (`docs/ENGINE-2.0.md`, раздел 8) живёт здесь, а не в
+    форме графа: граф пишет тот же лид, что по нему идёт, и может его переписать,
+    поэтому «публикация не обгонит ревью» доказывается историей фактов — два
+    приговора, оба из журнала:
+
+    - у публикующего этапа — `publish.review()`: approve ревьюера, его коммит в
+      истории публикуемой базы, и после approve нет возврата на доработку;
+    - у рискованного — `publish.approval()`: ответ человека на гейт вариантом из
+      `allow`, и с момента вопроса дерево не менялось.
+
+    Оба смотрят на **базу публикуемого дерева** (`runner.resolved_base`), то есть
+    на коммит, который действительно уйдёт в origin. Проверка стоит до лизинга и
+    спавна: отказ не пишет фактов и не занимает слот.
+    """
+    publishing = runner.publishes(stage)
+    risky = _risky(stage)
+    if not publishing and not risky:
+        return None
+    events = list(events)
+    try:
+        # База может не сойтись у самого движка (разошедшиеся предшественники):
+        # тогда публиковать не от чего, и это отказ, а не пустая сверка.
+        current = runner.resolved_base(spec, stage, events)
+    except runner.BaseError as exc:
+        return f"этап {stage.id}: {exc}"
+    if publishing:
+        reviewers = [
+            item.id
+            for item in spec.stages
+            if str(getattr(item, "role", "") or "") == spec_module.REVIEWING_ROLE
+        ]
+        approval = publish.review(
+            events, reviewers, current=current, ancestor=_ancestor_probe(spec)
+        )
+        if not approval.ok:
+            return f"этап {stage.id}: {approval.reason}"
+    if not risky:
+        return None
+    gates = runner.publish_gates(spec, stage)
+    if not gates:
+        return (
+            f"этап {stage.id} объявлен рискованным (ask.risky), а гейта "
+            f"(kind: {spec_module.GATE_KIND}) в его предках нет: человека никто не "
+            "спросит — нет ответа, нет старта"
+        )
+    # За рискованным этапом публикации может и не быть: коммит тогда гейт не
+    # называет (`pin=None`), и сверять нечего — но факт ответа человека
+    # требуется так же строго, поэтому `pin` ослабляет только сверку дерева.
+    approval = publish.approval(events, gates, current=current, pin=True if publishing else None)
+    if not approval.ok:
+        return f"этап {stage.id}: {approval.reason}"
+    return None
+
+
 def start(
     deal_id: Any,
     stage_id: Any,
@@ -543,8 +654,9 @@ def start(
 
     Отказы — до спавна и по фактам журнала (`docs/ENGINE-2.0.md`, разделы 5, 8 и
     11): этапа нет в принятом плане; по этапу уже идёт живая попытка; живых
-    попыток в деле не меньше `MAX_SLOTS`; бюджет дела исчерпан. Ни один отказ
-    ничего не пишет — журнал не растёт, слот не занимается.
+    попыток в деле не меньше `MAX_SLOTS`; бюджет дела исчерпан; публикация без
+    приговора ревью (и без ответа человека, если этап рискованный) — `_publish_refusal`.
+    Ни один отказ ничего не пишет — журнал не растёт, слот не занимается.
 
     Попытку исполняет **отдельный процесс в своей группе** (`start_new_session`):
     падение лида не убивает работу, а падение работы не убивает лида
@@ -589,6 +701,12 @@ def start(
             "попытки по нему не поднимаются — вернуть работу можно только новым "
             "этапом в новой ревизии плана"
         )
+    # Публикация проверяется по фактам до лизинга и спавна (раздел 8 контракта):
+    # отказ не пишет события и не занимает слот, а причина называет, какого
+    # именно факта не хватает — «публикация без ревью» видна ДО процесса.
+    refusal = _publish_refusal(graph, stage, events)
+    if refusal is not None:
+        raise ToolsError(refusal)
     moment = int(tick())
     live = _live_attempts(events, moment)
     busy = next((row for row in live if str(row.get("stage") or "") == name), None)

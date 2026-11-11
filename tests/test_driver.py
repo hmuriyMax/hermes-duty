@@ -807,6 +807,9 @@ def test_drive_without_spec_names_the_reason(tmp_path: Path) -> None:
 # движку как есть: цикл в графе давал вечный `wait("gate")` вместо отказа.
 
 # Та же тройка отказов, которую проверяет `bin/duty spec check` (`tests/test_spec.py`).
+# Гейтов топологии здесь нет намеренно: `review-gate`/`publish-gate` — предупреждения
+# (`docs/ENGINE-2.0.md`, раздел 8), а не отказ до первого процесса; их ловит
+# `duty_start` по фактам, и это проверяет `tests/test_publish_history.py`.
 BAD_SPECS = {
     "cycle": """
         duty: probe
@@ -833,16 +836,6 @@ BAD_SPECS = {
           - id: publish
             role: publisher
             needs: [review]
-            workspace: none
-        """,
-    "review-gate": """
-        duty: probe
-        stages:
-          - id: impl
-            role: implementer
-          - id: publish
-            role: publisher
-            needs: [impl]
             workspace: none
         """,
 }
@@ -991,7 +984,7 @@ def test_cli_run_json_refusal_is_a_line_in_errors(
     """`run --json` на негодной спеке: код 1 и строка отказа в `errors[]`."""
     home = make_home(tmp_path)
     conn = open_store(home)
-    spec = write_spec(tmp_path, BAD_SPECS["review-gate"])
+    spec = write_spec(tmp_path, BAD_SPECS["cycle"])
     deal = make_deal(conn, spec_path=spec.path)
     conn.close()
 
@@ -1003,7 +996,7 @@ def test_cli_run_json_refusal_is_a_line_in_errors(
     assert payload["exit_code"] == 1
     assert payload["errors"], payload
     assert all(line.startswith(f"{spec.path}:") for line in payload["errors"]), payload["errors"]
-    assert any("review-gate" in line for line in payload["errors"])
+    assert any("cycle" in line for line in payload["errors"])
 
 
 def test_cli_run_json_prints_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:

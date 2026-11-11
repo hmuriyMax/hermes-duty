@@ -510,8 +510,15 @@ def test_verdict_max_rounds_zero(tmp_path: Path):
 # ------------------------------------------------------------ гейт публикации
 
 
-def test_publish_without_review_is_error(tmp_path: Path):
-    """Публикация прямо от реализации — ровно «PUB обогнал RV»: спека не запускается."""
+def test_publish_without_review_warns_and_does_not_refuse(tmp_path: Path):
+    """Публикация прямо от реализации — предупреждение, а не отказ (ENGINE-2.0 §8).
+
+    Форма графа ничего не гарантирует: граф пишет тот же лид, что по нему идёт, и
+    может его переписать. Поэтому `review-gate` и `publish-gate` остаются
+    подсказкой (`severity: warning`), а отказом становится отсутствие фактов в
+    `duty_start` (`dashboard/publish.py`). Вернуть этим правилам `error` — значит
+    снова отказывать по форме и снова не ловить публикацию без ревью.
+    """
     path = write(
         tmp_path,
         """duty: probe
@@ -525,12 +532,13 @@ stages:
 """,
     )
     found = spec_module.validate_spec(spec_module.load_spec(path), profiles=PROFILES)
-    # Два отказа об одном: нет приговора и нет вопроса человеку. Оба — про этап
-    # публикации и оба с его `file:line`, поэтому проверяются вместе.
+    # Два предупреждения об одном: нет приговора и нет вопроса человеку. Оба — про
+    # этап публикации и оба с его `file:line`, поэтому проверяются вместе.
     assert [(issue.rule, issue.line, issue.severity) for issue in found] == [
-        ("review-gate", 5, "error"),
-        ("publish-gate", 5, "error"),
+        ("review-gate", 5, "warning"),
+        ("publish-gate", 5, "warning"),
     ]
+    assert spec_module.errors(found) == [], "спека годна: отказов нет"
     assert "этап 'publish' публикует, но в его предках нет ревью (role: reviewer)" in found[0].message
     assert str(found[0]).startswith(f"{path}:5: review-gate:")
 
@@ -563,12 +571,12 @@ def test_publish_after_review_is_ok(tmp_path: Path):
     assert found == []
 
 
-def test_publish_without_gate_is_error_even_after_review(tmp_path: Path):
-    """Ревью есть, человека не спросили — публикация не запускается: `publish-gate`.
+def test_publish_without_gate_warns_even_after_review(tmp_path: Path):
+    """Ревью есть, человека не спросили — предупреждение `publish-gate`, не отказ.
 
-    Это приёмка карточки: «спека без `kind: gate` перед `publisher` → `spec check`
-    отказ». Приговор ревьюера его не заменяет — он про дифф, а «ок» публикации
-    даёт человек.
+    Приговор ревьюера гейта не заменяет — он про дифф, а «ок» публикации даёт
+    человек. Но и отказом форма графа больше не приходит: публикацию остановит
+    `duty_start`, не найдя факта ответа (`docs/ENGINE-2.0.md`, раздел 8).
     """
     path = write(
         tmp_path,
@@ -588,12 +596,12 @@ stages:
 """,
     )
     found = spec_module.validate_spec(spec_module.load_spec(path), profiles=PROFILES)
-    assert [issue.rule for issue in found] == ["publish-gate"]
+    assert [(issue.rule, issue.severity) for issue in found] == [("publish-gate", "warning")]
     assert "публикация требует вопроса человеку (kind: gate) в предках" in found[0].message
     assert str(found[0]).startswith(f"{path}:10: publish-gate:")
 
 
-def test_publish_gate_without_allow_is_error(tmp_path: Path):
+def test_publish_gate_without_allow_warns(tmp_path: Path):
     """Гейт без `allow`: продолжением стал бы любой вариант, включая «не публиковать»."""
     path = write(
         tmp_path,
@@ -617,7 +625,7 @@ stages:
 """,
     )
     found = spec_module.validate_spec(spec_module.load_spec(path), profiles=PROFILES)
-    assert [issue.rule for issue in found] == ["publish-gate"]
+    assert [(issue.rule, issue.severity) for issue in found] == [("publish-gate", "warning")]
     assert "не объявляет allow" in found[0].message
     assert str(found[0]).startswith(f"{path}:10: publish-gate:")
 
@@ -700,8 +708,8 @@ def test_every_publishing_role_needs_review(tmp_path: Path, role: str):
     assert [issue.rule for issue in found] == ["review-gate", "publish-gate"]
 
 
-def test_risky_stage_without_review_is_error(tmp_path: Path):
-    """`ask.risky: true` на этапе без ревью в предках — тоже публикация без приговора."""
+def test_risky_stage_without_review_warns(tmp_path: Path):
+    """`ask.risky: true` на этапе без ревью в предках — предупреждение о том же."""
     found = issues(
         tmp_path,
         """
@@ -716,7 +724,7 @@ def test_risky_stage_without_review_is_error(tmp_path: Path):
             ask: {q: "Публикуем diff?", options: ["пушить", "стоп"], risky: true}
         """,
     )
-    assert [issue.rule for issue in found] == ["review-gate"]
+    assert [(issue.rule, issue.severity) for issue in found] == [("review-gate", "warning")]
     assert "этап 'ask'" in found[0].message
 
 
@@ -1355,7 +1363,9 @@ stages:
     code, out = run_cli(["spec", "check", str(path)], capsys)
     assert code == 1
     assert f"{path}:8: verdict.changes:" in out
-    assert out.strip().endswith("предупреждений 0")
+    # Предупреждение здесь одно и оно честное: гейта перед публикацией в спеке нет
+    # (`publish-gate` — подсказка, а не отказ, `docs/ENGINE-2.0.md`, раздел 8).
+    assert out.strip().endswith("предупреждений 1")
 
 
 def test_cli_check_json_shape(capsys, tmp_path: Path):

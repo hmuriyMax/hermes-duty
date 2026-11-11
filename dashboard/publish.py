@@ -4,10 +4,17 @@
 второго пути мимо этапа (`spec.FORBIDDEN_CMD_PREFIXES`). Движок делает две вещи,
 и обе — проверки:
 
-1. **Перед спавном** публикующего этапа сверяет журнал: гейт-предок спросил
-   человека, человек ответил «ок», и с момента ответа дерево не менялось. Иначе
-   человек одобрил один коммит, а публикуется другой — это отказ `contract` с
-   цитатой «одобрен commit X, в дереве Y».
+1. **Перед спавном** публикующего этапа сверяет журнал двумя приговорами, и оба
+   берутся из фактов, а не из формы графа (`docs/ENGINE-2.0.md`, раздел 8):
+
+   - `review()` — приговор ревью: есть `collected` от этапа с ролью `reviewer`,
+     его `commit` совпадает с базой публикуемого дерева или является её предком,
+     и после него нет `changes_requested` по тому же этапу. Иначе человек или
+     ревьюер одобрили одно дерево, а публикуется другое;
+   - `approval()` — ответ человека на гейт: гейт-предок спросил, человек ответил
+     вариантом из `allow`, и с момента вопроса дерево не менялось.
+
+   Иначе — отказ `contract` с цитатой («одобрен commit X, в дереве Y»).
 2. **После отчёта** сверяет заявку с origin: `published: {sha, branch, mr_url}` в
    `result.json` — слова исполнителя, а факт даёт `git ls-remote`
    (`runner.published_claim`). Нет заявленного sha в origin — класс `contract`,
@@ -17,14 +24,16 @@
 
 Почему это отдельный слой. Здесь нет ни git, ни БД, ни часов: на вход — события
 журнала, ответ гейта и текущий коммит дерева, на выход — `Approval` или причина
-отказа. Поэтому правило «одобрен один, публикуется другой» проверяется без
-репозитория и без модели, а `dashboard/runner.py` только исполняет его.
+отказа. Даже родство коммитов спрашивается у вызывающего (`ancestor`), поэтому
+правило «одобрен один, публикуется другой» проверяется без репозитория и без
+модели, а `dashboard/runner.py` только исполняет его.
 
 Одобренный коммит — факт **вопроса**, а не ответа: его записывает движок в
 `question_asked.payload.routing.approved_commit`, когда гейт спрашивает (в этот
 момент он и есть дерево, которое публикуется). Ответ приходит позже, и к этому
 времени дерево уже могло измениться: сверка двух коммитов и есть защита от
-подмены.
+подмены. У приговора ревью такой сверки не было вовсе — публикация обгоняла
+ревью молча; её и закрывает `review()`.
 """
 
 from __future__ import annotations
@@ -33,7 +42,7 @@ import importlib.util
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 JOURNAL_MODULE_NAME = "hermes_duty_journal"
 
@@ -64,6 +73,12 @@ EXPIRED_VIA = "expired"
 # Вид этапа-гейта: вопрос человеку, а не процесс.
 GATE_KIND = "gate"
 
+# Приговоры ревью: слова берутся у журнала, а не переписываются здесь — писатель
+# факта (`runner.report_verdict`) и читатель гейта обязаны называть одобрение
+# одинаково (`journal.VERDICT_FACTS`).
+REVIEW_APPROVE = _journal().VERDICT_APPROVE
+REVIEW_CHANGES = _journal().VERDICT_CHANGES
+
 # Исход успешной попытки — тот же набор, по которому `transit` считает этап `done`.
 OK_OUTCOMES = ("done",)
 
@@ -91,6 +106,12 @@ class Approval:
     `ok=False` — `reason` называет отказ словами, и он уходит в журнал как класс
     `contract`: публикация без «ок» — не сбой исполнителя, а невыполненное
     условие движка.
+
+    `reviewer` — этап-ревьюер, чей приговор одобрил публикацию (`review()`), а
+    `gate` — этап-гейт, спросивший человека (`approval()`). Поля разные, потому
+    что одобряют публикацию двое и разными фактами: приговор роли и ответ
+    человека; одним полем называть их значило бы путать, какой именно факт
+    проверен.
     """
 
     ok: bool
@@ -99,6 +120,7 @@ class Approval:
     gate: str = ""
     commit: str = ""
     answer: str = ""
+    reviewer: str = ""
 
 
 def _payload(event: Any) -> dict[str, Any]:
@@ -195,13 +217,25 @@ def origin_hits(refs: Iterable[tuple[str, str]], sha: Any) -> list[tuple[str, st
     return sorted(hits.items())
 
 
-def approval(events: Iterable[Any], gates: Iterable[str], *, current: str) -> Approval:
+def approval(
+    events: Iterable[Any],
+    gates: Iterable[str],
+    *,
+    current: str,
+    pin: Optional[bool] = True,
+) -> Approval:
     """Одобрение публикации по журналу: последний вопрос гейта-предка и его ответ.
 
     `gates` — этапы-гейты в предках публикующего этапа (по графу спеки),
     `current` — коммит, от которого сейчас отведётся дерево публикации. Берётся
     **последний** вопрос: если человек отвечал дважды, действует последнее «ок»,
     и одобрен именно тот коммит, который стоял в дереве на момент этого вопроса.
+
+    `pin` — сверять ли дерево с коммитом, который назвал гейт. `True`
+    (публикация): гейт обязан назвать коммит, и дерево обязано с ним совпасть.
+    `None` (рискованный этап, за которым публикации нет): коммита гейт не
+    называет — сверять нечего, и ответ человека принимается без сверки дерева,
+    но факт ответа спрашивается так же строго.
 
     Порядок отказов — от «вопроса не было» к «одобрено одно, публикуется другое»:
     каждый следующий имеет смысл, только если предыдущий пройден.
@@ -229,7 +263,7 @@ def approval(events: Iterable[Any], gates: Iterable[str], *, current: str) -> Ap
     question_id = _qid(payload)
     gate = str(routing.get("stage") or "")
     approved = str(routing.get("approved_commit") or "")
-    if not approved:
+    if not approved and pin:
         return Approval(
             ok=False,
             gate=gate,
@@ -288,7 +322,7 @@ def approval(events: Iterable[Any], gates: Iterable[str], *, current: str) -> Ap
             answer=given,
             reason=f"человек не дал ок: гейт {gate} — {str(ended.get('reason') or 'ответ вне allow')}",
         )
-    if not current or not same_commit(current, approved):
+    if approved and (not current or not same_commit(current, approved)):
         return Approval(
             ok=False,
             gate=gate,
@@ -309,6 +343,189 @@ def approval(events: Iterable[Any], gates: Iterable[str], *, current: str) -> Ap
         commit=approved,
         answer=given,
     )
+
+
+def reviewed_commit(events: Iterable[Any], stage: str, attempt: int, up_to: int) -> str:
+    """Коммит, который видело ревью: `commit` факта `attempt_ended` его попытки.
+
+    Движок фиксирует работу попытки коммитом в её дереве (`runner.commit_tree`), и
+    у ревьюера этот коммит — то, что он прочёл: ревьюер ничего не меняет, поэтому
+    `HEAD` его дерева и есть просмотренное дерево. Второй источник — `commit`
+    самого отчёта (исполнитель вправе закоммитить сам).
+
+    `attempt` — номер попытки из приговора; нулевой (старый журнал, приговор без
+    номера) читается как «последняя попытка этого этапа до приговора». Берутся
+    только факты **не позже** приговора (`up_to`): приговор одного раунда не
+    должен одобряться коммитом следующего.
+    """
+    found = ""
+    for event in _ordered(events):
+        if str(event.get("kind") or "") != "attempt_ended":
+            continue
+        if _seq(event) > int(up_to or 0):
+            continue
+        payload = _payload(event)
+        if str(payload.get("stage") or "") != str(stage):
+            continue
+        if attempt and _number(payload.get("attempt")) != attempt:
+            continue
+        found = _commit_of(payload) or found
+    return found
+
+
+def _commit_of(payload: dict[str, Any]) -> str:
+    """Коммит попытки из её факта: `payload.commit`, иначе `result.commit`."""
+    commit = payload.get("commit")
+    if isinstance(commit, str) and commit.strip():
+        return commit.strip()
+    result = payload.get("result")
+    if isinstance(result, dict):
+        commit = result.get("commit")
+        if isinstance(commit, str) and commit.strip():
+            return commit.strip()
+    return ""
+
+
+def _number(value: Any) -> int:
+    """Целое из payload: `True` и мусор — нулём (номер попытки не угадывается)."""
+    if value is None or isinstance(value, bool):
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def review(
+    events: Iterable[Any],
+    reviewers: Iterable[str],
+    *,
+    current: str,
+    ancestor: Optional[Callable[[str, str], Optional[bool]]] = None,
+) -> Approval:
+    """Одобрение публикации приговором ревью: последний `collected` и что он видел.
+
+    Жёсткая гарантия 2.0 (`docs/ENGINE-2.0.md`, раздел 8) стоит на фактах, а не на
+    форме графа: граф пишет тот же лид, что по нему идёт, и может его переписать.
+    Поэтому перед спавном публикующего этапа проверяется история:
+
+    1. в журнале есть `collected` (approve) от этапа, чья роль — `reviewer`
+       (`reviewers` — id таких этапов графа дела; роль этапа планом и объявлена);
+    2. приговор называет попытку, и её `commit` — тот коммит, который ревью
+       просмотрело. Он обязан совпасть с `current` (базой публикуемого дерева) или
+       быть её **предком**: ревью могло случиться раньше последнего коммита, но не
+       может быть про другую линию;
+    3. после этого приговора нет `changes_requested` по тому же этапу: вердикт
+       «на доработку» отменяет прежнее «ок», иначе публикация поехала бы по
+       одобрению, которое ревьюер уже забрал.
+
+    `ancestor(older, newer)` — родство коммитов; его подставляет вызывающий
+    (`git merge-base --is-ancestor`), потому что в этом слое нет ни git, ни БД:
+    сюда приходят только факты журнала. `None` — родство проверить нечем, и это
+    отказ: «не проверили» не равно «совпало».
+
+    Порядок отказов — от «приговора не было» к «приговор не про это дерево».
+    """
+    roles = {str(item) for item in reviewers or () if str(item)}
+    rows = _ordered(events)
+    approve: Optional[dict[str, Any]] = None
+    reviewed: Optional[dict[str, Any]] = None
+    changed: dict[str, int] = {}
+    for event in rows:
+        kind = str(event.get("kind") or "")
+        if kind not in (REVIEW_APPROVE, REVIEW_CHANGES):
+            continue
+        payload = _payload(event)
+        stage = str(payload.get("stage") or "")
+        if kind == REVIEW_CHANGES:
+            changed[stage] = _seq(event)
+            continue
+        approve = event
+        if stage in roles:
+            reviewed = event
+    if approve is None:
+        return Approval(
+            ok=False,
+            reason=(
+                "публикация без одобрения ревью: в журнале нет факта "
+                f"{REVIEW_APPROVE} — публиковать нечего"
+            ),
+        )
+    if reviewed is None:
+        stage = str(_payload(approve).get("stage") or "")
+        named = ", ".join(sorted(roles)) or "—"
+        return Approval(
+            ok=False,
+            reviewer=stage,
+            reason=(
+                f"approve пришёл от этапа {stage or '—'}, а его роль не reviewer: "
+                f"публикацию одобряет приговор ревьюера (этапы с этой ролью: {named})"
+            ),
+        )
+    payload = _payload(reviewed)
+    stage = str(payload.get("stage") or "")
+    attempt = _number(payload.get("attempt"))
+    commit = reviewed_commit(rows, stage, attempt, _seq(reviewed))
+    if changed.get(stage, 0) > _seq(reviewed):
+        return Approval(
+            ok=False,
+            reviewer=stage,
+            commit=commit,
+            reason=(
+                f"ревьюер {stage} вернул работу на доработку после approve: "
+                f"действует {REVIEW_CHANGES}, а не прежнее «ок»"
+            ),
+        )
+    if not commit:
+        return Approval(
+            ok=False,
+            reviewer=stage,
+            reason=(
+                f"приговор ревьюера {stage} не называет коммит, который он видел: "
+                "сверять публикацию не с чем"
+            ),
+        )
+    if not current:
+        return Approval(
+            ok=False,
+            reviewer=stage,
+            commit=commit,
+            reason="база публикуемого дерева не названа: сверять одобрение ревью не с чем",
+        )
+    if same_commit(commit, current):
+        return Approval(ok=True, reviewer=stage, commit=commit)
+    if ancestor is None:
+        return Approval(
+            ok=False,
+            reviewer=stage,
+            commit=commit,
+            reason=(
+                f"ревью видело commit {commit[:SHORT_SHA]}, публикуется "
+                f"{current[:SHORT_SHA]}: родство коммитов проверить нечем"
+            ),
+        )
+    related = ancestor(commit, current)
+    if related is None:
+        return Approval(
+            ok=False,
+            reviewer=stage,
+            commit=commit,
+            reason=(
+                f"git не ответил, предок ли commit {commit[:SHORT_SHA]} для "
+                f"{current[:SHORT_SHA]}: без ответа публикация не начинается"
+            ),
+        )
+    if not related:
+        return Approval(
+            ok=False,
+            reviewer=stage,
+            commit=commit,
+            reason=(
+                f"ревью видело commit {commit[:SHORT_SHA]}, а публикуемая база "
+                f"{current[:SHORT_SHA]}: одобренный коммит не в её истории"
+            ),
+        )
+    return Approval(ok=True, reviewer=stage, commit=commit)
 
 
 def claim(result: Any) -> tuple[Optional[dict[str, str]], str]:

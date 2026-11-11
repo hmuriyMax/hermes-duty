@@ -2884,10 +2884,15 @@ function journalBars(events, crashes) {
  * Живой этап помечается `live`, и поверхности анимируют обводку: граф не должен
  * выглядеть застывшей картинкой, пока попытка идёт.
  */
-function specView(rawStages) {
-  const stages = (Array.isArray(rawStages) ? rawStages : []).map(shapeStage)
-  if (!stages.length) return null
-  const byId = new Map(stages.map((stage) => [stage.id, stage]))
+/**
+ * Глубина этапа в графе зависимостей: 0 — ни от кого не зависит, дальше — на
+ * единицу глубже самого глубокого требования. Это порядок столбцов графа, и он
+ * же — порядок дорожек шкалы: одна формула на обе поверхности, иначе «последний
+ * в графе» и «последний в шкале» разъезжаются.
+ */
+function stageDepths(rawStages) {
+  const stages = (Array.isArray(rawStages) ? rawStages : []).map((stage) => stage && typeof stage === 'object' ? stage : {})
+  const byId = new Map(stages.map((stage) => [String(stage.id || ''), stage]))
   const depths = new Map()
   const depthOf = (id, trail) => {
     if (depths.has(id)) return depths.get(id)
@@ -2895,15 +2900,26 @@ function specView(rawStages) {
     if (trail.has(id)) return 0
     trail.add(id)
     const stage = byId.get(id)
-    const needs = stage ? stage.needs.filter((need) => byId.has(need)) : []
+    const needs = stage && Array.isArray(stage.needs) ? stage.needs.map(String).filter((need) => byId.has(need)) : []
     const depth = needs.length ? Math.max(...needs.map((need) => depthOf(need, trail) + 1)) : 0
     trail.delete(id)
     depths.set(id, depth)
     return depth
   }
+  for (const id of byId.keys()) depthOf(id, new Set())
+  return depths
+}
+
+function specView(rawStages) {
+  const stages = (Array.isArray(rawStages) ? rawStages : []).map(shapeStage)
+  if (!stages.length) return null
+  const byId = new Map(stages.map((stage) => [stage.id, stage]))
+  // Глубина — та же, по которой считаются дорожки шкалы (`stageDepths`): иначе
+  // «последний в графе» и «последний в шкале» разъезжаются.
+  const depths = stageDepths(stages)
   const columns = []
   const nodes = stages.map((stage) => {
-    const depth = depthOf(stage.id, new Set())
+    const depth = depths.get(stage.id) ?? 0
     const row = columns[depth] === undefined ? 0 : columns[depth]
     columns[depth] = row + 1
     const attempts = Array.isArray(stage.attempts) ? stage.attempts : []
@@ -3169,18 +3185,41 @@ function shapeDealTime(detail, attemptsPayload) {
     const seen = firstStart.get(bar.laneKey)
     if (seen === undefined || start < seen) firstStart.set(bar.laneKey, start)
   }
-  const laneOrder = [...graphKeys]
-  for (const bar of [...bars].sort((left, right) => (left.start || 0) - (right.start || 0))) {
-    if (bar.laneKey && !laneOrder.includes(bar.laneKey)) laneOrder.push(bar.laneKey)
-  }
+  // Порядок дорожек — порядок ГРАФА, а не хронология: `close` встаёт последним,
+  // даже если его попытка падала в самом начале (Макс, 11.11: «close опять не в
+  // самом низу, хотя по порядку графа он последний»). Глубина зависимости — тот
+  // же порядок, в котором этапы стоят столбцами графа; на равной глубине решает
+  // положение в `stages[]`.
+  const depths = stageDepths(Array.isArray(d.stages) ? d.stages : [])
   const graphPos = new Map(graphKeys.map((key, index) => [key, index]))
-  laneOrder.sort((left, right) => {
-    const leftStart = firstStart.has(left) ? firstStart.get(left) : Infinity
-    const rightStart = firstStart.has(right) ? firstStart.get(right) : Infinity
-    if (leftStart !== rightStart) return leftStart - rightStart
-    // Равный старт (параллельные) и никогда не работавшие — в порядке графа.
-    return (graphPos.has(left) ? graphPos.get(left) : graphKeys.length) - (graphPos.has(right) ? graphPos.get(right) : graphKeys.length)
-  })
+  const laneOrder = graphKeys
+    .filter((key, index) => graphKeys.indexOf(key) === index)
+    .sort((left, right) => {
+      const leftDepth = depths.has(left) ? depths.get(left) : 0
+      const rightDepth = depths.has(right) ? depths.get(right) : 0
+      if (leftDepth !== rightDepth) return leftDepth - rightDepth
+      return graphPos.get(left) - graphPos.get(right)
+    })
+  // Этапы вне графа (попытка без спеки, дело без графа, этап, добавленный планом
+  // раньше спеки) встают по своей хронологии: перед первым этапом графа, который
+  // начался позже, иначе в хвост. Так хронология сохраняется там, где порядок
+  // неизвестен, и не спорит с графом там, где он есть.
+  const extras = [...new Set(bars.map((bar) => bar.laneKey))]
+    .filter((key) => key && !graphPos.has(key))
+    .sort((left, right) => {
+      const leftStart = firstStart.has(left) ? firstStart.get(left) : Infinity
+      const rightStart = firstStart.has(right) ? firstStart.get(right) : Infinity
+      return leftStart - rightStart
+    })
+  for (const extra of extras) {
+    const start = firstStart.has(extra) ? firstStart.get(extra) : Infinity
+    const at = laneOrder.findIndex((key) => {
+      const keyStart = firstStart.has(key) ? firstStart.get(key) : Infinity
+      return keyStart > start
+    })
+    if (at < 0) laneOrder.push(extra)
+    else laneOrder.splice(at, 0, extra)
+  }
   for (const key of laneOrder) addLane(key)
   for (const bar of bars) {
     bar.lane = laneIndex.get(bar.laneKey) ?? 0
@@ -3461,7 +3500,17 @@ function shapeDealTime(detail, attemptsPayload) {
       // Ширина дорожки в экранах (Макс, 09.11: «максимальную ширину таймлайна
       // в час»): масштаб оси замораживается на «вьюпорт = час», более длинное
       // дело не сжимается, а листается по горизонтали. `1` — всё влезло.
-      zoom: durationSec === null ? 1 : Math.max(1, Math.round((durationSec / 3600) * 100) / 100),
+      //
+      // Час считается по времени работы, а не по календарю: простой сжат в
+      // `idleCompressedPct` процентов оси, и зум по календарной длительности давал
+      // на экран 20 минут работы вместо часа (Макс, 11.11). Активная доля оси —
+      // `100 − compressedPct`, поэтому экран — час активного времени.
+      zoom: durationSec === null
+        ? 1
+        : Math.max(
+            1,
+            Math.round((Math.max(0, durationSec - idleTotalSec) / (3600 * Math.max(0.05, 1 - idleCompressedPct / 100))) * 100) / 100,
+          ),
       live,
       text: axisStart === null || axisEnd === null ? 'времени в журнале нет' : `${fmtClockShort(axisStart)}–${fmtClockShort(axisEnd)}`,
       ticks: axisTicks,

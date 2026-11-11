@@ -995,31 +995,43 @@ test('шкала времени: смещение полосы — от нача
   assert.equal(scale.bars[0].ariaLabel, scale.bars[0].title)
 })
 
-test('шкала времени: дорожки в порядке работы, а не в порядке спеки', () => {
-  // Спека перечисляет plan → impl → review, но работа шла impl → review → plan:
-  // дорожка этапа встаёт по моменту первой попытки (Макс, 09.11: «располагай на
-  // шкале времени этапы в порядке их работы, как на графе спеки»).
+test('шкала времени: дорожки — в порядке графа, старт решает только для этапов вне графа', () => {
+  // Макс, 11.11: «close опять не в самом низу, хотя по порядку графа он
+  // последний». Порядок дорожек — порядок графа (глубина зависимостей, затем
+  // положение в `stages[]`), а не хронология: упавшая в самом начале попытка
+  // закрытия не поднимает этап наверх.
   const detail = {
     now: 900,
     status: 'running',
     terminal: false,
     timeline: [{ kind: 'created', at: 100, summary: '' }],
-    stages: [{ id: 'plan' }, { id: 'impl' }, { id: 'review' }],
+    stages: [
+      { id: 'coordinator', needs: [] },
+      { id: 'close', needs: ['coordinator'] },
+    ],
   }
   const attempts = {
     attempts: [
-      { run_id: 'impl#1', stage: 'impl', start: 300, end: 400, outcome: 'done', calls: [] },
-      { run_id: 'review#1', stage: 'review', start: 420, end: 500, outcome: 'failed', calls: [] },
-      { run_id: 'plan#1', stage: 'plan', start: 550, end: 650, outcome: 'done', calls: [] },
+      { run_id: 'close#1', stage: 'close', start: 300, end: 400, outcome: 'failed', calls: [] },
+      { run_id: 'coordinator#1', stage: 'coordinator', start: 420, end: 500, outcome: 'done', calls: [] },
     ],
   }
   const scale = shapeDealTime(detail, attempts)
-  assert.deepEqual(scale.lanes.map((lane) => lane.key), ['impl', 'review', 'plan'])
-  // Этап, который ещё не начинался, виден дорожкой — но в хвосте, в порядке графа:
-  // дорожек столько, сколько этапов, и «не начинался» — факт, а не отсутствие.
-  const idle = shapeDealTime({ ...detail, stages: [{ id: 'plan' }, { id: 'impl' }, { id: 'later' }] }, attempts)
-  assert.deepEqual(idle.lanes.map((lane) => lane.key), ['impl', 'review', 'plan', 'later'])
-  // Параллельные этапы стартуют в одну секунду: равные — в порядке графа.
+  assert.deepEqual(scale.lanes.map((lane) => lane.key), ['coordinator', 'close'], 'close не последний, хотя он последний в графе')
+  // Цепочка зависимостей задаёт глубину: план → дело → проверка.
+  const chain = shapeDealTime(
+    {
+      ...detail,
+      stages: [
+        { id: 'verify', needs: ['impl'] },
+        { id: 'plan', needs: [] },
+        { id: 'impl', needs: ['plan'] },
+      ],
+    },
+    { attempts: [{ run_id: 'verify#1', stage: 'verify', start: 300, end: 400, outcome: 'done', calls: [] }] },
+  )
+  assert.deepEqual(chain.lanes.map((lane) => lane.key), ['plan', 'impl', 'verify'])
+  // Параллельные этапы на одной глубине — в порядке `stages[]`.
   const parallel = shapeDealTime(
     { ...detail, stages: [{ id: 'review' }, { id: 'impl' }] },
     {
@@ -1029,7 +1041,59 @@ test('шкала времени: дорожки в порядке работы, 
       ],
     },
   )
-  assert.deepEqual(parallel.lanes.map((lane) => lane.key), ['review', 'impl'], 'при равном старте порядок графа не удержан')
+  assert.deepEqual(parallel.lanes.map((lane) => lane.key), ['review', 'impl'], 'при равной глубине порядок графа не удержан')
+  // Этап, которого в графе нет, держится своей хронологии: перед первым этапом
+  // графа, который начался позже, иначе в хвосте. Порядок графа он не ломает.
+  const extra = shapeDealTime(
+    { ...detail, stages: [{ id: 'plan' }] },
+    {
+      attempts: [
+        { run_id: 'later#1', stage: 'later', start: 600, end: 700, outcome: 'done', calls: [] },
+        { run_id: 'other#1', stage: 'other', start: 200, end: 300, outcome: 'done', calls: [] },
+        { run_id: 'plan#1', stage: 'plan', start: 300, end: 400, outcome: 'done', calls: [] },
+      ],
+    },
+  )
+  assert.deepEqual(extra.lanes.map((lane) => lane.key), ['other', 'plan', 'later'], 'этап вне графа потерял своё место по времени')
+})
+
+test('шкала времени: экран ~ час активной работы, простой не съедает кадр', () => {
+  // Макс, 11.11: «ширина таймлайна при прокрутке составляет минут 20, хотя я
+  // просил делать час». Зум считался по календарной длительности, а простой на
+  // оси сжат: экран показывал 20 минут работы вместо часа. Теперь час считается
+  // по времени работы.
+  const T0 = 1000
+  const detail = {
+    now: T0 + 19_000,
+    status: 'running',
+    terminal: false,
+    timeline: [{ kind: 'created', at: T0, summary: '' }],
+    stages: [],
+  }
+  // Час работы, потом три часа простоя, потом ещё час работы.
+  const attempts = {
+    attempts: [
+      { run_id: 'a#1', stage: 'a', start: T0, end: T0 + 3600, outcome: 'done', calls: [] },
+      { run_id: 'a#2', stage: 'a', start: T0 + 14_400, end: T0 + 18_000, outcome: 'done', calls: [] },
+    ],
+  }
+  const scale = shapeDealTime(detail, attempts)
+  // Ось тянется до «сейчас»: два часа работы плюс три часа простоя.
+  assert.equal(scale.axis.spanSec, 19_000)
+  assert.ok(scale.idle.totalSec > 10_000, `простой не сжат: ${scale.idle.totalSec}`)
+  // Календарных 5 часов, работы 2 — значит делим на календарь нельзя.
+  assert.ok(scale.axis.zoom < 5 / 3600 * 3600, `зум по календарю: ${scale.axis.zoom}`)
+  const screenPct = 100 / scale.axis.zoom
+  let lo = scale.axis.end
+  for (let t = scale.axis.end; t > scale.axis.start; t -= 1) {
+    if (scale.pctOf(scale.axis.end) - scale.pctOf(t) >= screenPct) { lo = t; break }
+  }
+  const covered = scale.axis.end - lo
+  // Час работы плюс хвост «сейчас» после последней попытки (ось тянется до now,
+  // и этот хвост — не простой, а незакрытое дело). Календарных 5 ч 17 м в кадр
+  // не влезают: до фикса экран покрывал 20 минут работы.
+  assert.ok(covered > 3400 && covered < 4800, `экран покрывает ${covered} с работы, а не час`)
+  assert.ok(scale.axis.zoom < 5.28, `зум посчитан по календарю: ${scale.axis.zoom}`)
 })
 
 test('шкала времени: у меток оси есть момент времени — устойчивый ключ поверхностей', () => {

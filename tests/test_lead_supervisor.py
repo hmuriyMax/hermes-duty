@@ -668,7 +668,7 @@ def test_deal_waiting_for_human_is_not_led(tmp_path: Path) -> None:
     assert spawned == []
 
 
-# ------------------------------------- 7. дело старого движка: жив его рантайм
+# ----------------------------------- 7. дело, которое ведут руками: чужой драйвер
 
 
 def test_live_legacy_runtime_is_not_raised_twice(tmp_path: Path) -> None:
@@ -695,6 +695,7 @@ def test_live_legacy_runtime_is_not_raised_twice(tmp_path: Path) -> None:
     )
     conn.close()
 
+    no_ps = lambda: ""
     spawned: list[str] = []
     tick = lead.supervise(
         home,
@@ -702,20 +703,53 @@ def test_live_legacy_runtime_is_not_raised_twice(tmp_path: Path) -> None:
         now=NOW + 5,
         probe=alive,
         spawn=lambda *args: spawned.append(args[1]) or 1,
+        ps=no_ps,
     )
     assert tick["action"] == "alive"
     assert tick["lead"]["mode"] == "runtime"
     assert tick["runtime"]["run_id"] == "implement#1"
     assert spawned == []
 
-    # Тот же журнал, но процесс попытки уже мёртв → не поднимаем лида 2.0.
+    # Процесс попытки мёртв, ручного драйвера нет, хартии у дела нет → не наш заход.
     tick = lead.supervise(
         home,
         str(deal["id"]),
         now=NOW + 10,
         probe=dead,
         spawn=lambda *args: spawned.append(args[1]) or 1,
+        ps=no_ps,
     )
     assert tick["action"] == "skipped"
-    assert "старого движка" in tick["reason"]
+    assert spawned == []
+
+
+def test_deal_driven_by_hand_is_left_to_its_driver(tmp_path: Path) -> None:
+    """Живой цикл `bin/duty run <deal>` в терминале → сторож не поднимает лида.
+
+    Между заходами цикла pid попытки мёртв и лизинга нет: по журналу дело выглядит
+    осиротевшим, но драйвер у него есть — человек. Второй драйвер (лид 2.0) дал бы
+    двойную работу по делу.
+    """
+    home = make_home(tmp_path)
+    spec = write_spec(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    deal_id = str(deal["id"])
+    append(conn, deal, ("attempt_started", {"run_id": "implement#1", "stage": "implement", "attempt": 1, "pid": 4242}))
+    conn.close()
+
+    ps = lambda: (
+        f"   1 /sbin/launchd\n15283 /bin/zsh -lic cd repo && for i in 1 2; do bin/duty run {deal_id}; sleep 40; done\n"
+    )
+    spawned: list[str] = []
+    tick = lead.supervise(
+        home,
+        deal_id,
+        now=NOW + 30,
+        probe=dead,
+        spawn=lambda *args: spawned.append(args[1]) or 1,
+        ps=ps,
+    )
+    assert tick["action"] == "skipped"
+    assert tick["manual_pid"] == 15283
     assert spawned == []

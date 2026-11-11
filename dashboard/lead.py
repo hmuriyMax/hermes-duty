@@ -1029,15 +1029,43 @@ def _live_runtime(
     }
 
 
-def _legacy_driven(events: list[dict[str, Any]]) -> bool:
-    """Дело ведёт рантайм старого движка, а не лид 2.0.
+def _manual_driver(deal_id: str, *, ps: Optional[Callable[[], str]] = None) -> Optional[int]:
+    """pid живого ручного рантайма `bin/duty run <deal>` — если дело ведут руками.
 
-    Признак один и он в журнале: у дела 2.0 заведена хартия (`created.payload.spec`),
-    у дел 0.1.x её нет вовсе — этапность жила в самой спеке, и поднимал их
-    `bin/duty run`. Такое дело сторож не трогает ни с живым, ни с мёртвым pid:
-    два движка на одном деле дали бы двойную работу и две правды в журнале.
+    Делo может крутить не сторож, а человек: `bin/duty run`, в том числе циклом из
+    терминала (`for i in …; do bin/duty run <deal>; sleep 40; done`). Между
+    заходами pid попытки мёртв, лизинга нет, и по журналу дело выглядит
+    осиротевшим — но поднимать на него лида 2.0 нельзя: два драйвера на одном
+    деле дают двойную работу и две правды в журнале. Командная строка цикла
+    содержит `duty run <deal>` и в паузе между заходами, поэтому pgrep -f её
+    видит; чужой инстанс самого сторожа сюда не попадает — он зовётся `lead`.
+    """
+    lister = ps or _ps_table
+    needle = f"duty run {deal_id}"
+    for line in lister().splitlines():
+        pid_text, _, command = line.strip().partition(" ")
+        if needle in command and "grep" not in command:
+            return _int(pid_text) or None
+    return None
+
+
+def _charterless(events: list[dict[str, Any]]) -> bool:
+    """У дела нет хартии — в 2.0 такое дело не наше.
+
+    Хартию (`created.payload.spec`) записывает заведение дела 2.0. Дела 0.1.x её
+    не имеют: этапность жила в самой спеке, и поднимал их `bin/duty run`. Если
+    такого дела нет и в живых драйверах (`_manual_driver`), это осиротевшее дело
+    старого движка — лида на него не поднимаем, пока человек не решит.
     """
     return not stagefeed.spec_of(events)
+
+
+def _ps_table() -> str:
+    """Таблица процессов `pid command`: одна строка на процесс, без заголовка."""
+    finished = subprocess.run(
+        ["ps", "-Ao", "pid=,command="], capture_output=True, text=True, check=False
+    )
+    return finished.stdout or ""
 
 
 def _not_led(deal: dict[str, Any], events: list[dict[str, Any]]) -> str:
@@ -1207,6 +1235,7 @@ def supervise(
     probe: Optional[Callable[[Any], Optional[bool]]] = None,
     spawn: Optional[Callable[..., int]] = None,
     write: bool = True,
+    ps: Optional[Callable[[], str]] = None,
 ) -> dict[str, Any]:
     """Тик сторожа по одному делу: жив ли лид, поднять резюм, запарковать.
 
@@ -1251,11 +1280,21 @@ def supervise(
                 "limit": limit,
                 "runtime": runtime,
             }
-        if _legacy_driven(events):
+        driver = _manual_driver(str(deal["id"]), ps=ps)
+        if driver:
             return {
                 "deal": str(deal["id"]),
                 "action": "skipped",
-                "reason": "дело ведёт рантайм старого движка: попытки есть, фактов лида нет",
+                "reason": f"дело ведёт ручной рантайм `duty run` (pid {driver})",
+                "lead": st,
+                "limit": limit,
+                "manual_pid": driver,
+            }
+        if _charterless(events):
+            return {
+                "deal": str(deal["id"]),
+                "action": "skipped",
+                "reason": "дело без хартии: его вёл движок 0.1.x, лида 2.0 не поднимаем",
                 "lead": st,
                 "limit": limit,
             }

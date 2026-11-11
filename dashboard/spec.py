@@ -178,6 +178,16 @@ REVIEWING_ROLE = "reviewer"
 # по заметке) — это проверяется отдельно от свидетеля.
 EVIDENCE_FREE_ROLES = (REVIEWING_ROLE, "researcher", "documenter")
 
+# Роли, чьи профили не запускают команд (`terminal` в disabled_toolsets): лид,
+# ресерчер, ревьюер. Объявлять такому этапу `evidence` бессмысленно: роль не
+# может выполнить команду, а `verify()` не запускает её повторно — он сверяет
+# заявленный код возврата с `must`, то есть при невыполнимом требовании отчёт
+# либо сочиняет код, либо падает по контракту. Живой случай (d_e575494f): лид
+# поставил ревьюеру `go build`/`make lint-full`/`make test`, попытка ревью
+# упала на `evidence.missing`, и этап ушёл в переосмысление вместо приговора.
+# Отказ поэтому даётся на входе плана — там, где появляется новая работа.
+NO_SHELL_ROLES = tuple(dict.fromkeys((*COORDINATOR_ROLES, "researcher", REVIEWING_ROLE)))
+
 # Команды, которые сами меняют мир: это действие, а не доказательство. Спека
 # принимает только то, что можно проверить повторным запуском, — поэтому такие
 # `cmd` отказывают до запуска, а не после публикации.
@@ -2248,6 +2258,31 @@ def _with_default_ask(stage: Stage) -> Stage:
     )
 
 
+def _with_repo_workspace(stage: Stage, repo: Optional[str]) -> Stage:
+    """Этап плана, который делает работу в репозитории, получает дерево.
+
+    Умолчание `_parse_stage` зависит от `needs`: у входа предшественника нет, и
+    этап остаётся с `workspace: none` — верно для гейта и для роли, которая
+    только читает. Для производящего этапа в деле с `repo` это ошибка: процесса
+    нет в каталоге дела, cwd — каталог попытки, и роль либо работает не там, где
+    проверяют (d_e575494f: импл закоммитил в живой чекаут, а `commit.resolve`
+    искал коммит в каталоге попытки), либо правит копию, которую никто не увидит.
+    Поэтому умолчание уточняется до `dir`: каталог дела из `spec.repo`, без
+    второго дерева.
+
+    Явно названный `workspace` не трогается никогда — это решение лида.
+    """
+    if not repo:
+        return stage
+    if not stage.workspace_default:
+        return stage
+    if stage.kind != DEFAULT_STAGE_KIND or stage.needs:
+        return stage
+    if stage.role in EVIDENCE_FREE_ROLES or stage.role in PUBLISHING_ROLES:
+        return stage
+    return replace(stage, workspace="dir")
+
+
 def parse_plan_cost(raw: Any, *, path: Optional[Path] = None) -> tuple[Optional[dict[str, int]], list[Issue]]:
     """Цена предложения плана: `{tokens: N}` или `None`, если цену не назвали.
 
@@ -2301,6 +2336,7 @@ def parse_plan(
     base_ids: Iterable[str],
     base_needs: Optional[Mapping[str, Iterable[str]]] = None,
     started_ids: Iterable[str] = (),
+    repo: Optional[str] = None,
     path: Optional[Path] = None,
 ) -> tuple[tuple[Stage, ...], list[Issue]]:
     """Предложение плана → этапы и отказы; непустые отказы — план не принимается.
@@ -2383,7 +2419,7 @@ def parse_plan(
                 )
             )
             continue
-        stages.append(stage if moving else _with_default_ask(stage))
+        stages.append(stage if moving else _with_repo_workspace(_with_default_ask(stage), repo))
     known = base | {stage.id for stage in stages}
     # Ссылки проверяются у всех записей, включая перестановки: `needs` и
     # `parallel_with` — ровно то, чем перестановка и распоряжается.
@@ -2507,6 +2543,17 @@ def parse_plan(
         # не работа в дереве, у гейта работы нет вовсе, а команда доказывает себя
         # кодом возврата `must`. Роли без терминала (ресерчер, ревьюер) не
         # производят: их работа — отчёт, и требовать с них команду нельзя.
+        if stage.evidence and stage.role in NO_SHELL_ROLES:
+            issues.append(
+                Issue(
+                    where,
+                    stage.line,
+                    "plan.evidence.role",
+                    f"этап {stage.id!r}: у роли {stage.role!r} нет терминала — объявленные "
+                    f"evidence ({', '.join(item.cmd for item in stage.evidence)}) нечем выполнить; "
+                    "проверяющие команды ставь этапу, который их действительно запускает",
+                )
+            )
         produces = (
             stage.kind == DEFAULT_STAGE_KIND
             and stage.verdict is None

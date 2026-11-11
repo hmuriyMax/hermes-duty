@@ -1887,8 +1887,9 @@ def plan_rules(raw: list, charter: Any = None) -> set[str]:
 def good_plan() -> list:
     """Годное предложение: исследование, реализация и проверка за ней."""
     return [
-        {"id": "research", "role": "researcher", "workspace": "none", "needs": ["plan"],
-         "evidence": [{"cmd": "ls docs", "must": 0}]},
+        # У роли без терминала evidence не объявляется (`NO_SHELL_ROLES`): её
+        # работа — отчёт, и команду ей выполнить нечем.
+        {"id": "research", "role": "researcher", "workspace": "none", "needs": ["plan"]},
         {"id": "impl", "role": "implementer", "needs": ["research"],
          "evidence": [{"cmd": "go build ./...", "must": 0}]},
         {"id": "check", "kind": "shell", "cmd": "go test ./...", "needs": ["impl"]},
@@ -1903,10 +1904,57 @@ def test_parse_plan_accepts_a_plain_growth():
     assert stages[1].needs == ("research",)
 
 
+def test_parse_plan_gives_code_stage_a_tree_when_deal_has_repo():
+    """Этап плана, который делает код, получает каталог дела — не каталог попытки.
+
+    Красная проба: с `workspace: none` у входа (предшественника нет) импл работал
+    там, где никто не проверяет, а `commit.resolve` искал коммит в каталоге попытки
+    (d_e575494f). Явно названный `workspace` план не переписывает.
+    """
+    stages, found = spec_module.parse_plan(
+        [{"id": "impl", "role": "implementer", "evidence": [{"cmd": "go build ./...", "must": 0}]}],
+        charter=spec_module.Charter(),
+        base_ids=BASE_IDS,
+        repo="/tmp/deal-repo",
+    )
+    assert found == []
+    assert stages[0].workspace == "dir"
+
+    explicit, _ = spec_module.parse_plan(
+        [{"id": "impl", "role": "implementer", "workspace": "none", "needs": ["plan"],
+          "evidence": [{"cmd": "go build ./...", "must": 0}]}],
+        charter=spec_module.Charter(),
+        base_ids=BASE_IDS,
+        repo="/tmp/deal-repo",
+    )
+    assert explicit[0].workspace == "none", "решение лида не переписывается"
+
+
+def test_parse_plan_refuses_evidence_on_role_without_terminal():
+    """Команда-доказательство у роли без терминала — отказ плана, а не сюрприз попытки.
+
+    У `reviewer`/`researcher`/координатора `terminal` выключен: `must=0` нечестно
+    только заявляется (d_e575494f — ревью ушло в переосмысление на
+    `evidence.missing`).
+    """
+    # Координатор в позиции работника отказывает раньше (`coordinator.scope`),
+    # поэтому правило проверяется на тех ролях, которые в граф попадают.
+    for role in ("reviewer", "researcher"):
+        _, found = plan(
+            [{"id": "check", "role": role, "needs": ["plan"], "evidence": [{"cmd": "make test", "must": 0}]}]
+        )
+        assert "plan.evidence.role" in {issue.rule for issue in found}, role
+    # Роль с терминалом то же самое объявляет законно.
+    _, ok = plan(
+        [{"id": "impl", "role": "implementer", "needs": ["plan"], "evidence": [{"cmd": "make test", "must": 0}]}]
+    )
+    assert ok == []
+
+
 def test_parse_plan_needs_may_point_at_the_seed():
     """Ссылка на этап, который уже есть в графе, законна — это и есть рост."""
     _, found = plan([{"id": "research", "role": "researcher", "workspace": "none",
-                      "needs": ["plan"], "evidence": [{"cmd": "ls", "must": 0}]}])
+                      "needs": ["plan"]}])
     assert found == []
 
 
@@ -1964,8 +2012,8 @@ def test_parse_plan_stage_role_must_be_allowed_by_charter():
 
 def test_parse_plan_empty_allowed_roles_does_not_restrict():
     """Пустой `allowed_roles` — хартия молчит: роль проверяет спека, а не план."""
-    _, found = plan([{"id": "research", "role": "researcher", "workspace": "none",
-                      "evidence": [{"cmd": "ls", "must": 0}]}], spec_module.Charter())
+    _, found = plan([{"id": "research", "role": "researcher", "workspace": "none"}],
+                    spec_module.Charter())
     assert found == []
 
 

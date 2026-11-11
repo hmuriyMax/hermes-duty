@@ -556,6 +556,43 @@ def _gate_park(conn: sqlite3.Connection, deal: Any, spec: Any, decision: Any, no
     return {"written": True, "already": False, **fact}
 
 
+def _stop_park(
+    conn: sqlite3.Connection, deal: Any, spec: Any, decision: Any, home: Path, now: float
+) -> Optional[dict[str, Any]]:
+    """Отказ движка — парковка, а не вечное `ready`.
+
+    Решение `failed` (репланы сверх хартии) до сих пор ничего не писало в строку
+    дела: состояние оставалось `ready`, диспетчер поднимал прогон каждую минуту,
+    прогон повторял тот же отказ (d_6bfce910 — 12 пустых прогонов подряд). Здесь
+    отказ становится парковкой (`runner.park_stopped`), и дело ждёт человека так
+    же, как после исчерпания попыток.
+
+    Паркуется НЕ любой отказ, а только остановка планом: приговор гейта («ответ
+    вне `allow`») и исчерпанный бюджет дела — уже решения, у них свой след в
+    журнале (`failed`/`capability`), и второй вопрос «продолжать?» переспрашивал
+    бы человека о том, что он только что решил.
+    """
+    if not spec_module.is_plan_stage(getattr(decision, "stage", "") or ""):
+        return None
+    if str(deal.get("status") or "") not in deals.GATED_STATUSES:
+        return {"written": False, "already": True, "stopped": True}
+    if journal.parked_of(journal.read_events(conn, str(deal["id"]))) is not None:
+        return {"written": False, "already": True, "stopped": True}
+    try:
+        fact = runner.park_stopped(
+            conn,
+            deal,
+            spec,
+            str(getattr(decision, "reason", "") or ""),
+            fail_kind=str(getattr(decision, "fail_kind", "") or ""),
+            home=home,
+            clock=lambda: float(now),
+        )
+    except deals.DealError as exc:
+        return {"written": False, "already": False, "stopped": True, "refused": str(exc)}
+    return {"written": True, "already": False, **fact}
+
+
 def _is_plan_wait(decision: Any) -> bool:
     """Это ожидание решения по плану (`wait(plan)`)? Тогда шаг — гейт плана.
 
@@ -677,6 +714,32 @@ def run(
     note = ""
     closed: Optional[dict[str, Any]] = None
     parked: Optional[dict[str, Any]] = None
+
+    # Гейт родителей проверяется ДО первой попытки: `todo` — это ровно «ждёт
+    # закрытия родителей», а диспетчер поднимает `todo` вместе с `ready` и
+    # `wait_slot`. Без этой проверки ребёнок получал попытку раньше, чем
+    # появлялись контракты, ради которых его и связали (`--parent`): живой случай
+    # d_2185bd17, дочернее дело стартовало через три секунды после создания, при
+    # двух незакрытых родителях. Ждём молча: попытку поднимет тот же диспетчер,
+    # когда родители закроются (`deals.gate_open`).
+    if not deals.gate_open(conn, str(deal["id"])):
+        waiting = ", ".join(
+            f"{parent['id']}={parent['status']}" for parent in deals.parents_of(conn, str(deal["id"]))
+        )
+        return _report(
+            deal,
+            spec,
+            steps,
+            transit.wait(transit.WAIT_NEED, f"ждёт родителей: {waiting}"),
+            OUTCOME_WAIT,
+            f"ждёт закрытия родителей: {waiting}",
+            reaped=reaped,
+            answers=answers,
+            answers_errors=answers_errors,
+            released=len(released),
+            release_errors=release_errors,
+            recovered=recovered,
+        )
 
     def release_pass(*, only: Any = None, grace_sec: int = release.RELEASE_GRACE_SEC) -> None:
         """Отпустить дела, которые журнал уже отпустил, а строка — нет (правило 11).
@@ -861,6 +924,11 @@ def run(
             # Парковка гейта — тоже решение, а не факт: вопрос истёк, и дело
             # паркуется здесь, с причиной «гейт: человек не ответил за N».
             parked = _gate_park(conn, deal, spec, decision, tick())
+        if getattr(decision, "kind", "") == transit.DECISION_FAILED:
+            # Остановка (исчерпанные репланы, предел раундов) — парковка с
+            # вопросом человеку: без неё строка остаётся `ready`, и диспетчер
+            # повторяет тот же отказ каждую минуту (d_6bfce910).
+            parked = _stop_park(conn, deal, spec, decision, home, tick())
     finally:
         children.stop()
         _release_mine(conn, deal, spec)

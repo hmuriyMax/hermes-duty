@@ -187,7 +187,13 @@ WAIT_PARKED = "parked"
 # — это факт о графе, и склеивание его с ожиданием попытки спрятало бы, что
 # графа ещё нет (`docs/ENGINE-1.0.md`, раздел 3).
 WAIT_PLAN = "plan"
-WAIT_KINDS = (WAIT_ATTEMPT, WAIT_QUESTION, WAIT_VERDICT, WAIT_FOR_GATE, WAIT_RETRY, WAIT_PARKED, WAIT_PLAN)
+
+# Родители ещё не закрыты — дело ждёт не события своего журнала, а чужой работы.
+# Такой `wait` движок возвращает до первого шага (`driver.run`), и он же
+# закрывает дыру «диспетчер поднимает `todo`»: гейт родителей — не только статус
+# строки, но и отказ начинать попытку.
+WAIT_NEED = "need"
+WAIT_KINDS = (WAIT_ATTEMPT, WAIT_QUESTION, WAIT_VERDICT, WAIT_FOR_GATE, WAIT_RETRY, WAIT_PARKED, WAIT_PLAN, WAIT_NEED)
 
 # Исходы попытки, которые считаются успехом. Набор объявлен, а не угадан по
 # подстроке: `contract_refused` тоже содержит «contract», и «похоже на успех»
@@ -388,9 +394,20 @@ def done(reason: str = "") -> Decision:
     return Decision(kind=DECISION_DONE, reason=reason)
 
 
-def failed(kind: str, reason: str = "") -> Decision:
-    """Дело остановлено отказом: класс пришёл из события или это `contract`."""
-    return Decision(kind=DECISION_FAILED, fail_kind=str(kind), reason=reason)
+def failed(kind: str, reason: str = "", stage_id: str = "") -> Decision:
+    """Дело остановлено отказом: класс пришёл из события или это `contract`.
+
+    `stage_id` называет остановивший этап, когда он известен: по нему движок
+    отличает остановку ПЛАНОМ (репланы сверх хартии — её нечем снять, кроме
+    человека) от приговора человеку («ответ вне `allow`» — решение уже принято,
+    переспрашивать нечего).
+    """
+    return Decision(
+        kind=DECISION_FAILED,
+        fail_kind=str(kind),
+        reason=reason,
+        stages=(str(stage_id),) if stage_id else (),
+    )
 
 
 def park(stage_id: str, question_id: Any = None, reason: str = "") -> Decision:
@@ -1101,6 +1118,7 @@ def graph(spec: Any, events: Iterable[Any]) -> tuple[Any, ...]:
         charter=charter,
         base_ids=[stage.id for stage in seed],
         base_needs={stage.id: stage.needs for stage in seed},
+        repo=getattr(spec, "repo", None),
     )
     if issues:
         return seed
@@ -1584,7 +1602,9 @@ def next_stage(spec: Any, events: Iterable[Any], now: Any) -> Decision:
     stopped = _first(view, states, FAILED)
     if stopped is not None:
         node = board.stages[stopped.id]
-        return failed(node.fail_kind or UNCLASSIFIED, f"этап {stopped.id!r}: {node.reason}")
+        return failed(
+            node.fail_kind or UNCLASSIFIED, f"этап {stopped.id!r}: {node.reason}", stopped.id
+        )
 
     parked = _first(view, states, PARKED)
     if parked is not None:

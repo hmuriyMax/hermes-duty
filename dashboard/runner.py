@@ -1161,6 +1161,7 @@ def report_plan(
         base_ids=base_ids,
         base_needs={item.id: item.needs for item in graph},
         started_ids=transit.started_stages(events),
+        repo=getattr(spec, "repo", None),
     )
     cost, cost_issues = spec_module.parse_plan_cost(raw.get("cost"))
     issues += cost_issues
@@ -2608,7 +2609,7 @@ def finish_shell_stage(
                 attempt_started_at=live.started_at,
                 now=now,
                 root=cwd,
-                base=spec.base,
+                base=actual_base or spec.base,
             )
             if not verdict.ok:
                 outcome, kind, reason = OUTCOME_FAILED, failures.verdict_kind(verdict), verdict.reason()
@@ -3579,6 +3580,7 @@ def _parsed_plan(spec: Any, raw_stages: list[Any], events: Iterable[Any]) -> tup
         base_ids=[stage.id for stage in graph],
         base_needs={stage.id: stage.needs for stage in graph},
         started_ids=transit.started_stages(events),
+        repo=getattr(spec, "repo", None),
     )
     return tuple(stages)
 
@@ -3883,11 +3885,23 @@ def start_stage(
     # Фактическая база дерева: `git rev-parse HEAD` после отвода. База в спеке
     # бывает ревизией (`main`, `HEAD`), а в журнале нужен коммит — иначе разбор
     # «от чего работал этап» снова требовал бы чтения кода.
+    #
+    # У `workspace: dir` дерева нет, и каталог этапа — сам каталог дела: имя базы
+    # (`release/RP-xxxx`) сдвинется вместе с коммитом попытки. Проверка
+    # доказательств на таком имени отвечает «commit.foreign», то есть объявляет
+    # чужой работой ровно то, что этап и сделал (живой случай d_6bfce910: коммит
+    # 323063e на `release/RP-14349` назван «уже был предком базы до попытки»).
+    # Поэтому база `dir`-этапа закрепляется коммитом, который стоял в каталоге
+    # ДО попытки, — он же и уезжает в журнал как база этапа.
     actual_base = stage_base
     if tree is not None:
         sha = _sha(Path(tree), "HEAD")
         if sha:
             actual_base = sha
+    elif str(getattr(stage, "workspace", "")) == "dir" and cwd is not None:
+        pinned = _sha(Path(cwd), "HEAD")
+        if pinned:
+            actual_base = pinned
 
     previous = previous_reports(conn, deal, spec, stage_id, events=events)
 
@@ -4131,7 +4145,9 @@ def finish_agent_stage(
             attempt_started_at=live.started_at,
             now=now,
             root=cwd,
-            base=spec.base,
+            # База проверки — закреплённый коммит этапа, а не имя из спеки:
+            # у `dir` имя сдвигается вместе с работой попытки (`_pinned_base`).
+            base=actual_base or spec.base,
         )
         if not verdict.ok:
             # Класс отказа гейта — из вердикта (`Verdict.kind`, W4), а не из текста:
@@ -4536,6 +4552,76 @@ def park_exhausted(
         "question_id": int(asked.question_id),
         "question_target": address.address,
         "question_reason": address.reason,
+    }
+
+
+def park_stopped(
+    conn: sqlite3.Connection,
+    deal: Any,
+    spec: Any,
+    reason: str,
+    *,
+    fail_kind: str,
+    home: Path,
+    clock: Optional[Callable[[], float]] = None,
+) -> dict[str, Any]:
+    """Дело остановлено отказом — припарковать его, а не оставить в `ready`.
+
+    Отказ движка окончателен: репланы сверх хартии, исчерпанные раунды приговора,
+    отказ плана после предела переосмыслений. Строка дела при этом оставалась
+    `ready`, а диспетчер поднимает `ready` каждую минуту — прогон мгновенно
+    повторял тот же отказ и ничего не записывал (живой случай d_6bfce910: 12
+    пустых прогонов подряд, «следующего шага движка не было»). Парковка
+    возвращает дело человеку тем же путём, что исчерпание попыток: `blocked` с
+    `block_kind='parked'`, вопрос `continue`/`stop` в пул, и только явное решение
+    возобновляет или закрывает дело.
+
+    Вопрос адресуется координатору дела: он ведёт дело и разбирается в причине,
+    а человеку достаётся уже решение о судьбе дела, если координатор его не снял.
+    """
+    now = _now_sec(int((clock or time.time)()))
+    stage = spec.stage(spec_module.PLAN_STAGE) if callable(getattr(spec, "stage", None)) else None
+    headline = f"Дело остановлено отказом {fail_kind or 'contract'}: {reason or 'причина не записана'}"
+    question = (
+        f"{headline}. Продолжать? continue — новая попытка с пересмотром графа, "
+        f"stop — закрыть дело."
+    )
+    address = routing.route(stage, {"kind": "authority", "risky": True}) if stage is not None else None
+    asked = None
+    if stage is not None:
+        asked = ask.ask(
+            conn,
+            {**deal, "home": Path(home)},
+            question,
+            headline,
+            list(failures.PARK_OPTIONS),
+            routing={
+                **(address.as_payload() if address is not None else {"target": "human", "reason": "authority"}),
+                "stage": stage.id,
+                "attempt": 0,
+            },
+        )
+    deals.set_blocked(
+        conn,
+        str(deal["id"]),
+        kind=failures.PARKED_KIND,
+        reason=headline,
+        author=ENGINE_SOURCE,
+        source=ENGINE_SOURCE,
+        details={
+            "kind": fail_kind,
+            "stage": stage.id if stage is not None else "",
+            "stopped": True,
+            "question_id": int(asked.question_id) if asked is not None else None,
+        },
+        now=now,
+    )
+    return {
+        "reason": headline,
+        "kind": fail_kind,
+        "stage": stage.id if stage is not None else "",
+        "stopped": True,
+        "question_id": int(asked.question_id) if asked is not None else None,
     }
 
 

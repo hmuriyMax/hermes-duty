@@ -1643,6 +1643,86 @@ def test_gate_answer_in_allow_lets_the_chain_finish(tmp_path: Path) -> None:
     assert transit.deal_state(spec, events(conn, deal)) == "done"
 
 
+def test_child_deal_waits_for_parents_even_when_dispatched(tmp_path: Path) -> None:
+    """Дело с незакрытым родителем попытки не получает, хоть диспетчер его поднял.
+
+    Красная проба гейта родителей: `create_deal` ставит ребёнку `todo`, но
+    диспетчер поднимает `todo` вместе с `ready`, а проверки гейта в движке не было
+    — ребёнок стартовал через три секунды после создания (d_2185bd17).
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, CHAIN)
+    parent = deals.create_deal(conn, repo="duty", title="контракт", now=NOW)
+    child = deals.create_deal(
+        conn, repo="duty", title="потребитель", parents=[parent["deal"]["id"]], now=NOW
+    )
+    deal = deals.deal_row(conn, str(child["deal"]["id"]))
+    assert str(deal["status"]) == "todo"
+    fake = Fake()
+
+    report = run(conn, spec, deal, home, fake)
+
+    assert fake.calls == [], "попытка не поднимается, пока родитель не закрыт"
+    assert report["outcome"] == "wait"
+    assert "ждёт" in report["note"]
+    assert str(deals.deal_row(conn, str(deal["id"]))["status"]) == "todo"
+
+
+def test_plan_stop_parks_the_deal_instead_of_spinning(tmp_path: Path) -> None:
+    """Остановка планом (репланы сверх хартии) паркует дело, а не оставляет `ready`.
+
+    Красная проба: строка оставалась `ready`, и диспетчер поднимал прогон каждую
+    минуту — 12 пустых прогонов подряд (d_6bfce910).
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(
+        tmp_path,
+        """
+        duty: probe
+        charter:
+          max_rounds_replan: 3
+        stages:
+          - id: coordinator
+            role: coordinator
+          - id: close
+            role: coordinator
+            needs: [coordinator]
+            workspace: none
+        """,
+    )
+    deal = make_deal(conn, spec_path=spec.path)
+    for index in range(1, 6):
+        seed(
+            conn,
+            deal,
+            "plan_rejected",
+            {"rev": index, "why": "план отклонён", "issues": ["plan.id: этап уже есть"]},
+            key=f"reject-{index}",
+        )
+    fake = Fake()
+
+    report = run(conn, spec, deal, home, fake)
+
+    assert report["outcome"] == "failed"
+    assert fake.calls == []
+    row = deals.deal_row(conn, str(deal["id"]))
+    assert str(row["status"]) == "blocked", "остановка — парковка, а не вечный ready"
+    parked = next(
+        dict(event["payload"]) for event in events(conn, deal) if str(event["kind"]) == "blocked"
+    )
+    assert parked["block_kind"] == "parked"
+    assert parked["reason"].startswith("Дело остановлено отказом contract")
+    # `set_blocked` кладёт `details` в сам факт (`deals.set_blocked`), а не в
+    # отдельное поле: у `parked_of` и поверхностей одна форма.
+    assert parked["stopped"] is True
+    assert parked["question_id"], "человеку задан вопрос: продолжать или закрыть"
+    assert any(
+        str(event["kind"]) == "question_asked" for event in events(conn, deal)
+    ), "вопрос лежит в пуле: парковка не молчаливая"
+
+
 def test_gate_answer_outside_allow_stops_the_deal(tmp_path: Path) -> None:
     """Ответ «нет» при `allow: [да]` — отказ контракта: дело дальше не идёт, `check` не запущен.
 

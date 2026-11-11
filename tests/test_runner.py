@@ -980,6 +980,40 @@ def test_workspace_dir_works_in_deal_catalog(tmp_path: Path) -> None:
     assert contract["boundaries"][0].startswith(f"рабочий каталог попытки: {repo}")
 
 
+def test_workspace_dir_pins_the_base_commit_not_the_branch(tmp_path: Path) -> None:
+    """База `dir`-этапа — коммит каталога до попытки, а не имя ветки.
+
+    Красная проба: с именем ветки работа этапа объявлялась чужой — «commit уже был
+    предком базы» (d_6bfce910), потому что ветка сдвигается тем же коммитом.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    repo = git_repo(tmp_path)
+    before = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True
+    ).stdout.strip()
+    spec = write_spec(
+        tmp_path,
+        f"""
+        duty: probe
+        repo: {repo}
+        base: HEAD
+        stages:
+          - id: impl
+            role: implementer
+            workspace: dir
+        """,
+    )
+    fake = Fake(result={"status": "done"})
+    report = run(conn, spec, deal, home, fake)
+    ended = [
+        dict(event["payload"]) for event in events(conn, deal) if str(event["kind"]) == "attempt_ended"
+    ][-1]
+    assert report["started"] is True
+    assert ended["base"] == before, "база этапа — коммит каталога до попытки"
+
+
 def test_workspace_none_has_no_tree(tmp_path: Path) -> None:
     """`workspace: none` — дерева нет вовсе: этап-гейт только выносит приговор."""
     home = make_home(tmp_path)

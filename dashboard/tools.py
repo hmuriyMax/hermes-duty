@@ -1,8 +1,11 @@
-"""Тулсет `duty` — четыре инструмента лида над журналом дел.
+"""Тулсет `duty` — инструменты лида над журналом дел.
 
-Контракт — `docs/ENGINE-2.0.md`, разделы 4 и 5: шедулером дела становится лид.
+Контракт — `docs/ENGINE-2.0.md`, разделы 4–6: шедулером дела становится лид.
 План предлагает `duty_plan`, этапы поднимает `duty_start`, факты читает
-`duty_wait`, дело закрывает `duty_close`.
+`duty_wait`, дело закрывает `duty_close`. Вопросы воркера — три исхода раздела 6:
+`duty_answer` (лид отвечает сам и сессия воркера продолжается), `duty_ask`
+(под-попытка профиля, ответ возвращается лиду строкой) и `duty_ask_human`
+(вопрос в пул, дело встаёт в `wait_human`).
 
 Своего состояния у модуля нет. Всё, что инструмент узнаёт, он читает из журнала
 `<home>/duty/duty.db` (журнал — единственная правда, `docs/JOURNAL.md`), а всё,
@@ -17,7 +20,10 @@
 
 Почему `duty_wait` блокирующий (`docs/ENGINE-2.0.md`, раздел 4): каждый вызов
 инструмента — это пересылка всего контекста заново, поэтому один блокирующий
-вызов на 120–300 секунд дешевле шестидесяти опросов по 5 секунд.
+вызов на 120–300 секунд дешевле шестидесяти опросов по 5 секунд. Ответ человека
+на `duty_ask_human` приходит лиду следующим фактом: пул дочитывает сам
+`duty_wait` (`ask.sync_answers`), потому что шедулера, который делал это перед
+каждым решением, в 2.0 нет.
 """
 
 from __future__ import annotations
@@ -70,6 +76,21 @@ CLOSE_VERDICT = "approve"
 # кончилось», а не заменяет лог.
 ATTEMPT_LOG_SUBDIR = "lead"
 
+# «Этап» под-попытки роли для вопроса самого лида (`duty_ask`): у вопроса лида
+# нет этапа графа, а `runner.ask_role` адресует свой контракт этапом и попыткой.
+# Имя не совпадает ни с одним этапом спеки (`plan`, `close`, `impl`…), поэтому
+# срез дела такой вопрос к этапу не относит.
+ASK_STAGE = "ask"
+
+# Вид блокировки, которым дело ждёт человека (`duty_ask_human`): тот же, что
+# ставит движок под вопрос попытки, — «нужен ввод», а не «нужен доступ».
+NEEDS_INPUT_KIND = "needs_input"
+
+# Как часто `duty_wait` дочитывает пул ответов (`ask.sync_answers`): ответ
+# человека — следующий факт лиду, но опрашивать пул на каждом тике ожидания
+# (0.5 с) незачем — пул читается отдельным соединением.
+WAIT_SYNC_SEC = 5.0
+
 JOURNAL_MODULE_NAME = "hermes_duty_journal"
 DEALS_MODULE_NAME = "hermes_duty_deals"
 SPEC_MODULE_NAME = "hermes_duty_spec"
@@ -77,6 +98,8 @@ TRANSIT_MODULE_NAME = "hermes_duty_transit"
 RUNNER_MODULE_NAME = "hermes_duty_runner"
 STAGEFEED_MODULE_NAME = "hermes_duty_stagefeed"
 BUDGET_MODULE_NAME = "hermes_duty_budget"
+ASK_MODULE_NAME = "hermes_duty_ask"
+ROUTING_MODULE_NAME = "hermes_duty_routing"
 
 
 def _load(name: str, filename: str) -> Any:
@@ -101,6 +124,8 @@ transit = _load(TRANSIT_MODULE_NAME, "transit.py")
 runner = _load(RUNNER_MODULE_NAME, "runner.py")
 stagefeed = _load(STAGEFEED_MODULE_NAME, "stagefeed.py")
 budget = _load(BUDGET_MODULE_NAME, "budget.py")
+ask_module = _load(ASK_MODULE_NAME, "ask.py")
+routing = _load(ROUTING_MODULE_NAME, "routing.py")
 
 
 class ToolsError(RuntimeError):
@@ -276,6 +301,98 @@ def _next_attempt(events: Iterable[Any], stage_id: str) -> int:
         if str(row.get("stage") or "") == stage_id:
             top = max(top, _int(row.get("n")))
     return top + 1
+
+
+def _question_stage(payload: dict[str, Any]) -> str:
+    """Этап, которому принадлежит вопрос: `payload.routing.stage`.
+
+    `ask()` пишет `question_asked` на уровне **дела** (у пула нет этапа), а адрес
+    кладёт движок — `payload.routing` (`dashboard/ask.py`, «форма журнала от
+    этого не меняется»). Пусто — вопрос задан мимо движка (`POST /ask`).
+    """
+    address = payload.get("routing")
+    if not isinstance(address, dict):
+        return ""
+    return str(address.get("stage") or "")
+
+
+def _question_number(payload: dict[str, Any]) -> str:
+    """Номер вопроса в пуле строкой; пусто — вопрос роли (строки пула нет)."""
+    return str(payload.get("question_id") or "")
+
+
+def _question_pair(events: Iterable[Any], stage_id: str, number: str) -> tuple[Optional[dict[str, Any]], bool]:
+    """Вопрос этапа и отвечен ли он: последний `question_asked` и факт ответа.
+
+    Пара «вопрос → ответ» сверяется и этапом, и номером пула: у вопроса роли
+    номера нет, и его закрывает ответ без номера по тому же адресу — ровно так
+    же, как это делает срез дела (`dashboard/transit.py`, `_deal_answer`).
+    Чужой ответ (другой этап, другой номер) вопрос не закрывает.
+    """
+    asked: Optional[dict[str, Any]] = None
+    answered = False
+    for event in events or ():
+        kind = str(event.get("kind") or "")
+        if kind not in ("question_asked", "question_answered"):
+            continue
+        payload = journal.payload_of(event)
+        if _question_stage(payload) != stage_id or _question_number(payload) != number:
+            continue
+        if kind == "question_asked":
+            asked, answered = event, False
+        elif asked is not None:
+            answered = True
+    return asked, answered
+
+
+def _open_question(events: Iterable[Any]) -> Optional[dict[str, Any]]:
+    """Последний вопрос дела без ответа — по тому же правилу, что у среза дела.
+
+    Своей пары «вопрос → ответ» здесь нет: срез читает её `journal._open_question`,
+    и второй разбор разошёлся бы с ним на первом же вопросе без номера (у вопроса
+    роли номера пула не существует). `None` — открытых вопросов нет.
+    """
+    ordered = sorted(
+        (item for item in events or () if isinstance(item, dict)),
+        key=lambda item: int(item.get("id") or 0),
+    )
+    found = journal._open_question(ordered)
+    if found is None:
+        return None
+    return journal.payload_of(found[1])
+
+
+def _awaiting(events: Iterable[Any]) -> tuple[str, int]:
+    """Этап и попытка, которые ждут ответа: адрес открытого вопроса дела.
+
+    Вопрос лида (`duty_ask`, `duty_ask_human`) задаётся ради открытого вопроса
+    воркера, и адресом ему служит тот же этап: тогда срез дела показывает
+    ожидание там, где оно есть, а не у последней попытки журнала. Открытых
+    вопросов нет — `("", 0)`, и вопрос адресуется как вопрос мимо движка.
+    """
+    payload = _open_question(events)
+    if not payload:
+        return "", 0
+    address = payload.get("routing")
+    attempt = _int(address.get("attempt")) if isinstance(address, dict) else 0
+    return _question_stage(payload), attempt
+
+
+def _by_routing_idem(events: Iterable[Any], kind: str, key: str) -> Optional[dict[str, Any]]:
+    """Факт этого вида с ключом вызова в `payload.routing.idem` — прежний вопрос лида.
+
+    `ask()` пишет `question_asked` сам (`dashboard/ask.py`), и ключ вызова ему
+    передаётся адресом: `payload.routing` уезжает в факт целиком, поэтому
+    `duty_ask_human` находит свой прежний вопрос там же, где остальные
+    инструменты находят свой — по `payload.idem`.
+    """
+    for event in reversed(list(events or ())):
+        if str(event.get("kind") or "") != kind:
+            continue
+        address = journal.payload_of(event).get("routing")
+        if isinstance(address, dict) and str(address.get("idem") or "") == key:
+            return event
+    return None
 
 
 # ------------------------------------------------------------------- duty_plan
@@ -536,19 +653,39 @@ def _attempt_log(home: Path, deal_id: str, stage_id: str, attempt: int) -> Path:
     return journal.journal_path(home).parent / ATTEMPT_LOG_SUBDIR / f"{deal_id}-{stage_id}-{attempt}.log"
 
 
-def _spawn_attempt(home: Path, deal_id: str, stage_id: str, attempt: int, key: str) -> int:
+def _answer_file(home: Path, deal_id: str, stage_id: str, attempt: int) -> Path:
+    """Текст ответа лида для процесса попытки — файлом, а не аргументом.
+
+    Кавычки, переводы строк и длина ответа — не забота спавна: процесс читает
+    файл, а журнал (`question_answered.answer`) остаётся местом, где ответ виден
+    целиком.
+    """
+    return journal.journal_path(home).parent / ATTEMPT_LOG_SUBDIR / f"{deal_id}-{stage_id}-{attempt}.answer"
+
+
+def _spawn_attempt(
+    home: Path, deal_id: str, stage_id: str, attempt: int, key: str, answer: Optional[str] = None
+) -> int:
     """Запустить попытку отдельным процессом в своей группе; вернуть его pid.
 
     `start_new_session=True` — своя группа процессов: kill супервизора лида не
     уносит работу (`docs/ENGINE-2.0.md`, раздел 2). Полный вывод процесса идёт
     файлом: причина падения должна быть видна, а журнал — не место для логов.
+
+    `answer` — ответ лида (`duty_answer`): он едет файлом и означает
+    «продолжи сессию этой попытки с ответом», а не «начни работу заново».
     """
     log = _attempt_log(home, deal_id, stage_id, attempt)
     log.parent.mkdir(parents=True, exist_ok=True)
+    argv = [sys.executable, str(Path(__file__).resolve()), deal_id, stage_id, str(attempt), key, str(home)]
+    if answer is not None:
+        path = _answer_file(home, deal_id, stage_id, attempt)
+        path.write_text(answer, encoding="utf-8")
+        argv.append(str(path))
     handle = log.open("a", encoding="utf-8")
     try:
         process = subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), deal_id, stage_id, str(attempt), key, str(home)],
+            argv,
             stdin=subprocess.DEVNULL,
             stdout=handle,
             stderr=subprocess.STDOUT,
@@ -565,18 +702,27 @@ def _attempt_main(argv: list[str]) -> int:
     """Сам процесс попытки: лизинг, дерево, отчёт и факты — через `runner.run_stage`.
 
     Здесь только сборка: правила попытки живут в движке, и второй реализации
-    «как идёт попытка» быть не должно.
+    «как идёт попытка» быть не должно. Ответ лида (`answer_file`) отличает
+    продолжение от новой попытки — тот же резюм-путь движка (`--resume`).
     """
     if len(argv) < 5:
-        print("usage: tools.py <deal_id> <stage_id> <attempt> <idempotency_key> <home>", file=sys.stderr)
+        print(
+            "usage: tools.py <deal_id> <stage_id> <attempt> <idempotency_key> <home> [answer_file]",
+            file=sys.stderr,
+        )
         return 2
     home = Path(argv[4]).expanduser()
+    answer: Optional[str] = None
+    if len(argv) > 5 and argv[5]:
+        answer = Path(argv[5]).read_text(encoding="utf-8")
     try:
         conn = _store(home)
         deal = _deal(conn, argv[0])
         events = journal.read_events(conn, str(deal["id"]))
         spec = _spec(events)
-        runner.run_stage(conn, spec, deal, argv[1], _int(argv[2]), home=home, idem=argv[3])
+        runner.run_stage(
+            conn, spec, deal, argv[1], _int(argv[2]), home=home, answer=answer, idem=argv[3]
+        )
     except Exception:  # noqa: BLE001 - процесс отдельный: причина уходит в лог, а не лиду
         traceback.print_exc()
         return 1
@@ -602,6 +748,11 @@ def wait(
     (`attempt_progress`) лида не будит, но курсор двигает: иначе журнал
     перечитывался бы с того же места вечно.
 
+    Пул ответов дочитывается здесь же (`ask.sync_answers`): ответ человека на
+    `duty_ask_human` — следующий факт лиду, а шедулера, который делал это перед
+    каждым решением, в 2.0 нет. Чтение пула идёт раз в `WAIT_SYNC_SEC`, а не на
+    каждом тике: ожидание не должно превращаться в опрос чужой БД.
+
     Потолок `timeout_sec` — `WAIT_CEILING_SEC` (300 с): дольше держать турн лида
     нельзя, а пустой ответ `{events: [], timed_out: true}` — не ошибка, а факт
     «ничего не случилось» (`docs/ENGINE-2.0.md`, раздел 4).
@@ -614,17 +765,35 @@ def wait(
     position = max(0, _int(cursor))
     window = min(max(0.0, float(timeout_sec or 0.0)), WAIT_CEILING_SEC)
     deadline = tick() + window
+    answers = 0
+    synced_at = 0.0
     while True:
+        if tick() - synced_at >= WAIT_SYNC_SEC:
+            answers += _sync_answers(conn, home)
+            synced_at = tick()
         fresh = journal.read_events(conn, str(deal["id"]), since_id=position)
         if fresh:
             position = max(position, max(_int(event.get("id")) for event in fresh))
         facts = [event for event in fresh if str(event.get("kind") or "") not in NOISE_KINDS]
         if facts:
             return {"ok": True, "deal": str(deal["id"]), "events": [_brief(event) for event in facts],
-                    "cursor": position, "timed_out": False}
+                    "cursor": position, "timed_out": False, "answers": answers}
         if tick() >= deadline:
-            return {"ok": True, "deal": str(deal["id"]), "events": [], "cursor": position, "timed_out": True}
+            return {"ok": True, "deal": str(deal["id"]), "events": [], "cursor": position,
+                    "timed_out": True, "answers": answers}
         pause(min(WAIT_POLL_SEC, max(0.0, deadline - tick())))
+
+
+def _sync_answers(conn: sqlite3.Connection, home: Path) -> int:
+    """Дочитать закрытые вопросы пула в журнал: сколько фактов `question_answered`.
+
+    Писатель — `ask.sync_answers` (`dashboard/ask.py`): второго разбора пула в
+    плагине нет, и ключ события там идемпотентный (`ask:<id>:question_answered`),
+    поэтому повторный проход даёт ноль, а не второй факт. Сбой пула не отказ
+    инструмента: ожидание журнала от недоступного пула не зависит.
+    """
+    report = ask_module.sync_answers(conn, home)
+    return max(0, _int((report or {}).get("appended")))
 
 
 def _brief(event: dict[str, Any]) -> dict[str, Any]:
@@ -724,6 +893,440 @@ def close(
         "cause": deals.CLOSE_CAUSE_LEAD,
         "summary": text,
         "events": _int(applied.get("events")),
+    }
+
+
+# ----------------------------------------------------------------- duty_answer
+
+
+def answer(
+    deal_id: Any,
+    stage_id: Any,
+    question_id: Any,
+    text: Any,
+    idempotency_key: Any,
+    *,
+    home: Optional[Path] = None,
+    spawn: Optional[Callable[..., int]] = None,
+    clock: Optional[Callable[[], float]] = None,
+    ack_sec: float = START_ACK_SEC,
+) -> dict[str, Any]:
+    """Ответ лида воркеру: факт `question_answered(by: lead)` и продолжение сессии.
+
+    Работа не начинается заново (`docs/ENGINE-2.0.md`, раздел 6, исход 1): попытку
+    продолжает **резюм сессии этой попытки** — `runner.run_stage(..., answer=text)`
+    берёт `session_id` из `attempt_ended.details`, кладёт ответ во вход
+    (`answer_this_attempt`) и собирает команду с `--resume`. Резюм-путь здесь не
+    второй: `duty_start` поднимает попытку тем же `runner.run_stage`, разница
+    только в ответе на входе.
+
+    Отказы — до записи и до спавна: этапа нет в плане, вопроса этого этапа нет в
+    журнале, вопрос уже отвечен, дело запарковано (попытки исчерпаны — продолжение
+    решает человек), по этапу идёт живая попытка, живых попыток не меньше
+    `MAX_SLOTS`, бюджет дела исчерпан.
+
+    Повтор с тем же `idempotency_key` второго факта и второй попытки не пишет:
+    ключ едет в `question_answered` (`payload.idem`) и в `attempt_started`, и
+    повтор отвечает тем, что уже случилось.
+    """
+    key = _key(idempotency_key)
+    name = str(stage_id or "").strip()
+    if not name:
+        raise ToolsError("stage_id не назван: duty_answer(deal, stage_id, question_id, text, idempotency_key)")
+    number = str(question_id if question_id is not None else "").strip()
+    word = " ".join(str(text or "").split())
+    if not word:
+        raise ToolsError("text не назван: ответ без текста работу не продолжает")
+    home = hermes_home(home)
+    tick = clock or time.time
+    conn = _store(home)
+    deal = _deal(conn, deal_id)
+    events = journal.read_events(conn, str(deal["id"]))
+    if journal.closed_fact(events) is not None:
+        raise ToolsError(f"дело {deal['id']} закрыто: отвечать некому")
+    spec = _spec(events)
+    graph = transit.graph_spec(spec, events)
+    stage = next((item for item in graph.stages if str(getattr(item, "id", "")) == name), None)
+    if stage is None:
+        named = ", ".join(str(getattr(item, "id", "")) for item in graph.stages) or "—"
+        raise ToolsError(f"этапа {name!r} нет в принятом плане: этапы дела — {named}")
+    repeated = _by_idem(events, "question_answered", key)
+    asked: Optional[dict[str, Any]] = repeated
+    if repeated is not None:
+        lifted = _by_idem(events, "attempt_started", key)
+        if lifted is not None:
+            return _answer_repeat(repeated, lifted)
+        # Факт записан, а попытка не поднялась (лид упал между записью и
+        # спавном): повтор доводит начатое и второго факта не пишет.
+    else:
+        asked, answered = _question_pair(events, name, number)
+        if asked is None:
+            raise ToolsError(
+                f"вопроса {number or '—'} этапа {name!r} нет в журнале дела: отвечать нечему"
+            )
+        if answered:
+            raise ToolsError(
+                f"вопрос {number or '—'} этапа {name!r} уже отвечен: второй ответ работу не продолжает"
+            )
+        if journal.parked_of(events) is not None:
+            raise ToolsError(
+                "дело запарковано: попытки этапа исчерпаны, и ответ на вопрос работу не поднимает — "
+                "продолжение решает человек"
+            )
+    address = journal.payload_of(asked).get("routing")
+    asked_attempt = _int(address.get("attempt")) if isinstance(address, dict) else 0
+    moment = int(tick())
+    live = _live_attempts(events, moment)
+    busy = next((row for row in live if str(row.get("stage") or "") == name), None)
+    if busy is not None:
+        raise ToolsError(
+            f"этап {name!r} уже идёт: попытка {busy['run_id']} (pid {busy.get('pid')}) — "
+            "ответу нужен свободный этап, дождись её факта или отмени её"
+        )
+    if len(live) >= MAX_SLOTS:
+        named = ", ".join(str(row.get("run_id") or "") for row in live)
+        raise ToolsError(
+            f"живых попыток {len(live)} из {MAX_SLOTS} ({named}): ответ поднимает попытку, "
+            "а слот освободится, когда попытка отчитается"
+        )
+    cap = budget.refusal(spec, events)
+    if cap is not None:
+        raise ToolsError(cap.reason())
+    attempt = _next_attempt(events, name)
+    written = 0
+    if repeated is None:
+        payload: dict[str, Any] = {
+            "by": SOURCE,
+            "answer": word,
+            "answer_len": len(word),
+            "answered_via": SOURCE,
+            "routing": {"stage": name, "attempt": asked_attempt},
+            "idem": key,
+        }
+        if number:
+            payload["question_id"] = question_id
+        fact = _lead_event(
+            deal,
+            "question_answered",
+            payload,
+            {"stage": name, "attempt": asked_attempt, "by": SOURCE, "idem": key},
+            moment,
+        )
+        written = journal.append(conn, [fact])
+    # Блок `needs_input` ставил движок под вопрос попытки, и снимает его тот, кто
+    # взял работу (`runner.close_answered_block`): иначе дело осталось бы в
+    # `wait_human`, хотя попытка уже идёт.
+    runner.close_answered_block(conn, deal, clock=tick)
+    spawner = spawn or _spawn_attempt
+    pid = spawner(home, str(deal["id"]), name, attempt, key, answer=word)
+    started = _await_start(conn, str(deal["id"]), key, deadline=tick() + float(ack_sec), tick=tick)
+    if started is None:
+        return {
+            "ok": True,
+            "answered": True,
+            "confirmed": False,
+            "deal": str(deal["id"]),
+            "stage": name,
+            "question_id": question_id,
+            "attempt": attempt,
+            "run_id": f"{name}#{attempt}",
+            "pid": pid,
+            "written": written,
+            "reason": (
+                f"ответ записан, попытка поднята (pid {pid}), факта attempt_started ещё нет за "
+                f"{int(ack_sec)} с — её события придут в duty_wait"
+            ),
+        }
+    lifted = journal.payload_of(started)
+    return {
+        "ok": True,
+        "answered": True,
+        "confirmed": True,
+        "deal": str(deal["id"]),
+        "stage": name,
+        "question_id": question_id,
+        "attempt": _int(lifted.get("attempt")) or attempt,
+        "run_id": str(lifted.get("run_id") or f"{name}#{attempt}"),
+        "pid": lifted.get("pid"),
+        "workdir": lifted.get("workdir"),
+        "written": written,
+    }
+
+
+def _answer_repeat(answered: dict[str, Any], lifted: dict[str, Any]) -> dict[str, Any]:
+    """Ответ на повтор `duty_answer`: прежний факт и прежняя попытка, без второго.
+
+    Номер попытки берётся из `attempt_started`, а не пересчитывается по журналу:
+    после первого вызова счётчик уже сдвинут, и пересчёт ответил бы про другую
+    попытку.
+    """
+    payload = journal.payload_of(answered)
+    lifted_payload = journal.payload_of(lifted)
+    address = payload.get("routing")
+    stage = str(address.get("stage") or "") if isinstance(address, dict) else ""
+    return {
+        "ok": True,
+        "answered": True,
+        "repeated": True,
+        "confirmed": True,
+        "deal": str(answered.get("deal_id") or ""),
+        "stage": stage,
+        "question_id": payload.get("question_id"),
+        "attempt": _int(lifted_payload.get("attempt")),
+        "run_id": str(lifted_payload.get("run_id") or ""),
+        "pid": lifted_payload.get("pid"),
+        "text": str(payload.get("answer") or ""),
+    }
+
+
+# -------------------------------------------------------------------- duty_ask
+
+
+def ask(
+    deal_id: Any,
+    role: Any,
+    question: Any,
+    idempotency_key: Any,
+    *,
+    home: Optional[Path] = None,
+    spawn: Optional[Callable[..., Any]] = None,
+    clock: Optional[Callable[[], float]] = None,
+) -> dict[str, Any]:
+    """Спросить профиль за лида: под-попытка роли, ответ возвращается строкой.
+
+    Механика — существующая `runner.ask_role` (`docs/ENGINE-2.0.md`, раздел 6,
+    исход 2): роль получает контракт ответа, её процесс живёт попыткой со своим
+    каталогом, ответ читается из `result.json`. Пула здесь нет — строки вопроса
+    тоже: второй канал не заводится (`docs/JOURNAL.md`), а факты пары
+    `question_asked` → `question_answered(by: role)` пишутся в журнал.
+
+    Адрес — лид: роль называет он, поэтому причина адреса `declared_role` (адрес
+    объявлен, а не выведен из `ask.allowed`; сам `ask.allowed` остаётся подсказкой,
+    раздел 6). Этап, к которому относятся факты, — тот, чей вопрос ждёт ответа:
+    лид спрашивает ради него. Открытого вопроса нет — факты адресуются «этапу»
+    под-попытки (`ASK_STAGE`), которого нет в графе.
+
+    `hops` — номер передачи по цепочке: он считается той же `runner.hops_done`,
+    что и у вопросов движка, поэтому «третья передача» читается одинаково.
+
+    Ответ вернулся — `{ok: true, answer, text}`. Роль переадресовала вопрос
+    человеку (`authority: true`) или её попытка упала — `{ok: false}` с причиной:
+    вопрос не сгорает, и следующий шаг лида — `duty_ask_human`.
+    """
+    key = _key(idempotency_key)
+    name = str(role or "").strip()
+    if not name:
+        raise ToolsError("role не назван: duty_ask(deal, role, question, idempotency_key)")
+    word = " ".join(str(question or "").split())
+    if not word:
+        raise ToolsError("question не назван: спрашивать нечего")
+    home = hermes_home(home)
+    tick = clock or time.time
+    conn = _store(home)
+    deal = _deal(conn, deal_id)
+    events = journal.read_events(conn, str(deal["id"]))
+    if journal.closed_fact(events) is not None:
+        raise ToolsError(f"дело {deal['id']} закрыто: вопрос задавать некому")
+    repeated = _by_idem(events, "question_answered", key)
+    if repeated is not None:
+        payload = journal.payload_of(repeated)
+        return {**_ask_result(payload, name), "repeated": True}
+    spec = _spec(events)
+    stage, attempt, hops = _ask_target(conn, deal, events, name)
+    address = routing.Target(routing.ROLE, value=name, reason=routing.REASON_DECLARED)
+    moment = int(tick())
+    asked = runner._role_question_fact(
+        deal, stage, attempt, word, {"text": word}, address, hops, moment, idem=key
+    )
+    journal.append(conn, [asked])
+    result = runner.ask_role(
+        conn,
+        spec,
+        deal,
+        stage,
+        attempt,
+        {"text": word},
+        address,
+        home=home,
+        previous=(),
+        spawn=spawn,
+        clock=tick,
+    )
+    after = int(tick())
+    if result["ok"] and not result["authority"]:
+        text = str(result["answer"] or "")
+        answered = runner._role_answer_fact(
+            deal, stage.id, attempt, name, hops + 1, text, "", after, idem=key
+        )
+        journal.append(conn, [answered])
+        return {**_ask_result(journal.payload_of(answered), name), "workdir": result["workdir"]}
+    # Вопрос не сгорает: и переадресация, и провал ответа закрывают передачу роли
+    # причиной, а решает дальше лид (человек — `duty_ask_human`).
+    why = (
+        f"роль {name} переадресовала вопрос человеку: authority"
+        if result["ok"]
+        else str(result["reason"] or "")
+    )
+    closed = runner._role_answer_fact(
+        deal,
+        stage.id,
+        attempt,
+        name,
+        hops + 1,
+        "",
+        transit.ROLE_ANSWER_REDIRECTED if result["ok"] else transit.ROLE_ANSWER_FAILED,
+        after,
+        reason=why,
+        idem=key,
+    )
+    journal.append(conn, [closed])
+    return {**_ask_result(journal.payload_of(closed), name), "authority": bool(result["ok"])}
+
+
+def _ask_target(
+    conn: sqlite3.Connection, deal: dict[str, Any], events: Iterable[Any], role: str
+) -> tuple[Any, int, int]:
+    """Этап, номер под-попытки и номер передачи для вопроса лида профилю.
+
+    Вопрос задаётся ради открытого вопроса дела (лид передаёт его профилю), и
+    тогда адрес — этап и попытка, которые ждут ответа: факты ложатся туда же, где
+    их писал бы движок, и срез дела показывает ожидание на своём этапе. Открытого
+    вопроса нет — «этап» под-попытки `ASK_STAGE` (в графе его нет) и номер
+    передачи по этой же цепочке.
+    """
+    stage_id, attempt = _awaiting(events)
+    if stage_id:
+        hops = runner.hops_done(conn, deal, stage_id)
+        return spec_module.Stage(id=stage_id, role=role, workspace="none"), max(attempt, 1), hops
+    hops = runner.hops_done(conn, deal, ASK_STAGE)
+    return spec_module.Stage(id=ASK_STAGE, role=role, workspace="none"), hops + 1, hops
+
+
+def _ask_result(payload: dict[str, Any], role: str) -> dict[str, Any]:
+    """Ответ `duty_ask` по факту ответа роли: строка лиду, автор и номер передачи.
+
+    Факт один на два исхода (`question_answered`), и различает их `answered_via`:
+    пусто — роль ответила, `redirected`/`failed` — вопрос ушёл дальше и текста нет.
+    """
+    via = str(payload.get("answered_via") or "")
+    text = str(payload.get("answer") or "")
+    if not text and via:
+        return {
+            "ok": False,
+            "answered": False,
+            "role": str(payload.get("by") or role),
+            "hops": _int(payload.get("hops")),
+            "error": str(payload.get("reason") or f"роль {role} не ответила: {via}"),
+        }
+    return {
+        "ok": True,
+        "answered": True,
+        "by": str(payload.get("by") or role),
+        "role": str(payload.get("by") or role),
+        "hops": _int(payload.get("hops")),
+        "answer": text,
+        "text": text,
+    }
+
+
+# --------------------------------------------------------------- duty_ask_human
+
+
+def ask_human(
+    deal_id: Any,
+    question: Any,
+    options: Any = None,
+    risky: Any = False,
+    idempotency_key: Any = "",
+    *,
+    home: Optional[Path] = None,
+    clock: Optional[Callable[[], float]] = None,
+) -> dict[str, Any]:
+    """Спросить человека: вопрос в пул `ask.ask`, дело встаёт в `wait_human`.
+
+    Исход 3 раздела 6: властный вопрос (публикация, скоуп, доступы, приоритет)
+    модель не решает никогда — его задаёт человеку лид. Канал — существующий
+    `ask.ask` (`dashboard/ask.py`): строка пула, факт `question_asked` и блок
+    `needs_input`, который и держит дело в ожидании. Ответ человека приходит
+    лиду следующим фактом: пул дочитывает `duty_wait` (`ask.sync_answers`), и
+    факт `question_answered` встаёт в журнал штатным путём пула.
+
+    `risky: true` делает вопрос критичным (`critical` в пуле): властный вопрос по
+    сроку не истекает — молчание не превращает его в ответ. Срок некритичного
+    вопроса считает пул по общим правилам.
+
+    Ключ вызова едет в `payload.routing.idem` (адрес уезжает в факт целиком, так
+    пишет `ask()`), поэтому повтор с тем же ключом отвечает прежним вопросом и
+    второго не задаёт.
+    """
+    key = _key(idempotency_key)
+    word = " ".join(str(question or "").split())
+    if not word:
+        raise ToolsError("question не назван: спрашивать нечего")
+    names = (
+        [str(item).strip() for item in options if str(item).strip()]
+        if isinstance(options, (list, tuple))
+        else []
+    )
+    dangerous = bool(risky)
+    home = hermes_home(home)
+    moment = int((clock or time.time)())
+    conn = _store(home)
+    deal = _deal(conn, deal_id)
+    events = journal.read_events(conn, str(deal["id"]))
+    if journal.closed_fact(events) is not None:
+        raise ToolsError(f"дело {deal['id']} закрыто: вопрос задавать некому")
+    earlier = _by_routing_idem(events, "question_asked", key)
+    if earlier is not None:
+        payload = journal.payload_of(earlier)
+        address = payload.get("routing")
+        return {
+            "ok": True,
+            "repeated": True,
+            "question_id": _int(payload.get("question_id")),
+            "target": "human",
+            "reason": str(address.get("reason") or "") if isinstance(address, dict) else "",
+            "blocked": True,
+            "text": word,
+        }
+    stage_id, attempt = _awaiting(events)
+    address = routing.Target(
+        routing.HUMAN, reason=routing.REASON_RISKY if dangerous else routing.REASON_AUTHORITY
+    )
+    marked: dict[str, Any] = {**address.as_payload(), "idem": key}
+    if stage_id:
+        marked.update({"stage": stage_id, "attempt": attempt})
+    try:
+        asked = ask_module.ask(
+            conn,
+            {**deal, "home": home},
+            word,
+            None,
+            names or None,
+            critical=True if dangerous else None,
+            routing=marked,
+        )
+    except ask_module.AskError as exc:
+        raise ToolsError(str(exc)) from exc
+    deals.set_blocked(
+        conn,
+        str(deal["id"]),
+        kind=NEEDS_INPUT_KIND,
+        reason=f"вопрос лида #{asked.question_id}: {word}",
+        author=SOURCE,
+        source=SOURCE,
+        details={"question_id": int(asked.question_id), "risky": dangerous},
+        now=moment,
+    )
+    return {
+        "ok": True,
+        "question_id": int(asked.question_id),
+        "target": "human",
+        "reason": address.reason,
+        "blocked": True,
+        "options": names,
+        "risky": dangerous,
+        "text": word,
     }
 
 
@@ -833,6 +1436,87 @@ CLOSE_SCHEMA = {
 }
 
 
+ANSWER_SCHEMA = {
+    "name": "duty_answer",
+    "description": (
+        "Ответить воркеру самому: записать вопрос как отвеченный тобой (question_answered, by=lead) "
+        "и поднять продолжение той же попытки — движок резюмирует её сессию с твоим ответом, "
+        "работа не начинается заново. Отказывает, не поднимая ничего: этапа нет в плане, вопроса "
+        "этого этапа нет в журнале, вопрос уже отвечен, дело запарковано (попытки исчерпаны — "
+        "продолжение решает человек), по этапу идёт живая попытка или слотов нет. Повтор с тем же "
+        "idempotency_key второго факта и второй попытки не пишет."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "deal": {"type": "string", "description": "id своего дела (d_<hex>)"},
+            "stage_id": {"type": "string", "description": "id этапа, чей вопрос ты отвечаешь"},
+            "question_id": {
+                "type": "string",
+                "description": "номер вопроса из журнала (payload.question_id факта question_asked)",
+            },
+            "text": {"type": "string", "description": "ответ воркеру — с ним продолжится его сессия"},
+            "idempotency_key": {
+                "type": "string",
+                "description": "ключ вызова: повтор не пишет второй факт и не поднимает вторую попытку",
+            },
+        },
+        "required": ["deal", "stage_id", "question_id", "text", "idempotency_key"],
+    },
+}
+
+ASK_SCHEMA = {
+    "name": "duty_ask",
+    "description": (
+        "Спросить профиль за себя: под-попытка роли (как вопрос этапа движку), ответ возвращается "
+        "тебе строкой — его передаёт воркеру duty_answer. Факты журнала: question_asked и "
+        "question_answered (by=<роль>) с номером передачи (hops). Пула не касается: вопрос профилю "
+        "остаётся в журнале дела. Ответа нет — ok=false с причиной (роль переадресовала вопрос "
+        "человеку или её попытка упала): тогда следующий шаг — duty_ask_human. Повтор с тем же "
+        "idempotency_key отвечает прежним результатом."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "deal": {"type": "string", "description": "id своего дела (d_<hex>)"},
+            "role": {"type": "string", "description": "профиль, у которого спрашиваешь (researcher, reviewer…)"},
+            "question": {"type": "string", "description": "вопрос профилю, своими словами"},
+            "idempotency_key": {"type": "string", "description": "ключ вызова: повтор не задаёт вопрос второй раз"},
+        },
+        "required": ["deal", "role", "question", "idempotency_key"],
+    },
+}
+
+ASK_HUMAN_SCHEMA = {
+    "name": "duty_ask_human",
+    "description": (
+        "Спросить человека: вопрос уходит в пул решений (ask.ask), дело встаёт в wait_human, ответ "
+        "приходит следующим фактом в duty_wait. Властные вопросы — публикация, скоуп, доступы, "
+        "приоритет — решает только человек: на них твой ответ не годится. risky=true делает вопрос "
+        "критичным: по сроку он не истекает. Повтор с тем же idempotency_key второго вопроса не задаёт."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "deal": {"type": "string", "description": "id своего дела (d_<hex>)"},
+            "question": {"type": "string", "description": "вопрос человеку — короткая строка"},
+            "options": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "варианты ответа словами (панель покажет их кнопками)",
+            },
+            "risky": {
+                "type": "boolean",
+                "description": "властный вопрос: критичный, сроком не закрывается",
+                "default": False,
+            },
+            "idempotency_key": {"type": "string", "description": "ключ вызова: повтор не задаёт второй вопрос"},
+        },
+        "required": ["deal", "question", "idempotency_key"],
+    },
+}
+
+
 def _json(value: dict[str, Any]) -> str:
     """Ответ инструмента строкой JSON: модель читает причину и решает сама."""
     return json.dumps(value, ensure_ascii=False)
@@ -846,7 +1530,14 @@ def _run(call: Callable[[], dict[str, Any]]) -> dict[str, Any]:
     """
     try:
         return call()
-    except (ToolsError, deals.DealError, spec_module.SpecError, sqlite3.Error) as exc:
+    except (
+        ToolsError,
+        deals.DealError,
+        spec_module.SpecError,
+        runner.RunnerError,
+        ask_module.AskError,
+        sqlite3.Error,
+    ) as exc:
         return {"ok": False, "error": str(exc) or type(exc).__name__}
 
 
@@ -909,6 +1600,56 @@ def handle_close(params: dict, **kwargs: Any) -> str:
                 args.get("deal", ""),
                 args.get("summary", ""),
                 args.get("verdict", CLOSE_VERDICT),
+                args.get("idempotency_key", ""),
+                home=kwargs.get("home"),
+            )
+        )
+    )
+
+
+def handle_answer(params: dict, **kwargs: Any) -> str:
+    """`duty_answer`: аргументы модели → ответ строкой; `home` — шов для тестов."""
+    args = params or {}
+    return _json(
+        _run(
+            lambda: answer(
+                args.get("deal", ""),
+                args.get("stage_id", ""),
+                args.get("question_id", ""),
+                args.get("text", ""),
+                args.get("idempotency_key", ""),
+                home=kwargs.get("home"),
+            )
+        )
+    )
+
+
+def handle_ask(params: dict, **kwargs: Any) -> str:
+    """`duty_ask`: аргументы модели → ответ строкой; `home` — шов для тестов."""
+    args = params or {}
+    return _json(
+        _run(
+            lambda: ask(
+                args.get("deal", ""),
+                args.get("role", ""),
+                args.get("question", ""),
+                args.get("idempotency_key", ""),
+                home=kwargs.get("home"),
+            )
+        )
+    )
+
+
+def handle_ask_human(params: dict, **kwargs: Any) -> str:
+    """`duty_ask_human`: аргументы модели → ответ строкой; `home` — шов для тестов."""
+    args = params or {}
+    return _json(
+        _run(
+            lambda: ask_human(
+                args.get("deal", ""),
+                args.get("question", ""),
+                args.get("options"),
+                args.get("risky", False),
                 args.get("idempotency_key", ""),
                 home=kwargs.get("home"),
             )

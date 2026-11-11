@@ -4854,6 +4854,8 @@ def _role_question_fact(
     address: Any,
     hops: int,
     now: int,
+    *,
+    idem: str = "",
 ) -> dict[str, Any]:
     """Вопрос, ушедший роли: `question_asked` без пула.
 
@@ -4861,6 +4863,10 @@ def _role_question_fact(
     поля», а правда: строки пула не существует, вопрос прочитает роль из своего
     контракта, а журнал хранит его текст и адрес. `routing.hops` — номер
     передачи по цепочке (`max_hops`): он же потом считается `hops_done`.
+
+    `idem` — ключ вызова лида (`duty_ask`): он едет в факт и в ключ события, как
+    у остальных инструментов, поэтому повтор вопроса второго факта не пишет. У
+    движка ключа нет, и его факты остаются прежними.
     """
     payload: dict[str, Any] = {
         "routing": {
@@ -4874,13 +4880,11 @@ def _role_question_fact(
     text_full = question.get("text_full")
     if isinstance(text_full, str) and text_full.strip():
         payload["text_full"] = text_full.strip()
-    return _event(
-        deal,
-        "question_asked",
-        payload,
-        {"stage": stage.id, "attempt": int(attempt), "role": str(address.value)},
-        now,
-    )
+    args: dict[str, Any] = {"stage": stage.id, "attempt": int(attempt), "role": str(address.value)}
+    if idem:
+        payload["idem"] = idem
+        args["idem"] = idem
+    return _event(deal, "question_asked", payload, args, now)
 
 
 def _role_answer_fact(
@@ -4893,6 +4897,8 @@ def _role_answer_fact(
     via: str,
     now: int,
     reason: str = "",
+    *,
+    idem: str = "",
 ) -> dict[str, Any]:
     """Ответ роли: `question_answered` с автором-ролью, а не с пулом.
 
@@ -4905,6 +4911,9 @@ def _role_answer_fact(
     `via` — чем кончилась передача, когда ответа нет: `redirected` («дальше
     человек») или `failed` (попытка ответа упала) — по ним `transit` отличает
     закрытие вопроса роли от ответа по сроку (`expired`).
+
+    `idem` — ключ вызова лида (`duty_ask`): повтор вопроса отвечает прежним
+    фактом, а не пишет второй. У движка ключа нет, и его факты остаются прежними.
     """
     payload: dict[str, Any] = {
         "by": role,
@@ -4918,13 +4927,11 @@ def _role_answer_fact(
         payload["answered_via"] = via
     if reason:
         payload["reason"] = reason
-    return _event(
-        deal,
-        "question_answered",
-        payload,
-        {"stage": stage_id, "attempt": int(attempt), "role": role, "via": via},
-        now,
-    )
+    args: dict[str, Any] = {"stage": stage_id, "attempt": int(attempt), "role": role, "via": via}
+    if idem:
+        payload["idem"] = idem
+        args["idem"] = idem
+    return _event(deal, "question_answered", payload, args, now)
 
 
 def role_answer_before(events: Iterable[Any], stage_id: str, attempt: int) -> Optional[str]:

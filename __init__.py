@@ -1,10 +1,10 @@
 """Hermes Duty — агентная половина плагина.
 
 С 0.2.0 плагин отдаёт инструменты лиду (`docs/ENGINE-2.0.md`, раздел 4): тулсет
-`duty` — `duty_plan`, `duty_start`, `duty_wait`, `duty_close`. Шедулером дела
-становится лид, поэтому инструменты живут здесь, а обработчики — в
-`dashboard/tools.py`: они работают с журналом дел и спекой, а не с карточками
-kanban.
+`duty` — `duty_plan`, `duty_start`, `duty_wait`, `duty_answer`, `duty_ask`,
+`duty_ask_human`, `duty_close`. Шедулером дела становится лид, поэтому
+инструменты живут здесь, а обработчики — в `dashboard/tools.py`: они работают с
+журналом дел и спекой, а не с карточками kanban.
 
 Профилю `lead` тулсет включается ключом `duty` в `platform_toolsets`: у роли
 whitelist, и без этого ключа инструменты не поднимутся.
@@ -25,11 +25,15 @@ __version__ = "0.2.0"
 TOOLS_MODULE_NAME = "hermes_duty_tools"
 
 # Инструменты тулсета: имя, схема, обработчик, значок. Порядок — порядок турна
-# лида (`docs/ENGINE-2.0.md`, раздел 5): план, этап, ожидание, закрытие.
+# лида (`docs/ENGINE-2.0.md`, разделы 5 и 6): план, этап, ожидание, ответ воркеру,
+# вопрос профилю, вопрос человеку, закрытие.
 _TOOLS = (
     ("duty_plan", "PLAN_SCHEMA", "handle_plan", "🗺"),
     ("duty_start", "START_SCHEMA", "handle_start", "▶"),
     ("duty_wait", "WAIT_SCHEMA", "handle_wait", "⏳"),
+    ("duty_answer", "ANSWER_SCHEMA", "handle_answer", "💬"),
+    ("duty_ask", "ASK_SCHEMA", "handle_ask", "🙋"),
+    ("duty_ask_human", "ASK_HUMAN_SCHEMA", "handle_ask_human", "🧑"),
     ("duty_close", "CLOSE_SCHEMA", "handle_close", "🏁"),
 )
 
@@ -50,7 +54,7 @@ def tools_module() -> Any:
 
 
 def register(ctx) -> None:
-    """Точка входа плагина: четыре инструмента лида в тулсете `duty`.
+    """Точка входа плагина: семь инструментов лида в тулсете `duty`.
 
     `ctx.register_tool` — единственный путь: список `provides_tools` в
     `plugin.yaml` объявляет ровно то, что регистрируется здесь, и `hermes plugins

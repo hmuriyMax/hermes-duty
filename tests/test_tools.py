@@ -592,7 +592,17 @@ def test_wait_returns_a_batch_with_the_cursor(tmp_path: Path) -> None:
     assert [event["kind"] for event in answer["events"]] == ["attempt_started", "attempt_ended"]
     assert answer["cursor"] == answer["events"][-1]["id"]
     more = tools.wait(str(deal["id"]), answer["cursor"], 0, home=home)
-    assert more == {"ok": True, "deal": str(deal["id"]), "events": [], "cursor": answer["cursor"], "timed_out": True}
+    # `answers` — сколько фактов ответа человека дочитано из пула этим вызовом:
+    # ответ на `duty_ask_human` приходит лиду следующим фактом ожидания
+    # (`docs/ENGINE-2.0.md`, раздел 6), поэтому счётчик есть в каждом ответе.
+    assert more == {
+        "ok": True,
+        "deal": str(deal["id"]),
+        "events": [],
+        "cursor": answer["cursor"],
+        "timed_out": True,
+        "answers": 0,
+    }
 
 
 def test_wait_skips_telemetry_but_moves_the_cursor(tmp_path: Path) -> None:
@@ -738,13 +748,21 @@ def load_plugin() -> Any:
 
 
 def test_register_declares_the_duty_toolset() -> None:
-    """`register(ctx)` объявляет ровно четыре инструмента тулсета `duty`."""
+    """`register(ctx)` объявляет ровно семь инструментов тулсета `duty`."""
     plugin = load_plugin()
     ctx = RecordingContext()
 
     plugin.register(ctx)
 
-    assert [tool["name"] for tool in ctx.tools] == ["duty_plan", "duty_start", "duty_wait", "duty_close"]
+    assert [tool["name"] for tool in ctx.tools] == [
+        "duty_plan",
+        "duty_start",
+        "duty_wait",
+        "duty_answer",
+        "duty_ask",
+        "duty_ask_human",
+        "duty_close",
+    ]
     assert {tool["toolset"] for tool in ctx.tools} == {"duty"}
     for tool in ctx.tools:
         assert callable(tool["handler"])

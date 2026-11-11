@@ -26,11 +26,21 @@
 `retry: {max: N, on: [infra, contract]}` (по умолчанию `max: 1, on: [infra]`) —
 сколько раз повторять отказ **этого** класса. Счётчик считается на этап и на класс:
 `infra` и `contract` — разные причины, и общий счётчик склеил бы их в один.
-`capability` по умолчанию не повторяется: стена не рассосётся.
+`capability` не повторяется никогда: стена не рассосётся.
+
+Какие классы движок повторяет сам — политика **движка**, а не спеки (`AUTO_ON`,
+`docs/ENGINE-2.0.md`, раздел 7). `retry.on` из спеки этапа набор **сужает**, но не
+расширяет: `retry.on: [capability]` не включает повторы, а `policy()` отдаёт
+эффективный набор — тот, по которому движок и будет повторять. Иначе однажды
+появился бы `retry.on: [capability]`, и движок вечно бился бы в отсутствующий
+доступ (по истории переходов `capability` дал 0 done / 2 failed).
 
 Пауза между попытками растёт экспоненциально от 30 с и упирается в потолок 5 мин.
 Пауза не блокирует движок: дело просто ждёт `retry_at` в срезе, а решение о
-следующем шаге отвечает `wait("retry", …)` (`dashboard/transit.py`).
+следующем шаге отвечает `wait("retry", …)` (`dashboard/transit.py`). Собственная
+серия движка (2.0, `runner.run_attempts`) идёт без паузы: попытка — отдельный
+процесс, и спать в нём значило бы держать этап без лизинга, пока `reaper` считает
+дело осиротевшим.
 
 Общий предохранитель: если за дело набралось `MAX_ROUNDS_PER_DEAL` упавших попыток
 по любому классу, дело паркуется — это защита от того самого `gave_up`-класса,
@@ -111,6 +121,12 @@ REFUSED_STATUSES = ("refused", "rejected")
 # Политика этапа по умолчанию: одна повторная попытка, и только на `infra`.
 DEFAULT_MAX = 1
 DEFAULT_ON = (INFRA,)
+
+# Классы, которые движок повторяет сам (`docs/ENGINE-2.0.md`, раздел 7). Это
+# политика **движка**, а не спеки: `retry.on` этапа набор сужает, но расширить не
+# может. `capability` в наборе нет и не будет — стена (бюджет, доступ, роль)
+# повтором не рассасывается, и за историю такие переходы дали 0 done / 2 failed.
+AUTO_ON = (INFRA, CONTRACT)
 
 # Общий предохранитель на дело: столько упавших попыток (по любому классу) — и
 # дело паркуется, а не крутится.
@@ -210,14 +226,24 @@ def verdict_kind(verdict: Any) -> str:
 
 @dataclass(frozen=True)
 class Policy:
-    """Политика ретраев этапа: сколько повторов и на каких классах."""
+    """Политика ретраев этапа: сколько повторов и на каких классах.
+
+    `on` — **эффективный** набор: то, что осталось от объявленного `retry.on`
+    после сужения политикой движка (`AUTO_ON`). Объявленный набор читается в
+    `spec` и виден там как есть; повторять движок будет только это.
+    """
 
     max: int = DEFAULT_MAX
     on: tuple[str, ...] = DEFAULT_ON
 
     def allows(self, kind: str) -> bool:
-        """Повторяется ли этот класс вообще (до счёта попыток)."""
-        return kind in self.on
+        """Повторяется ли этот класс вообще (до счёта попыток).
+
+        Два условия, и второе сильнее первого: класс назван в политике этапа **и**
+        он вообще подлежит автоматическому повтору. Так `retry.on: [capability]`
+        не расширяет набор, а сужает его до пустого — повторов не будет вовсе.
+        """
+        return kind in self.on and kind in AUTO_ON
 
 
 def policy(stage_spec: Any) -> Policy:
@@ -225,13 +251,16 @@ def policy(stage_spec: Any) -> Policy:
 
     `retry` в спеке не задан → `{max: 1, on: [infra]}` (спека-источник,
     `docs/SPEC.md`). Отрицательный `max` читается как ноль: повторов не будет,
-    а не «сколько-нибудь».
+    а не «сколько-нибудь». Объявленные классы сужаются до `AUTO_ON`: набор
+    повторов — политика движка (`docs/ENGINE-2.0.md`, раздел 7), спека может
+    только отказаться от части, но не потребовать невозможного.
     """
     retry = getattr(stage_spec, "retry", None)
     if retry is None:
         return Policy()
     maximum = getattr(retry, "max", DEFAULT_MAX)
-    on = tuple(str(kind) for kind in (getattr(retry, "on", None) or ()))
+    declared = tuple(str(kind) for kind in (getattr(retry, "on", None) or ()))
+    on = tuple(kind for kind in declared if kind in AUTO_ON)
     return Policy(max=max(0, _int(maximum)), on=on)
 
 
@@ -316,6 +345,43 @@ def failures_of(events: Iterable[Any], stage: Optional[str] = None) -> dict[str,
 def total_failures(events: Iterable[Any]) -> int:
     """Сколько попыток дела упало по любому классу — предохранитель на дело."""
     return sum(failures_of(events).values())
+
+
+def auto_retries(events: Iterable[Any], stage: Optional[str] = None) -> dict[str, Any]:
+    """Сколько автоматических повторов сделал движок и по каким классам.
+
+    Повтор движка отличим от повторного `duty_start` лида по факту: у
+    `attempt_started` повторной попытки есть `retried_from` — номер попытки, чей
+    отказ повторяется (`dashboard/runner.py`, `start_stage`). Класс берётся из
+    `attempt_ended` той самой попытки, а не из нашего слова: «два повтора, оба
+    `contract`» — это факт журнала, и лид читает его, не пересчитывая.
+
+    Ответ — `{"count": N, "kinds": {класс: N}}`: число повторов и их состав.
+    """
+    started: dict[int, Optional[int]] = {}
+    ended: dict[int, str] = {}
+    for event in events or ():
+        if not isinstance(event, dict):
+            continue
+        kind = str(event.get("kind") or "")
+        payload = _payload(event)
+        if stage is not None and str(payload.get("stage") or "") != str(stage):
+            continue
+        number = _int(payload.get("attempt"))
+        if kind == "attempt_started":
+            retried_from = payload.get("retried_from")
+            started[number] = None if retried_from is None else _int(retried_from)
+        elif kind == "attempt_ended" and str(payload.get("outcome") or "").strip().lower() == OUTCOME_FAILED:
+            ended[number] = str(payload.get("kind") or "").strip() or UNCLASSIFIED
+    counts: dict[str, int] = {}
+    total = 0
+    for retried_from in started.values():
+        if retried_from is None:
+            continue
+        total += 1
+        cause = ended.get(retried_from, UNCLASSIFIED)
+        counts[cause] = counts.get(cause, 0) + 1
+    return {"count": total, "kinds": counts}
 
 
 def _payload(event: dict[str, Any]) -> dict[str, Any]:

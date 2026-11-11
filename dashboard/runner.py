@@ -2942,6 +2942,10 @@ def finish_shell_stage(
         "duration_sec": round(duration, 1),
         "verdict": verdict.as_payload() if verdict is not None else None,
         "park": park,
+        # Авто-повтор у команды свой: `kind: shell` не принимает `retry`, повтор
+        # выражается кодом возврата `must` (`docs/SPEC.md`). Поэтому движок
+        # команду не повторяет даже на `infra` — это решает спека.
+        "retry": False,
     }
 
 
@@ -3968,6 +3972,7 @@ def start_stage(
     home: Path,
     answer: Optional[str] = None,
     idem: str = "",
+    retry_of: Optional[int] = None,
     spawn: Optional[Callable[..., Any]] = None,
     clock: Optional[Callable[[], float]] = None,
     monotonic: Optional[Callable[[], float]] = None,
@@ -3986,6 +3991,12 @@ def start_stage(
     `idem` — ключ вызова лида (`duty_start`, 2.0): повтор инструмента находит по
     нему эту же попытку в журнале и второго процесса не поднимает. У движка ключа
     нет, поле не пишется, и ключи прежних фактов не меняются.
+
+    `retry_of` — номер попытки, чей отказ движок повторяет сам
+    (`docs/ENGINE-2.0.md`, раздел 7). Повтор лида его не ставит: иначе «сколько
+    автоматических повторов сделал движок» пришлось бы угадывать по номерам
+    попыток, а номер растёт и от руки поднятой попытки тоже
+    (`dashboard/failures.py:auto_retries`).
     """
     spawner = spawn or spawn_process
     clock = clock or time.time
@@ -4110,6 +4121,9 @@ def start_stage(
                 "tree": None,
                 "base": stage_base,
                 "park": park,
+                # Политика сказала «повторяем» — значит попытку поднимет движок,
+                # а не лид (`run_attempts`): сбой дерева бывает флейком.
+                "retry": park is None,
             },
         }
 
@@ -4222,6 +4236,11 @@ def start_stage(
     if idem:
         started_args["idem"] = idem
         started_payload["idem"] = idem
+    if retry_of is not None:
+        # Повтор движка: факт называет, чей отказ повторяется. По нему лид видит
+        # «этап review: 2 автоматических повтора, оба contract», не сверяя номера
+        # попыток руками (`dashboard/failures.py:auto_retries`).
+        started_payload["retried_from"] = int(retry_of)
     started = _event(deal, "attempt_started", started_payload, started_args, now)
     try:
         # Одна транзакция: лизинг переезжает к процессу, дело становится
@@ -4574,6 +4593,11 @@ def finish_agent_stage(
         "question_reason": question_reason,
         "verdict": verdict.as_payload() if verdict is not None else None,
         "park": park,
+        # Повтор — политика движка (раздел 7 контракта): `park is None` при отказе
+        # значит «класс повторяется и лимит не исчерпан», и следующую попытку
+        # поднимает `run_attempts` сам, дописав в её бриф причину этого отказа.
+        # Парковка и переосмысление (`park` — словарь) отдают решение лиду.
+        "retry": park is None and outcome == OUTCOME_FAILED,
     }
 
 
@@ -4587,6 +4611,7 @@ def run_stage(
     home: Path,
     answer: Optional[str] = None,
     idem: str = "",
+    retry_of: Optional[int] = None,
     spawn: Optional[Callable[..., Any]] = None,
     clock: Optional[Callable[[], float]] = None,
     monotonic: Optional[Callable[[], float]] = None,
@@ -4601,13 +4626,98 @@ def run_stage(
     продолжается резюмом (`RESUME-OK`), без него начинается новая сессия.
     `idem` — ключ вызова лида: он едет в `attempt_started`, и повтор инструмента
     находит по нему эту же попытку (см. `start_stage`).
+    `retry_of` — чей отказ эта попытка повторяет автоматически: тот же смысл, что
+    у `start_stage`, и ставит его только `run_attempts`.
     """
     launched = start_stage(
-        conn, spec, deal, stage_id, attempt, home=home, answer=answer, idem=idem, spawn=spawn, clock=clock, monotonic=monotonic
+        conn,
+        spec,
+        deal,
+        stage_id,
+        attempt,
+        home=home,
+        answer=answer,
+        idem=idem,
+        retry_of=retry_of,
+        spawn=spawn,
+        clock=clock,
+        monotonic=monotonic,
     )
     if launched["live"] is None:
         return launched["result"]
     return finish_stage(conn, deal, launched["live"], home=home, spawn=spawn, clock=clock, monotonic=monotonic)
+
+
+def run_attempts(
+    conn: sqlite3.Connection,
+    spec: Any,
+    deal: Any,
+    stage_id: str,
+    attempt: int,
+    *,
+    home: Path,
+    answer: Optional[str] = None,
+    idem: str = "",
+    spawn: Optional[Callable[..., Any]] = None,
+    clock: Optional[Callable[[], float]] = None,
+    monotonic: Optional[Callable[[], float]] = None,
+) -> dict[str, Any]:
+    """Попытка этапа и авто-повторы движка поверх неё (`docs/ENGINE-2.0.md`, §7).
+
+    Какие классы повторяются — политика **движка**, а не лида: `infra` и
+    `contract` в пределах `retry.max` этапа, `capability` никогда (решение и
+    данные: `dashboard/failures.py:AUTO_ON`, `retry.on` из спеки набор сужает,
+    но не расширяет — «дело стоит, вопрос в доступе» не лечится ещё раз).
+
+    Каждый повтор — отдельная попытка со своим лизингом, деревом, процессом и
+    фактом: серия выглядит в журнале как серия, а не как одна длинная. Причина
+    прошлого отказа уезжает в её бриф (`build_contract` → `previous_failures`),
+    поэтому повтор не повторяет ошибку вслепую. `idem` лида повтору не передаётся:
+    ключ отвечает за одну попытку, а не за серию. Ответ человека тоже не
+    передаётся: сессия упавшей попытки ломалась вместе с ней, и продолжать её
+    значит унаследовать поломку — новая попытка начинает сессию, но читает
+    прошлые причины.
+
+    Паузы между повторами здесь нет (в отличие от `transit.wait("retry")`):
+    попытка — отдельный процесс, и спать в нём значило бы держать этап без
+    лизинга, пока `reaper` считает дело осиротевшим.
+
+    Ответ — отчёт последней попытки плюс `retries` — сколько повторов движок
+    сделал сам (в отчёте каждой попытки их нет: там своя попытка).
+    """
+    report = run_stage(
+        conn,
+        spec,
+        deal,
+        stage_id,
+        attempt,
+        home=home,
+        answer=answer,
+        idem=idem,
+        spawn=spawn,
+        clock=clock,
+        monotonic=monotonic,
+    )
+    retried = 0
+    while report.get("retry") is True:
+        previous = int(report.get("attempt") or attempt)
+        attempt = previous + 1
+        retried += 1
+        report = run_stage(
+            conn,
+            spec,
+            deal,
+            stage_id,
+            attempt,
+            home=home,
+            retry_of=previous,
+            spawn=spawn,
+            clock=clock,
+            monotonic=monotonic,
+        )
+    if retried:
+        report = {**report, "retries": retried}
+    return report
 
 
 MAX_RETHINKS_PER_DEAL = 2
@@ -4624,6 +4734,8 @@ def _rethink_park(
     total: int,
     events: list[dict[str, Any]],
     clock: Callable[[], float],
+    *,
+    retries: Optional[dict[str, Any]] = None,
 ) -> Optional[dict[str, Any]]:
     """Попытки исчерпаны — вернуть дело лиду на переосмысление, не человеку.
 
@@ -4632,6 +4744,11 @@ def _rethink_park(
     порядок, гейт человеку. Ограничения: этап плана сам себе переосмысление не
     возвращает (иначе петля), а число переосмыслений на дело —
     `MAX_RETHINKS_PER_DEAL`, дальше решает человек (прежний путь `park_exhausted`).
+
+    `retries` — сколько автоматических повторов движок уже сделал по этапу
+    (`failures.auto_retries`): это тот самый «один факт лиду», в котором класс,
+    число повторов и последняя причина стоят рядом (`docs/ENGINE-2.0.md`,
+    раздел 7). Без числа лид читал бы серию отказов как один.
     """
     if spec_module.is_plan_stage(getattr(stage, "id", "")):
         return None
@@ -4659,6 +4776,9 @@ def _rethink_park(
                     "why": str(reason or ""),
                     "total": int(total),
                     "round": rethinks + 1,
+                    # Класс, число автоматических повторов и последняя причина —
+                    # в одном факте: лид решает по серии, а не по одной попытке.
+                    "retries": retries or {"count": 0, "kinds": {}},
                 },
                 {"stage": stage.id, "attempt": int(attempt), "kind": kind, "round": rethinks + 1},
                 now,
@@ -4721,26 +4841,31 @@ def park_exhausted(
     rule = failures.decide_park(kind=kind, attempts=attempts, total=total, policy_=policy)
     if rule is None:
         return None
+    # Сколько раз движок уже повторил этот этап сам: лид должен видеть, что за
+    # отказом стоит не одна попытка, а серия (`docs/ENGINE-2.0.md`, раздел 7) —
+    # иначе флейк выглядит как провал работы.
+    retries = failures.auto_retries(events, stage.id)
     # Прежде чем будить человека — вернуть дело лиду: он эксперт по делу и
     # сначала должен разобраться, что происходит (кейс d_c8551c18: review
     # падал шесть раз по одной причине, а движок каждый раз спрашивал человека
     # про «continue»). Ревизия плана — один из исходов переосмысления, не
     # единственный.
-    rethink = _rethink_park(conn, spec, deal, stage, attempt, kind, reason, total, events, clock)
+    rethink = _rethink_park(conn, spec, deal, stage, attempt, kind, reason, total, events, clock, retries=retries)
     if rethink is not None:
         return rethink
     limit = failures.park_limit(rule, policy)
     counter = failures.counter(kind, attempts, limit)
+    retried = _retries_text(retries)
     if rule == failures.REASON_TOO_MANY:
         headline = (
             f"Попытки исчерпаны: у дела {total} упавших попыток из "
             f"{failures.MAX_ROUNDS_PER_DEAL} (последний класс — {kind} "
-            f"на этапе {stage.id}, попытка {attempt})."
+            f"на этапе {stage.id}, попытка {attempt}). {retried}"
         )
     else:
         headline = (
             f"Попытки исчерпаны: {counter} на этапе {stage.id}, попытка {attempt} "
-            f"(политика этапа: max={policy.max}, on=[{', '.join(policy.on) or '—'}])."
+            f"(политика этапа: max={policy.max}, on=[{', '.join(policy.on) or '—'}]). {retried}"
         )
     question = (
         f"{headline} Продолжать? continue — новая попытка со сбросом счётчиков "
@@ -4774,6 +4899,10 @@ def park_exhausted(
             "limit": limit,
             "park_reason": rule,
             "question_id": int(asked.question_id),
+            # Сколько повторов движок сделал сам до этого исчерпания: без числа
+            # «попытки кончились» читалось бы как «работа не удалась», хотя это
+            # может быть флейк (`docs/ENGINE-2.0.md`, раздел 7).
+            "retries": retries,
         },
         now=now,
     )
@@ -4785,10 +4914,26 @@ def park_exhausted(
         "attempts": attempts,
         "limit": limit,
         "total": total,
+        "retries": retries,
         "question_id": int(asked.question_id),
         "question_target": address.address,
         "question_reason": address.reason,
     }
+
+
+def _retries_text(retries: dict[str, Any]) -> str:
+    """Сколько повторов сделал движок — одной фразой для факта и вопроса.
+
+    `retries` считает `failures.auto_retries` по журналу: `{"count": N, "kinds":
+    {...}}`. Состав называется, потому что «два повтора `contract`» и «infra плюс
+    `contract`» — разные истории, и лиду решать по ним по-разному.
+    """
+    count = int(retries.get("count") or 0)
+    if count <= 0:
+        return "Автоматических повторов не было."
+    kinds = retries.get("kinds") or {}
+    named = ", ".join(f"{kind} ×{int(number)}" for kind, number in sorted(kinds.items())) or "—"
+    return f"Автоматических повторов: {count} ({named})."
 
 
 def park_stopped(

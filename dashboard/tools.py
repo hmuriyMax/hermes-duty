@@ -831,6 +831,11 @@ def _attempt_main(argv: list[str]) -> int:
     Здесь только сборка: правила попытки живут в движке, и второй реализации
     «как идёт попытка» быть не должно. Ответ лида (`answer_file`) отличает
     продолжение от новой попытки — тот же резюм-путь движка (`--resume`).
+
+    Попыток в процессе может быть несколько: `infra` и `contract` движок
+    повторяет сам в пределах политики этапа (`runner.run_attempts`,
+    `docs/ENGINE-2.0.md`, раздел 7), и лид видит серию фактами `attempt_*`, не
+    поднимая каждый повтор вручную.
     """
     if len(argv) < 5:
         print(
@@ -847,7 +852,7 @@ def _attempt_main(argv: list[str]) -> int:
         deal = _deal(conn, argv[0])
         events = journal.read_events(conn, str(deal["id"]))
         spec = _spec(events)
-        runner.run_stage(
+        runner.run_attempts(
             conn, spec, deal, argv[1], _int(argv[2]), home=home, answer=answer, idem=argv[3]
         )
     except Exception:  # noqa: BLE001 - процесс отдельный: причина уходит в лог, а не лиду

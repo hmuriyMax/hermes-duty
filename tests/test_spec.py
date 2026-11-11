@@ -1233,10 +1233,12 @@ def test_retry_on_empty(tmp_path: Path):
 
 
 def test_retry_on_capability_is_warning_not_error(tmp_path: Path):
-    """`capability` повтором обычно не рассасывается — предупреждение, а не отказ.
+    """`capability` движок не повторяет никогда — предупреждение, а не отказ.
 
-    Осознанный выбор автора спеки законен: движок всё равно решает по политике,
-    а валидатор не запрещает то, что объявлено нарочно.
+    `retry.on` набор **сужает**, но не расширяет (`docs/ENGINE-2.0.md`, раздел 7):
+    объявленный `capability` не попадает в эффективную политику, и повтора не
+    будет. Спека говорит об этом предупреждением, а не отказом: старые файлы
+    остаются валидными, а автор видит, что строка не работает.
     """
     path = write(
         tmp_path,
@@ -1249,7 +1251,8 @@ stages:
     )
     found = spec_module.validate_spec(spec_module.load_spec(path), profiles=PROFILES)
     assert [(issue.rule, issue.line, issue.severity) for issue in found] == [("retry.on", 5, "warning")]
-    assert "capability обычно не рассасывается повтором; если это осознанно — оставь как есть" in found[0].message
+    assert "capability движок не повторяет никогда" in found[0].message
+    assert "класс сужается" in found[0].message
     assert spec_module.errors(found) == []
 
 

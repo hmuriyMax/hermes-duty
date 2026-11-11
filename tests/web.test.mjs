@@ -975,6 +975,84 @@ test('веб: при prefers-reduced-motion подсветка не навеши
   }
 })
 
+test('веб: список дел и «Здоровье» опрашивают себя сами — тик ставит следующий', async (t) => {
+  // Макс, 11.11: «а че страница дел не обновляется автоматом». Таймер взводился
+  // ровно один раз при смене маршрута: срабатывал, и цепочка обрывалась.
+  const root = jsdomRoot()
+  if (!root) return t.skip('jsdom не найден')
+  const { JSDOM } = await import(pathToFileURL(join(root, 'jsdom', 'lib', 'api.js')).href)
+  const dir = mkdtempSync(join(tmpdir(), 'duty-web-poll-'))
+  writeFileSync(join(dir, 'app.js'), app)
+  writeFileSync(join(dir, 'model.js'), read('desktop/model.js'))
+  const dom = new JSDOM(
+    '<!doctype html><div id="app"></div><span id="stamp"></span><span id="ver"></span><span id="human"></span><div id="tabs"></div><button id="refresh"></button>',
+    // `pretendToBeVisual` — не косметика: jsdom по умолчанию считает вкладку
+    // скрытой (`document.hidden === true`), а скрытая страница по нашему же
+    // правилу не опрашивает сервер и таймер не взводит.
+    { url: 'http://localhost/#/', pretendToBeVisual: true },
+  )
+  globalThis.window = dom.window
+  globalThis.document = dom.window.document
+  globalThis.Node = dom.window.Node
+  globalThis.localStorage = dom.window.localStorage
+  globalThis.location = dom.window.location
+
+  const saved = {
+    fetch: globalThis.fetch,
+    setTimeout: globalThis.setTimeout,
+    setInterval: globalThis.setInterval,
+    clearTimeout: globalThis.clearTimeout,
+    clearInterval: globalThis.clearInterval,
+  }
+  const seen = []
+  const pending = new Map()
+  let seq = 1
+  globalThis.fetch = async (url) => {
+    seen.push(String(url))
+    return { ok: true, status: 200, json: async () => ({ deals: [], groups: [], finished: [], kpi: {}, source: {} }) }
+  }
+  globalThis.setTimeout = (fn, ms) => {
+    const id = seq++
+    pending.set(id, { fn, ms })
+    return id
+  }
+  globalThis.setInterval = () => 0
+  globalThis.clearTimeout = (id) => { pending.delete(id) }
+  globalThis.clearInterval = () => {}
+
+  const settle = async () => {
+    for (let i = 0; i < 40; i += 1) await new Promise((resolve) => setImmediate(resolve))
+  }
+  const fireNext = async () => {
+    const entry = [...pending.entries()].pop()
+    if (!entry) return null
+    pending.delete(entry[0])
+    entry[1].fn()
+    await settle()
+    return entry[1].ms
+  }
+
+  try {
+    await import(pathToFileURL(join(dir, 'app.js')).href)
+    await settle()
+    const first = seen.filter((url) => url.includes('/now')).length
+    assert.ok(first >= 1, 'первый запрос списка не ушёл')
+
+    // Один тик: сработавший таймер обязан и сходить за данными, и взвести
+    // следующий — иначе страница замирает после первого обновления.
+    const delay = await fireNext()
+    assert.equal(delay, 10000, `период списка должен быть 10 с, а не ${delay}`)
+    const second = seen.filter((url) => url.includes('/now')).length
+    assert.ok(second > first, `после тика второго запроса не было (${first} → ${second})`)
+    assert.ok(
+      [...pending.values()].some((entry) => entry.ms === 10000),
+      'после тика следующий таймер не взведён — цепочка обрывается',
+    )
+  } finally {
+    Object.assign(globalThis, saved)
+  }
+})
+
 test('веб: отказы опроса молчат до третьего и только тогда говорят', async (t) => {
   if (!jsdomRoot()) return t.skip('нет jsdom в ~/.hermes/hermes-agent/node_modules')
   // Три отказа подряд после удачного кадра: до третьего на экране не должно

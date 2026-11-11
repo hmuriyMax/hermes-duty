@@ -2923,11 +2923,18 @@ async function dealPollTick(dealId) {
 document.addEventListener('visibilitychange', () => {
   if (document.hidden === true) {
     dealPollStop()
+    // Ушли из вкладки — общий таймер тоже снимается: скрытая страница не
+    // опрашивает сервер (deal-петля выходит сама через `refreshPlan`).
+    clearTimeout(timer)
+    timer = null
     return
   }
-  if (!route.id || route.bad || route.name !== 'deal') return
-  dealPollStop()
-  void dealPollTick(route.id)
+  if (route.name === 'deal' && route.id && !route.bad) {
+    dealPollStop()
+    void dealPollTick(route.id)
+    return
+  }
+  void run()
 })
 
 /* ---------------------------------------------------------------- маршруты */
@@ -2965,8 +2972,15 @@ function render() {
   if (humanEl && route.name !== 'now') humanEl.textContent = ''
 }
 
+/**
+ * Поставить следующий тик экрана.
+ *
+ * Таймер один на все экраны (`timer`), поэтому перед постановкой прежний
+ * снимается: две цепочки опроса одновременно — это двойные запросы и мигание.
+ */
 function schedule() {
   clearTimeout(timer)
+  timer = null
   // Страница дела опрашивает себя сама (`dealPollLater`): её период зависит от
   // состояния дела — идущее обновляем часто, закрытое редко, — а общий таймер
   // экранов знает только «медленно/быстро».
@@ -2974,20 +2988,33 @@ function schedule() {
     dealPollLater(route.id)
     return
   }
+  // Скрытая вкладка не опрашивает вовсе: вернувшаяся получает немедленный тик
+  // из `visibilitychange` (см. ниже) и дальше идёт по расписанию.
+  if (document.hidden === true) return
   // «Здоровье» и «Завершённые» — по журналу за всю историю: они не меняются за
   // секунды, и опрашивать их так же часто, как срез «сейчас», незачем.
   const slow = route.name === 'health'
-  const ms = slow ? HEALTH_REFRESH_MS : REFRESH_MS
-  timer = setTimeout(run, ms)
+  timer = setTimeout(() => void run(), slow ? HEALTH_REFRESH_MS : REFRESH_MS)
 }
 
-function run() {
-  if (route.name === 'now') void loadNow()
-  else if (route.name === 'why') void loadNow()
-  else if (route.name === 'health') void loadHealth()
-  else if (route.bad) void loadNow()
-  else if (route.id) void loadDeal(route.id)
-  else void loadNow()
+/**
+ * Один цикл опроса экрана: запрос, перерисовка, постановка следующего тика.
+ *
+ * Следующий тик ставится в `finally`, а не в `onRoute`: раньше таймер взводился
+ * ровно один раз при смене маршрута, срабатывал — и цепочка обрывалась, так что
+ * список дел и «Здоровье» после первого же тика замирали навсегда (Макс, 11.11).
+ */
+async function run() {
+  try {
+    if (route.name === 'now') await loadNow()
+    else if (route.name === 'why') await loadNow()
+    else if (route.name === 'health') await loadHealth()
+    else if (route.bad) await loadNow()
+    else if (route.id) await loadDeal(route.id)
+    else await loadNow()
+  } finally {
+    schedule()
+  }
 }
 
 function onRoute() {
@@ -3009,8 +3036,7 @@ function onRoute() {
     tickStamp()
   }
   render()
-  run()
-  schedule()
+  void run()
 }
 
 window.addEventListener('hashchange', onRoute)

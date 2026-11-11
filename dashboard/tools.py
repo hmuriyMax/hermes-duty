@@ -568,6 +568,7 @@ def start(
     if stage is None:
         named = ", ".join(str(getattr(item, "id", "")) for item in graph.stages) or "—"
         raise ToolsError(f"этапа {name!r} нет в принятом плане: этапы дела — {named}")
+    cancelled = _stage_cancelled(events, name)
     repeated = _by_idem(events, "attempt_started", key)
     if repeated is not None:
         payload = journal.payload_of(repeated)
@@ -580,6 +581,14 @@ def start(
             "run_id": str(payload.get("run_id") or ""),
             "pid": payload.get("pid"),
         }
+    if cancelled is not None:
+        # Отменённый этап не воскресает: иначе «лид отказался от работы» значило
+        # бы только «попытка погашена», и следующий шаг вернул бы её в граф.
+        raise ToolsError(
+            f"этап {name!r} отменён лидом ({cancelled or 'причина не записана'}): "
+            "попытки по нему не поднимаются — вернуть работу можно только новым "
+            "этапом в новой ревизии плана"
+        )
     moment = int(tick())
     live = _live_attempts(events, moment)
     busy = next((row for row in live if str(row.get("stage") or "") == name), None)
@@ -1079,6 +1088,308 @@ def _answer_repeat(answered: dict[str, Any], lifted: dict[str, Any]) -> dict[str
     }
 
 
+# ------------------------------------------------------------------ duty_cancel
+
+
+def _stage_cancelled(events: Iterable[Any], stage_id: str) -> Optional[str]:
+    """Причина, которой этап отменён; `None` — этап не отменяли.
+
+    Отмена терминальна для этого id, и новая ревизия плана её не снимает. Так же
+    читает журнал срез (`transit._stage_event`): отменённый этап остаётся
+    `failed`, и `_runnable` движка его больше не поднимает. Снять отмену в
+    решении и оставить этап отменённым на экране — значит разойтись в ответе на
+    вопрос «идёт ли этап», а лид читает именно экран.
+
+    Вернуть этап в работу можно только под новым id: единственная запись ревизии
+    под занятым id — перестановка (`needs`/`parallel_with`), и её одного мало,
+    чтобы «лид отказался» превратилось в «лид пока отказался».
+    """
+    reason: Optional[str] = None
+    for event in events or ():
+        if str(event.get("kind") or "") != transit.STAGE_CANCELLED:
+            continue
+        payload = journal.payload_of(event)
+        if str(payload.get("stage") or "") == stage_id:
+            reason = str(payload.get("reason") or "")
+    return reason
+
+
+def _attempt_of(row: dict[str, Any]) -> tuple[str, int, int]:
+    """Этап, номер попытки и pid живой попытки: `(stage, attempt, pid)`."""
+    stage = str(row.get("stage") or "")
+    attempt = _int(row.get("n"))
+    pid = _int(row.get("pid"))
+    if not stage or attempt <= 0 or pid <= 0:
+        raise ToolsError(
+            f"попытка {row.get('run_id') or '—'} не называет этап, номер и pid: "
+            "гасить нечего и не по чему — нужен человек"
+        )
+    return stage, attempt, pid
+
+
+def _extinguish(
+    conn: sqlite3.Connection,
+    deal: dict[str, Any],
+    row: dict[str, Any],
+    *,
+    reason: str,
+    key: str,
+    killer: Callable[[int], bool],
+    moment: int,
+    events: Iterable[Any],
+) -> dict[str, Any]:
+    """Погасить живую попытку: гард pid, сигнал, факт `attempt_ended(cancelled)`.
+
+    Порядок — контрактный (`docs/ENGINE-2.0.md`, раздел 5): сначала гард
+    принадлежности pid (`runner.attempt_owner`), потом сигнал, потом отпускание
+    лизинга вместе с фактом `attempt_ended`. Сигнал до факта — не наоборот:
+    живой процесс, чью попытку уже закрыли словами, дописал бы свой конец поверх
+    отмены и «воскресил» её.
+
+    `killer` — шов для тестов (`runner.stop_pid` в жизни): настоящий процесс под
+    нож теста не попадает, а порядок «гард → сигнал → факт» проверяется как есть.
+    `events` — журнал, уже прочитанный вызывающим: второй проход по нему дал бы
+    ту же картину за лишнее чтение.
+    """
+    stage, attempt, pid = _attempt_of(row)
+    why = runner.attempt_owner(conn, deal, stage=stage, attempt=attempt, pid=pid, events=events)
+    if why:
+        raise ToolsError(
+            f"попытку {stage}#{attempt} не гашу: {why} — сигнал по чужому pid "
+            "убил бы чужую работу, а попытка осталась бы живой в журнале"
+        )
+    stopped = bool(killer(pid))
+    written = runner.cancel_attempt(
+        conn,
+        deal,
+        stage=stage,
+        attempt=attempt,
+        pid=pid,
+        reason=reason,
+        now=moment,
+        source=SOURCE,
+    )
+    return {
+        "stage": stage,
+        "attempt": attempt,
+        "pid": pid,
+        "stopped": stopped,
+        "written": written,
+        "idem": key,
+    }
+
+
+def _cancelled_event(
+    deal: dict[str, Any], stage: str, attempt: int, reason: str, key: str, moment: int, killed: Optional[dict[str, Any]]
+) -> dict[str, Any]:
+    """Факт `stage_cancelled`: этап отменён лидом, с причиной и следом гашения."""
+    payload: dict[str, Any] = {
+        "stage": stage,
+        "attempt": int(attempt),
+        "reason": reason,
+        "by": SOURCE,
+        "idem": key,
+    }
+    if killed is not None:
+        payload["pid"] = killed["pid"]
+        payload["stopped"] = killed["stopped"]
+    return _lead_event(deal, transit.STAGE_CANCELLED, payload, {"stage": stage, "idem": key}, moment)
+
+
+def cancel(
+    deal_id: Any,
+    stage_id: Any,
+    reason: Any,
+    idempotency_key: Any,
+    *,
+    home: Optional[Path] = None,
+    clock: Optional[Callable[[], float]] = None,
+    kill: Optional[Callable[[int], bool]] = None,
+) -> dict[str, Any]:
+    """Отменить этап: `pending` — только факт, идущую попытку — погасить.
+
+    `docs/ENGINE-2.0.md`, раздел 5: лид понял, что этап не нужен, и не должен
+    ждать идущую попытку, чтобы освободить слот. Поэтому у отмены два исхода, и
+    оба — факты журнала:
+
+    - этап без живой попытки (`pending`) — только `stage_cancelled`: гасить
+      нечего, работа по этапу не начиналась;
+    - этап с живой попыткой — гард pid (`runner.attempt_owner`), сигнал процессу
+      (SIGTERM, затем SIGKILL через `KILL_GRACE_SEC`, `runner.stop_pid`),
+      отпускание лизинга вместе с `attempt_ended(outcome=cancelled)`, и
+      `stage_cancelled` с причиной.
+
+    Отказы — до сигнала и до записи: этапа нет в плане, дело закрыто, этап уже
+    отменён, pid не доказуемо принадлежит этой попытке (тогда сигнал убил бы
+    чужую работу, и попытка осталась бы живой в журнале — инструмент называет
+    причину, а разбирается человек).
+
+    Повтор с тем же `idempotency_key` второго факта не пишет и процессов не
+    трогает: ключ едет в `payload.idem` обеих записей.
+    """
+    key = _key(idempotency_key)
+    name = str(stage_id or "").strip()
+    if not name:
+        raise ToolsError("stage_id не назван: duty_cancel(deal, stage_id, reason, idempotency_key)")
+    text = " ".join(str(reason or "").split())
+    if not text:
+        raise ToolsError("reason не назван: у отмены должна быть причина — её читают лид и человек")
+    home = hermes_home(home)
+    tick = clock or time.time
+    conn = _store(home)
+    deal = _deal(conn, deal_id)
+    events = journal.read_events(conn, str(deal["id"]))
+    repeated = _by_idem(events, transit.STAGE_CANCELLED, key)
+    if repeated is not None:
+        payload = journal.payload_of(repeated)
+        return {
+            "ok": True,
+            "deal": str(deal["id"]),
+            "stage": str(payload.get("stage") or name),
+            "cancelled": True,
+            "repeated": True,
+            "attempt": _int(payload.get("attempt")),
+            "stopped": bool(payload.get("stopped")),
+        }
+    if journal.closed_fact(events) is not None:
+        raise ToolsError(f"дело {deal['id']} закрыто: отменять в нём нечего")
+    spec = _spec(events)
+    graph = transit.graph_spec(spec, events)
+    stage = next((item for item in graph.stages if str(getattr(item, "id", "")) == name), None)
+    if stage is None:
+        named = ", ".join(str(getattr(item, "id", "")) for item in graph.stages) or "—"
+        raise ToolsError(f"этапа {name!r} нет в принятом плане: этапы дела — {named}")
+    earlier = _stage_cancelled(events, name)
+    if earlier is not None:
+        raise ToolsError(
+            f"этап {name!r} уже отменён ({earlier or 'причина не записана'}): "
+            "вторая отмена ничего не меняет — вернуть этап можно только новым "
+            "этапом в новой ревизии плана"
+        )
+    moment = int(tick())
+    killer = kill or runner.stop_pid
+    live = _live_attempts(events, moment)
+    busy = next((row for row in live if str(row.get("stage") or "") == name), None)
+    killed: Optional[dict[str, Any]] = None
+    if busy is not None:
+        killed = _extinguish(
+            conn, deal, busy, reason=text, key=key, killer=killer, moment=moment, events=events
+        )
+    attempt = _int(busy.get("n")) if busy is not None else 0
+    fact = _cancelled_event(deal, name, attempt, text, key, moment, killed)
+    written = journal.append(conn, [fact])
+    return {
+        "ok": True,
+        "deal": str(deal["id"]),
+        "stage": name,
+        "cancelled": True,
+        "attempt": attempt,
+        "stopped": bool(killed["stopped"]) if killed is not None else False,
+        "cancelled_facts": _int(written) + (_int(killed["written"]) if killed is not None else 0),
+        "text": text,
+    }
+
+
+def cancel_deal(
+    deal_id: Any,
+    reason: Any,
+    idempotency_key: Any,
+    *,
+    home: Optional[Path] = None,
+    clock: Optional[Callable[[], float]] = None,
+    kill: Optional[Callable[[int], bool]] = None,
+) -> dict[str, Any]:
+    """Отменить дело целиком: погасить все живые попытки, статус `cancelled`.
+
+    `docs/ENGINE-2.0.md`, раздел 5: то же гашение, что у `duty_cancel`, но сразу
+    для всех живых попыток, дальше `completed(cause=lead_cancelled)` и строка
+    дела `cancelled` (`deals.cancel_deal`). Это не `duty_close`: отменённое дело
+    не считается завершённым, и `duty now`/`stats` держат его отдельно.
+
+    Сначала проверяются **все** живые попытки (гард pid), и только потом идёт
+    сигнал: иначе одна недоказуемая попытка оставила бы дело наполовину
+    погашенным, а лид — с вопросом «что именно уже отменено». Отказ называет
+    попытку, на которой гард не сошёлся, и не пишет ничего.
+
+    Повтор с тем же ключом второго `completed` не пишет и процессов не трогает.
+    """
+    key = _key(idempotency_key)
+    text = " ".join(str(reason or "").split())
+    if not text:
+        raise ToolsError("reason не назван: у отмены должна быть причина — её читают лид и человек")
+    home = hermes_home(home)
+    tick = clock or time.time
+    conn = _store(home)
+    deal = _deal(conn, deal_id)
+    events = journal.read_events(conn, str(deal["id"]))
+    repeated = _by_idem(events, "completed", key)
+    if repeated is not None:
+        payload = journal.payload_of(repeated)
+        return {
+            "ok": True,
+            "deal": str(deal["id"]),
+            "cancelled": True,
+            "repeated": True,
+            "status": str(payload.get("status") or deals.STATUS_CANCELLED),
+            "cause": str(payload.get("cause") or ""),
+        }
+    if journal.closed_fact(events) is not None:
+        raise ToolsError(f"дело {deal['id']} уже закрыто: отменять нечего")
+    if str(deal["status"]) in deals.CLOSED_STATUSES:
+        # Строка store бывает закрыта и без факта `completed` (старый store, рука в
+        # БД). Спрашивается она **до** сигнала: иначе попытки были бы погашены, а
+        # дело — нет, и «наполовину отменённого не бывает» стало бы неправдой
+        # (`deals.cancel_deal` отказал бы уже после гашения).
+        raise ToolsError(f"дело {deal['id']} уже закрыто (status={deal['status']}): отменять нечего")
+    moment = int(tick())
+    killer = kill or runner.stop_pid
+    live = _live_attempts(events, moment)
+    for row in live:
+        stage, attempt, pid = _attempt_of(row)
+        why = runner.attempt_owner(conn, deal, stage=stage, attempt=attempt, pid=pid, events=events)
+        if why:
+            raise ToolsError(
+                f"дело не отменяю: попытку {stage}#{attempt} не погасить — {why}. "
+                "Сигнал по чужому pid убил бы чужую работу"
+            )
+    killed = [
+        _extinguish(conn, deal, row, reason=text, key=key, killer=killer, moment=moment, events=events)
+        for row in live
+    ]
+    if killed:
+        journal.append(
+            conn,
+            [
+                _cancelled_event(deal, row["stage"], row["attempt"], text, key, moment, row)
+                for row in killed
+            ],
+        )
+    try:
+        applied = deals.cancel_deal(
+            conn,
+            str(deal["id"]),
+            reason=text,
+            source=SOURCE,
+            now=moment,
+            idem=key,
+        )
+    except deals.DealError as exc:
+        raise ToolsError(str(exc)) from exc
+    return {
+        "ok": True,
+        "deal": str(deal["id"]),
+        "cancelled": True,
+        "status": deals.STATUS_CANCELLED,
+        "cause": deals.CLOSE_CAUSE_LEAD_CANCELLED,
+        "reason": text,
+        "attempts": [
+            {"stage": row["stage"], "attempt": row["attempt"], "pid": row["pid"], "stopped": row["stopped"]}
+            for row in killed
+        ],
+        "events": _int(applied.get("events")),
+    }
+
+
 # -------------------------------------------------------------------- duty_ask
 
 
@@ -1517,6 +1828,56 @@ ASK_HUMAN_SCHEMA = {
 }
 
 
+CANCEL_SCHEMA = {
+    "name": "duty_cancel",
+    "description": (
+        "Отменить этап — отказаться от работы, не дожидаясь её. Этап без живой попытки "
+        "(pending): один факт stage_cancelled. Этап с идущей попыткой: сигнал процессу "
+        "(SIGTERM, затем SIGKILL через KILL_GRACE_SEC), отпускание лизинга, факты "
+        "attempt_ended(outcome=cancelled) и stage_cancelled с причиной — слот "
+        "освобождается сразу. Перед сигналом проверяется, что pid принадлежит именно "
+        "этой попытке (лизинг + attempt_started): чужой переиспользованный pid не "
+        "гасится, и тогда инструмент отказывает, не записав ничего. Отменённый этап "
+        "duty_start больше не поднимает — вернуть работу можно только новым этапом "
+        "в новой ревизии плана."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "deal": {"type": "string", "description": "id своего дела (d_<hex>)"},
+            "stage_id": {"type": "string", "description": "id отменяемого этапа из принятого плана"},
+            "reason": {"type": "string", "description": "почему этап больше не нужен — причина уходит в факт"},
+            "idempotency_key": {
+                "type": "string",
+                "description": "ключ вызова: повтор не пишет второй факт и процессов не трогает",
+            },
+        },
+        "required": ["deal", "stage_id", "reason", "idempotency_key"],
+    },
+}
+
+CANCEL_DEAL_SCHEMA = {
+    "name": "duty_cancel_deal",
+    "description": (
+        "Отменить дело целиком: погасить все живые попытки (тот же гард pid и то же "
+        "гашение, что у duty_cancel) и закрыть дело фактом completed(cause=lead_cancelled) "
+        "со статусом cancelled. Это не duty_close: отменённое дело не считается "
+        "завершённым и в duty now/stats не смешивается с завершённым. Если хоть одну "
+        "живую попытку нельзя погасить (pid не доказуемо её), инструмент отказывает и "
+        "ничего не пишет — наполовину отменённого дела не бывает."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "deal": {"type": "string", "description": "id своего дела (d_<hex>)"},
+            "reason": {"type": "string", "description": "почему дело отменяется — причина уходит в факт"},
+            "idempotency_key": {"type": "string", "description": "ключ вызова: повтор второго факта не пишет"},
+        },
+        "required": ["deal", "reason", "idempotency_key"],
+    },
+}
+
+
 def _json(value: dict[str, Any]) -> str:
     """Ответ инструмента строкой JSON: модель читает причину и решает сама."""
     return json.dumps(value, ensure_ascii=False)
@@ -1650,6 +2011,37 @@ def handle_ask_human(params: dict, **kwargs: Any) -> str:
                 args.get("question", ""),
                 args.get("options"),
                 args.get("risky", False),
+                args.get("idempotency_key", ""),
+                home=kwargs.get("home"),
+            )
+        )
+    )
+
+
+def handle_cancel(params: dict, **kwargs: Any) -> str:
+    """`duty_cancel`: аргументы модели → ответ строкой; `home` — шов для тестов."""
+    args = params or {}
+    return _json(
+        _run(
+            lambda: cancel(
+                args.get("deal", ""),
+                args.get("stage_id", ""),
+                args.get("reason", ""),
+                args.get("idempotency_key", ""),
+                home=kwargs.get("home"),
+            )
+        )
+    )
+
+
+def handle_cancel_deal(params: dict, **kwargs: Any) -> str:
+    """`duty_cancel_deal`: аргументы модели → ответ строкой; `home` — шов для тестов."""
+    args = params or {}
+    return _json(
+        _run(
+            lambda: cancel_deal(
+                args.get("deal", ""),
+                args.get("reason", ""),
                 args.get("idempotency_key", ""),
                 home=kwargs.get("home"),
             )

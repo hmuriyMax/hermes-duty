@@ -95,12 +95,17 @@ def _spec() -> Any:
 # Своё пространство id: `d_<hex>`; kanban-дела — `t_<hex>` (`docs/OWNERSHIP.md`).
 OWN_PREFIX = "d_"
 
-# Жизненный цикл дела (`deals.status`) — закрытый набор контракта.
-DEAL_STATUSES = ("todo", "ready", "running", "blocked", "review", "done", "archived")
+# Жизненный цикл дела (`deals.status`) — закрытый набор контракта. `cancelled` —
+# дело, от которого отказался лид (`duty_cancel_deal`, `docs/ENGINE-2.0.md`,
+# раздел 5): оно закрыто, но **не завершено**, и в `stats` не смешивается с
+# успешными.
+DEAL_STATUSES = ("todo", "ready", "running", "blocked", "review", "done", "cancelled", "archived")
 
 # Статусы, в которых дело закрыто: его не гейтит незавершённый родитель и оно не
-# попадает в «дела сейчас».
-CLOSED_STATUSES = ("done", "archived")
+# попадает в «дела сейчас». `cancelled` здесь потому, что отмена — тоже конец:
+# отменённое дело не вернётся в очередь и не должно держать гейт детей открытым
+# навсегда.
+CLOSED_STATUSES = ("done", "cancelled", "archived")
 
 # Статусы, которые пересчитываются гейтом по родителям: пока дело не взято в
 # работу, оно `todo`/`ready`, и решает это граф, а не рука.
@@ -1235,6 +1240,14 @@ CLOSE_CAUSE_ALL_STAGES = "all_stages_done"
 # граф — условие, а решение («дело кончено, вот итог») — слово лида, и итог дела
 # лежит в `summary` этого факта (`docs/ENGINE-1.0.md`, раздел 9).
 CLOSE_CAUSE_LEAD = "lead_closed"
+# Причина закрытия 2.0: лид **отказался** от дела (`duty_cancel_deal`). Это не
+# `lead_closed` («задача решена, вот итог») и не `stopped_by_human`: отменённое
+# дело не считается завершённым — строка store получает статус `cancelled`, и
+# `stats` держит его отдельно от успешных (`docs/ENGINE-2.0.md`, раздел 5).
+CLOSE_CAUSE_LEAD_CANCELLED = "lead_cancelled"
+
+# Статус отменённого дела: закрыто, но не завершено.
+STATUS_CANCELLED = "cancelled"
 
 # Два решения человека одной командой (`duty decide`): слова закрытого набора,
 # чтобы «продолжить» и «остановить» не угадывались по тексту ответа.
@@ -1409,6 +1422,64 @@ def close_stages_done(
         payload["summary"] = text
     event = _event(deal, "completed", payload, source, {"cause": cause}, now)
     return _apply(conn, deal, [event], "done", now)
+
+
+def cancel_deal(
+    conn: sqlite3.Connection,
+    deal_id: str,
+    *,
+    reason: str = "",
+    source: str = "engine",
+    now: Optional[int] = None,
+    idem: str = "",
+) -> dict[str, Any]:
+    """Отменить дело: одно `completed(cause='lead_cancelled')` и строка `cancelled`.
+
+    Отмена — не закрытие (`docs/ENGINE-2.0.md`, раздел 5): лид отказывается от
+    работы, и «сделано» об этом сказать нельзя. Поэтому вид факта тот же
+    (`completed` — набор журнала закрыт), а причина и статус другие: `cause`
+    называет отказ, `status` в payload и в строке store — `cancelled`. По ним
+    поверхности держат отменённое отдельно от завершённого.
+
+    Правила здесь свои, и это не копия `close_stages_done`: та отказывает делу,
+    которое держит человек (`blocked`/`review`) или у которого открыт блок, — а
+    отменить как раз такое дело и нужно, иначе лид ждёт ответа на вопрос, который
+    уже не нужен. Живые попытки гасит вызывающий (`tools.cancel`): у него pid и
+    гард принадлежности, у store их нет.
+
+    Идемпотентность — ключом события от `cause`/`reason`/`idem`: повтор того же
+    вызова даёт `events: 0` и не двигает `updated_at`. Другая причина по уже
+    закрытому делу — отказ: причину закрытия не переписываем.
+    """
+    now = _now_sec() if now is None else int(now)
+    deal = _require_row(conn, deal_id)
+    _reject_archived(deal, "cancel")
+    text = " ".join(str(reason or "").split())
+    events = journal.read_events(conn, str(deal["id"]))
+    if str(deal["status"]) in CLOSED_STATUSES:
+        last = _last_completion(events)
+        if last is None or str(last.get("cause") or "") != CLOSE_CAUSE_LEAD_CANCELLED:
+            raise DealError(
+                f"cancel: дело {deal['id']} уже закрыто (status={deal['status']}) — "
+                "отменять нечего, а причину закрытия не переписываем"
+            )
+    payload: dict[str, Any] = {
+        "cause": CLOSE_CAUSE_LEAD_CANCELLED,
+        "status": STATUS_CANCELLED,
+        "reason": text,
+        "from": str(deal["status"]),
+    }
+    if idem:
+        payload["idem"] = str(idem)
+    event = _event(
+        deal,
+        "completed",
+        payload,
+        source,
+        {"cause": CLOSE_CAUSE_LEAD_CANCELLED, "reason": text, "idem": str(idem or "")},
+        now,
+    )
+    return _apply(conn, deal, [event], STATUS_CANCELLED, now)
 
 
 def _last_completion(events: Iterable[dict[str, Any]]) -> Optional[dict[str, Any]]:

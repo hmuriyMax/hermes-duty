@@ -655,6 +655,12 @@ HEARTBEAT_FRESH_SEC = 300
 # этого набора: он уходит клиенту в `crash_outcomes`, чтобы UI не держал копию.
 CRASH_OUTCOMES = ("crashed", "gave_up", "spawn_failed", "timed_out")
 
+# Исход отменённой лидом попытки (`attempt_ended.outcome`, `runner.OUTCOME_CANCELLED`):
+# не успех и не отказ. Такой этап в знаменатель «с первой попытки» не идёт —
+# отменённая работа не была закрыта, и смешивать её с завершённой значило бы
+# занизить долю успеха отменой, а не работой (`docs/ENGINE-2.0.md`, раздел 5).
+CANCELLED_OUTCOME = "cancelled"
+
 # Статусы дела, в которых оно ждёт незавершённого родителя в графе зависимостей.
 GATE_STATUSES = ("todo", "ready")
 
@@ -2054,7 +2060,12 @@ def _repo_metrics(
             by_outcome[key] = by_outcome.get(key, 0) + 1
         stages_total += len(stages)
         for stage_attempts in stages.values():
-            finished = [item for item in stage_attempts if item.get("finished_at") is not None]
+            finished = [
+                item
+                for item in stage_attempts
+                if item.get("finished_at") is not None
+                and str(item.get("outcome") or "") != CANCELLED_OUTCOME
+            ]
             if not finished:
                 continue
             closed += 1

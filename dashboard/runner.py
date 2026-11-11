@@ -81,6 +81,7 @@ import os
 import queue
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -187,6 +188,10 @@ SHELL_ENV_ROLE_KEYS = ("HERMES_PROFILE", "HERMES_ROLE", "HERMES_SESSION_TOKEN", 
 # вторым видом события (`docs/JOURNAL.md`).
 OUTCOME_DONE = failures.OUTCOME_DONE
 OUTCOME_FAILED = failures.OUTCOME_FAILED
+# Отмена попытки лидом (`docs/ENGINE-2.0.md`, раздел 5). Класса отказа у неё нет
+# и быть не должно: отмена — решение, а не отказ работы, и `kind` здесь сказал бы
+# про работу то, чего не было (её не сломали — от неё отказались).
+OUTCOME_CANCELLED = "cancelled"
 
 # Классы отказа попытки (`attempt_ended.kind`): `infra` — упал сам процесс,
 # `contract` — исполнитель не отчитался, `capability` — упёрся в бюджет. Словарь
@@ -238,6 +243,10 @@ ENGINE_COMMIT_EMAIL = "duty@local"
 # Шаг опроса потока: короткий, чтобы heartbeat лизинга и таймаут срабатывали
 # вовремя, но без busy-loop.
 POLL_SEC = 0.2
+
+# Шаг ожидания смерти процесса после SIGTERM (`stop_pid`): гашение — не busy-loop
+# и не «подождать подольше», а опрос с тем же порядком цены.
+STOP_POLL_SEC = 0.1
 
 # Чем запускается попытка: тот же `hermes`, что и у человека в PATH.
 HERMES_BIN = shutil.which("hermes") or "hermes"
@@ -392,6 +401,131 @@ def lease_of(conn: sqlite3.Connection, deal: Any, stage: str) -> Optional[dict[s
         (str(deal["id"]), stage),
     ).fetchone()
     return None if row is None else dict(row)
+
+
+# Насколько факт старта попытки может опережать взятие лизинга. Часы у движка и у
+# попытки одни (это одна машина), а вот `taken_at` пишется до спавна: разница
+# бывает только в одну сторону, и запас нужен на округление.
+OWNER_SKEW_SEC = 5
+
+
+def attempt_owner(
+    conn: sqlite3.Connection,
+    deal: Any,
+    *,
+    stage: str,
+    attempt: int,
+    pid: int,
+    events: Optional[Iterable[Any]] = None,
+) -> str:
+    """Пустая строка — pid принадлежит **именно этой** попытке; иначе причина.
+
+    Гард перед сигналом (`docs/ENGINE-2.0.md`, раздел 5): убить переиспользованный
+    чужой pid — это тихая потеря чужой работы, и её не видно ни в одном факте.
+    Один номер процесса не доказывает ничего: ОС отдаёт освободившийся pid
+    следующему процессу, и «наши» записи о попытке при этом никто не менял.
+    Поэтому сверяются два независимых наших факта — строка лизинга и последний
+    `attempt_started` этой попытки:
+
+    - оба называют один pid и один номер попытки;
+    - лизинг взят не позже старта: взятый **после** старта лизинг означает, что
+      этап уже перехватил кто-то другой, а факт в журнале остался старый;
+    - у этой попытки нет `attempt_ended` после старта — закрытую попытку никто не
+      ведёт, и её pid тоже свободен.
+
+    `events` — уже прочитанный журнал дела: шаг отмены читает его один раз.
+    """
+    deal_id = str(deal["id"])
+    lease = lease_of(conn, deal, stage)
+    if lease is None:
+        return f"лизинга этапа {stage!r} нет: попытку никто не ведёт — гасить нечего"
+    if int(lease["pid"]) != int(pid):
+        return f"лизинг этапа {stage!r} у pid {lease['pid']}, а не у {pid}"
+    if int(lease["attempt"]) != int(attempt):
+        return f"лизинг этапа {stage!r} держит попытку {lease['attempt']}, а не {attempt}"
+    run_id = f"{stage}#{int(attempt)}"
+    started_at = 0
+    started_pid: Any = None
+    for event in journal.read_events(conn, deal_id) if events is None else events:
+        payload = journal.payload_of(event)
+        if str(payload.get("run_id") or "") != run_id:
+            continue
+        kind = str(event.get("kind") or "")
+        if kind == "attempt_started":
+            started_at = _int(event.get("ts")) or 0
+            started_pid = payload.get("pid")
+            continue
+        if kind == "attempt_ended" and started_at:
+            return (
+                f"попытка {run_id} уже закрыта фактом {event.get('id')}: "
+                f"её pid {pid} мог достаться другому процессу"
+            )
+    if not started_at:
+        return f"в журнале дела нет attempt_started попытки {run_id}"
+    if _int(started_pid) != int(pid):
+        return f"попытку {run_id} начинал pid {started_pid}, а не {pid}"
+    if int(lease["taken_at"]) > started_at + OWNER_SKEW_SEC:
+        return (
+            f"лизинг этапа {stage!r} взят позже старта попытки {run_id} "
+            f"({lease['taken_at']} > {started_at}): этап ведёт уже другой запуск"
+        )
+    return ""
+
+
+def cancel_attempt(
+    conn: sqlite3.Connection,
+    deal: Any,
+    *,
+    stage: str,
+    attempt: int,
+    pid: int,
+    reason: str,
+    exit_code: Optional[int] = None,
+    now: Optional[int] = None,
+    source: str = ENGINE_SOURCE,
+) -> int:
+    """Закрыть попытку фактом `attempt_ended(outcome=cancelled)` и отпустить лизинг.
+
+    Одна транзакция на оба действия: иначе между фактом и лизингом попытка была бы
+    уже закрыта, а этап — занят до конца срока, и следующая попытка того же этапа
+    упёрлась бы в лизинг отменённой работы.
+
+    Лизинг снимается по номеру попытки, а не по паре «дело + этап» (так же, как у
+    уборки): строку мог перехватить следующий запуск, и стирать её значило бы снять
+    чужую защиту от двух движков на одном этапе.
+
+    `exit` едет в `details.exit_code`, как у остальных концов попытки
+    (`stagefeed.attempts` читает его оттуда), `cancelled: true` — по нему видно,
+    что попытку погасил инструмент лида, а не исполнитель.
+    """
+    moment = _now_sec(now)
+    run_id = f"{stage}#{int(attempt)}"
+    payload: dict[str, Any] = {
+        "run_id": run_id,
+        "stage": stage,
+        "attempt": int(attempt),
+        "outcome": OUTCOME_CANCELLED,
+        "reason": reason,
+        "cancelled": True,
+        "pid": int(pid),
+    }
+    if exit_code is not None:
+        payload["details"] = {"exit_code": int(exit_code)}
+    event = _event(
+        deal,
+        "attempt_ended",
+        payload,
+        {"cancelled": True, "run_id": run_id},
+        moment,
+        source,
+    )
+    with conn:
+        written = journal.append_in_tx(conn, [event])
+        conn.execute(
+            "DELETE FROM leases WHERE deal_id = ? AND stage = ? AND attempt = ?",
+            (str(deal["id"]), stage, int(attempt)),
+        )
+    return int(written)
 
 
 # --------------------------------------------------------------------- пути
@@ -1709,6 +1843,91 @@ class Process:
                 pass
             code = self.wait(grace)
         return code
+
+
+def _signal(pid: int, sig: int) -> bool:
+    """Послать сигнал попытке (и её группе); `False` — посылать уже некому.
+
+    Попытку поднимают своей группой (`start_new_session=True`, `tools._spawn_attempt`):
+    если погасить только вожака, `hermes chat` переживёт обёртку и допишет свой
+    конец уже отменённой попытке. Поэтому сигнал идёт группе — но только когда
+    вожак и есть попытка: у чужого процесса `getpgid(pid) != pid`, и его группа
+    (возможно, наша собственная) не трогается.
+    """
+    try:
+        group = os.getpgid(pid)
+    except OSError:
+        return False  # процесса нет или он не наш — в обоих случаях гасить нечего
+    try:
+        if group == pid and group != os.getpgid(0):
+            os.killpg(group, sig)
+        else:
+            os.kill(pid, sig)
+    except OSError:
+        return False  # вышел между getpgid и сигналом, либо это чужой процесс
+    return True
+
+
+def _child_exited(pid: int) -> bool:
+    """Нашего ребёнка больше нет: он вышел (и уже убран `waitpid`); иначе `False`.
+
+    Попытку поднимает `tools._spawn_attempt` из процесса лида, поэтому вышедший
+    ребёнок остаётся **зомби** до `wait` — а `os.kill(pid, 0)` на зомби
+    успешен, и «процесс жив» было бы неправдой. `ChildProcessError` означает «это
+    не наш ребёнок» (или его уже убрали): там решает `kill`-проба.
+    """
+    try:
+        done, _ = os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, OSError):
+        return False  # не наш ребёнок: ждать его нам нечего
+    return done == pid
+
+
+def _gone(pid: int, timeout: float, sleep: Callable[[float], None]) -> bool:
+    """Процесса больше нет: он либо уже наш вышедший ребёнок, либо не отвечает `kill`.
+
+    Обе пробы нужны: зомби (см. `_child_exited`) и живой процесс одинаково
+    отвечают на `kill(pid, 0)`, и без первой пробы гашение рапортовало бы
+    «остался жив» о процессе, который этим же сигналом и убит.
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        if _child_exited(pid):
+            return True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False  # процесс есть, но не наш: SIGKILL тут не поможет
+        if time.monotonic() >= deadline:
+            return False
+        sleep(STOP_POLL_SEC)
+
+
+def stop_pid(pid: int, *, grace: float = KILL_GRACE_SEC, sleep: Callable[[float], None] = time.sleep) -> bool:
+    """Погасить попытку по pid: SIGTERM, затем SIGKILL через `grace` секунд.
+
+    Тот же порядок, что у попытки, которую гасит сам движок (`Process.stop`), и
+    тот же `KILL_GRACE_SEC`: у отмены нет своего срока, потому что «сколько ждать
+    процесс» — свойство машины, а не решения лида.
+
+    `True` — процесса больше нет. `False` — он остался жив (чужой namespace,
+    `PermissionError`): тогда отмена обязана сказать это лиду, а не выдать
+    «погашено» за факт. Гард принадлежности pid — у вызывающего
+    (`attempt_owner`): сигнал по чужому pid убивает чужую работу.
+    """
+    if not _signal(pid, signal.SIGTERM):
+        # Сигнал не прошёл по двум разным причинам: процесса уже нет (гасить
+        # нечего) или он чужой (`PermissionError`, а он жив). Различить их —
+        # обязанность этой строки: сказать «погашено» о живой чужой работе
+        # значило бы записать в журнал то, чего не было.
+        return _gone(pid, 0.0, sleep)
+    if _gone(pid, grace, sleep):
+        return True
+    if not _signal(pid, signal.SIGKILL):
+        return _gone(pid, 0.0, sleep)
+    return _gone(pid, grace, sleep)
 
 
 def spawn_process(

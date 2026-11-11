@@ -4,13 +4,15 @@ manifest_version: 2
 description: >-
   Hermes Duty — «дело» вместо карточки: этапы, попытки, доказательства и вопросы.
   С 0.2.0 отдаёт лиду тулсет `duty` (план, запуск этапа, ожидание фактов,
-  вопросы воркера, закрытие): шедулером дела становится лид, а движок остаётся
-  исполнителем. Экраны по-прежнему только читают источники и не пишут в чужие БД.
+  вопросы воркера, отмена этапа и дела, закрытие): шедулером дела становится лид,
+  а движок остаётся исполнителем. Экраны по-прежнему только читают источники и не
+  пишут в чужие БД.
 author: "mshchemilkin"
 kind: standalone
 license: MIT
 tags: [orchestration, observability, desktop, duty]
 provides_tools:
-  [duty_plan, duty_start, duty_wait, duty_answer, duty_ask, duty_ask_human, duty_close]
+  [duty_plan, duty_start, duty_wait, duty_answer, duty_ask, duty_ask_human,
+   duty_cancel, duty_cancel_deal, duty_close]
 provides_hooks: []
 requires_env: []

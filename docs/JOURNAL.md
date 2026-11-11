@@ -57,7 +57,7 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 | `released` | движок отпустил дело, оставившееся `running`: попытка закончилась, а продолжения не было (таймаут, `--once`, предел шагов, Ctrl-C, прогон, убитый между шагом и решением). Пишет `dashboard/release.py` — проход, материализующий ответ `transit`: `run`/`wait(retry)` → этот факт и строка `ready`/`todo`; `done`/`failed`/`park` пишутся своими фактами (`completed`, `blocked`), а не `released` | `run_id`, `stage`, `attempt`, `decision` (`run`/`wait`), `wait` (`retry` или `null`), `idle_sec` (сколько журнал молчал), `from`/`to` (строка до и после), `reason` |
 | `blocked` | `status=blocked` | `block_kind`, `reason` |
 | `unblocked` | был `blocked`, стал иной статус | `previous_kind` |
-| `completed` | `status=done` (или `archived` как отдельный факт: переносится тем же `completed` со `status="archived"`) | `status` |
+| `completed` | `status=done` (или `archived` как отдельный факт: переносится тем же `completed` со `status="archived"`; или `cancelled` — лид отказался от дела, `cause=lead_cancelled`) | `status`, `cause`, `reason` (у отмены) |
 | `review_requested` | своё дело сдано в ревью (`duty complete d_… --review`) | `reviewer`, `summary` |
 | `changes_requested` | ревьюер вернул дело на доработку — или этап с `verdict` вернул граф на названный этап (payload тогда несёт `stage`, `target`, `attempt`) | `reason`, `reviewer` / `stage`, `target`, `attempt` |
 | `collected` | ревью пройдено: вердикт снял ожидание — или этап с `verdict` одобрил и открыл следующий (payload тогда несёт `stage`, `target`, `attempt`) | `summary` / `stage`, `target`, `reason`, `attempt` |
@@ -74,6 +74,7 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 | `plan_rejected` | валидатор или человек отказал предложению: этап плана возвращается в работу с причиной и списком отказов; сверх `charter.max_rounds_replan` — `failed(contract)` | `rev`, `why`, `issues[]` |
 | `plan_rethink` | попытки этапа исчерпаны — движок вернул дело лиду на переосмысление: лид разбирается в причине (диагноз в `why`/`stage`/`kind`), ревизия плана — лишь один из исходов; этап плана возвращается в работу, общий с `plan_rejected` счётчик `max_rounds_replan` | `stage`, `kind`, `attempt`, `why`, `total`, `round` |
 | `plan_gate` | план дороже порога `charter.plan_gate` — ждём человека (`ask()`), до ответа дело стоит в `wait_human` | `rev`, `reason`, `question_id` |
+| `stage_cancelled` | лид отказался от этапа (`duty_cancel`/`duty_cancel_deal`): этап `pending` закрывается одним фактом, идущую попытку перед ним гасят сигналом и `attempt_ended(outcome=cancelled)`. Этап после факта терминален: `duty_start` его не поднимает, срез держит его `failed`, и новая ревизия плана отмену **не** снимает — вернуть работу можно только новым этапом (новым id) | `stage`, `attempt` (0 — попытки не было), `reason`, `by` (`lead`), `pid`/`stopped` (если попытку гасили) |
 
 Четыре вида плана заведены движком 1.0 (`docs/ENGINE-1.0.md`, раздел 8): файл
 `duty.yaml` остаётся seed-ом, а принятый план живёт фактами и переживает реплей.

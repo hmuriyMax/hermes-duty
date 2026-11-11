@@ -200,6 +200,11 @@ WAIT_KINDS = (WAIT_ATTEMPT, WAIT_QUESTION, WAIT_VERDICT, WAIT_FOR_GATE, WAIT_RET
 # здесь недопустимо.
 OK_OUTCOMES = ("ok", "done", "success", "passed", "accepted")
 
+# Исход отменённой попытки (`attempt_ended.outcome`, `runner.OUTCOME_CANCELLED`):
+# не успех и не отказ — решение лида. Класса отказа у такой попытки нет, и слой
+# не выводит его из отсутствия: `unknown` сказал бы про работу то, чего не было.
+CANCELLED_OUTCOME = "cancelled"
+
 # Класс отказа, которого в событии нет. Это не догадка о причине, а честное имя
 # отсутствия класса: такой отказ не ретраится (`retry.on` его не называет).
 # Словарь классов один на плагин — он живёт в `dashboard/failures.py`.
@@ -240,6 +245,7 @@ STAGE_KINDS = (
     "question_asked",
     "question_answered",
     "completed",
+    "stage_cancelled",
     journal.VERDICT_APPROVE,
     journal.VERDICT_CHANGES,
 )
@@ -261,6 +267,11 @@ PLAN_REJECTED = "plan_rejected"
 PLAN_RETHINK = "plan_rethink"
 PLAN_GATE = "plan_gate"
 PLAN_KINDS = (PLAN_PROPOSED, PLAN_ACCEPTED, PLAN_REJECTED, PLAN_RETHINK, PLAN_GATE)
+
+# Факт отмены этапа (`journal.EVENT_KINDS`): лид отказался от работы
+# (`duty_cancel`, `docs/ENGINE-2.0.md`, раздел 5). Отдельный вид, а не
+# `attempt_ended`: у `pending`-этапа попытки нет, и отменять в нём нечего.
+STAGE_CANCELLED = "stage_cancelled"
 
 # id этапа, чей отчёт — предложение плана: так он назван в seed-графе 1.0
 # (`docs/ENGINE-1.0.md`, раздел 3, `stages: - id: plan`). Слово берётся у спеки:
@@ -755,6 +766,20 @@ def _stage_event(
         board.last_attempt = (node.id, node.attempt)
         outcome = str(payload.get("outcome") or "").strip().lower()
         fail_kind = str(payload.get("kind") or "").strip()
+        if outcome == CANCELLED_OUTCOME:
+            # Отмена — решение лида, а не отказ работы (`docs/ENGINE-2.0.md`,
+            # раздел 5): класс отказа не выдумывается (`unknown` сказал бы про
+            # работы то, чего не было), счётчик отказов этапа не растёт, повтора
+            # нет. Восьмого состояния среза не заводится — набор закрыт
+            # контрактом, — поэтому отменённый этап терминален и называет себя
+            # словами: вернуть работу можно только новым этапом в новой ревизии
+            # плана (перестановка того же id отмену не снимает).
+            node.state = FAILED
+            reason = str(payload.get("reason") or "").strip()
+            node.reason = f"попытка {node.attempt}: отменена лидом" + (
+                f": {reason}" if reason else ""
+            )
+            return
         if outcome in OK_OUTCOMES and not fail_kind:
             node.state = DONE
             node.question_id = None
@@ -780,6 +805,17 @@ def _stage_event(
         node.question_id = None
         node.verdict = None  # закрытие этапа закрывает и приговор прошлого раунда
         node.reason = "этап закрыт событием completed"
+        return
+
+    if kind == "stage_cancelled":
+        # Этап, у которого попытки не было: отменять в нём нечего, но и
+        # запускать его больше нельзя (`duty_start` откажет). Состояние —
+        # терминальное, причина — слова лида, а не выдуманный класс отказа.
+        node.state = FAILED
+        node.question_id = None
+        node.verdict = None
+        reason = str(payload.get("reason") or "").strip()
+        node.reason = "этап отменён лидом" + (f": {reason}" if reason else "")
         return
 
     if kind == "question_asked":

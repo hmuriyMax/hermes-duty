@@ -288,6 +288,47 @@ def find_live(home: Path, deal_id: str) -> Optional[dict[str, Any]]:
     return None if row is None else dict(row)
 
 
+def resolve(home: Path, question_id: Any, answer: str, *, via: str = "lead") -> bool:
+    """Закрыть **живой** вопрос пула ответом лида — штатным путём пула.
+
+    Лид отвечает воркеру (`duty_answer`) и делает это раньше человека: вопрос,
+    оставленный в пуле открытым, висел бы в панели и в iMessage, человек нажимал
+    бы кнопку по уже отвеченному вопросу, и его нажатие писало бы второй факт по
+    тому же `question_id` (живое дело `d_8ec6a401`, вопрос #555). Поэтому ответ
+    лида закрывает строку пула так же, как `msgq resolve`: теми же полями
+    (`status`, `answer`, `answered_at`, `answered_via`).
+
+    Перезаписи не происходит: `WHERE status IN ('pending','sent')` — ответ
+    человека, дошедший первым, остаётся его ответом, а повтор лида даёт `False`.
+    Возврат — «строка была живой и закрыта этим вызовом»; `False` значит «пул
+    закрыл вопрос сам» и это не ошибка.
+    """
+    db = pool_path(Path(home))
+    if not db.is_file():
+        raise AskError(f"pool.db not found: {db}")
+    try:
+        number = int(str(question_id).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"ask: номер вопроса не разобран: {question_id!r}") from None
+    marks = ", ".join("?" * len(LIVE_STATUSES))
+    try:
+        conn = sqlite3.connect(db, timeout=BUSY_TIMEOUT_MS / 1000)
+        try:
+            conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+            cur = conn.execute(
+                "UPDATE questions SET status='answered', answer=?, "
+                "answered_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), answered_via=? "
+                f"WHERE id = ? AND status IN ({marks})",
+                (str(answer), via, number, *LIVE_STATUSES),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0) > 0
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        raise AskError(f"pool.db write failed: {db} ({exc})") from exc
+
+
 def ask(
     conn: sqlite3.Connection,
     deal: dict[str, Any],
@@ -406,9 +447,19 @@ def sync_answers(conn: sqlite3.Connection, home: Path) -> dict[str, Any]:
     повторный проход (в том числе после падения между проходами) даёт `appended: 0`,
     а не второй факт.
 
+    Вопрос, по которому в журнале **уже** есть `question_answered`, пропускается:
+    его закрыл кто-то раньше — лид (`duty_answer`) или прошлый проход этого
+    модуля. Второй факт по тому же `question_id` — это второй ответ на один
+    вопрос: в живом деле `d_8ec6a401` (вопрос #555) лид ответил в 03:35:16,
+    человек нажал кнопку в 03:35:57, и факт человека пришёл без `routing`, то есть
+    срез этапа его вопросом не видел вовсе. Поэтому свой факт несёт `routing` из
+    `question_asked` — адрес вопроса (`stage`/`attempt`) принадлежит журналу, а не
+    строке пула.
+
     Ответ и истечение в самом пуле этот модуль не закрывает и не переписывает:
     вопрос закрывается штатным путём пула (`msgq resolve`, реплай в iMessage,
-    панель `/imsg`, чистящий цикл демона), а duty только замечает факт.
+    панель `/imsg`, чистящий цикл демона), а duty только замечает факт. Ответ лида
+    закрывает строку пула раньше — `ask.resolve` из `duty_answer`.
     """
     db = pool_path(Path(home))
     report: dict[str, Any] = {"appended": 0, "errors": []}
@@ -424,6 +475,9 @@ def sync_answers(conn: sqlite3.Connection, home: Path) -> dict[str, Any]:
     journal = _journal()
     now = int(time.time())
     events: list[dict[str, Any]] = []
+    # Журнал читается один раз на дело: адрес вопроса (`routing`) и признак
+    # «уже отвечен» — свойства фактов дела, а не строк пула.
+    seen: dict[str, tuple[dict[str, dict[str, Any]], set[str]]] = {}
     for row in rows:
         deal_id = deal_id_of(str(row.get("session_key") or ""))
         if deal_id is None:
@@ -439,7 +493,28 @@ def sync_answers(conn: sqlite3.Connection, home: Path) -> dict[str, Any]:
                 }
             )
             continue
+        if deal_id not in seen:
+            seen[deal_id] = _questions_of(journal.read_events(conn, deal_id))
+        routing, answered = seen[deal_id]
+        number = str(int(row["id"]))
+        if number in answered:
+            # Вопрос уже закрыт фактом журнала — вторым ответом он не закрывается,
+            # а второй факт по тому же номеру читается как два разных ответа на
+            # один вопрос.
+            continue
         expired = str(row.get("status") or "") == "expired"
+        payload: dict[str, Any] = {
+            "question_id": int(row["id"]),
+            "answer_len": 0 if expired else len(str(row.get("answer") or "")),
+            # Причину закрытия называет пул, если назвал: истёкший по сроку
+            # вопрос приходит без `answered_via` (его ставит только наша
+            # пометка), а закрытый чужой причиной — со своим значением.
+            "answered_via": row.get("answered_via") or (EXPIRED_VIA if expired else None),
+        }
+        if routing.get(number):
+            # Адрес вопроса — из `question_asked`: без него срез этапа вопрос
+            # отвеченным не видит (`dashboard/tools.py`, `_question_pair`).
+            payload["routing"] = dict(routing[number])
         events.append(
             {
                 # У истёкшего вопроса пул `answered_at` не заполняет: момент
@@ -449,20 +524,45 @@ def sync_answers(conn: sqlite3.Connection, home: Path) -> dict[str, Any]:
                 "recorded_at": now,
                 "deal_id": deal_id,
                 "kind": "question_answered",
-                "payload": {
-                    "question_id": int(row["id"]),
-                    "answer_len": 0 if expired else len(str(row.get("answer") or "")),
-                    # Причину закрытия называет пул, если назвал: истёкший по сроку
-                    # вопрос приходит без `answered_via` (его ставит только наша
-                    # пометка), а закрытый чужой причиной — со своим значением.
-                    "answered_via": row.get("answered_via") or (EXPIRED_VIA if expired else None),
-                },
+                "payload": payload,
                 "source": ASK_SOURCE,
                 "idempotency_key": f"ask:{int(row['id'])}:question_answered",
             }
         )
     report["appended"] = journal.append(conn, events)
     return report
+
+
+def _questions_of(events: Iterable[Any]) -> tuple[dict[str, dict[str, Any]], set[str]]:
+    """Адреса вопросов дела и номера уже отвеченных — по фактам журнала.
+
+    `routing` пишет `ask()` в факт `question_asked` (`dashboard/ask.py`), и до
+    сих пор он жил только там: факт закрытия его не повторял. Срез этапа
+    (`dashboard/tools.py`, `_question_pair`) адресует вопрос именно по
+    `payload.routing.stage`, поэтому закрытие без адреса вопрос не закрывает.
+
+    Второй ответ на вопрос (`answered`) — признак «закрыт раньше»: так выглядит
+    пара «лид ответил, человек нажал кнопку» в живом журнале.
+    """
+    routing: dict[str, dict[str, Any]] = {}
+    answered: set[str] = set()
+    for event in events or ():
+        if not isinstance(event, dict):
+            continue
+        kind = str(event.get("kind") or "")
+        if kind not in ("question_asked", "question_answered"):
+            continue
+        payload = _journal().payload_of(event)
+        number = str(payload.get("question_id") or "")
+        if not number:
+            continue
+        if kind == "question_answered":
+            answered.add(number)
+            continue
+        address = payload.get("routing")
+        if isinstance(address, dict):
+            routing[number] = address
+    return routing, answered
 
 
 def _closed_rows(db: Path) -> list[dict[str, Any]]:

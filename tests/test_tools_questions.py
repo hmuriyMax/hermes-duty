@@ -492,7 +492,88 @@ def test_lead_asks_the_human_and_the_deal_waits(tmp_path: Path) -> None:
     assert waited["answers"] == 1
 
 
-# --------------------------------------------------------- 4. повтор безопасен
+# ------------------- 4. один вопрос — один ответ: пул и журнал сходятся
+
+def add_pool_question(home: Path, deal: dict[str, Any], number: int, text: str = "в каком формате отчёт?") -> None:
+    """Строка пула ровно с номером вопроса из журнала — так выглядит живой вопрос."""
+    conn = sqlite3.connect(home / "messaging" / "pool.db")
+    try:
+        conn.execute(
+            "INSERT INTO questions (id, session_key, text, origin, status, critical, timeout) "
+            "VALUES (?, ?, ?, 'duty', 'sent', 0, 24.0)",
+            (number, f"t_{deal['id']}", text),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_lead_answer_closes_the_pool_question_and_the_button_changes_nothing(tmp_path: Path) -> None:
+    """Лид ответил, человек нажал кнопку — один факт, вопрос закрыт в срезе этапа.
+
+    Живой баг дела `d_8ec6a401` (вопрос #555): `question_answered` от лида в
+    03:35:16 и от кнопки в 03:35:57, а `duty now` показывал `wait_human` по уже
+    отвеченному вопросу. Два правила держат этот случай:
+
+    - `duty_answer` закрывает строку пула (`ask.resolve`) — нажимать нечего; если
+      нажатие всё же пришло, `sync_answers` второго факта не пишет: вопрос уже
+      закрыт фактом журнала;
+    - факт закрытия несёт `routing` вопроса, поэтому срез этапа видит вопрос
+      отвеченным, а не ждущим.
+    """
+    home = make_home(tmp_path)
+    spec = write_spec(tmp_path, SEED)
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    seed_worker_question(conn, deal, 41)
+    add_pool_question(home, deal, 41)
+    seen: list[Any] = []
+    spawn = process_spawner(
+        home, spec, seen, Fake(pack=True, result={"status": "done", "summary": "по ответу лида"})
+    )
+
+    report = tools.answer(
+        str(deal["id"]),
+        "impl",
+        41,
+        "формат JSON",
+        "answer-1",
+        home=home,
+        spawn=spawn,
+        clock=lambda: NOW + 10,
+        ack_sec=0,
+    )
+
+    assert report["answered"] is True
+    assert report["pool_resolved"] is True
+    rows = pool_rows(home)
+    assert len(rows) == 1
+    assert (rows[0]["status"], rows[0]["answer"], rows[0]["answered_via"]) == (
+        "answered",
+        "формат JSON",
+        "lead",
+    )
+
+    # Кнопка человека в гонке: он нажал, пока строку пула видел живой.
+    answer_human(home, 41, "стоп")
+    waited = tools.wait(str(deal["id"]), 0, 0, home=home, clock=lambda: NOW + 30)
+
+    assert waited["answers"] == 0, "второго факта по тому же вопросу нет"
+    answered = facts(conn, deal, "question_answered")
+    assert len(answered) == 1
+    assert answered[0]["by"] == "lead"
+    # Срез этапа: пара «вопрос → ответ» сходится по адресу, а не по номеру пула.
+    asked, closed = tools._question_pair(journal.read_events(conn, str(deal["id"])), "impl", "41")
+    assert asked is not None
+    assert closed is True
+    events = journal.read_events(conn, str(deal["id"]))
+    folded = journal.fold(events, now=NOW + 30)
+    assert folded["state"] != "wait_human"
+    assert "ответа нет" not in str(folded["evidence"] or "")
+    assert transit.deal_state(spec, events) != transit.WAIT_HUMAN
+
+
+# --------------------------------------------------------- 5. повтор безопасен
 
 
 def test_repeat_answer_writes_one_fact_and_lifts_one_attempt(tmp_path: Path) -> None:

@@ -795,3 +795,158 @@ def test_plan_without_a_reviewer_passes_with_a_warning_and_publish_does_not_star
 
     assert "публикация без одобрения ревью" in reason
     assert spawned == []
+
+
+# ------------------------------- 5. роль ревьюера и человеческий гейт — из хартии
+
+
+def seed_with_charter(repo: Path, base: str, charter: str, *stages: str) -> str:
+    """Сид с блоком `charter`: он записывается до `stages`, как в доке 2.0."""
+    lines = ["duty: хартия публикации", f"repo: {repo}", f"base: {base}", "charter:"]
+    for line in textwrap.dedent(charter).strip("\n").splitlines():
+        lines.append(f"  {line}")
+    lines.append("stages:")
+    for stage in stages:
+        lines.append(textwrap.indent(textwrap.dedent(stage).strip("\n"), "  "))
+    return "\n".join(lines) + "\n"
+
+
+QA_REVIEW = """
+- id: review
+  role: qa
+  workspace: none
+  needs: [impl]
+  verdict: {approve: next, changes: impl, max_rounds: 1}
+"""
+
+
+@pytest.mark.parametrize(
+    ("approved_by", "started"),
+    [("review", True), ("impl", False)],
+    ids=["qa approves", "implementer approves"],
+)
+def test_the_reviewer_role_comes_from_the_charter(tmp_path: Path, approved_by: str, started: bool):
+    """Роль ревьюера — из `charter.publish.reviewer_role`, а не константа `reviewer`.
+
+    Дело объявило ревьюером `qa` (`docs/ENGINE-2.0.md`, разделы 3 и 8): приговор
+    этапа с этой ролью публикацию одобряет, приговор исполнителя — нет, и отказ
+    называет ту роль, которой приговора не хватило.
+    """
+    repo, first, _second = git_repo(tmp_path)
+    home = make_home(tmp_path)
+    spec = write_spec(
+        tmp_path,
+        seed_with_charter(
+            repo, first, "publish: {reviewer_role: qa, human_gate: false}", IMPL, QA_REVIEW, PUBLISH
+        ),
+    )
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    append(conn, deal, ended(stage=approved_by, commit=first), approve(stage=approved_by, attempt=1))
+    spawned: list[tuple[Any, ...]] = []
+
+    if started:
+        answer = tools.start(
+            str(deal["id"]), "publish", "start-qa", home=home, spawn=fake_spawn(spawned), ack_sec=0
+        )
+
+        assert answer["started"] is True
+        assert spawned == [(str(deal["id"]), "publish", 1, "start-qa")]
+        return
+    reason = refusal(
+        tools.start, str(deal["id"]), "publish", "start-qa", home=home, spawn=fake_spawn(spawned), ack_sec=0
+    )
+
+    assert "роль не qa" in reason
+    assert spawned == []
+
+
+HUMAN_GATE = """
+- id: gate
+  kind: gate
+  workspace: none
+  needs: [impl]
+  ask: {q: "Публикуем?", options: [публиковать, стоп]}
+  allow: [публиковать]
+"""
+
+GATED_PUBLISH = """
+- id: publish
+  role: publisher
+  workspace: none
+  needs: [review, gate]
+"""
+
+
+@pytest.mark.parametrize(
+    ("charter", "answered", "started"),
+    [
+        ("publish: {human_gate: true}", True, True),
+        ("publish: {human_gate: true}", False, False),
+        ("publish: {human_gate: false}", False, True),
+    ],
+    ids=["gate asked and answered", "gate asked but silent", "no human gate"],
+)
+def test_human_gate_comes_from_the_charter(
+    tmp_path: Path, charter: str, answered: bool, started: bool
+):
+    """`charter.publish.human_gate` решает, спрашивают ли человека перед публикацией.
+
+    Поле было объявлено в хартии и не читалось никем (`docs/ENGINE-2.0.md`, раздел
+    3): `false` не менял ничего. Теперь `true` — публикация требует **факта**
+    ответа человека на гейт, `false` — не требует; ревью спрашивается в обоих
+    случаях.
+    """
+    repo, first, _second = git_repo(tmp_path)
+    home = make_home(tmp_path)
+    spec = write_spec(
+        tmp_path, seed_with_charter(repo, first, charter, IMPL, REVIEW, HUMAN_GATE, GATED_PUBLISH)
+    )
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    append(conn, deal, ended(stage="review", commit=first), approve(stage="review", attempt=1))
+    if answered:
+        append(conn, deal, ask_gate(21, approved=first), answer_gate(21), gate_verdict(21))
+    spawned: list[tuple[Any, ...]] = []
+
+    if started:
+        answer = tools.start(
+            str(deal["id"]), "publish", "start-gate", home=home, spawn=fake_spawn(spawned), ack_sec=0
+        )
+
+        assert answer["started"] is True
+        assert spawned == [(str(deal["id"]), "publish", 1, "start-gate")]
+        return
+    reason = refusal(
+        tools.start, str(deal["id"]), "publish", "start-gate", home=home, spawn=fake_spawn(spawned), ack_sec=0
+    )
+
+    assert "гейт gate не спрашивал" in reason
+    assert spawned == []
+
+
+def test_risky_stage_asks_the_human_even_without_the_charter_gate(tmp_path: Path):
+    """`ask.risky` сильнее хартии: `human_gate: false` не отменяет вопрос человеку.
+
+    Раздел 8 требует ответа человека на рискованном этапе независимо от того, что
+    хартия говорит про публикацию: «нет ответа — нет старта».
+    """
+    repo, first, _second = git_repo(tmp_path)
+    home = make_home(tmp_path)
+    spec = write_spec(
+        tmp_path,
+        seed_with_charter(
+            repo, first, "publish: {human_gate: false}", IMPL, REVIEW, RISKY_GATE, RISKY_PUBLISH
+        ),
+    )
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    append(conn, deal, ended(stage="review", commit=first), approve(stage="review", attempt=1))
+    spawned: list[tuple[Any, ...]] = []
+
+    reason = refusal(
+        tools.start, str(deal["id"]), "publish", "start-risky", home=home, spawn=fake_spawn(spawned), ack_sec=0
+    )
+
+    assert "гейт gate не спрашивал" in reason
+    assert spawned == []

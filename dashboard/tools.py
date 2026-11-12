@@ -605,6 +605,27 @@ def _ancestor_probe(spec: Any) -> Optional[Callable[[str, str], Optional[bool]]]
     return lambda older, newer: runner._ancestor(repo, older, newer)
 
 
+def _publish_settings(spec: Any) -> tuple[str, bool]:
+    """Роль-ревьюер и человеческий гейт из хартии: `(reviewer_role, human_gate)`.
+
+    Оба поля объявлены в `charter.publish` (`docs/ENGINE-2.0.md`, разделы 3 и 8) и
+    до сих пор не читались движком: гейт публикации фильтровал этапы по константе
+    `spec.REVIEWING_ROLE`, а `human_gate` не спрашивал никто. Теперь роль берётся
+    из хартии (умолчание — та же константа, поэтому спека без `publish` ведёт себя
+    как 1.x), а `human_gate` работает так: объявленный `true` — человека перед
+    публикацией спрашивают **по факту** ответа на гейт, объявленный `false` — нет
+    (рискованный этап спрашивается всё равно, `ask.risky` сильнее хартии).
+
+    `human_gate` действует только когда блок `publish` в хартии **объявлен**
+    (`Publish.declared`): иначе умолчание `true` включило бы гейт у спек 1.x, где
+    его не было, и обещание «нет блока — поведение 0.0.8» стало бы ложью.
+    """
+    publish_decl = getattr(getattr(spec, "charter", None), "publish", None)
+    declared = bool(getattr(publish_decl, "declared", False))
+    human_gate = bool(getattr(publish_decl, "human_gate", False)) if declared else False
+    return spec_module.reviewer_role(spec), human_gate
+
+
 def _publish_refusal(spec: Any, stage: Any, events: Iterable[Any]) -> Optional[str]:
     """Отказ публикации по фактам — или `None`, если попытку поднимать можно.
 
@@ -618,6 +639,10 @@ def _publish_refusal(spec: Any, stage: Any, events: Iterable[Any]) -> Optional[s
     - у рискованного — `publish.approval()`: ответ человека на гейт вариантом из
       `allow`, и с момента вопроса дерево не менялось.
 
+    Роль ревьюера и необходимость вопроса человеку берутся из хартии дела
+    (`_publish_settings`): дело вправе назвать ревьюером не `reviewer`, а другую
+    роль, и вправе объявить, что человека перед публикацией не спрашивают.
+
     Оба смотрят на **базу публикуемого дерева** (`runner.resolved_base`), то есть
     на коммит, который действительно уйдёт в origin. Проверка стоит до лизинга и
     спавна: отказ не пишет фактов и не занимает слот.
@@ -626,6 +651,7 @@ def _publish_refusal(spec: Any, stage: Any, events: Iterable[Any]) -> Optional[s
     risky = _risky(stage)
     if not publishing and not risky:
         return None
+    reviewer_role, human_gate = _publish_settings(spec)
     events = list(events)
     try:
         # База может не сойтись у самого движка (разошедшиеся предшественники):
@@ -637,19 +663,24 @@ def _publish_refusal(spec: Any, stage: Any, events: Iterable[Any]) -> Optional[s
         reviewers = [
             item.id
             for item in spec.stages
-            if str(getattr(item, "role", "") or "") == spec_module.REVIEWING_ROLE
+            if str(getattr(item, "role", "") or "") == reviewer_role
         ]
         approval = publish.review(
-            events, reviewers, current=current, ancestor=_ancestor_probe(spec)
+            events, reviewers, current=current, ancestor=_ancestor_probe(spec), role=reviewer_role
         )
         if not approval.ok:
             return f"этап {stage.id}: {approval.reason}"
-    if not risky:
+    if not risky and not human_gate:
         return None
     gates = runner.publish_gates(spec, stage)
     if not gates:
+        needs = (
+            "объявлен рискованным (ask.risky)"
+            if risky
+            else "публикует, а хартия требует вопроса человеку (publish.human_gate)"
+        )
         return (
-            f"этап {stage.id} объявлен рискованным (ask.risky), а гейта "
+            f"этап {stage.id} {needs}, а гейта "
             f"(kind: {spec_module.GATE_KIND}) в его предках нет: человека никто не "
             "спросит — нет ответа, нет старта"
         )
@@ -675,9 +706,11 @@ def start(
     """Поднять попытку этапа отсоединённым процессом и ответить её фактом.
 
     Отказы — до спавна и по фактам журнала (`docs/ENGINE-2.0.md`, разделы 5, 8 и
-    11): этапа нет в принятом плане; по этапу уже идёт живая попытка; живых
-    попыток в деле не меньше `MAX_SLOTS`; бюджет дела исчерпан; публикация без
-    приговора ревью (и без ответа человека, если этап рискованный) — `_publish_refusal`.
+    11): этапа нет в принятом плане; серия попыток этапа упёрлась в
+    `charter.max_attempts`; по этапу уже идёт живая попытка; живых попыток в деле
+    не меньше `MAX_SLOTS`; бюджет дела исчерпан; публикация без приговора ревью (и
+    без ответа человека, если этап рискованный или хартия требует гейта) —
+    `_publish_refusal`.
     Ни один отказ ничего не пишет — журнал не растёт, слот не занимается.
 
     Попытку исполняет **отдельный процесс в своей группе** (`start_new_session`):
@@ -723,6 +756,12 @@ def start(
             "попытки по нему не поднимаются — вернуть работу можно только новым "
             "этапом в новой ревизии плана"
         )
+    # Потолок серии — хартия дела (`charter.max_attempts`, раздел 11 контракта):
+    # «3 попытки на этап, включая авто-повторы». До этой проверки серию
+    # ограничивал только `retry.max` этапа (для авто-повторов) — число ручных
+    # `duty_start` по одному этапу не ограничивал никто.
+    attempt = _next_attempt(events, name)
+    ceiling = spec_module.attempts_ceiling(graph)
     # Публикация проверяется по фактам до лизинга и спавна (раздел 8 контракта):
     # отказ не пишет события и не занимает слот, а причина называет, какого
     # именно факта не хватает — «публикация без ревью» видна ДО процесса.
@@ -737,6 +776,12 @@ def start(
             f"этап {name!r} уже идёт: попытка {busy['run_id']} (pid {busy.get('pid')}) — "
             "слот этапа занят, дождись её факта или отмени её"
         )
+    if attempt > ceiling:
+        raise ToolsError(
+            f"этап {name!r}: попыток {attempt - 1} из {ceiling} — серия исчерпана "
+            "хартией (charter.max_attempts): новая попытка — новая ревизия плана, "
+            "а не повтор duty_start"
+        )
     if len(live) >= MAX_SLOTS:
         named = ", ".join(str(row.get("run_id") or "") for row in live)
         raise ToolsError(
@@ -746,7 +791,6 @@ def start(
     cap = budget.refusal(spec, events)
     if cap is not None:
         raise ToolsError(cap.reason())
-    attempt = _next_attempt(events, name)
     run_id = f"{name}#{attempt}"
     spawner = spawn or _spawn_attempt
     pid = spawner(home, str(deal["id"]), name, attempt, key)
@@ -1082,6 +1126,10 @@ def answer(
     Повтор с тем же `idempotency_key` второго факта и второй попытки не пишет:
     ключ едет в `question_answered` (`payload.idem`) и в `attempt_started`, и
     повтор отвечает тем, что уже случилось.
+
+    Строка пула закрывается этим же вызовом (`ask.resolve`): ответ лида — ответ на
+    вопрос, и человеку больше нечего нажимать. Порядок — по правилу раздела 9:
+    сначала факт журнала, потом действие в пуле.
     """
     key = _key(idempotency_key)
     name = str(stage_id or "").strip()
@@ -1167,6 +1215,18 @@ def answer(
             moment,
         )
         written = journal.append(conn, [fact])
+    # Ответ человека больше не нужен: строка пула закрывается штатным путём пула
+    # (`ask.resolve`, те же поля, что у `msgq resolve`). Иначе вопрос висит в
+    # панели/iMessage, человек жмёт кнопку по уже отвеченному вопросу, и его
+    # нажатие даёт второй `question_answered` (живое дело `d_8ec6a401`, #555).
+    # Сбой пула ответ не отменяет: факт записан, воркер продолжается — но об этом
+    # сказано ответом (`pool_resolved`), а не тишиной.
+    pool_resolved = False
+    if number:
+        try:
+            pool_resolved = ask_module.resolve(home, question_id, word, via=SOURCE)
+        except (ask_module.AskError, ValueError):
+            pool_resolved = False
     # Блок `needs_input` ставил движок под вопрос попытки, и снимает его тот, кто
     # взял работу (`runner.close_answered_block`): иначе дело осталось бы в
     # `wait_human`, хотя попытка уже идёт.
@@ -1186,6 +1246,7 @@ def answer(
             "run_id": f"{name}#{attempt}",
             "pid": pid,
             "written": written,
+            "pool_resolved": pool_resolved,
             "reason": (
                 f"ответ записан, попытка поднята (pid {pid}), факта attempt_started ещё нет за "
                 f"{int(ack_sec)} с — её события придут в duty_wait"
@@ -1204,6 +1265,7 @@ def answer(
         "pid": lifted.get("pid"),
         "workdir": lifted.get("workdir"),
         "written": written,
+        "pool_resolved": pool_resolved,
     }
 
 

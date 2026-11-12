@@ -256,6 +256,40 @@ def test_contract_is_retried_by_engine_with_reason_in_brief(tmp_path: Path) -> N
     assert previous[0]["reason"], "у контрактного отказа причина тоже есть"
 
 
+def test_charter_max_attempts_caps_the_series(tmp_path: Path) -> None:
+    """Серия упирается в потолок хартии, а не в `retry.max` этапа.
+
+    `charter.max_attempts: 2` — две попытки на этап **включая** авто-повторы
+    (`docs/ENGINE-2.0.md`, разделы 3 и 11), хотя политика этапа разрешает пять.
+    Красная проба: без проверки в `run_attempts` движок сделал бы шесть попыток, и
+    «3 попыток на этап» из хартии остались бы обещанием.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = write_spec(
+        tmp_path,
+        """
+        duty: потолок хартии
+        charter:
+          max_attempts: 2
+        stages:
+          - id: impl
+            role: implementer
+            workspace: none
+            retry: {max: 5, on: [infra]}
+        """,
+    )
+    fake = Fake(exit_code=1)
+
+    report = runner.run_attempts(conn, spec, deal, "impl", 1, home=home, spawn=fake, clock=lambda: NOW)
+
+    assert (report["attempt"], report["retries"]) == (2, 1)
+    assert report["attempts_ceiling"] == 2
+    assert report["retry"] is False, "повтор за потолком хартии не поднимается"
+    assert [row["attempt"] for row in attempts_started(conn, deal)] == [1, 2]
+
+
 def test_retry_limit_bounds_the_series(tmp_path: Path) -> None:
     """`max: 2` — три попытки всего, дальше политика отказывает в повторе."""
     home = make_home(tmp_path)

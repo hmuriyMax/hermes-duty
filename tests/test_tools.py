@@ -371,6 +371,60 @@ def test_start_on_a_busy_stage_refuses_without_writing(tmp_path: Path) -> None:
     assert row_count(conn, deal) == before
 
 
+def test_start_refuses_past_the_charter_attempt_ceiling(tmp_path: Path) -> None:
+    """Серия этапа исчерпана хартией: `duty_start` отказывает, повтор — не работа.
+
+    `charter.max_attempts: 2` объявляет две попытки на этап включая авто-повторы
+    (`docs/ENGINE-2.0.md`, раздел 11). Закрытые попытки 1 и 2 — серия исчерпана, и
+    третий `duty_start` по тому же этапу поднял бы попытку, которую хартия не
+    разрешает: отказ до спавна, журнал не растёт.
+    """
+    home = make_home(tmp_path)
+    spec = write_spec(
+        tmp_path,
+        """
+        duty: потолок попыток
+        repo: ~/GolandProjects/duty
+        charter:
+          max_stages: 6
+          max_attempts: 2
+          allowed_roles: [implementer]
+        stages:
+          - id: impl
+            role: implementer
+            workspace: none
+            evidence:
+              - {cmd: "true", must: 0}
+        """,
+    )
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    for attempt in (1, 2):
+        append(
+            conn,
+            deal,
+            (
+                "attempt_started",
+                {"run_id": f"impl#{attempt}", "stage": "impl", "attempt": attempt, "pid": attempt},
+            ),
+            (
+                "attempt_ended",
+                {"run_id": f"impl#{attempt}", "stage": "impl", "attempt": attempt, "outcome": "done"},
+            ),
+        )
+    before = row_count(conn, deal)
+    spawned: list[tuple[Any, ...]] = []
+
+    reason = refusal(
+        tools.start, str(deal["id"]), "impl", "start-3", home=home, spawn=fake_spawn(spawned), ack_sec=0
+    )
+
+    assert "попыток 2 из 2" in reason
+    assert "charter.max_attempts" in reason
+    assert spawned == []
+    assert row_count(conn, deal) == before
+
+
 def test_start_refuses_when_slots_are_taken(tmp_path: Path) -> None:
     """Живых попыток `MAX_SLOTS`: третий этап не поднимается, журнал не растёт."""
     home = make_home(tmp_path)

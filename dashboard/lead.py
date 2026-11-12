@@ -113,6 +113,15 @@ LEASE_GRACE_SEC = 300
 # Сколько раз супервизор поднимает упавшего лида (`charter.max_lead_resumes`).
 DEFAULT_MAX_RESUMES = 6
 
+# Порог тишины захода (`docs/ENGINE-2.0.md`, раздел 10, `lead_idle_timeout`):
+# сколько секунд поток сессии может молчать, пока процесс ещё жив. Тишина — это
+# не «нет фактов» (лид законно ждёт их в `duty_wait`), а «процесс ничего не
+# говорит вовсе»: заблокированный `duty_wait` возвращается с `tool_result` не
+# позже `WAIT_CEILING_SEC` (300 с, `dashboard/tools.py`), поэтому 15 минут тишины
+# в потоке — зависание, а не работа. Порог меньше бюджета захода (1800 с): иначе
+# тишина была бы видна только через `overrun`.
+LEAD_IDLE_TIMEOUT_SEC = 900
+
 # Режимы захода: первый (бриф) и продолжение (дайджест фактов после курсора).
 MODE_FIRST = "brief"
 MODE_RESUME = "resume"
@@ -834,6 +843,7 @@ def run(
     deal_id: str,
     *,
     run_budget: Optional[int] = None,
+    idle_timeout: Optional[int] = None,
     now: Any = None,
     clock: Optional[Callable[[], float]] = None,
     monotonic: Optional[Callable[[], float]] = None,
@@ -845,6 +855,10 @@ def run(
     единственный, кто пишет `lead_started`/`lead_exited`: модель о своей смерти
     факта не оставит. Порядок ровно как у попытки (`runner.start_stage`):
     сначала взаимное исключение, потом процесс, потом факт с его pid.
+
+    `idle_timeout` — порог тишины потока (`LEAD_IDLE_TIMEOUT_SEC` по умолчанию):
+    молчащий процесс, который ещё жив, гасится с `lead_exited(reason="idle")`, и
+    супервизор поднимает резюм штатно — «лид завис», раздел 10 контракта.
     """
     home = Path(home).expanduser()
     budget_sec = DEFAULT_RUN_BUDGET_SEC if run_budget is None else max(1, _int(run_budget))
@@ -952,9 +966,11 @@ def run(
         session_id = str(st["session_id"])
         tokens = 0
         reason = "exit"
+        idle_sec = LEAD_IDLE_TIMEOUT_SEC if idle_timeout is None else max(1, _int(idle_timeout))
         deadline = monotonic() + budget_sec + LEASE_GRACE_SEC
         renew_every = max(ttl / 3.0, runner.POLL_SEC)
         last_renew = monotonic()
+        last_line_at = monotonic()
         while True:
             if monotonic() - last_renew >= renew_every:
                 runner.renew(
@@ -969,7 +985,15 @@ def run(
                     reason = "overrun"
                     process.stop()
                     break
+                # Тишина в потоке: процесс жив, но ничего не говорит. Живой
+                # `duty_wait` возвращается с `tool_result` не позже 300 с, так
+                # что молчание дольше порога — зависание, а не ожидание работы.
+                if monotonic() - last_line_at >= idle_sec:
+                    reason = "idle"
+                    process.stop()
+                    break
                 continue
+            last_line_at = monotonic()
             data = _line_object(line)
             if data is None or str(data.get("type") or "") != "result":
                 continue

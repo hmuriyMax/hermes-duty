@@ -171,6 +171,28 @@ DEFAULT_MAX_ROUNDS_REPLAN = 3
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_MAX_LEAD_RESUMES = 6
 
+
+def attempts_ceiling(spec: Any) -> int:
+    """Потолок попыток этапа из хартии: `charter.max_attempts` (раздел 11).
+
+    Считает **все** попытки этапа, включая авто-повторы движка: хартия говорит
+    «попыток на этап», а не «ручных повторов лида». Спека без `charter` получает
+    умолчание `DEFAULT_MAX_ATTEMPTS`, поэтому старые дела 1.x не меняют поведения.
+
+    Одна функция на два пути к новой попытке (`tools.start` и
+    `runner.run_attempts`): разойдись они — лид поднимал бы попытку, которую серия
+    тут же назвала бы лишней.
+    """
+    charter = getattr(spec, "charter", None)
+    value = getattr(charter, "max_attempts", None)
+    if value is None:
+        return DEFAULT_MAX_ATTEMPTS
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_ATTEMPTS
+
+
 # Код возврата shell-этапа по умолчанию: «команда сходилась» — это 0.
 DEFAULT_SHELL_MUST = 0
 
@@ -183,6 +205,23 @@ PUBLISHING_ROLES = ("publisher", "deployer")
 # Роль, которая выносит приговор. Ревью в предках публикующего этапа — то, что
 # делает «гейти PUB на RV, а не на IMP» проверкой, а не договорённостью в скилле.
 REVIEWING_ROLE = "reviewer"
+
+
+def reviewer_role(spec: Any) -> str:
+    """Роль ревьюера дела: `charter.publish.reviewer_role`, умолчание `REVIEWING_ROLE`.
+
+    Одна функция на три места, которые обязаны сойтись: гейт публикации
+    (`dashboard/tools.py`, `_publish_settings`), предупреждение `review-gate` в
+    `spec check` и текст отказа `publish.review`. Дело вправе назвать ревьюером
+    `qa`, и тогда «ревью нет» не должно звучать про `reviewer`.
+
+    Спека без `charter` или без блока `publish` получает `REVIEWING_ROLE` — то же
+    поведение, что 1.x.
+    """
+    publish_decl = getattr(getattr(spec, "charter", None), "publish", None)
+    role = str(getattr(publish_decl, "reviewer_role", "") or "").strip()
+    return role or REVIEWING_ROLE
+
 
 # Роли без терминала: их профили не запускают команд (`terminal` в
 # disabled_toolsets). Такие этапы доказывают себя отчётом и приговором, а не
@@ -374,17 +413,22 @@ class Publish:
     - `reviewer_role` — роль, чью работу дело считает ревью; умолчание —
       `REVIEWING_ROLE`, поэтому спека без `publish` ведёт себя как 1.x;
     - `human_gate` — нужен ли вопрос человеку перед публикацией; умолчание
-      `true`, как у 1.x, где публикующий этап требует гейта в предках.
+      `true`, как у 1.x, где публикующий этап требует гейта в предках;
+    - `declared` — блок `publish` в хартии **объявлен**. Без этого признака
+      умолчание `human_gate: true` включило бы человеческий гейт у спек 1.x, где
+      его не было, и «нет блока — поведение 0.0.8» перестало бы быть правдой.
 
     Гарантия публикации от этих полей не зависит: она живёт в истории фактов
     (`duty_start` → `dashboard/publish.py`), а не в форме графа и не в хартии
     (раздел 8: «статически доказать нельзя — можно проверить факты»). Здесь поля
     только разбираются и проверяются на форму — булево и непустое имя роли, —
-    чтобы `duty spec check` называл мусор в хартии до запуска дела.
+    чтобы `duty spec check` называл мусор в хартии до запуска дела. Читает их
+    движок: `dashboard/tools.py`, `_publish_settings`.
     """
 
     human_gate: bool = True
     reviewer_role: str = REVIEWING_ROLE
+    declared: bool = False
     line: int = 0
 
 
@@ -884,7 +928,9 @@ def _parse_publish(
             )
         )
         reviewer_role = REVIEWING_ROLE
-    return Publish(human_gate=human_gate, reviewer_role=str(reviewer_role).strip(), line=line)
+    return Publish(
+        human_gate=human_gate, reviewer_role=str(reviewer_role).strip(), declared=True, line=line
+    )
 
 
 def _parse_charter(
@@ -1780,25 +1826,31 @@ def _check_review_gate(spec: Any) -> list[Issue]:
     что между реализацией и публикацией стоит приговор. Поэтому этап, который
     действует вовне (`role` из `PUBLISHING_ROLES` — профиль `publisher`, деплой)
     или сам объявлен рискованным (`ask.risky: true`), называется отдельно: в его
-    транзитивных `needs` нет ни одного этапа с `role: reviewer`.
+    транзитивных `needs` нет ни одного этапа с ролью ревьюера.
+
+    Роль ревьюера — из хартии (`charter.publish.reviewer_role`), та же, по которой
+    гейт публикации ищет приговор (`dashboard/tools.py`, `_publish_settings`):
+    дело, назвавшее ревьюером `qa`, не должно получать предупреждение «ревью
+    нет» за правильно объявленный план.
     """
     if not _references_intact(spec):
         return []  # ссылки битые — уже отказ `needs`/`parallel_with`, граф не проверить
     by_id = {stage.id: stage for stage in spec.stages}
     ancestors = _ancestors(spec)
+    reviewer = reviewer_role(spec)
     issues: list[Issue] = []
     for stage in spec.stages:
         risky = stage.ask.risky if stage.ask is not None else False
         if stage.role not in PUBLISHING_ROLES and not risky:
             continue
-        if any(by_id[need].role == REVIEWING_ROLE for need in ancestors.get(stage.id, set())):
+        if any(by_id[need].role == reviewer for need in ancestors.get(stage.id, set())):
             continue
         issues.append(
             Issue(
                 spec.path,
                 stage.line,
                 "review-gate",
-                f"этап {stage.id!r} публикует, но в его предках нет ревью (role: {REVIEWING_ROLE}): "
+                f"этап {stage.id!r} публикует, но в его предках нет ревью (role: {reviewer}): "
                 "публикацию не одобрит никто — приговора ревьюера в истории не будет",
                 severity=WARNING,
             )

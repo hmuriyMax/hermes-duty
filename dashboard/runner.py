@@ -4684,6 +4684,11 @@ def run_attempts(
 
     Ответ — отчёт последней попытки плюс `retries` — сколько повторов движок
     сделал сам (в отчёте каждой попытки их нет: там своя попытка).
+
+    Серия упирается в `charter.max_attempts` (`docs/ENGINE-2.0.md`, раздел 11):
+    «попыток на этап, включая авто-повторы». Потолок называется в отчёте
+    (`attempts_ceiling`) и снимает `retry`: следующий повтор был бы N+1-й попыткой
+    этапа, а хартия считает их все.
     """
     report = run_stage(
         conn,
@@ -4698,8 +4703,9 @@ def run_attempts(
         clock=clock,
         monotonic=monotonic,
     )
+    ceiling = spec_module.attempts_ceiling(spec)
     retried = 0
-    while report.get("retry") is True:
+    while report.get("retry") is True and attempt < ceiling:
         previous = int(report.get("attempt") or attempt)
         attempt = previous + 1
         retried += 1
@@ -4715,6 +4721,10 @@ def run_attempts(
             clock=clock,
             monotonic=monotonic,
         )
+    if report.get("retry") is True:
+        # Серия исчерпана не политикой класса, а потолком хартии: повтор
+        # остаётся мнением движка, но поднимать его больше нельзя.
+        report = {**report, "retry": False, "attempts_ceiling": ceiling}
     if retried:
         report = {**report, "retries": retried}
     return report

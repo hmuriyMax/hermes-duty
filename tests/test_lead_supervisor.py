@@ -601,6 +601,99 @@ def test_live_lead_is_not_raised_twice(tmp_path: Path) -> None:
     conn.close()
 
 
+# --------------------------------- 4. лид завис: тишина в потоке — это `idle`
+
+
+class SilentProcess:
+    """Живой и молчащий процесс сессии: строки кончаются, а процесс — нет.
+
+    Так выглядит зависание (`docs/ENGINE-2.0.md`, раздел 10): pid жив, поток
+    молчит. Форма та же, что у `runner.Process`; `stop` запоминает, что заход
+    погасил именно он.
+    """
+
+    def __init__(self, lines: list[str], *, pid: int = 4242) -> None:
+        self._lines = list(lines)
+        self._pid = pid
+        self.stopped = False
+        self._exit: Optional[int] = None
+
+    @property
+    def pid(self) -> int:
+        return self._pid
+
+    def next_line(self, timeout: float = 0.0) -> Optional[str]:
+        return self._lines.pop(0) if self._lines else None
+
+    def finished(self) -> bool:
+        return False
+
+    @property
+    def exit_code(self) -> Optional[int]:
+        return self._exit
+
+    def wait(self, timeout: Optional[int] = None) -> Optional[int]:
+        return self._exit
+
+    def stop(self, grace: float = 0.0) -> Optional[int]:
+        self.stopped = True
+        self._exit = -15
+        return self._exit
+
+    @property
+    def stderr_tail(self) -> list[str]:
+        return []
+
+
+def test_silent_lead_exits_idle_and_the_supervisor_resumes(tmp_path: Path) -> None:
+    """Тишина в потоке — `lead_exited(reason=idle)`, дальше штатный резюм.
+
+    §10 различает «лид умер» и «лид завис»: живой процесс, от которого нет ни
+    слова. `overrun` видит это только через бюджет захода (30 минут), поэтому у
+    захода свой порог тишины (`lead.LEAD_IDLE_TIMEOUT_SEC`): живой `duty_wait`
+    возвращается не позже 300 с, и молчание дольше порога — зависание, а не
+    ожидание работы.
+
+    Красная проба: без проверки заход держал бы лизинг до `overrun`, и «лид
+    завис» было бы неотличимо от «лид работает».
+    """
+    home = make_home(tmp_path)
+    spec = write_spec(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    conn.close()
+    silence = SilentProcess([stream_result("sess-idle")])
+    ticks = itertools.count(0, 10)
+
+    report = lead.run(
+        home,
+        str(deal["id"]),
+        run_budget=3600,
+        idle_timeout=30,
+        now=NOW,
+        clock=lambda: NOW,
+        monotonic=lambda: next(ticks),
+        spawn=lambda cmd, cwd: silence,
+    )
+
+    assert report["reason"] == "idle"
+    assert silence.stopped is True, "зависший заход гасит обёртка, а не супервизор"
+    conn = open_store(home)
+    exited = facts_of(conn, deal, lead.LEAD_KIND_EXITED)
+    conn.close()
+    assert [item["reason"] for item in exited] == ["idle"]
+    assert exited[0]["session_id"] == "sess-idle", "резюм поднимается из той же сессии"
+
+    spawned: list[str] = []
+    tick = lead.supervise(
+        home, str(deal["id"]), now=NOW + 60, probe=dead, spawn=lambda *args: spawned.append(args[1]) or 1
+    )
+
+    assert tick["action"] == "started"
+    assert tick["mode"] == lead.MODE_RESUME
+    assert spawned == [str(deal["id"])]
+
+
 def test_dead_lead_gets_the_missing_exit_fact(tmp_path: Path) -> None:
     """Мёртвому заходу сторож дописывает `lead_exited` — «умер» ≠ «отсутствует».
 

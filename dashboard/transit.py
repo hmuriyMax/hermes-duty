@@ -193,7 +193,11 @@ WAIT_PLAN = "plan"
 # закрывает дыру «диспетчер поднимает `todo`»: гейт родителей — не только статус
 # строки, но и отказ начинать попытку.
 WAIT_NEED = "need"
-WAIT_KINDS = (WAIT_ATTEMPT, WAIT_QUESTION, WAIT_VERDICT, WAIT_FOR_GATE, WAIT_RETRY, WAIT_PARKED, WAIT_PLAN, WAIT_NEED)
+# Дело ведёт лид: `bin/duty run` на живое дело не заходит вовсе (`driver.run`).
+# Второе слово рядом с `need`, потому что ожидание другое: там работают родители
+# по другим делам, здесь по этому делу уже есть вторая рука — лид.
+WAIT_LEAD = "lead"
+WAIT_KINDS = (WAIT_ATTEMPT, WAIT_QUESTION, WAIT_VERDICT, WAIT_FOR_GATE, WAIT_RETRY, WAIT_PARKED, WAIT_PLAN, WAIT_NEED, WAIT_LEAD)
 
 # Исходы попытки, которые считаются успехом. Набор объявлен, а не угадан по
 # подстроке: `contract_refused` тоже содержит «contract», и «похоже на успех»

@@ -2665,6 +2665,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             else:
                 action = "СОЗДАНО" if payload.get("created") else "ДЕЛО УЖЕ ЕСТЬ"
                 print(render_mutation(payload, action), file=out)
+            if payload.get("warning"):
+                # Предупреждение — в stderr, не в stdout: вывод создания остаётся
+                # парсимым (`--json` — одна JSON-строка), а «по тикету уже было
+                # закрытое дело» видно и человеку, и скрипту, который читает оба
+                # потока.
+                print(f"warning: {payload['warning']}", file=sys.stderr)
             return _payload_code(payload)
         if args.command == "comment":
             request = {"author": args.author, "body": args.body}

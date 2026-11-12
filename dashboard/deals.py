@@ -134,6 +134,16 @@ CLOSED_STATUSES = ("done", "cancelled", "archived")
 # работу, оно `todo`/`ready`, и решает это граф, а не рука.
 GATED_STATUSES = ("todo", "ready")
 
+# Свежесть закрытого дела с тем же внешним именем: сутки. Порог — не отказ, а
+# предупреждение: продолжение работы по тикету законно (`create` его не
+# запрещает), но если вчерашнее дело по этому же `jira:` закрыли, новое дело —
+# уже не первое, и это обязано быть видно в ответе. Сутки потому, что «вчера
+# закрыли, сегодня продолжаем» — ещё тот же заход по тикету, а недельная история
+# — уже другая работа, и предупреждать о ней значило бы шуметь на каждом
+# возврате к старому тикету. Живой случай RP-14338: пять дел по одному
+# `external_ref` за 1 ч 52 мин, и ни одно создание об этом не сказало.
+CLOSED_REF_LOOKBACK_SEC = 24 * 60 * 60
+
 # Единственный статус, который разрешено ставить через PATCH: остальные — только
 # командами (`docs/OWNERSHIP.md`), иначе журнал перестал бы объяснять переходы.
 PATCH_STATUSES = ("archived",)
@@ -624,6 +634,78 @@ def live_deal_by_ref(
     return None if row is None else dict(row)
 
 
+def closed_deal_by_ref(
+    conn: sqlite3.Connection,
+    repo: Optional[str],
+    external_ref: str,
+    *,
+    now: Optional[int] = None,
+    lookback: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
+    """Закрытое дело с этим внешним именем моложе `lookback` — о чём предупредить.
+
+    `create` закрытое дело не воскрешает: продолжение заводится новым. Но и
+    молчать нельзя — по одному тикету так набирается серия дел, и ни одно
+    создание об этом не говорит (RP-14338: пять дел по `jira:RP-14338` за 1 ч 52
+    мин). Поэтому создание, нашедшее свежезакрытое дело с тем же именем, отвечает
+    `warning`: id закрытого дела, его `cause` и счёт дел по этому имени.
+
+    Отказом это не становится: продолжение работы по тикету законно. Порог
+    `lookback` — `CLOSED_REF_LOOKBACK_SEC`; время закрытия берётся из факта
+    `journal.closed_fact` (`completed`), а не из `updated_at` строки: строка
+    обновляется и позже (комментарий, правка), и «свежезакрытое» по ней значило
+    бы «недавно трогали».
+
+    Область поиска — та же, что у `live_deal_by_ref`: `repo` плюс имя, `repo IS
+    NULL` — своя область «репозиторий не назван». `None` — свежих закрытых дел с
+    этим именем нет.
+    """
+    moment = _now_sec() if now is None else int(now)
+    window = CLOSED_REF_LOOKBACK_SEC if lookback is None else int(lookback)
+    rows = conn.execute(
+        f"SELECT {_deal_fields(conn)} FROM deals WHERE repo IS ? AND external_ref = ? "
+        "AND status IN ({}) ORDER BY updated_at DESC, id DESC LIMIT 5".format(
+            ", ".join("?" * len(CLOSED_STATUSES))
+        ),
+        (repo, external_ref, *CLOSED_STATUSES),
+    ).fetchall()
+    for row in rows:
+        found = dict(row)
+        fact = journal.closed_fact(journal.read_events(conn, str(found["id"])))
+        if fact is None:
+            # Строка закрыта, а факта нет (старый store, руками): времени закрытия
+            # нет, значит и «моложе суток» утверждать нечем.
+            continue
+        if int(fact["at"]) <= moment - window:
+            continue
+        payload = fact.get("payload") or {}
+        return {
+            "id": str(found["id"]),
+            "status": str(found["status"]),
+            # `cause` есть не у всякого закрытия: `complete` (человек нажал
+            # «завершить») пишет `status` и `summary`, а `cause` — только решения
+            # (`close_deal`, пройденный граф, слово лида). Пустой `cause` не
+            # выдумывается: предупреждение назовёт статус.
+            "cause": str(payload.get("cause") or ""),
+            "closed_at": int(fact["at"]),
+            "total": _deals_by_ref(conn, repo, external_ref),
+        }
+    return None
+
+
+def _deals_by_ref(conn: sqlite3.Connection, repo: Optional[str], external_ref: str) -> int:
+    """Сколько дел с этим внешним именем в этом репозитории — включая закрытые.
+
+    Число нужно предупреждению («это уже N-е дело по тикету»): серия дел по
+    одному тикету видна только целиком, а не по последнему.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) AS total FROM deals WHERE repo IS ? AND external_ref = ?",
+        (repo, external_ref),
+    ).fetchone()
+    return int(row["total"] or 0) if row is not None else 0
+
+
 def gate_open(conn: sqlite3.Connection, deal_id: str) -> bool:
     """Открыт ли гейт: все родители закрыты (`done` или `archived`).
 
@@ -855,6 +937,11 @@ def create_deal(
     заводится новым (`created: true`). `dedup_window` ограничивает поиск свежими
     делами (секунды); по умолчанию окна нет.
 
+    Свежезакрытое дело с тем же именем (моложе `CLOSED_REF_LOOKBACK_SEC`) создание
+    не отменяет, но называет: в ответе появляется `warning` с id закрытого дела,
+    его `cause` и номером нового дела по этому имени. Иначе серия дел по одному
+    тикету заводится молча (RP-14338: пять дел по `jira:RP-14338` за 1 ч 52 мин).
+
     Без `external_ref` `create` намеренно не дедуплицируется: id порождает сам
     вызов, поэтому повтор — это второе дело (как в kanban), а не идемпотентный
     повтор.
@@ -905,6 +992,22 @@ def create_deal(
                     "с этим именем не воскрешается: продолжение заводится новым)"
                 ),
             }
+
+    # Свежезакрытое дело с тем же именем — предупреждение, а не отказ: серию дел
+    # по одному тикету видно только так (RP-14338: пять дел за 1 ч 52 мин).
+    warning = ""
+    if ref is not None:
+        closed = closed_deal_by_ref(conn, repo_name, ref, now=now)
+        if closed is not None:
+            # Время — местное `ЧЧ:ММ`: в предупреждении человеку нужен час, а не epoch.
+            at = time.strftime("%H:%M", time.localtime(closed["closed_at"]))
+            # Чем закрыто: `cause` — если журнал его назвал (решение), иначе статус.
+            why = f"cause={closed['cause']}" if closed["cause"] else f"status={closed['status']}"
+            warning = (
+                f"по external_ref={ref!r} (repo={repo_name or '—'}) уже закрыто дело "
+                f"{closed['id']} ({why}, {at}): новое дело — {closed['total'] + 1}-е "
+                "по этому имени; продолжение законно, но это уже не первое дело по тикету"
+            )
 
     deal_id = new_id()
     deal = {"id": deal_id, "repo": repo_name}
@@ -973,12 +1076,18 @@ def create_deal(
                 )
             )
         written = journal.append_in_tx(conn, events)
-    return {
+    result = {
         "deal": deal_row(conn, deal_id),
         "events": written,
         "idempotent": written == 0,
         "created": True,
     }
+    if warning:
+        # Предупреждение рядом с созданным делом, а не строкой `reason`: `reason`
+        # объясняет, почему дела **не** появилось, и смешивать два разных ответа
+        # в одном поле нельзя.
+        result["warning"] = warning
+    return result
 
 
 def patch_deal(

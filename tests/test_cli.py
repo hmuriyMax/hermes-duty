@@ -1394,6 +1394,51 @@ def test_evidence_names_the_answer_and_the_decision_command(home, frozen_now, ca
     assert "wait_human/decision" in out
 
 
+# ------------------- повторное дело по одному тикету: `create` предупреждает
+#
+# RP-14338: по `external_ref='jira:RP-14338'` за 1 ч 52 мин завели пять дел, и ни
+# одно создание об этом не сказало. Живое дело по-прежнему не дублируется
+# (`created: false`), а свежезакрытое — не отказ, но предупреждение: stdout
+# остаётся парсимым (`--json`), строка уходит в stderr.
+
+
+def test_create_warns_in_stderr_about_closed_deal_of_the_same_ref(home, capsys):
+    api = cli.api()
+    first = api.deals_create(
+        home,
+        {"repo": REPO, "title": "ревью правки", "external_ref": "jira:RP-14338"},
+        source="cli",
+    )
+    conn = api.deals.open_store(home)
+    assert conn is not None
+    try:
+        api.deals.close_deal(conn, str(first["id"]), reason="пауза")
+    finally:
+        conn.close()
+
+    code, out, err = run(
+        [
+            "create",
+            "--title",
+            "ревью правки ещё раз",
+            "--repo",
+            REPO,
+            "--external-ref",
+            "jira:RP-14338",
+            "--json",
+        ],
+        capsys,
+    )
+
+    payload = json.loads(out)  # stdout — одна JSON-строка, предупреждение не в ней
+    assert code == cli.EXIT_OK
+    assert payload["created"] is True
+    assert str(first["id"]) in payload["warning"]
+    assert "cause=closed_by_human" in payload["warning"]
+    assert err.startswith("warning: ")
+    assert str(first["id"]) in err
+
+
 # ------------------- W21: `decide stop` на бегущем деле без живого драйвера
 #
 # Живой случай: попытка погибла при рестарте гейтвея, драйвера нет, а лизинг

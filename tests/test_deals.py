@@ -1517,6 +1517,74 @@ def test_archived_deal_is_not_resurrected_by_external_ref(home: Path, client: Te
 
     assert second["created"] is True
     assert second["id"] != first["id"]
+    assert first["id"] in second["warning"], "серия дел по тикету называет предыдущее"
+
+
+def test_closed_deal_of_the_same_ref_warns_through_the_route(
+    home: Path, client: TestClient
+) -> None:
+    """Свежезакрытое дело по тому же ref: дело заводится, но ответ предупреждает.
+
+    RP-14338: пять дел по `jira:RP-14338` за 1 ч 52 мин, и ни одно создание об
+    этом не сказало. Предупреждение не отменяет создание: продолжение законно.
+    """
+    first = create(client, external_ref="jira:RP-14338")
+    mutate(client, "POST", f"/deals/{first['id']}/complete", json={"summary": "пауза"})
+
+    second = create(client, external_ref="jira:RP-14338", title="продолжение")
+
+    assert second["created"] is True
+    assert second["id"] != first["id"]
+    assert second["mutation"] == {"events": 1, "idempotent": False}
+    warning = second["warning"]
+    assert first["id"] in warning
+    assert "status=done" in warning, "у `complete` нет cause — предупреждение называет статус"
+    assert "2-е" in warning, "видно, что дело по этому имени уже не первое"
+    assert len(deal_rows(home)) == 2
+
+
+def test_live_deal_of_the_same_ref_is_returned_without_warning(
+    home: Path, client: TestClient
+) -> None:
+    """Живое дело по тому же ref — прежний `created: false` и ни слова о серии."""
+    first = create(client, external_ref="jira:RP-14338")
+    second = create(client, external_ref="jira:RP-14338", title="нажали ещё раз")
+
+    assert second["created"] is False
+    assert second["existing"] is True
+    assert second["id"] == first["id"]
+    assert "warning" not in second
+
+
+def test_create_without_external_ref_has_no_warning(home: Path, client: TestClient) -> None:
+    """Без внешнего имени предупреждения нет: дедупликации по имени тоже нет."""
+    first = create(client)
+    mutate(client, "POST", f"/deals/{first['id']}/complete", json={"summary": "пауза"})
+
+    second = create(client, title="другое дело")
+
+    assert second["created"] is True
+    assert "warning" not in second
+
+
+def test_closed_deal_older_than_a_day_is_no_warning(home: Path) -> None:
+    """Закрытое дело старше суток — уже другая работа, а не серия по тикету."""
+    conn = store(home)
+    try:
+        first = deals.create_deal(
+            conn, repo=BOARD, title="первое", external_ref="jira:RP-7", now=NOW - 90_000
+        )
+        deals.complete_deal(conn, str(first["deal"]["id"]), summary="пауза", now=NOW - 86_400)
+        fresh = deals.closed_deal_by_ref(conn, BOARD, "jira:RP-7", now=NOW)
+        second = deals.create_deal(
+            conn, repo=BOARD, title="продолжение", external_ref="jira:RP-7", now=NOW
+        )
+    finally:
+        conn.close()
+
+    assert fresh is None, "порог — сутки: вчерашнее закрытие уже не предупреждение"
+    assert second["created"] is True
+    assert "warning" not in second
 
 
 def test_external_ref_dedups_only_inside_its_own_repo(home: Path, client: TestClient) -> None:

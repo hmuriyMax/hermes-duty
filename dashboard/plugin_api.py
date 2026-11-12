@@ -2585,6 +2585,11 @@ def _mutation(conn: sqlite3.Connection, home: Path, result: dict[str, Any]) -> d
         if not result["created"]:
             body["existing"] = True
             body["reason"] = str(result.get("reason") or "")
+    if result.get("warning"):
+        # Предупреждение создания (серия дел по одному `external_ref`) едет в
+        # ответе рядом с `created`: отказом оно не является, и хоронить его в
+        # `errors[]` значило бы сказать «не создано».
+        body["warning"] = str(result["warning"])
     return body
 
 

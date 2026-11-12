@@ -93,6 +93,15 @@ Python — то есть гейт «дело проходит impl → verify �
    пула нет), а спавна роли больше не будет (попытка закрыта) — и работа
    терялась бы. Восстановленные вопросы попадают в отчёт (`recovered`) и в
    вывод прогона, а не срабатывают молча.
+13. **Две руки на одном деле — нет.** Дело, которое ведёт лид, `bin/duty run`
+   не трогает: до первой попытки он спрашивает журнал тем же предикатом, что
+   супервизор (`lead.state` — pid жив, иначе срок лизинга лида), и на живого
+   лида выходит ожиданием `wait(lead)` с причиной «дело ведёт лид: pid N,
+   лизинг до HH:MM» (код 3). Живой случай RP-14338: в 18:57:59 прогон из сессии
+   поднял `impl-draft#2` при живом лиде (лизинг `59632` до 19:15) и по делу
+   пошли две руки. Обратная сторона уже была: лид, видящий живую попытку
+   драйвера, уступает (`lead._live_runtime`), и эта симметрия — часть одного
+   правила, а не двух.
 
 ## Коды возврата — контракт `bin/duty run`
 
@@ -136,6 +145,7 @@ STAGEFEED_MODULE_NAME = "hermes_duty_stagefeed"
 REAPER_MODULE_NAME = "hermes_duty_reaper"
 ASK_MODULE_NAME = "hermes_duty_ask"
 RELEASE_MODULE_NAME = "hermes_duty_release"
+LEAD_MODULE_NAME = "hermes_duty_lead"
 
 
 def _load(name: str, filename: str) -> Any:
@@ -173,6 +183,10 @@ ask = _load(ASK_MODULE_NAME, "ask.py")
 # (`dashboard/release.py`) грузится после уборки: открытую попытку отпускание не
 # трогает, а предикат «попытка без конца» берёт у `reaper`.
 release = _load(RELEASE_MODULE_NAME, "release.py")
+# Живость лида (`lead.state`) — тот же предикат, которым супервизор решает «лид
+# жив»: прогон на живое дело не заходит (правило 13). Своей копии «жив ли лид» у
+# драйвера быть не должно — она разошлась бы с супервизором на первой же правке.
+lead = _load(LEAD_MODULE_NAME, "lead.py")
 
 # Коды возврата драйвера. Первые три совпадают с кодами остального CLI: дело
 # закрыто / отказ / припарковано. Остальные — только у прогона: ожидание, предел
@@ -665,6 +679,49 @@ def _release_mine(conn: sqlite3.Connection, deal: Any, spec: Any) -> None:
         runner.release(conn, deal=deal, stage=stage.id, pid=pid)
 
 
+def _lead_lease(
+    events: list[dict[str, Any]],
+    *,
+    now: float,
+    probe: Optional[Callable[[Any], Optional[bool]]] = None,
+) -> Optional[dict[str, Any]]:
+    """Живой лид на этом деле — вторая рука, которой прогон уступает.
+
+    Живой случай RP-14338: в 18:57:59 `duty run` из сессии поднял `impl-draft#2`
+    при живом лиде (лизинг `59632` до 19:15), и по одному делу пошли две руки —
+    две правды в журнале и двойная работа. `lead.py` умеет видеть чужую живую
+    попытку драйвера (`_live_runtime`), и симметрии не хватало: драйвер о лиде не
+    спрашивал вовсе.
+
+    Живость решает не своя копия правила, а `lead.state` — тот же предикат,
+    которым супервизор отвечает «лид жив» (pid жив, иначе срок лизинга): иначе
+    прогон и сторож разошлись бы на первой же правке. `probe` — шов для тестов,
+    по умолчанию `journal.pid_alive`.
+
+    `None` — лида на деле нет (или он не поднимался никогда): прогон идёт как
+    раньше.
+    """
+    st = lead.state(events, now=now, probe=probe)
+    if not st.get("live"):
+        return None
+    return st
+
+
+def _lead_refusal(st: dict[str, Any]) -> str:
+    """Строка отказа: кто ведёт дело и до какого часа держит лизинг.
+
+    Время — местное `ЧЧ:ММ`: человеку в терминале нужен час, а не epoch. Срок
+    лизинга берётся из факта `lead_started`; если его нет (старый факт без
+    `lease_expires`), остаётся pid — выдумывать срок нельзя.
+    """
+    pid = st.get("pid")
+    expires = st.get("expires_at")
+    if not expires:
+        return f"дело ведёт лид: pid {pid or '—'}, срок лизинга в журнале не записан"
+    until = time.strftime("%H:%M", time.localtime(int(expires)))
+    return f"дело ведёт лид: pid {pid or '—'}, лизинг до {until}"
+
+
 def run(
     conn: sqlite3.Connection,
     deal: Any,
@@ -682,6 +739,7 @@ def run(
     on_recover: Optional[Callable[[dict[str, Any]], None]] = None,
     on_release: Optional[Callable[[dict[str, Any]], None]] = None,
     on_release_error: Optional[Callable[[dict[str, Any]], None]] = None,
+    probe: Optional[Callable[[Any], Optional[bool]]] = None,
 ) -> dict[str, Any]:
     """Довести дело до терминального исхода: решение → шаг → перечитать журнал.
 
@@ -695,7 +753,9 @@ def run(
     оформление живёт в CLI.
 
     `spawn`, `clock`, `monotonic` — те же швы, что у `runner.step`: тесты
-    подменяют спавн фейком, а живые часы — неподвижными.
+    подменяют спавн фейком, а живые часы — неподвижными. `probe` — шов
+    «жив ли pid» для проверки лида (по умолчанию `journal.pid_alive`): тест
+    не должен зависеть от того, занят ли pid 59632 на этой машине.
     """
     tick = clock or time.time
     measure = monotonic or time.monotonic
@@ -733,6 +793,29 @@ def run(
             transit.wait(transit.WAIT_NEED, f"ждёт родителей: {waiting}"),
             OUTCOME_WAIT,
             f"ждёт закрытия родителей: {waiting}",
+            reaped=reaped,
+            answers=answers,
+            answers_errors=answers_errors,
+            released=len(released),
+            release_errors=release_errors,
+            recovered=recovered,
+        )
+
+    # Живой лид проверяется тоже ДО первой попытки и сразу после гейта родителей:
+    # дело, которое ведёт лид, — не «наше», и вторая рука на нём даёт две правды
+    # в журнале (правило 13). Отказ называет руками: pid и срок лизинга, — а код
+    # выхода остаётся «ждёт» (3): после лида прогон снова законен, и это не
+    # остановка дела.
+    held = _lead_lease(journal.read_events(conn, str(deal["id"])), now=tick(), probe=probe)
+    if held is not None:
+        reason = _lead_refusal(held)
+        return _report(
+            deal,
+            spec,
+            steps,
+            transit.wait(transit.WAIT_LEAD, reason),
+            OUTCOME_WAIT,
+            reason,
             reaped=reaped,
             answers=answers,
             answers_errors=answers_errors,
@@ -1002,6 +1085,7 @@ def drive(
     on_recover: Optional[Callable[[dict[str, Any]], None]] = None,
     on_release: Optional[Callable[[dict[str, Any]], None]] = None,
     on_release_error: Optional[Callable[[dict[str, Any]], None]] = None,
+    probe: Optional[Callable[[Any], Optional[bool]]] = None,
 ) -> dict[str, Any]:
     """Вход `bin/duty run`: открыть store, найти спеку, проверить её и довести дело.
 
@@ -1040,6 +1124,7 @@ def drive(
             on_recover=on_recover,
             on_release=on_release,
             on_release_error=on_release_error,
+            probe=probe,
         )
     finally:
         conn.close()

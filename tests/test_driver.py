@@ -555,6 +555,64 @@ def test_busy_lease_exits_3_instead_of_spinning(tmp_path: Path) -> None:
     assert report["steps"][0]["started"] is False
 
 
+def test_live_lead_stops_the_run_before_the_first_attempt(tmp_path: Path) -> None:
+    """Живой лид на деле: прогон не заходит вовсе и называет pid и срок лизинга.
+
+    Красная проба RP-14338: 18:57:59 `duty run` из сессии поднял `impl-draft#2`
+    при живом лиде (лизинг `59632` до 19:15), и по одному делу пошли две руки.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, CHAIN)
+    deal = make_deal(conn, spec_path=spec.path)
+    expires = NOW + 1020
+    seed(
+        conn,
+        deal,
+        "lead_started",
+        {"pid": 59632, "mode": "start", "lease_expires": expires},
+        key="lead:59632",
+    )
+    fake = Fake()
+
+    report = run(conn, spec, deal, home, fake, probe=lambda pid: pid == 59632)
+
+    assert fake.calls == [], "при живом лиде попытка не поднимается"
+    assert report["outcome"] == "wait"
+    assert report["exit_code"] == 3
+    assert report["decision"]["what"] == transit.WAIT_LEAD
+    assert "дело ведёт лид: pid 59632" in report["note"]
+    assert time.strftime("%H:%M", time.localtime(expires)) in report["note"]
+    assert kinds(conn, deal) == ["created", "lead_started"], "прогон не пишет фактов попытки"
+    assert leases(conn, deal) == []
+
+
+@pytest.mark.parametrize(
+    "payload, probe",
+    [
+        ({"pid": 59632, "mode": "start", "lease_expires": NOW + 1020}, lambda pid: False),
+        ({"pid": 59632, "mode": "start", "lease_expires": NOW - 1}, lambda pid: None),
+    ],
+    ids=["pid dead", "lease expired"],
+)
+def test_run_goes_when_the_lead_is_gone(
+    tmp_path: Path, payload: dict[str, Any], probe: Any
+) -> None:
+    """Мёртвый pid или истёкший лизинг — лида нет, и прогон идёт как раньше."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, CHAIN)
+    deal = make_deal(conn, spec_path=spec.path)
+    seed(conn, deal, "lead_started", payload, key="lead:59632")
+    fake = Fake()
+
+    report = run(conn, spec, deal, home, fake, probe=probe)
+
+    assert [call["stage"] for call in fake.calls] == ["impl", "verify", "review"]
+    assert report["outcome"] == "done"
+    assert "дело ведёт лид" not in report["note"]
+
+
 def test_park_exits_2_and_deal_stays_wait_human(tmp_path: Path) -> None:
     """Припаркованный этап (вопрос закрыт сроком): код 2, дело остаётся `wait_human`."""
     home = make_home(tmp_path)

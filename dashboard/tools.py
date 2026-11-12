@@ -461,8 +461,7 @@ def plan(
     parsed, issues = spec_module.parse_plan(
         stages,
         charter=getattr(spec, "charter", None) or spec_module.Charter(),
-        base_ids=[stage.id for stage in graph],
-        base_needs={stage.id: stage.needs for stage in graph},
+        base_stages={stage.id: stage for stage in graph},
         started_ids=transit.started_stages(events),
         repo=getattr(spec, "repo", None),
     )
@@ -1318,9 +1317,10 @@ def _stage_cancelled(events: Iterable[Any], stage_id: str) -> Optional[str]:
     решении и оставить этап отменённым на экране — значит разойтись в ответе на
     вопрос «идёт ли этап», а лид читает именно экран.
 
-    Вернуть этап в работу можно только под новым id: единственная запись ревизии
-    под занятым id — перестановка (`needs`/`parallel_with`), и её одного мало,
-    чтобы «лид отказался» превратилось в «лид пока отказался».
+    Вернуть этап в работу можно только под новым id: ревизия под занятым id
+    правит неначатый этап (`needs`/`parallel_with`, `cmd`, `budget`, …), но
+    отмену не снимает — отменённый этап остаётся `failed`, и «лид отказался»
+    не превращается в «лид пока отказался».
     """
     reason: Optional[str] = None
     for event in events or ():
@@ -1849,7 +1849,10 @@ PLAN_SCHEMA = {
                 "items": {"type": "object"},
                 "description": (
                     "этапы плана: {id, role, kind, workspace, needs, evidence, retry, budget}; "
-                    "этап, который что-то производит, обязан объявить evidence {cmd, must}"
+                    "этап, который что-то производит, обязан объявить evidence {cmd, must}. "
+                    "id, который уже есть в графе, — не новый этап: needs/parallel_with "
+                    "переставляют порядок, а cmd/budget/evidence/retry/kind/role/workspace "
+                    "правят этап, который ещё не начинался"
                 ),
             },
             "reason": {"type": "string", "description": "зачем такой план — слова лида, попадают в факт"},

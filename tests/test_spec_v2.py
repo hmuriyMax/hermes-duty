@@ -312,8 +312,8 @@ def test_single_stage_is_refused_like_a_batch(stage: dict[str, Any], rule: str) 
     """
     charter = spec_module.Charter(allowed_roles=("implementer",), allowed_kinds=("agent",))
 
-    single, single_issues = spec_module.parse_plan(stage, charter=charter, base_ids=())
-    batch, batch_issues = spec_module.parse_plan([stage], charter=charter, base_ids=())
+    single, single_issues = spec_module.parse_plan(stage, charter=charter, base_stages={})
+    batch, batch_issues = spec_module.parse_plan([stage], charter=charter, base_stages={})
 
     assert [issue.rule for issue in single_issues] == [issue.rule for issue in batch_issues]
     assert [item.id for item in single] == [item.id for item in batch] == [stage["id"]]
@@ -322,7 +322,7 @@ def test_single_stage_is_refused_like_a_batch(stage: dict[str, Any], rule: str) 
 
 def test_single_stage_that_is_not_a_mapping_is_refused() -> None:
     """Не словарь — не этап: отказ `plan.stages`, а не выдуманная запись."""
-    stages, found = spec_module.parse_plan("impl", charter=spec_module.Charter(), base_ids=())
+    stages, found = spec_module.parse_plan("impl", charter=spec_module.Charter(), base_stages={})
 
     assert stages == ()
     assert rules(found) == {"plan.stages"}

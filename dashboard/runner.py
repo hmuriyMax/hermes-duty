@@ -1427,7 +1427,6 @@ def report_plan(
             "без плана следующие этапы не знают, что делать"
         )
     graph = transit.graph(spec, events)
-    base_ids = [item.id for item in graph]
     proposals = [
         journal.payload_of(event)
         for event in events
@@ -1440,8 +1439,7 @@ def report_plan(
     stages, issues = spec_module.parse_plan(
         raw_stages,
         charter=charter,
-        base_ids=base_ids,
-        base_needs={item.id: item.needs for item in graph},
+        base_stages={item.id: item for item in graph},
         started_ids=transit.started_stages(events),
         repo=getattr(spec, "repo", None),
     )
@@ -1537,12 +1535,13 @@ def plan_payload(spec: Any, events: Iterable[Any]) -> dict[str, Any]:
     """Что этап плана знает о деле: существующий граф и остаток бюджета.
 
     План рисуется поверх графа, а не с нуля: `base_ids` — id, на которые можно
-    ссылаться в `needs` (переписывать их нельзя), `remaining` — расход и
-    потолок дела (если потолка нет, поля просто нет: «0 из 0» было бы выдумкой).
+    ссылаться в `needs`, `remaining` — расход и потолок дела (если потолка нет,
+    поля просто нет: «0 из 0» было бы выдумкой).
 
     `started` у этапа графа — «у него была попытка»: такой этап план не
-    переставляет (`spec.parse_plan`, отказ `plan.reorder`), и лид должен видеть
-    это из контракта, а не из отказа. `parallel_with` в графе — объявленная
+    переставляет и не правит (`spec.parse_plan`, отказы `plan.reorder`/
+    `plan.edit`), и лид должен видеть это из контракта, а не из отказа. У
+    неначатого этапа правка разрешена. `parallel_with` в графе — объявленная
     параллель, чтобы план её видел и продолжал, а не изобретал заново.
     """
     events = list(events or ())
@@ -3989,16 +3988,15 @@ def _append_plan_facts(conn: sqlite3.Connection, facts: list[dict[str, Any]]) ->
 def _parsed_plan(spec: Any, raw_stages: list[Any], events: Iterable[Any]) -> tuple[Any, ...]:
     """Этапы предложения тем же разбором, что у движка: порог считается по ним.
 
-    `base_needs`/`started_ids` — те же, что у приёма предложения: перестановка
-    уже начатого этапа отказывает до гейта, а не только после него.
+    `base_stages`/`started_ids` — те же, что у приёма предложения: перестановка и
+    правка уже начатого этапа отказывают до гейта, а не только после него.
     """
     charter = getattr(spec, "charter", None) or spec_module.Charter()
     graph = transit.graph(spec, events)
     stages, _issues = spec_module.parse_plan(
         raw_stages,
         charter=charter,
-        base_ids=[stage.id for stage in graph],
-        base_needs={stage.id: stage.needs for stage in graph},
+        base_stages={stage.id: stage for stage in graph},
         started_ids=transit.started_stages(events),
         repo=getattr(spec, "repo", None),
     )

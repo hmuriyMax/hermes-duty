@@ -1125,11 +1125,13 @@ def graph(spec: Any, events: Iterable[Any]) -> tuple[Any, ...]:
     валидатор отверг бы, не становится графом и при чтении (мусорный журнал не
     роняет дело, правило 8 — граф остаётся seed-ом).
 
-    Ревизия несёт два вида записи: **добавление** (новый этап) и **перестановку**
-    (этап, который уже есть в графе, с новыми `needs`/`parallel_with`). Второе
-    проверяется без `started_ids`: «этап уже начат» — отказ момента предложения
-    (`runner.report_plan` знает журнал), а принятая перестановка остаётся графом и
-    после того, как её этап начали, — иначе граф сжался бы задним числом.
+    Ревизия несёт два вида записи: **добавление** (новый этап) и запись про этап,
+    который уже есть в графе — **перестановку** (`needs`/`parallel_with`) или
+    **правку** неначатого этапа (`cmd`, `budget`, `evidence`, …; `spec.parse_plan`).
+    Обе проверяются без `started_ids`: «этап уже начинался» — отказ момента
+    предложения (`runner.report_plan` знает журнал), а принятая перестановка или
+    правка остаётся графом и после того, как её этап начали, — иначе граф сжался
+    бы задним числом.
     """
     seed = tuple(getattr(spec, "stages", ()) or ())
     proposals: dict[int, Any] = {}
@@ -1158,8 +1160,7 @@ def graph(spec: Any, events: Iterable[Any]) -> tuple[Any, ...]:
     stages, issues = spec_module.parse_plan(
         payload.get("stages"),
         charter=charter,
-        base_ids=[stage.id for stage in seed],
-        base_needs={stage.id: stage.needs for stage in seed},
+        base_stages={stage.id: stage for stage in seed},
         repo=getattr(spec, "repo", None),
     )
     if issues:
@@ -1169,11 +1170,14 @@ def graph(spec: Any, events: Iterable[Any]) -> tuple[Any, ...]:
 
 
 def _relinked(seed: tuple[Any, ...], proposed: tuple[Any, ...], plan_stage: str) -> tuple[Any, ...]:
-    """Seed плюс план: перестановки применены, этапы seed ждут «последние» из плана.
+    """Seed плюс план: изменения применены, этапы seed ждут «последние» из плана.
 
-    Запись предложения с `id` из seed — перестановка, а не новый этап: у неё
-    берутся только `needs`/`parallel_with`, остальные поля этапа остаются
-    спекой (`spec.parse_plan`, `REORDER_KEYS`).
+    Запись предложения с `id` из seed — перестановка или правка, и `parse_plan`
+    уже свёл её с полями этапа (`base_stages`): порядок берётся из записи, а
+    названные правкой поля — её. Поэтому здесь запись встаёт на место этапа
+    целиком, а не пересобирается из seed: иначе правка `cmd`/`budget` у этапа,
+    который ещё не начинался, потерялась бы при первом же перечитывании графа
+    (RP-14338 — лид, который не смог поправить свой же `check`).
 
     Без этого рёбра seed, ждавшие план, стали бы готовы сразу после принятия
     плана и закрыли бы дело до работы, которую план объявил
@@ -1187,10 +1191,7 @@ def _relinked(seed: tuple[Any, ...], proposed: tuple[Any, ...], plan_stage: str)
     ordered: list[Any] = []
     for stage in seed:
         moved = moving.get(stage.id)
-        if moved is None:
-            ordered.append(stage)
-            continue
-        ordered.append(dataclasses.replace(stage, needs=moved.needs, parallel_with=moved.parallel_with))
+        ordered.append(stage if moved is None else moved)
     if not added:
         return tuple(ordered)
     needed = {need for stage in added for need in stage.needs}

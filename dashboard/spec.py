@@ -86,10 +86,19 @@ CHARTER_KEYS = (
 )
 PLAN_GATE_KEYS = ("min_stages", "budget_share")
 PUBLISH_KEYS = ("human_gate", "reviewer_role")
-# Что предложение плана вправе сказать про этап, который **уже есть** в графе:
-# только порядок (`needs`) и параллель (`parallel_with`). Остальные поля были бы
-# переписыванием этапа, а этап объявляется спекой (`parse_plan`, правило `plan.id`).
+# Что предложение плана вправе сказать про этап, который **уже есть** в графе.
+# Перестановка — это порядок: `needs` и `parallel_with`, и ничего больше. Остальные
+# поля были бы переписыванием этапа, а этап объявляется спекой (`parse_plan`,
+# правило `plan.id`).
 REORDER_KEYS = ("id", "needs", "parallel_with")
+# Правка — это этап, который **ещё не начинался**: у него лид вправе поменять то,
+# что объявил бы заново, если бы писал этап с нуля (сузить команду, добавить
+# бюджет, поправить доказательства). У начатого этапа те же поля — уже история
+# попытки, и переписать её вправе приговор ревью, а не план (`plan.edit`).
+# «Не начинался» — факт журнала, а не слово лида: по этапу нет `attempt_started`
+# (`transit.started_stages`), и отвечает на это вызывающий, у которого есть журнал.
+EDIT_KEYS = ("cmd", "budget", "evidence", "retry", "kind", "role", "workspace")
+STAGE_EDIT_KEYS = REORDER_KEYS + EDIT_KEYS
 # Цена предложения (`docs/ENGINE-1.0.md`, раздел 5): план называет свою стоимость в
 # токенах сам, а не выводится из этапных бюджетов. Ключ один — «токены»; лимиты по
 # этапам как политика в 0.1.0 не объявляются.
@@ -2584,8 +2593,7 @@ def parse_plan(
     raw_stages: Any,
     *,
     charter: Charter,
-    base_ids: Iterable[str],
-    base_needs: Optional[Mapping[str, Iterable[str]]] = None,
+    base_stages: Optional[Mapping[str, Any]] = None,
     started_ids: Iterable[str] = (),
     repo: Optional[str] = None,
     path: Optional[Path] = None,
@@ -2609,20 +2617,30 @@ def parse_plan(
       замкнутый перестановкой через уже существующие этапы, тоже отказ;
     - `len(seed ∪ план) <= charter.max_stages`.
 
-    **Перестановка.** Запись с `id`, который уже есть в графе, — не новый этап, а
-    перестановка: у неё читаются только `needs`/`parallel_with` (`REORDER_KEYS`), а
-    любое другое поле — `plan.id` («план не переписывает этап»). Переставлять можно
-    только этап, который **не начинали**: `started_ids` — id с фактом попытки, и
-    такая запись получает отказ `plan.reorder` («этап уже начат»). Ход, ради
-    которого эта проверка существует, — вернуть в работу то, что уже сделано, в
-    обход `verdict.changes`.
+    **Перестановка и правка.** Запись с `id`, который уже есть в графе, граф не
+    растит: это либо перестановка, либо правка этапа, который ещё не начинался.
 
-    `base_ids` — id уже существующего графа (seed плюс принятые ревизии): на них
-    плану ссылаться можно, а `base_needs` (их `needs`) нужен, чтобы поймать цикл,
-    который перестановка замыкает через существующие этапы. `started_ids` читает
-    вызывающий, у которого есть журнал (`runner.report_plan`): сама проверка
-    структуры графа от попыток не зависит, и принятый план, чей этап потом начали,
-    остаётся графом.
+    - Перестановка называет `needs`/`parallel_with` (`REORDER_KEYS`): граф получает
+      новые рёбра этапа, а остальные поля остаются спекой.
+    - Правка неначатого этапа называет ещё `cmd`, `budget`, `evidence`, `retry`,
+      `kind`, `role`, `workspace` (`EDIT_KEYS`): лид, который ошибся в своём же
+      этапе, правит его, а не заводит второй рядом (RP-14338: три ревизии
+      отклонены, обошёл этапом `check2`, мёртвый `check` остался в графе). Запись
+      сводится с полями этапа графа (`base_stages`), а любое другое поле —
+      `plan.id` («план не переписывает этап»).
+
+    Переставлять и править можно только этап, который **не начинался**:
+    `started_ids` — id с фактом попытки, и такая запись получает отказ
+    `plan.reorder` (перестановка) или `plan.edit` (правка): «этап уже начинался».
+    Ход, ради которого эта проверка существует, — вернуть в работу то, что уже
+    сделано, в обход `verdict.changes`.
+
+    `base_stages` — этапы уже существующего графа (seed плюс принятые ревизии): на
+    них плану ссылаться можно, из них берутся `needs` для проверки цикла, который
+    замыкает перестановка, ими дополняется правка, и по ним видно, что правка
+    действительно изменила. `started_ids` читает вызывающий, у которого есть
+    журнал (`runner.report_plan`): сама проверка структуры графа от попыток не
+    зависит, и принятый план, чей этап потом начали, остаётся графом.
 
     **Один этап.** `raw_stages` вправе быть одной записью, а не списком: в 2.0
     этап проверяется там, где его запускают (`duty_start`), и требований к нему те
@@ -2640,14 +2658,16 @@ def parse_plan(
     # Строк в предложении нет: `lines` пуст, и `_parse_stage` берёт номер 1 —
     # отказ называет этап по `id`, а не по строке отчёта.
     lines: dict[tuple[Any, ...], int] = {}
-    base = {str(stage_id) for stage_id in base_ids}
+    base: dict[str, Stage] = {str(stage_id): stage for stage_id, stage in (base_stages or {}).items()}
     started = {str(stage_id) for stage_id in started_ids}
     stages: list[Stage] = []
     for index, raw in enumerate(raw_stages):
         # Какие поля назвала запись — видно только у сырого словаря, а разбирать
         # перестановку иначе нечем: `_parse_stage` заполняет умолчания.
         declared = _mapping(raw) or {}
-        moving = isinstance(declared.get("id"), str) and declared.get("id") in base
+        declared_id = declared.get("id")
+        existing = base.get(declared_id) if isinstance(declared_id, str) else None
+        moving = existing is not None
         try:
             stage = _parse_stage(raw, index, where, lines, issues)
         except SpecError as exc:
@@ -2655,31 +2675,65 @@ def parse_plan(
             # уезжает в `plan_rejected.issues[]`, и лид видит, что не так.
             issues.append(exc.issue())
             continue
-        extra = sorted(set(declared) - set(REORDER_KEYS))
-        if moving and extra:
+        beyond = sorted(set(declared) - set(STAGE_EDIT_KEYS))
+        if moving and beyond:
             issues.append(
                 Issue(
                     where,
                     stage.line,
                     "plan.id",
-                    f"id {stage.id!r} уже есть в графе: перестановка называет только "
-                    f"{'/'.join(REORDER_KEYS[1:])}, а поля {', '.join(extra)} переписывают этап",
+                    f"id {stage.id!r} уже есть в графе: план не переписывает этап — перестановка "
+                    f"называет {'/'.join(REORDER_KEYS[1:])}, правка неначатого этапа ещё "
+                    f"{', '.join(EDIT_KEYS)}, а поля {', '.join(beyond)} переписывают этап",
                 )
             )
             continue
         if moving and stage.id in started:
-            issues.append(
-                Issue(
-                    where,
-                    stage.line,
-                    "plan.reorder",
-                    f"этап {stage.id!r} уже начат: переставлять можно только этап, у которого "
-                    "нет попытки — сделанное возвращает приговор ревью, а не план",
+            if set(declared) - set(REORDER_KEYS):
+                issues.append(
+                    Issue(
+                        where,
+                        stage.line,
+                        "plan.edit",
+                        f"этап {stage.id!r} уже начинался: перестановка называет только "
+                        f"{'/'.join(REORDER_KEYS[1:])} — правку начатого этапа возвращает приговор "
+                        "ревью, а не план",
+                    )
                 )
-            )
+            else:
+                issues.append(
+                    Issue(
+                        where,
+                        stage.line,
+                        "plan.reorder",
+                        f"этап {stage.id!r} уже начат: переставлять можно только этап, у которого "
+                        "нет попытки — сделанное возвращает приговор ревью, а не план",
+                    )
+                )
             continue
-        stages.append(stage if moving else _with_repo_workspace(_with_default_ask(stage), repo))
-    known = base | {stage.id for stage in stages}
+        if existing is None:
+            stages.append(_with_repo_workspace(_with_default_ask(stage), repo))
+            continue
+        # Правка сводится с этапом графа: названные поля берутся из записи,
+        # остальные остаются как были. `needs`/`parallel_with` — всегда из записи:
+        # перестановка называет порядок целиком, а не добавкой к нему.
+        changes = {name: getattr(stage, name) for name in EDIT_KEYS if name in declared}
+        if "workspace" in changes:
+            changes["workspace_default"] = stage.workspace_default
+        stages.append(replace(existing, needs=stage.needs, parallel_with=stage.parallel_with, **changes))
+    # Какие поля этапа судятся как новые: у добавленного — все, у правки — только
+    # те, что она действительно изменила. Иначе правка бюджета у seed-этапа
+    # отказывала бы за то, чего план не трогал: seed правилам «план добавляет» не
+    # подчиняется, этапы файла объявляет человек (`check_seed`).
+    new_fields = {
+        stage.id: (
+            set(EDIT_KEYS)
+            if stage.id not in base
+            else {name for name in EDIT_KEYS if getattr(stage, name) != getattr(base[stage.id], name)}
+        )
+        for stage in stages
+    }
+    known = set(base) | {stage.id for stage in stages}
     # Ссылки проверяются у всех записей, включая перестановки: `needs` и
     # `parallel_with` — ровно то, чем перестановка и распоряжается.
     for stage in stages:
@@ -2712,9 +2766,27 @@ def parse_plan(
             issues.append(Issue(where, stage.line, "plan.id", f"id {stage.id!r} повторяется в предложении"))
             continue
         seen.add(stage.id)
-        if moving:
-            continue  # перестановка: роль, вид и evidence — не её дело
-        if stage.kind not in charter.allowed_kinds:
+        fresh = new_fields[stage.id]
+        if moving and not fresh:
+            continue  # чистая перестановка: роль, вид и evidence — не её дело
+        # «План добавляет» судится по новым значениям: у правки это только поля,
+        # которые она изменила, — restate того же значения отказом не считается.
+        if "kind" in fresh and stage.kind not in charter.allowed_kinds:
+            issues.append(
+                Issue(
+                    where,
+                    stage.line,
+                    "charter.allowed_kinds",
+                    f"этап {stage.id!r}: вид {stage.kind!r} планом не добавляется — "
+                    f"хартия разрешает {', '.join(charter.allowed_kinds) or 'ничего'}",
+                )
+            )
+        if (
+            "role" in fresh
+            and stage.kind == DEFAULT_STAGE_KIND
+            and charter.allowed_roles
+            and stage.role not in charter.allowed_roles
+        ):
             issues.append(
                 Issue(
                     where,
@@ -2734,7 +2806,7 @@ def parse_plan(
                     f"хартия разрешает {', '.join(charter.allowed_roles)}",
                 )
             )
-        if stage.role in PUBLISHING_ROLES:
+        if "role" in fresh and stage.role in PUBLISHING_ROLES:
             issues.append(
                 Issue(
                     where,
@@ -2744,7 +2816,7 @@ def parse_plan(
                     "в seed-спеке и требует ревью в предках — планом она не добавляется",
                 )
             )
-        if stage.role in COORDINATOR_ROLES:
+        if "role" in fresh and stage.role in COORDINATOR_ROLES:
             # У добавленного планом этапа `needs` есть всегда, а `close` в графе
             # уже занят (`plan.id`), — значит координаторская роль здесь означает
             # этап-исполнитель, который координатор делает сам (кейс d_48e01a0e:
@@ -2802,7 +2874,7 @@ def parse_plan(
         # не работа в дереве, у гейта работы нет вовсе, а команда доказывает себя
         # кодом возврата `must`. Роли без терминала (ресерчер, ревьюер) не
         # производят: их работа — отчёт, и требовать с них команду нельзя.
-        if stage.evidence and stage.role in NO_SHELL_ROLES:
+        if (fresh & {"evidence", "role"}) and stage.evidence and stage.role in NO_SHELL_ROLES:
             issues.append(
                 Issue(
                     where,
@@ -2819,7 +2891,9 @@ def parse_plan(
             and stage.role not in PUBLISHING_ROLES
             and stage.role not in EVIDENCE_FREE_ROLES
         )
-        if produces and not any(evidence.cmd.strip() for evidence in stage.evidence):
+        if produces and (fresh & {"kind", "role", "evidence"}) and not any(
+            evidence.cmd.strip() for evidence in stage.evidence
+        ):
             issues.append(
                 Issue(
                     where,
@@ -2834,7 +2908,8 @@ def parse_plan(
     # добавленным. Иначе `plan.needs: [close]` поверх seed `close.needs: [plan]`
     # принимался бы и вешал дело в ожидании, которого никто не снимет.
     merged: dict[str, tuple[str, ...]] = {
-        str(stage_id): tuple(str(need) for need in needs) for stage_id, needs in (base_needs or {}).items()
+        stage_id: tuple(str(need) for need in getattr(stage, "needs", ()) or ())
+        for stage_id, stage in base.items()
     }
     merged.update({stage.id: stage.needs for stage in stages})
     trail: list[str] = []
@@ -2935,7 +3010,6 @@ def check_seed(spec: Spec) -> list[Issue]:
     _, issues = parse_plan(
         list(spec.raw_stages),
         charter=spec.charter,
-        base_ids=(),
         repo=spec.repo,
         path=spec.path,
     )

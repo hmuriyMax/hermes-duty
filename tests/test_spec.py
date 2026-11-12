@@ -1901,13 +1901,18 @@ def test_charter_plan_gate_thresholds(tmp_path: Path, charter: str):
 
 # ------------------------------------------------------------------- план дела
 
-# Граф-заготовка: seed из спеки плюс принятые раньше этапы.
-BASE_IDS = ("plan", "close")
+# Граф-заготовка: seed из спеки плюс принятые раньше этапы. Запись с таким `id`
+# — не новый этап, а перестановка или правка неначатого этапа (`parse_plan`).
+BASE_STAGES = {
+    "plan": spec_module.Stage(id="plan", role="lead", workspace="none"),
+    "feed": spec_module.Stage(id="feed", role="implementer", needs=("plan",), workspace="worktree"),
+    "close": spec_module.Stage(id="close", role="coordinator", needs=("feed",)),
+}
 
 
 def plan(raw: list, charter: Any = None) -> tuple:
-    """`spec.parse_plan` с хартией по умолчанию и seed-графом `BASE_IDS`."""
-    return spec_module.parse_plan(raw, charter=charter or spec_module.Charter(), base_ids=BASE_IDS)
+    """`spec.parse_plan` с хартией по умолчанию и seed-графом `BASE_STAGES`."""
+    return spec_module.parse_plan(raw, charter=charter or spec_module.Charter(), base_stages=BASE_STAGES)
 
 
 def plan_rules(raw: list, charter: Any = None) -> set[str]:
@@ -1944,7 +1949,7 @@ def test_parse_plan_gives_code_stage_a_tree_when_deal_has_repo():
     stages, found = spec_module.parse_plan(
         [{"id": "impl", "role": "implementer", "evidence": [{"cmd": "go build ./...", "must": 0}]}],
         charter=spec_module.Charter(),
-        base_ids=BASE_IDS,
+        base_stages=BASE_STAGES,
         repo="/tmp/deal-repo",
     )
     assert found == []
@@ -1954,7 +1959,7 @@ def test_parse_plan_gives_code_stage_a_tree_when_deal_has_repo():
         [{"id": "impl", "role": "implementer", "workspace": "none", "needs": ["plan"],
           "evidence": [{"cmd": "go build ./...", "must": 0}]}],
         charter=spec_module.Charter(),
-        base_ids=BASE_IDS,
+        base_stages=BASE_STAGES,
         repo="/tmp/deal-repo",
     )
     assert explicit[0].workspace == "none", "решение лида не переписывается"
@@ -1990,10 +1995,15 @@ def test_parse_plan_needs_may_point_at_the_seed():
 
 
 def test_parse_plan_does_not_redefine_existing_id():
-    """`id` из seed планом не переопределяется: иначе публикация правила бы себя."""
-    _, found = plan([{"id": "close", "role": "researcher", "workspace": "none",
-                      "evidence": [{"cmd": "ls", "must": 0}]}])
-    assert "plan.id" in {issue.rule for issue in found}
+    """`id` из seed планом не переопределяется: поля вне `STAGE_EDIT_KEYS` — отказ.
+
+    Роль, вид и evidence у неначатого этапа править можно (`EDIT_KEYS`), а
+    `verdict`, `ask`, `must` объявляет спека: приговор и вопрос — не то, что
+    лид переписывает планом.
+    """
+    for extra in ({"verdict": {"approve": "next", "changes": "feed"}}, {"must": 7}, {"ask": {"q": "?"}}):
+        _, found = plan([{"id": "close", "needs": [], **extra}])
+        assert "plan.id" in {issue.rule for issue in found}, extra
 
 
 def test_parse_plan_duplicate_id_inside_proposal():
@@ -2180,9 +2190,86 @@ def test_parse_plan_parallel_with_is_declared_by_the_plan():
 
 
 def test_parse_plan_reorder_names_only_needs_and_parallel_with():
-    """Перестановка этапа из графа не переписывает его: роль в ней — отказ."""
-    _, found = plan([{"id": "close", "role": "researcher", "needs": []}])
+    """Перестановка этапа из графа не переписывает его: `must` в ней — отказ.
+
+    Порядок (`needs`/`parallel_with`) — единственное, что перестановка вправе
+    назвать. Поля, которых у правки нет (`must`, `artifacts`, `ask`, `verdict`),
+    этап переписывают: их объявляет спека.
+    """
+    _, found = plan([{"id": "close", "must": 7, "needs": []}])
     assert "plan.id" in {issue.rule for issue in found}
+
+
+def test_parse_plan_edit_of_a_not_started_stage_changes_its_fields():
+    """Правка неначатого этапа меняет его поля, а не заводит второй рядом.
+
+    RP-14338: лид хотел сузить команду и добавить бюджет своему же `check`,
+    получал `plan.id` на каждую ревизию, обошёл этапом `check2`, а мёртвый
+    `check` остался в графе.
+    """
+    stages, found = spec_module.parse_plan(
+        [{"id": "feed", "cmd": "go vet ./...", "budget": {"tokens": 500},
+          "evidence": [{"cmd": "go build ./...", "must": 0}], "needs": ["plan"]}],
+        charter=spec_module.Charter(),
+        base_stages=BASE_STAGES,
+    )
+    assert found == []
+    assert [stage.id for stage in stages] == ["feed"]
+    edited = stages[0]
+    assert (edited.cmd, edited.budget.tokens, edited.needs) == ("go vet ./...", 500, ("plan",))
+    assert [item.cmd for item in edited.evidence] == ["go build ./..."]
+    assert edited.role == "implementer", "поля, которых правка не назвала, остаются спекой"
+
+
+def test_parse_plan_edit_of_a_started_stage_names_the_stage():
+    """Начатый этап править нельзя: отказ называет этап и факт, а не только правило."""
+    stages, found = spec_module.parse_plan(
+        [{"id": "feed", "budget": {"tokens": 500}}],
+        charter=spec_module.Charter(),
+        base_stages=BASE_STAGES,
+        started_ids=("feed",),
+    )
+    assert stages == ()
+    assert [issue.rule for issue in found] == ["plan.edit"]
+    assert "'feed'" in found[0].message and "уже начинался" in found[0].message
+
+
+def test_parse_plan_edit_of_a_started_stage_still_moves():
+    """`needs`/`parallel_with` работают и у начатого этапа: это перестановка."""
+    stages, found = spec_module.parse_plan(
+        [{"id": "feed", "needs": []}],
+        charter=spec_module.Charter(),
+        base_stages=BASE_STAGES,
+        started_ids=("feed",),
+    )
+    assert stages == ()
+    assert "plan.reorder" in {issue.rule for issue in found}
+
+
+def test_parse_plan_edit_cannot_invite_a_role_the_charter_forbids():
+    """Расширение не даёт лиду права позвать роль, которой хартия не разрешает."""
+    charter = spec_module.Charter(allowed_roles=("implementer",))
+    _, found = spec_module.parse_plan(
+        [{"id": "close", "role": "reviewer"}],
+        charter=charter,
+        base_stages=BASE_STAGES,
+    )
+    assert "charter.allowed_roles" in {issue.rule for issue in found}
+
+
+def test_parse_plan_restating_the_same_value_is_not_an_edit():
+    """Повтор того же значения отказом не считается: судятся только новые значения.
+
+    seed-этап правилам «план добавляет» не подчиняется (его объявляет человек),
+    поэтому пересказ роли координатора не должен упираться в `coordinator.scope`.
+    """
+    stages, found = spec_module.parse_plan(
+        [{"id": "close", "role": "coordinator", "needs": ["feed"]}],
+        charter=spec_module.Charter(allowed_roles=("implementer",)),
+        base_stages=BASE_STAGES,
+    )
+    assert found == []
+    assert stages[0].role == "coordinator"
 
 
 def test_parse_plan_reorder_of_a_started_stage_is_refused():
@@ -2190,8 +2277,7 @@ def test_parse_plan_reorder_of_a_started_stage_is_refused():
     stages, found = spec_module.parse_plan(
         [{"id": "close", "needs": []}],
         charter=spec_module.Charter(),
-        base_ids=BASE_IDS,
-        base_needs={"plan": (), "close": ("plan",)},
+        base_stages=BASE_STAGES,
         started_ids=("close",),
     )
     assert stages == ()

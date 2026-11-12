@@ -1,19 +1,22 @@
-"""План переставляет этапы, объявляет параллель и называет свою цену (1.0).
+"""План переставляет этапы, правит неначатые, объявляет параллель и называет цену (1.0).
 
 Проверяется контракт `docs/ENGINE-1.0.md` (разделы 4, 5 и 8) там, где его видно
 без модели:
 
 1. перестановка **неначатого** этапа применяется: принятая ревизия меняет `needs`
    этапа графа, а не добавляет его копию, и решение идёт по новому порядку;
-2. перестановка этапа, у которого была попытка, — `plan_rejected` с отказом
-   «этап уже начат», а граф остаётся прежним (сделанное возвращает приговор);
-3. `parallel_with` из предложения доезжает до графа, и сразу готовые этапы
+2. правка **неначатого** этапа применяется так же: `cmd`, `budget` и `evidence`
+   лид меняет у своего же этапа, а не заводит второй рядом (RP-14338);
+3. перестановка этапа, у которого была попытка, — `plan_rejected` с отказом
+   «этап уже начат», а правка такого этапа — отказ `plan.edit` с его именем;
+   граф в обоих случаях остаётся прежним (сделанное возвращает приговор);
+4. `parallel_with` из предложения доезжает до графа, и сразу готовые этапы
    запускаются одной пачкой — параллель объявлена, а не угадана;
-4. `cost.tokens` двигает срабатывание `plan_gate`: цена плана важнее суммы
+5. `cost.tokens` двигает срабатывание `plan_gate`: цена плана важнее суммы
    этапных бюджетов, а без цены порог считается по ним (фолбэк);
-5. цикл в `needs`, замкнутый перестановкой через существующие этапы, — отказ
+6. цикл в `needs`, замкнутый перестановкой через существующие этапы, — отказ
    `plan.cycle`, а не граф, по которому дело не пойдёт никогда;
-6. принятая перестановка остаётся графом и после того, как её этап начали:
+7. принятая перестановка остаётся графом и после того, как её этап начали:
    граф не сжимается задним числом.
 
 Часы нигде не читаются — `now` передаётся аргументом, как и в остальных слоях.
@@ -192,7 +195,63 @@ def test_reorder_survives_the_stage_starting(tmp_path: Path) -> None:
     assert needs_of(transit.graph(spec, journal_events))["check"] == ("plan",)
 
 
-# ------------------------------------------------- 2. перестановка начатого
+# ------------------------------------------------- 2. правка неначатого этапа
+
+
+def test_edit_of_a_not_started_stage_reaches_the_graph(tmp_path: Path) -> None:
+    """`check` ещё не начинали: правка команды, бюджета и доказательств принята.
+
+    RP-14338: лид хотел сузить команду и добавить бюджет своему же `check`,
+    получал `plan.id` на каждую ревизию, обошёл этапом `check2`, а мёртвый
+    `check` остался в графе. Здесь граф (а не только разбор) несёт новые поля, а
+    этап остаётся один.
+    """
+    spec = write_spec(tmp_path, SEED)
+    facts, why = report(spec, [{
+        "id": "check",
+        "cmd": "go vet ./...",
+        "budget": {"tokens": 900},
+        "evidence": [{"cmd": "go list ./...", "must": 0}],
+        "needs": ["plan"],
+    }])
+    assert why == ""
+    assert [fact["kind"] for fact in facts] == ["plan_proposed", "plan_accepted"]
+
+    graph = {stage.id: stage for stage in transit.graph(spec, facts)}
+    assert tuple(graph) == ("plan", "impl", "check")
+    assert graph["check"].cmd == "go vet ./..."
+    assert graph["check"].budget.tokens == 900
+    assert [item.cmd for item in graph["check"].evidence] == ["go list ./..."]
+    assert graph["check"].needs == ("plan",)
+    assert graph["check"].role == "implementer", "поля, которых правка не назвала, — из спеки"
+
+
+def test_edit_of_a_started_stage_is_refused_and_names_the_stage(tmp_path: Path) -> None:
+    """`impl` начинали — правка отклонена, в отказе имя этапа и факт, не только правило."""
+    spec = write_spec(tmp_path, SEED)
+    facts, why = report(
+        spec, [{"id": "impl", "budget": {"tokens": 900}}], journal_events=events(started("impl"))
+    )
+
+    assert why == ""
+    assert [fact["kind"] for fact in facts] == ["plan_proposed", "plan_rejected"]
+    issues = facts[1]["payload"]["issues"]
+    assert any("plan.edit" in issue and "'impl'" in issue and "уже начинался" in issue for issue in issues), issues
+    assert needs_of(transit.graph(spec, facts)) == {"plan": (), "impl": ("plan",), "check": ("impl",)}
+
+
+def test_needs_of_a_started_stage_are_still_reordered(tmp_path: Path) -> None:
+    """`needs`/`parallel_with` — не правка: перестановка начатого этапа отказывает по-своему."""
+    spec = write_spec(tmp_path, SEED)
+    moved, _why = report(spec, [{"id": "check", "needs": ["plan"]}], journal_events=events(started("impl")))
+    assert [fact["kind"] for fact in moved] == ["plan_proposed", "plan_accepted"]
+    assert needs_of(transit.graph(spec, moved))["check"] == ("plan",)
+
+    refused, _why = report(spec, [{"id": "impl", "needs": []}], journal_events=events(started("impl")))
+    assert any("plan.reorder" in issue for issue in refused[1]["payload"]["issues"])
+
+
+# ------------------------------------------------- 3. перестановка начатого
 
 
 def test_reorder_of_a_started_stage_is_refused(tmp_path: Path) -> None:
@@ -212,15 +271,15 @@ def test_reorder_of_a_started_stage_is_refused(tmp_path: Path) -> None:
 
 
 def test_reorder_cannot_rewrite_the_stage_it_moves(tmp_path: Path) -> None:
-    """Перестановка называет только `needs`/`parallel_with`: роль в ней — отказ."""
+    """Перестановка называет порядок: `must` в ней — отказ, его объявляет спека."""
     spec = write_spec(tmp_path, SEED)
-    facts, _why = report(spec, [{"id": "check", "role": "reviewer", "needs": ["plan"]}])
+    facts, _why = report(spec, [{"id": "check", "must": 7, "needs": ["plan"]}])
 
     assert facts[-1]["kind"] == "plan_rejected"
     assert any("plan.id" in issue for issue in facts[-1]["payload"]["issues"])
 
 
-# ---------------------------------------------- 3. параллель из предложения
+# ---------------------------------------------- 4. параллель из предложения
 
 
 def test_parallel_with_declared_by_the_plan_starts_both(tmp_path: Path) -> None:
@@ -259,7 +318,7 @@ def test_stage_slice_names_the_author_and_the_parallel_of_added_stages(tmp_path:
     assert rows["impl"]["parallel_with"] == []
 
 
-# ------------------------------------------------------- 4. цена предложения
+# ------------------------------------------------------- 5. цена предложения
 
 
 def test_declared_cost_moves_the_plan_gate(tmp_path: Path) -> None:
@@ -300,7 +359,7 @@ def test_broken_cost_is_refused(tmp_path: Path) -> None:
     assert any("plan.cost" in issue for issue in facts[-1]["payload"]["issues"])
 
 
-# ------------------------------------------------------- 5. цикл в needs
+# ------------------------------------------------------- 6. цикл в needs
 
 
 def test_cycle_closed_by_a_reorder_is_refused(tmp_path: Path) -> None:

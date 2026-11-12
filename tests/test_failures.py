@@ -928,6 +928,66 @@ def test_plan_stage_never_rethinks_itself(tmp_path: Path) -> None:
     assert "plan_rethink" not in [item["kind"] for item in events(conn, deal)]
 
 
+def lead_started(conn: sqlite3.Connection, deal: dict[str, Any]) -> None:
+    """Факт «заход лида по этому делу уже поднимался» (`lead_started`)."""
+    seed(conn, deal, "lead_started", {"pid": 777, "mode": "start", "max": 6}, key="lead:started")
+
+
+@pytest.mark.parametrize(
+    ("with_plan", "lead", "spent", "want"),
+    [
+        (False, True, 0, "rethink"),
+        (False, False, 0, "question"),
+        (True, False, 0, "rethink"),
+        (False, True, runner.MAX_RETHINKS_PER_DEAL, "question"),
+    ],
+    ids=["lead starts it", "nobody led", "plan stage only", "rethink limit"],
+)
+def test_rethink_gate_follows_the_lead(
+    tmp_path: Path, with_plan: bool, lead: bool, spent: int, want: str
+) -> None:
+    """Переосмыслять есть кому, пока делом ведёт лид — и не дольше лимита.
+
+    Лид виден по двум доказательствам: факт `lead_started` в журнале или
+    объявленный графом этап плана, любого хватает. Работающему лиду собственный
+    этап в графе не нужен (кейс d_ff4c3c3f: seed 1.x, ревизий плана нет — и
+    исчерпание попыток уходило человеку). Дело, которым лид не занимался,
+    спрашивает человека как раньше, и истраченные переосмысления тоже.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = plan_impl_spec(tmp_path) if with_plan else retry_spec(tmp_path, "{max: 1, on: [infra]}")
+    if lead:
+        lead_started(conn, deal)
+    for round_ in range(1, spent + 1):
+        seed(
+            conn,
+            deal,
+            "plan_rethink",
+            {"failed_stage": "impl", "kind": "infra", "round": round_},
+            key=f"rethink:{round_}",
+        )
+    failed_attempt(conn, deal, 1, "infra")
+    failed_attempt(conn, deal, 2, "infra")
+
+    report = rethink(conn, spec, deal, home)
+
+    kinds = [item["kind"] for item in events(conn, deal)]
+    assert report is not None
+    if want == "rethink":
+        assert report["reason"] == "rethink"
+        assert kinds.count("plan_rethink") == spent + 1
+        assert "question_asked" not in kinds
+        assert "blocked" not in kinds
+        assert deals.deal_row(conn, deal["id"])["status"] == "ready"
+        return
+    assert report["reason"] == failures.REASON_RETRIES
+    assert kinds.count("plan_rethink") == spent
+    assert len(pool_rows(home)) == 1
+    assert deals.deal_row(conn, deal["id"])["status"] == "blocked"
+
+
 # --------------------------------------- сигнал и сломанный инструмент (2.1)
 
 

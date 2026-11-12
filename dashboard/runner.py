@@ -4781,6 +4781,12 @@ def run_attempts(
 
 MAX_RETHINKS_PER_DEAL = 2
 
+# Факт «лид по этому делу уже поднимался» (`docs/ENGINE-2.0.md`, разделы 7 и 10).
+# По нему движок видит, что делом ведёт лид, и возвращает ему исчерпанные попытки.
+# Жив ли заход сейчас — вопрос супервизора `bin/duty lead`, а не движка: мёртвый
+# заход поднимают резюмом, а факт начатого дела остаётся.
+LEAD_STARTED = "lead_started"
+
 
 def _rethink_park(
     conn: sqlite3.Connection,
@@ -4804,6 +4810,13 @@ def _rethink_park(
     возвращает (иначе петля), а число переосмыслений на дело —
     `MAX_RETHINKS_PER_DEAL`, дальше решает человек (прежний путь `park_exhausted`).
 
+    Некому переосмыслять только тогда, когда делом лида не ведут вовсе: лид есть,
+    если в журнале уже стоит `lead_started` **или** граф объявляет этап плана.
+    Первое условия главное: работающий лид читает факты и без собственного этапа
+    в графе (кейс d_ff4c3c3f — граф из seed 1.x, ревизий плана лид не делал, и
+    исчерпание попыток 55 минут ждало человека при живом лиде). Дело без лида
+    (старый путь `bin/duty run`) спрашивает человека как раньше.
+
     `retries` — сколько автоматических повторов движок уже сделал по этапу
     (`failures.auto_retries`): это тот самый «один факт лиду», в котором класс,
     число повторов и последняя причина стоят рядом (`docs/ENGINE-2.0.md`,
@@ -4811,8 +4824,10 @@ def _rethink_park(
     """
     if spec_module.is_plan_stage(getattr(stage, "id", "")):
         return None
-    if not any(spec_module.is_plan_stage(getattr(item, "id", "")) for item in spec.stages):
-        return None  # без этапа плана переосмыслять некому — сразу человеку
+    lead_started = any(str(event.get("kind") or "") == LEAD_STARTED for event in events)
+    plan_stage = any(spec_module.is_plan_stage(getattr(item, "id", "")) for item in spec.stages)
+    if not lead_started and not plan_stage:
+        return None  # без лида переосмыслять некому — сразу человеку
     rethinks = sum(1 for event in events if str(event.get("kind") or "") == transit.PLAN_RETHINK)
     if rethinks >= MAX_RETHINKS_PER_DEAL:
         return None

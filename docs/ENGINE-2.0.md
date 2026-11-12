@@ -113,7 +113,8 @@ charter:
   через `parse_plan`, чтобы старые файлы не гнили. К seed применяются отказы,
   которых нет у самого `spec check`: потолок `charter.max_stages` и
   `plan.evidence.role` (доказательство у роли без терминала не выполнится
-  никогда). Права плана — `charter.allowed_roles`/`allowed_kinds` — к seed **не**
+  никогда — из ролей плана это `researcher`; ревьюер с 0.2.1 запускает проверки
+  сам). Права плана — `charter.allowed_roles`/`allowed_kinds` — к seed **не**
   применяются: они говорят, что план вправе *добавить*, а seed объявляет человек,
   и вход/`close` в спеках 1.x идут ролью координатора, которой в `allowed_roles`
   нет и быть не должно (`coordinator.scope`).

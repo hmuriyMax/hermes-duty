@@ -5,7 +5,23 @@
 
 ## [0.2.1] — в разработке
 
-- _заполняется по ходу работы_
+- **Ревьюер проверяет сам: сборка, тесты, линт.** Приговор по коду без
+  собственного прогона — догадка (живой случай RP-14338: ревью судило дифф, пока
+  линтер падал на сломанном тулчейне, и оба факта жили в разных делах). Роль
+  убрана из `NO_SHELL_ROLES` (`dashboard/spec.py`): этап ревьюера теперь вправе
+  объявлять `evidence` (`go build`, `go test`, `golangci-lint run`), и `parse_plan`
+  его принимает. Профиль `reviewer` получил `terminal` (убран из
+  `agent.disabled_toolsets`), а плагин `role-access` открыл ему **читающий**
+  shell: allowlist программ и подкоманд (`go build|test|vet|list|env|version|doc`,
+  `gofmt -l|-d`, `golangci-lint run|version|config|linters`, `make
+  build|test|lint|lint-full|lint-diff|vet|coverage|check`, `git status|diff|log|
+  show|rev-parse|rev-list|describe|ls-files|ls-tree|show-ref|blame|merge-base|
+  cat-file|shortlog|grep|name-rev`, плюс `cd/pwd/ls/cat/head/tail/wc/grep/rg/true/test`).
+  Отказ даётся за: перенаправление в файл, `$(...)` и обратные кавычки, фоновое
+  выполнение, `gofmt -w`, `git commit|checkout|push`, `make format`, `go generate`,
+  обёртки вида `sh -c` — свидетель ревьюера `verdict`, а не коммит, поэтому любая
+  правка из shell осталась бы невидимой. Остальным read-only ролям shell закрыт.
+  Доки: `docs/SPEC.md`, `docs/ENGINE-2.0.md` §3.
 
 ## [0.2.0] — опубликована 12.11.2026
 

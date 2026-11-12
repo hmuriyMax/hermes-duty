@@ -200,8 +200,12 @@ def test_seed_over_the_plan_ceiling_is_refused(tmp_path: Path) -> None:
     assert "хартия держит не больше 1" in offending[0].message
 
 
-def test_seed_evidence_on_role_without_terminal_is_refused(tmp_path: Path) -> None:
-    """`evidence` у роли без терминала (ревьюер) не выполнится никогда — отказ."""
+def test_seed_evidence_on_reviewer_is_accepted(tmp_path: Path) -> None:
+    """Ревьюер с 0.2.1 запускает проверки сам — `evidence` у него законен.
+
+    До 0.2.1 роль стояла в `NO_SHELL_ROLES` (терминал выключен), и такой seed
+    отказывал на `plan.evidence.role`: приговор выносился без прогона.
+    """
     found = spec_module.validate_spec(
         spec_module.load_spec(
             write(
@@ -215,6 +219,29 @@ def test_seed_evidence_on_role_without_terminal_is_refused(tmp_path: Path) -> No
                   - id: review
                     role: reviewer
                     needs: [impl]
+                    workspace: none
+                    evidence:
+                      - {cmd: "go build ./...", must: 0}
+                """,
+            )
+        ),
+        profiles=PROFILES,
+    )
+
+    assert "plan.evidence.role" not in rules(found)
+
+
+def test_seed_evidence_on_researcher_is_refused(tmp_path: Path) -> None:
+    """У ресерчера терминала нет — объявленную команду ему нечем выполнить."""
+    found = spec_module.validate_spec(
+        spec_module.load_spec(
+            write(
+                tmp_path,
+                """
+                duty: probe
+                stages:
+                  - id: research
+                    role: researcher
                     workspace: none
                     evidence:
                       - {cmd: "true", must: 0}

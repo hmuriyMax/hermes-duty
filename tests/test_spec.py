@@ -1967,22 +1967,23 @@ def test_parse_plan_gives_code_stage_a_tree_when_deal_has_repo():
 def test_parse_plan_refuses_evidence_on_role_without_terminal():
     """Команда-доказательство у роли без терминала — отказ плана, а не сюрприз попытки.
 
-    У `reviewer`/`researcher`/координатора `terminal` выключен: `must=0` нечестно
-    только заявляется (d_e575494f — ревью ушло в переосмысление на
-    `evidence.missing`).
+    У `researcher`/координатора `terminal` выключен: `must=0` нечестно только
+    заявляется (d_e575494f — ревью ушло в переосмысление на `evidence.missing`).
+    Ревьюер с 0.2.1 терминал имеет и проверки объявляет сам.
     """
     # Координатор в позиции работника отказывает раньше (`coordinator.scope`),
     # поэтому правило проверяется на тех ролях, которые в граф попадают.
-    for role in ("reviewer", "researcher"):
+    for role in ("researcher",):
         _, found = plan(
             [{"id": "check", "role": role, "needs": ["plan"], "evidence": [{"cmd": "make test", "must": 0}]}]
         )
         assert "plan.evidence.role" in {issue.rule for issue in found}, role
-    # Роль с терминалом то же самое объявляет законно.
-    _, ok = plan(
-        [{"id": "impl", "role": "implementer", "needs": ["plan"], "evidence": [{"cmd": "make test", "must": 0}]}]
-    )
-    assert ok == []
+    # Роли с терминалом то же самое объявляют законно.
+    for role in ("implementer", "reviewer"):
+        _, ok = plan(
+            [{"id": "impl", "role": role, "needs": ["plan"], "evidence": [{"cmd": "make test", "must": 0}]}]
+        )
+        assert ok == [], role
 
 
 def test_parse_plan_needs_may_point_at_the_seed():

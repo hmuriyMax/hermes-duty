@@ -313,9 +313,10 @@ def _live_attempts(events: Iterable[Any], now: int) -> list[dict[str, Any]]:
     Живость считает лента этапов (`stagefeed._alive`): закрытая попытка мертва
     по факту, незакрытая с действующим лизингом — живая. Попытка без срока
     лизинга (`live: None`) считается занятой: «не знаю» — не повод поднять
-    вторую работу поверх неё.
+    вторую работу поверх неё. Само правило одно на плагин — `runner.live_attempts`:
+    им же пользуется гашение попыток при закрытии дела.
     """
-    return [row for row in stagefeed.attempts(events, now) if row.get("live") is not False]
+    return runner.live_attempts(events, now)
 
 
 def _next_attempt(events: Iterable[Any], stage_id: str) -> int:
@@ -1331,69 +1332,37 @@ def _stage_cancelled(events: Iterable[Any], stage_id: str) -> Optional[str]:
     return reason
 
 
-def _attempt_of(row: dict[str, Any]) -> tuple[str, int, int]:
-    """Этап, номер попытки и pid живой попытки: `(stage, attempt, pid)`."""
-    stage = str(row.get("stage") or "")
-    attempt = _int(row.get("n"))
-    pid = _int(row.get("pid"))
-    if not stage or attempt <= 0 or pid <= 0:
-        raise ToolsError(
-            f"попытка {row.get('run_id') or '—'} не называет этап, номер и pid: "
-            "гасить нечего и не по чему — нужен человек"
-        )
-    return stage, attempt, pid
-
-
 def _extinguish(
     conn: sqlite3.Connection,
     deal: dict[str, Any],
     row: dict[str, Any],
     *,
     reason: str,
-    key: str,
     killer: Callable[[int], bool],
     moment: int,
     events: Iterable[Any],
 ) -> dict[str, Any]:
-    """Погасить живую попытку: гард pid, сигнал, факт `attempt_ended(cancelled)`.
+    """Погасить живую попытку механизмом движка: гард pid, сигнал, факт отмены.
 
-    Порядок — контрактный (`docs/ENGINE-2.0.md`, раздел 5): сначала гард
-    принадлежности pid (`runner.attempt_owner`), потом сигнал, потом отпускание
-    лизинга вместе с фактом `attempt_ended`. Сигнал до факта — не наоборот:
-    живой процесс, чью попытку уже закрыли словами, дописал бы свой конец поверх
-    отмены и «воскресил» её.
-
-    `killer` — шов для тестов (`runner.stop_pid` в жизни): настоящий процесс под
-    нож теста не попадает, а порядок «гард → сигнал → факт» проверяется как есть.
-    `events` — журнал, уже прочитанный вызывающим: второй проход по нему дал бы
-    ту же картину за лишнее чтение.
+    Самого гашения здесь нет (`runner.stop_attempt`, `docs/ENGINE-2.0.md`, раздел
+    5): лид и человек гасят работу тем же кодом, что и закрытие дела
+    (`deals.close_deal`) — второй копии «гард → сигнал → факт» в плагине не
+    заводится. Инструмент только переводит отказ движка в свой (`ToolsError`):
+    лиду отказ уезжает ответом, а не трейсбеком.
     """
-    stage, attempt, pid = _attempt_of(row)
-    why = runner.attempt_owner(conn, deal, stage=stage, attempt=attempt, pid=pid, events=events)
-    if why:
-        raise ToolsError(
-            f"попытку {stage}#{attempt} не гашу: {why} — сигнал по чужому pid "
-            "убил бы чужую работу, а попытка осталась бы живой в журнале"
+    try:
+        return runner.stop_attempt(
+            conn,
+            deal,
+            row,
+            reason=reason,
+            now=moment,
+            killer=killer,
+            source=SOURCE,
+            events=events,
         )
-    stopped = bool(killer(pid))
-    written = runner.cancel_attempt(
-        conn,
-        deal,
-        stage=stage,
-        attempt=attempt,
-        pid=pid,
-        reason=reason,
-        now=moment,
-        source=SOURCE,
-    )
-    return {
-        "stage": stage,
-        "attempt": attempt,
-        "pid": pid,
-        "stopped": stopped,
-        "written": written,
-        "idem": key,
-    }
+    except runner.RunnerError as exc:
+        raise ToolsError(str(exc)) from exc
 
 
 def _cancelled_event(
@@ -1490,7 +1459,7 @@ def cancel(
     killed: Optional[dict[str, Any]] = None
     if busy is not None:
         killed = _extinguish(
-            conn, deal, busy, reason=text, key=key, killer=killer, moment=moment, events=events
+            conn, deal, busy, reason=text, killer=killer, moment=moment, events=events
         )
     attempt = _int(busy.get("n")) if busy is not None else 0
     fact = _cancelled_event(deal, name, attempt, text, key, moment, killed)
@@ -1523,9 +1492,10 @@ def cancel_deal(
     дела `cancelled` (`deals.cancel_deal`). Это не `duty_close`: отменённое дело
     не считается завершённым, и `duty now`/`stats` держат его отдельно.
 
-    Сначала проверяются **все** живые попытки (гард pid), и только потом идёт
-    сигнал: иначе одна недоказуемая попытка оставила бы дело наполовину
-    погашенным, а лид — с вопросом «что именно уже отменено». Отказ называет
+    Гашение — `runner.stop_live_attempts`, тот же механизм, что у закрытия дела
+    (`deals.close_deal`): все живые попытки проверяются гардом pid **до** первого
+    сигнала, иначе одна недоказуемая попытка оставила бы дело наполовину
+    погашенным, а лида — с вопросом «что именно уже отменено». Отказ называет
     попытку, на которой гард не сошёлся, и не пишет ничего.
 
     Повтор с тем же ключом второго `completed` не пишет и процессов не трогает.
@@ -1560,19 +1530,18 @@ def cancel_deal(
         raise ToolsError(f"дело {deal['id']} уже закрыто (status={deal['status']}): отменять нечего")
     moment = int(tick())
     killer = kill or runner.stop_pid
-    live = _live_attempts(events, moment)
-    for row in live:
-        stage, attempt, pid = _attempt_of(row)
-        why = runner.attempt_owner(conn, deal, stage=stage, attempt=attempt, pid=pid, events=events)
-        if why:
-            raise ToolsError(
-                f"дело не отменяю: попытку {stage}#{attempt} не погасить — {why}. "
-                "Сигнал по чужому pid убил бы чужую работу"
-            )
-    killed = [
-        _extinguish(conn, deal, row, reason=text, key=key, killer=killer, moment=moment, events=events)
-        for row in live
-    ]
+    try:
+        killed = runner.stop_live_attempts(
+            conn,
+            deal,
+            reason=text,
+            now=moment,
+            killer=killer,
+            source=SOURCE,
+            events=events,
+        )
+    except runner.RunnerError as exc:
+        raise ToolsError(str(exc)) from exc
     if killed:
         journal.append(
             conn,

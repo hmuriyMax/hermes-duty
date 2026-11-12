@@ -102,6 +102,7 @@ ROUTING_MODULE_NAME = "hermes_duty_routing"
 FAILURES_MODULE_NAME = "hermes_duty_failures"
 BUDGET_MODULE_NAME = "hermes_duty_budget"
 PUBLISH_MODULE_NAME = "hermes_duty_publish"
+STAGEFEED_MODULE_NAME = "hermes_duty_stagefeed"
 
 
 def _load(name: str, filename: str) -> Any:
@@ -140,6 +141,11 @@ publish = _load(PUBLISH_MODULE_NAME, "publish.py")
 # попытке нужен этап из графа, а не из файла. Обратной загрузки нет — `transit`
 # не знает про `runner`, поэтому цикл модулей не замыкается.
 transit = _load(TRANSIT_MODULE_NAME, "transit.py")
+# Лента этапов (`dashboard/stagefeed.py`): у неё одно правило «попытка жива» —
+# пара `attempt_started` ↔ `attempt_ended` плюс срок лизинга. Гашение попыток
+# (`stop_live_attempts`) спрашивает именно её: вторая копия правила разошлась бы с
+# экраном на первом же истёкшем лизинге. Обратной загрузки тоже нет.
+stagefeed = _load(STAGEFEED_MODULE_NAME, "stagefeed.py")
 
 # Источник событий движка в журнале: `engine`, а не `cli`/`api`/`ingest` — по нему
 # видно, что факт записал движок, а не человек и не проход по чужой доске.
@@ -532,6 +538,142 @@ def cancel_attempt(
             (str(deal["id"]), stage, int(attempt)),
         )
     return int(written)
+
+
+def _require_owner(
+    conn: sqlite3.Connection, deal: Any, row: dict[str, Any], *, events: Iterable[Any]
+) -> tuple[str, int, int]:
+    """Гард перед сигналом: `(stage, attempt, pid)` живой попытки или отказ.
+
+    Один гард на все пути гашения (`duty_cancel`, `duty_cancel_deal`, закрытие
+    дела): `attempt_owner` сверяет лизинг и старт попытки, потому что
+    переиспользованный чужой pid иначе потерял бы чужую работу молча. Строка без
+    этапа, номера или pid — тоже отказ: гасить нечего и не по чему.
+    """
+    stage = str(row.get("stage") or "")
+    attempt = _int(row.get("n")) or 0
+    pid = _int(row.get("pid")) or 0
+    if not stage or attempt <= 0 or pid <= 0:
+        raise RunnerError(
+            f"попытка {row.get('run_id') or '—'} не называет этап, номер и pid: "
+            "гасить нечего и не по чему — нужен человек"
+        )
+    why = attempt_owner(conn, deal, stage=stage, attempt=attempt, pid=pid, events=events)
+    if why:
+        raise RunnerError(
+            f"попытку {stage}#{attempt} не гашу: {why} — сигнал по чужому pid убил бы "
+            "чужую работу, а попытка осталась бы живой в журнале"
+        )
+    return stage, attempt, pid
+
+
+def live_attempts(events: Iterable[Any], now: Any) -> list[dict[str, Any]]:
+    """Незакрытые попытки дела, которые считаются живыми, — по журналу и лизингу.
+
+    Живость считает лента этапов (`stagefeed._alive`): закрытая попытка мертва
+    по факту, незакрытая с действующим лизингом — живая. Попытка без срока
+    лизинга (`live: None`) считается занятой: «не знаю» — не повод поднять
+    вторую работу поверх неё.
+    """
+    return [row for row in stagefeed.attempts(events, now) if row.get("live") is not False]
+
+
+def stop_attempt(
+    conn: sqlite3.Connection,
+    deal: Any,
+    row: dict[str, Any],
+    *,
+    reason: str,
+    now: Optional[int] = None,
+    killer: Optional[Callable[[int], bool]] = None,
+    source: str = ENGINE_SOURCE,
+    events: Optional[Iterable[Any]] = None,
+) -> dict[str, Any]:
+    """Погасить одну живую попытку: гард pid, сигнал, факт `attempt_ended(cancelled)`.
+
+    Порядок — контрактный (`docs/ENGINE-2.0.md`, раздел 5): сначала гард
+    принадлежности pid (`attempt_owner`), потом сигнал, потом отпускание лизинга
+    вместе с фактом `attempt_ended`. Сигнал до факта — не наоборот: живой процесс,
+    чью попытку уже закрыли словами, дописал бы свой конец поверх отмены и
+    «воскресил» её.
+
+    `killer` — шов для тестов (`stop_pid` в жизни): настоящий процесс под нож
+    теста не попадает, а порядок «гард → сигнал → факт» проверяется как есть.
+    `events` — журнал, уже прочитанный вызывающим: второй проход по нему дал бы
+    ту же картину за лишнее чтение.
+    """
+    moment = _now_sec(now)
+    facts = journal.read_events(conn, str(deal["id"])) if events is None else events
+    stage, attempt, pid = _require_owner(conn, deal, row, events=facts)
+    stopped = bool((killer or stop_pid)(pid))
+    written = cancel_attempt(
+        conn,
+        deal,
+        stage=stage,
+        attempt=attempt,
+        pid=pid,
+        reason=reason,
+        now=moment,
+        source=source,
+    )
+    return {"stage": stage, "attempt": attempt, "pid": pid, "stopped": stopped, "written": written}
+
+
+def stop_live_attempts(
+    conn: sqlite3.Connection,
+    deal: Any,
+    *,
+    reason: str,
+    now: Optional[int] = None,
+    killer: Optional[Callable[[int], bool]] = None,
+    source: str = ENGINE_SOURCE,
+    events: Optional[Iterable[Any]] = None,
+    skip_unled: bool = False,
+) -> list[dict[str, Any]]:
+    """Погасить все живые попытки дела — один механизм на все пути закрытия работы.
+
+    Им пользуются и отмена (`tools.cancel_deal`: лид отказался от дела), и закрытие
+    (`deals.close_deal`/`close_stages_done`: дело закрыто, а живых попыток оно
+    держать не должно). Второй копии «гард → сигнал → факт» в плагине нет: разойдись
+    они, отмена и закрытие гасили бы работу по разным правилам.
+
+    Сначала проверяются **все** живые попытки, и только потом идёт сигнал: иначе
+    одна недоказуемая попытка оставила бы работу наполовину погашенной, а читатель
+    журнала — с вопросом «что именно уже погашено». Отказ называет попытку, на
+    которой гард не сошёлся, и не трогает ни процессы, ни журнал.
+
+    `skip_unled` — что делать с живой по журналу попыткой, которую не ведёт ни одна
+    строка лизинга. Отмена отказывает (`False`): попытка осталась бы живой в
+    журнале, и лид должен это знать. Закрытие пропускает (`True`): гасить нечего и
+    не по чему — сигнала без pid не бывает, а записать «погашена» о работе, которую
+    никто не ведёт, значило бы соврать в журнале; осиротевшую попытку закрывает
+    уборка (`dashboard/reaper.py`) своим фактом.
+
+    Гард стоит дважды — здесь (все попытки до первого сигнала) и в `stop_attempt`
+    (перед каждым сигналом): второй нужен пути, который гасит **одну** попытку
+    (`duty_cancel`), и он же читает лизинг заново — между проходами его мог снять
+    чужой запуск.
+    """
+    moment = _now_sec(now)
+    facts = journal.read_events(conn, str(deal["id"])) if events is None else events
+    live = live_attempts(facts, moment)
+    if skip_unled:
+        live = [row for row in live if lease_of(conn, deal, str(row.get("stage") or "")) is not None]
+    for row in live:
+        _require_owner(conn, deal, row, events=facts)
+    return [
+        stop_attempt(
+            conn,
+            deal,
+            row,
+            reason=reason,
+            now=moment,
+            killer=killer,
+            source=source,
+            events=facts,
+        )
+        for row in live
+    ]
 
 
 # --------------------------------------------------------------------- пути

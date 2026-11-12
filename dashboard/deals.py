@@ -92,6 +92,29 @@ def _spec() -> Any:
     return module
 
 
+# Кто гасит живые попытки закрываемого дела: `dashboard/runner.py` — у него гард
+# принадлежности pid, сигнал и факт отмены попытки (`runner.stop_live_attempts`).
+# На уровне модуля он не грузится: `runner` грузит `deals`, и обратный импорт замкнул
+# бы модули друг на друга. Загрузка по требованию — к моменту закрытия дела оба
+# модуля уже собраны.
+RUNNER_MODULE_NAME = "hermes_duty_runner"
+
+
+def _runner() -> Any:
+    """`dashboard/runner.py` — модуль движка, один на процесс (по требованию)."""
+    loaded = sys.modules.get(RUNNER_MODULE_NAME)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / "runner.py"
+    spec = importlib.util.spec_from_file_location(RUNNER_MODULE_NAME, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise ImportError(f"runner module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[RUNNER_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 # Своё пространство id: `d_<hex>`; kanban-дела — `t_<hex>` (`docs/OWNERSHIP.md`).
 OWN_PREFIX = "d_"
 
@@ -1304,6 +1327,50 @@ DECISION_STOP = "stop"
 DECISION_WORDS = (DECISION_CONTINUE, DECISION_STOP)
 
 
+def _stop_live_attempts(
+    conn: sqlite3.Connection,
+    deal: dict[str, Any],
+    *,
+    cause: str,
+    now: int,
+    source: str,
+    killer: Optional[Callable[[int], bool]],
+    events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Погасить живые попытки закрываемого дела — механизмом отмены, не вторым.
+
+    Правило одно с `duty_cancel_deal` (`docs/ENGINE-2.0.md`, раздел 5): гард
+    принадлежности pid, сигнал процессу, `attempt_ended(outcome='cancelled')` и
+    отпущенный лизинг. Живёт оно в `runner` (`runner.stop_live_attempts`), здесь
+    только вызов: второй копии «гард → сигнал → факт» в плагине нет.
+
+    Почему это делает store, а не вызывающий: путей закрытия много (`close`,
+    `decide stop`, движок по пройденному графу, гейт публикации, `POST /close`), и
+    «закрыл, а попытки оставил» — это не решение, а забытая строка в одном из них.
+    Живой случай RP-14338: человек убил pid и закрыл дело, а через 3.5 минуты
+    попытка дописала «процесс умер» — дело было закрыто, работа жила отдельно.
+
+    Отказ (`DealError`) — до сигнала и до записи: попытку не погасить, значит и
+    закрывать нечего — наполовину погашенного не бывает. Живая по журналу попытка
+    без строки лизинга закрытию не мешает (`skip_unled`): процесса за ней нет, и
+    сигнала без pid не бывает — её закрывает уборка своим фактом.
+    """
+    runner = _runner()
+    try:
+        return runner.stop_live_attempts(
+            conn,
+            deal,
+            reason=f"попытка погашена: дело закрывается ({cause})",
+            now=now,
+            source=source,
+            killer=killer,
+            events=events,
+            skip_unled=True,
+        )
+    except runner.RunnerError as exc:
+        raise DealError(str(exc)) from exc
+
+
 def close_deal(
     conn: sqlite3.Connection,
     deal_id: str,
@@ -1313,12 +1380,17 @@ def close_deal(
     source: str = "cli",
     now: Optional[int] = None,
     expired_leases_at: Optional[int] = None,
+    kill: Optional[Callable[[int], bool]] = None,
 ) -> dict[str, Any]:
     """Закрыть дело решением человека: одно `completed` и строка дела.
 
     Это вторая половина решения по запаркованному делу: движок паркует работу и
     не поднимает её без человека, а «остановить» до 0.0.4 записать было нечем —
     запаркованное дело с ответом «stop» оставалось запаркованным навсегда.
+
+    Живые попытки гасятся **до** `completed` (`_stop_live_attempts`): закрытое
+    дело живых попыток держать не должно, иначе осиротевшая работа дописывает
+    свой конец уже после закрытия (живой случай RP-14338).
 
     Payload называет, откуда закрыли, а не догадку о том: `cause` (кто решил),
     `reason` (слова человека, как их сказали), `stage` (этап, если он был) и
@@ -1330,7 +1402,11 @@ def close_deal(
     `from` меняется после первого закрытия, и повтор того же вызова иначе
     записал бы второй `completed`. Закрытие **другим** фактом (иная причина или
     `complete` с итогом) — не повтор: дело уже терминально, и молча переписать
-    причину закрытия нельзя.
+    причину закрытия нельзя. Живых попыток у закрытого дела уже нет, поэтому
+    повтор никого не гасит и второго факта отмены не пишет.
+
+    `kill` — шов для тестов (`runner.stop_pid` в жизни): настоящий процесс под нож
+    теста не попадает, а порядок «попытки → `completed`» проверяется как есть.
     """
     now = _now_sec() if now is None else int(now)
     deal = _require_row(conn, deal_id)
@@ -1358,6 +1434,9 @@ def close_deal(
     payload: dict[str, Any] = {"cause": cause, "reason": text, "from": before}
     if stage:
         payload["stage"] = stage
+    _stop_live_attempts(
+        conn, deal, cause=cause, now=now, source=source, killer=kill, events=events
+    )
     event = _event(deal, "completed", payload, source, {"cause": cause, "reason": text}, now)
     return _apply(conn, deal, [event], "done", now, expired_leases_at=expired_leases_at)
 
@@ -1413,6 +1492,7 @@ def close_stages_done(
     now: Optional[int] = None,
     cause: str = CLOSE_CAUSE_ALL_STAGES,
     summary: str = "",
+    kill: Optional[Callable[[int], bool]] = None,
 ) -> dict[str, Any]:
     """Закрыть дело по пройденному графу: одно `completed` и строка дела.
 
@@ -1426,19 +1506,27 @@ def close_stages_done(
     Дело с закрывающим этапом (`spec.CLOSE_STAGE`) в графе «все этапы пройдены»
     не закрывает: граф пройден — условие, а «дело кончено» говорит лид. Такой
     вызов — отказ (`DealError`), а не тихое закрытие мимо приговора. Граф приходит
-    от вызывающего (`transit.graph` в прогоне): сама функция журнал на граф не
-    читает и второго чтения плана не заводит.
+    от вызывающего (`transit.graph` в прогоне): сама функция граф из журнала не
+    читает и второго чтения плана не заводит — журнал ей нужен только на живые
+    попытки.
+
+    Живые попытки гасятся **до** `completed` (`_stop_live_attempts`) — тем же
+    механизмом, что у `close`: дело, закрытое пройденным графом, живых попыток
+    держать не должно (параллельный этап пережил бы своё дело).
 
     Идемпотентность — ключом события: он считается от `cause`, поэтому повторный
     прогон на уже закрытом деле даёт `events: 0` и не трогает ни строку, ни
     `updated_at`. Гонка двух прогонов решается там же, `INSERT OR IGNORE`: второй
-    факт не ляжет, и второй `completed` не появится.
+    факт не ляжет, и второй `completed` не появится. Живых попыток у закрытого
+    дела уже нет — повтор никого не гасит.
 
     Дело, которое держит человек, — отказ (`DealError`) и ни одной записи:
     «все этапы пройдены» — факт графа, а не разрешение стереть блок или ожидание
     вердикта. Блок читается **журналом** (`blocked` без `unblocked`), а не только
     строкой store: шаг движка ставит делу `running`, и по одной строке открытый
     блок человека уже не виден.
+
+    `kill` — шов для тестов (`runner.stop_pid` в жизни), как у `close_deal`.
     """
     now = _now_sec() if now is None else int(now)
     deal = _require_row(conn, deal_id)
@@ -1468,6 +1556,15 @@ def close_stages_done(
     text = " ".join(str(summary or "").split())
     if text:
         payload["summary"] = text
+    _stop_live_attempts(
+        conn,
+        deal,
+        cause=cause,
+        now=now,
+        source=source,
+        killer=kill,
+        events=journal.read_events(conn, str(deal["id"])),
+    )
     event = _event(deal, "completed", payload, source, {"cause": cause}, now)
     return _apply(conn, deal, [event], "done", now)
 

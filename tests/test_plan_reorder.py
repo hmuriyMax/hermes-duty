@@ -307,6 +307,23 @@ def test_edit_keeps_the_parallel_the_spec_declared(tmp_path: Path) -> None:
     assert graph["docs"].budget.tokens == 500
 
 
+def test_reorder_keeps_the_field_the_record_does_not_name(tmp_path: Path) -> None:
+    """Перестановка не трогает то, чего не назвала: `parallel_with` остаётся.
+
+    `needs` и `parallel_with` — разные рёбра, и запись, которая двигает одно,
+    не вправе стереть другое: `needs: []` значит «этап стал входом», а
+    отсутствие поля — «как было» (`spec.parse_plan`, `order`).
+    """
+    spec = write_spec(tmp_path, SEED_PARALLEL)
+    facts, why = report(spec, [{"id": "docs", "needs": ["plan", "impl"]}])
+    assert why == ""
+    assert [fact["kind"] for fact in facts] == ["plan_proposed", "plan_accepted"]
+
+    graph = {stage.id: stage for stage in transit.graph(spec, facts)}
+    assert tuple(graph["docs"].needs) == ("plan", "impl"), "названный `needs` — порядок целиком"
+    assert tuple(graph["docs"].parallel_with) == ("impl",), "неназванный `parallel_with` стёрт"
+
+
 def test_reorder_still_names_the_order_entirely(tmp_path: Path) -> None:
     """Перестановка задаёт порядок целиком: `needs: []` в ней — «этап стал входом».
 

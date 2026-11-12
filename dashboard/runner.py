@@ -4781,7 +4781,7 @@ def finish_agent_stage(
         "question_reason": question_reason,
         "verdict": verdict.as_payload() if verdict is not None else None,
         "park": park,
-        # Повтор — политика движка (раздел 7 контракта): `park is None` при отказе
+        # Повтор — политика этапа (раздел 7 контракта): `park is None` при отказе
         # значит «класс повторяется и лимит не исчерпан», и следующую попытку
         # поднимает `run_attempts` сам, дописав в её бриф причину этого отказа.
         # Парковка и переосмысление (`park` — словарь) отдают решение лиду.

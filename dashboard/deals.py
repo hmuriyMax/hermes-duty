@@ -1369,6 +1369,7 @@ def complete_deal(
     reviewer: Optional[str] = None,
     source: str = "cli",
     now: Optional[int] = None,
+    kill: Optional[Callable[[int], bool]] = None,
 ) -> dict[str, Any]:
     """Завершить дело; `review=True` — сдать в ревью вместо закрытия.
 
@@ -1377,6 +1378,13 @@ def complete_deal(
     Дело, уже стоящее в ревью, закрывается здесь же: событие `collected` («ревью
     пройдено») плюс `completed` в одной транзакции — вердикт и закрытие это два
     факта, и склеивать их в один значило бы потерять, что ревью было.
+
+    Живые попытки гасятся **до** `completed` (`_stop_live_attempts`) — тем же
+    механизмом, что у `close`: «человек нажал завершить» — такое же закрытие дела,
+    и осиротевшая работа иначе дописывает свой конец уже после него (живой случай
+    RP-14338, `docs/ENGINE-2.0.md`, раздел 5).
+
+    `kill` — шов для тестов (`runner.stop_pid` в жизни), как у `close_deal`.
     """
     now = _now_sec() if now is None else int(now)
     deal = _require_row(conn, deal_id)
@@ -1386,6 +1394,15 @@ def complete_deal(
         return request_review(
             conn, str(deal["id"]), reviewer=reviewer, summary=text, source=source, now=now
         )
+    _stop_live_attempts(
+        conn,
+        deal,
+        cause=CLOSE_CAUSE_COMPLETE,
+        now=now,
+        source=source,
+        killer=kill,
+        events=journal.read_events(conn, str(deal["id"])),
+    )
     events = [
         _event(deal, "completed", {"status": "done", "summary": text}, source, {"summary": text}, now)
     ]
@@ -1410,6 +1427,10 @@ def complete_deal(
 # текста причины.
 CLOSE_CAUSE_HUMAN = "closed_by_human"
 CLOSE_CAUSE_STOP = "stopped_by_human"
+# Причина гашения попыток у `complete`: своего `cause` его `completed` не несёт
+# (человек не закрывает дело, а завершает его), и называть отмену попытки
+# `closed_by_human` значило бы выдать `complete` за `close` в журнале.
+CLOSE_CAUSE_COMPLETE = "completed_by_human"
 # Причина закрытия движком: все этапы графа пройдены. Пишет её драйвер, а не
 # команда: до 0.0.4 прогон объявлял «дело закрыто» строкой stdout, а в журнале
 # дело оставалось живым (`status='running'` без `completed`) — движок называл

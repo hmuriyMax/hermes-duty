@@ -6,7 +6,8 @@
 1. перестановка **неначатого** этапа применяется: принятая ревизия меняет `needs`
    этапа графа, а не добавляет его копию, и решение идёт по новому порядку;
 2. правка **неначатого** этапа применяется так же: `cmd`, `budget` и `evidence`
-   лид меняет у своего же этапа, а не заводит второй рядом (RP-14338);
+   лид меняет у своего же этапа, а не заводит второй рядом (RP-14338), и
+   зависимости этапа при этом сохраняются, если запись их не назвала;
 3. перестановка этапа, у которого была попытка, — `plan_rejected` с отказом
    «этап уже начат», а правка такого этапа — отказ `plan.edit` с его именем;
    граф в обоих случаях остаётся прежним (сделанное возвращает приговор);
@@ -29,6 +30,8 @@ import sys
 import textwrap
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -238,6 +241,100 @@ def test_edit_of_a_started_stage_is_refused_and_names_the_stage(tmp_path: Path) 
     issues = facts[1]["payload"]["issues"]
     assert any("plan.edit" in issue and "'impl'" in issue and "уже начинался" in issue for issue in issues), issues
     assert needs_of(transit.graph(spec, facts)) == {"plan": (), "impl": ("plan",), "check": ("impl",)}
+
+
+# Граф с параллелью в спеке: правка не вправе её потерять — `parallel_with`
+# объявлен человеком, а не той записью, которая правит бюджет.
+SEED_PARALLEL = """
+duty: параллель в спеке
+stages:
+  - id: plan
+    role: implementer
+    workspace: none
+  - id: impl
+    role: implementer
+    needs: [plan]
+    workspace: none
+  - id: docs
+    role: implementer
+    needs: [plan]
+    parallel_with: [impl]
+    workspace: none
+"""
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"cmd": "go vet ./..."},
+        {"budget": {"tokens": 500}},
+        {"evidence": [{"cmd": "go list ./...", "must": 0}]},
+    ],
+    ids=["cmd", "budget", "evidence"],
+)
+def test_edit_keeps_the_dependencies_the_record_does_not_name(tmp_path: Path, record: dict[str, Any]) -> None:
+    """Правка этапа **с зависимостями** и без `needs` в записи: порядок тот же.
+
+    Запись без `needs:` приходит с пустым полем (`_str_tuple`), и правка `cmd`
+    иначе обнуляла бы зависимости: `check` стал бы входом графа, и движок поднял
+    бы его сразу, вне порядка (`RP-14338` — лид правит свой этап).
+    """
+    spec = write_spec(tmp_path, SEED)
+    facts, why = report(spec, [{"id": "check", **record}])
+    assert why == ""
+    assert [fact["kind"] for fact in facts] == ["plan_proposed", "plan_accepted"]
+
+    graph = transit.graph(spec, facts)
+    assert needs_of(graph) == {"plan": (), "impl": ("plan",), "check": ("impl",)}
+    assert graph[-1].id == "check" and graph[-1].needs, "этап не стал входом графа"
+
+    journal_events = facts + events(
+        ("attempt_ended", {"stage": "impl", "attempt": 1, "outcome": "done", "kind": None, "run_id": "impl#1", "reason": ""})
+    )
+    # `check` ждёт `impl`, а не идёт первым: входом он не стал.
+    assert transit.next_stage(spec, journal_events, NOW).pair == [("check", 1)]
+
+
+def test_edit_keeps_the_parallel_the_spec_declared(tmp_path: Path) -> None:
+    """`parallel_with` — тоже зависимость: правка без него её не стирает."""
+    spec = write_spec(tmp_path, SEED_PARALLEL)
+    facts, why = report(spec, [{"id": "docs", "budget": {"tokens": 500}}])
+    assert why == ""
+
+    graph = {stage.id: stage for stage in transit.graph(spec, facts)}
+    assert tuple(graph["docs"].parallel_with) == ("impl",)
+    assert tuple(graph["docs"].needs) == ("plan",)
+    assert graph["docs"].budget.tokens == 500
+
+
+def test_reorder_still_names_the_order_entirely(tmp_path: Path) -> None:
+    """Перестановка задаёт порядок целиком: `needs: []` в ней — «этап стал входом».
+
+    Смягчить это значило бы отнять у лида единственный способ убрать ребро:
+    «не назвал» и «назвал пустым» — разные записи, и вторая значит «вход».
+    """
+    spec = write_spec(tmp_path, SEED)
+    facts, why = report(spec, [{"id": "check", "needs": []}])
+    assert why == ""
+    assert [fact["kind"] for fact in facts] == ["plan_proposed", "plan_accepted"]
+    assert needs_of(transit.graph(spec, facts)) == {"plan": (), "impl": ("plan",), "check": ()}
+
+
+def test_edit_of_an_occupied_id_is_applied_by_the_engine(tmp_path: Path) -> None:
+    """Проба F4 на родителе (`57adcb0`): правка `cmd` под занятым id.
+
+    Проверяется поведение движка, а не форма вызова: на `57adcb0` эта запись
+    получала `plan_rejected`/`plan.id` — правки не было вовсе (лид обходил этапом
+    `check2`, мёртвый `check` оставался в графе). Здесь тот же путь
+    (`runner.report_plan`, без шимов `base_stages`) даёт принятый план.
+    """
+    spec = write_spec(tmp_path, SEED)
+    facts, why = report(spec, [{"id": "check", "cmd": "go vet ./..."}])
+
+    assert why == ""
+    assert [fact["kind"] for fact in facts] == ["plan_proposed", "plan_accepted"], facts
+    graph = {stage.id: stage for stage in transit.graph(spec, facts)}
+    assert graph["check"].cmd == "go vet ./..."
 
 
 def test_needs_of_a_started_stage_are_still_reordered(tmp_path: Path) -> None:

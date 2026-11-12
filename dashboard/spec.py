@@ -1323,6 +1323,26 @@ def failure_classes() -> tuple[str, ...]:
     return tuple(module.CLASSES) if module is not None else ()
 
 
+def failure_class(name: str) -> str:
+    """Значение константы класса (`CAPABILITY`, …) из `dashboard/failures.py`.
+
+    Нужно правилу про `retry.on`: спека предупреждает про `capability` по имени,
+    а имя берёт из того же словаря, чтобы «стена» не завелась вторым написанием.
+    """
+    module = _failures_module()
+    return str(getattr(module, name, "")) if module is not None else ""
+
+
+def auto_classes() -> tuple[str, ...]:
+    """Классы, которые движок повторяет сам (`failures.AUTO_ON`), — для текста правила.
+
+    Спека текстом правила называет, до чего сузился `retry.on`: автору спеки
+    важно видеть, что именно осталось от объявленного набора, а не догадываться.
+    """
+    module = _failures_module()
+    return tuple(module.AUTO_ON) if module is not None else ()
+
+
 def known_profiles(root: Optional[Path] = None) -> frozenset[str]:
     """Профили Hermes: `$HERMES_HOME/profiles/*` плюс `default`, снимок один раз на процесс.
 
@@ -2154,6 +2174,25 @@ def _check_retry(spec: Spec) -> list[Issue]:
                     "retry.on пуст: ретрай без классов отказов не сработает",
                 )
             )
+        # `capability` — стена (бюджет, доступ, роль), а не сбой: набор классов,
+        # которые движок повторяет сам, — политика движка (`failures.AUTO_ON`,
+        # `docs/ENGINE-2.0.md`, раздел 7). Спека может только отказаться от части
+        # повторов, поэтому `capability` здесь **сужается**: объявленный класс не
+        # попадёт в эффективную политику (`failures.policy`), и повтора не будет.
+        # Предупреждение, а не отказ: цель — сказать автору спеки, что строка не
+        # работает, а не заставить переписать файл.
+        capability = failure_class("CAPABILITY")
+        if capability and capability in retry.on:
+            issues.append(
+                Issue(
+                    spec.path,
+                    stage.lines.get("retry.on", line),
+                    "retry.on",
+                    f"{capability} движок не повторяет никогда: класс сужается "
+                    f"до {', '.join(auto_classes()) or '—'} — убери его из retry.on",
+                    WARNING,
+                )
+            )
         # Класс сравнивается со словарём `dashboard/failures.py`: опечатка в
         # `retry.on` иначе молча выключила бы повтор, и спека выглядела бы
         # объявленной, а политика — без классов.
@@ -2621,13 +2660,18 @@ def parse_plan(
     растит: это либо перестановка, либо правка этапа, который ещё не начинался.
 
     - Перестановка называет `needs`/`parallel_with` (`REORDER_KEYS`): граф получает
-      новые рёбра этапа, а остальные поля остаются спекой.
+      новые рёбра этапа, а остальные поля остаются спекой. Порядок перестановка
+      называет **целиком**: `needs: []` в ней — это «этап стал входом», а не «как
+      было».
     - Правка неначатого этапа называет ещё `cmd`, `budget`, `evidence`, `retry`,
       `kind`, `role`, `workspace` (`EDIT_KEYS`): лид, который ошибся в своём же
       этапе, правит его, а не заводит второй рядом (RP-14338: три ревизии
       отклонены, обошёл этапом `check2`, мёртвый `check` остался в графе). Запись
       сводится с полями этапа графа (`base_stages`), а любое другое поле —
-      `plan.id` («план не переписывает этап»).
+      `plan.id` («план не переписывает этап»). Зависимости правка сохраняет:
+      `needs`/`parallel_with` берутся из записи только тогда, когда она их
+      назвала, — иначе одна правка `cmd` обнулила бы порядок, и этап пошёл бы
+      вне графа.
 
     Переставлять и править можно только этап, который **не начинался**:
     `started_ids` — id с фактом попытки, и такая запись получает отказ
@@ -2715,12 +2759,16 @@ def parse_plan(
             stages.append(_with_repo_workspace(_with_default_ask(stage), repo))
             continue
         # Правка сводится с этапом графа: названные поля берутся из записи,
-        # остальные остаются как были. `needs`/`parallel_with` — всегда из записи:
-        # перестановка называет порядок целиком, а не добавкой к нему.
+        # остальные остаются как были. `needs`/`parallel_with` берутся из записи
+        # только если запись их назвала: у записи без `needs` поле приходит пустым
+        # (`_str_tuple`), и правка `cmd` иначе обнулила бы зависимости этапа — он
+        # стал бы входом графа и пошёл бы вне порядка. Перестановка порядок
+        # по-прежнему называет целиком, и `needs: []` в ней — это «вход».
         changes = {name: getattr(stage, name) for name in EDIT_KEYS if name in declared}
         if "workspace" in changes:
             changes["workspace_default"] = stage.workspace_default
-        stages.append(replace(existing, needs=stage.needs, parallel_with=stage.parallel_with, **changes))
+        order = {name: getattr(stage, name) for name in REORDER_KEYS[1:] if name in declared}
+        stages.append(replace(existing, **order, **changes))
     # Какие поля этапа судятся как новые: у добавленного — все, у правки — только
     # те, что она действительно изменила. Иначе правка бюджета у seed-этапа
     # отказывала бы за то, чего план не трогал: seed правилам «план добавляет» не

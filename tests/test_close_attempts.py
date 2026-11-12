@@ -16,15 +16,20 @@
    гасить нечего и не по чему;
 4. повтор `close` идемпотентен: процессов не трогает, второго `completed` и
    второго `attempt_ended` не пишет;
-5. `close_stages_done` (дело, закрытое пройденным графом) ведёт себя так же.
+5. `close_stages_done` (дело, закрытое пройденным графом) ведёт себя так же;
+6. `complete` (человек нажал «завершить») — шестая дверь закрытия — гасит живую
+   попытку тем же механизмом и тоже **до** своего `completed`.
 
-Гашение процессов подменяется фейком (`kill`): настоящий процесс под нож теста не
-попадает, а порядок «гард → сигнал → факт» проверяется как есть.
+Гашение процессов подменяется фейком (`kill`), кроме одной пробы: в ней процесс
+настоящий (`/bin/sleep`), гашение настоящее, а вызов — как в жизни (без шва).
+Эта проба и есть доказательство «красное на родителе»: на `4cfebde`, где гашения
+не было, она падает по поведению («процесс жив»), а не по `TypeError`.
 """
 
 from __future__ import annotations
 
 import sqlite3
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -237,3 +242,37 @@ def test_close_stages_done_extinguishes_live_attempts(tmp_path: Path) -> None:
     assert runner.lease_of(conn, deal, "verify") is None
     assert seen(conn, deal)[-1] == "completed"
     assert "attempt_ended" not in seen(conn, deal)[seen(conn, deal).index("completed") :]
+
+
+# --------------------------- 6. complete: «человек нажал завершить» — та же дверь
+
+
+def test_complete_extinguishes_a_live_attempt_before_completed(tmp_path: Path) -> None:
+    """`complete` гасит живую попытку **до** своего `completed`, а не после.
+
+    Шестая дверь закрытия: `bin/duty complete` пишет `completed`/`status=done`, и
+    до 2.1 живые попытки за ней оставались — закрытое дело получало
+    `attempt_failed` уже после своего закрытия (живой случай RP-14338).
+    """
+    home = make_home(tmp_path)
+    spec = write_spec(tmp_path, SEED)
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    live_attempt(conn, deal, stage="impl", attempt=1, pid=111)
+    killed: list[int] = []
+
+    applied = deals.complete_deal(
+        conn, str(deal["id"]), summary="готово", now=MOMENT, kill=recording_kill(killed)
+    )
+
+    assert applied["events"] == 1  # факт закрытия один; `attempt_ended` пишет гашение
+    assert killed == [111]  # процесс погашен
+    ended = ended_payloads(conn, deal)
+    assert len(ended) == 1
+    assert ended[0]["outcome"] == "cancelled"
+    assert ended[0]["pid"] == 111
+    assert ended[0]["reason"] == "попытка погашена: дело закрывается (completed_by_human)"
+    assert runner.lease_of(conn, deal, "impl") is None  # лизинг отпущен
+    assert seen(conn, deal)[-2:] == ["attempt_ended", "completed"]
+    row = deals.deal_row(conn, str(deal["id"]))
+    assert row is not None and row["status"] == "done"

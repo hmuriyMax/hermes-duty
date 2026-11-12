@@ -1253,12 +1253,13 @@ def test_retry_on_empty(tmp_path: Path):
     assert "retry.on" in rules(found)
 
 
-def test_retry_on_capability_is_accepted(tmp_path: Path):
-    """`retry.on` уважается как есть: объявленный `capability` — рабочая политика.
+def test_retry_on_capability_is_warning_not_error(tmp_path: Path):
+    """`capability` движок не повторяет никогда — предупреждение, а не отказ.
 
-    Хартия главнее политики движка (2.1, `docs/ENGINE-2.0.md`, раздел 7): раньше
-    объявленный класс сужался, и спека предупреждала, что строка не работает.
-    Теперь она работает, и предупреждать не о чем — ни отказа, ни `warning`.
+    `retry.on` набор **сужает**, но не расширяет (`docs/ENGINE-2.0.md`, раздел 7):
+    объявленный `capability` не попадает в эффективную политику, и повтора не
+    будет. Спека говорит об этом предупреждением, а не отказом: старые файлы
+    остаются валидными, а автор видит, что строка не работает.
     """
     path = write(
         tmp_path,
@@ -1270,7 +1271,10 @@ stages:
 """,
     )
     found = spec_module.validate_spec(spec_module.load_spec(path), profiles=PROFILES)
-    assert found == []
+    assert [(issue.rule, issue.line, issue.severity) for issue in found] == [("retry.on", 5, "warning")]
+    assert "capability движок не повторяет никогда" in found[0].message
+    assert "класс сужается" in found[0].message
+    assert spec_module.errors(found) == []
 
 
 # --------------------------------------------------------------- строка отказа

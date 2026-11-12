@@ -963,7 +963,11 @@ def test_the_human_gate_question_is_asked_by_the_live_gate_stage(tmp_path: Path)
     а прежние тесты гейта собирали этот факт руками (`ask_gate`). Писатель —
     `runner._ask_gate` (`dashboard/runner.py`): вопрос гейт-этапа идёт через
     `ask.ask`, и в `routing` уезжает фактическая база публикуемого дерева
-    (`publish_facts` того этапа, за которым стоит публикация).
+    (`publish_facts` того этапа, за которым стоит публикация). Строка писателя
+    лежит вне ханков полосы (код гейта был до неё), поэтому цитатой `file:line`
+    этот путь не проверяется: он доказан прогоном этого теста
+    (`test_the_human_gate_question_is_asked_by_the_live_gate_stage`), а не
+    ссылкой на строку.
 
     Здесь весь путь живой: гейт-этап поднимает сам движок
     (`runner.run_stage`), человек отвечает в пуле, `ask.sync_answers` дочитывает

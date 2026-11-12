@@ -783,25 +783,55 @@ def stream_tool_result(name: str, *, call: str = "call-1") -> str:
 # под-попытка роли-исполнителя.
 ASK_ANSWER_SEC = lead.LEAD_IDLE_TIMEOUT_SEC + 100
 
+# Момент, когда пара `tool_use`→`tool_result` закрылась: с него отсчитывается
+# настоящая тишина потока, а не с начала вызова.
+PAIR_CLOSE_SEC = 10
+
 
 def script_of(kind: str) -> list[tuple[float, str]]:
-    """Поток одного вызова: начало, а для `ask` — ответ роли и итог захода."""
+    """Поток одного вызова: начало, а дальше — по сценарию кейса.
+
+    `ask` — роль отвечает дольше порога тишины, и заход кончается штатно;
+    `wait` — `duty_wait` молчит дольше своего потолка; `pair` — пара закрылась
+    (`tool_result`) и после неё поток молчит: это уже настоящая тишина;
+    `ask-expired` — `duty_ask` открыт, ответа нет вовсе.
+    """
     if kind == "ask":
         return [
             (0, stream_tool_use("duty_ask")),
             (ASK_ANSWER_SEC, stream_tool_result("duty_ask")),
             (ASK_ANSWER_SEC, stream_result("sess-ask")),
         ]
+    if kind == "pair":
+        return [(0, stream_tool_use("duty_wait")), (PAIR_CLOSE_SEC, stream_tool_result("duty_wait"))]
+    if kind == "ask-expired":
+        return [(0, stream_tool_use("duty_ask"))]
     return [(0, stream_tool_use("duty_wait"))]
 
 
 @pytest.mark.parametrize(
-    ("kind", "ends", "want_reason", "want_stopped"),
-    [("ask", True, "exit", False), ("wait", False, "idle", True)],
-    ids=["ask inside the role budget", "wait past its ceiling"],
+    ("kind", "ends", "want_reason", "want_stopped", "clock_from", "clock_to"),
+    [
+        ("ask", True, "exit", False, ASK_ANSWER_SEC, None),
+        ("wait", False, "idle", True, None, lead.LEAD_IDLE_TIMEOUT_SEC),
+        ("pair", False, "idle", True, lead.LEAD_IDLE_TIMEOUT_SEC, lead.LEAD_IDLE_TIMEOUT_SEC + 200),
+        ("ask-expired", False, "idle", True, lead.LEAD_IDLE_TIMEOUT_SEC, None),
+    ],
+    ids=[
+        "ask inside the role budget",
+        "wait past its ceiling",
+        "pair closed then silence",
+        "ask past its budget",
+    ],
 )
 def test_lead_waits_inside_a_blocking_call_instead_of_counting_stream_silence(
-    tmp_path: Path, kind: str, ends: bool, want_reason: str, want_stopped: bool
+    tmp_path: Path,
+    kind: str,
+    ends: bool,
+    want_reason: str,
+    want_stopped: bool,
+    clock_from: Optional[float],
+    clock_to: Optional[float],
 ) -> None:
     """Открытый блокирующий вызов — ожидание, а не тишина: у каждого свой потолок.
 
@@ -813,14 +843,32 @@ def test_lead_waits_inside_a_blocking_call_instead_of_counting_stream_silence(
     тратились на работу, которую никто не бросал.
 
     Инвариант — «молчание внутри живого вызова не считается тишиной» — проверяется
-    с двух сторон:
+    с четырёх сторон:
 
-    - `duty_ask` молчит 1000 с (дольше порога) и всё равно доводит заход до
-      штатного выхода: потолок вызова — срок под-попытки роли
-      (`runner.ttl_sec`, у seed-этапа 1800 с), а не 900 с порога;
-    - `duty_wait` пересидел свой потолок (`tools.WAIT_CEILING_SEC`), и порог
-      тишины обязан его видеть, иначе зависание внутри `duty_wait` стало бы
-      невидимым до `overrun`.
+    - `ask inside the role budget`: `duty_ask` молчит 1000 с (дольше порога) и всё
+      равно доводит заход до штатного выхода: потолок вызова — срок под-попытки
+      роли (`runner.ttl_sec`, у seed-этапа 1800 с плюс `BLOCKING_GRACE_SEC`), а не
+      900 с порога;
+    - `wait past its ceiling`: `duty_wait` пересидел свой потолок
+      (`tools.WAIT_CEILING_SEC`), и порог тишины обязан его видеть, иначе
+      зависание внутри `duty_wait` стало бы невидимым до `overrun`;
+    - `pair closed then silence`: пара `tool_use`→`tool_result` закрылась, процесс
+      жив и больше ничего не говорит — это настоящая тишина, и заход гасится
+      порогом (`idle`). Ветка `open_calls.pop` (`lead._note_call`) исполняется
+      здесь, иначе `tool_result` мог бы перестать закрывать пару незамеченно:
+      лид остался бы «внутри вызова» навсегда, тишина перестала бы давать `idle`,
+      и заход висел бы до `overrun` (1800 с);
+    - `ask past its budget`: `duty_ask` открыт, ответа нет, и вызов пересидел
+      свой потолок — заход гасится по нему. `run_budget` кейса (7200 с) выше
+      потолка намеренно: на дефолтном бюджете (1800 с) первым сработал бы
+      `overrun` (`docs/ENGINE-2.0.md`, раздел 10), и кейс не отличил бы потолок
+      вызова от бюджета захода.
+
+    Оба последних кейса — **гарды от регресса**, а не новое поведение: на коде до
+    правок круга 2 (`2101490`) они зелёные по определению, потому что там тишина
+    мерилась только потоком и `idle` приходил по порогу. Красными они становятся
+    ровно тогда, когда ломается механика: `tool_result` перестаёт закрывать пару
+    или `_call_ceiling` возвращает `None`.
     """
     home = make_home(tmp_path)
     spec = write_spec(tmp_path)
@@ -842,10 +890,12 @@ def test_lead_waits_inside_a_blocking_call_instead_of_counting_stream_silence(
 
     assert report["reason"] == want_reason
     assert process.stopped is want_stopped
-    if want_reason == "exit":
-        assert clock.now > lead.LEAD_IDLE_TIMEOUT_SEC, "роль отвечала дольше порога тишины"
-    else:
-        assert clock.now < lead.LEAD_IDLE_TIMEOUT_SEC, "вызов гасится по своему потолку, а не по порогу"
+    # Момент гашения: `clock_from` — вызов не гасится раньше своего срока,
+    # `clock_to` — гасится потолком вызова, а не порогом тишины.
+    if clock_from is not None:
+        assert clock.now >= clock_from, "заход гасится не раньше своего потолка"
+    if clock_to is not None:
+        assert clock.now <= clock_to, "поток молчал меньше порога: это потолок вызова, а не тишина"
     conn = open_store(home)
     exited = facts_of(conn, deal, lead.LEAD_KIND_EXITED)
     conn.close()

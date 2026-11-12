@@ -45,6 +45,8 @@ import {
   docBlocks,
   finishedStatusMeta,
   shapeDeal,
+  shapeDecisions,
+  decisionsCount,
   shapeDealTime,
   shapeFinished,
   shapeFinishedPage,
@@ -518,7 +520,21 @@ function dealRow(deal) {
     h('td', { class: 'n', title: attemptTitle }, deal.attemptAgeText),
     h('td', { title: leaseTitle }, deal.leaseText),
     h('td', { class: 'n', title: `${deal.lastActionKind}: ${deal.lastActionSummary || '—'}` }, deal.lastActionAgeText),
-    h('td', null, Badge(deal.state, deal.humanKind)),
+    // Состояние — единственная ячейка, которую бэкенд формулирует словами, поэтому
+    // лид дописывается сюда же строкой, как в `duty now` (`dashboard/cli.py`,
+    // `_now_row`): своего столбца у него нет, а «кто ведёт дело» — часть состояния.
+    h(
+      'td',
+      null,
+      Badge(deal.state, deal.humanKind),
+      deal.lead && deal.lead.known
+        ? h(
+            'span',
+            { class: `lead-note t-${deal.lead.tone}`, title: deal.lead.evidence || 'состояние лида по журналу' },
+            deal.lead.short,
+          )
+        : null,
+    ),
   )
 }
 
@@ -1931,6 +1947,38 @@ function stageBlockNode(dealId, stage, timeline, rebuild) {
 }
 
 /**
+ * Лента решений лида: план, перезапуски этапов, ответы воркерам, отмена и закрытие.
+ *
+ * Источник один — `decisions[]` ответа `/deal` (`dashboard/leadfeed.feed`), тот же
+ * список, который печатает `bin/duty deal`. Порядок журнальный, автор подписан
+ * там, где его назвал факт. Пустая лента не рисуется: «решений нет» на экране
+ * свежего дела — это шум, а не факт (в терминале строка об этом есть).
+ */
+function decisionsBlock(items) {
+  const total = decisionsCount(items)
+  if (!total) return null
+  const rows = shapeDecisions(items)
+  return h(
+    'div',
+    { class: 'panel decisions', 'data-key': 'decisions' },
+    h('div', { class: 'panel-h' }, `решения лида · ${total}`),
+    h(
+      'div',
+      { class: 'panel-b decisions-list' },
+      ...rows.map((row) =>
+        h(
+          'div',
+          { class: 'dec-row', key: row.key },
+          h('span', { class: 'dec-clock mono muted', title: row.ageText ? `${row.ageText} назад` : '' }, row.clock),
+          row.authorLabel ? h('span', { class: `dec-author t-${row.tone}`, title: row.author }, row.authorLabel) : null,
+          h('span', { class: 'dec-text' }, row.text),
+        ),
+      ),
+    ),
+  )
+}
+
+/**
  * Столбец этапов и попыток в карточке дела.
  *
  * Одна панель вместо двух (широкой ленты этапов и отдельной панели попыток):
@@ -2673,6 +2721,18 @@ function viewDeal(dealId) {
       // Статус уже стоит бейджем справа, исполнитель у дела без рана не записан:
       // «исполнитель: —» — это пустое поле, а не факт.
       data.assignee ? h('span', null, 'исполнитель: ', h('b', null, data.assignee)) : null,
+      // Состояние лида — факт журнала (`leadfeed.status`), рядом с попыткой и
+      // лизингом: «кто ведёт дело» отвечается тем же словом, что в терминале.
+      deal && deal.lead
+        ? h(
+            'span',
+            { 'data-key': 'fact:lead', title: deal.lead.evidence || 'состояние лида по журналу' },
+            'лид: ',
+            h('b', { class: `t-${deal.lead.tone}` }, deal.lead.short),
+            ' · ',
+            h('span', { class: 'muted' }, deal.lead.resumesText),
+          )
+        : null,
       deal ? h('span', { 'data-key': 'fact:attempt' }, 'попытка: ', h('b', null, `${deal.attemptAgeText} (${deal.attemptNote})`)) : null,
       deal ? h('span', { 'data-key': 'fact:lease' }, 'лизинг: ', h('b', null, `${deal.leaseText}`)) : null,
       h('span', null, 'создано: ', h('b', null, fmtClock(data.created_at))),
@@ -2717,6 +2777,9 @@ function viewDeal(dealId) {
   // попытки раньше повторялась в широкой ленте этапов и в отдельной панели
   // попыток, и страница дела росла на три с половиной экрана.
   const stages = stagesColumn(data.id)
+  // Решения лида — во всю ширину над колонками: это история по времени, рядом со
+  // шкалой, а не ещё один узкий столбец. Список тот же, что печатает `duty deal`.
+  const decisions = decisionsBlock(data.decisions)
 
   return h(
     'div',
@@ -2725,6 +2788,7 @@ function viewDeal(dealId) {
     head,
     kpiStrip(scale),
     scalePanel(scale),
+    decisions,
     left ? h('div', { class: 'deal-cols' }, left, stages) : stages,
   )
 }

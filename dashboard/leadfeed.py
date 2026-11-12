@@ -155,7 +155,25 @@ def _cap(rows: list[dict[str, Any]]) -> int:
     return DEFAULT_MAX_LEAD_RESUMES
 
 
-def status(events: Iterable[Any]) -> dict[str, Any]:
+def open_pid(events: Iterable[Any]) -> Optional[int]:
+    """pid захода, о котором журнал говорит «поднят» и не сказал «ушёл».
+
+    Нужен тому, кто может проверить процесс (`plugin_api` зовёт
+    `journal.pid_alive`): проекция сама процессов не трогает, но и молчать о
+    мёртвом заходе не должна. `None` — либо фактов лида нет, либо последний факт
+    уже назвал конец захода.
+    """
+    rows = [event for event in _ordered(events) if str(event.get("kind") or "") in LEAD_KINDS]
+    if not rows:
+        return None
+    last = rows[-1]
+    if str(last.get("kind") or "") not in (LEAD_STARTED, LEAD_RESUMED):
+        return None
+    pid = _int(_payload(last).get("pid"))
+    return pid or None
+
+
+def status(events: Iterable[Any], *, live: Optional[bool] = None) -> dict[str, Any]:
     """Состояние лида по журналу: жив, отсутствует или поднят резюмом N из M.
 
     Читаются только факты `lead_*`: живая сессия не спрашивается ничем, иначе
@@ -163,6 +181,13 @@ def status(events: Iterable[Any]) -> dict[str, Any]:
     («жив» после `lead_started`/`lead_resumed`, «отсутствует» после
     `lead_exited`), а число резюмов считается по всем фактам дела — это и есть
     счётчик `max_lead_resumes` из раздела 10 контракта.
+
+    `live` — ответ того, кто процесс проверил (`open_pid` → `pid_alive`). Он
+    нужен потому, что факт `lead_started` без парного `lead_exited` — не редкость:
+    обёртку захода убивают снаружи (рестарт гейтвея, SIGKILL), и записать конец
+    некому. Читать такой журнал как «лид жив» значит показывать на экране живого
+    лида у мёртвого дела (так было на d_ff4c3c3f). Поэтому при `live=False` слово
+    называет отсутствие, а доказательство — что конец захода не записан.
     """
     rows = [event for event in _ordered(events) if str(event.get("kind") or "") in LEAD_KINDS]
     cap = _cap(rows)
@@ -181,28 +206,37 @@ def status(events: Iterable[Any]) -> dict[str, Any]:
     last = rows[-1]
     kind = str(last.get("kind") or "")
     payload = _payload(last)
-    live = kind in (LEAD_STARTED, LEAD_RESUMED)
+    claimed = kind in (LEAD_STARTED, LEAD_RESUMED)
+    # `live` не передан — верим журналу; передан — он и решает (см. docstring).
+    is_live = claimed if live is None else bool(live)
+    gone = claimed and not is_live
     reason = str(payload.get("reason") or "")
-    if live and resumes:
+    if is_live and resumes:
         text = f"лид: резюм {resumes} из {cap}"
-    elif live:
+    elif is_live:
         text = "лид: жив"
     elif resumes:
         text = f"лид: отсутствует · резюм {resumes} из {cap}"
     else:
         text = "лид: отсутствует"
     evidence = f"журнал: последний факт лида {kind}"
-    if live:
+    if gone:
+        pid = _int(payload.get("pid"))
+        evidence += f", конец захода не записан" + (f" (pid {pid} мёртв)" if pid else "")
+    elif is_live:
         evidence += f", пробуждений {resumes} из {cap}"
     elif reason:
         evidence += f": {reason}"
     return {
-        "state": STATE_LIVE if live else STATE_ABSENT,
+        "state": STATE_LIVE if is_live else STATE_ABSENT,
         "resumes": resumes,
         "cap": cap,
         "since": _int(last.get("ts")),
         "last": kind,
         "reason": reason,
+        # «факт говорит поднят, а процесса нет» — отдельный признак: поверхность
+        # не должна подписывать это как обычное «ушёл» с причиной выхода.
+        "stale": gone,
         "text": text,
         "evidence": evidence,
     }

@@ -313,6 +313,10 @@ function shapeDeal(deal) {
     // считается по нему (см. `stateMeta`), иначе «ждёт ответа» звучит у блокировки
     // без вопроса.
     humanKind,
+    // Состояние лида (`lead`): у дела 1.x и у дела, до которого супервизор не
+    // дошёл, бэкенд отвечает «нет фактов» — это честный ответ, а не выдуманное
+    // «жив». Слово и доказательство целиком бэкендовы (`leadfeed.status`).
+    lead: shapeLead(d.lead),
     attemptAge,
     attemptAgeText: fmtAge(attemptAge),
     attemptNote,
@@ -335,6 +339,87 @@ function shapeDeal(deal) {
       : '',
     search: `${d.repo || ''} ${d.id || ''} ${d.title || ''} ${d.assignee || ''} ${stageRole} ${waiting.state || ''}`.toLowerCase(),
   }
+}
+
+/* ------------------------------------------ лид: состояние и лента решений */
+
+/**
+ * Тон и подпись автора решения — из того слова, которое назвал факт.
+ *
+ * Автор приходит с бэкенда (`leadfeed.answer_author`/`payload.by`): `lead` —
+ * лид решил сам, `role` — передал роли, `human` — ушёл в пул к человеку,
+ * `expired` — вопрос закрылся по сроку. Пусто — факт автора не называет
+ * (перезапуск этапа, закрытие движком), и подпись не выдумывается.
+ */
+const LEAD_AUTHOR_LABEL = { lead: 'лид', role: 'роль', human: 'человек', expired: 'срок' }
+const LEAD_AUTHOR_TONE = { lead: 'blue', role: 'purple', human: 'yellow', expired: 'gray' }
+/** Тон состояния лида: жив — зелёный, отсутствует и «нет фактов» — серые. */
+const LEAD_STATE_TONE = { live: 'green', absent: 'gray', unknown: 'gray' }
+
+/**
+ * Блок `lead` ответа `/now` и `/deal` — в подпись экрана.
+ *
+ * Бэкенд отдаёт готовое слово (`lead.text`: «лид: жив», «лид: отсутствует ·
+ * резюм 2 из 6», «лид: нет фактов») и доказательство (`lead.evidence`), поэтому
+ * шейпер ничего не пересчитывает: он снимает префикс для узких мест, добавляет
+ * счётчик пробуждений и признак `stale` — «журнал говорит поднят, а процесса
+ * нет» (факт `lead_started` без парного `lead_exited`, см. `leadfeed.status`).
+ */
+function shapeLead(block) {
+  const b = block && typeof block === 'object' ? block : {}
+  const state = String(b.state || 'unknown')
+  const resumes = Number(b.resumes) || 0
+  const cap = Number(b.cap) || 0
+  const text = String(b.text || 'лид: нет фактов')
+  const short = text.replace(/^лид:\s*/, '')
+  return {
+    state,
+    tone: LEAD_STATE_TONE[state] || 'gray',
+    text,
+    short,
+    resumes,
+    cap,
+    resumesText: resumes ? `пробуждений ${resumes} из ${cap || '—'}` : 'пробуждений нет',
+    evidence: String(b.evidence || ''),
+    since: numOrNull(b.since),
+    last: String(b.last || ''),
+    stale: b.stale === true,
+    reason: String(b.reason || ''),
+    known: state !== 'unknown',
+  }
+}
+
+/**
+ * Лента решений лида (`decisions[]` ответа `/deal`) в строки экрана.
+ *
+ * Порядок журнальный (старые сверху) и не пересортировывается: это история
+ * решений, а не очередь. `limit` оставляет последние строки — полная история
+ * живёт в `duty attempts`/журнале, на экране нужны свежие.
+ */
+function shapeDecisions(items, limit = 50) {
+  const rows = (Array.isArray(items) ? items : []).filter((item) => item && typeof item === 'object')
+  const shown = limit && rows.length > limit ? rows.slice(-limit) : rows
+  return shown.map((item, index) => {
+    const author = String(item.author || '')
+    const at = numOrNull(item.at)
+    return {
+      key: `${String(item.kind || 'decision')}-${at === null ? 0 : at}-${index}`,
+      kind: String(item.kind || ''),
+      at,
+      clock: fmtClock(at),
+      ageText: fmtAge(numOrNull(item.age_sec)),
+      text: String(item.text || '—'),
+      stage: String(item.stage || ''),
+      author,
+      authorLabel: LEAD_AUTHOR_LABEL[author] || author,
+      tone: LEAD_AUTHOR_TONE[author] || 'gray',
+    }
+  })
+}
+
+/** Заголовок ленты решений: сколько их всего (обрезанная лента не врёт числом). */
+function decisionsCount(items) {
+  return Array.isArray(items) ? items.length : 0
 }
 
 /** Сколько дел в каждом состоянии — по строкам, а не по ответу бэкенда. */
@@ -3680,6 +3765,11 @@ export {
   fmtTitle,
   fmtClock,
   shapeDeal,
+  shapeLead,
+  shapeDecisions,
+  decisionsCount,
+  LEAD_AUTHOR_LABEL,
+  LEAD_STATE_TONE,
   shapeFinished,
   shapeFinishedPage,
   questionsText,

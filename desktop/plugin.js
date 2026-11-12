@@ -362,6 +362,10 @@ function shapeDeal(deal) {
     // считается по нему (см. `stateMeta`), иначе «ждёт ответа» звучит у блокировки
     // без вопроса.
     humanKind,
+    // Состояние лида (`lead`): у дела 1.x и у дела, до которого супервизор не
+    // дошёл, бэкенд отвечает «нет фактов» — это честный ответ, а не выдуманное
+    // «жив». Слово и доказательство целиком бэкендовы (`leadfeed.status`).
+    lead: shapeLead(d.lead),
     attemptAge,
     attemptAgeText: fmtAge(attemptAge),
     attemptNote,
@@ -384,6 +388,87 @@ function shapeDeal(deal) {
       : '',
     search: `${d.repo || ''} ${d.id || ''} ${d.title || ''} ${d.assignee || ''} ${stageRole} ${waiting.state || ''}`.toLowerCase(),
   }
+}
+
+/* ------------------------------------------ лид: состояние и лента решений */
+
+/**
+ * Тон и подпись автора решения — из того слова, которое назвал факт.
+ *
+ * Автор приходит с бэкенда (`leadfeed.answer_author`/`payload.by`): `lead` —
+ * лид решил сам, `role` — передал роли, `human` — ушёл в пул к человеку,
+ * `expired` — вопрос закрылся по сроку. Пусто — факт автора не называет
+ * (перезапуск этапа, закрытие движком), и подпись не выдумывается.
+ */
+const LEAD_AUTHOR_LABEL = { lead: 'лид', role: 'роль', human: 'человек', expired: 'срок' }
+const LEAD_AUTHOR_TONE = { lead: 'blue', role: 'purple', human: 'yellow', expired: 'gray' }
+/** Тон состояния лида: жив — зелёный, отсутствует и «нет фактов» — серые. */
+const LEAD_STATE_TONE = { live: 'green', absent: 'gray', unknown: 'gray' }
+
+/**
+ * Блок `lead` ответа `/now` и `/deal` — в подпись экрана.
+ *
+ * Бэкенд отдаёт готовое слово (`lead.text`: «лид: жив», «лид: отсутствует ·
+ * резюм 2 из 6», «лид: нет фактов») и доказательство (`lead.evidence`), поэтому
+ * шейпер ничего не пересчитывает: он снимает префикс для узких мест, добавляет
+ * счётчик пробуждений и признак `stale` — «журнал говорит поднят, а процесса
+ * нет» (факт `lead_started` без парного `lead_exited`, см. `leadfeed.status`).
+ */
+function shapeLead(block) {
+  const b = block && typeof block === 'object' ? block : {}
+  const state = String(b.state || 'unknown')
+  const resumes = Number(b.resumes) || 0
+  const cap = Number(b.cap) || 0
+  const text = String(b.text || 'лид: нет фактов')
+  const short = text.replace(/^лид:\s*/, '')
+  return {
+    state,
+    tone: LEAD_STATE_TONE[state] || 'gray',
+    text,
+    short,
+    resumes,
+    cap,
+    resumesText: resumes ? `пробуждений ${resumes} из ${cap || '—'}` : 'пробуждений нет',
+    evidence: String(b.evidence || ''),
+    since: numOrNull(b.since),
+    last: String(b.last || ''),
+    stale: b.stale === true,
+    reason: String(b.reason || ''),
+    known: state !== 'unknown',
+  }
+}
+
+/**
+ * Лента решений лида (`decisions[]` ответа `/deal`) в строки экрана.
+ *
+ * Порядок журнальный (старые сверху) и не пересортировывается: это история
+ * решений, а не очередь. `limit` оставляет последние строки — полная история
+ * живёт в `duty attempts`/журнале, на экране нужны свежие.
+ */
+function shapeDecisions(items, limit = 50) {
+  const rows = (Array.isArray(items) ? items : []).filter((item) => item && typeof item === 'object')
+  const shown = limit && rows.length > limit ? rows.slice(-limit) : rows
+  return shown.map((item, index) => {
+    const author = String(item.author || '')
+    const at = numOrNull(item.at)
+    return {
+      key: `${String(item.kind || 'decision')}-${at === null ? 0 : at}-${index}`,
+      kind: String(item.kind || ''),
+      at,
+      clock: fmtClock(at),
+      ageText: fmtAge(numOrNull(item.age_sec)),
+      text: String(item.text || '—'),
+      stage: String(item.stage || ''),
+      author,
+      authorLabel: LEAD_AUTHOR_LABEL[author] || author,
+      tone: LEAD_AUTHOR_TONE[author] || 'gray',
+    }
+  })
+}
+
+/** Заголовок ленты решений: сколько их всего (обрезанная лента не врёт числом). */
+function decisionsCount(items) {
+  return Array.isArray(items) ? items.length : 0
 }
 
 /** Сколько дел в каждом состоянии — по строкам, а не по ответу бэкенда. */
@@ -4061,6 +4146,17 @@ const CSS = `
 .duty-deal-ico{flex:none;width:15px;height:15px;fill:none;stroke:var(--ui-accent,currentColor);stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
 .duty-deal-facts{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--ui-text-secondary)}
 .duty-deal-facts b{color:var(--ui-text-primary);font-weight:600}
+/* Лента решений лида: время · автор · решение. Время и автор — узкие колонки,
+   текст забирает остаток, чтобы строки не плясали от слова к слову. */
+.duty-decisions-list{display:flex;flex-direction:column;gap:2px;max-height:320px;overflow-y:auto}
+.duty-dec-row{display:grid;grid-template-columns:58px 70px minmax(0,1fr);gap:8px;align-items:baseline;font-size:11.5px;padding:2px 0}
+.duty-dec-row+.duty-dec-row{border-top:1px solid var(--ui-stroke-tertiary)}
+.duty-dec-clock{font-size:11px;font-variant-numeric:tabular-nums;color:var(--ui-text-tertiary)}
+.duty-dec-author{font-size:10.5px;font-weight:650;text-transform:uppercase;letter-spacing:.02em}
+.duty-dec-text{color:var(--ui-text-primary);overflow-wrap:anywhere}
+/* Строка лида в ячейке состояния списка: вторичная подпись под бейджем — столбец
+   «состояние» не должен менять ширину от длинного слова. */
+.duty-lead-note{display:block;margin-top:4px;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .duty-deal-body{display:flex;flex-direction:column;gap:12px;min-width:0}
 /* Две колонки карточки дела: документы (растут) и тонкий столбец этапов — ровно
    320 px, не растёт: в нём строки этапов и попыток, а не абзацы. */
@@ -4710,7 +4806,20 @@ function DealRow({ deal, selected, onPick }) {
     h('td', { className: 'duty-num', title: attemptTitle }, deal.attemptAgeText),
     h('td', { title: leaseTitle }, deal.leaseText),
     h('td', { className: 'duty-num', title: `${deal.lastActionKind}: ${deal.lastActionSummary || '—'}` }, deal.lastActionAgeText),
-    h('td', null, h(StateBadge, { label: deal.stateLabel, tone: deal.tone, title: deal.evidence })),
+    // Лид — строкой под бейджем в той же ячейке, как в вебе и `duty now`: своего
+    // столбца у него нет, а «кто ведёт дело» — часть состояния (слова бэкенда).
+    h(
+      'td',
+      null,
+      h(StateBadge, { label: deal.stateLabel, tone: deal.tone, title: deal.evidence }),
+      deal.lead && deal.lead.known
+        ? h(
+            'span',
+            { className: 'duty-lead-note duty-muted', title: deal.lead.evidence || 'состояние лида по журналу' },
+            deal.lead.short,
+          )
+        : null,
+    ),
   )
 }
 
@@ -5007,6 +5116,35 @@ function DealFactSpans({ scale }) {
         )
       : null,
     facts.closed ? h('span', { title: facts.closed.cause || '' }, 'закрытие: ', h('b', null, facts.closed.text)) : null,
+  )
+}
+
+/** Лента решений лида (`decisions[]` ответа `/deal`) — тот же список, что в терминале. */
+function DecisionsPanel({ items }) {
+  // Пустая лента не рисуется: «решений нет» на экране свежего дела — шум, а не
+  // факт (в терминале `duty deal` об этом печатает строку).
+  const total = decisionsCount(items)
+  if (!total) return null
+  const rows = shapeDecisions(items)
+  return h(
+    'div',
+    { className: 'duty-panel' },
+    h('div', { className: 'duty-group-h' }, `решения лида · ${total}`),
+    h(
+      'div',
+      { className: 'duty-decisions-list' },
+      ...rows.map((row) =>
+        h(
+          'div',
+          { className: 'duty-dec-row', key: row.key },
+          h('span', { className: 'duty-dec-clock', title: row.ageText === '—' ? '' : `${row.ageText} назад` }, row.clock),
+          row.authorLabel
+            ? h('span', { className: 'duty-dec-author', style: { color: TONE_COLOR[row.tone] || TONE_COLOR.gray }, title: row.author }, row.authorLabel)
+            : null,
+          h('span', { className: 'duty-dec-text' }, row.text),
+        ),
+      ),
+    ),
   )
 }
 
@@ -6077,6 +6215,18 @@ function DealScreen({ sel, onBack }) {
           { className: 'duty-deal-facts' },
           h('span', null, 'статус: ', h('b', null, detail.data.status || '—')),
           h('span', null, 'исполнитель: ', h('b', null, detail.data.assignee || '—')),
+          // Состояние лида — тот же факт журнала, что в терминале: слово и
+          // доказательство бэкендовы (`leadfeed.status`), шейпер снимает префикс.
+          deal && deal.lead
+            ? h(
+                'span',
+                { title: deal.lead.evidence || 'состояние лида по журналу' },
+                'лид: ',
+                h('b', { style: { color: TONE_COLOR[deal.lead.tone] || TONE_COLOR.gray } }, deal.lead.short),
+                ' · ',
+                h('span', { className: 'duty-muted' }, deal.lead.resumesText),
+              )
+            : null,
           deal ? h('span', null, 'попытка: ', h('b', null, `${deal.attemptAgeText} (${deal.attemptNote})`)) : null,
           deal ? h('span', null, 'лизинг: ', h('b', null, deal.leaseText)) : null,
           deal ? h('span', null, 'действие: ', h('b', null, `${deal.lastActionAgeText} назад`)) : null,
@@ -6102,6 +6252,9 @@ function DealScreen({ sel, onBack }) {
       // столбец этапов — пояснение к нему.
       h(KpiStrip, { scale }),
       h(ScalePanel, { scale, dealId: sel.id, callSel, onSelectCall: selectCall, toolFilter, onToggleTool: toggleTool }),
+      // Решения лида — во всю ширину над колонками: история по времени рядом со
+      // шкалой, а не ещё один узкий столбец.
+      h(DecisionsPanel, { items: detail.data.decisions }),
       docs.length
         ? h(
             'div',

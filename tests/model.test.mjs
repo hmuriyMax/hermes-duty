@@ -43,6 +43,9 @@ import {
   shapeSays,
   shapeSilences,
   shapeDeal,
+  shapeLead,
+  shapeDecisions,
+  decisionsCount,
   shapeDealTime,
   shapeFinished,
   shapeNow,
@@ -3286,4 +3289,79 @@ test('сказанное держит попытку живой: молчани�
   const view = attemptView(scale.bars[0], scale)
   const longest = view.silences.reduce((best, item) => (item.sec > (best ? best.sec : 0) ? item : best), null)
   assert.ok(!longest || longest.sec < 900, `молчание не распалось: ${longest && longest.tip}`)
+})
+
+/* ------------------------------------- лид: состояние и лента решений (2.0) */
+
+test('лид: слово и доказательство бэкенда доезжают до поверхности без пересчёта', () => {
+  // Макс, 12.11: «почему в UI не видно постоянно работающего лида?» — блок `lead`
+  // в ответах `/now` и `/deal` был, но шейпер его не переносил, и обе поверхности
+  // (веб и десктоп берут один шейпер) про лида молчали.
+  const live = shapeLead({
+    state: 'live',
+    resumes: 2,
+    cap: 6,
+    since: 1_700_000_000,
+    last: 'lead_resumed',
+    text: 'лид: резюм 2 из 6',
+    evidence: 'журнал: последний факт лида lead_resumed, пробуждений 2 из 6',
+    stale: false,
+  })
+  // Префикс снят только для узких мест: полное слово остаётся в `text`.
+  assert.equal(live.short, 'резюм 2 из 6')
+  assert.equal(live.resumesText, 'пробуждений 2 из 6')
+  assert.equal(live.tone, 'green')
+  assert.equal(live.known, true)
+  assert.equal(live.stale, false)
+
+  // «Нет фактов» — законный ответ дела 1.x, а не «жив»: серый и `known=false`.
+  const unknown = shapeLead({ state: 'unknown', text: 'лид: нет фактов', evidence: 'журнал: ни одного факта lead_*' })
+  assert.equal(unknown.tone, 'gray')
+  assert.equal(unknown.known, false)
+  assert.equal(unknown.resumesText, 'пробуждений нет')
+  // Пустой блок (поля нет вовсе) не выдумывает лида.
+  assert.equal(shapeLead(undefined).known, false)
+
+  // `stale` — «журнал говорит поднят, а процесса нет»: слово приходит с бэкенда
+  // уже честным, шейпер только переносит признак.
+  const stale = shapeLead({ state: 'absent', text: 'лид: отсутствует', stale: true, evidence: 'журнал: последний факт лида lead_started, конец захода не записан (pid 59632 мёртв)' })
+  assert.equal(stale.state, 'absent')
+  assert.equal(stale.stale, true)
+})
+
+test('лид: `shapeDeal` переносит блок lead в строку списка', () => {
+  const row = shapeDeal({
+    id: 'd_aaaaaa',
+    status: 'running',
+    waiting: { state: 'working' },
+    lead: { state: 'live', resumes: 0, cap: 3, text: 'лид: жив', evidence: 'журнал: последний факт лида lead_started, пробуждений 0 из 3' },
+  })
+  assert.equal(row.lead.short, 'жив')
+  assert.equal(row.lead.cap, 3)
+  // Дело без блока (старый ответ) читается как «нет фактов», а не падает.
+  assert.equal(shapeDeal({ id: 'd_bbbbbb', waiting: { state: 'working' } }).lead.known, false)
+})
+
+test('решения лида: порядок журнальный, автор подписан, лента обрезается хвостом', () => {
+  const items = [
+    { kind: 'plan_accepted', at: 1_000, author: 'lead', text: 'план создан (3 этапа)' },
+    { kind: 'question_answered', at: 1_100, author: 'human', text: 'ответ на вопрос #4 пришёл от человека' },
+    { kind: 'attempt_started', at: 1_200, author: null, text: 'этап impl перезапущен после contract' },
+    { kind: 'completed', at: 1_300, author: 'lead', text: 'дело закрыто лидом' },
+  ]
+  const rows = shapeDecisions(items)
+  assert.deepEqual(rows.map((row) => row.text), items.map((item) => item.text))
+  assert.deepEqual(rows.map((row) => row.authorLabel), ['лид', 'человек', '', 'лид'])
+  // Автор назван фактом → у него свой тон; факт автора не называет (перезапуск
+  // этапа пишет движок) → подписи нет вовсе, а не выдуманный «лид».
+  assert.equal(rows[1].tone, 'yellow')
+  assert.equal(rows[2].authorLabel, '')
+
+  const tail = shapeDecisions(items, 2)
+  assert.deepEqual(tail.map((row) => row.text), items.slice(2).map((item) => item.text))
+  // Число в заголовке считает всю ленту, а не обрезанную часть.
+  assert.equal(decisionsCount(items), 4)
+  assert.equal(rows[0].clock.length, 8)
+  assert.equal(shapeDecisions(null).length, 0)
+  assert.equal(decisionsCount(undefined), 0)
 })

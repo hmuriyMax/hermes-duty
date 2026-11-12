@@ -10,7 +10,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -622,7 +622,36 @@ test('обрезанная команда доказательства несё�
 function jsdomRoot() {
   const candidates = [process.env.HERMES_REACT_ROOT, join(homedir(), '.hermes', 'hermes-agent', 'node_modules')]
     .filter(Boolean)
-  return candidates.find((dir) => existsSync(join(dir, 'jsdom', 'package.json'))) || ''
+  const direct = candidates.find((dir) => existsSync(join(dir, 'jsdom', 'package.json')))
+  // Hermes ставит зависимости через pnpm: пакеты лежат в `.pnpm/<имя>@<версия>/node_modules`,
+  // а в корне `node_modules` их может не быть вовсе. Без этого фолбэка каждый DOM-тест
+  // молча уходил в skip и «зелёный» прогон ничего не проверял.
+  if (direct) return direct
+  return pnpmRoot()
+}
+
+/**
+ * Корень node_modules, собранный из pnpm-стора: символические ссылки на пакеты,
+ * которые нужны рендеру. Строится один раз за прогон.
+ */
+let pnpmCache = ''
+function pnpmRoot() {
+  if (pnpmCache !== '') return pnpmCache
+  const store = join(homedir(), '.hermes', 'hermes-agent', 'node_modules', '.pnpm')
+  if (!existsSync(store)) return ''
+  const dir = join(mkdtempSync(join(tmpdir(), 'duty-node-modules-')), 'node_modules')
+  mkdirSync(dir)
+  let found = 0
+  for (const name of ['jsdom', 'react', 'react-dom', 'scheduler']) {
+    const entry = readdirSync(store).find((item) => item === name || item.startsWith(`${name}@`))
+    if (!entry) continue
+    const target = join(store, entry, 'node_modules', name)
+    if (!existsSync(target)) continue
+    symlinkSync(target, join(dir, name), 'dir')
+    found += 1
+  }
+  pnpmCache = found ? dir : ''
+  return pnpmCache
 }
 
 /**
@@ -1260,4 +1289,80 @@ test('веб: одиночный маркер остаётся прежним �
   assert.ok(!mark.className.includes('is-grouped'), `одиночный маркер помечен группой: ${mark.className}`)
   assert.equal(mark.querySelectorAll('i').length, 1, 'у одиночного маркера больше одной палки')
   assert.equal(mark.style.left, '50%', `одиночный маркер сдвинут: ${mark.style.left}`)
+})
+
+/* ------------------------------- лид на экране дела: состояние и решения (2.0) */
+
+test('веб: экран дела показывает лида и его решения — данные бэкенда доезжают до DOM', async (t) => {
+  // Макс, 12.11: «почему в UI не видно постоянно работающего лида?» — ответ `/deal`
+  // отдавал `deal.lead` и `decisions[]`, но ни веб, ни десктоп их не читали.
+  if (!jsdomRoot()) return t.skip('нет jsdom в ~/.hermes/hermes-agent/node_modules')
+  const { detail, attempts } = verdictClosedDeal()
+  detail.status = 'running'
+  detail.terminal = false
+  detail.deal = {
+    id: DEAL_ID,
+    status: 'running',
+    waiting: { state: 'working', evidence: 'попытка идёт' },
+    lead: {
+      state: 'live',
+      resumes: 2,
+      cap: 6,
+      text: 'лид: резюм 2 из 6',
+      evidence: 'журнал: последний факт лида lead_resumed, пробуждений 2 из 6',
+      stale: false,
+    },
+  }
+  detail.decisions = [
+    { kind: 'plan_accepted', at: DEAL_T0 + 10, author: 'lead', text: 'план создан (3 этапа)' },
+    { kind: 'question_answered', at: DEAL_T0 + 20, author: 'human', text: 'ответ на вопрос #4 пришёл от человека' },
+  ]
+  const doc = await renderDealPanel(detail, attempts)
+
+  // Состояние лида — факт шапки: слово, счётчик пробуждений и доказательство в title.
+  const lead = doc.querySelector('[data-key="fact:lead"]')
+  assert.ok(lead, 'в шапке дела нет строки лида')
+  assert.match(lead.textContent, /лид: резюм 2 из 6/, `слово лида не то: ${lead.textContent}`)
+  assert.match(lead.textContent, /пробуждений 2 из 6/, `счётчик пробуждений не показан: ${lead.textContent}`)
+  assert.equal(lead.getAttribute('title'), 'журнал: последний факт лида lead_resumed, пробуждений 2 из 6')
+  assert.ok(lead.querySelector('b.t-green'), 'тон живого лида не зелёный')
+
+  // Лента решений: строки, время, автор и текст — в том же порядке, что в журнале.
+  const panel = doc.querySelector('[data-key="decisions"]')
+  assert.ok(panel, 'нет панели решений лида')
+  assert.match(panel.querySelector('.panel-h').textContent, /решения лида · 2/)
+  const rows = [...panel.querySelectorAll('.dec-row')]
+  assert.deepEqual(
+    rows.map((row) => row.querySelector('.dec-text').textContent),
+    ['план создан (3 этапа)', 'ответ на вопрос #4 пришёл от человека'],
+  )
+  assert.deepEqual(
+    rows.map((row) => (row.querySelector('.dec-author') || { textContent: '' }).textContent),
+    ['лид', 'человек'],
+  )
+  assert.ok(rows[0].querySelector('.dec-author').className.includes('t-blue'), 'автор-лид не своим тоном')
+  assert.ok(rows[1].querySelector('.dec-author').className.includes('t-yellow'), 'автор-человек не своим тоном')
+  // Время стоит у каждой строки: лента — история, а не список без дат.
+  assert.match(rows[0].querySelector('.dec-clock').textContent, /^\d{2}:\d{2}:\d{2}$/)
+})
+
+test('веб: без фактов лида и без решений экран молчит, а не выдумывает', async (t) => {
+  if (!jsdomRoot()) return t.skip('нет jsdom в ~/.hermes/hermes-agent/node_modules')
+  const { detail, attempts } = verdictClosedDeal()
+  detail.deal = {
+    id: DEAL_ID,
+    status: 'done',
+    waiting: { state: 'no_signal', evidence: 'нет живых фактов' },
+    lead: { state: 'unknown', text: 'лид: нет фактов', evidence: 'журнал: ни одного факта lead_*' },
+  }
+  detail.decisions = []
+  const doc = await renderDealPanel(detail, attempts)
+
+  // Дело 1.x: лида не поднимали — подпись честно говорит это, но панели решений
+  // нет вовсе (пустая панель читалась бы как «лид ничего не решал»).
+  const lead = doc.querySelector('[data-key="fact:lead"]')
+  assert.ok(lead, 'нет строки лида у дела без фактов')
+  assert.match(lead.textContent, /лид: нет фактов/)
+  assert.ok(!lead.querySelector('b.t-green'), 'у дела без лида зелёный тон')
+  assert.equal(doc.querySelector('[data-key="decisions"]'), null, 'пустая лента решений нарисована')
 })

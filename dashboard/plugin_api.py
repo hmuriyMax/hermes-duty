@@ -1275,6 +1275,20 @@ def _own_attempt_facts(
     )
 
 
+def _lead_alive(events: list[dict[str, Any]]) -> Optional[bool]:
+    """Жив ли заход лида по журналу: `None` — журнал не утверждает «поднят».
+
+    Проверяется только pid из последнего `lead_started`/`lead_resumed`: если
+    фактов лида нет или последний факт уже назвал конец захода, спрашивать ядро
+    не о чем. `None` здесь — законный ответ «проверять нечего», и `leadfeed`
+    читает его как «верь журналу».
+    """
+    pid = leadfeed.open_pid(events)
+    if pid is None:
+        return None
+    return journal.pid_alive(pid)
+
+
 def _own_shaped(
     row: dict[str, Any],
     events: list[dict[str, Any]],
@@ -1327,9 +1341,11 @@ def _own_shaped(
         # Публикация — тот же факт журнала, что у `/deal` (`dashboard/publish.py`).
         "published": publish.published_of(events),
         # Состояние лида по журналу (`dashboard/leadfeed.py`): жив, отсутствует или
-        # поднят резюмом N из M. Живая сессия не спрашивается — иначе `now`
-        # отвечал бы про процесс, а не про дело (`docs/ENGINE-2.0.md`, раздел 9).
-        "lead": leadfeed.status(events),
+        # поднят резюмом N из M. Живой процесс проверяется (`pid_alive`) только
+        # когда журнал утверждает «поднят»: факт `lead_started` без парного
+        # `lead_exited` переживает убитую обёртку, и без этой проверки экран
+        # показывал живого лида у мёртвого захода (d_ff4c3c3f).
+        "lead": leadfeed.status(events, live=_lead_alive(events)),
         "waiting": _own_waiting(
             folded, question, str(row["status"]), journal_note, pool_note,
             home=home, deal_id=str(row["id"]), attempts=attempts,

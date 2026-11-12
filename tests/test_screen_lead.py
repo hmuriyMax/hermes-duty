@@ -281,6 +281,38 @@ def test_now_state_column_carries_the_lead_line(home: Path, client: TestClient) 
     assert "лид: резюм 1 из 6" in printed
 
 
+def test_stale_lead_start_is_reported_as_absent() -> None:
+    """`lead_started` без парного `lead_exited` — не «жив», а «конец не записан».
+
+    Факт пишет обёртка захода; если её убили снаружи (рестарт гейтвея, SIGKILL),
+    парного факта нет вовсе, и журнал навсегда выглядит как «лид поднят». Живость
+    проверяет тот, кто может (`plugin_api` → `journal.pid_alive`), и отдаёт ответ
+    в проекцию: без этого экран показывал живого лида у мёртвого захода — так и
+    случилось на d_ff4c3c3f (её заход 18:40 не записал конец, а `/deal` отвечал
+    «лид: жив»).
+    """
+    events = [fact(1, "lead_started", NOW - 600, {"pid": 59632, "mode": "resume", "max": 6})]
+
+    assert leadfeed.open_pid(events) == 59632
+    claimed = leadfeed.status(events)
+    assert claimed["state"] == leadfeed.STATE_LIVE
+    assert claimed["text"] == "лид: жив"
+
+    dead = leadfeed.status(events, live=False)
+    assert dead["state"] == leadfeed.STATE_ABSENT
+    assert dead["text"] == "лид: отсутствует"
+    assert dead["stale"] is True
+    assert "конец захода не записан" in dead["evidence"]
+    assert "59632" in dead["evidence"]
+
+    # Конец захода записан — проверять процесс не о чем: `open_pid` молчит, и
+    # проекция читает журнал как есть, без второго мнения.
+    ended = events + [fact(2, "lead_exited", NOW - 300, {"pid": 59632, "reason": "exit", "exit_code": 0})]
+    assert leadfeed.open_pid(ended) is None
+    assert leadfeed.status(ended, live=None)["state"] == leadfeed.STATE_ABSENT
+    assert leadfeed.status(ended, live=None)["stale"] is False
+
+
 def test_deal_screen_shows_lead_decisions_next_to_attempts(home: Path, client: TestClient) -> None:
     """Экран дела: лента решений рядом с попытками, с автором каждого ответа."""
     deal = make_deal(home)

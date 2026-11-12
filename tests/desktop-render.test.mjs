@@ -16,7 +16,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -38,14 +38,31 @@ function reactRoot() {
     process.env.HERMES_REACT_ROOT,
     join(homedir(), '.hermes', 'hermes-agent', 'node_modules'),
   ].filter(Boolean)
-  return candidates.find((dir) => existsSync(join(dir, 'react-dom', 'package.json'))) || ''
+  const direct = candidates.find((dir) => existsSync(join(dir, 'react-dom', 'package.json')))
+  if (direct) return direct
+  // pnpm-стор: в корне `node_modules` пакетов может не быть (они лежат в
+  // `.pnpm/<имя>@<версия>/node_modules`), и тогда React-тесты молча уходили в skip.
+  const store = join(homedir(), '.hermes', 'hermes-agent', 'node_modules', '.pnpm')
+  if (!existsSync(store)) return ''
+  const dir = join(mkdtempSync(join(tmpdir(), 'duty-react-')), 'node_modules')
+  mkdirSync(dir)
+  let found = 0
+  for (const name of ['react', 'react-dom', 'scheduler', 'jsdom']) {
+    const entry = readdirSync(store).find((item) => item === name || item.startsWith(`${name}@`))
+    if (!entry) continue
+    const target = join(store, entry, 'node_modules', name)
+    if (!existsSync(target)) continue
+    symlinkSync(target, join(dir, name), 'dir')
+    found += 1
+  }
+  return found ? dir : ''
 }
 
 /** Копия плагина, которую можно импортировать в Node: SDK и React подменены. */
 function moduleForRender(root) {
   const dir = mkdtempSync(join(tmpdir(), 'duty-render-'))
   mkdirSync(join(dir, 'node_modules'))
-  for (const name of ['react', 'react-dom', 'scheduler']) {
+  for (const name of ['react', 'react-dom', 'scheduler', 'jsdom']) {
     const target = join(root, name)
     if (existsSync(target)) symlinkSync(target, join(dir, 'node_modules', name), 'dir')
   }
@@ -62,7 +79,7 @@ function moduleForRender(root) {
   const source = read('desktop/plugin.js')
     .replace(/from '@hermes\/plugin-sdk'/, "from './sdk.mjs'")
     .concat(
-      '\nexport { DutyLane, DutyAttemptRow, ScalePanel, KpiStrip, SpecStrip, CallInspector, DutyMiniTimeline, FinishedBlock, shapeFinishedRow, dealTimeline, stageRole, DutyPage, parseWindow, TL_WINDOWS, windowLabel }\n',
+      '\nexport { DutyLane, DutyAttemptRow, ScalePanel, KpiStrip, SpecStrip, CallInspector, DutyMiniTimeline, FinishedBlock, shapeFinishedRow, dealTimeline, stageRole, DutyPage, parseWindow, TL_WINDOWS, windowLabel, DecisionsPanel, DealRow, DealFactSpans, shapeDeal }\n',
     )
   const file = join(dir, 'plugin.mjs')
   writeFileSync(file, source)
@@ -925,4 +942,71 @@ test('десктоп: страница — таймлайн и развёрну�
     }
     keepWindow = dom.window
   }
+})
+
+test('десктоп: лента решений лида рендерится, пустая — не рисуется', async (t) => {
+  // Макс, 12.11: «почему в UI не видно постоянно работающего лида?» — компонент
+  // обязан показывать решения лида тем же списком, что печатает `duty deal`, и
+  // молчать, когда решений нет (пустая панель читалась бы как «лид ничего не решал»).
+  const root = reactRoot()
+  if (!root) return t.skip('нет React в ~/.hermes/hermes-agent/node_modules')
+
+  const mod = await import(pathToFileURL(moduleForRender(root)).href)
+  const React = (await import(pathToFileURL(join(root, 'react', 'index.js')).href)).default
+  const { renderToStaticMarkup } = await import(pathToFileURL(join(root, 'react-dom', 'server.node.js')).href)
+
+  const html = renderToStaticMarkup(
+    React.createElement(mod.DecisionsPanel, {
+      items: [
+        { kind: 'plan_accepted', at: 1_700_000_000, author: 'lead', text: 'план создан (3 этапа)' },
+        { kind: 'question_answered', at: 1_700_000_100, author: 'human', text: 'ответ на вопрос #4 пришёл от человека' },
+      ],
+    }),
+  )
+  assert.match(html, /решения лида · 2/, 'заголовок ленты не назвал число решений')
+  assert.equal((html.match(/duty-dec-row/g) || []).length, 2, 'строк не две')
+  assert.match(html, /план создан \(3 этапа\)/, 'решение не доехало до разметки')
+  assert.match(html, /duty-dec-author[^>]*>лид</, 'автор-лид не подписан')
+  assert.match(html, /duty-dec-author[^>]*>человек</, 'автор-человек не подписан')
+  // Время у каждой строки: лента — история, а не список без дат.
+  assert.equal((html.match(/duty-dec-clock/g) || []).length, 2, 'время есть не у каждой строки')
+
+  const empty = renderToStaticMarkup(React.createElement(mod.DecisionsPanel, { items: [] }))
+  assert.equal(empty, '', 'пустая лента что-то нарисовала')
+})
+
+test('десктоп: экран дела и строка списка берут лида из шейпера', async (t) => {
+  // Проверка проводки, а не только компонента: `deal.lead` собирает шейпер
+  // (`shapeDeal`), и экран/строка обязаны читать именно его — иначе лид снова
+  // «есть в данных, нет на экране».
+  const source = read('desktop/plugin.js')
+  assert.match(source, /h\(DecisionsPanel, \{ items: detail\.data\.decisions \}\)/, 'экран дела не передаёт решения в ленту')
+  assert.match(source, /deal\.lead && deal\.lead\.known/, 'строка списка не рисует лида')
+  assert.match(source, /duty-lead-note/, 'нет класса строки лида')
+  const css = source.replace(/\/\*[\s\S]*?\*\//g, '')
+  assert.match(css, /\.duty-lead-note\{/, 'нет правила .duty-lead-note')
+  assert.match(css, /\.duty-dec-row\{/, 'нет правила .duty-dec-row')
+})
+
+test('десктоп: в строке списка лид стоит под бейджем, а не отдельным столбцом', async (t) => {
+  // Обе поверхности подписывают лида ВНУТРИ ячейки состояния (`duty now` тоже
+  // дописывает его к состоянию): новый столбец сломал бы общую геометрию таблицы.
+  const root = reactRoot()
+  if (!root) return t.skip('нет React в ~/.hermes/hermes-agent/node_modules')
+  const mod = await import(pathToFileURL(moduleForRender(root)).href)
+  const React = (await import(pathToFileURL(join(root, 'react', 'index.js')).href)).default
+  const { renderToStaticMarkup } = await import(pathToFileURL(join(root, 'react-dom', 'server.node.js')).href)
+
+  const deal = mod.shapeDeal({
+    id: 'd_aaaaaa',
+    status: 'running',
+    waiting: { state: 'working', evidence: 'попытка идёт' },
+    lead: { state: 'live', resumes: 1, cap: 6, text: 'лид: резюм 1 из 6', evidence: 'журнал: последний факт лида lead_resumed' },
+  })
+  const html = renderToStaticMarkup(React.createElement(mod.DealRow, { deal, selected: false, onPick: () => {} }))
+  const cells = (html.match(/<td/g) || []).length
+  assert.equal(cells, 8, `столбцов ${cells}, а таблица списка знает восемь`)
+  assert.match(html, /duty-lead-note/, 'в ячейке состояния нет строки лида')
+  assert.match(html, /резюм 1 из 6/, 'слово лида не доехало до строки')
+  assert.match(html, /журнал: последний факт лида lead_resumed/, 'доказательство лида не в подсказке')
 })

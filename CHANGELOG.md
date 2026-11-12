@@ -120,7 +120,12 @@
   tests/…`, `bin/duty demo|now|why|deals|stats|version`, `bin/duty-version check`,
   `hermes plugins validate|info`, `hermes tools list`; без них «прогнать гейты» у
   ревьюера плагина невозможно, а гейт — единственное доказательство, которое он
-  может предъявить сам.
+  может предъявить сам. Право на команду не равно возможности её выполнить:
+  `python -m pytest` проходил allowlist и падал у ревьюера, потому что его `python3`
+  — системный, без pytest (живой случай круга 4: вердикт вынесен по чужим числам).
+  Поэтому у плагина один вход в гейты — `bin/duty-test`: сам выбирает интерпретатор
+  (`$HERMES_PYTHON` → venv Hermes → `python3`, с проверкой `import pytest`) и гоняет
+  pytest + все `tests/*.test.mjs` + `bin/duty demo` + `hermes plugins validate`.
   Отказ даётся за: перенаправление в файл, `$(...)` и обратные кавычки, фоновое
   выполнение, `gofmt -w`, `git commit|checkout|push`, `make format`, `go generate`,
   обёртки вида `sh -c`, `python -c`/`-m http.server`/`-m pip`, `node -e|--eval`,

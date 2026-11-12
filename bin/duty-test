@@ -1,0 +1,62 @@
+#!/bin/sh
+# `bin/duty-test` — гейты плагина одной командой, тем интерпретатором, у которого есть pytest.
+#
+# Зачем: роль, которой разрешено «прогнать проверки» (ревьюер, 0.2.1), не обязана
+# знать, какой python в этом дереве настоящий. Системный `/usr/bin/python3` на этой
+# машине без pytest, venv Hermes — с ним, и живой случай уже был: ревью круга 4
+# честно написало «pytest запустить не смог» и судило по чужим числам. Один вход
+# снимает вопрос: `bin/duty-test`.
+#
+# Порядок выбора интерпретатора: $HERMES_PYTHON → venv Hermes → python3.
+# Код возврата: 0 — все гейты зелёные, 1 — есть красный, 2 — нет интерпретатора.
+#
+#   bin/duty-test             # pytest + node-тесты + bin/duty demo + валидатор манифеста
+#   bin/duty-test -k close    # аргументы уходят в pytest (узкий прогон для отладки)
+set -u
+
+cd "$(dirname "$0")/.." || exit 2
+
+PY="${HERMES_PYTHON:-}"
+if [ -z "$PY" ]; then
+    for candidate in "$HOME/.hermes/hermes-agent/venv/bin/python" "$(command -v python3 || true)"; do
+        if [ -n "$candidate" ] && [ -x "$candidate" ] && "$candidate" -c 'import pytest' >/dev/null 2>&1; then
+            PY="$candidate"
+            break
+        fi
+    done
+fi
+if [ -z "$PY" ]; then
+    echo "bin/duty-test: нет python с pytest (задай HERMES_PYTHON)" >&2
+    exit 2
+fi
+
+status=0
+echo "== pytest ($PY)"
+"$PY" -m pytest tests/ -q -p no:randomly "$@" || status=1
+
+if command -v node >/dev/null 2>&1; then
+    for suite in tests/model.test.mjs tests/markup.test.mjs tests/web.test.mjs tests/desktop-render.test.mjs; do
+        [ -f "$suite" ] || continue
+        echo "== node $suite"
+        node "$suite" || status=1
+    done
+else
+    echo "== node: нет в PATH, node-тесты пропущены" >&2
+fi
+
+echo "== bin/duty demo"
+"$PY" bin/duty demo >/dev/null || status=1
+
+if command -v hermes >/dev/null 2>&1; then
+    echo "== hermes plugins validate ."
+    hermes plugins validate . >/dev/null || status=1
+else
+    echo "== hermes: нет в PATH, валидатор манифеста пропущен" >&2
+fi
+
+if [ "$status" = 0 ]; then
+    echo "все гейты зелёные"
+else
+    echo "есть красный гейт" >&2
+fi
+exit "$status"

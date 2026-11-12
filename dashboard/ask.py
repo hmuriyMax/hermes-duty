@@ -288,7 +288,7 @@ def find_live(home: Path, deal_id: str) -> Optional[dict[str, Any]]:
     return None if row is None else dict(row)
 
 
-def resolve(home: Path, question_id: Any, answer: str, *, via: str = "lead") -> bool:
+def resolve(home: Path, question_id: Any, answer: str, *, via: str = "lead", deal_id: Any) -> bool:
     """Закрыть **живой** вопрос пула ответом лида — штатным путём пула.
 
     Лид отвечает воркеру (`duty_answer`) и делает это раньше человека: вопрос,
@@ -298,10 +298,15 @@ def resolve(home: Path, question_id: Any, answer: str, *, via: str = "lead") -> 
     лида закрывает строку пула так же, как `msgq resolve`: теми же полями
     (`status`, `answer`, `answered_at`, `answered_via`).
 
+    Строка сверяется **вместе с делом**: `session_key` (`t_<deal_id>`) стоит в том
+    же `WHERE`, что и номер. Номер сам по себе — не адрес: названный не тем делом
+    он закрыл бы чужой живой вопрос другого дела тихо и безвозвратно, и человек
+    никогда не увидел бы вопроса, на который его просили ответить.
+
     Перезаписи не происходит: `WHERE status IN ('pending','sent')` — ответ
     человека, дошедший первым, остаётся его ответом, а повтор лида даёт `False`.
     Возврат — «строка была живой и закрыта этим вызовом»; `False` значит «пул
-    закрыл вопрос сам» и это не ошибка.
+    закрыл вопрос сам или вопрос чужой» и это не ошибка.
     """
     db = pool_path(Path(home))
     if not db.is_file():
@@ -310,6 +315,7 @@ def resolve(home: Path, question_id: Any, answer: str, *, via: str = "lead") -> 
         number = int(str(question_id).strip())
     except (TypeError, ValueError):
         raise ValueError(f"ask: номер вопроса не разобран: {question_id!r}") from None
+    key = session_key(str(deal_id or ""))
     marks = ", ".join("?" * len(LIVE_STATUSES))
     try:
         conn = sqlite3.connect(db, timeout=BUSY_TIMEOUT_MS / 1000)
@@ -318,8 +324,8 @@ def resolve(home: Path, question_id: Any, answer: str, *, via: str = "lead") -> 
             cur = conn.execute(
                 "UPDATE questions SET status='answered', answer=?, "
                 "answered_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), answered_via=? "
-                f"WHERE id = ? AND status IN ({marks})",
-                (str(answer), via, number, *LIVE_STATUSES),
+                f"WHERE id = ? AND session_key = ? AND status IN ({marks})",
+                (str(answer), via, number, key, *LIVE_STATUSES),
             )
             conn.commit()
             return int(cur.rowcount or 0) > 0

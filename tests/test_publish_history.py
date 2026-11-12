@@ -72,6 +72,10 @@ journal = load_module("hermes_duty_journal", "journal.py")
 deals = load_module("hermes_duty_deals", "deals.py")
 publish = load_module("hermes_duty_publish", "publish.py")
 tools = load_module("hermes_duty_tools", "tools.py")
+# Движок и канал вопросов: живой вопрос гейта задаёт `runner.run_stage`, а ответ
+# человека дочитывает `ask.sync_answers` — так же, как в прогоне.
+runner = load_module("hermes_duty_runner", "runner.py")
+ask_module = load_module("hermes_duty_ask", "ask.py")
 
 
 # ------------------------------------------------------ факты чистого слоя
@@ -923,6 +927,87 @@ def test_human_gate_comes_from_the_charter(
 
     assert "гейт gate не спрашивал" in reason
     assert spawned == []
+
+
+def answer_pool(home: Path, question_id: Any, text: str) -> None:
+    """Человек ответил в пуле — так вопрос закрывает панель/iMessage, не duty."""
+    conn = sqlite3.connect(home / "messaging" / "pool.db")
+    try:
+        conn.execute(
+            "UPDATE questions SET status = 'answered', answer = ?, answered_at = ?, answered_via = NULL "
+            "WHERE id = ?",
+            (text, "2026-09-01T00:00:00.000Z", int(question_id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def pool_question(home: Path, question_id: Any) -> dict[str, Any]:
+    """Строка пула по номеру: вопрос, адрес дела и срок."""
+    conn = sqlite3.connect(home / "messaging" / "pool.db")
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT * FROM questions WHERE id = ?", (int(question_id),)).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    return dict(row)
+
+
+def test_the_human_gate_question_is_asked_by_the_live_gate_stage(tmp_path: Path):
+    """`routing.approved_commit` пишет движок на живом вопросе гейта, а не тест.
+
+    Замечание ревью круга 2: `_publish_refusal` спрашивает `approval(...)` с
+    `pin=True`, то есть требует `approved_commit` в `question_asked.payload.routing`,
+    а прежние тесты гейта собирали этот факт руками (`ask_gate`). Писатель —
+    `runner._ask_gate` (`dashboard/runner.py`): вопрос гейт-этапа идёт через
+    `ask.ask`, и в `routing` уезжает фактическая база публикуемого дерева
+    (`publish_facts` того этапа, за которым стоит публикация).
+
+    Здесь весь путь живой: гейт-этап поднимает сам движок
+    (`runner.run_stage`), человек отвечает в пуле, `ask.sync_answers` дочитывает
+    ответ, приговор гейта пишет `attempt_ended`, и `duty_start` публикации при
+    `publish: {human_gate: true}` поднимает попытку — по фактам журнала.
+    """
+    repo, first, second = git_repo(tmp_path)
+    home = make_home(tmp_path)
+    spec = write_spec(
+        tmp_path,
+        seed_with_charter(
+            repo, second, "publish: {human_gate: true}", IMPL, REVIEW, HUMAN_GATE, GATED_PUBLISH
+        ),
+    )
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    append(conn, deal, ended(stage="review", commit=first), approve(stage="review", attempt=1))
+
+    asked = runner.run_stage(conn, spec, deal, "gate", 1, home=home, clock=lambda: NOW)
+
+    assert asked["started"] is True, asked
+    question_id = asked["question_id"]
+    routed = [
+        journal.payload_of(event)
+        for event in journal.read_events(conn, str(deal["id"]))
+        if str(event["kind"]) == "question_asked"
+    ]
+    assert [item["routing"]["approved_commit"] for item in routed] == [second], (
+        "одобряемый коммит назван самим вопросом гейта"
+    )
+    assert pool_question(home, question_id)["session_key"] == f"t_{deal['id']}"
+
+    answer_pool(home, question_id, "публиковать")
+    assert ask_module.sync_answers(conn, home)["appended"] == 1
+    verdict = runner.run_stage(conn, spec, deal, "gate", 2, home=home, clock=lambda: NOW)
+    assert verdict["outcome"] == "done", verdict
+
+    spawned: list[tuple[Any, ...]] = []
+    answer = tools.start(
+        str(deal["id"]), "publish", "start-live-gate", home=home, spawn=fake_spawn(spawned), ack_sec=0
+    )
+
+    assert answer["started"] is True
+    assert spawned == [(str(deal["id"]), "publish", 1, "start-live-gate")]
 
 
 def test_risky_stage_asks_the_human_even_without_the_charter_gate(tmp_path: Path):

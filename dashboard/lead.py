@@ -53,6 +53,9 @@ RUNNER_MODULE_NAME = "hermes_duty_runner"
 ASK_MODULE_NAME = "hermes_duty_ask"
 FAILURES_MODULE_NAME = "hermes_duty_failures"
 BUDGET_MODULE_NAME = "hermes_duty_budget"
+# Потолки блокирующих вызовов живут у их владельца — в тулсете (`WAIT_CEILING_SEC`
+# у `duty_wait`): супервизор спрашивает их оттуда, а не держит вторую копию числа.
+TOOLS_MODULE_NAME = "hermes_duty_tools"
 
 
 def _load(name: str, filename: str) -> Any:
@@ -78,6 +81,7 @@ runner = _load(RUNNER_MODULE_NAME, "runner.py")
 ask = _load(ASK_MODULE_NAME, "ask.py")
 failures = _load(FAILURES_MODULE_NAME, "failures.py")
 budget = _load(BUDGET_MODULE_NAME, "budget.py")
+tools = _load(TOOLS_MODULE_NAME, "tools.py")
 
 # Писатель фактов лида: это супервизор, а не модель. По источнику видно, что
 # «лид поднят» сказал сторож, а решения по делу (`plan_accepted` и соседи) — сам
@@ -115,12 +119,25 @@ DEFAULT_MAX_RESUMES = 6
 
 # Порог тишины захода (`docs/ENGINE-2.0.md`, раздел 10, `lead_idle_timeout`):
 # сколько секунд поток сессии может молчать, пока процесс ещё жив. Тишина — это
-# не «нет фактов» (лид законно ждёт их в `duty_wait`), а «процесс ничего не
-# говорит вовсе»: заблокированный `duty_wait` возвращается с `tool_result` не
-# позже `WAIT_CEILING_SEC` (300 с, `dashboard/tools.py`), поэтому 15 минут тишины
-# в потоке — зависание, а не работа. Порог меньше бюджета захода (1800 с): иначе
-# тишина была бы видна только через `overrun`.
+# не «лид законно ждёт работу»: ожидание внутри блокирующего вызова инструмента
+# видно по самому потоку (`tool_use` без `tool_result`), и к такому вызову порог
+# не применяется — у каждого вызова свой потолок (`_call_ceiling`). Порог
+# считается по **потоку**, а не по журналу: дело, которое законно ждёт фактов, не
+# должно выглядеть зависшим. Порог меньше бюджета захода (1800 с): иначе тишина
+# была бы видна только через `overrun`.
 LEAD_IDLE_TIMEOUT_SEC = 900
+
+# Запас к потолку блокирующего вызова. Потолок — это срок самого инструмента
+# (`duty_wait` возвращается «не позже 300 с»), а `tool_result` доезжает через поток
+# сессии: без запаса законный вызов гасился бы ровно на своём пределе.
+BLOCKING_GRACE_SEC = 60.0
+
+# Блокирующие вызовы лида с собственным потолком (`_call_ceiling`): `duty_wait`
+# держит турн до `tools.WAIT_CEILING_SEC`, `duty_ask` — всю под-попытку роли
+# (`runner.ask_role` ждёт процесс до `runner.ttl_sec` этапа). Остальные вызовы
+# своего потолка не имеют: их сторожит бюджет захода (`overrun`).
+BLOCKING_WAIT = "duty_wait"
+BLOCKING_ASK = "duty_ask"
 
 # Режимы захода: первый (бриф) и продолжение (дайджест фактов после курсора).
 MODE_FIRST = "brief"
@@ -838,6 +855,89 @@ def _line_object(line: str) -> Optional[dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
+def _note_call(open_calls: dict[str, tuple[str, float]], data: dict[str, Any], at: float) -> None:
+    """Отметить открытый вызов инструмента и его закрытие: пара `tool_use`↔`tool_result`.
+
+    Поток сессии говорит о вызовах двумя строками (`hermes_cli/stream_json.py`):
+    `tool_use` — вызов начался, `tool_result` — вернулся. Пока второй строки нет,
+    лид сидит внутри вызова и по определению ничего не печатает — именно это
+    отличает ожидание от зависания. Ключ пары — `tool_call_id`, если ядро его
+    дало, иначе имя: два параллельных вызова одного имени иначе затёрли бы друг
+    друга, а имя без id — единственное, что есть у старых строк.
+    """
+    kind = str(data.get("type") or "")
+    if kind not in ("tool_use", "tool_result"):
+        return
+    name = str(data.get("name") or "")
+    key = str(data.get("tool_call_id") or name)
+    if kind == "tool_use":
+        open_calls.setdefault(key, (name, at))
+        return
+    open_calls.pop(key, None)
+
+
+def _call_ceiling(name: str, spec: Any) -> Optional[float]:
+    """Сколько секунд вызов вправе молчать: `None` — своего потолка нет.
+
+    Потолок — срок самого инструмента, а не общий порог тишины: `duty_wait`
+    возвращается с `tool_result` не позже `tools.WAIT_CEILING_SEC` (300 с), а
+    `duty_ask` держит лида **всю** под-попытку роли — `runner.ask_role` ждёт её
+    процесс до `runner.ttl_sec` этапа (`process.wait(deadline_sec)`), поэтому
+    потолок берётся тот же, а не 900 с порога. Под-попытка, которая отвечает
+    дольше порога тишины, — обычное дело для роли-исполнителя, и гасить заход на
+    ней значило бы обрывать работу, которую никто не бросал.
+
+    У остальных вызовов своего потолка нет: их сторожит бюджет захода (`overrun`),
+    и придумывать им срок здесь значило бы гасить живую работу по чужому числу.
+    """
+    if name == BLOCKING_WAIT:
+        return float(tools.WAIT_CEILING_SEC) + BLOCKING_GRACE_SEC
+    if name == BLOCKING_ASK:
+        return float(_ask_budget_sec(spec)) + BLOCKING_GRACE_SEC
+    return None
+
+
+def _ask_budget_sec(spec: Any) -> int:
+    """Срок под-попытки роли в секундах — тот же `runner.ttl_sec`, что у `ask_role`.
+
+    Какой именно этап отвечает роль, знает только вызов (`tools._ask_target`), а
+    супервизор видит спеку целиком: берётся самый щедрый срок дела. Лишний запас
+    здесь безопаснее ложного зависания — пересидевший своё ожидание вызов всё
+    равно виден как `overrun`.
+    """
+    stages = tuple(getattr(spec, "stages", ()) or ())
+    return max([runner.ttl_sec(None), *(runner.ttl_sec(stage) for stage in stages)])
+
+
+def _hang(
+    *,
+    now: float,
+    last_line_at: float,
+    open_calls: dict[str, tuple[str, float]],
+    idle_sec: float,
+    spec: Any,
+) -> bool:
+    """Пора ли гасить заход: поток молчит, и ждать внутри вызова больше нечего.
+
+    Два разных случая, и путать их нельзя:
+
+    - лид ничего не печатает и **не держит** открытого вызова — это тишина в
+      чистом виде, и её мерит `idle_sec` (`lead_exited(reason="idle")` + резюм);
+    - лид сидит внутри вызова — тишина законна, пока вызов жив; зависанием
+      считается только вызов, пересидевший свой потолок (`_call_ceiling`).
+
+    Вызов без своего потолка не гасится по тишине вовсе: его срок — бюджет захода
+    (`overrun`).
+    """
+    if not open_calls:
+        return now - last_line_at >= idle_sec
+    for name, started in open_calls.values():
+        ceiling = _call_ceiling(name, spec)
+        if ceiling is not None and now - started >= ceiling:
+            return True
+    return False
+
+
 def run(
     home: Path,
     deal_id: str,
@@ -856,9 +956,11 @@ def run(
     факта не оставит. Порядок ровно как у попытки (`runner.start_stage`):
     сначала взаимное исключение, потом процесс, потом факт с его pid.
 
-    `idle_timeout` — порог тишины потока (`LEAD_IDLE_TIMEOUT_SEC` по умолчанию):
-    молчащий процесс, который ещё жив, гасится с `lead_exited(reason="idle")`, и
-    супервизор поднимает резюм штатно — «лид завис», раздел 10 контракта.
+    `idle_timeout` — порог тишины захода (`LEAD_IDLE_TIMEOUT_SEC` по умолчанию):
+    заход, который молчит и не держит открытого вызова инструмента, гасится с
+    `lead_exited(reason="idle")`, и супервизор поднимает резюм штатно — «лид
+    завис», раздел 10 контракта. Внутри блокирующего вызова тишина законна: порог
+    применяется к самому вызову по его собственному потолку (`_hang`).
     """
     home = Path(home).expanduser()
     budget_sec = DEFAULT_RUN_BUDGET_SEC if run_budget is None else max(1, _int(run_budget))
@@ -971,6 +1073,9 @@ def run(
         renew_every = max(ttl / 3.0, runner.POLL_SEC)
         last_renew = monotonic()
         last_line_at = monotonic()
+        # Открытые вызовы инструментов: ключ → (имя, момент начала). Пока вызов
+        # жив, молчание потока — это ожидание внутри него, а не зависание.
+        open_calls: dict[str, tuple[str, float]] = {}
         while True:
             if monotonic() - last_renew >= renew_every:
                 runner.renew(
@@ -985,17 +1090,28 @@ def run(
                     reason = "overrun"
                     process.stop()
                     break
-                # Тишина в потоке: процесс жив, но ничего не говорит. Живой
-                # `duty_wait` возвращается с `tool_result` не позже 300 с, так
-                # что молчание дольше порога — зависание, а не ожидание работы.
-                if monotonic() - last_line_at >= idle_sec:
+                # Тишина в потоке: процесс жив, но ничего не говорит. Зависание
+                # это или законное ожидание, решает вызов (`_hang`): внутри
+                # `duty_wait` лид молчит до 300 с, внутри `duty_ask` — всю
+                # под-попытку роли, а без вызова молчание дольше порога и есть
+                # зависание.
+                if _hang(
+                    now=monotonic(),
+                    last_line_at=last_line_at,
+                    open_calls=open_calls,
+                    idle_sec=idle_sec,
+                    spec=spec,
+                ):
                     reason = "idle"
                     process.stop()
                     break
                 continue
             last_line_at = monotonic()
             data = _line_object(line)
-            if data is None or str(data.get("type") or "") != "result":
+            if data is None:
+                continue
+            _note_call(open_calls, data, last_line_at)
+            if str(data.get("type") or "") != "result":
                 continue
             found = data.get("session_id")
             if isinstance(found, str) and found:

@@ -777,10 +777,18 @@ def start(
             "слот этапа занят, дождись её факта или отмени её"
         )
     if attempt > ceiling:
+        # Чей потолок — хартии или умолчания — отказ называет прямо: спека без
+        # блока `charter` получает те же 3 попытки, но «хартией» это назвать
+        # нельзя, иначе лид ищет в деле причину, которой в нём не объявлено.
+        declared = bool(getattr(getattr(graph, "charter", None), "declared", False))
+        source = (
+            f"хартией (charter.max_attempts={ceiling})"
+            if declared
+            else f"потолком по умолчанию {ceiling} (`charter` не объявлен)"
+        )
         raise ToolsError(
-            f"этап {name!r}: попыток {attempt - 1} из {ceiling} — серия исчерпана "
-            "хартией (charter.max_attempts): новая попытка — новая ревизия плана, "
-            "а не повтор duty_start"
+            f"этап {name!r}: попыток {attempt - 1} из {ceiling} — серия исчерпана {source}: "
+            "новая попытка — новая ревизия плана, а не повтор duty_start"
         )
     if len(live) >= MAX_SLOTS:
         named = ", ".join(str(row.get("run_id") or "") for row in live)
@@ -1219,12 +1227,14 @@ def answer(
     # (`ask.resolve`, те же поля, что у `msgq resolve`). Иначе вопрос висит в
     # панели/iMessage, человек жмёт кнопку по уже отвеченному вопросу, и его
     # нажатие даёт второй `question_answered` (живое дело `d_8ec6a401`, #555).
+    # Строка сверяется и по делу: номер, названный не тем делом, чужой живой
+    # вопрос не закроет.
     # Сбой пула ответ не отменяет: факт записан, воркер продолжается — но об этом
     # сказано ответом (`pool_resolved`), а не тишиной.
     pool_resolved = False
     if number:
         try:
-            pool_resolved = ask_module.resolve(home, question_id, word, via=SOURCE)
+            pool_resolved = ask_module.resolve(home, question_id, word, via=SOURCE, deal_id=str(deal["id"]))
         except (ask_module.AskError, ValueError):
             pool_resolved = False
     # Блок `needs_input` ставил движок под вопрос попытки, и снимает его тот, кто

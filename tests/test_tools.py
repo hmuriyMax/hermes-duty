@@ -425,6 +425,64 @@ def test_start_refuses_past_the_charter_attempt_ceiling(tmp_path: Path) -> None:
     assert row_count(conn, deal) == before
 
 
+def test_start_refuses_past_the_default_ceiling_without_a_charter(tmp_path: Path) -> None:
+    """Спека **без** блока `charter`: потолок 3 действует, но отказ называет умолчание.
+
+    Раздел 11 обещает «3 попытки на этап» и без хартии — `Charter.max_attempts`
+    приходит умолчанием, — поэтому четвёртый `duty_start` по тому же этапу
+    отказывает. Разница с объявленной хартией одна, и она в причине: спека без
+    блока получает «потолок по умолчанию 3 (`charter` не объявлен)», а не
+    «хартией (charter.max_attempts)» — иначе лид ищет в деле причину, которой в
+    нём нет.
+
+    Красная проба: без разбора `Charter.declared` отказ называет хартией то, чего
+    в деле не объявлено; без самого потолка четвёртая попытка поднимается.
+    """
+    home = make_home(tmp_path)
+    spec = write_spec(
+        tmp_path,
+        """
+        duty: потолок по умолчанию
+        repo: ~/GolandProjects/duty
+        stages:
+          - id: impl
+            role: implementer
+            workspace: none
+            evidence:
+              - {cmd: "true", must: 0}
+        """,
+    )
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    for attempt in (1, 2, 3):
+        append(
+            conn,
+            deal,
+            (
+                "attempt_started",
+                {"run_id": f"impl#{attempt}", "stage": "impl", "attempt": attempt, "pid": attempt},
+            ),
+            (
+                "attempt_ended",
+                {"run_id": f"impl#{attempt}", "stage": "impl", "attempt": attempt, "outcome": "done"},
+            ),
+        )
+    before = row_count(conn, deal)
+    spawned: list[tuple[Any, ...]] = []
+
+    assert spec.charter.declared is False, "спека без блока `charter`"
+    reason = refusal(
+        tools.start, str(deal["id"]), "impl", "start-4", home=home, spawn=fake_spawn(spawned), ack_sec=0
+    )
+
+    assert "попыток 3 из 3" in reason
+    assert "потолком по умолчанию 3" in reason
+    assert "`charter` не объявлен" in reason
+    assert "хартией" not in reason
+    assert spawned == []
+    assert row_count(conn, deal) == before
+
+
 def test_start_refuses_when_slots_are_taken(tmp_path: Path) -> None:
     """Живых попыток `MAX_SLOTS`: третий этап не поднимается, журнал не растёт."""
     home = make_home(tmp_path)

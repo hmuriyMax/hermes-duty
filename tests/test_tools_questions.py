@@ -494,14 +494,20 @@ def test_lead_asks_the_human_and_the_deal_waits(tmp_path: Path) -> None:
 
 # ------------------- 4. один вопрос — один ответ: пул и журнал сходятся
 
-def add_pool_question(home: Path, deal: dict[str, Any], number: int, text: str = "в каком формате отчёт?") -> None:
-    """Строка пула ровно с номером вопроса из журнала — так выглядит живой вопрос."""
+def add_pool_question(
+    home: Path, deal: dict[str, Any], number: int, text: str = "в каком формате отчёт?", *, session_key: str = ""
+) -> None:
+    """Строка пула ровно с номером вопроса из журнала — так выглядит живой вопрос.
+
+    `session_key` по умолчанию — ключ этого дела (`t_<deal_id>`); другое значение
+    ставит строку чужому делу ровно так, как её завёл бы пул.
+    """
     conn = sqlite3.connect(home / "messaging" / "pool.db")
     try:
         conn.execute(
             "INSERT INTO questions (id, session_key, text, origin, status, critical, timeout) "
             "VALUES (?, ?, ?, 'duty', 'sent', 0, 24.0)",
-            (number, f"t_{deal['id']}", text),
+            (number, session_key or f"t_{deal['id']}", text),
         )
         conn.commit()
     finally:
@@ -571,6 +577,51 @@ def test_lead_answer_closes_the_pool_question_and_the_button_changes_nothing(tmp
     assert folded["state"] != "wait_human"
     assert "ответа нет" not in str(folded["evidence"] or "")
     assert transit.deal_state(spec, events) != transit.WAIT_HUMAN
+
+
+def test_lead_answer_does_not_close_a_foreign_question(tmp_path: Path) -> None:
+    """Номер вопроса без своего дела чужой живой вопрос не закрывает.
+
+    `ask.resolve` закрывает строку пула по номеру, а номер сам по себе — не адрес:
+    ответ лида этого дела по номеру, который в пуле принадлежит другому делу,
+    гасил чужой вопрос тихо и безвозвратно, и человек никогда не видел вопроса, на
+    который его просили ответить. Поэтому `session_key` (`t_<deal_id>`) сверяется
+    вместе с номером, а факт журнала пишется как обычно: воркеру ответ нужен
+    независимо от того, чья строка в пуле.
+
+    Красная проба: без сверки строка чужого дела уходит в `answered` с ответом
+    этого дела.
+    """
+    home = make_home(tmp_path)
+    spec = write_spec(tmp_path, SEED)
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    seed_worker_question(conn, deal, 41)
+    add_pool_question(home, deal, 41, session_key="t_d_чужое")
+    seen: list[Any] = []
+    spawn = process_spawner(
+        home, spec, seen, Fake(pack=True, result={"status": "done", "summary": "по ответу лида"})
+    )
+
+    report = tools.answer(
+        str(deal["id"]),
+        "impl",
+        41,
+        "формат JSON",
+        "answer-foreign",
+        home=home,
+        spawn=spawn,
+        clock=lambda: NOW + 10,
+        ack_sec=0,
+    )
+
+    assert report["answered"] is True
+    assert report["pool_resolved"] is False, "чужую строку пула этот ответ не закрывает"
+    rows = pool_rows(home)
+    assert len(rows) == 1
+    assert (rows[0]["status"], rows[0]["answer"], rows[0]["answered_via"]) == ("sent", None, None)
+    answered = facts(conn, deal, "question_answered")
+    assert [item["answer"] for item in answered] == ["формат JSON"]
 
 
 # --------------------------------------------------------- 5. повтор безопасен

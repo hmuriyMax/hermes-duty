@@ -694,6 +694,171 @@ def test_silent_lead_exits_idle_and_the_supervisor_resumes(tmp_path: Path) -> No
     assert spawned == [str(deal["id"])]
 
 
+class WaitingClock:
+    """Часы захода: стоят, пока поток отдаёт строки, и идут на пустом опросе.
+
+    Так выглядит ожидание внутри вызова инструмента: строк в потоке нет, а время
+    идёт. Счётчик с постоянным шагом здесь не годится — он двигал бы время и на
+    чтении строки, и «сколько заход просидел в вызове» стало бы функцией числа
+    вызовов часов, а не сценария.
+    """
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def poll(self, step: float) -> None:
+        """Пустой опрос потока: время идёт хотя бы на секунду — шаг виден в тесте."""
+        self.now += max(float(step), 1.0)
+
+
+class ScriptedProcess:
+    """Живой процесс, который говорит по расписанию: пары «момент, строка».
+
+    `SilentProcess` молчит вечно, а ожидание внутри блокирующего вызова выглядит
+    иначе: `tool_use` пришёл, потом поток молчит до `tool_result`, и всё это время
+    процесс жив. `ends=False` — процесс не кончается сам (завис внутри вызова).
+    """
+
+    def __init__(
+        self,
+        clock: WaitingClock,
+        script: list[tuple[float, str]],
+        *,
+        ends: bool = True,
+        pid: int = 4242,
+    ) -> None:
+        self._clock = clock
+        self._script = list(script)
+        self._ends = ends
+        self._pid = pid
+        self._exit: Optional[int] = 0
+        self.stopped = False
+
+    @property
+    def pid(self) -> int:
+        return self._pid
+
+    def next_line(self, timeout: float = 0.0) -> Optional[str]:
+        if self._script and self._clock.now >= self._script[0][0]:
+            return self._script.pop(0)[1]
+        self._clock.poll(timeout)
+        return None
+
+    def finished(self) -> bool:
+        return self._ends and not self._script
+
+    @property
+    def exit_code(self) -> Optional[int]:
+        return self._exit
+
+    def wait(self, timeout: Optional[int] = None) -> Optional[int]:
+        return self._exit
+
+    def stop(self, grace: float = 0.0) -> Optional[int]:
+        self.stopped = True
+        self._exit = -15
+        return self._exit
+
+    @property
+    def stderr_tail(self) -> list[str]:
+        return []
+
+
+def stream_tool_use(name: str, *, call: str = "call-1") -> str:
+    """Строка `tool_use` потока: вызов инструмента начался (`hermes_cli/stream_json.py`)."""
+    return json.dumps({"type": "tool_use", "name": name, "tool_call_id": call})
+
+
+def stream_tool_result(name: str, *, call: str = "call-1") -> str:
+    """Строка `tool_result` потока: тот же вызов вернулся — по тому же `tool_call_id`."""
+    return json.dumps(
+        {"type": "tool_result", "name": name, "tool_call_id": call, "output": "ок", "duration_ms": 1000}
+    )
+
+
+# Сколько «отвечает» роль: дольше порога тишины захода (900 с) — как живая
+# под-попытка роли-исполнителя.
+ASK_ANSWER_SEC = lead.LEAD_IDLE_TIMEOUT_SEC + 100
+
+
+def script_of(kind: str) -> list[tuple[float, str]]:
+    """Поток одного вызова: начало, а для `ask` — ответ роли и итог захода."""
+    if kind == "ask":
+        return [
+            (0, stream_tool_use("duty_ask")),
+            (ASK_ANSWER_SEC, stream_tool_result("duty_ask")),
+            (ASK_ANSWER_SEC, stream_result("sess-ask")),
+        ]
+    return [(0, stream_tool_use("duty_wait"))]
+
+
+@pytest.mark.parametrize(
+    ("kind", "ends", "want_reason", "want_stopped"),
+    [("ask", True, "exit", False), ("wait", False, "idle", True)],
+    ids=["ask inside the role budget", "wait past its ceiling"],
+)
+def test_lead_waits_inside_a_blocking_call_instead_of_counting_stream_silence(
+    tmp_path: Path, kind: str, ends: bool, want_reason: str, want_stopped: bool
+) -> None:
+    """Открытый блокирующий вызов — ожидание, а не тишина: у каждого свой потолок.
+
+    Блокер ревью круга 2: тишина мерилась только потоком, а `duty_ask`
+    (`dashboard/tools.py` → `runner.ask_role`) синхронно держит лида **всю**
+    под-попытку роли — строк в потоке при этом нет. Роль-исполнитель легко
+    отвечает дольше `LEAD_IDLE_TIMEOUT_SEC` (900 с), и такой заход гасился
+    `idle`: под-попытка рвалась, резюм запускал заход заново, резюмы лида
+    тратились на работу, которую никто не бросал.
+
+    Инвариант — «молчание внутри живого вызова не считается тишиной» — проверяется
+    с двух сторон:
+
+    - `duty_ask` молчит 1000 с (дольше порога) и всё равно доводит заход до
+      штатного выхода: потолок вызова — срок под-попытки роли
+      (`runner.ttl_sec`, у seed-этапа 1800 с), а не 900 с порога;
+    - `duty_wait` пересидел свой потолок (`tools.WAIT_CEILING_SEC`), и порог
+      тишины обязан его видеть, иначе зависание внутри `duty_wait` стало бы
+      невидимым до `overrun`.
+    """
+    home = make_home(tmp_path)
+    spec = write_spec(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    conn.close()
+    clock = WaitingClock()
+    process = ScriptedProcess(clock, script_of(kind), ends=ends)
+
+    report = lead.run(
+        home,
+        str(deal["id"]),
+        run_budget=7200,
+        now=NOW,
+        clock=lambda: NOW,
+        monotonic=clock,
+        spawn=lambda cmd, cwd: process,
+    )
+
+    assert report["reason"] == want_reason
+    assert process.stopped is want_stopped
+    if want_reason == "exit":
+        assert clock.now > lead.LEAD_IDLE_TIMEOUT_SEC, "роль отвечала дольше порога тишины"
+    else:
+        assert clock.now < lead.LEAD_IDLE_TIMEOUT_SEC, "вызов гасится по своему потолку, а не по порогу"
+    conn = open_store(home)
+    exited = facts_of(conn, deal, lead.LEAD_KIND_EXITED)
+    conn.close()
+    assert [item["reason"] for item in exited] == [want_reason]
+    if want_reason == "exit":
+        assert exited[0]["session_id"] == "sess-ask", "дело продолжается той же сессией"
+    # Потолки — по инструменту: `duty_ask` держит лида дольше порога тишины,
+    # `duty_wait` ограничен своим сроком, у прочих вызова своего потолка нет.
+    assert lead._call_ceiling("duty_ask", spec) > lead.LEAD_IDLE_TIMEOUT_SEC
+    assert lead._call_ceiling("duty_wait", spec) > 0
+    assert lead._call_ceiling("read_file", spec) is None, "у прочих вызовов потолка нет"
+
+
 def test_dead_lead_gets_the_missing_exit_fact(tmp_path: Path) -> None:
     """Мёртвому заходу сторож дописывает `lead_exited` — «умер» ≠ «отсутствует».
 

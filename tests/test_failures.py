@@ -2,8 +2,9 @@
 
 Проверяется не «функция что-то вернула», а **что именно** она решила:
 
-- класс выводится только из четырёх источников (`result.json`, код выхода,
-  наличие файла, `Verdict.kind` гейта) и не путается с соседним классом;
+- класс выводится только из пяти источников (`result.json`, код выхода, наличие
+  файла, `Verdict.kind` гейта и подпись сломанного инструмента из закрытого
+  `TOOLCHAIN_SIGNATURES`) и не путается с соседним классом;
 - лимит, пауза и предохранитель на дело — политика (`dashboard/failures.py`), а
   не комментарий: `max: 0` паркует сразу, `on: [contract]` не повторяет `infra`,
   счётчик считается по классу, пауза растёт и упирается в потолок;
@@ -925,3 +926,53 @@ def test_plan_stage_never_rethinks_itself(tmp_path: Path) -> None:
     assert report is not None
     assert report["reason"] == failures.REASON_RETRIES
     assert "plan_rethink" not in [item["kind"] for item in events(conn, deal)]
+
+
+# --------------------------------------- сигнал и сломанный инструмент (2.1)
+
+
+@pytest.mark.parametrize(
+    ("code", "signal"),
+    [
+        (143, 15),
+        (137, 9),
+        (-15, 15),
+        (-9, 9),
+        (255, 127),
+        (128, None),
+        (0, None),
+        (1, None),
+        (None, None),
+        (True, None),
+    ],
+)
+def test_signal_of_reads_both_forms_of_the_same_fact(code: Optional[int], signal: Optional[int]) -> None:
+    """Номер сигнала: `128 + N` от оболочки и отрицательный `returncode` — одно.
+
+    Ровно `128` сигналом не считается (`128 + 0` не существует): такой код
+    команда вернула сама, и это «она сказала нет», а не «её убили».
+    """
+    assert failures.signal_of(code) is signal
+
+
+@pytest.mark.parametrize(
+    ("stderr", "signature"),
+    [
+        ("Error: can't load config: Go version (go1.26) is lower than the targeted (1.27)\n", "can't load config"),
+        ("go: cannot find main module; see 'go help modules'\n", "go: cannot find main module"),
+        ("/bin/sh: golangci-lint: command not found\n", "command not found"),
+        ("go: GOROOT is not defined\n", "GOROOT"),
+        ("go: downloading go1.27 toolchain not available\n", "toolchain not available"),
+        ("--- FAIL: TestThing (0.00s)\n", ""),
+        ("", ""),
+        (None, ""),
+    ],
+)
+def test_toolchain_signature_names_a_broken_tool(stderr: Any, signature: str) -> None:
+    """Подпись сломанного инструмента — сравнение с закрытым списком, а не regexp.
+
+    Список закрыт намеренно (`failures.TOOLCHAIN_SIGNATURES`): расширять его —
+    решение с тестом, а не догадка по очередному тексту ошибки. Поэтому обычный
+    отказ тестов (`--- FAIL:`) сломанным инструментом не считается.
+    """
+    assert failures.toolchain_signature(stderr) == signature

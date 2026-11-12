@@ -159,6 +159,12 @@ KILL_GRACE_SEC = 10
 # а весь лог — нет (журнал не место для логов).
 STDERR_TAIL = 20
 
+# Сколько первых знаков stderr помнит процесс. Голова нужна ради подписи
+# сломанного инструмента: линтер печатает «can't load config» первым делом, а
+# хвост из 20 строк к этому времени мог уехать дальше. В событие она попадает
+# только у отказа `capability` (`details.stderr_head`): «что сломано» — факт дела.
+STDERR_HEAD = 300
+
 # Виды этапа (`dashboard/spec.py`): `agent` исполняет профиль роли, `shell` —
 # команда, `gate` — никто: этап спрашивает человека. Здесь — только исполнение:
 # что запускать, решила спека.
@@ -1720,6 +1726,7 @@ class Process:
         self.cmd = list(cmd)
         self._queue: "queue.Queue[Optional[str]]" = queue.Queue()
         self._stderr: list[str] = []
+        self._stderr_head = ""
         self._eof = False
         self._logs = Path(logs) if logs is not None else None
         self._stdout_log = self._open_log(SHELL_STDOUT_LOG)
@@ -1792,11 +1799,18 @@ class Process:
     def _read_stderr(self) -> None:
         for line in self._proc.stderr or ():
             self._write_log(self._stderr_log, line)
+            if len(self._stderr_head) < STDERR_HEAD:
+                self._stderr_head += line
             text = line.rstrip("\n")
             if not text:
                 continue
             self._stderr.append(text)
             del self._stderr[:-STDERR_TAIL]
+
+    @property
+    def stderr_head(self) -> str:
+        """Первые `STDERR_HEAD` знаков stderr: там подпись сломанного инструмента."""
+        return self._stderr_head[:STDERR_HEAD]
 
     @property
     def stderr_text(self) -> str:
@@ -2423,22 +2437,38 @@ def follow_shell(
 
 
 def classify_shell(
-    *, exit_code: Optional[int], timed_out: bool, must: int, timeout_sec: int
+    *, exit_code: Optional[int], timed_out: bool, must: int, timeout_sec: int, stderr: str = ""
 ) -> tuple[str, str, str]:
-    """Чем кончилась shell-попытка: `(outcome, kind, reason)` — по коду возврата.
+    """Чем кончилась shell-попытка: `(outcome, kind, reason)` — по коду и stderr.
 
-    Источников три, как у агента, но отчёта среди них нет: наша собственная
-    остановка по сроку (таймаут), смерть процесса (сигнал — отрицательный код) и
-    его слово — код возврата. Ненулевой код — отказ **контракта** («код N, ждали
-    M»), а не инфраструктуры: команда дошла до конца и сказала «нет».
+    Источников четыре, и они не равны: наша собственная остановка по сроку
+    (таймаут), смерть процесса (сигнал — отрицательный код или `128 + N` от
+    оболочки), подпись сломанного инструмента в stderr (`failures.
+    TOOLCHAIN_SIGNATURES`) и его слово — код возврата.
+
+    Не дожила — `infra`: команда не сказала «нет», её убили (живой случай
+    RP-14338: `check2#1` умер с кодом 143, а движок записал `contract`). Сломан
+    инструмент — `capability`: работа до проверки не дошла, чинится среда, и
+    повтор движком её не лечит (там же: `check#1` упал кодом 3 на «can't load
+    config: Go version (go1.26) is lower than the targeted (1.27)», и дело встало
+    на человека). Ненулевой код без подписи — отказ **контракта** («код N, ждали
+    M»): команда дошла до конца и сказала «нет».
     """
     if timed_out:
         return OUTCOME_FAILED, FAIL_INFRA, f"команда не дожила: таймаут этапа {int(timeout_sec)} с"
     if exit_code is None:
         return OUTCOME_FAILED, FAIL_INFRA, "команда не дожила: код выхода неизвестен"
-    if int(exit_code) < 0:
-        return OUTCOME_FAILED, FAIL_INFRA, f"команда не дожила: сигнал {-int(exit_code)}"
+    signal = failures.signal_of(exit_code)
+    if signal is not None:
+        return OUTCOME_FAILED, FAIL_INFRA, f"команда не дожила: код {int(exit_code)} (сигнал {signal})"
     if int(exit_code) != int(must):
+        signature = failures.toolchain_signature(stderr)
+        if signature:
+            return (
+                OUTCOME_FAILED,
+                FAIL_CAPABILITY,
+                f"сломан инструмент проверки, а не код: «{signature}» (код {int(exit_code)}, ждали {int(must)})",
+            )
         return OUTCOME_FAILED, FAIL_CONTRACT, f"код {int(exit_code)}, ждали {int(must)}"
     return OUTCOME_DONE, "", ""
 
@@ -2815,8 +2845,18 @@ def finish_shell_stage(
     exit_code = live.process.exit_code if live.process.exit_code is not None else live.process.wait(KILL_GRACE_SEC)
     duration = max(0.0, monotonic() - began)
     live.process.close_logs()
+    # Подпись сломанного инструмента ищется и в голове, и в хвосте stderr: голова
+    # (`stderr_head`) — это первые знаки вывода, где инструмент и жалуется на свою
+    # конфигурацию, хвост — последние строки, где он же может сказать «command not
+    # found». Между ними может быть длинный лог, и целиком он в событие не едет.
+    stderr_head = live.process.stderr_head
+    stderr_seen = stderr_head + "\n" + "\n".join(followed.stderr_tail)
     outcome, kind, reason = classify_shell(
-        exit_code=exit_code, timed_out=followed.timed_out, must=int(getattr(stage, "must", 0)), timeout_sec=deadline_sec
+        exit_code=exit_code,
+        timed_out=followed.timed_out,
+        must=int(getattr(stage, "must", 0)),
+        timeout_sec=deadline_sec,
+        stderr=stderr_seen,
     )
 
     # Пакет: команда отчёта не пишет, поэтому его собирает движок — и только
@@ -2884,6 +2924,14 @@ def finish_shell_stage(
             "duration_sec": round(duration, 1),
             "must": int(getattr(stage, "must", 0)),
             "timed_out": followed.timed_out,
+            # Номер сигнала у смертельной попытки: «кто убил» — факт дела, а не
+            # реконструкция по коду 143 и логам (случай RP-14338: `check2#1` умер
+            # с кодом 143, и по журналу нельзя было сказать, чья это рука).
+            "signal": failures.signal_of(exit_code),
+            # Голова stderr у отказа `capability`: «что сломано» — тоже факт, а не
+            # догадка по хвосту. У остальных классов её нет: там причина названа
+            # кодом, и чужой текст в событии только мешал бы читать.
+            "stderr_head": stderr_head if kind == FAIL_CAPABILITY else None,
             "stdout_tail": followed.stdout_tail,
             "stderr_tail": followed.stderr_tail,
             "stdout_path": str(workdir / DUTY_SUBDIR / SHELL_STDOUT_LOG),
@@ -4664,10 +4712,11 @@ def run_attempts(
 ) -> dict[str, Any]:
     """Попытка этапа и авто-повторы движка поверх неё (`docs/ENGINE-2.0.md`, §7).
 
-    Какие классы повторяются — политика **движка**, а не лида: `infra` и
-    `contract` в пределах `retry.max` этапа, `capability` никогда (решение и
-    данные: `dashboard/failures.py:AUTO_ON`, `retry.on` из спеки набор сужает,
-    но не расширяет — «дело стоит, вопрос в доступе» не лечится ещё раз).
+    Какие классы повторяются — политика этапа, а не догадка движка: без `retry` в
+    спеке повторяется только `infra` (`failures.DEFAULT_ON`), объявленный набор
+    уважается как есть (хартия главнее — `on: [infra, capability]` повторяет
+    `capability`), а серию ограничивают `retry.max` и предохранитель на дело
+    (`dashboard/failures.py`).
 
     Каждый повтор — отдельная попытка со своим лизингом, деревом, процессом и
     фактом: серия выглядит в журнале как серия, а не как одна длинная. Причина

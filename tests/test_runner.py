@@ -2753,19 +2753,157 @@ def test_shell_absolute_artifact_path_is_refused(tmp_path: Path) -> None:
     assert "artifact.path" in report["reason"]
 
 
-def test_classify_shell_timeout_and_signal_are_infra() -> None:
-    """«Команда не дожила» — `infra`, как у агента: таймаут и смерть по сигналу."""
-    assert runner.classify_shell(exit_code=None, timed_out=True, must=0, timeout_sec=30) == (
-        runner.OUTCOME_FAILED,
-        runner.FAIL_INFRA,
-        "команда не дожила: таймаут этапа 30 с",
+SHELL_CLASSES = [
+    # имя кейса — чем кончилась команда, а не что мы про неё думаем
+    (
+        "timeout",
+        {"exit_code": None, "timed_out": True, "must": 0, "timeout_sec": 30},
+        (runner.OUTCOME_FAILED, runner.FAIL_INFRA, "команда не дожила: таймаут этапа 30 с"),
+    ),
+    (
+        "code unknown",
+        {"exit_code": None, "timed_out": False, "must": 0, "timeout_sec": 30},
+        (runner.OUTCOME_FAILED, runner.FAIL_INFRA, "команда не дожила: код выхода неизвестен"),
+    ),
+    (
+        "signal by shell code",
+        {"exit_code": 143, "timed_out": False, "must": 0, "timeout_sec": 30},
+        (runner.OUTCOME_FAILED, runner.FAIL_INFRA, "команда не дожила: код 143 (сигнал 15)"),
+    ),
+    (
+        "signal by returncode",
+        {"exit_code": -9, "timed_out": False, "must": 0, "timeout_sec": 30},
+        (runner.OUTCOME_FAILED, runner.FAIL_INFRA, "команда не дожила: код -9 (сигнал 9)"),
+    ),
+    (
+        "own code 128",
+        {"exit_code": 128, "timed_out": False, "must": 0, "timeout_sec": 30},
+        (runner.OUTCOME_FAILED, runner.FAIL_CONTRACT, "код 128, ждали 0"),
+    ),
+    (
+        "broken lint toolchain",
+        {
+            "exit_code": 3,
+            "timed_out": False,
+            "must": 0,
+            "timeout_sec": 30,
+            "stderr": "Error: can't load config: Go version (go1.26) is lower than the targeted (1.27)\n",
+        },
+        (
+            runner.OUTCOME_FAILED,
+            runner.FAIL_CAPABILITY,
+            "сломан инструмент проверки, а не код: «can't load config» (код 3, ждали 0)",
+        ),
+    ),
+    (
+        "go test said no",
+        {"exit_code": 1, "timed_out": False, "must": 0, "timeout_sec": 30, "stderr": "--- FAIL: TestThing\n"},
+        (runner.OUTCOME_FAILED, runner.FAIL_CONTRACT, "код 1, ждали 0"),
+    ),
+    (
+        "signature on success",
+        {"exit_code": 0, "timed_out": False, "must": 0, "timeout_sec": 30, "stderr": "GOROOT=/usr/local/go\n"},
+        (runner.OUTCOME_DONE, "", ""),
+    ),
+]
+
+
+@pytest.mark.parametrize(("case", "facts", "want"), SHELL_CLASSES, ids=[row[0] for row in SHELL_CLASSES])
+def test_classify_shell_reads_code_and_stderr(case: str, facts: dict[str, Any], want: tuple[str, str, str]) -> None:
+    """Класс shell-отказа: «не дожила» — `infra`, «сломан инструмент» — `capability`.
+
+    Решение RP-14338: код `128 + N` (и отрицательный `returncode`) значит смерть от
+    сигнала, а не «команда сказала нет»; подпись сломанного тулчейна в stderr —
+    `capability`, потому что работа до проверки не дошла и повтор её не вылечит.
+    Ненулевой код без подписи остаётся отказом контракта, а подпись при успешном
+    коде не значит ничего: команда дошла до конца и сказала «да».
+    """
+    assert runner.classify_shell(**facts) == want
+
+
+def test_shell_killed_by_signal_is_infra_and_names_the_signal(tmp_path: Path) -> None:
+    """Убитая команда — `infra`, и номер сигнала лежит в событии отдельным полем.
+
+    Живой случай RP-14338: `check2#1` умер с кодом 143, движок записал `contract`,
+    и «кто его убил» пришлось бы реконструировать по логам. Теперь причина
+    называет сигнал, а `details.signal` — это факт, а не вывод из кода 143.
+
+    Код 143 здесь настоящий: оболочка отдаёт `128 + N`, когда сигналом убит её
+    ребёнок (в живом деле — `go test` под SIGTERM), а не она сама.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = shell_spec(tmp_path, "echo go test; sh -c 'kill -TERM $$'")
+    report = run_shell(conn, spec, deal, home)
+
+    assert (report["outcome"], report["kind"]) == (runner.OUTCOME_FAILED, runner.FAIL_INFRA)
+    details = only(conn, deal, "attempt_ended")["payload"]["details"]
+    assert details["exit_code"] == 143, "оболочка отдаёт 128 + номер сигнала"
+    assert details["signal"] == 15
+    assert report["reason"] == "команда не дожила: код 143 (сигнал 15)"
+
+
+def test_shell_broken_toolchain_is_capability_with_stderr_head(tmp_path: Path) -> None:
+    """Сломанный инструмент проверки — `capability`, и голова stderr лежит в событии.
+
+    Это тот же живой случай: `golangci-lint` упал кодом 3 на «can't load config».
+    Класс не должен читаться как «код плохой», а «что сломано» должно быть
+    цитатой в журнале, а не пересказом по логам.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = shell_spec(
+        tmp_path,
+        "echo \"Error: can't load config: Go version (go1.26) is lower than the targeted (1.27)\" >&2; exit 3",
     )
-    assert runner.classify_shell(exit_code=-15, timed_out=False, must=0, timeout_sec=30) == (
-        runner.OUTCOME_FAILED,
-        runner.FAIL_INFRA,
-        "команда не дожила: сигнал 15",
-    )
-    assert runner.classify_shell(exit_code=None, timed_out=False, must=0, timeout_sec=30)[1] == runner.FAIL_INFRA
+    report = run_shell(conn, spec, deal, home)
+
+    assert (report["outcome"], report["kind"]) == (runner.OUTCOME_FAILED, runner.FAIL_CAPABILITY)
+    assert "can't load config" in report["reason"]
+    assert "а не код" in report["reason"]
+    details = only(conn, deal, "attempt_ended")["payload"]["details"]
+    assert details["exit_code"] == 3
+    assert details["stderr_head"].startswith("Error: can't load config")
+    assert details["stderr_head"] == details["stderr_head"][: runner.STDERR_HEAD]
+
+
+def test_shell_plain_failure_stays_contract_without_extra_fields(tmp_path: Path) -> None:
+    """`exit 1` от `go test` — по-прежнему `contract`: сигнала и стены тут нет.
+
+    `details.signal` и `details.stderr_head` остаются `null`: у контрактного
+    отказа причина названа кодом, и чужих полей в событии быть не должно.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = shell_spec(tmp_path, "echo '--- FAIL: TestThing' >&2; exit 1")
+    report = run_shell(conn, spec, deal, home)
+
+    assert (report["outcome"], report["kind"]) == (runner.OUTCOME_FAILED, runner.FAIL_CONTRACT)
+    assert report["reason"] == "код 1, ждали 0"
+    details = only(conn, deal, "attempt_ended")["payload"]["details"]
+    assert (details["signal"], details["stderr_head"]) == (None, None)
+
+
+def test_shell_capability_is_not_retried_by_default(tmp_path: Path) -> None:
+    """`capability` без объявления в спеке не повторяется: попытка одна.
+
+    Хартия главнее политики движка, но и она молчит: `retry` в спеке нет, значит
+    повторяется только `infra`. Сломанный тулчейн повтором не лечится, и дело
+    встаёт сразу — вопрос человеку, а не вторая попытка вслепую.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = shell_spec(tmp_path, "echo 'go: cannot find main module' >&2; exit 1")
+
+    report = runner.run_attempts(conn, spec, deal, "check", 1, home=home, clock=lambda: NOW)
+
+    assert (report["kind"], report["attempt"]) == (runner.FAIL_CAPABILITY, 1)
+    assert "retries" not in report, "повторов не было — и числа повторов в отчёте нет"
+    assert [row["payload"]["attempt"] for row in events(conn, deal) if row["kind"] == "attempt_started"] == [1]
 
 
 def test_follow_shell_stops_the_command_at_the_deadline(tmp_path: Path) -> None:

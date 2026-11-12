@@ -4,10 +4,11 @@
 дал 9 done / 9 failed, `contract` — 8 done / 4 failed, `capability` — 0 done /
 2 failed. Отсюда два правила, и оба проверяются здесь:
 
-1. `infra` и `contract` движок повторяет **сам** в пределах `retry.max` этапа, а
-   в бриф повторной попытки кладёт причину прошлого отказа;
-2. `capability` не повторяется никогда, даже если спека объявила
-   `retry.on: [capability]` с `max: 3`: `retry.on` набор сужает, но не расширяет.
+1. без объявления в спеке движок повторяет **только** `infra` в пределах
+   `retry.max` этапа, а в бриф повторной попытки кладёт причину прошлого отказа;
+2. объявленный набор хартия задаёт сама: `retry.on: [infra, capability]` с
+   `max: 3` повторяет `capability` — политика движка объявленный набор не сужает
+   (2.1), а серию ограничивают `max` и предохранитель на дело.
 
 Ни один тест не поднимает модель: `spawn` подменяется фейком, который задаёт код
 выхода и поток процесса. Проверяется то, что движок **записал** — факты журнала,
@@ -304,22 +305,22 @@ def test_retry_limit_bounds_the_series(tmp_path: Path) -> None:
     assert [row["attempt"] for row in attempts_started(conn, deal)] == [1, 2, 3]
 
 
-# ------------------------------------------------------- capability не повторяется
+# ------------------------------------------- хартия задаёт набор: capability тоже
 
 
-def test_capability_is_never_retried_even_when_declared(tmp_path: Path) -> None:
-    """`retry.on: [capability]` с `max: 3` повторов не включает: стена не рассосётся.
+def test_capability_is_retried_when_the_charter_declares_it(tmp_path: Path) -> None:
+    """`retry.on: [capability]` с `max: 3` повторяет: хартия главнее политики.
 
-    Спека называет класс, который движок не повторяет никогда, — набор сужается
-    до пустого, и попытка одна. Иначе движок вечно бился бы в отсутствующий
-    доступ (0 done / 2 failed по истории переходов).
+    Решение 2.1: объявленный набор движок не сужает. Раньше `capability`
+    выбрасывался всегда, и объявить повтор стены было нельзя; теперь серию держат
+    `max` этапа и предохранитель на дело, а класс берётся из факта.
     """
     home = make_home(tmp_path)
     conn = open_store(home)
     deal = make_deal(conn)
     spec = retry_spec(
         tmp_path,
-        "{max: 3, on: [capability]}",
+        "{max: 1, on: [capability]}",
         budget="""budget: {tokens: 10}""",
     )
     # Расход больше бюджета этапа и отчёта нет: `classify` называет это `capability`.
@@ -327,21 +328,19 @@ def test_capability_is_never_retried_even_when_declared(tmp_path: Path) -> None:
 
     report = runner.run_attempts(conn, spec, deal, "impl", 1, home=home, spawn=fake, clock=lambda: NOW)
 
-    assert report["kind"] == "capability"
-    assert report["retry"] is False
-    assert len(fake.calls) == 1, "второй попытки быть не должно"
+    assert (report["kind"], report["attempt"], report["retries"]) == ("capability", 2, 1)
     started = attempts_started(conn, deal)
-    assert [row["attempt"] for row in started] == [1]
-    assert "retried_from" not in started[0]
+    assert [row["attempt"] for row in started] == [1, 2]
+    assert started[1]["retried_from"] == 1
 
     stage = next(item for item in spec.stages if item.id == "impl")
     policy = failures.policy(stage)
-    assert policy.on == (), "объявленный capability сузился до пустого набора"
-    assert policy.allows("capability") is False
+    assert policy.on == ("capability",), "объявленный класс остался в наборе"
+    assert policy.allows("capability") is True
 
 
 def test_capability_stops_the_series_of_retries(tmp_path: Path) -> None:
-    """Серия повторов обрывается на `capability`: следующий отказ — стена, не флейк.
+    """Серия повторов обрывается на `capability`, если хартия его не назвала.
 
     `retry.on: [infra, contract]` разрешает повторы по этим классам, но класс
     отказа берётся из факта: упёрлись в бюджет — повтора нет, даже если лимит
@@ -363,38 +362,37 @@ def test_capability_stops_the_series_of_retries(tmp_path: Path) -> None:
     assert len(fake.calls) == 1
 
 
-# ------------------------------------------------ `retry.on` сужает, не расширяет
+# ------------------------------------- объявленный набор читается как есть (2.1)
 
 
-def test_retry_on_narrows_the_engine_set(tmp_path: Path) -> None:
-    """Эффективная политика — пересечение объявленного набора с политикой движка.
+def test_retry_on_is_taken_as_declared(tmp_path: Path) -> None:
+    """Политика этапа — ровно объявленный набор, без сужения политикой движка.
 
-    Выбор зафиксирован: недозволенный класс **сужается** (а не отвергается
-    спекой) — старые спеки остаются валидными, а движок всё равно не повторяет
-    то, что повторять нельзя. Спека говорит об этом предупреждением.
+    `on: [contract]` не повторяет `infra` (класс назван поимённо, а не «любой»),
+    `on: [infra, capability]` повторяет оба, а имя вне словаря классов в набор не
+    попадает: его и так отвергает спека до запуска.
     """
-    narrow = failures.policy(next(item for item in retry_spec(tmp_path, "{max: 2, on: [contract]}").stages))
-    assert (narrow.max, narrow.on) == (2, ("contract",))
-    assert narrow.allows("infra") is False and narrow.allows("contract") is True
+    narrow = retry_spec(tmp_path, "{max: 2, on: [contract]}")
+    policy = failures.policy(next(item for item in narrow.stages))
+    assert (policy.max, policy.on) == (2, ("contract",))
+    assert policy.allows("infra") is False and policy.allows("contract") is True
 
-    mixed = failures.policy(next(item for item in retry_spec(tmp_path, "{max: 3, on: [infra, capability]}").stages))
-    assert mixed.on == ("infra",), "capability выброшен, infra остался"
-    assert mixed.allows("capability") is False
+    mixed = retry_spec(tmp_path, "{max: 3, on: [infra, capability]}")
+    policy = failures.policy(next(item for item in mixed.stages))
+    assert policy.on == ("infra", "capability")
+    assert policy.allows("capability") is True
 
-    nothing = failures.policy(next(item for item in retry_spec(tmp_path, "{max: 3, on: [capability]}").stages))
-    assert (nothing.max, nothing.on) == (3, ()), "лимит остался, повторять нечего — и это не ошибка спеки"
+    stranger = failures.policy(next(item for item in retry_spec(tmp_path, "{max: 3, on: [infr]}").stages))
+    assert (stranger.max, stranger.on) == (3, ()), "чужое имя повтором не станет"
 
 
-def test_spec_warns_about_narrowed_class_without_rejecting(tmp_path: Path) -> None:
-    """Спека объясняет сужение предупреждением, но спека остаётся валидной."""
+def test_spec_accepts_declared_capability_without_a_warning(tmp_path: Path) -> None:
+    """Спека молчит про `capability` в `retry.on`: строка работает, предупреждать не о чем."""
     spec = retry_spec(tmp_path, "{max: 3, on: [capability]}")
 
     issues = spec_module.validate_spec(spec, profiles=frozenset({"implementer"}))
 
-    assert [issue.rule for issue in issues] == ["retry.on"]
-    assert issues[0].severity == spec_module.WARNING
-    assert "capability" in issues[0].message and "infra, contract" in issues[0].message
-    assert spec_module.errors(issues) == []
+    assert issues == []
 
 
 # ------------------------------------------- исчерпание: один факт лиду с числом

@@ -1314,26 +1314,6 @@ def failure_classes() -> tuple[str, ...]:
     return tuple(module.CLASSES) if module is not None else ()
 
 
-def failure_class(name: str) -> str:
-    """Значение константы класса (`CAPABILITY`, …) из `dashboard/failures.py`.
-
-    Нужно правилу про `retry.on`: спека предупреждает про `capability` по имени,
-    а имя берёт из того же словаря, чтобы «стена» не завелась вторым написанием.
-    """
-    module = _failures_module()
-    return str(getattr(module, name, "")) if module is not None else ""
-
-
-def auto_classes() -> tuple[str, ...]:
-    """Классы, которые движок повторяет сам (`failures.AUTO_ON`), — для текста правила.
-
-    Спека текстом правила называет, до чего сузился `retry.on`: автору спеки
-    важно видеть, что именно осталось от объявленного набора, а не догадываться.
-    """
-    module = _failures_module()
-    return tuple(module.AUTO_ON) if module is not None else ()
-
-
 def known_profiles(root: Optional[Path] = None) -> frozenset[str]:
     """Профили Hermes: `$HERMES_HOME/profiles/*` плюс `default`, снимок один раз на процесс.
 
@@ -2163,25 +2143,6 @@ def _check_retry(spec: Spec) -> list[Issue]:
                     stage.lines.get("retry.on", line),
                     "retry.on",
                     "retry.on пуст: ретрай без классов отказов не сработает",
-                )
-            )
-        # `capability` — стена (бюджет, доступ, роль), а не сбой: набор классов,
-        # которые движок повторяет сам, — политика движка (`failures.AUTO_ON`,
-        # `docs/ENGINE-2.0.md`, раздел 7). Спека может только отказаться от части
-        # повторов, поэтому `capability` здесь **сужается**: объявленный класс не
-        # попадёт в эффективную политику (`failures.policy`), и повтора не будет.
-        # Предупреждение, а не отказ: цель — сказать автору спеки, что строка не
-        # работает, а не заставить переписать файл.
-        capability = failure_class("CAPABILITY")
-        if capability and capability in retry.on:
-            issues.append(
-                Issue(
-                    spec.path,
-                    stage.lines.get("retry.on", line),
-                    "retry.on",
-                    f"{capability} движок не повторяет никогда: класс сужается "
-                    f"до {', '.join(auto_classes()) or '—'} — убери его из retry.on",
-                    WARNING,
                 )
             )
         # Класс сравнивается со словарём `dashboard/failures.py`: опечатка в

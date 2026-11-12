@@ -96,17 +96,28 @@
   линтер падал на сломанном тулчейне, и оба факта жили в разных делах). Роль
   убрана из `NO_SHELL_ROLES` (`dashboard/spec.py`): этап ревьюера теперь вправе
   объявлять `evidence` (`go build`, `go test`, `golangci-lint run`), и `parse_plan`
-  его принимает. Профиль `reviewer` получил `terminal` (убран из
-  `agent.disabled_toolsets`), а плагин `role-access` открыл ему **читающий**
+  его принимает. Профиль `reviewer` получил `terminal`: убран из
+  `agent.disabled_toolsets` **и добавлен в `platform_toolsets` всех пяти платформ**
+  — этот второй замок виден только на живом воркере: без него роль отвечает «shell
+  недоступен», хотя `disabled_toolsets` уже пуст (живой случай: ревью F1–F5
+  заблокировалось именно на этом). Плагин `role-access` открыл ему **читающий**
   shell: allowlist программ и подкоманд (`go build|test|vet|list|env|version|doc`,
   `gofmt -l|-d`, `golangci-lint run|version|config|linters`, `make
   build|test|lint|lint-full|lint-diff|vet|coverage|check`, `git status|diff|log|
   show|rev-parse|rev-list|describe|ls-files|ls-tree|show-ref|blame|merge-base|
-  cat-file|shortlog|grep|name-rev`, плюс `cd/pwd/ls/cat/head/tail/wc/grep/rg/true/test`).
+  cat-file|shortlog|grep|name-rev`, плюс `cd/pwd/ls/cat/head/tail/wc/grep/rg/true/test`
+  и **собственные гейты плагина** — `pytest` (в т.ч. `python -m pytest`), `node
+  tests/…`, `bin/duty demo|now|why|deals|stats|version`, `bin/duty-version check`,
+  `hermes plugins validate|info`, `hermes tools list`; без них «прогнать гейты» у
+  ревьюера плагина невозможно, а гейт — единственное доказательство, которое он
+  может предъявить сам.
   Отказ даётся за: перенаправление в файл, `$(...)` и обратные кавычки, фоновое
   выполнение, `gofmt -w`, `git commit|checkout|push`, `make format`, `go generate`,
-  обёртки вида `sh -c` — свидетель ревьюера `verdict`, а не коммит, поэтому любая
-  правка из shell осталась бы невидимой. Остальным read-only ролям shell закрыт.
+  обёртки вида `sh -c`, `python -c`/`-m http.server`/`-m pip`, `node -e|--eval`,
+  `node` не из `tests/`, `pytest -p <модуль>`, `hermes chat|cron|kanban`, `bin/duty
+  run|close|decide`, `bin/duty-version finalize` — свидетель ревьюера `verdict`, а не
+  коммит, поэтому любая правка из shell осталась бы невидимой.
+  Остальным read-only ролям shell закрыт.
   Доки: `docs/SPEC.md`, `docs/ENGINE-2.0.md` §3.
 
 - **Исчерпанные попытки возвращаются лиду, а не человеку.** Живой случай RP-14338:

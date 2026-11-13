@@ -319,6 +319,56 @@ def test_plan_accepted_grows_the_graph(tmp_path: Path) -> None:
     assert decision.pair == [("research", 1)]
 
 
+def test_second_revision_builds_on_the_stages_of_the_first(tmp_path: Path) -> None:
+    """Принятая ревизия читается на графе предыдущих, а не на seed.
+
+    Переплан редко повторяет весь список: лид правит то, что сломалось, и
+    ссылается на этапы, добавленные раньше (`d_cf918495`: ревизия 7 объявила
+    `check` поверх `implement` из ревизии 4). С seed-базой такой разбор отвечает
+    «`needs` ссылается на несуществующий этап», граф молча падал до seed, и
+    `duty_start` отказывал на собственный принятый план. Валидатор предложения
+    мерит ревизию по текущему графу — чтение обязано мерить тем же.
+    """
+    spec = seed_spec(tmp_path)
+    first = proposal(plan_stage("research"), plan_stage("impl"))
+    second = [plan_stage("check", needs=("impl",))]
+    journal_events = events(
+        ("attempt_started", {"stage": "plan", "attempt": 1, "run_id": "plan#1"}),
+        ("attempt_ended", ended("plan")),
+        ("plan_proposed", {"rev": 1, "stages": first, "reason": "скоуп", "source_stage": "plan", "attempt": 1}),
+        accepted(1),
+        ("plan_proposed", {"rev": 2, "stages": second, "reason": "переплан", "source_stage": "plan", "attempt": 2}),
+        accepted(2),
+    )
+
+    stages = transit.graph(spec, journal_events)
+    assert tuple(stage.id for stage in stages) == ("plan", "close", "research", "impl", "check")
+    # этап второй ревизии виден тому же графу, из которого запускают попытку
+    assert transit.graph_spec(spec, journal_events).stage("check") is not None
+    assert dict((stage.id, tuple(stage.needs)) for stage in stages)["check"] == ("impl",)
+
+
+def test_unreadable_revision_keeps_what_the_earlier_ones_added(tmp_path: Path) -> None:
+    """Ревизия, которую разбор отвергает, графа не меняет — но и не отменяет.
+
+    Приёмка проверяет предложение тем же `parse_plan`, поэтому такой журнал
+    движок не писал бы; читателю он всё равно может достаться (правка журнала,
+    чужой плагин). Отдать seed значило бы стереть работу, которую приняли и уже
+    начали, поэтому граф остаётся тем, что собрали предыдущие ревизии.
+    """
+    spec = seed_spec(tmp_path)
+    first = proposal(plan_stage("impl"))
+    broken = [plan_stage("check", needs=("ghost",))]
+    journal_events = events(
+        ("plan_proposed", {"rev": 1, "stages": first, "reason": "скоуп", "source_stage": "plan", "attempt": 1}),
+        accepted(1),
+        ("plan_proposed", {"rev": 2, "stages": broken, "reason": "переплан", "source_stage": "plan", "attempt": 2}),
+        accepted(2),
+    )
+
+    assert tuple(stage.id for stage in transit.graph(spec, journal_events)) == ("plan", "close", "impl")
+
+
 def test_plan_title_reaches_the_graph(tmp_path: Path) -> None:
     """Имя этапа плана доезжает до графа: его читают бриф лида и поверхность дела.
 

@@ -1151,11 +1151,20 @@ def graph(spec: Any, events: Iterable[Any]) -> tuple[Any, ...]:
     и состояние. Журнал без фактов плана даёт ровно `spec.stages` — поведение
     0.0.8 не меняется ни на факт.
 
-    Этапы берутся из `plan_proposed` той ревизии, которую назвал `plan_accepted`:
+    Этапы берутся из `plan_proposed` тех ревизий, которые назвал `plan_accepted`:
     отдельной копии плана в событии принятия нет — иначе две копии одного графа
     разошлись бы. Разбор — тем же `spec.parse_plan` по хартии: граф, который
     валидатор отверг бы, не становится графом и при чтении (мусорный журнал не
     роняет дело, правило 8 — граф остаётся seed-ом).
+
+    **Принятые ревизии складываются по порядку**, и базой каждой служит граф,
+    собранный из предыдущих, а не seed (`d_cf918495`: ревизия 7 правила `check`
+    поверх `implement`, добавленного ревизией 4; с seed-базой разбор отвечал
+    «`needs` этапа `check` ссылается на несуществующий этап `implement`», и граф
+    молча падал до seed — лид получал отказ `duty_start` на собственный принятый
+    план). Валидатор предложения (`tools.plan`) мерит ревизию ровно так — по
+    текущему графу, — и чтение графа обязано мерить её тем же, иначе принятое
+    предложение перечитывается строже, чем принималось.
 
     Ревизия несёт два вида записи: **добавление** (новый этап) и запись про этап,
     который уже есть в графе — **перестановку** (`needs`/`parallel_with`) или
@@ -1163,11 +1172,12 @@ def graph(spec: Any, events: Iterable[Any]) -> tuple[Any, ...]:
     Обе проверяются без `started_ids`: «этап уже начинался» — отказ момента
     предложения (`runner.report_plan` знает журнал), а принятая перестановка или
     правка остаётся графом и после того, как её этап начали, — иначе граф сжался
-    бы задним числом.
+    бы задним числом. Этап, который ревизия не назвала, из графа не уходит: план
+    переставляет и добавляет, а не удаляет (снятие работы — приговор ревью).
     """
     seed = tuple(getattr(spec, "stages", ()) or ())
     proposals: dict[int, Any] = {}
-    accepted = 0
+    accepted: set[int] = set()
     for event in _ordered(events):
         kind = str(event.get("kind") or "")
         if kind not in (PLAN_PROPOSED, PLAN_ACCEPTED):
@@ -1183,22 +1193,29 @@ def graph(spec: Any, events: Iterable[Any]) -> tuple[Any, ...]:
             stages = payload.get("stages")
             if isinstance(stages, list):
                 proposals[rev] = payload
-        elif rev > accepted:
-            accepted = rev
-    if accepted <= 0 or accepted not in proposals:
+        else:
+            accepted.add(rev)
+    revisions = sorted(rev for rev in accepted if rev in proposals)
+    if not revisions:
         return seed
-    payload = proposals[accepted]
     charter = getattr(spec, "charter", None) or spec_module.Charter()
-    stages, issues = spec_module.parse_plan(
-        payload.get("stages"),
-        charter=charter,
-        base_stages={stage.id: stage for stage in seed},
-        repo=getattr(spec, "repo", None),
-    )
-    if issues:
-        return seed
-    plan_stage = str(payload.get("source_stage") or "") or PLAN_STAGE
-    return _relinked(seed, tuple(stages), plan_stage)
+    current = seed
+    for rev in revisions:
+        payload = proposals[rev]
+        stages, issues = spec_module.parse_plan(
+            payload.get("stages"),
+            charter=charter,
+            base_stages={stage.id: stage for stage in current},
+            repo=getattr(spec, "repo", None),
+        )
+        if issues:
+            # Отказ у принятой ревизии — журнал, которого движок не писал бы
+            # (приёмка проверяет тем же разбором): такая ревизия графа не
+            # меняет, но и принятое раньше не отменяет.
+            return current
+        plan_stage = str(payload.get("source_stage") or "") or PLAN_STAGE
+        current = _relinked(current, tuple(stages), plan_stage)
+    return current
 
 
 def _relinked(seed: tuple[Any, ...], proposed: tuple[Any, ...], plan_stage: str) -> tuple[Any, ...]:

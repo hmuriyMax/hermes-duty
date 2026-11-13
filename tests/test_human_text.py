@@ -229,6 +229,26 @@ def test_missing_text_is_silent_not_a_failure(home: Path) -> None:
 # ------------------------------------------- то, что видит лид: wait и дайджест
 
 
+def test_brief_finds_the_comment_by_the_caller_deal_id(home: Path) -> None:
+    """Номер дела приходит и аргументом: факт без `deal_id` не должен терять тело.
+
+    Живое дело `d_1c53fbd0`: комментарий вернулся лиду одной длиной — номер дела
+    искали только в строке факта, а вызывающий его и так знает.
+    """
+    conn = deals.open_store(home)
+    assert conn is not None
+    try:
+        with conn:
+            deals.add_comment(conn, DEAL, author="hermes", body="подними review", source="cli")
+        event = dict(next(e for e in journal.read_events(conn, DEAL) if e["kind"] == "commented"))
+        event.pop("deal_id")  # так факт выглядит у читателя, который номера не несёт
+        brief = tools._brief(event, home=home, conn=conn, deal_id=DEAL)
+    finally:
+        conn.close()
+
+    assert brief["payload"]["body"] == "подними review"
+
+
 def test_wait_brief_carries_the_answer(home: Path) -> None:
     """`duty_wait` отдаёт факт с текстом ответа: иначе лид решает вслепую."""
     question_id = make_pool(home, answer="перенеси поверх")

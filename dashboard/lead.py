@@ -512,7 +512,7 @@ def _spec(events: Iterable[Any]) -> Optional[Any]:
 # ----------------------------------------------------------- текст для сессии
 
 
-def _human_text_of(conn: Any, home: Any) -> Callable[[dict[str, Any]], str]:
+def _human_text_of(conn: Any, home: Any, deal_id: str = "") -> Callable[[dict[str, Any]], str]:
     """Читатель слов человека для дайджеста: текст ответа пула и тело комментария.
 
     Журнал слов не хранит — у ответа `answer_len`, у комментария `len`. Лиду нужен
@@ -522,7 +522,7 @@ def _human_text_of(conn: Any, home: Any) -> Callable[[dict[str, Any]], str]:
         return deals.human_text(
             conn,
             home,
-            str(event.get("deal_id") or ""),
+            str(event.get("deal_id") or deal_id),
             str(event.get("kind") or ""),
             journal.payload_of(event),
         )
@@ -1216,7 +1216,7 @@ def run(
                     resume_limit=resume_limit,
                     now=moment,
                     run_budget=budget_sec,
-                    text_of=_human_text_of(conn, home),
+                    text_of=_human_text_of(conn, home, str(deal["id"])),
                 )
                 if mode == MODE_FIRST
                 else digest(
@@ -1227,7 +1227,7 @@ def run(
                     resume_limit=resume_limit,
                     now=moment,
                     run_budget=budget_sec,
-                    text_of=_human_text_of(conn, home),
+                    text_of=_human_text_of(conn, home, str(deal["id"])),
                 )
             ),
         )

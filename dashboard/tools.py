@@ -994,7 +994,7 @@ def wait(
             position = max(position, max(_int(event.get("id")) for event in fresh))
         facts = [event for event in fresh if str(event.get("kind") or "") not in NOISE_KINDS]
         if facts:
-            return {"ok": True, "deal": str(deal["id"]), "events": [_brief(event, home=home, conn=conn) for event in facts],
+            return {"ok": True, "deal": str(deal["id"]), "events": [_brief(event, home=home, conn=conn, deal_id=deal_id) for event in facts],
                     "cursor": position, "timed_out": False, "answers": answers}
         if tick() >= deadline:
             work = _live_work(conn, str(deal["id"]))
@@ -1064,6 +1064,7 @@ def _brief(
     *,
     home: Optional[Path] = None,
     conn: Optional[sqlite3.Connection] = None,
+    deal_id: str = "",
 ) -> dict[str, Any]:
     """Событие для лида: `id`, вид, время и payload.
 
@@ -1076,7 +1077,9 @@ def _brief(
     """
     kind = str(event.get("kind") or "")
     payload = journal.payload_of(event)
-    text = deals.human_text(conn, home, str(event.get("deal_id") or ""), kind, payload)
+    # Номер дела приходит аргументом: `read_events` отдаёт факты без `deal_id` в
+    # строке, и без этого тело комментария искалось бы в пустом деле.
+    text = deals.human_text(conn, home, str(event.get("deal_id") or deal_id), kind, payload)
     if text:
         payload = {**payload, ("answer" if kind == "question_answered" else "body"): text}
     return {

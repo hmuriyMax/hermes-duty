@@ -1348,6 +1348,40 @@ def test_fenced_report_with_prose_is_rescued(tmp_path: Path) -> None:
     assert json.loads(result_file.read_text(encoding="utf-8")) == expected
 
 
+def test_report_example_in_reasoning_is_not_rescued(tmp_path: Path) -> None:
+    """Пример формы из рассуждения не спасает попытку вместо неразобранного отчёта.
+
+    Срез прозы берётся только у последней реплики. Иначе объект со `status`,
+    показанный посреди работы как образец, закрывал бы попытку чужим текстом:
+    при `done` — работой, которой не было, при `blocked` — парковкой дела с
+    выдуманным вопросом (ровно тот случай, ради которого каскад и писался).
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = plan_spec(tmp_path)
+    example = "Вот форма отчёта: " + json.dumps(RESCUE_REPORT, ensure_ascii=False)
+    said = 'Итог: {"status": "done", "summary": "проверил "шапку" — всё зелено"}'
+    fake = Fake(
+        result=None,
+        exit_code=0,
+        lines=[
+            {"type": "text", "text": example},
+            {"type": "tool_use", "name": "read_file"},
+            {"type": "text", "text": said},
+        ],
+    )
+
+    report = run_stage(conn, spec, deal, home, fake)
+
+    assert (report["outcome"], report["kind"]) == ("failed", "contract")
+    result_file = runner.result_path(runner.attempt_dir(home, deal, "plan", 1))
+    assert not result_file.is_file(), "пример из рассуждения — не отчёт"
+    prose = result_file.parent / runner.REPORT_TXT
+    assert prose.read_text(encoding="utf-8") == said + "\n"
+    assert only(conn, deal, "attempt_ended")["payload"]["details"]["report_path"] == str(prose)
+
+
 def test_plan_contract_teaches_the_proposal_form(tmp_path: Path) -> None:
     """Границы этапа плана называют форму предложения — до первого отказа хартии.
 

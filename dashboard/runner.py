@@ -2508,9 +2508,13 @@ def rescue_report(result_file: Optional[Path], says: list[str]) -> Optional[str]
             candidates.append(stripped)
         candidates.extend(fence.strip() for fence in RESULT_FENCE_RE.findall(text))
         forms.extend(reversed(candidates))
-    # Срез прозы — последняя форма, а не первая: отчёт в фенсе важнее объекта,
-    # который модель показала примером посреди рассуждения.
-    forms.extend(text.strip() for text in reversed(says) if "{" in text)
+    # Срез прозы — только у ПОСЛЕДНЕЙ непустой реплики и последней формой: фенс
+    # ранней реплики ещё можно защищать как «вот отчёт», а прозу — нет. Иначе
+    # пример формы из рассуждения («вот форма: {…}») выигрывал бы у настоящего
+    # отчёта, который не разобрался, — то есть спасал бы не тот JSON.
+    last = next((text.strip() for text in reversed(says) if text.strip()), "")
+    if "{" in last:
+        forms.append(last)
     for form in forms:
         data = _report_object(form)
         if data is None:
@@ -4661,6 +4665,7 @@ def finish_agent_stage(
             now=_now_sec(int(clock())),
         )
     result, result_error = read_result(result_file)
+    prose: Optional[Path] = None
     if result is None:
         # Отчёт не в форме (не разобрался): проза попытки остаётся файлом, а
         # причина называет путь. Отказ читается «отчёт не в форме», а не
@@ -4819,6 +4824,10 @@ def finish_agent_stage(
             "branch": branch or None,
             "branch_error": branch_error or None,
             "stderr_path": str(stderr_file) if stderr_file is not None else None,
+            # Проза попытки, не ставшая отчётом (не разобралась): путь нужен и
+            # тогда, когда причину написал класс (`infra`) и `result_error` не
+            # дошёл до события, — иначе файл лежит безымянным.
+            "report_path": str(prose) if prose is not None else None,
             "verdict": verdict.as_payload() if verdict is not None else None,
             # Чем этап назвал работу, когда пакет принят (`evidence.witness`):
             # `commit|artifacts`, `verdict` или `published`. Без этого поля в

@@ -2557,7 +2557,7 @@ function layoutCalls(calls, options) {
   const width = Number(opts.width) || 1000
   const levelH = Number(opts.levelH) || 12
   const top = Number(opts.top) || 0
-  const maxLevels = Math.max(1, Number(opts.maxLevels) || 5)
+  const maxLevels = Math.max(1, Number(opts.maxLevels) || 16)
   const gap = Number(opts.gap) || 2
   const span = from === null || to === null ? 0 : to - from
   // Позиция вызова — та же карта оси, что у полос и маркеров (`pctOf` из
@@ -2596,9 +2596,8 @@ function layoutCalls(calls, options) {
   // бы утверждать «0 мс»: длительности нет, а не она нулевая. Отдельная ширина и
   // флаг `unfinished` дают поверхности возможность показать это иначе.
   const UNFINISHED_W = 5
-  const lastEnd = []
-  const chips = []
-  let clipped = 0
+  // Сначала — место каждого вызова на карте оси, потом склейка всплесков.
+  const spots = []
   for (const call of list) {
     let px = Math.max(0, Math.min(width, pxOf(call.at)))
     const unfinished = call.ms === null || call.ms === undefined
@@ -2614,12 +2613,39 @@ function layoutCalls(calls, options) {
     if (clampLeftPx !== null && px < clampLeftPx) {
       px = Math.min(clampLeftPx, (clampRightPx !== null ? clampRightPx : width) - size)
     }
-    const linSize = size
+    spots.push({ call, px, size, unfinished })
+  }
+  // Всплеск — вызовы, которые на этой карте стоят вплотную: между ними меньше
+  // MERGE_GAP виртуальных пикселей. Сто пятьдесят восемь чипов по 2 px в одну
+  // попытку не читаются никак: ряды кончаются, и они ложатся друг на друга
+  // (`d_92177017`, Макс, 14.11: «наслоения в шкале времени»). Всплеск рисуется
+  // одной полосой, а его точное число вызовов уходит в подсказку и в счёт
+  // попытки — факт не теряется, теряется только его пиксельная дробь.
+  const MERGE_GAP = 4
+  const groups = []
+  for (const spot of spots) {
+    const last = groups[groups.length - 1]
+    const end = last ? last.px + last.size : null
+    if (last && spot.px - end < MERGE_GAP) {
+      last.size = Math.max(last.size, spot.px + spot.size - last.px)
+      last.calls.push(spot.call)
+      last.unfinished = last.unfinished || spot.unfinished
+      continue
+    }
+    groups.push({ px: spot.px, size: spot.size, calls: [spot.call], unfinished: spot.unfinished })
+  }
+  const lastEnd = []
+  const chips = []
+  let clipped = 0
+  for (const group of groups) {
+    const px = group.px
+    const size = group.size
     let level = lastEnd.findIndex((end) => px - end >= gap)
     if (level < 0) {
       if (lastEnd.length >= maxLevels) {
-        // Уровни кончились — вызов всё равно показываем: прятать факт хуже, чем
-        // наложить его на соседа. Число наложенных считается в `clipped`.
+        // Уровни кончились даже после склейки (больше шестнадцати рядов на одну
+        // попытку) — полосу всё равно показываем: прятать факт хуже, чем
+        // наложить его на соседа. Число наложенных считает `clipped`.
         level = lastEnd.indexOf(Math.min(...lastEnd))
         clipped += 1
       } else {
@@ -2628,15 +2654,17 @@ function layoutCalls(calls, options) {
     }
     lastEnd[level] = px + size
     chips.push({
-      call,
+      call: group.calls[0],
+      calls: group.calls,
+      count: group.calls.length,
       left: Math.round(px * 10) / 10,
       width: size,
       leftPct: Math.round((px / width) * 10000) / 100,
       widthPct: Math.round((size / width) * 10000) / 100,
-      widthLinPct: Math.round((linSize / width) * 10000) / 100,
+      widthLinPct: Math.round((size / width) * 10000) / 100,
       level,
       top: top + level * levelH,
-      unfinished,
+      unfinished: group.unfinished,
     })
   }
   const levels = lastEnd.length
@@ -2675,7 +2703,12 @@ const TL = {
   collapsed: 20,
   levelH: 12,
   top: 6,
-  maxLevels: 5,
+  // Потолок уровней ряда. Пять было мало: на живом деле `d_92177017` попытка
+  // набрала 108 вызовов и требовала шести рядов — шестой ложился поверх первого,
+  // и дорожка читалась как «наслоения» (Макс, 14.11). Потолок остался, но высокий:
+  // ряд растёт вниз, пока вызовы не перестанут сталкиваться, и только после
+  // шестнадцатого ряда наложение считается приемлемым (крайний случай).
+  maxLevels: 16,
   pad: 8,
   // Зазор, с которого молчание стоит называть тишиной: полминуты — обычная
   // пауза между вызовами, а не простой, и рисовать её значило бы шуметь.
@@ -2780,7 +2813,12 @@ function attemptView(bar, scale) {
     const call = chip.call || {}
     // Подсказка и инспектор читают одни и те же поля: имя инструмента, время
     // начала и длительность. Поверхность ничего не досчитывает.
-    const tip = `${call.name || '—'} · ${call.clock || '—'} · ${call.msText || '—'}`
+    const count = Number(chip.count) || 1
+    const tip = count > 1
+      // Всплеск: полоса — не один вызов, а N подряд. Подсказка называет число и
+      // крайние инструменты, чтобы полоса не читалась как «один длинный вызов».
+      ? `${count} вызовов подряд · ${call.clock || '—'}–${(chip.calls[chip.calls.length - 1] || {}).clock || '—'} · ${call.name || '—'}…${(chip.calls[chip.calls.length - 1] || {}).name || '—'}`
+      : `${call.name || '—'} · ${call.clock || '—'} · ${call.msText || '—'}`
     return {
       // Идентификатор вызова — ключ выбора в инспекторе (`stage:attempt:seq`).
       id: `${b.stage || '—'}:${b.number || '—'}:${call.seq === null || call.seq === undefined ? '—' : call.seq}`,
@@ -2797,6 +2835,8 @@ function attemptView(bar, scale) {
       level: chip.level,
       tone: toolTone(call.name),
       unfinished: chip.unfinished === true,
+      count,
+      burst: count > 1,
       tip,
       title: tip,
     }
@@ -2906,14 +2946,17 @@ function attemptView(bar, scale) {
       widthPct: span.widthPct,
       title: span.title,
     }))
-  // Свёрнутая строка показывает первый уровень вызовов и маркеры; остальные
-  // уровни раскрываются по наведению. Высоту считает шейпер — иначе две
-  // поверхности разойдутся в том, «сколько строки видно без наведения».
-  // Маркеры журнала рисуются вертикальными палками на всю высоту строки, поэтому
-  // отдельной полосы под чипами больше нет: высота строки не зависит от того,
-  // случился ли в ней вердикт, — иначе соседние попытки разъезжались по высоте.
+  // Высота строки — по содержимому всегда, а не «20 px, остальное по наведению».
+  // Свёрнутая строка в 20 px держала только первый уровень вызовов, а чипы
+  // остальных уровней всё равно рисовались — они вылезали за строку и ложились
+  // на соседние (Макс, 14.11, дело `d_92177017`: «наслоения в шкале времени»).
+  // Прятать уровни под наведение — тоже враньё: на экране не то, что в журнале.
+  // Поэтому «свёрнутая» и «полная» высоты совпадают, а ряд растёт вниз на
+  // столько уровней, сколько вызовов действительно не помещается. Потолок
+  // уровней (16) остался: он для вырожденных случаев, и тогда `clipped` честно
+  // считает наложенные вызовы.
   const full = Math.max(TL.collapsed, layout.height + TL.pad)
-  const collapsed = Math.min(full, TL.collapsed)
+  const collapsed = full
   return {
     full,
     collapsed,
@@ -4286,7 +4329,7 @@ function DutyAttemptRow({ view, callSel, onSelectCall, toolFilter }) {
     track.push(
       h('span', {
         key: `call-${chip.id}`,
-        className: `duty-tl-call${chip.unfinished ? ' duty-tl-unfinished' : ''}${callSel === chip.id ? ' duty-tl-sel' : ''}${active.length && !active.includes(chip.tone) ? ' duty-tl-dim' : ''}`,
+        className: `duty-tl-call${chip.unfinished ? ' duty-tl-unfinished' : ''}${chip.burst ? ' duty-tl-burst' : ''}${callSel === chip.id ? ' duty-tl-sel' : ''}${active.length && !active.includes(chip.tone) ? ' duty-tl-dim' : ''}`,
         'data-level': String(chip.level || 0),
         'data-tip': chip.tip || chip.title,
         'aria-label': chip.tip || chip.title,
@@ -4350,14 +4393,20 @@ function DutyLeadLane({ leadLane }) {
         'div',
         { className: 'duty-tl-lane-id' },
         h('span', { className: 'duty-tl-lane-name', title: 'лид: процесс, который ведёт дело' }, 'лид'),
+        // Вид и счёт — второй строкой под именем: в одну строку они отбирали у
+        // имени всю ширину, и длинное имя ложилось на счёт (Макс, 14.11).
         h(
           'span',
-          { className: 'duty-tl-kind duty-tl-kind-agent', title: 'профиль: lead' },
-          h('svg', { className: 'duty-tl-kind-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' }, h('path', { d: KIND_ICON.agent })),
-          'lead',
+          { className: 'duty-tl-lane-sub' },
+          h(
+            'span',
+            { className: 'duty-tl-kind duty-tl-kind-agent', title: 'профиль: lead' },
+            h('svg', { className: 'duty-tl-kind-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' }, h('path', { d: KIND_ICON.agent })),
+            'lead',
+          ),
+          h('span', { className: 'duty-tl-lane-meta' }, leadLane ? leadLane.text : ''),
         ),
       ),
-      h('span', { className: 'duty-tl-lane-meta' }, leadLane ? leadLane.text : ''),
     ),
     runs.length
       ? h(
@@ -4418,23 +4467,27 @@ function DutyLane({ lane, bars, scale, callSel, onSelectCall, toolFilter }) {
         'div',
         { className: 'duty-tl-lane-id' },
         h('span', { className: 'duty-tl-lane-name', title: view.hint || view.name }, view.name),
-        view.kind
-          ? h(
-              'span',
-              {
-                className: `duty-tl-kind duty-tl-kind-${view.kind}`,
-                title: view.kind === 'agent' ? `профиль: ${view.kindText}` : view.kind,
-              },
-              h(
-                'svg',
-                { className: 'duty-tl-kind-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' },
-                h('path', { d: view.icon }),
-              ),
-              view.kindText,
-            )
-          : null,
+        h(
+          'span',
+          { className: 'duty-tl-lane-sub' },
+          view.kind
+            ? h(
+                'span',
+                {
+                  className: `duty-tl-kind duty-tl-kind-${view.kind}`,
+                  title: view.kind === 'agent' ? `профиль: ${view.kindText}` : view.kind,
+                },
+                h(
+                  'svg',
+                  { className: 'duty-tl-kind-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' },
+                  h('path', { d: view.icon }),
+                ),
+                view.kindText,
+              )
+            : null,
+          h('span', { className: 'duty-tl-lane-meta' }, view.meta),
+        ),
       ),
-      h('span', { className: 'duty-tl-lane-meta' }, view.meta),
     ),
     view.empty
       ? h('div', { className: 'duty-tl-empty' }, 'попыток не было')
@@ -4572,21 +4625,19 @@ const CSS = `
 .duty-dec-filter{height:20px;padding:0 7px;border-radius:999px;cursor:pointer;border:1px solid var(--ui-stroke-tertiary);background:transparent;color:var(--ui-text-secondary);font:inherit;font-size:11px;font-variant-numeric:tabular-nums}
 .duty-dec-filter:hover{color:var(--ui-text-primary);border-color:var(--ui-text-tertiary)}
 .duty-dec-filter.on{color:var(--ui-text-primary);border-color:color-mix(in srgb, var(--ui-blue) 55%, transparent);background:color-mix(in srgb, var(--ui-blue) 10%, transparent)}
-.duty-dec-list{list-style:none;margin:0;padding:6px 0 8px;position:relative;max-width:640px}
-.duty-dec-list::before{content:'';position:absolute;left:17px;top:12px;bottom:14px;width:1px;background:var(--ui-stroke-tertiary)}
-.duty-dec-item{position:relative;padding:7px 12px 7px 32px}
-.duty-dec-item+.duty-dec-item{border-top:1px solid color-mix(in srgb, var(--ui-stroke-tertiary) 55%, transparent)}
-.duty-dec-item:hover{background:color-mix(in srgb, var(--ui-text-primary) 5%, transparent)}
-.duty-dec-dot{position:absolute;left:14px;top:12px;width:7px;height:7px;border-radius:50%;box-shadow:0 0 0 3px var(--ui-bg-primary)}
-.duty-dec-when{display:flex;align-items:baseline;gap:7px;flex-wrap:wrap;min-width:0}
-.duty-dec-clock{font-size:10.5px;font-variant-numeric:tabular-nums;color:var(--ui-text-tertiary)}
-.duty-dec-gap{font-size:9.5px;font-style:normal;color:var(--ui-text-tertiary)}
-.duty-dec-type{font-size:11.5px;font-weight:650;white-space:nowrap}
-.duty-dec-who{margin-left:auto;font-size:9.5px;font-weight:650;text-transform:uppercase;letter-spacing:.03em;white-space:nowrap}
-.duty-dec-say{margin-top:2px;font-size:12px;line-height:1.4;color:var(--ui-text-primary);overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
-.duty-dec-panel:not(.is-open) .duty-dec-item:nth-child(n+7){display:none}
-.duty-dec-more{margin-top:3px;display:flex;gap:8px}
-.duty-dec-stage{font-size:10.5px;font-family:ui-monospace, Menlo, monospace;color:var(--ui-text-tertiary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.duty-dec-table{padding:6px 0 4px}
+.duty-dec-thead,.duty-dec-row{display:grid;grid-template-columns:34px 88px 50px minmax(0,1fr);column-gap:8px;padding:0 12px}
+.duty-dec-thead{font-size:9.5px;font-weight:650;letter-spacing:.04em;text-transform:uppercase;color:var(--ui-text-tertiary);padding-bottom:4px}
+.duty-dec-row{padding-top:6px;padding-bottom:6px;align-items:baseline}
+.duty-dec-row+.duty-dec-row{border-top:1px solid color-mix(in srgb, var(--ui-stroke-tertiary) 55%, transparent)}
+.duty-dec-row:hover{background:color-mix(in srgb, var(--ui-text-primary) 5%, transparent)}
+.duty-dec-time{font-size:10.5px;font-variant-numeric:tabular-nums;color:var(--ui-text-tertiary)}
+.duty-dec-kind{font-size:11px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.duty-dec-who{font-size:9.5px;font-weight:650;text-transform:uppercase;letter-spacing:.03em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--ui-text-tertiary)}
+.duty-dec-stage{font-size:10px;font-family:ui-monospace, Menlo, monospace;color:var(--ui-text-tertiary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.duty-dec-say{grid-column:1 / -1;margin-top:2px;font-size:12px;line-height:1.4;color:var(--ui-text-primary);overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.duty-dec-panel:not(.is-open) .duty-dec-row:nth-of-type(n+8){display:none}
+.duty-dec-empty{padding:10px 12px;font-size:12px;color:var(--ui-text-tertiary)}
 .duty-dec-empty{padding:8px 12px;color:var(--ui-text-tertiary);font-size:11px}
 /* Заход лида на шкале — разметка поверх дорожек, а не вторая полоса попытки:
    рейка на уровне текста, засечки начала и конца, слово режима над рейкой, вся
@@ -4686,9 +4737,10 @@ const CSS = `
 .duty-tl-lane{animation:duty-fade-in .32s ease both}
 @media (prefers-reduced-motion:reduce){.duty-stage-block,.duty-tl-lane{animation:none}.duty-scale-tick,.duty-scale-grid-line,.duty-tl-idle-gap,.duty-tl-call,.duty-tl-wait,.duty-tl-say,.duty-tl-lane,.duty-tl-row,.duty-stage-block,.duty-att-row{transition:none!important}}
 .duty-tl-lane-h{display:grid;grid-template-columns:var(--duty-tl-gutter,186px) 1fr;gap:var(--duty-tl-gap,8px);align-items:center;min-height:20px}
-.duty-tl-lane-id{display:flex;align-items:center;gap:6px;min-width:0;white-space:nowrap}
-.duty-tl-lane-name{font-size:12.5px;font-weight:600;color:var(--ui-text-primary);letter-spacing:.01em}
-.duty-tl-lane-meta{margin-left:auto;font-size:11px;color:var(--ui-text-tertiary);font-variant-numeric:tabular-nums;white-space:nowrap}
+.duty-tl-lane-id{display:flex;flex-direction:column;align-items:stretch;gap:1px;min-width:0;white-space:nowrap}
+.duty-tl-lane-sub{display:flex;align-items:center;gap:6px;min-width:0}
+.duty-tl-lane-name{font-size:12.5px;font-weight:600;color:var(--ui-text-primary);letter-spacing:.01em;min-width:0;flex:0 1 auto;overflow:hidden;text-overflow:ellipsis}
+.duty-tl-lane-meta{margin-left:auto;font-size:11px;color:var(--ui-text-tertiary);font-variant-numeric:tabular-nums;white-space:nowrap;min-width:0;overflow:hidden;text-overflow:ellipsis}
 .duty-tl-kind{display:inline-flex;align-items:center;gap:5px;height:19px;padding:0 7px;border-radius:5px;border:1px solid var(--ui-border-primary, rgba(127,127,127,.3));background:var(--ui-bg-quaternary);font-size:10.5px;font-weight:600;color:var(--ui-text-secondary)}
 .duty-tl-kind-ico{width:12px;height:12px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
 .duty-tl-kind-agent{color:var(--ui-text-primary);border-color:var(--ui-blue);background:color-mix(in srgb, var(--ui-blue) 12%, transparent)}
@@ -4715,6 +4767,7 @@ const CSS = `
 /* Суммарное число вызовов попытки: факт, а не предупреждение — тон нейтральный.
  * Жёлтым помечается только усечённое потолком: у части вызовов чипа нет. */
 /* Вызов без результата: полый чип — длительности нет, а не ноль. */
+.duty-tl-call.duty-tl-burst{background-image:repeating-linear-gradient(135deg,rgba(255,255,255,.55) 0 1px,transparent 1px 3px)}
 .duty-tl-call.duty-tl-unfinished,.duty-tl-tick.duty-tl-unfinished{background:transparent !important;box-shadow:inset 0 0 0 1.5px currentColor !important;opacity:.9}
 .duty-tl-track{position:relative;height:100%}
 .duty-tl-track{position:relative;min-height:20px}
@@ -5672,30 +5725,38 @@ function DecisionsPanel({ items, plan, dealId }) {
       ),
     ),
     shown.length
+      // Решения — таблица, а не таймлайн: у записи есть поля, и сравнивают их по
+      // колонкам. Слова решения — второй строкой во всю ширину: в 340 px колонке
+      // текста осталось бы три слова (Макс, 14.11).
       ? h(
-          'ol',
-          { className: 'duty-dec-list' },
+          'div',
+          { className: 'duty-dec-table', role: 'table', 'aria-label': 'решения лида' },
+          h(
+            'div',
+            { className: 'duty-dec-thead', role: 'row' },
+            h('span', { role: 'columnheader' }, 'время'),
+            h('span', { role: 'columnheader' }, 'решение'),
+            h('span', { role: 'columnheader' }, 'кто'),
+            h('span', { role: 'columnheader' }, 'этап'),
+          ),
           ...shown.map((row) =>
             h(
-              'li',
-              { className: `duty-dec-item${open ? ' is-open' : ''}`, key: row.key },
-              h('span', { className: 'duty-dec-dot', style: { background: TONE_COLOR[row.tone] || TONE_COLOR.gray } }),
+              'div',
+              { className: `duty-dec-row${open ? ' is-open' : ''}`, key: row.key, role: 'row' },
+              h('span', { className: 'duty-dec-time duty-mono', role: 'cell', title: row.ageText === '—' ? '' : `${row.ageText} назад` }, row.clock),
               h(
-                'div',
-                { className: 'duty-dec-when' },
-                h('span', { className: 'duty-dec-clock', title: row.ageText === '—' ? '' : `${row.ageText} назад` }, row.clock),
-                h('span', { className: 'duty-dec-type', style: { color: TONE_COLOR[row.tone] || TONE_COLOR.gray } }, row.typeLabel),
-                row.gapText ? h('i', { className: 'duty-dec-gap', title: 'прошло после предыдущего решения' }, row.gapText) : null,
-                row.authorLabel
-                  ? h(
-                      'span',
-                      { className: 'duty-dec-who', style: { color: TONE_COLOR[row.authorTone] || TONE_COLOR.gray }, title: `автор: ${row.author}` },
-                      row.authorLabel,
-                    )
-                  : null,
+                'span',
+                {
+                  className: 'duty-dec-kind',
+                  role: 'cell',
+                  style: { color: TONE_COLOR[row.tone] || TONE_COLOR.gray },
+                  title: row.gapText ? `${row.gapText} после предыдущего решения` : '',
+                },
+                row.typeLabel,
               ),
-              h('div', { className: 'duty-dec-say' }, row.text),
-              row.stage ? h('div', { className: 'duty-dec-more' }, h('span', { className: 'duty-dec-stage', title: `этап: ${row.stage}` }, row.stage)) : null,
+              h('span', { className: 'duty-dec-who', role: 'cell', title: row.author ? `автор: ${row.author}` : '' }, row.authorLabel || ''),
+              h('span', { className: 'duty-dec-stage', role: 'cell', title: row.stage ? `этап: ${row.stage}` : '' }, row.stage || ''),
+              h('span', { className: 'duty-dec-say', role: 'cell', title: `${row.text}${row.gapText ? ` · ${row.gapText}` : ''}` }, row.text),
             ),
           ),
         )
@@ -5898,12 +5959,12 @@ function ScalePanel({ scale, dealId, callSel, onSelectCall, toolFilter, onToggle
         // Ячейка имени целиком: имя этапа и чип профиля в одной строке —
         // максимального из детей мало, нужна их сумма (fix-planned-branch
         // + «implementer» на d_c8551c18).
-        for (const cell of root.querySelectorAll('.duty-tl-lbl > *, .duty-tl-lane-id')) {
+        for (const cell of root.querySelectorAll('.duty-tl-lbl > *, .duty-tl-lane-name, .duty-tl-lane-sub')) {
           need = Math.max(need, cell.scrollWidth || 0)
         }
         seen.px = Math.max(seen.px, need)
         // 18px — отступы ячейки, зазор и запас на красную кромку провала.
-        wrap.style.setProperty('--duty-tl-gutter', `${Math.min(360, Math.max(186, Math.ceil(seen.px) + 18))}px`)
+        wrap.style.setProperty('--duty-tl-gutter', `${Math.min(320, Math.max(186, Math.ceil(seen.px) + 18))}px`)
       }
     }
     if (!el || el.__tlPinned === false) return

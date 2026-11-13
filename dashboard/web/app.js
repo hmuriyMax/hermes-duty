@@ -2020,30 +2020,38 @@ function decisionsPanel(items, plan, dealId) {
         ),
       ),
     ),
+    // Решения — таблица, а не таймлайн: у записи есть поля (время, вид, автор,
+    // этап), и человек сравнивает их по колонкам, а не выискивает на оси. Слова
+    // решения — вторая строка во всю ширину: в 340 px втиснуть их в колонку
+    // значит резать мысль до трёх слов (Макс, 14.11: «таблицей, а не таймлайном»).
     h(
-      'ol',
-      { class: 'dec-list' },
+      'div',
+      { class: 'dec-table', role: 'table', 'aria-label': 'решения лида' },
+      h(
+        'div',
+        { class: 'dec-thead', role: 'row' },
+        h('span', { role: 'columnheader' }, 'время'),
+        h('span', { role: 'columnheader' }, 'решение'),
+        h('span', { role: 'columnheader' }, 'кто'),
+        h('span', { role: 'columnheader' }, 'этап'),
+      ),
       ...rows.map((row) =>
         h(
-          'li',
-          { class: 'dec-item', key: row.key, 'data-group': row.group, 'data-at': row.at === null ? '' : String(row.at) },
-          h('span', { class: `dec-dot t-${row.tone}` }),
+          'div',
+          { class: 'dec-row', key: row.key, role: 'row', 'data-group': row.group, 'data-at': row.at === null ? '' : String(row.at) },
+          h('span', { class: 'dec-time mono', role: 'cell', title: row.ageText ? `${row.ageText} назад` : '' }, row.clock),
           h(
-            'div',
-            { class: 'dec-when' },
-            h('span', { class: 'dec-clock mono', title: row.ageText ? `${row.ageText} назад` : '' }, row.clock),
-            h('span', { class: `dec-type t-${row.tone}` }, row.typeLabel),
-            row.gapText ? h('span', { class: 'dec-gap', title: 'прошло после предыдущего решения' }, row.gapText) : null,
-            row.authorLabel
-              ? h('span', { class: `dec-who t-${row.authorTone}`, title: `автор: ${row.author}` }, row.authorLabel)
-              : null,
+            'span',
+            { class: `dec-kind t-${row.tone}`, role: 'cell', title: row.gapText ? `${row.gapText} после предыдущего решения` : '' },
+            row.typeLabel,
           ),
-          // Слова решения обрезаны тремя строками: клик по строке раскрывает
-          // целиком — «чем кончилось» не должно теряться из-за меры чтения.
-          h('div', { class: 'dec-say' }, row.text),
-          row.stage
-            ? h('div', { class: 'dec-more' }, h('span', { class: 'dec-stage mono', title: `этап: ${row.stage}` }, row.stage))
-            : null,
+          h('span', { class: 'dec-who', role: 'cell', title: row.author ? `автор: ${row.author}` : '' }, row.authorLabel || ''),
+          h('span', { class: 'dec-stage mono', role: 'cell', title: row.stage ? `этап: ${row.stage}` : '' }, row.stage || ''),
+          h(
+            'span',
+            { class: 'dec-say', role: 'cell', title: `${row.text}${row.gapText ? ` · ${row.gapText}` : ''}` },
+            row.text,
+          ),
         ),
       ),
     ),
@@ -2064,7 +2072,7 @@ const wiredDecisionHosts = new WeakSet()
 /** Применить фильтр ленты решений к уже нарисованной панели. */
 function applyDecisionFilter(panel) {
   const active = dutyDecisionFilter.size
-  for (const row of panel.querySelectorAll('.dec-list .dec-item')) {
+  for (const row of panel.querySelectorAll('.dec-table .dec-row')) {
     const on = !active || dutyDecisionFilter.has(row.getAttribute('data-group'))
     row.classList.toggle('is-dim', !on)
   }
@@ -2113,7 +2121,7 @@ function wireDecisionsPanel(panel) {
     }
     // Клик по самой строке раскрывает её слова целиком: обрезка тремя строками
     // — мера чтения в узком рельсе, а не запрет на подробности.
-    const item = event.target.closest('.dec-item')
+    const item = event.target.closest('.dec-row')
     if (item) item.classList.toggle('is-open')
   })
   applyDecisionFilter(panel)
@@ -2347,7 +2355,7 @@ function attemptRowNode(view, key) {
   for (const chip of view.chips) {
     track.append(
       h('span', {
-        class: `tl-call${chip.unfinished ? ' tl-unfinished' : ''}`,
+        class: `tl-call${chip.unfinished ? ' tl-unfinished' : ''}${chip.burst ? ' tl-burst' : ''}`,
         'data-level': String(chip.level || 0),
         'data-tone': chip.tone,
         'data-key': `call:${chip.id}`,
@@ -2429,12 +2437,16 @@ function leadLaneNode(leadLane, scale) {
       h('span', { class: 'tl-lane-name', title: 'лид: процесс, который ведёт дело' }, 'лид'),
       h(
         'span',
-        { class: 'tl-kind tl-kind-agent', title: 'профиль: lead' },
-        h('svg', { class: 'tl-kind-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' }, h('path', { d: KIND_ICON.agent })),
-        'lead',
+        { class: 'tl-lane-sub' },
+        h(
+          'span',
+          { class: 'tl-kind tl-kind-agent', title: 'профиль: lead' },
+          h('svg', { class: 'tl-kind-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' }, h('path', { d: KIND_ICON.agent })),
+          'lead',
+        ),
+        h('span', { class: 'tl-lane-meta', 'data-fresh': 'lane:lead' }, leadLane.text),
       ),
     ),
-    h('span', { class: 'tl-lane-meta', 'data-fresh': 'lane:lead' }, leadLane.text),
   )
   return h(
     'div',
@@ -2499,6 +2511,9 @@ function laneNode(lane, bars, scale) {
       'div',
       { class: 'tl-lane-id' },
       h('span', { class: 'tl-lane-name', title: view.hint || view.name }, view.name),
+      // Вид и счёт — второй строкой под именем: в одну строку они отбирали у
+      // имени всю ширину, и длинное имя ложилось на «0 попыток» (Макс, 14.11).
+      h('span', { class: 'tl-lane-sub' },
       view.kind
         ? h(
             'span',
@@ -2514,8 +2529,9 @@ function laneNode(lane, bars, scale) {
             view.kindText,
           )
         : null,
+      h('span', { class: 'tl-lane-meta fresh', 'data-fresh': `lane:${lane.key}` }, view.meta),
+      ),
     ),
-    h('span', { class: 'tl-lane-meta fresh', 'data-fresh': `lane:${lane.key}` }, view.meta),
   )
   return h(
     'div',
@@ -3388,12 +3404,15 @@ function fitScaleGutter(root, dealKey) {
   // Ячейка имени целиком: имя этапа и чип профиля лежат в одной строке —
   // максимального из детей мало, нужна их сумма (см. `fix-planned-branch`
   // + «implementer» на d_c8551c18).
-  for (const el of root.querySelectorAll('.tl-lbl > *, .tl-lane-id')) {
+  // Имя этапа меряется собственной шириной: у ячейки `scrollWidth` равен её же
+  // ширине (длинное имя обрезано), и колонка не росла под него вовсе — имена
+  // стояли в 204 px и терялись на середине слова.
+  for (const el of root.querySelectorAll('.tl-lbl > *, .tl-lane-name, .tl-lane-sub')) {
     need = Math.max(need, el.scrollWidth || 0)
   }
   scaleGutterSeen.px = Math.max(scaleGutterSeen.px, need)
   // 18px — внутренние отступы ячейки, зазор и запас на красную кромку провала.
-  const px = Math.min(360, Math.max(186, Math.ceil(scaleGutterSeen.px) + 18))
+  const px = Math.min(320, Math.max(186, Math.ceil(scaleGutterSeen.px) + 18))
   wrap.style.setProperty('--tl-gutter', `${px}px`)
 }
 function pinScaleScroll(root) {

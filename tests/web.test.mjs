@@ -42,8 +42,11 @@ test('левый столбец: шапка дорожки липнет вмес
   assert.match(css, /\.scale-main\.is-wide \.tl-lane-id \{ position: sticky/, 'веб: шапка дорожки не липнет')
   // ширина столбца подстраивается под самый широкий контент
   assert.match(app, /function fitScaleGutter/, 'веб: нет подгона ширины столбца')
-  assert.match(app, /\.tl-lbl > \*, \.tl-lane-id'/, 'веб: замер не по ячейке имени целиком')
-  assert.match(app, /Math\.min\(360, Math\.max\(186,/, 'веб: нет потолка 360px')
+  // Замер — по имени и подписям, а не по ячейке: у обрезанной ячейки scrollWidth
+  // равен её ширине, и колонка не росла под длинное имя (Макс, 14.11).
+  assert.match(app, /\.tl-lbl > \*, \.tl-lane-name, \.tl-lane-sub'/, 'веб: замер не по имени этапа')
+  assert.match(app, /Math\.min\(320, Math\.max\(186,/, 'веб: нет потолка 320px')
+  assert.match(css, /\.tl-lane-id \{ display: flex; flex-direction: column/, 'веб: имя и счёт снова в одной строке')
   assert.match(pluginSource, /duty-tl-lane-id/, 'десктоп: нет ячейки имени')
   assert.match(pluginSource, /duty-tl-lane-h\{display:grid;grid-template-columns:var\(--duty-tl-gutter,186px\) 1fr/, 'десктоп: шапка не решёткой')
   assert.match(pluginSource, /--duty-tl-gutter/, 'десктоп: нет подгона ширины')
@@ -1377,27 +1380,26 @@ test('веб: экран дела показывает лида и его реш
   assert.ok(!panel.closest('[data-key="scale"]'), 'лента решений осталась в панели шкалы')
   assert.ok(panel.closest('.deal-rail'), 'лента решений стоит вне правого рельса')
   assert.match(panel.querySelector('.dec-panel-title').textContent, /решения лида · 2/)
-  const rows = [...panel.querySelectorAll('.dec-list .dec-item')]
+  const rows = [...panel.querySelectorAll('.dec-table .dec-row')]
   assert.deepEqual(
     rows.map((row) => row.querySelector('.dec-say').textContent),
     ['ответ на вопрос #4 пришёл от человека', 'план создан (3 этапа)'],
     'свежее решение должно стоять первым',
   )
   // Вид решения — своё слово у каждого факта, а не «решение»: по нему читают строку.
-  assert.deepEqual(rows.map((row) => row.querySelector('.dec-type').textContent), ['ответ', 'план принят'])
+  assert.deepEqual(rows.map((row) => row.querySelector('.dec-kind').textContent), ['ответ', 'план принят'])
   assert.deepEqual(
     rows.map((row) => (row.querySelector('.dec-who') || { textContent: '' }).textContent),
     ['человек', 'лид'],
   )
-  assert.ok(rows[1].querySelector('.dec-who').className.includes('t-blue'), 'автор-лид не своим тоном')
-  assert.ok(rows[0].querySelector('.dec-who').className.includes('t-yellow'), 'автор-человек не своим тоном')
+  // Вид решения — в колонке «решение» и в цвете тона: по нему читают строку.
+  assert.ok(rows[0].querySelector('.dec-kind').className.includes('t-purple'), 'вид «ответ» не своим тоном')
   // Время стоит у каждой строки: журнал — история, а не список без дат. Часы до
-  // минуты, а под ними — через сколько после предыдущего решения.
-  const clock = rows[0].querySelector('.dec-clock')
+  // минуты в своей колонке, зазор до прошлого решения — в подсказке.
+  const clock = rows[0].querySelector('.dec-time')
   assert.match(clock.textContent, /^\d{2}:\d{2}/)
-  // Зазор до прошлого решения стоит рядом с часами, в той же строке ленты.
-  const when = rows[0].querySelector('.dec-when')
-  assert.match(when.querySelector('.dec-gap').textContent, /^\+\d/)
+  assert.match(clock.getAttribute('title'), /назад/)
+  assert.match(rows[0].querySelector('.dec-say').getAttribute('title'), /· \+\d/)
   // Фильтр по семействам: чипы с числами, «все» включён по умолчанию.
   const chips = [...panel.querySelectorAll('.dec-filter')]
   assert.deepEqual(chips.map((chip) => chip.textContent), ['все 2', 'план 1', 'вопросы 1'])
@@ -1427,11 +1429,20 @@ test('веб: лента решений — шесть записей в рел�
 
   const panel = doc.querySelector('[data-key="decisions"]')
   assert.ok(panel.closest('.deal-rail'), 'лента решений стоит вне правого рельса')
-  assert.equal(panel.querySelectorAll('.dec-list .dec-item').length, 9, 'в ленте не все записи')
+  assert.equal(panel.querySelectorAll('.dec-table .dec-row').length, 9, 'в таблице не все записи')
+  // Решения — таблица: шапка с колонками и по ячейке на поле записи.
+  const head = [...panel.querySelectorAll('.dec-thead [role="columnheader"]')].map((cell) => cell.textContent)
+  assert.deepEqual(head, ['время', 'решение', 'кто', 'этап'], `колонки таблицы: ${head.join(' · ')}`)
+  const first = panel.querySelector('.dec-row')
+  assert.deepEqual(
+    [...first.querySelectorAll('[role="cell"]')].map((cell) => cell.className.split(' ')[0]),
+    ['dec-time', 'dec-kind', 'dec-who', 'dec-stage', 'dec-say'],
+    'ячейки строки решения не по колонкам',
+  )
   // Превью — правило CSS, а не обрезка данных: записи на месте, лишние скрыты.
   const css = read('dashboard/web/styles.css').replace(/\/\*[\s\S]*?\*\//g, '')
-  assert.match(css, /\.dec-panel:not\(\.is-open\) \.dec-item:nth-child\(n\+7\) \{ display: none; \}/, 'превью шести записей не задано')
-  assert.match(css, /\.dec-item\.is-open \.dec-say \{ -webkit-line-clamp: unset; display: block; \}/, 'запись не раскрывается целиком')
+  assert.match(css, /\.dec-panel:not\(\.is-open\) \.dec-row:nth-of-type\(n\+8\) \{ display: none; \}/, 'превью шести записей не задано')
+  assert.match(css, /\.dec-row\.is-open \.dec-say \{ -webkit-line-clamp: unset; display: block; \}/, 'запись не раскрывается целиком')
 
   // Кнопка: «все 9» → раскрыто → «свежие».
   const toggle = panel.querySelector('.dec-toggle')
@@ -1445,7 +1456,7 @@ test('веб: лента решений — шесть записей в рел�
   assert.ok(!panel.classList.contains('is-open'), 'лента не свернулась обратно')
 
   // Клик по записи раскрывает её слова целиком.
-  const item = panel.querySelector('.dec-item')
+  const item = panel.querySelector('.dec-row')
   item.click()
   assert.ok(item.classList.contains('is-open'), 'запись не раскрылась по клику')
 })

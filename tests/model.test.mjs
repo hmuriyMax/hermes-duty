@@ -712,24 +712,32 @@ test('маркеры: событие принадлежит одной попы�
   assert.ok(answerRow >= 0, 'ответ человека не попал ни в одну строку')
 })
 
-test('разворот строки: свёрнутая высота меньше полной, маркеры видны и без наведения', () => {
-  // Вызовы в одну секунду накладываются друг на друга — уровней больше одного.
-  const calls = Array.from({ length: 6 }, (_, i) => ({ seq: i + 1, name: 'read_file', at: 1_000, ms: 400 }))
+test('плотная попытка: 158 вызовов дают несколько полос без наложений, счёт сходится', () => {
+  // Дело `d_92177017` (14.11): 158 вызовов в одной попытке рисовались стеной
+  // наложений, а строка была высотой в один уровень — глубокие чипы вылезали
+  // за неё и ложились на соседние. Теперь всплески склеиваются, ряд растёт по
+  // уровням, а «свёрнутая» высота равна полной: на экране то же, что в журнале.
+  const calls = Array.from({ length: 158 }, (_, i) => ({ seq: i + 1, name: 'read_file', at: 1_000 + i * 0.05, ms: 300 }))
   const scale = shapeDealTime(
-    { now: 1_100, terminal: true, timeline: [{ kind: 'created', at: 1_000, summary: '' }], stages: [{ id: 'impl', needs: [] }] },
+    { now: 1_400, terminal: true, timeline: [{ kind: 'created', at: 1_000, summary: '' }], stages: [{ id: 'impl', needs: [] }] },
     { attempts: [{ stage: 'impl', attempt: 1, start: 1_000, end: 1_010, status: 'done', outcome: 'done', calls }] },
   )
   const view = attemptView(scale.bars[0], scale)
-  const levels = new Set(view.chips.map((chip) => chip.level))
-  assert.ok(levels.size > 1, `уровней ${levels.size}: разворачивать нечего`)
-  assert.ok(view.collapsed > 0 && view.collapsed < view.full, `свёрнутая ${view.collapsed}, полная ${view.full}`)
-  // Свёрнутая высота — первый уровень плюс строка маркеров, иначе точки фактов
-  // исчезали бы вместе с глубокими чипами.
-  // 20 px — свёрнутая строка (`TL.collapsed`): маркеры рисуются палками поверх
-  // строки, отдельной полосы под чипами больше нет, высота от них не зависит.
-  assert.equal(view.collapsed, 20)
-  // Уровень приходит в вид: поверхности прячут глубокие чипы, не считая сами.
-  assert.deepEqual([...new Set(view.chips.map((chip) => chip.level))].sort(), [...levels].sort())
+  assert.equal(view.collapsed, view.full, 'строка снова прячет уровни под наведение')
+  assert.ok(view.chips.length <= 8, `полос ${view.chips.length}: всплески не склеились`)
+  assert.equal(view.chips.reduce((sum, chip) => sum + chip.count, 0), 158, 'вызовы потерялись')
+  assert.ok(view.chips.some((chip) => chip.burst), 'всплеск не назван всплеском')
+  // Ни одна полоса не лежит на другой: верхние края уровней различны там, где
+  // полосы пересекаются по горизонтали.
+  for (let i = 0; i < view.chips.length; i += 1) {
+    for (let j = i + 1; j < view.chips.length; j += 1) {
+      const a = view.chips[i]
+      const b = view.chips[j]
+      const crossX = a.leftPct < b.leftPct + b.widthPct && a.leftPct + a.widthPct > b.leftPct
+      if (!crossX) continue
+      assert.notEqual(a.top, b.top, `полосы ${i} и ${j} пересекаются на одном уровне`)
+    }
+  }
 })
 
 test('граф спеки: красный — про последнюю попытку, а не про память о провале', () => {
@@ -2565,24 +2573,44 @@ test('раскладка вызовов: ширина растёт с длите
   }
 })
 
-test('раскладка вызовов: вызовы в одну секунду расходятся по уровням, а не липнут', () => {
+test('раскладка вызовов: всплеск склеивается в одну полосу и не накладывается сам на себя', () => {
+  // Прежнее правило «вызовы в одну секунду расходятся по уровням» на живом деле
+  // дало стену наложений: 158 вызовов на 2 px каждый требуют столько рядов,
+  // сколько нет места рисовать (`d_92177017`, Макс, 14.11). Теперь вплотную
+  // стоящие вызовы — один всплеск с точным счётом.
   const calls = shapeCalls(
-    Array.from({ length: 6 }, (_, index) => ({ seq: index * 2 + 1, name: 'read_file', at: 5 + index * 0.05, ms: 120 })),
+    Array.from({ length: 6 }, (_, index) => ({ seq: index * 2 + 1, name: 'read_file', at: 5 + index * 0.002, ms: 120 })),
   )
   const layout = layoutCalls(calls, { from: 0, to: 10, width: 700, levelH: 12, top: 6 })
-  assert.equal(layout.chips.length, 6)
-  assert.ok(layout.levels > 1, 'шесть вызовов в 0.3 с не влезают в один уровень')
-  assert.equal(layout.clipped, 0, 'пока уровней хватает, наложений быть не должно')
+  assert.equal(layout.chips.length, 1, 'всплеск должен стать одной полосой')
+  assert.equal(layout.chips[0].count, 6, 'счёт вызовов во всплеске потерян')
+  assert.equal(layout.clipped, 0, 'наложений быть не должно')
 })
 
-test('раскладка вызовов: потолок уровней не теряет вызовы, а считает наложения', () => {
+test('раскладка вызовов: одинокие вызовы остаются собой, всплеск называется числом', () => {
+  const calls = shapeCalls([
+    { seq: 1, name: 'read_file', at: 1, ms: 100 },
+    { seq: 3, name: 'bash', at: 2, ms: 100 },
+    { seq: 5, name: 'bash', at: 2.01, ms: 100 },
+    { seq: 7, name: 'bash', at: 2.02, ms: 100 },
+    { seq: 9, name: 'bash', at: 6, ms: 100 },
+  ])
+  const layout = layoutCalls(calls, { from: 0, to: 10, width: 700, levelH: 12, top: 6 })
+  const counts = layout.chips.map((chip) => chip.count)
+  assert.deepEqual(counts, [1, 3, 1])
+  assert.equal(layout.clipped, 0)
+})
+
+test('раскладка вызовов: при переполнении уровней вызов не теряется из счёта', () => {
+  // Даже когда полос не хватает, сумма счётов обязана равняться числу вызовов:
+  // наложение — предел рисования, а не повод забыть факт.
   const calls = shapeCalls(
     Array.from({ length: 20 }, (_, index) => ({ seq: index * 2 + 1, name: 'read_file', at: index * 0.01, ms: 10 })),
   )
   const layout = layoutCalls(calls, { from: 0, to: 10, width: 700, maxLevels: 2, levelH: 12, top: 6 })
-  assert.equal(layout.chips.length, 20)
-  assert.equal(layout.levels, 2)
-  assert.ok(layout.clipped > 0)
+  const total = layout.chips.reduce((sum, chip) => sum + chip.count, 0)
+  assert.equal(total, 20, 'вызовы потерялись при склейке')
+  assert.ok(layout.levels <= 2)
 })
 
 test('раскладка вызовов: тело чипа не вылезает за конец своей полосы', () => {

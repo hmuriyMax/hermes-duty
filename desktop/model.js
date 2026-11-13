@@ -2508,7 +2508,7 @@ function layoutCalls(calls, options) {
   const width = Number(opts.width) || 1000
   const levelH = Number(opts.levelH) || 12
   const top = Number(opts.top) || 0
-  const maxLevels = Math.max(1, Number(opts.maxLevels) || 5)
+  const maxLevels = Math.max(1, Number(opts.maxLevels) || 16)
   const gap = Number(opts.gap) || 2
   const span = from === null || to === null ? 0 : to - from
   // Позиция вызова — та же карта оси, что у полос и маркеров (`pctOf` из
@@ -2547,9 +2547,8 @@ function layoutCalls(calls, options) {
   // бы утверждать «0 мс»: длительности нет, а не она нулевая. Отдельная ширина и
   // флаг `unfinished` дают поверхности возможность показать это иначе.
   const UNFINISHED_W = 5
-  const lastEnd = []
-  const chips = []
-  let clipped = 0
+  // Сначала — место каждого вызова на карте оси, потом склейка всплесков.
+  const spots = []
   for (const call of list) {
     let px = Math.max(0, Math.min(width, pxOf(call.at)))
     const unfinished = call.ms === null || call.ms === undefined
@@ -2565,12 +2564,39 @@ function layoutCalls(calls, options) {
     if (clampLeftPx !== null && px < clampLeftPx) {
       px = Math.min(clampLeftPx, (clampRightPx !== null ? clampRightPx : width) - size)
     }
-    const linSize = size
+    spots.push({ call, px, size, unfinished })
+  }
+  // Всплеск — вызовы, которые на этой карте стоят вплотную: между ними меньше
+  // MERGE_GAP виртуальных пикселей. Сто пятьдесят восемь чипов по 2 px в одну
+  // попытку не читаются никак: ряды кончаются, и они ложатся друг на друга
+  // (`d_92177017`, Макс, 14.11: «наслоения в шкале времени»). Всплеск рисуется
+  // одной полосой, а его точное число вызовов уходит в подсказку и в счёт
+  // попытки — факт не теряется, теряется только его пиксельная дробь.
+  const MERGE_GAP = 4
+  const groups = []
+  for (const spot of spots) {
+    const last = groups[groups.length - 1]
+    const end = last ? last.px + last.size : null
+    if (last && spot.px - end < MERGE_GAP) {
+      last.size = Math.max(last.size, spot.px + spot.size - last.px)
+      last.calls.push(spot.call)
+      last.unfinished = last.unfinished || spot.unfinished
+      continue
+    }
+    groups.push({ px: spot.px, size: spot.size, calls: [spot.call], unfinished: spot.unfinished })
+  }
+  const lastEnd = []
+  const chips = []
+  let clipped = 0
+  for (const group of groups) {
+    const px = group.px
+    const size = group.size
     let level = lastEnd.findIndex((end) => px - end >= gap)
     if (level < 0) {
       if (lastEnd.length >= maxLevels) {
-        // Уровни кончились — вызов всё равно показываем: прятать факт хуже, чем
-        // наложить его на соседа. Число наложенных считается в `clipped`.
+        // Уровни кончились даже после склейки (больше шестнадцати рядов на одну
+        // попытку) — полосу всё равно показываем: прятать факт хуже, чем
+        // наложить его на соседа. Число наложенных считает `clipped`.
         level = lastEnd.indexOf(Math.min(...lastEnd))
         clipped += 1
       } else {
@@ -2579,15 +2605,17 @@ function layoutCalls(calls, options) {
     }
     lastEnd[level] = px + size
     chips.push({
-      call,
+      call: group.calls[0],
+      calls: group.calls,
+      count: group.calls.length,
       left: Math.round(px * 10) / 10,
       width: size,
       leftPct: Math.round((px / width) * 10000) / 100,
       widthPct: Math.round((size / width) * 10000) / 100,
-      widthLinPct: Math.round((linSize / width) * 10000) / 100,
+      widthLinPct: Math.round((size / width) * 10000) / 100,
       level,
       top: top + level * levelH,
-      unfinished,
+      unfinished: group.unfinished,
     })
   }
   const levels = lastEnd.length
@@ -2626,7 +2654,12 @@ const TL = {
   collapsed: 20,
   levelH: 12,
   top: 6,
-  maxLevels: 5,
+  // Потолок уровней ряда. Пять было мало: на живом деле `d_92177017` попытка
+  // набрала 108 вызовов и требовала шести рядов — шестой ложился поверх первого,
+  // и дорожка читалась как «наслоения» (Макс, 14.11). Потолок остался, но высокий:
+  // ряд растёт вниз, пока вызовы не перестанут сталкиваться, и только после
+  // шестнадцатого ряда наложение считается приемлемым (крайний случай).
+  maxLevels: 16,
   pad: 8,
   // Зазор, с которого молчание стоит называть тишиной: полминуты — обычная
   // пауза между вызовами, а не простой, и рисовать её значило бы шуметь.
@@ -2731,7 +2764,12 @@ function attemptView(bar, scale) {
     const call = chip.call || {}
     // Подсказка и инспектор читают одни и те же поля: имя инструмента, время
     // начала и длительность. Поверхность ничего не досчитывает.
-    const tip = `${call.name || '—'} · ${call.clock || '—'} · ${call.msText || '—'}`
+    const count = Number(chip.count) || 1
+    const tip = count > 1
+      // Всплеск: полоса — не один вызов, а N подряд. Подсказка называет число и
+      // крайние инструменты, чтобы полоса не читалась как «один длинный вызов».
+      ? `${count} вызовов подряд · ${call.clock || '—'}–${(chip.calls[chip.calls.length - 1] || {}).clock || '—'} · ${call.name || '—'}…${(chip.calls[chip.calls.length - 1] || {}).name || '—'}`
+      : `${call.name || '—'} · ${call.clock || '—'} · ${call.msText || '—'}`
     return {
       // Идентификатор вызова — ключ выбора в инспекторе (`stage:attempt:seq`).
       id: `${b.stage || '—'}:${b.number || '—'}:${call.seq === null || call.seq === undefined ? '—' : call.seq}`,
@@ -2748,6 +2786,8 @@ function attemptView(bar, scale) {
       level: chip.level,
       tone: toolTone(call.name),
       unfinished: chip.unfinished === true,
+      count,
+      burst: count > 1,
       tip,
       title: tip,
     }
@@ -2857,14 +2897,17 @@ function attemptView(bar, scale) {
       widthPct: span.widthPct,
       title: span.title,
     }))
-  // Свёрнутая строка показывает первый уровень вызовов и маркеры; остальные
-  // уровни раскрываются по наведению. Высоту считает шейпер — иначе две
-  // поверхности разойдутся в том, «сколько строки видно без наведения».
-  // Маркеры журнала рисуются вертикальными палками на всю высоту строки, поэтому
-  // отдельной полосы под чипами больше нет: высота строки не зависит от того,
-  // случился ли в ней вердикт, — иначе соседние попытки разъезжались по высоте.
+  // Высота строки — по содержимому всегда, а не «20 px, остальное по наведению».
+  // Свёрнутая строка в 20 px держала только первый уровень вызовов, а чипы
+  // остальных уровней всё равно рисовались — они вылезали за строку и ложились
+  // на соседние (Макс, 14.11, дело `d_92177017`: «наслоения в шкале времени»).
+  // Прятать уровни под наведение — тоже враньё: на экране не то, что в журнале.
+  // Поэтому «свёрнутая» и «полная» высоты совпадают, а ряд растёт вниз на
+  // столько уровней, сколько вызовов действительно не помещается. Потолок
+  // уровней (16) остался: он для вырожденных случаев, и тогда `clipped` честно
+  // считает наложенные вызовы.
   const full = Math.max(TL.collapsed, layout.height + TL.pad)
-  const collapsed = Math.min(full, TL.collapsed)
+  const collapsed = full
   return {
     full,
     collapsed,

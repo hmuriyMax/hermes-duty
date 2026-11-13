@@ -183,6 +183,9 @@ NOW_KEYS = {
     "deals[].lease.state",
     "deals[].stage",
     "deals[].stage.id",
+    # Имя этапа для человека (`title` спеки или принятого плана): `id` остаётся
+    # адресом в журнале, а строка списка зовёт этап именем.
+    "deals[].stage.title",
     "deals[].stage.state",
     "deals[].stage.role",
     "deals[].stage.attempt",

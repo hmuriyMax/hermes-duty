@@ -336,11 +336,19 @@ function shapeDeal(deal) {
   // читалась как «никто» (09.11).
   const assigned = String(d.assignee || '').trim()
   const stageRole = stage ? String(stage.role || '').trim() : ''
+  // Человеческое имя текущего этапа (`stagefeed.current`): `id` остаётся адресом
+  // в журнале и графе, а в строке стоит имя. Не назван — называем по `id`, как
+  // до 0.2.1: пустая клетка вместо этапа читалась бы как «этапа нет».
+  const stageId = stage ? String(stage.id || '') : ''
+  const stageName = (stage ? String(stage.title || '').trim() : '') || stageId
+  const stageText = stage
+    ? `${stageName || '—'} · попытка ${Number(stage.attempt) || 0}${stage.live === true ? ' · идёт' : ''}`
+    : ''
   const performer = assigned || stageRole || '—'
   const performerNote = assigned
     ? 'исполнитель дела'
     : stageRole
-      ? `роль текущего этапа${stage && stage.id ? ` «${stage.id}»` : ''}`
+      ? `роль текущего этапа${stageName ? ` «${stageName}»` : ''}`
       : 'исполнитель не записан'
   // «pid не записан» и «состояние pid неизвестно» (`os.kill` вернул OSError) — разные факты.
   let attemptNote = 'нет попытки'
@@ -398,13 +406,17 @@ function shapeDeal(deal) {
     // Этап и номер попытки из журнала (`/now.stage`): «что сейчас» видно в
     // строке, не открывая дело. Пусто — ни одной попытки у дела не было, и
     // подставлять «этап 0» значило бы выдумать граф.
-    stageId: stage ? String(stage.id || '') : '',
+    stageId,
+    // Имя этапа для показа (`title` из графа, иначе `id`). Подсказка клетки несёт
+    // `id` техническим хвостом, когда этап назван: по нему ищут в журнале.
+    stageName,
+    stageText,
+    stageHint: stageText && stageName !== stageId ? `${stageText} · этап: ${stageId}` : stageText,
     stageAttempt: stage ? Number(stage.attempt) || 0 : 0,
     stageLive: stage ? stage.live === true : false,
-    stageText: stage
-      ? `${String(stage.id || '—')} · попытка ${Number(stage.attempt) || 0}${stage.live === true ? ' · идёт' : ''}`
-      : '',
-    search: `${d.repo || ''} ${d.id || ''} ${d.title || ''} ${d.assignee || ''} ${stageRole} ${waiting.state || ''}`.toLowerCase(),
+    // Поиск — по обоим именам: искомое `research` из журнала должно находить
+    // этап, названный «Собрать требования», и наоборот.
+    search: `${d.repo || ''} ${d.id || ''} ${d.title || ''} ${d.assignee || ''} ${stageRole} ${stageId} ${stageName} ${waiting.state || ''}`.toLowerCase(),
   }
 }
 
@@ -1672,8 +1684,16 @@ function shapeStage(stage, journal, lead) {
     waitText = `пауза до ${fmtClock(waits.retry_at)}: повтор после отказа`
   }
   const attempt = Number(s.attempt) || 0
+  // Человеческое имя этапа (`stagefeed.stages.title`): в графе и журнале этап
+  // зовётся `id`, а человек читает имя. Не назван — показываем `id` (0.0.8 и
+  // раньше имён не объявляли), и `id` остаётся в подсказке строки: по нему ищут
+  // в журнале.
+  const title = String(s.title || '').trim()
+  const id = String(s.id || '—')
   return {
-    id: String(s.id || '—'),
+    id,
+    title,
+    name: title || id,
     // Вид этапа (`agent`/`shell`/`gate`) из спеки: подпись строки столбца и
     // значок графа берут его отсюда, а не угадывают по имени этапа.
     kind: String(s.kind || 'agent'),
@@ -1878,10 +1898,18 @@ function compactStageView(stage) {
   const standing = ['running', 'wait_human', 'wait_gate', 'parked', 'failed'].includes(state)
   const open = standing || failed
   const id = String(s.id || '—')
+  // Строка зовёт этап именем, если оно есть (`stagefeed.stages.title`), иначе
+  // `id`. Имя — из шейпера (`shapeStage.name`), второй расчёт здесь не заводится.
+  const name = String(s.name || '').trim() || id
   const kind = String(s.kind || 'agent')
   const leadNote = s.leadNote && typeof s.leadNote === 'object' ? s.leadNote : null
   return {
     id,
+    // Что печатает строка: имя этапа, если оно объявлено, иначе `id`.
+    name,
+    // Подсказка строки: `id` этапа остаётся техническим хвостом — по нему ищут в
+    // журнале и графе.
+    nameHint: `этап: ${id}`,
     // Вид этапа: у агентских — подпись исполнителя (`executorText`: для
     // координатора «лид (координатор)», иначе имя профиля), у остальных — сам вид
     // (`shell`, `gate`) из спеки. Та же подпись, что у дорожки шкалы: одна
@@ -1901,7 +1929,7 @@ function compactStageView(stage) {
     waitText: String(s.waitText || ''),
     waitHref: String(s.questionHref || ''),
     openByDefault: open,
-    toggleTitle: `${open ? 'свернуть' : 'развернуть'} попытки этапа ${id}`,
+    toggleTitle: `${open ? 'свернуть' : 'развернуть'} попытки этапа ${name}`,
   }
 }
 
@@ -2932,6 +2960,9 @@ function laneView(lane, bars, scale) {
     .join(' · ')
   return {
     name: String((lane && lane.label) || '—'),
+    // Подсказка дорожки несёт `id` этапа: печатается имя, а ищут в журнале по
+    // `id`. У безымянного этапа подсказки нет — имя ему и есть `id`.
+    hint: lane && lane.id && lane.id !== lane.label ? `этап: ${lane.id}` : '',
     kind: first ? String(first.kind || 'agent') : '',
     kindText: first ? (first.kind === 'agent' ? executorText(first) : String(first.kind)) : '',
     icon: first ? KIND_ICON[first.kind] || KIND_ICON.shell : '',
@@ -3454,10 +3485,19 @@ function shapeDealTime(detail, attemptsPayload) {
   // работы и вне графа — в хвосте, в порядке графа и появления на оси.
   const lanes = []
   const laneIndex = new Map()
+  // Имя дорожки — человеческое название этапа из графа (`detail.stages[].title`),
+  // иначе `id`: по `id` дорожка и попытки сходятся с журналом, поэтому `key`
+  // остаётся им, а имя живёт подписью.
+  const stageTitles = new Map(
+    (Array.isArray(d.stages) ? d.stages : []).map((stage) => [
+      String((stage && stage.id) || ''),
+      String((stage && stage.title) || '').trim(),
+    ]),
+  )
   const addLane = (key) => {
     if (!key || laneIndex.has(key)) return
     laneIndex.set(key, lanes.length)
-    lanes.push({ key, label: key, count: 0 })
+    lanes.push({ key, label: stageTitles.get(key) || key, id: key, count: 0 })
   }
   const graphKeys = (Array.isArray(d.stages) ? d.stages : []).map((stage) => String((stage && stage.id) || ''))
   const firstStart = new Map()
@@ -3506,6 +3546,11 @@ function shapeDealTime(detail, attemptsPayload) {
   for (const bar of bars) {
     bar.lane = laneIndex.get(bar.laneKey) ?? 0
     if (lanes[bar.lane]) lanes[bar.lane].count += 1
+    // Подпись этапа в подсказке строки: имя, а `id` — техническим хвостом в
+    // скобках, потому что ищут в журнале по нему. У безымянного этапа их два
+    // раза не пишут: он и так называется `id`.
+    const lane = lanes[bar.lane]
+    if (lane && lane.label !== lane.id) bar.laneLabel = `${lane.label} (${lane.id})`
   }
   if (!lanes.length) bars.forEach((bar) => { bar.lane = 0 })
 
@@ -4311,7 +4356,7 @@ function DutyLane({ lane, bars, scale, callSel, onSelectCall, toolFilter }) {
       h(
         'div',
         { className: 'duty-tl-lane-id' },
-        h('span', { className: 'duty-tl-lane-name', title: view.name }, view.name),
+        h('span', { className: 'duty-tl-lane-name', title: view.hint || view.name }, view.name),
         view.kind
           ? h(
               'span',
@@ -4403,7 +4448,7 @@ const CSS = `
 .duty-stage-block + .duty-stage-block .duty-stage-row{border-top:1px solid var(--ui-stroke-tertiary)}
 .duty-stage-row:hover{background:color-mix(in srgb, var(--ui-text-primary) 6%, transparent)}
 .duty-stage-row:focus-visible{outline:2px solid var(--ui-accent);outline-offset:-2px}
-.duty-stage-row-id{color:var(--ui-text-primary);font-weight:600;overflow:hidden;text-overflow:ellipsis}
+.duty-stage-row-name{color:var(--ui-text-primary);font-weight:600;overflow:hidden;text-overflow:ellipsis}
 .duty-stage-row-kind{overflow:hidden;text-overflow:ellipsis}
 .duty-stage-row-att{color:var(--ui-text-tertiary)}
 .duty-stage-row-tog,.duty-att-row-tog{color:var(--ui-text-tertiary);font-size:10px}
@@ -5142,7 +5187,7 @@ function DealRow({ deal, selected, onPick }) {
       'td',
       {
         className: `duty-muted duty-mono${deal.stageLive ? ' duty-stage-now' : ''}`,
-        title: deal.stageText || 'этап не начат',
+        title: deal.stageHint || 'этап не начат',
       },
       deal.stageText || '—',
     ),
@@ -5362,7 +5407,9 @@ function CompactStages({ feed, timeline }) {
           'aria-expanded': open ? 'true' : 'false',
           onClick: () => setOpenStages((prev) => ({ ...prev, [view.id]: !open })),
         },
-        h('span', { className: 'duty-mono duty-stage-row-id' }, view.id),
+        // Печатается имя этапа, если оно объявлено; `id` — в подсказке строки
+        // (по нему ищут в журнале).
+        h('span', { className: 'duty-mono duty-stage-row-name', title: view.nameHint }, view.name),
         h('span', { className: 'duty-muted duty-stage-row-kind' }, view.kindText),
         h('span', { className: 'duty-num duty-stage-row-att' }, view.attemptsText),
         h('span', { className: 'duty-spacer' }),

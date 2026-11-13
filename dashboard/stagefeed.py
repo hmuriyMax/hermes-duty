@@ -623,6 +623,10 @@ def stages(spec: Any, events: Iterable[Any], now: Any) -> list[dict[str, Any]]:
 
     Парковка читается из журнала (`journal.parked_of`): у неё нет состояния этапа,
     потому что исчерпанный этап в графе `failed`, — а ждёт он человека.
+
+    `title` — имя этапа для человека (`spec.Stage.title`): пустое значит «этап не
+    назван», и поверхность называет его по `id`. Имя — факт графа, а не догадка
+    экрана: спека или принятый план называют этап, а попытка знает только `id`.
     """
     moment = _int(now)
     events = list(events or ())
@@ -640,6 +644,8 @@ def stages(spec: Any, events: Iterable[Any], now: Any) -> list[dict[str, Any]]:
         out.append(
             {
                 "id": stage.id,
+                # Имя для человека: пустое — этап не назван (`spec.Stage.title`).
+                "title": str(getattr(stage, "title", "") or ""),
                 "kind": getattr(stage, "kind", STAGE_KIND_AGENT),
                 "role": stage.role,
                 # Профиль Hermes, под которым этап реально спавнится: роль
@@ -679,7 +685,14 @@ def current(events: Iterable[Any], now: Any) -> Optional[dict[str, Any]]:
     (`running` — не закрыта, `done`/`failed` — чем кончилась), а не состояние
     графа: граф без спеки не считается, и подставлять сюда `wait_gate` значило бы
     выдумать факт. Живость — тем же правилом лизинга, что у ленты этапов.
+
+    `title` — единственное поле не из попытки: попытка знает этап только по `id`,
+    а человеческое имя живёт в графе. Его называют спека (`created.payload.spec`)
+    и принятый план, поэтому имя ищется там же, где его ищет лента этапов. Граф не
+    читается — имени нет, и строка называет этап по `id`: срез «сейчас» не падает
+    из-за битой спеки, а «не назван» и «не прочитан» экран не различил бы всё равно.
     """
+    events = list(events or ())
     rows = _attempts(events)
     if not rows:
         return None
@@ -692,12 +705,33 @@ def current(events: Iterable[Any], now: Any) -> Optional[dict[str, Any]]:
         state = transit.FAILED
     return {
         "id": row["stage"],
+        "title": _stage_title(events, row["stage"]),
         "role": row["role"],
         "attempt": row["n"],
         "state": state,
         "live": row["live"],
         "since": row["started_at"],
     }
+
+
+def _stage_title(events: list[dict[str, Any]], stage_id: str) -> str:
+    """Имя этапа из графа дела: спека, названная журналом, плюс принятый план.
+
+    Поверхности зовут этап человеческим именем, но попытка его не знает. Поэтому
+    имя ищется в том же графе, что рисует дело (`graph_of`), и пустая строка здесь
+    — законный ответ: этап без имени и спека, которая не читается, выглядят для
+    экрана одинаково (`id` в обоих случаях остаётся адресом этапа).
+    """
+    path = spec_of(events)
+    if not path:
+        return ""
+    try:
+        spec = spec_module.load_spec(Path(path).expanduser())
+        graph = graph_of(spec, events)
+    except Exception:  # noqa: BLE001 - срез «сейчас» не падает из-за спеки
+        return ""
+    stage = next((item for item in graph.stages if item.id == stage_id), None)
+    return "" if stage is None else str(getattr(stage, "title", "") or "")
 
 
 def snapshot(events: Iterable[Any], now: Any, *, spec_path: Optional[str] = None) -> dict[str, Any]:

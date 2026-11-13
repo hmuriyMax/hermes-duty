@@ -762,8 +762,45 @@ test('веб: сжатый простой подписан на оси, без �
 })
 
 
-/* ------------------ страница дела обновляется сама и тихо (0.0.8) --------- */
+test('веб: строка этапа зовёт этап именем, а `id` держит в подсказке', async (t) => {
+  if (!jsdomRoot()) return t.skip('нет jsdom в ~/.hermes/hermes-agent/node_modules')
 
+  // Этап назван (`title` спеки или принятого плана): человек читает имя, `id`
+  // остаётся в подсказке — по нему ищут в журнале и графе.
+  const detail = {
+    id: 'd_0123456789abcdef',
+    title: 'дело с названным этапом',
+    repo: '/x/hermes-duty',
+    status: 'done',
+    terminal: true,
+    timeline: [{ kind: 'created', at: 1, summary: '' }],
+    stages: [
+      {
+        id: 'research',
+        title: 'Собрать требования',
+        kind: 'agent',
+        role: 'researcher',
+        state: 'done',
+        needs: [],
+        attempts: [{ n: 1, run_id: 'research#1', outcome: 'done', started_at: 1, finished_at: 31, duration_sec: 30 }],
+      },
+    ],
+  }
+  const attempts = { attempts: [{ stage: 'research', attempt: 1, start: 1, end: 31, status: 'done', outcome: 'done' }] }
+  const doc = await renderDealPanel(detail, attempts)
+
+  const row = doc.querySelector('.stage-row-name')
+  assert.ok(row, 'в строке этапа нет имени')
+  assert.equal(row.textContent, 'Собрать требования', `строка этапа: ${row.textContent}`)
+  assert.equal(row.getAttribute('title'), 'этап: research', 'подсказка строки не несёт `id`')
+
+  const lanes = [...doc.querySelectorAll('.tl-lane-name')]
+  const lane = lanes.find((item) => item.textContent === 'Собрать требования')
+  assert.ok(lane, `дорожка шкалы зовёт этап не именем: ${lanes.map((item) => item.textContent).join(' | ')}`)
+  assert.equal(lane.getAttribute('title'), 'этап: research', 'подсказка дорожки не несёт `id`')
+})
+
+/* ------------------ страница дела обновляется сама и тихо (0.0.8) --------- */
 const DEAL_ID = 'd_0123456789abcdef'
 const DEAL_T0 = 1_700_000_000
 

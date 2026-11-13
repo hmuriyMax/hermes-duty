@@ -79,16 +79,24 @@ def client(home):
     return TestClient(app)
 
 
-def spec_file(home: Path) -> Path:
+def spec_file(home: Path, *, title: str = "") -> Path:
+    """Спека дела: `title` называет первый этап — так имя попадает в граф.
+
+    Имя — необязательный ключ (`spec.STAGE_KEYS`), поэтому без него спека та же,
+    что была до 0.2.1: фикстура большинства тестов имён не объявляет.
+    """
     path = home / "duty.yaml"
-    path.write_text(SPEC, encoding="utf-8")
+    text = SPEC
+    if title:
+        text = SPEC.replace("- id: impl\n    role: implementer", f"- id: impl\n    title: {title}\n    role: implementer")
+    path.write_text(text, encoding="utf-8")
     return path
 
 
-def new_deal(client: TestClient, home: Path, *, spec: bool = True) -> str:
+def new_deal(client: TestClient, home: Path, *, spec: bool = True, title: str = "") -> str:
     payload = {"repo": REPO, "title": "дело с лентой"}
     if spec:
-        payload["spec"] = str(spec_file(home))
+        payload["spec"] = str(spec_file(home, title=title))
     response = client.post("/deals", json=payload)
     assert response.status_code == 200, response.text
     return response.json()["id"]
@@ -333,12 +341,46 @@ def test_now_shows_stage_and_attempt(client, home):
 
     assert row["stage"] == {
         "id": "impl",
+        # Имя этапа: спека этот этап не называет — строка зовёт его по `id`.
+        "title": "",
         "role": "implementer",
         "attempt": 2,
         "state": "running",
         "live": True,
         "since": NOW - 50,
     }
+
+
+def test_stage_name_reaches_both_routes(client, home):
+    """Названный этап виден и в ленте, и в строке «сейчас», а `id` остаётся адресом.
+
+    Имя — факт графа (`title` в спеке или в принятом плане), а не догадка экрана:
+    `/deal` отдаёт его строкой этапа, `/now` — в блоке `stage`. Этап без имени
+    остаётся безымянным (`""`), и поверхность зовёт его по `id`, как до 0.2.1.
+    """
+    deal_id = new_deal(client, home, title="Правка входа")
+    append(client, home, deal_id, two_attempts(deal_id))
+
+    titles = {stage["id"]: stage["title"] for stage in client.get(f"/deal/{deal_id}").json()["stages"]}
+    assert titles == {"impl": "Правка входа", "review": ""}
+
+    row = next(deal for deal in client.get("/now").json()["deals"] if deal["id"] == deal_id)
+    assert (row["stage"]["id"], row["stage"]["title"]) == ("impl", "Правка входа")
+
+
+def test_now_keeps_the_stage_when_the_spec_does_not_read(client, home):
+    """Битая спека не роняет `/now`: этап остаётся названным по `id`.
+
+    Имя ищется в графе, а граф — из файла спеки. Файл мог исчезнуть или развалиться,
+    и срез «сейчас» обязан ответить всё равно: состояние и номер попытки — факты
+    журнала, а имя в таком случае пустое.
+    """
+    deal_id = new_deal(client, home, title="Правка входа")
+    append(client, home, deal_id, two_attempts(deal_id))
+    (home / "duty.yaml").write_text("duty: [не словарь", encoding="utf-8")
+
+    row = next(deal for deal in client.get("/now").json()["deals"] if deal["id"] == deal_id)
+    assert (row["stage"]["id"], row["stage"]["title"]) == ("impl", "")
 
 
 def test_now_stage_is_null_without_attempts(client, home):

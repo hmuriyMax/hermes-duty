@@ -484,6 +484,8 @@ test('десктоп: строки этапов раскрываются кли�
             },
             {
               id: 'verify',
+              // Этап назван спекой (`title`): строка печатает имя, `id` — в подсказке.
+              title: 'Сверка правки',
               needs: ['check'],
               state: 'failed',
               attempts: [
@@ -533,6 +535,13 @@ test('десктоп: строки этапов раскрываются кли�
     // Клик по строке этапа раскрывает его попытки, повторный — сворачивает.
     const stageRow = blocks[0].querySelector('.duty-stage-row')
     assert.ok(stageRow, 'в этапе нет строки .duty-stage-row')
+    // Строка этапа печатает имя из графа, `id` живёт в подсказке: по нему ищут
+    // в журнале. Этап без имени называется `id`, как до 0.2.1.
+    const namedCheck = blocks[1].querySelector('.duty-stage-row-name')
+    assert.ok(namedCheck, 'в строке этапа нет имени')
+    assert.equal(namedCheck.textContent, 'Сверка правки', `строка этапа: ${namedCheck.textContent}`)
+    assert.equal(namedCheck.getAttribute('title'), 'этап: verify', 'подсказка строки не несёт `id`')
+    assert.equal(blocks[0].querySelector('.duty-stage-row-name').textContent, 'check', 'безымянный этап потерял `id`')
     stageRow.click()
     await settle(60)
     assert.equal(blocks[0].querySelectorAll('.duty-att-row').length, 1, 'клик по этапу не раскрыл попытки')

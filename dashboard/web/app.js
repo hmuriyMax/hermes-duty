@@ -516,7 +516,7 @@ function dealRow(deal) {
     // тонуть среди прочих ячеек (09.11).
     h(
       'td',
-      { class: `mono muted${deal.stageLive ? ' stage-now' : ''}`, title: deal.stageText || 'этап не начат' },
+      { class: `mono muted${deal.stageLive ? ' stage-now' : ''}`, title: deal.stageHint || 'этап не начат' },
       deal.stageText || '—',
     ),
     h('td', { class: 'n', title: attemptTitle }, deal.attemptAgeText),
@@ -1916,7 +1916,9 @@ function stageBlockNode(dealId, stage, timeline, rebuild) {
           rebuild()
         },
       },
-      h('span', { class: 'mono stage-row-id' }, view.id),
+      // Печатается имя этапа, если оно объявлено; `id` — в подсказке строки
+      // (по нему ищут в журнале).
+      h('span', { class: 'mono stage-row-name', title: view.nameHint }, view.name),
       h('span', { class: 'stage-row-kind muted' }, view.kindText),
       h('span', { class: 'stage-row-att fresh', 'data-fresh': `stage:${stageKey}` }, view.attemptsText),
       h('span', { class: 'sp' }),
@@ -2475,7 +2477,7 @@ function laneNode(lane, bars, scale) {
     h(
       'div',
       { class: 'tl-lane-id' },
-      h('span', { class: 'tl-lane-name', title: view.name }, view.name),
+      h('span', { class: 'tl-lane-name', title: view.hint || view.name }, view.name),
       view.kind
         ? h(
             'span',

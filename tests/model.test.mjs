@@ -1978,6 +1978,28 @@ test('/now: этап и номер попытки видны в строке, б
   assert.equal(shapeDeal({ repo: 'r', id: 'd_2' }).stageText, '')
 })
 
+test('/now: строка зовёт этап именем, `id` остаётся в подсказке', () => {
+  // Имя приходит из графа (`stagefeed.current.title`): дело с живым планом
+  // читалось как «research», хотя этап назван «Собрать требования».
+  const named = shapeDeal({
+    repo: 'r',
+    id: 'd_1',
+    stage: { id: 'research', title: 'Собрать требования', attempt: 2, state: 'running', live: true },
+  })
+  assert.equal(named.stageText, 'Собрать требования · попытка 2 · идёт')
+  assert.equal(named.stageName, 'Собрать требования')
+  // `id` ищут в журнале — он в подсказке, а не вместо имени
+  assert.equal(named.stageHint, 'Собрать требования · попытка 2 · идёт · этап: research')
+  assert.equal(named.stageId, 'research')
+  // поиск находит этап по обоим именам
+  assert.match(named.search, /research/)
+
+  // Этап не назван — подсказка не повторяет имя дважды: она и есть `id`
+  const bare = shapeDeal({ repo: 'r', id: 'd_2', stage: { id: 'research', attempt: 1 } })
+  assert.equal(bare.stageText, 'research · попытка 1')
+  assert.equal(bare.stageHint, 'research · попытка 1')
+})
+
 /* ------------------- компактный столбец этапов и попыток (0.0.8) ---------- */
 
 const implStage = feed.stages[0]
@@ -2005,6 +2027,36 @@ test('строка этапа: имя, вид, попытки и состоян�
   const ask = compactStageView(feed.stages[2])
   assert.match(ask.waitText, /#284/)
   assert.equal(ask.waitHref, '/imsg')
+})
+
+test('строка этапа зовёт этап именем, а `id` держит в подсказке', () => {
+  // Имя объявлено спекой или планом (`stagefeed.stages.title`) — строка печатает
+  // его; `id` остаётся в подсказке, потому что по нему ищут в журнале и графе.
+  const named = compactStageView(
+    shapeStages({ stages: [{ id: 'research', title: 'Собрать требования', state: 'running', role: 'researcher' }] }).stages[0],
+  )
+  assert.equal(named.name, 'Собрать требования')
+  assert.equal(named.id, 'research')
+  assert.equal(named.nameHint, 'этап: research')
+  // подпись раскрытия — тоже человеку: «попытки этапа Собрать требования»
+  assert.equal(named.toggleTitle, 'свернуть попытки этапа Собрать требования')
+
+  // Не назван — и строка, и подсказка называют `id`: имён спека 0.0.8 не знала
+  const bare = compactStageView(shapeStages({ stages: [{ id: 'research', state: 'running' }] }).stages[0])
+  assert.equal(bare.name, 'research')
+  assert.equal(bare.nameHint, 'этап: research')
+})
+
+test('дорожка шкалы зовёт этап именем, а `id` держит в подсказках', () => {
+  const scale = shapeDealTime(
+    { stages: [{ id: 'research', title: 'Собрать требования' }] },
+    { attempts: [{ run_id: 'research#1', stage: 'research', attempt: 1, start: 1000, end: 1300, outcome: 'done', calls: [] }] },
+  )
+  const view = laneView(scale.lanes[0], scale.bars, scale)
+  assert.equal(view.name, 'Собрать требования')
+  assert.equal(view.hint, 'этап: research')
+  // подсказка строки попытки несёт оба имени: имя для человека, `id` для журнала
+  assert.match(scale.bars[0].title, /Собрать требования \(research\) · попытка #1/)
 })
 
 test('параллель и автор этапа — из графа, а не догадка экрана', () => {

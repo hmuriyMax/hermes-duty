@@ -44,7 +44,9 @@ test('левый столбец: шапка дорожки липнет вмес
   assert.match(app, /function fitScaleGutter/, 'веб: нет подгона ширины столбца')
   // Замер — по имени и подписям, а не по ячейке: у обрезанной ячейки scrollWidth
   // равен её ширине, и колонка не росла под длинное имя (Макс, 14.11).
-  assert.match(app, /\.tl-lbl > \*, \.tl-lane-name, \.tl-lane-sub'/, 'веб: замер не по имени этапа')
+  // Замер — по коду и описанию этапа, а не по обёртке: у обрезанной ячейки
+  // scrollWidth равен её ширине, и колонка не росла под длинный текст.
+  assert.match(app, /\.tl-lbl > \*, \.tl-lane-code, \.tl-lane-desc, \.tl-lane-sub'/, 'веб: замер не по коду и описанию этапа')
   assert.match(app, /Math\.min\(320, Math\.max\(186,/, 'веб: нет потолка 320px')
   assert.match(css, /\.tl-lane-id \{ display: flex; flex-direction: column/, 'веб: имя и счёт снова в одной строке')
   assert.match(pluginSource, /duty-tl-lane-id/, 'десктоп: нет ячейки имени')
@@ -114,10 +116,10 @@ test('свёрнутая строка: чипы линейной ширины, �
   // развороте, иначе короткие вызовы становились бы точками.
   assert.match(app, /--w-log:\$\{chip\.widthPct\}%/, 'веб: у чипа нет лог-ширины')
   assert.match(app, /--w-lin:\$\{chip\.widthLinPct/, 'веб: у чипа нет линейной ширины')
-  assert.match(css, /\.tl-row:hover \.tl-call, \.tl-row:focus-visible \.tl-call \{ width: var\(--w-log\)/, 'веб: развёрнутая не возвращает лог')
+  assert.match(css, /\.tl-row:has\(\.tl-band:hover, \.tl-call:hover\) \.tl-call, \.tl-row:focus-visible \.tl-call \{ width: var\(--w-log\)/, 'веб: развёрнутая не возвращает лог')
   assert.match(app, /width:var\(--w-lin\)/, 'веб: свёрнутая не линейна')
   assert.match(read('desktop/plugin.js'), /width: 'var\(--w-lin\)'/, 'десктоп: свёрнутая не линейна')
-  assert.match(read('desktop/plugin.js'), /\.duty-tl-row:hover \.duty-tl-call,\.duty-tl-row:focus-visible \.duty-tl-call\{width:var\(--w-log\)\}/, 'десктоп: развёрнутая не возвращает лог')
+  assert.match(read('desktop/plugin.js'), /\.duty-tl-row:has\(\.duty-tl-band:hover,\.duty-tl-call:hover\) \.duty-tl-call,\.duty-tl-row:focus-visible \.duty-tl-call\{width:var\(--w-log\)\}/, 'десктоп: развёрнутая не возвращает лог')
 })
 
 test('палитра инструментов: интеграции и служебные не серые', () => {
@@ -318,13 +320,27 @@ test('разворот строки и правки экрана дела: пр�
   ]
   for (const [name, text, collapsed, full] of surfaces) {
     assert.match(text, new RegExp(`height:\\s*var\\(${collapsed}`), `${name}: нет свёрнутой высоты строки`)
-    assert.match(text, new RegExp(`:hover[^{]*\\{[^}]*height:\\s*var\\(${full}`), `${name}: наведение не раскрывает строку`)
+    // Разворот включает наведение на полосу попытки (или на чип, который на ней
+    // лежит), а не на всю строку с подписью (Макс, 14.11).
+    const band = name === 'веб' ? 'tl-band' : 'duty-tl-band'
+    const rowCls = name === 'веб' ? 'tl-row' : 'duty-tl-row'
+    assert.match(
+      text,
+      new RegExp(`\\.${rowCls}:has\\(\\.${band}:hover,[^{]*\\)[^{]*\\{[^}]*height:\\s*var\\(${full}`),
+      `${name}: наведение на полосу попытки не раскрывает строку`,
+    )
     // Свёрнутая строка — нахлёст, а не прятание: все чипы на одной линии и
     // вполсилы, глубокие уровни лежат поверх (Макс, 09.11: «в свернутом виде
     // будем рисовать все квадратики с наложением… прозрачностью»). Рамки у
     // чипов больше нет: перекрытие читается плотностью цвета.
     assert.doesNotMatch(text, /box-shadow:\s*inset\s+0\s+0\s+0\s+1px\s+rgba\(0,\s*0,\s*0,\s*\.22\)/, `${name}: рамка чипа вернулась`)
-    assert.match(text, /:not\(:hover\):not\(:focus-visible\)\s+[^{]*tl-call[^{]*\{[^}]*top:\s*calc\(50%[^}]*opacity:\s*\.45/, `${name}: свёрнутая строка не рисуется нахлёстом`)
+    // Свёрнутая лента: чипы одной линией по центру, вполсилы. Условие —
+    // «на полосу не наведено», а не «на строку».
+    assert.match(
+      text,
+      /:not\(:has\([^{]*tl-band:hover[^{]*\)\):not\(:focus-visible\)\s+[^{]*tl-call[^{]*\{[^}]*top:\s*calc\(50%[^}]*opacity:\s*\.45/,
+      `${name}: свёрнутая лента не рисуется одной линией`,
+    )
   }
   assert.match(app, /'data-level':\s*String\(chip\.level/, 'веб не отдаёт уровень чипа в разметку')
   assert.match(plugin, /'data-level':\s*String\(chip\.level/, 'десктоп не отдаёт уровень чипа в разметку')
@@ -604,10 +620,10 @@ test('обе поверхности рисуют одни и те же клас�
   ]) {
     assert.ok(text.includes(row), `${name}: строка попытки не помечает раскрытие`)
   }
-  // Строка этапа — одна линия ~26 px, попытка ~24 px с отступом 12 px.
-  assert.match(css, /\.stage-row \{[^}]*height: 26px/, 'веб: строка этапа не 26 px')
+  // Строка этапа — три уровня: код, описание, статистика. Попытка — 24 px.
+  assert.match(css, /\.stage-row \{[^}]*grid-template-areas: 'code badge tog' 'desc desc desc' 'meta meta meta'/, 'веб: строка этапа не в три уровня')
   assert.match(css, /\.att-row \{[^}]*height: 24px[^}]*margin-left: 12px/s, 'веб: строка попытки не 24 px с отступом')
-  assert.match(plugin, /\.duty-stage-row\{[^}]*height:26px/, 'десктоп: строка этапа не 26 px')
+  assert.match(plugin, /\.duty-stage-row\{display:grid;[^}]*grid-template-areas:'code badge tog' 'desc desc desc' 'meta meta meta'/, 'десктоп: строка этапа не в три уровня')
   assert.match(plugin, /\.duty-att-row\{[^}]*height:24px[^}]*margin-left:12px/, 'десктоп: строка попытки не 24 px с отступом')
 })
 
@@ -794,15 +810,23 @@ test('веб: строка этапа зовёт этап именем, а `id` 
   const attempts = { attempts: [{ stage: 'research', attempt: 1, start: 1, end: 31, status: 'done', outcome: 'done' }] }
   const doc = await renderDealPanel(detail, attempts)
 
-  const row = doc.querySelector('.stage-row-name')
-  assert.ok(row, 'в строке этапа нет имени')
-  assert.equal(row.textContent, 'Собрать требования', `строка этапа: ${row.textContent}`)
+  // Крупно — код этапа, описание из спеки — строкой ниже (Макс, 14.11).
+  const row = doc.querySelector('.stage-row-code')
+  assert.ok(row, 'в строке этапа нет кода')
+  assert.equal(row.textContent, 'research', `код этапа: ${row.textContent}`)
   assert.equal(row.getAttribute('title'), 'этап: research', 'подсказка строки не несёт `id`')
+  const desc = doc.querySelector('.stage-row-desc')
+  assert.ok(desc, 'у названного этапа нет строки описания')
+  assert.equal(desc.textContent, 'Собрать требования', `описание этапа: ${desc.textContent}`)
+  assert.match(doc.querySelector('.stage-row-meta').textContent, /попытка/, 'статистика этапа потерялась')
 
-  const lanes = [...doc.querySelectorAll('.tl-lane-name')]
-  const lane = lanes.find((item) => item.textContent === 'Собрать требования')
-  assert.ok(lane, `дорожка шкалы зовёт этап не именем: ${lanes.map((item) => item.textContent).join(' | ')}`)
+  // Дорожка шкалы: код этапа крупно, описание — строкой ниже.
+  const codes = [...doc.querySelectorAll('.tl-lane-code')]
+  const lane = codes.find((item) => item.textContent === 'research')
+  assert.ok(lane, `дорожка шкалы не зовёт этап кодом: ${codes.map((item) => item.textContent).join(' | ')}`)
   assert.equal(lane.getAttribute('title'), 'этап: research', 'подсказка дорожки не несёт `id`')
+  const descs = [...doc.querySelectorAll('.tl-lane-desc')].map((item) => item.textContent)
+  assert.ok(descs.includes('Собрать требования'), `описание этапа не в дорожке: ${descs.join(' | ')}`)
 })
 
 /* ------------------ страница дела обновляется сама и тихо (0.0.8) --------- */

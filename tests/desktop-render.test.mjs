@@ -414,7 +414,9 @@ test('десктоп: этапы и дорожки анимированы на �
   // Чипы keyed id вызова: React правит тот же узел, и CSS-переезд к новым
   // процентам играется, а не пересоздаётся. Ушедшие этапы доигрывают уход
   // снимком с is-leaving, вход — duty-fade-in.
-  assert.match(pluginSource(), /key: `call-\$\{chip\.id\}`/, 'чипы не имеют устойчивого ключа')
+  // Ключ устойчив и уникален в пределах своего слоя: у всплеска и у отдельного
+  // вызова один и тот же id, и без метки слоя React склеил бы их.
+  assert.match(pluginSource(), /key: `call-\$\{detailLayer \? 'd' : 'b'\}-\$\{chip\.id\}`/, 'чипы не имеют устойчивого ключа')
   assert.match(pluginSource(), /is-leaving/, 'уход этапа не анимируется')
   assert.match(pluginSource(), /duty-fade-in/, 'нет анимации входа')
   assert.match(pluginSource(), /duty-scale-tick,\.duty-scale-grid-line/, 'метки оси не переезжают плавно')
@@ -545,13 +547,14 @@ test('десктоп: строки этапов раскрываются кли�
     // Клик по строке этапа раскрывает его попытки, повторный — сворачивает.
     const stageRow = blocks[0].querySelector('.duty-stage-row')
     assert.ok(stageRow, 'в этапе нет строки .duty-stage-row')
-    // Строка этапа печатает имя из графа, `id` живёт в подсказке: по нему ищут
-    // в журнале. Этап без имени называется `id`, как до 0.2.1.
-    const namedCheck = blocks[1].querySelector('.duty-stage-row-name')
-    assert.ok(namedCheck, 'в строке этапа нет имени')
-    assert.equal(namedCheck.textContent, 'Сверка правки', `строка этапа: ${namedCheck.textContent}`)
-    assert.equal(namedCheck.getAttribute('title'), 'этап: verify', 'подсказка строки не несёт `id`')
-    assert.equal(blocks[0].querySelector('.duty-stage-row-name').textContent, 'check', 'безымянный этап потерял `id`')
+    // Строка этапа печатает код крупно, описание из графа — строкой ниже.
+    const namedCheck = blocks[1].querySelector('.duty-stage-row-desc')
+    assert.ok(namedCheck, 'у названного этапа нет строки описания')
+    assert.equal(namedCheck.textContent, 'Сверка правки', `описание этапа: ${namedCheck.textContent}`)
+    const code = blocks[1].querySelector('.duty-stage-row-code')
+    assert.equal(code.textContent, 'verify', `код этапа: ${code.textContent}`)
+    assert.equal(code.getAttribute('title'), 'этап: verify', 'подсказка строки не несёт `id`')
+    assert.equal(blocks[0].querySelector('.duty-stage-row-code').textContent, 'check', 'безымянный этап потерял `id`')
     stageRow.click()
     await settle(60)
     assert.equal(blocks[0].querySelectorAll('.duty-att-row').length, 1, 'клик по этапу не раскрыл попытки')

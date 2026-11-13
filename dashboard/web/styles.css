@@ -733,7 +733,7 @@ pre.body {
 .scale-key.on .scale-key-n { opacity: 1; font-weight: 600; }
 /* Чужие семейства гаснут, а не исчезают: картина дела остаётся целой. */
 .tl-call.tl-dim { opacity: .18; filter: saturate(.35); }
-.tl-row:hover .tl-call.tl-dim { opacity: .3; }
+.tl-row:has(.tl-band:hover, .tl-call:hover) .tl-call.tl-dim { opacity: .3; }
 .tl-call.tl-dim { pointer-events: none; }
 .scale-key-l { overflow: hidden; text-overflow: ellipsis; }
 .scale-key-n { font-family: var(--mono); font-variant-numeric: tabular-nums; opacity: .8; }
@@ -842,25 +842,35 @@ pre.body {
 .stages-list { padding: 2px 0 6px; }
 
 /* Строка этапа: id моноширинно, вид, число попыток, состояние словами, глиф. */
+/* Строка этапа — три уровня, а не одна строка в 26 px: код этапа крупно,
+   описание из спеки в две строки, статистика последней строкой. В одну строку
+   длинное описание выдавливало счёт попыток и бейдж за край, и статистика
+   читалась как обрубок (Макс, 14.11: «статистика как-то по-уродски рисуется»). */
 .stage-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-areas: 'code badge tog' 'desc desc desc' 'meta meta meta';
   align-items: center;
-  gap: 6px;
-  height: 26px;
-  padding: 0 10px;
+  gap: 2px 6px;
+  padding: 7px 10px;
   font-size: 12px;
-  white-space: nowrap;
-  overflow: hidden;
   cursor: pointer;
 }
 .stage-block + .stage-block .stage-row { border-top: 1px solid var(--border); }
 .stage-row:hover { background: var(--bg-soft); }
 .stage-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.stage-row .sp { margin-left: auto; }
-.stage-row-name { color: var(--text); font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
-.stage-row-kind { overflow: hidden; text-overflow: ellipsis; }
-.stage-row-att { color: var(--text-3); font-variant-numeric: tabular-nums; }
-.stage-row-tog, .att-row-tog { color: var(--text-3); font-size: 10px; }
+.stage-row .sp { display: none; }
+.stage-row-code { grid-area: code; color: var(--text); font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stage-row .badge { grid-area: badge; }
+.stage-row-desc {
+  grid-area: desc; font-size: 11px; line-height: 1.3; color: var(--text-2);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.stage-row-meta {
+  grid-area: meta; font-size: 10.5px; color: var(--text-3); font-variant-numeric: tabular-nums;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.stage-row-tog, .att-row-tog { grid-area: tog; color: var(--text-3); font-size: 10px; }
 
 /* Строка попытки: `#n`, длительность, исход словами, глиф. */
 .att-row {
@@ -1063,6 +1073,13 @@ pre.body {
    ложилось на счёт. */
 .tl-lane-sub { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .tl-lane-name { font-size: 12.5px; font-weight: 600; color: var(--text); letter-spacing: .01em; min-width: 0; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
+/* Крупно — id этапа, ниже — описание из спеки в две строки. Описание длинное по
+   природе (это фраза, а не код), и в одну строку оно вытесняло счёт попыток. */
+.tl-lane-code { font-size: 12.5px; font-weight: 650; color: var(--text); min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.tl-lane-desc {
+  font-size: 11px; line-height: 1.3; color: var(--text-2); min-width: 0;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
 .tl-lane-id > .tl-kind { flex: none; }
 .tl-lane-meta { font-size: 11px; color: var(--text-3); font-variant-numeric: tabular-nums; white-space: nowrap; min-width: 0; overflow: hidden; text-overflow: ellipsis; margin-left: auto; }
 .tl-lane-h .sp { flex: 1; }
@@ -1099,11 +1116,21 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
   height: var(--tl-collapsed, 20px);
   transition: height .12s ease;
 }
-.tl-row:hover, .tl-row:focus-visible { height: var(--tl-full, 20px); }
-/* Глубокие уровни в свёрнутой строке лежат внахлёст с остальными (см. правило
- * «свёрнутая строка» выше): прятать их не нужно, а наhover-развороте чипы
- * доезжают на свои уровни. */
+/* Разворот — наведение на «колбаску» попытки или на чип, который на ней лежит:
+   чипы перекрывают полосу, и без второго условия половина наведений уходила бы в
+   пустоту. Подпись слева дорожку не разворачивает (Макс, 14.11). */
+.tl-row:has(.tl-band:hover, .tl-call:hover), .tl-row:focus-visible { height: var(--tl-full, 20px); }
+/* Глубокие уровни в свёрнутой ленте стоят в один ряд по центру (правило ниже) и
+ * на развороте доезжают на свои уровни — разворот включает наведение на полосу
+ * попытки («колбаску»), а не на всю строку с подписью. */
 .tl-row:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* Два слоя чипов: свёрнутая лента — полосы всплесков, развёрнутая строка — каждый
+   вызов своим чипом. Показывается ровно один слой, иначе один и тот же вызов
+   стоял бы на дорожке дважды. */
+.tl-row:not(:has(.tl-band:hover, .tl-call:hover)):not(:focus-visible) .tl-call.tl-detail { display: none; }
+.tl-row:has(.tl-band:hover, .tl-call:hover) .tl-call.tl-burst,
+.tl-row:focus-visible .tl-call.tl-burst { display: none; }
 
 /* Колонки подписи фиксированы: номер, статус, время, надбавка. Иначе «готово»
  * и «вердиктов много» разной ширины двигали время в каждой строке. */
@@ -1230,14 +1257,14 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
  * предел точности, а не выдуманная длина. `--w-log` держим равной ей же:
  * свёрнутая и развёрнутая строка рисуют одинаковую геометрию, разница только в
  * уровнях и прозрачности (Макс, 11.11: «рисовать четную ширину по длине тулкола»). */
-.tl-row:hover .tl-call, .tl-row:focus-visible .tl-call { width: var(--w-log); }
-.tl-row:not(:hover):not(:focus-visible) .tl-call {
+.tl-row:has(.tl-band:hover, .tl-call:hover) .tl-call, .tl-row:focus-visible .tl-call { width: var(--w-log); }
+.tl-row:not(:has(.tl-band:hover, .tl-call:hover)):not(:focus-visible) .tl-call {
   top: calc(50% - 5px) !important; /* чип 10px по центру свёрнутой строки */
   opacity: .45;
 }
-.tl-row:not(:hover):not(:focus-visible) .tl-call.tl-unfinished,
-.tl-row:not(:hover):not(:focus-visible) .tl-call.tl-sel { opacity: 1; }
-.tl-row:not(:hover):not(:focus-visible) .tl-call.tl-dim { opacity: .18; }
+.tl-row:not(:has(.tl-band:hover, .tl-call:hover)):not(:focus-visible) .tl-call.tl-unfinished,
+.tl-row:not(:has(.tl-band:hover, .tl-call:hover)):not(:focus-visible) .tl-call.tl-sel { opacity: 1; }
+.tl-row:not(:has(.tl-band:hover, .tl-call:hover)):not(:focus-visible) .tl-call.tl-dim { opacity: .18; }
 
 .tl-row-empty { font-size: 11.5px; color: var(--text-3); }
 

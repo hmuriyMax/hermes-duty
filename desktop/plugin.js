@@ -2623,10 +2623,13 @@ function layoutCalls(calls, options) {
   // попытки — факт не теряется, теряется только его пиксельная дробь.
   const MERGE_GAP = 4
   const groups = []
+  // `merge: false` — раскладка по отдельным вызовам: её показывает развёрнутая
+  // строка, где у каждого вызова свой уровень и своя подсказка.
+  const merging = opts.merge !== false
   for (const spot of spots) {
     const last = groups[groups.length - 1]
     const end = last ? last.px + last.size : null
-    if (last && spot.px - end < MERGE_GAP) {
+    if (merging && last && spot.px - end < MERGE_GAP) {
       last.size = Math.max(last.size, spot.px + spot.size - last.px)
       last.calls.push(spot.call)
       last.unfinished = last.unfinished || spot.unfinished
@@ -2802,6 +2805,27 @@ function attemptView(bar, scale) {
         maxLevels: TL.maxLevels,
       })
     : { chips: [], height: TL.top + TL.levelH, clipped: 0 }
+  // Развёрнутая строка показывает каждый вызов своим чипом, свёрнутая — полосы
+  // всплесков. Вторая раскладка считается только если склейка что-то склеила.
+  const merged = layout.chips.some((chip) => (Number(chip.count) || 1) > 1)
+  const detailLayout = merged
+    ? layoutCalls(calls, {
+        from: axis.start,
+        to: axis.end,
+        toPct: scale && typeof scale.pctOf === 'function' ? scale.pctOf : null,
+        clamp: { leftPct: b.leftPct, rightPct: b.endPct },
+        levelH: TL.levelH,
+        top: TL.top,
+        maxLevels: TL.maxLevels,
+        merge: false,
+      })
+    : layout
+  // Раскладка по отдельным вызовам годится, только если она читается: у попытки
+  // на 161 вызов в двадцатисекундном окне все чипы встают в один пиксель, и
+  // «развернуть» значит нарисовать стену наложений. Тогда остаются полосы
+  // всплесков с числом в подсказке — факт тот же, картинка честная.
+  const detailUsable = merged && detailLayout.clipped === 0 && detailLayout.levels <= 6
+  const detail = detailUsable ? detailLayout : layout
   const omitted = numOrNull(b.callsOmitted) || 0
   const says = Array.isArray(b.says) ? b.says : []
   const saysOmitted = numOrNull(b.saysOmitted) || 0
@@ -2809,7 +2833,9 @@ function attemptView(bar, scale) {
   const notes = []
   if (saysOmitted) notes.push(`ещё ${fmtCount(saysOmitted)} ${plural(saysOmitted, 'фраза', 'фразы', 'фраз')} не показано (потолок)`)
   if (omitted) notes.push(`ещё ${fmtCount(omitted)} ${plural(omitted, 'вызов', 'вызова', 'вызовов')} не показано (потолок)`)
-  const chips = layout.chips.map((chip) => {
+  // Одна разметка чипа на обе раскладки: свёрнутая лента (всплески) и
+  // развёрнутая строка (отдельные вызовы) отличаются только раскладкой.
+  const chipView = (chip) => {
     const call = chip.call || {}
     // Подсказка и инспектор читают одни и те же поля: имя инструмента, время
     // начала и длительность. Поверхность ничего не досчитывает.
@@ -2840,7 +2866,9 @@ function attemptView(bar, scale) {
       tip,
       title: tip,
     }
-  })
+  }
+  const chips = layout.chips.map(chipView)
+  const chipsDetail = detail === layout ? [] : detail.chips.map(chipView)
   const status = b.outcomeText || (b.open ? b.leaseText : b.outcome || b.status || b.durationText)
 
   // Сказанное и тишина — на той же кусочной карте оси, что чипы и маркеры: одна
@@ -2946,17 +2974,16 @@ function attemptView(bar, scale) {
       widthPct: span.widthPct,
       title: span.title,
     }))
-  // Высота строки — по содержимому всегда, а не «20 px, остальное по наведению».
-  // Свёрнутая строка в 20 px держала только первый уровень вызовов, а чипы
-  // остальных уровней всё равно рисовались — они вылезали за строку и ложились
-  // на соседние (Макс, 14.11, дело `d_92177017`: «наслоения в шкале времени»).
-  // Прятать уровни под наведение — тоже враньё: на экране не то, что в журнале.
-  // Поэтому «свёрнутая» и «полная» высоты совпадают, а ряд растёт вниз на
-  // столько уровней, сколько вызовов действительно не помещается. Потолок
-  // уровней (16) остался: он для вырожденных случаев, и тогда `clipped` честно
-  // считает наложенные вызовы.
-  const full = Math.max(TL.collapsed, layout.height + TL.pad)
-  const collapsed = full
+  // Свёрнутая строка — одна лента мелких вызовов по центру, полная — те же вызовы
+  // на своих уровнях. Разворачивает строку наведение на «колбаску» попытки (CSS
+  // поверхности), а не на всю строку: подпись слева не должна раскрывать дорожку.
+  // Наслоения шли не от свёрнутой высоты, а от того, что в свёрнутой ленте сотни
+  // двухпиксельных чипов стояли в одних и тех же пикселях — их разводит склейка
+  // всплесков выше, а не высота строки.
+  // Полная высота — по более высокой раскладке: развёрнутая строка держит
+  // отдельные вызовы, и уровней у них больше, чем у полос всплесков.
+  const full = Math.max(TL.collapsed, layout.height + TL.pad, detail.height + TL.pad)
+  const collapsed = Math.min(full, TL.collapsed)
   return {
     full,
     collapsed,
@@ -2980,6 +3007,8 @@ function attemptView(bar, scale) {
       unfinished: chip.unfinished,
     })),
     chips,
+    // Отдельные вызовы для развёрнутой строки; пусто, когда склейки не было.
+    chipsDetail,
     marks,
     waits,
     // Сказанное агентом и тишина: две вещи, которые на пустой полосе выглядели
@@ -3064,6 +3093,10 @@ function laneView(lane, bars, scale) {
     .join(' · ')
   return {
     name: String((lane && lane.label) || '—'),
+    // `id` этапа — отдельным полем: слева он печатается крупно (`impl-v3`), а
+    // описание из спеки идёт строкой ниже. Одно поле на оба случая заставляло
+    // выбирать между «не найти в журнале» и «не понять, о чём этап».
+    id: String((lane && lane.id) || ''),
     // Подсказка дорожки несёт `id` этапа: печатается имя, а ищут в журнале по
     // `id`. У безымянного этапа подсказки нет — имя ему и есть `id`.
     hint: lane && lane.id && lane.id !== lane.label ? `этап: ${lane.id}` : '',
@@ -4325,11 +4358,13 @@ function DutyAttemptRow({ view, callSel, onSelectCall, toolFilter }) {
       }),
     )
   }
-  for (const [i, chip] of view.chips.entries()) {
-    track.push(
+  // Два слоя чипов: свёрнутая лента — полосы всплесков, развёрнутая строка —
+  // каждый вызов своим чипом. Показывает один слой CSS по наведению на полосу.
+  const chipNodes = (list, detailLayer) =>
+    list.map((chip) =>
       h('span', {
-        key: `call-${chip.id}`,
-        className: `duty-tl-call${chip.unfinished ? ' duty-tl-unfinished' : ''}${chip.burst ? ' duty-tl-burst' : ''}${callSel === chip.id ? ' duty-tl-sel' : ''}${active.length && !active.includes(chip.tone) ? ' duty-tl-dim' : ''}`,
+        key: `call-${detailLayer ? 'd' : 'b'}-${chip.id}`,
+        className: `duty-tl-call${chip.unfinished ? ' duty-tl-unfinished' : ''}${chip.burst ? ' duty-tl-burst' : ''}${detailLayer ? ' duty-tl-detail' : ''}${callSel === chip.id ? ' duty-tl-sel' : ''}${active.length && !active.includes(chip.tone) ? ' duty-tl-dim' : ''}`,
         'data-level': String(chip.level || 0),
         'data-tip': chip.tip || chip.title,
         'aria-label': chip.tip || chip.title,
@@ -4339,7 +4374,8 @@ function DutyAttemptRow({ view, callSel, onSelectCall, toolFilter }) {
           : { left: `${chip.leftPct}%`, '--w-log': `${chip.widthPct}%`, '--w-lin': `${chip.widthLinPct ?? chip.widthPct}%`, width: 'var(--w-lin)', top: `${chip.top}px`, background: dutyToneVar(chip.tone) },
       }),
     )
-  }
+  track.push(...chipNodes(view.chips, false))
+  if (view.chipsDetail && view.chipsDetail.length) track.push(...chipNodes(view.chipsDetail, true))
   if (view.marks.length) {
     track.push(
       h(
@@ -4466,7 +4502,11 @@ function DutyLane({ lane, bars, scale, callSel, onSelectCall, toolFilter }) {
       h(
         'div',
         { className: 'duty-tl-lane-id' },
-        h('span', { className: 'duty-tl-lane-name', title: view.hint || view.name }, view.name),
+        // Крупно — id этапа, ниже — описание из спеки в две строки (см. веб).
+        h('span', { className: 'duty-tl-lane-code duty-mono', title: view.id ? `этап: ${view.id}` : view.name }, view.id || view.name),
+        view.id && view.name && view.name !== view.id
+          ? h('span', { className: 'duty-tl-lane-desc', title: view.name }, view.name)
+          : null,
         h(
           'span',
           { className: 'duty-tl-lane-sub' },
@@ -4558,14 +4598,18 @@ const CSS = `
    решение прошлого круга; остальные свёрнуты, иначе столбец снова простыня. */
 .duty-deal-stages{display:flex;flex-direction:column;gap:2px}
 .duty-stage-block{display:flex;flex-direction:column;min-width:0}
-.duty-stage-row{display:flex;align-items:center;gap:6px;height:26px;padding:0 2px;font-size:12px;white-space:nowrap;overflow:hidden;cursor:pointer}
+.duty-stage-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto;grid-template-areas:'code badge tog' 'desc desc desc' 'meta meta meta';align-items:center;gap:2px 6px;padding:7px 2px;font-size:12px;cursor:pointer}
+.duty-stage-row-code{grid-area:code;color:var(--ui-text-primary);font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.duty-stage-row>.duty-badge,.duty-stage-row>span[class*=badge]{grid-area:badge}
+.duty-stage-row-desc{grid-area:desc;font-size:11px;line-height:1.3;color:var(--ui-text-secondary);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.duty-stage-row-meta{grid-area:meta;font-size:10.5px;color:var(--ui-text-tertiary);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .duty-stage-block + .duty-stage-block .duty-stage-row{border-top:1px solid var(--ui-stroke-tertiary)}
 .duty-stage-row:hover{background:color-mix(in srgb, var(--ui-text-primary) 6%, transparent)}
 .duty-stage-row:focus-visible{outline:2px solid var(--ui-accent);outline-offset:-2px}
 .duty-stage-row-name{color:var(--ui-text-primary);font-weight:600;overflow:hidden;text-overflow:ellipsis}
 .duty-stage-row-kind{overflow:hidden;text-overflow:ellipsis}
 .duty-stage-row-att{color:var(--ui-text-tertiary)}
-.duty-stage-row-tog,.duty-att-row-tog{color:var(--ui-text-tertiary);font-size:10px}
+.duty-stage-row-tog,.duty-att-row-tog{grid-area:tog;color:var(--ui-text-tertiary);font-size:10px}
 .duty-att-item{display:flex;flex-direction:column;min-width:0}
 .duty-att-row{display:flex;align-items:center;gap:6px;height:24px;margin-left:12px;padding:0 2px 0 0;font-size:12px;white-space:nowrap;overflow:hidden;cursor:pointer;color:var(--ui-text-secondary)}
 .duty-att-row:hover{background:color-mix(in srgb, var(--ui-text-primary) 6%, transparent)}
@@ -4740,6 +4784,8 @@ const CSS = `
 .duty-tl-lane-id{display:flex;flex-direction:column;align-items:stretch;gap:1px;min-width:0;white-space:nowrap}
 .duty-tl-lane-sub{display:flex;align-items:center;gap:6px;min-width:0}
 .duty-tl-lane-name{font-size:12.5px;font-weight:600;color:var(--ui-text-primary);letter-spacing:.01em;min-width:0;flex:0 1 auto;overflow:hidden;text-overflow:ellipsis}
+.duty-tl-lane-code{font-size:12.5px;font-weight:650;color:var(--ui-text-primary);min-width:0;overflow:hidden;text-overflow:ellipsis}
+.duty-tl-lane-desc{font-size:11px;line-height:1.3;color:var(--ui-text-secondary);min-width:0;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .duty-tl-lane-meta{margin-left:auto;font-size:11px;color:var(--ui-text-tertiary);font-variant-numeric:tabular-nums;white-space:nowrap;min-width:0;overflow:hidden;text-overflow:ellipsis}
 .duty-tl-kind{display:inline-flex;align-items:center;gap:5px;height:19px;padding:0 7px;border-radius:5px;border:1px solid var(--ui-border-primary, rgba(127,127,127,.3));background:var(--ui-bg-quaternary);font-size:10.5px;font-weight:600;color:var(--ui-text-secondary)}
 .duty-tl-kind-ico{width:12px;height:12px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
@@ -4748,7 +4794,7 @@ const CSS = `
 .duty-tl-kind-gate{color:var(--ui-yellow);border-color:var(--ui-yellow);background:color-mix(in srgb, var(--ui-yellow) 12%, transparent)}
 .duty-tl-rows{display:flex;flex-direction:column;gap:4px}
 .duty-tl-row{position:relative;display:grid;grid-template-columns:var(--duty-tl-gutter, 186px) 1fr;gap:var(--duty-tl-gap, 8px);align-items:stretch;border-radius:6px;height:var(--duty-tl-collapsed, 20px);transition:height .12s ease}
-.duty-tl-row:hover,.duty-tl-row:focus-visible{height:var(--duty-tl-full, 20px)}
+.duty-tl-row:has(.duty-tl-band:hover,.duty-tl-call:hover),.duty-tl-row:focus-visible{height:var(--duty-tl-full, 20px)}
 /* Глубокие уровни вызовов видны только в раскрытой строке: visibility, а не display —
  * чипы позиционированы абсолютно, разметка не прыгает, подсказки не обрезаются. */
 /* Глубокие уровни в свёрнутой строке лежат внахлёст с остальными: прятать их
@@ -4768,6 +4814,9 @@ const CSS = `
  * Жёлтым помечается только усечённое потолком: у части вызовов чипа нет. */
 /* Вызов без результата: полый чип — длительности нет, а не ноль. */
 .duty-tl-call.duty-tl-burst{background-image:repeating-linear-gradient(135deg,rgba(255,255,255,.55) 0 1px,transparent 1px 3px)}
+.duty-tl-row:not(:has(.duty-tl-band:hover,.duty-tl-call:hover)):not(:focus-visible) .duty-tl-call.duty-tl-detail{display:none}
+.duty-tl-row:has(.duty-tl-band:hover,.duty-tl-call:hover) .duty-tl-call.duty-tl-burst,
+.duty-tl-row:focus-visible .duty-tl-call.duty-tl-burst{display:none}
 .duty-tl-call.duty-tl-unfinished,.duty-tl-tick.duty-tl-unfinished{background:transparent !important;box-shadow:inset 0 0 0 1.5px currentColor !important;opacity:.9}
 .duty-tl-track{position:relative;height:100%}
 .duty-tl-track{position:relative;min-height:20px}
@@ -4817,11 +4866,11 @@ const CSS = `
 /* Свёрнутая строка: все вызовы на одной линии, внахлёст и вполсилы — плотность
  * работы, а не россыпь квадратиков; наведение раскрывает строку, и чипы
  * доезжают на свои уровни. */
-.duty-tl-row:hover .duty-tl-call,.duty-tl-row:focus-visible .duty-tl-call{width:var(--w-log)}
-.duty-tl-row:not(:hover):not(:focus-visible) .duty-tl-call{top:calc(50% - 5px)!important;opacity:.45}
-.duty-tl-row:not(:hover):not(:focus-visible) .duty-tl-call.duty-tl-unfinished,
-.duty-tl-row:not(:hover):not(:focus-visible) .duty-tl-call.duty-tl-sel{opacity:1}
-.duty-tl-row:not(:hover):not(:focus-visible) .duty-tl-call.duty-tl-dim{opacity:.18}
+.duty-tl-row:has(.duty-tl-band:hover,.duty-tl-call:hover) .duty-tl-call,.duty-tl-row:focus-visible .duty-tl-call{width:var(--w-log)}
+.duty-tl-row:not(:has(.duty-tl-band:hover,.duty-tl-call:hover)):not(:focus-visible) .duty-tl-call{top:calc(50% - 5px)!important;opacity:.45}
+.duty-tl-row:not(:has(.duty-tl-band:hover,.duty-tl-call:hover)):not(:focus-visible) .duty-tl-call.duty-tl-unfinished,
+.duty-tl-row:not(:has(.duty-tl-band:hover,.duty-tl-call:hover)):not(:focus-visible) .duty-tl-call.duty-tl-sel{opacity:1}
+.duty-tl-row:not(:has(.duty-tl-band:hover,.duty-tl-call:hover)):not(:focus-visible) .duty-tl-call.duty-tl-dim{opacity:.18}
 /* Подсказка — общий слой для чипа, полосы попытки, подписи и маркера. */
 .duty-tl-tip{position:fixed;left:0;top:0;z-index:9999;padding:3px 7px;border-radius:5px;white-space:normal;max-width:280px;width:max-content;text-align:left;background:var(--ui-surface-raised, var(--ui-surface-background));color:var(--ui-text-primary);border:1px solid var(--ui-stroke-tertiary);box-shadow:0 8px 20px rgba(0,0,0,.38);font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:10.5px;line-height:1.5;opacity:0;pointer-events:none;transition:opacity .09s ease}
 .duty-tl-call,.duty-tl-band,.duty-tl-lbl,.duty-tl-mark,.duty-tl-wait{cursor:pointer}
@@ -4850,7 +4899,7 @@ const CSS = `
 .duty-scale-key.on .duty-scale-key-n{opacity:1;font-weight:600}
 /* Чужие семейства гаснут, а не исчезают: картина дела остаётся целой. */
 .duty-tl-call.duty-tl-dim{opacity:.18;filter:saturate(.35);pointer-events:none}
-.duty-tl-row:hover .duty-tl-call.duty-tl-dim{opacity:.3}
+.duty-tl-row:has(.duty-tl-band:hover,.duty-tl-call:hover) .duty-tl-call.duty-tl-dim{opacity:.3}
 .duty-scale-key-l{overflow:hidden;text-overflow:ellipsis}
 .duty-scale-key-n{font-family:var(--ui-font-mono, ui-monospace, monospace);font-variant-numeric:tabular-nums;opacity:.8}
 .duty-scale-key-dot{width:7px;height:7px;border-radius:2px;background:var(--ui-text-tertiary)}
@@ -5538,14 +5587,20 @@ function CompactStages({ feed, timeline }) {
           'aria-expanded': open ? 'true' : 'false',
           onClick: () => setOpenStages((prev) => ({ ...prev, [view.id]: !open })),
         },
-        // Печатается имя этапа, если оно объявлено; `id` — в подсказке строки
-        // (по нему ищут в журнале).
-        h('span', { className: 'duty-mono duty-stage-row-name', title: view.nameHint }, view.name),
-        h('span', { className: 'duty-muted duty-stage-row-kind' }, view.kindText),
-        h('span', { className: 'duty-num duty-stage-row-att' }, view.attemptsText),
-        h('span', { className: 'duty-spacer' }),
+        // Крупно — код этапа; описание из спеки строкой ниже, статистика последней
+        // строкой (см. веб: в одну строку описание выдавливало счёт за край).
+        h('span', { className: 'duty-mono duty-stage-row-code', title: view.nameHint }, view.id),
         h(StateBadge, { label: view.stateLabel, tone: view.tone, title: view.stateLabel }),
         h('span', { className: 'duty-stage-row-tog' }, open ? '▾' : '▸'),
+        view.name && view.name !== view.id
+          ? h('span', { className: 'duty-stage-row-desc', title: view.name }, view.name)
+          : null,
+        h(
+          'span',
+          { className: 'duty-stage-row-meta' },
+          view.attemptsText,
+          view.kindText ? ` · ${view.kindText}` : '',
+        ),
       ),
     ]
     // Состояние лида — строкой у координаторского этапа, а не только в шапке:
@@ -5959,7 +6014,7 @@ function ScalePanel({ scale, dealId, callSel, onSelectCall, toolFilter, onToggle
         // Ячейка имени целиком: имя этапа и чип профиля в одной строке —
         // максимального из детей мало, нужна их сумма (fix-planned-branch
         // + «implementer» на d_c8551c18).
-        for (const cell of root.querySelectorAll('.duty-tl-lbl > *, .duty-tl-lane-name, .duty-tl-lane-sub')) {
+        for (const cell of root.querySelectorAll('.duty-tl-lbl > *, .duty-tl-lane-code, .duty-tl-lane-desc, .duty-tl-lane-sub')) {
           need = Math.max(need, cell.scrollWidth || 0)
         }
         seen.px = Math.max(seen.px, need)

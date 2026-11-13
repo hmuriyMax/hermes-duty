@@ -2574,10 +2574,13 @@ function layoutCalls(calls, options) {
   // попытки — факт не теряется, теряется только его пиксельная дробь.
   const MERGE_GAP = 4
   const groups = []
+  // `merge: false` — раскладка по отдельным вызовам: её показывает развёрнутая
+  // строка, где у каждого вызова свой уровень и своя подсказка.
+  const merging = opts.merge !== false
   for (const spot of spots) {
     const last = groups[groups.length - 1]
     const end = last ? last.px + last.size : null
-    if (last && spot.px - end < MERGE_GAP) {
+    if (merging && last && spot.px - end < MERGE_GAP) {
       last.size = Math.max(last.size, spot.px + spot.size - last.px)
       last.calls.push(spot.call)
       last.unfinished = last.unfinished || spot.unfinished
@@ -2753,6 +2756,27 @@ function attemptView(bar, scale) {
         maxLevels: TL.maxLevels,
       })
     : { chips: [], height: TL.top + TL.levelH, clipped: 0 }
+  // Развёрнутая строка показывает каждый вызов своим чипом, свёрнутая — полосы
+  // всплесков. Вторая раскладка считается только если склейка что-то склеила.
+  const merged = layout.chips.some((chip) => (Number(chip.count) || 1) > 1)
+  const detailLayout = merged
+    ? layoutCalls(calls, {
+        from: axis.start,
+        to: axis.end,
+        toPct: scale && typeof scale.pctOf === 'function' ? scale.pctOf : null,
+        clamp: { leftPct: b.leftPct, rightPct: b.endPct },
+        levelH: TL.levelH,
+        top: TL.top,
+        maxLevels: TL.maxLevels,
+        merge: false,
+      })
+    : layout
+  // Раскладка по отдельным вызовам годится, только если она читается: у попытки
+  // на 161 вызов в двадцатисекундном окне все чипы встают в один пиксель, и
+  // «развернуть» значит нарисовать стену наложений. Тогда остаются полосы
+  // всплесков с числом в подсказке — факт тот же, картинка честная.
+  const detailUsable = merged && detailLayout.clipped === 0 && detailLayout.levels <= 6
+  const detail = detailUsable ? detailLayout : layout
   const omitted = numOrNull(b.callsOmitted) || 0
   const says = Array.isArray(b.says) ? b.says : []
   const saysOmitted = numOrNull(b.saysOmitted) || 0
@@ -2760,7 +2784,9 @@ function attemptView(bar, scale) {
   const notes = []
   if (saysOmitted) notes.push(`ещё ${fmtCount(saysOmitted)} ${plural(saysOmitted, 'фраза', 'фразы', 'фраз')} не показано (потолок)`)
   if (omitted) notes.push(`ещё ${fmtCount(omitted)} ${plural(omitted, 'вызов', 'вызова', 'вызовов')} не показано (потолок)`)
-  const chips = layout.chips.map((chip) => {
+  // Одна разметка чипа на обе раскладки: свёрнутая лента (всплески) и
+  // развёрнутая строка (отдельные вызовы) отличаются только раскладкой.
+  const chipView = (chip) => {
     const call = chip.call || {}
     // Подсказка и инспектор читают одни и те же поля: имя инструмента, время
     // начала и длительность. Поверхность ничего не досчитывает.
@@ -2791,7 +2817,9 @@ function attemptView(bar, scale) {
       tip,
       title: tip,
     }
-  })
+  }
+  const chips = layout.chips.map(chipView)
+  const chipsDetail = detail === layout ? [] : detail.chips.map(chipView)
   const status = b.outcomeText || (b.open ? b.leaseText : b.outcome || b.status || b.durationText)
 
   // Сказанное и тишина — на той же кусочной карте оси, что чипы и маркеры: одна
@@ -2897,17 +2925,16 @@ function attemptView(bar, scale) {
       widthPct: span.widthPct,
       title: span.title,
     }))
-  // Высота строки — по содержимому всегда, а не «20 px, остальное по наведению».
-  // Свёрнутая строка в 20 px держала только первый уровень вызовов, а чипы
-  // остальных уровней всё равно рисовались — они вылезали за строку и ложились
-  // на соседние (Макс, 14.11, дело `d_92177017`: «наслоения в шкале времени»).
-  // Прятать уровни под наведение — тоже враньё: на экране не то, что в журнале.
-  // Поэтому «свёрнутая» и «полная» высоты совпадают, а ряд растёт вниз на
-  // столько уровней, сколько вызовов действительно не помещается. Потолок
-  // уровней (16) остался: он для вырожденных случаев, и тогда `clipped` честно
-  // считает наложенные вызовы.
-  const full = Math.max(TL.collapsed, layout.height + TL.pad)
-  const collapsed = full
+  // Свёрнутая строка — одна лента мелких вызовов по центру, полная — те же вызовы
+  // на своих уровнях. Разворачивает строку наведение на «колбаску» попытки (CSS
+  // поверхности), а не на всю строку: подпись слева не должна раскрывать дорожку.
+  // Наслоения шли не от свёрнутой высоты, а от того, что в свёрнутой ленте сотни
+  // двухпиксельных чипов стояли в одних и тех же пикселях — их разводит склейка
+  // всплесков выше, а не высота строки.
+  // Полная высота — по более высокой раскладке: развёрнутая строка держит
+  // отдельные вызовы, и уровней у них больше, чем у полос всплесков.
+  const full = Math.max(TL.collapsed, layout.height + TL.pad, detail.height + TL.pad)
+  const collapsed = Math.min(full, TL.collapsed)
   return {
     full,
     collapsed,
@@ -2931,6 +2958,8 @@ function attemptView(bar, scale) {
       unfinished: chip.unfinished,
     })),
     chips,
+    // Отдельные вызовы для развёрнутой строки; пусто, когда склейки не было.
+    chipsDetail,
     marks,
     waits,
     // Сказанное агентом и тишина: две вещи, которые на пустой полосе выглядели
@@ -3015,6 +3044,10 @@ function laneView(lane, bars, scale) {
     .join(' · ')
   return {
     name: String((lane && lane.label) || '—'),
+    // `id` этапа — отдельным полем: слева он печатается крупно (`impl-v3`), а
+    // описание из спеки идёт строкой ниже. Одно поле на оба случая заставляло
+    // выбирать между «не найти в журнале» и «не понять, о чём этап».
+    id: String((lane && lane.id) || ''),
     // Подсказка дорожки несёт `id` этапа: печатается имя, а ищут в журнале по
     // `id`. У безымянного этапа подсказки нет — имя ему и есть `id`.
     hint: lane && lane.id && lane.id !== lane.label ? `этап: ${lane.id}` : '',

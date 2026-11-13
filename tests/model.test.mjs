@@ -723,7 +723,9 @@ test('плотная попытка: 158 вызовов дают несколь�
     { attempts: [{ stage: 'impl', attempt: 1, start: 1_000, end: 1_010, status: 'done', outcome: 'done', calls }] },
   )
   const view = attemptView(scale.bars[0], scale)
-  assert.equal(view.collapsed, view.full, 'строка снова прячет уровни под наведение')
+  // Свёрнутая лента ниже полной: разворот идёт по наведению на полосу попытки.
+  assert.ok(view.collapsed < view.full, 'строка не сворачивается — разворот потерял смысл')
+  assert.ok(view.collapsed <= 20, `свёрнутая строка ${view.collapsed}px: лента не помещается в один уровень`)
   assert.ok(view.chips.length <= 8, `полос ${view.chips.length}: всплески не склеились`)
   assert.equal(view.chips.reduce((sum, chip) => sum + chip.count, 0), 158, 'вызовы потерялись')
   assert.ok(view.chips.some((chip) => chip.burst), 'всплеск не назван всплеском')

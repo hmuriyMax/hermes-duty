@@ -1916,14 +1916,18 @@ function stageBlockNode(dealId, stage, timeline, rebuild) {
           rebuild()
         },
       },
-      // Печатается имя этапа, если оно объявлено; `id` — в подсказке строки
-      // (по нему ищут в журнале).
-      h('span', { class: 'mono stage-row-name', title: view.nameHint }, view.name),
-      h('span', { class: 'stage-row-kind muted' }, view.kindText),
-      h('span', { class: 'stage-row-att fresh', 'data-fresh': `stage:${stageKey}` }, view.attemptsText),
-      h('span', { class: 'sp' }),
+      // Крупно — код этапа: по нему ищут в журнале и графе. Описание из спеки
+      // идёт строкой ниже (две строки), статистика — последней строкой.
+      h('span', { class: 'mono stage-row-code', title: view.nameHint }, view.id),
       h('span', { class: `badge t-${view.tone}`, title: view.stateLabel }, h('i'), view.stateLabel),
       h('span', { class: 'stage-row-tog' }, open ? '▾' : '▸'),
+      view.name && view.name !== view.id ? h('span', { class: 'stage-row-desc', title: view.name }, view.name) : null,
+      h(
+        'span',
+        { class: 'stage-row-meta' },
+        h('span', { class: 'fresh', 'data-fresh': `stage:${stageKey}` }, view.attemptsText),
+        view.kindText ? ` · ${view.kindText}` : '',
+      ),
     ),
   ]
   // Состояние лида — строкой у координаторского этапа, а не только в шапке:
@@ -2352,10 +2356,12 @@ function attemptRowNode(view, key) {
       }),
     )
   }
-  for (const chip of view.chips) {
-    track.append(
+  // Два слоя чипов: свёрнутая лента (всплески одной полосой) и развёрнутая строка
+  // (каждый вызов своим чипом). Показывается один — CSS по наведению на полосу.
+  const chipNodes = (list, detailLayer) =>
+    list.map((chip) =>
       h('span', {
-        class: `tl-call${chip.unfinished ? ' tl-unfinished' : ''}${chip.burst ? ' tl-burst' : ''}`,
+        class: `tl-call${chip.unfinished ? ' tl-unfinished' : ''}${chip.burst ? ' tl-burst' : ''}${detailLayer ? ' tl-detail' : ''}`,
         'data-level': String(chip.level || 0),
         'data-tone': chip.tone,
         'data-key': `call:${chip.id}`,
@@ -2369,7 +2375,8 @@ function attemptRowNode(view, key) {
         'data-call-id': chip.id,
       }),
     )
-  }
+  track.append(...chipNodes(view.chips, false))
+  if (view.chipsDetail && view.chipsDetail.length) track.append(...chipNodes(view.chipsDetail, true))
   // Сказанное агентом: точки на верхней кромке строки. Вопрос, на который они
   // отвечают, — «он думал или просто ничего не приходило», поэтому точка это
   // факт телеметрии, а не украшение.
@@ -2510,9 +2517,15 @@ function laneNode(lane, bars, scale) {
     h(
       'div',
       { class: 'tl-lane-id' },
-      h('span', { class: 'tl-lane-name', title: view.hint || view.name }, view.name),
-      // Вид и счёт — второй строкой под именем: в одну строку они отбирали у
-      // имени всю ширину, и длинное имя ложилось на «0 попыток» (Макс, 14.11).
+      // Крупно — `id` этапа (`impl-v3`): по нему этап ищут в журнале и графе.
+      // Описание из спеки («чистка API-слоя: интерфейс sCompanyInfo, main.go,
+      // моки») — строкой ниже мелким шрифтом: в одну строку оно вытесняло и
+      // значок вида, и счёт (Макс, 14.11).
+      h('span', { class: 'tl-lane-code mono', title: view.id ? `этап: ${view.id}` : view.name }, view.id || view.name),
+      view.id && view.name && view.name !== view.id
+        ? h('span', { class: 'tl-lane-desc', title: view.name }, view.name)
+        : null,
+      // Вид и счёт — последней строкой колонки.
       h('span', { class: 'tl-lane-sub' },
       view.kind
         ? h(
@@ -3407,7 +3420,7 @@ function fitScaleGutter(root, dealKey) {
   // Имя этапа меряется собственной шириной: у ячейки `scrollWidth` равен её же
   // ширине (длинное имя обрезано), и колонка не росла под него вовсе — имена
   // стояли в 204 px и терялись на середине слова.
-  for (const el of root.querySelectorAll('.tl-lbl > *, .tl-lane-name, .tl-lane-sub')) {
+  for (const el of root.querySelectorAll('.tl-lbl > *, .tl-lane-code, .tl-lane-desc, .tl-lane-sub')) {
     need = Math.max(need, el.scrollWidth || 0)
   }
   scaleGutterSeen.px = Math.max(scaleGutterSeen.px, need)

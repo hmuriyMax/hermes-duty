@@ -964,10 +964,10 @@ test('десктоп: страница — таймлайн и развёрну�
   }
 })
 
-test('десктоп: журнал решений лида — таблица со свежими сверху, пустая не рисуется', async (t) => {
-  // Макс, 13.11: «блок с решениями уродский: инфы мало, а занимает всю ширину» —
-  // компонент обязан быть таблицей с колонками и видами решений, а не лентой
-  // растянутого текста. Пустой журнал не рисуется: это читалось бы как «лид
+test('десктоп: решения лида — лентой на оси, свежие сверху, пустая не рисуется', async (t) => {
+  // Решения — лента на вертикальной оси в правом рельсе: точки видов, часы,
+  // слово вида, автор и слова. Таблица во всю ширину занимала место и оставляла
+  // половину панели пустой. Пустая лента не рисуется: это читалось бы как «лид
   // ничего не решал».
   const root = reactRoot()
   if (!root) return t.skip('нет React в ~/.hermes/hermes-agent/node_modules')
@@ -982,19 +982,20 @@ test('десктоп: журнал решений лида — таблица с
         { kind: 'plan_accepted', at: 1_700_000_000, author: 'lead', text: 'план создан (3 этапа)' },
         { kind: 'question_answered', at: 1_700_000_100, author: 'human', text: 'ответ на вопрос #4 пришёл от человека' },
       ],
+      dealId: 'd_0123456789abcdef',
     }),
   )
   assert.match(html, /решения лида · 2/, 'заголовок не назвал число решений')
-  assert.match(html, /свежие сверху/, 'порядок не объявлен')
-  // Колонки: время, вид, кто, что решил. Вид — слово факта, а не «решение».
-  for (const head of ['время', 'решение', 'кто', 'что решил']) {
-    assert.match(html, new RegExp(`>${head}<`), `нет колонки «${head}»`)
-  }
-  assert.equal((html.match(/duty-dec-row(?![-\w])/g) || []).length, 3, 'строк не две плюс шапка')
+  // Раскрытие ленты — кнопкой в шапке панели, а не прокруткой внутри рельса.
+  assert.match(html, /duty-dec-toggle[^>]*>все 2</, 'нет кнопки раскрытия ленты')
+  // Записи идут лентой: точка вида, часы, слово вида, автор, слова.
+  assert.equal((html.match(/duty-dec-item(?![-\w])/g) || []).length, 2, 'записей не две')
+  assert.match(html, /duty-dec-dot/, 'нет точки вида на оси')
   assert.match(html, /duty-dec-type[^>]*>ответ</, 'вид решения не назван')
   assert.match(html, /план создан \(3 этапа\)/, 'решение не доехало до разметки')
   assert.match(html, /duty-dec-who[^>]*>лид</, 'автор-лид не подписан')
   assert.match(html, /duty-dec-who[^>]*>человек</, 'автор-человек не подписан')
+  assert.match(html, /duty-dec-say/, 'слова решения не в своей строке')
   // Свежее решение (ответ) стоит первым — порядок даёт шейпер.
   assert.ok(html.indexOf('ответ на вопрос') < html.indexOf('план создан'), 'свежее решение не первое')
   // Фильтр семейств: чипы с числами, «все» включён, пока фильтр пуст.
@@ -1003,7 +1004,7 @@ test('десктоп: журнал решений лида — таблица с
   assert.match(html, />вопросы 1</, 'нет чипа семейства «вопросы»')
 
   const empty = renderToStaticMarkup(React.createElement(mod.DecisionsPanel, { items: [] }))
-  assert.equal(empty, '', 'пустой журнал что-то нарисовал')
+  assert.equal(empty, '', 'пустая лента что-то нарисовала')
 })
 
 test('десктоп: экран дела и строка списка берут лида из шейпера', async (t) => {
@@ -1011,13 +1012,13 @@ test('десктоп: экран дела и строка списка беру�
   // (`shapeDeal`), и экран/строка обязаны читать именно его — иначе лид снова
   // «есть в данных, нет на экране».
   const source = read('desktop/plugin.js')
-  assert.match(source, /h\(ScalePanel, \{[^}]*decisions: detail\.data\.decisions/, 'экран дела не передаёт решения в панель шкалы')
-  assert.match(source, /h\(DecisionsPanel, \{ items: decisions, plan \}\)/, 'панель шкалы не рисует журнал решений')
+  assert.match(source, /h\(DecisionsPanel, \{ items: detail\.data\.decisions, plan: deal && deal\.plan, dealId: sel\.id \}\)/, 'рельс не рисует ленту решений')
+  assert.ok(!/h\(ScalePanel, \{[^}]*decisions:/.test(source), 'решения снова едут в панель шкалы')
   assert.match(source, /deal\.lead && deal\.lead\.known/, 'строка списка не рисует лида')
   assert.match(source, /duty-lead-note/, 'нет класса строки лида')
   const css = source.replace(/\/\*[\s\S]*?\*\//g, '')
   assert.match(css, /\.duty-lead-note\{/, 'нет правила .duty-lead-note')
-  assert.match(css, /\.duty-dec-row\{/, 'нет правила .duty-dec-row')
+  assert.match(css, /\.duty-dec-item\{/, 'нет правила .duty-dec-item')
 })
 
 test('десктоп: в строке списка лид стоит под бейджем, а не отдельным столбцом', async (t) => {
@@ -1052,7 +1053,7 @@ test('десктоп: отказ плана стоит под графом де�
     /deal && deal\.plan && deal\.plan\.refused \? h\(DutyPlanRefusal, \{ plan: deal\.plan \}\)/,
     'экран дела не рисует строку отказа плана под графом',
   )
-  assert.match(source, /h\(DecisionsPanel, \{ items: decisions, plan \}\)/, 'журнал решений не получает счётчики плана')
+  assert.match(source, /h\(DecisionsPanel, \{ items: detail\.data\.decisions, plan: deal && deal\.plan, dealId: sel\.id \}\)/, 'лента решений не получает счётчики плана')
   assert.match(source, /title: plan \? plan\.hint : ''/, 'у подсказки истории нет счётчиков плана')
   const css = source.replace(/\/\*[\s\S]*?\*\//g, '')
   assert.match(css, /\.duty-plan-refusal\{/, 'нет правила .duty-plan-refusal')

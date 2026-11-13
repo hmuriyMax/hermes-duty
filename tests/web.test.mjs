@@ -524,8 +524,8 @@ test('карточка дела не повторяет числа и не по�
   // Документы дела строятся шейпером; колонки нет только когда нет ни тела, ни спеки.
   assert.match(app, /const docs = docBlocks\(data\)/, 'документы дела решает поверхность, а не шейпер')
   assert.match(app, /const left = docs\.length/, 'панель документов рисуется всегда, даже пустая')
-  // Без документов столбец этапов один и на всю ширину.
-  assert.match(app, /left \? h\('div', \{ class: 'deal-cols' \}, left, stages\) : stages/, 'без документов этапы уезжают в узкую колонку')
+  // Без документов рельс (решения + этапы) один и на всю ширину.
+  assert.match(app, /left \? h\('div', \{ class: 'deal-cols' \}, left, rail\) : rail/, 'без документов рельс уезжает в узкую колонку')
   // Заголовок этапов не повторяет счёт попыток из KPI.
   assert.doesNotMatch(app, /этапы · \$\{feed\.count\}, попыток/, 'счёт попыток дублируется в заголовке этапов')
   // Пути — именами, полный путь в подсказке.
@@ -549,23 +549,25 @@ test('десктопная карточка дела: те же правила, 
 
 /* --------------------------------- столбец этапов и попыток (0.0.8) */
 
-test('две колонки дела: документы растут, этапы — ровно 320 px на обеих поверхностях', () => {
+test('две колонки дела: документы растут, рельс — ровно 340 px на обеих поверхностях', () => {
   const css = read('dashboard/web/styles.css').replace(/\/\*[\s\S]*?\*\//g, '')
   const rule = /\.deal-cols\s*\{([^}]*)\}/.exec(css)
   assert.ok(rule, 'в styles.css нет правила .deal-cols')
   assert.match(rule[1], /display:\s*grid/, 'колонки собраны не гридом')
-  assert.match(rule[1], /grid-template-columns:\s*minmax\(0, 1fr\) 320px/, 'правая колонка не 320 px или растёт')
+  assert.match(rule[1], /grid-template-columns:\s*minmax\(0, 1fr\) 340px/, 'правая колонка не 340 px или растёт')
   assert.match(rule[1], /gap:\s*14px/, 'зазор между колонками не 14 px')
   assert.match(rule[1], /align-items:\s*start/, 'колонки тянутся друг под друга')
-  assert.match(css, /@media \(max-width: 1100px\) \{[\s\S]{0,120}\.deal-cols \{ grid-template-columns: 1fr; \}/, 'узкое окно не складывает колонки в одну')
+  // Рельс — вертикальный стек: лента решений над этапами, обе панели во всю его ширину.
+  assert.match(css, /\.deal-rail \{ display: flex; flex-direction: column; gap: 14px; min-width: 0; \}/, 'рельс не собран столбцом')
+  assert.match(css, /@media \(max-width: 1180px\) \{[\s\S]{0,120}\.deal-cols \{ grid-template-columns: 1fr; \}/, 'узкое окно не складывает колонки в одну')
 
   const plugin = read('desktop/plugin.js')
   const dutyRule = /\.duty-deal-cols\{([^}]*)\}/.exec(plugin)
   assert.ok(dutyRule, 'в CSS плагина нет правила .duty-deal-cols')
-  assert.match(dutyRule[1], /grid-template-columns:minmax\(0,1fr\) 320px/, 'десктоп: правая колонка не 320 px или растёт')
+  assert.match(dutyRule[1], /grid-template-columns:minmax\(0,1fr\) 340px/, 'десктоп: правая колонка не 340 px или растёт')
   assert.match(dutyRule[1], /gap:14px/, 'десктоп: зазор не 14 px')
   assert.match(dutyRule[1], /align-items:start/, 'десктоп: колонки тянутся')
-  assert.match(plugin, /@media \(max-width:1100px\)\{\.duty-deal-cols\{grid-template-columns:1fr\}\}/, 'десктоп: узкое окно не складывает колонки')
+  assert.match(plugin, /@media \(max-width:1180px\)\{\.duty-deal-cols\{grid-template-columns:1fr\}\}/, 'десктоп: узкое окно не складывает колонки')
 })
 
 test('панели попыток больше нет ни в вебе, ни на десктопе', () => {
@@ -1369,14 +1371,15 @@ test('веб: экран дела показывает лида и его реш
   assert.equal(lead.getAttribute('title'), 'журнал: последний факт лида lead_resumed, пробуждений 2 из 6')
   assert.ok(lead.querySelector('b.t-green'), 'тон живого лида не зелёный')
 
-  // Журнал решений: таблица внизу панели шкалы, свежие сверху, колонки на месте.
+  // Лента решений: в правом рельсе дела, над этапами, свежие сверху.
   const panel = doc.querySelector('[data-key="decisions"]')
-  assert.ok(panel, 'нет журнала решений лида')
-  assert.ok(panel.closest('[data-key="scale"]'), 'журнал решений стоит вне панели шкалы')
-  assert.match(panel.querySelector('.scale-log-title').textContent, /решения лида · 2/)
-  const rows = [...panel.querySelectorAll('.dec-body .dec-row')]
+  assert.ok(panel, 'нет ленты решений лида')
+  assert.ok(!panel.closest('[data-key="scale"]'), 'лента решений осталась в панели шкалы')
+  assert.ok(panel.closest('.deal-rail'), 'лента решений стоит вне правого рельса')
+  assert.match(panel.querySelector('.dec-panel-title').textContent, /решения лида · 2/)
+  const rows = [...panel.querySelectorAll('.dec-list .dec-item')]
   assert.deepEqual(
-    rows.map((row) => row.querySelector('.dec-text').textContent),
+    rows.map((row) => row.querySelector('.dec-say').textContent),
     ['ответ на вопрос #4 пришёл от человека', 'план создан (3 этапа)'],
     'свежее решение должно стоять первым',
   )
@@ -1392,11 +1395,59 @@ test('веб: экран дела показывает лида и его реш
   // минуты, а под ними — через сколько после предыдущего решения.
   const clock = rows[0].querySelector('.dec-clock')
   assert.match(clock.textContent, /^\d{2}:\d{2}/)
-  assert.match(clock.querySelector('.dec-gap').textContent, /^\+\d/)
+  // Зазор до прошлого решения стоит рядом с часами, в той же строке ленты.
+  const when = rows[0].querySelector('.dec-when')
+  assert.match(when.querySelector('.dec-gap').textContent, /^\+\d/)
   // Фильтр по семействам: чипы с числами, «все» включён по умолчанию.
   const chips = [...panel.querySelectorAll('.dec-filter')]
   assert.deepEqual(chips.map((chip) => chip.textContent), ['все 2', 'план 1', 'вопросы 1'])
   assert.ok(chips[0].className.includes('on'), 'чип «все» не включён')
+})
+
+test('веб: лента решений — шесть записей в рельсе, раскрытие кнопкой, KPI в шапке', async (t) => {
+  // Рельс 340 px: шесть записей по умолчанию, остальные — по кнопке «все N».
+  // Раскрытие и клик по записи — на панели, состояние на экране: тик их не сбрасывает.
+  if (!jsdomRoot()) return t.skip('нет jsdom в ~/.hermes/hermes-agent/node_modules')
+  const { detail, attempts } = verdictClosedDeal()
+  detail.status = 'running'
+  detail.terminal = false
+  detail.deal = { id: DEAL_ID, status: 'running', waiting: { state: 'working', evidence: 'идёт' } }
+  detail.decisions = Array.from({ length: 9 }, (_, i) => ({
+    kind: i % 2 ? 'question_answered' : 'plan_accepted',
+    at: DEAL_T0 + 10 + i * 10,
+    author: i % 2 ? 'human' : 'lead',
+    text: `решение номер ${i + 1}`,
+  }))
+  const doc = await renderDealPanel(detail, attempts)
+
+  // KPI — низ карточки шапки, второй полосы под ней нет.
+  const headKpi = doc.querySelector('.deal-head [data-key="kpi"]')
+  assert.ok(headKpi, 'KPI уехали из шапки дела')
+  assert.equal(doc.querySelectorAll('.duty-kpi').length, 1, 'KPI нарисованы дважды')
+
+  const panel = doc.querySelector('[data-key="decisions"]')
+  assert.ok(panel.closest('.deal-rail'), 'лента решений стоит вне правого рельса')
+  assert.equal(panel.querySelectorAll('.dec-list .dec-item').length, 9, 'в ленте не все записи')
+  // Превью — правило CSS, а не обрезка данных: записи на месте, лишние скрыты.
+  const css = read('dashboard/web/styles.css').replace(/\/\*[\s\S]*?\*\//g, '')
+  assert.match(css, /\.dec-panel:not\(\.is-open\) \.dec-item:nth-child\(n\+7\) \{ display: none; \}/, 'превью шести записей не задано')
+  assert.match(css, /\.dec-item\.is-open \.dec-say \{ -webkit-line-clamp: unset; display: block; \}/, 'запись не раскрывается целиком')
+
+  // Кнопка: «все 9» → раскрыто → «свежие».
+  const toggle = panel.querySelector('.dec-toggle')
+  assert.equal(toggle.textContent, 'все 9', `кнопка раскрытия не названа: ${toggle.textContent}`)
+  assert.equal(toggle.getAttribute('aria-expanded'), 'false')
+  toggle.click()
+  assert.ok(panel.classList.contains('is-open'), 'лента не раскрылась по клику')
+  assert.equal(toggle.textContent, 'свежие', 'кнопка не вернулась к слову «свежие»')
+  assert.equal(toggle.getAttribute('aria-expanded'), 'true')
+  toggle.click()
+  assert.ok(!panel.classList.contains('is-open'), 'лента не свернулась обратно')
+
+  // Клик по записи раскрывает её слова целиком.
+  const item = panel.querySelector('.dec-item')
+  item.click()
+  assert.ok(item.classList.contains('is-open'), 'запись не раскрылась по клику')
 })
 
 test('веб: без фактов лида и без решений экран молчит, а не выдумывает', async (t) => {
@@ -1501,7 +1552,7 @@ test('веб: отказ плана стоит под графом, раскры
   const issues = [...line.querySelectorAll('.plan-issues li')].map((item) => item.textContent)
   assert.deepEqual(issues, ["plan.evidence: этап 'fix' что-то производит, а evidence пуст"], 'полный список причин не раскрыт')
   // Счётчики истории — в подсказке журнала решений: строка уходит, история нет.
-  const story = doc.querySelector('[data-key="decisions"] .scale-log-title')
+  const story = doc.querySelector('[data-key="decisions"] .dec-panel-title')
   assert.match(story.getAttribute('title'), /кругов плана: 2, отказов: 2/, 'подсказка истории без счётчиков плана')
   assert.equal(line.getAttribute('title'), 'кругов плана: 2, отказов: 2')
 
@@ -1524,7 +1575,7 @@ test('веб: отказ плана стоит под графом, раскры
   const accepted = await renderDealPanel(detail, attempts)
   assert.equal(accepted.querySelector('[data-key="fact:plan"]'), null, 'строка отказа осталась после приёмки плана')
   assert.match(
-    accepted.querySelector('[data-key="decisions"] .scale-log-title').getAttribute('title'),
+    accepted.querySelector('[data-key="decisions"] .dec-panel-title').getAttribute('title'),
     /кругов плана: 3, отказов: 2/,
     'история кругов пропала вместе со строкой отказа',
   )

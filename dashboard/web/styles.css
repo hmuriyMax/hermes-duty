@@ -10,7 +10,7 @@
   --border-strong: #cdd2d9;
   --text: #1a1d21;
   --text-2: #5a6472;
-  --text-3: #8a94a3;
+  --text-3: #5f6b7a;
   --accent: #2563eb;
   --accent-soft: rgba(37, 99, 235, 0.09);
   --danger: #dc2626;
@@ -51,7 +51,7 @@
     --border-strong: #333a46;
     --text: #e6e9ee;
     --text-2: #9aa4b2;
-    --text-3: #6b7686;
+    --text-3: #8b95a5;
     --accent: #5b8def;
     --accent-soft: rgba(91, 141, 239, 0.14);
     --danger: #f26d6d;
@@ -468,14 +468,20 @@ svg.deal-ico { flex: none; width: 16px; height: 16px; fill: none; stroke: var(--
 .deal-facts b.t-green { color: var(--ok); }
 .deal-facts b.t-gray { color: var(--text-2); }
 
-/* Журнал решений лида — таблица внизу панели шкалы (`decisions[]` ответа
-   `/deal`). Колонки: время · вид · кто · этап · что решил. Ширина занята
-   колонками, а не растянутым текстом: строка читается слева направо, и глаз
-   находит «кто» и «когда» в одном и том же месте каждой строки. */
-.scale-log { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; }
-.scale-log-h { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
-.scale-log-title { font-size: 11px; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-2); }
-.dec-filters { display: flex; flex-wrap: wrap; gap: 4px; }
+/* Решения лида — лента на вертикальной оси в правом рельсе дела (`decisions[]`
+   ответа `/deal`). Таблица во всю ширину занимала место и оставляла половину
+   панели пустой; здесь у решений своя ось: точка вида, часы, слово вида, зазор
+   до прошлого решения, автор и слова. Свежие сверху, шесть по умолчанию. */
+.dec-panel-title { font-size: 11px; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-2); }
+/* Раскрытие ленты: кнопка в шапке панели, единственный контрол рядом с названием. */
+.dec-toggle {
+  margin-left: auto; height: 20px; padding: 0 8px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--border); background: transparent; color: var(--text-2);
+  font: inherit; font-size: 10.5px; letter-spacing: 0; text-transform: none; font-weight: 600;
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.dec-toggle:hover { color: var(--text); border-color: var(--text-3); }
+.dec-filters { display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 12px 0; }
 /* Чип семейства: выключенный — контур, включённый — заливка. «Все» показывается
    включённым, пока фильтр пуст, поэтому состояние читается в любую секунду. */
 .dec-filter {
@@ -484,45 +490,36 @@ svg.deal-ico { flex: none; width: 16px; height: 16px; fill: none; stroke: var(--
   font: inherit; font-size: 11px; font-variant-numeric: tabular-nums;
 }
 .dec-filter:hover { color: var(--text); border-color: var(--text-3); }
-.dec-filter.on { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); background: var(--accent-soft); }
-/* Ширина таблицы ограничена по мере чтения: свободный текст в 1100 px не
-   читается, а строки-обрубки в 30 знаков оставляли бы пустую половину панели. */
-.dec-table { --dec-cols: 58px 112px 62px minmax(0, 1fr); max-width: 1080px; }
-.dec-row {
-  display: grid; grid-template-columns: var(--dec-cols); gap: 10px;
-  align-items: baseline; font-size: 12.5px; padding: 3px 0;
-}
-.dec-row.is-head {
-  font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-3);
-  padding-bottom: 4px; border-bottom: 1px solid var(--border); position: sticky; top: 0;
-  background: var(--bg); z-index: 1;
-}
-.dec-body { max-height: 232px; overflow-y: auto; }
-.dec-body .dec-row + .dec-row { border-top: 1px solid var(--border); }
-.dec-row:hover { background: color-mix(in srgb, var(--text-3) 8%, transparent); }
-/* Строка, выключенная фильтром, гаснет — но остаётся на месте: пропавшие строки
-   читались бы как «решений не было». */
-.dec-row.is-dim { opacity: 0.28; }
-.dec-clock {
-  font-size: 11.5px; font-variant-numeric: tabular-nums; color: var(--text-2);
-  display: flex; flex-direction: column; align-items: flex-end; line-height: 1.25;
-}
-/* Через сколько после предыдущего решения: мелкая строка под часами — ритм
-   решений виден без арифметики в голове. */
-.dec-gap { font-size: 9.5px; font-style: normal; color: var(--text-3); }
+.dec-filter.on { color: var(--text); border-color: color-mix(in srgb, var(--accent) 55%, transparent); background: var(--accent-soft); }
+/* Ось ленты: одна линия на все записи — по ней видно, что записи идут во
+   времени, а точки на ней различают виды решений цветом. */
+.dec-list { list-style: none; margin: 0; padding: 6px 0 8px; position: relative; }
+.dec-list::before { content: ''; position: absolute; left: 17px; top: 12px; bottom: 14px; width: 1px; background: var(--border); }
+.dec-item { position: relative; padding: 7px 12px 7px 32px; }
+.dec-item + .dec-item { border-top: 1px solid color-mix(in srgb, var(--border) 55%, transparent); }
+.dec-item:hover { background: color-mix(in srgb, var(--text-3) 6%, transparent); }
+/* Строка, выключенная фильтром, гаснет — но остаётся на месте. */
+.dec-item.is-dim { opacity: 0.28; }
+.dec-dot { position: absolute; left: 14px; top: 12px; width: 7px; height: 7px; border-radius: 50%; background: var(--text-3); box-shadow: 0 0 0 3px var(--card); }
+.dec-when { display: flex; align-items: baseline; gap: 7px; flex-wrap: wrap; min-width: 0; }
+.dec-clock { font-size: 10.5px; font-variant-numeric: tabular-nums; color: var(--text-3); }
+/* Через сколько после предыдущего решения: ритм виден без арифметики в голове. */
+.dec-gap { font-size: 9.5px; color: var(--text-3); }
 /* Вид решения — то, что человек различает первым: слово вида в цвете тона. */
-.dec-type { font-size: 11.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.dec-who { font-size: 11px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.dec-who.is-blank { color: var(--text-3); }
-.dec-stage {
-  font-size: 11px; font-family: var(--mono); color: var(--text-2);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+.dec-type { font-size: 11.5px; font-weight: 650; white-space: nowrap; }
+.dec-who { margin-left: auto; font-size: 9.5px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.03em; white-space: nowrap; color: var(--text-3); }
+.dec-say {
+  margin-top: 2px; font-size: 12.5px; line-height: 1.4; color: var(--text); overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
 }
-.dec-text { color: var(--text); overflow-wrap: anywhere; line-height: 1.35; }
-/* Строка лида в ячейке состояния списка: вторичная подпись под бейджем, чтобы
-   столбец «состояние» не менял ширину от длинного слова. */
-.lead-note { display: block; margin-top: 4px; font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-
+/* Клик по строке раскрывает слова целиком: три строки — мера чтения в узком
+   рельсе, а не запрет на подробности. */
+.dec-item.is-open .dec-say { -webkit-line-clamp: unset; display: block; }
+.dec-more { margin-top: 3px; display: flex; gap: 8px; }
+.dec-stage { font-size: 10.5px; font-family: var(--mono); color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Превью ленты: шесть записей. Остальные ждут кнопки «все N» — иначе рельс
+   растёт на экран из-за истории, а свежее уезжает вниз. */
+.dec-panel:not(.is-open) .dec-item:nth-child(n+7) { display: none; }
 /* Заход лида на шкале — не полоса попытки, а разметка поверх неё: рейка на
    уровне текста, засечки начала и конца, слово режима над рейкой. Полоса попытки
    залита на всю высоту строки, и заход лида, нарисованный так же, читался как ещё
@@ -568,18 +565,21 @@ svg.deal-ico { flex: none; width: 16px; height: 16px; fill: none; stroke: var(--
 }
 .tl-lane.is-lead .tl-lane-name { color: var(--text); }
 
-/* Две колонки карточки дела: документы (растут) и тонкий столбец этапов.
-   Правая колонка — ровно 320 px и не растёт: в ней живут строки этапов и
-   попыток, а не абзацы. Левая забирает остаток ширины. */
+/* Две колонки карточки дела: документы (растут) и правый рельс.
+   Рельс — 340 px и не растёт: в нём лента решений и строки этапов, а не абзацы.
+   Левая колонка забирает остаток ширины. */
 .deal-cols {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 320px;
+  grid-template-columns: minmax(0, 1fr) 340px;
   gap: 14px;
   align-items: start;
 }
 
+/* Рельс: две панели друг под другом, обе на всю ширину рельса. */
+.deal-rail { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+
 /* Узкое окно: колонки друг под другом, документы — первыми, этапы — следом. */
-@media (max-width: 1100px) {
+@media (max-width: 1180px) {
   .deal-cols { grid-template-columns: 1fr; }
   input[type="search"] { width: 100%; }
 }
@@ -1288,6 +1288,12 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
   display: grid; grid-auto-flow: column; align-items: baseline; gap: 6px;
   padding: 7px 12px; border-radius: 7px; border: 1px solid var(--border); background: var(--card);
 }
+/* В шапке дела KPI — плоская строка под волоском: числа принадлежат делу, и
+   вторая рамка внутри карточки делила бы одно на два. */
+.deal-head-kpi .duty-kpi { margin: 0; gap: 22px; }
+.deal-head-kpi { margin-top: 12px; padding-top: 11px; border-top: 1px solid var(--border); }
+.deal-head-kpi .duty-kpi-cell { display: flex; flex-direction: column; gap: 1px; padding: 0; border: 0; background: transparent; }
+.deal-head-kpi .duty-kpi-v { font-size: 16px; }
 .duty-kpi-v { font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; }
 /* Подписи под числами — тот же контраст, что у основного текста: 10.5px в
    --text-3 не читается ни в светлой (3.07:1), ни в тёмной (3.78:1) теме. */

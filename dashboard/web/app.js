@@ -1971,105 +1971,100 @@ function stageBlockNode(dealId, stage, timeline, rebuild) {
 }
 
 /**
- * Журнал решений лида — таблица под шкалой, в той же панели.
+ * Решения лида — лентой на вертикальной оси времени, в правом рельсе дела.
  *
- * Источник один — `decisions[]` ответа `/deal` (`dashboard/leadfeed.feed`), тот же
- * список, который печатает `bin/duty deal`. Раньше это была отдельная панель во
- * всю ширину, где строки были почти пустыми: время, автор и текст, растянутый на
- * 1386 px, — длинная лента без опоры для глаза. Теперь это таблица с колонками
- * `время · вид · кто · этап · что решил` (этап рисуется только если он в ленте
- * есть) и фильтром по семействам в шапке: ширина занята колонками, а не пустым
- * текстом, и по ленте можно спрашивать «а что решалось по этапам».
+ * Таблица во всю ширину повторяла журнал терминала: сорок строк, прочитанных
+ * один раз, и половина панели пустой. Здесь у решений своя ось: точка вида,
+ * часы, слово вида, зазор до прошлого решения, автор и слова до трёх строк.
  *
- * Свежие сверху (порядок — шейпер): в журнале решений последнее решение ищут
- * первым, а журнальный порядок остался в терминале. Пустая лента не рисуется:
- * «решений нет» на экране свежего дела — шум, а не факт.
+ * Свежие сверху (порядок — шейпер). По умолчанию шесть строк, остальные — по
+ * кнопке: рельс не должен расти на экран из-за истории. Пустая лента не
+ * рисуется: «решений нет» на свежем деле — шум, а не факт.
  */
-function decisionsSection(items, plan) {
+const DECISION_PREVIEW = 6
+
+function decisionsPanel(items, plan, dealId) {
   const total = decisionsCount(items)
   if (!total) return null
   const rows = shapeDecisions(items)
   const groups = decisionGroups(rows)
-  const hasStage = rows.some((row) => row.stage)
-  // Решётка по составу: колонка этапа появляется только там, где этапы в ленте
-  // есть, — иначе треть строк стояла бы пустым прочерком.
-  const cols = hasStage ? '58px 112px 62px 104px minmax(0, 1fr)' : '58px 112px 62px minmax(0, 1fr)'
-  const body = h(
+  const key = String(dealId || '')
+  const open = decisionsOpen.has(key)
+  const panel = h(
     'div',
-    { class: 'dec-body' },
-    ...rows.map((row) =>
+    { class: `panel dec-panel${open ? ' is-open' : ''}`, 'data-key': 'decisions', 'data-deal': key, 'data-total': String(total) },
+    h(
+      'div',
+      { class: 'panel-h' },
+      h('span', { class: 'dec-panel-title', title: plan ? plan.hint : '' }, `решения лида · ${total}`),
+      // Кнопка раскрытия — единственный контрол в шапке: фильтр живёт строкой
+      // ниже, и два ряда кнопок в 340 px читались бы как пульт.
       h(
-        'div',
-        { class: 'dec-row', key: row.key, 'data-group': row.group, 'data-at': row.at === null ? '' : String(row.at) },
+        'button',
+        { class: 'dec-toggle', type: 'button', 'data-act': 'toggle', 'aria-expanded': open ? 'true' : 'false' },
+        open ? 'свежие' : `все ${total}`,
+      ),
+    ),
+    // Фильтр семейств: вопрос «что решалось по этапам» задаётся один раз, а не
+    // перечитыванием всей ленты. Выключенная строка гаснет, но остаётся на
+    // месте — пропавшие строки читались бы как «решений не было».
+    h(
+      'div',
+      { class: 'dec-filters', role: 'group', 'aria-label': 'фильтр решений по семействам' },
+      h('button', { class: 'dec-filter on', type: 'button', 'data-group': '', 'aria-pressed': 'true' }, `все ${total}`),
+      ...groups.map((group) =>
         h(
-          'span',
-          { class: 'dec-clock mono', title: row.ageText ? `${row.ageText} назад` : '' },
-          row.clock,
-          row.gapText ? h('i', { class: 'dec-gap', title: 'прошло после предыдущего решения' }, row.gapText) : null,
+          'button',
+          { class: 'dec-filter', type: 'button', 'data-group': group.key, 'aria-pressed': 'false' },
+          `${group.label} ${group.count}`,
         ),
-        h('span', { class: `dec-type t-${row.tone}` }, row.typeLabel),
-        row.authorLabel
-          ? h('span', { class: `dec-who t-${row.authorTone}`, title: `автор: ${row.author}` }, row.authorLabel)
-          : h('span', { class: 'dec-who is-blank', 'aria-hidden': 'true' }, '—'),
-        hasStage ? h('span', { class: 'dec-stage', title: row.stage ? `этап: ${row.stage}` : '' }, row.stage) : null,
-        h('span', { class: 'dec-text' }, row.text),
       ),
     ),
-  )
-  const section = h(
-    'div',
-    { class: 'scale-log', 'data-key': 'decisions' },
     h(
-      'div',
-      { class: 'scale-log-h' },
-      h('span', { class: 'scale-log-title', title: plan ? plan.hint : '' }, `решения лида · ${total}`),
-      h('span', { class: 'muted' }, 'свежие сверху'),
-      h('span', { class: 'tl-spacer' }),
-      // Фильтр — чипы семейств с числами: вопрос к ленте формулируется один раз
-      // («что решалось по этапам»), а не перечитыванием всех строк.
-      h(
-        'div',
-        { class: 'dec-filters', role: 'group', 'aria-label': 'фильтр решений по семействам' },
-        h('button', { class: 'dec-filter on', type: 'button', 'data-group': '', 'aria-pressed': 'true' }, `все ${total}`),
-        ...groups.map((group) =>
+      'ol',
+      { class: 'dec-list' },
+      ...rows.map((row) =>
+        h(
+          'li',
+          { class: 'dec-item', key: row.key, 'data-group': row.group, 'data-at': row.at === null ? '' : String(row.at) },
+          h('span', { class: `dec-dot t-${row.tone}` }),
           h(
-            'button',
-            { class: 'dec-filter', type: 'button', 'data-group': group.key, 'aria-pressed': 'false' },
-            `${group.label} ${group.count}`,
+            'div',
+            { class: 'dec-when' },
+            h('span', { class: 'dec-clock mono', title: row.ageText ? `${row.ageText} назад` : '' }, row.clock),
+            h('span', { class: `dec-type t-${row.tone}` }, row.typeLabel),
+            row.gapText ? h('span', { class: 'dec-gap', title: 'прошло после предыдущего решения' }, row.gapText) : null,
+            row.authorLabel
+              ? h('span', { class: `dec-who t-${row.authorTone}`, title: `автор: ${row.author}` }, row.authorLabel)
+              : null,
           ),
+          // Слова решения обрезаны тремя строками: клик по строке раскрывает
+          // целиком — «чем кончилось» не должно теряться из-за меры чтения.
+          h('div', { class: 'dec-say' }, row.text),
+          row.stage
+            ? h('div', { class: 'dec-more' }, h('span', { class: 'dec-stage mono', title: `этап: ${row.stage}` }, row.stage))
+            : null,
         ),
       ),
     ),
-    h(
-      'div',
-      { class: 'dec-table', style: `--dec-cols:${cols}` },
-      h(
-        'div',
-        { class: 'dec-row is-head', 'aria-hidden': 'true' },
-        h('span', null, 'время'),
-        h('span', null, 'решение'),
-        h('span', null, 'кто'),
-        hasStage ? h('span', null, 'этап') : null,
-        h('span', null, 'что решил'),
-      ),
-      body,
-    ),
   )
-  return section
+  wireDecisionsPanel(panel)
+  return panel
 }
 
-// Выбранные семейства решений: состояние принадлежит экрану и переживает тихий
-// тик так же, как подсветка инструментов (`dutyToolFilter`).
+// Раскрытые ленты и выбранные семейства принадлежат экрану и переживают тихий
+// тик — так же, как подсветка инструментов (`dutyToolFilter`).
+const decisionsOpen = new Set()
 const dutyDecisionFilter = new Set()
 
 // Шапка журнала решений слушает клик один раз: морф переиспользует узлы, и без
 // отметки каждый тик добавлял бы ещё один обработчик.
 const wiredDecisionHosts = new WeakSet()
 
-/** Применить фильтр журнала решений к уже нарисованной панели. */
+/** Применить фильтр ленты решений к уже нарисованной панели. */
 function applyDecisionFilter(panel) {
   const active = dutyDecisionFilter.size
-  for (const row of panel.querySelectorAll('.dec-body .dec-row')) {
+  for (const row of panel.querySelectorAll('.dec-list .dec-item')) {
     const on = !active || dutyDecisionFilter.has(row.getAttribute('data-group'))
     row.classList.toggle('is-dim', !on)
   }
@@ -2081,23 +2076,45 @@ function applyDecisionFilter(panel) {
   }
 }
 
-/** Клик по чипу семейства: включить/выключить его; «все» снимает фильтр. */
+/**
+ * Обработчики ленты решений: чипы семейств, раскрытие ленты и раскрытие строки.
+ *
+ * Ставятся один раз на панель (морф переиспользует узел), а состояние живёт в
+ * модульных множествах: тихий тик пересобирает содержимое, но не сбрасывает
+ * ни фильтр, ни раскрытую ленту.
+ */
 function wireDecisionsPanel(panel) {
-  const host = panel.querySelector('.scale-log-h')
-  if (!host || wiredDecisionHosts.has(host)) return
-  wiredDecisionHosts.add(host)
-  host.addEventListener('click', (event) => {
+  if (wiredDecisionHosts.has(panel)) return
+  wiredDecisionHosts.add(panel)
+  panel.addEventListener('click', (event) => {
     const chip = event.target.closest('.dec-filter')
-    if (!chip) return
-    const group = chip.getAttribute('data-group') || ''
-    if (!group) {
-      dutyDecisionFilter.clear()
-    } else if (dutyDecisionFilter.has(group)) {
-      dutyDecisionFilter.delete(group)
-    } else {
-      dutyDecisionFilter.add(group)
+    if (chip) {
+      const group = chip.getAttribute('data-group') || ''
+      if (!group) {
+        dutyDecisionFilter.clear()
+      } else if (dutyDecisionFilter.has(group)) {
+        dutyDecisionFilter.delete(group)
+      } else {
+        dutyDecisionFilter.add(group)
+      }
+      applyDecisionFilter(panel)
+      return
     }
-    applyDecisionFilter(panel)
+    const toggle = event.target.closest('.dec-toggle')
+    if (toggle) {
+      const key = panel.getAttribute('data-deal') || ''
+      const open = !panel.classList.contains('is-open')
+      panel.classList.toggle('is-open', open)
+      if (open) decisionsOpen.add(key)
+      else decisionsOpen.delete(key)
+      toggle.textContent = open ? 'свежие' : `все ${panel.getAttribute('data-total') || ''}`
+      toggle.setAttribute('aria-expanded', open ? 'true' : 'false')
+      return
+    }
+    // Клик по самой строке раскрывает её слова целиком: обрезка тремя строками
+    // — мера чтения в узком рельсе, а не запрет на подробности.
+    const item = event.target.closest('.dec-item')
+    if (item) item.classList.toggle('is-open')
   })
   applyDecisionFilter(panel)
 }
@@ -2628,7 +2645,7 @@ function specStrip(spec) {
  * Панель шкалы времени: подписанная ось, дорожка на этап, полосы попыток и лента
  * маркеров. Геометрия приходит посчитанной (`shapeDealTime`); здесь только DOM.
  */
-function scalePanel(scale, decisions, plan) {
+function scalePanel(scale) {
   // Индекс вызовов: чип и инспектор читают один и тот же вид (`attemptView`).
   dutyCallIndex.clear()
   for (const bar of scale.bars) {
@@ -2777,16 +2794,11 @@ function scalePanel(scale, decisions, plan) {
       // Легенда маркеров: что означают точки внутри строк попыток.
       markerLegend(scale),
       scale.facts.attempts.journal ? h('div', { class: 'muted' }, 'полосы собраны из журнала: ответ попыток пуст') : null,
-      // Журнал решений — внизу той же панели, а не второй полосой во всю ширину:
-      // это тот же разговор «что произошло», только словами, и он читается сразу
-      // под дорожками, к которым относится.
-      decisionsSection(decisions, plan),
     ),
   )
   // Фильтр, выбранный в легенде, переживает перерисовку данных: экран
   // пересобирается по новому кадру, а подсветка остаётся там, где её оставили.
   wireScalePanel(panel)
-  wireDecisionsPanel(panel)
     // «Висим на правой границе»: пока человек не уехал влево, каждый тик держит
   // в кадре свежую кромку. Флаг живёт на элементе — морф его не теряет.
   // Микрозадача, а не setTimeout: панель монтируется в этом же синхронном
@@ -2976,6 +2988,9 @@ function viewDeal(dealId) {
     ),
     // Факты шкалы: попытки по этапам, длительность, вопросы, бюджет, публикация.
     h('div', { class: 'deal-facts', 'data-key': 'facts' }, ...dealFactSpans(scale)),
+    // KPI — низ той же карточки, а не отдельная полоса под шапкой: числа дела
+    // принадлежат делу, и волосок внутри шапки говорит это без второй рамки.
+    h('div', { class: 'deal-head-kpi', 'data-key': 'kpi-strip' }, kpiStrip(scale)),
     deal && deal.evidence ? h('div', { class: 'why-evidence', style: 'margin-top:10px', text: deal.evidence }) : null,
     // Отказы опроса молчат, пока их меньше трёх: одиночный таймаут — не повод
     // махать баннером. Три подряд — это уже сломанное обновление, и о нём честно.
@@ -3009,19 +3024,22 @@ function viewDeal(dealId) {
       )
     : null
 
-  // Этапы и попытки — одним тонким столбцом (320 px) рядом с описанием: шапка
-  // попытки раньше повторялась в широкой ленте этапов и в отдельной панели
-  // попыток, и страница дела росла на три с половиной экрана.
+  // Правый рельс дела: решения лида лентой на оси времени, под ними этапы и
+  // попытки. Оба списка — про одно и то же дело и оба читаются сверху вниз,
+  // поэтому стоят рядом, а не двумя полосами во всю ширину.
+  const decisions = decisionsPanel(data.decisions, deal && deal.plan, data.id)
   const stages = stagesColumn(data.id)
+  const rail = h('div', { class: 'deal-rail' }, decisions, stages)
 
   return h(
     'div',
     { 'data-key': 'deal' },
     h('div', { style: 'margin-bottom:10px' }, h('a', { href: '#/deal' }, '← к списку дел')),
     head,
-    kpiStrip(scale),
-    scalePanel(scale, data.decisions, deal && deal.plan),
-    left ? h('div', { class: 'deal-cols' }, left, stages) : stages,
+    scalePanel(scale),
+    // Документов нет — нет и левой колонки: рельс забирает ширину, а не стоит
+    // половиной пустой страницы.
+    left ? h('div', { class: 'deal-cols' }, left, rail) : rail,
   )
 }
 

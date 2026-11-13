@@ -4565,28 +4565,29 @@ const CSS = `
 .duty-deal-facts b{color:var(--ui-text-primary);font-weight:600}
 /* Журнал решений лида — таблица внизу панели шкалы: колонки вместо растянутого
    текста, свежие сверху, фильтр по семействам в шапке. */
-.duty-scale-log{margin-top:10px;border-top:1px solid var(--ui-stroke-tertiary);padding-top:8px}
-.duty-scale-log-h{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px}
-.duty-scale-log-title{font-size:10.5px;font-weight:650;letter-spacing:.04em;text-transform:uppercase;color:var(--ui-text-secondary)}
-.duty-dec-filters{display:flex;flex-wrap:wrap;gap:4px}
+.duty-dec-panel-title{font-size:10.5px;font-weight:650;letter-spacing:.04em;text-transform:uppercase;color:var(--ui-text-secondary)}
+.duty-dec-toggle{margin-left:auto;height:20px;padding:0 8px;border-radius:999px;cursor:pointer;border:1px solid var(--ui-stroke-tertiary);background:transparent;color:var(--ui-text-secondary);font:inherit;font-size:10.5px;letter-spacing:0;text-transform:none;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap}
+.duty-dec-toggle:hover{color:var(--ui-text-primary);border-color:var(--ui-text-tertiary)}
+.duty-dec-filters{display:flex;flex-wrap:wrap;gap:4px;padding:8px 12px 0}
 .duty-dec-filter{height:20px;padding:0 7px;border-radius:999px;cursor:pointer;border:1px solid var(--ui-stroke-tertiary);background:transparent;color:var(--ui-text-secondary);font:inherit;font-size:11px;font-variant-numeric:tabular-nums}
 .duty-dec-filter:hover{color:var(--ui-text-primary);border-color:var(--ui-text-tertiary)}
-.duty-dec-filter.on{color:var(--ui-blue);border-color:color-mix(in srgb, var(--ui-blue) 45%, transparent);background:color-mix(in srgb, var(--ui-blue) 10%, transparent)}
-.duty-dec-table{--duty-dec-cols:58px 112px 62px 104px minmax(0,1fr);max-width:1080px}
-.duty-dec-table.no-stage{--duty-dec-cols:58px 112px 62px minmax(0,1fr)}
-.duty-dec-row{display:grid;grid-template-columns:var(--duty-dec-cols);gap:10px;align-items:baseline;font-size:11.5px;padding:3px 0}
-.duty-dec-row.is-head{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--ui-text-tertiary);padding-bottom:4px;border-bottom:1px solid var(--ui-stroke-tertiary)}
-.duty-dec-body{max-height:232px;overflow-y:auto}
-.duty-dec-body .duty-dec-row+.duty-dec-row{border-top:1px solid var(--ui-stroke-tertiary)}
-.duty-dec-row:hover{background:color-mix(in srgb, var(--ui-text-primary) 6%, transparent)}
-.duty-dec-clock{font-size:11.5px;font-variant-numeric:tabular-nums;color:var(--ui-text-secondary);display:flex;flex-direction:column;align-items:flex-end;line-height:1.25}
+.duty-dec-filter.on{color:var(--ui-text-primary);border-color:color-mix(in srgb, var(--ui-blue) 55%, transparent);background:color-mix(in srgb, var(--ui-blue) 10%, transparent)}
+.duty-dec-list{list-style:none;margin:0;padding:6px 0 8px;position:relative}
+.duty-dec-list::before{content:'';position:absolute;left:17px;top:12px;bottom:14px;width:1px;background:var(--ui-stroke-tertiary)}
+.duty-dec-item{position:relative;padding:7px 12px 7px 32px}
+.duty-dec-item+.duty-dec-item{border-top:1px solid color-mix(in srgb, var(--ui-stroke-tertiary) 55%, transparent)}
+.duty-dec-item:hover{background:color-mix(in srgb, var(--ui-text-primary) 5%, transparent)}
+.duty-dec-dot{position:absolute;left:14px;top:12px;width:7px;height:7px;border-radius:50%;box-shadow:0 0 0 3px var(--ui-bg-primary)}
+.duty-dec-when{display:flex;align-items:baseline;gap:7px;flex-wrap:wrap;min-width:0}
+.duty-dec-clock{font-size:10.5px;font-variant-numeric:tabular-nums;color:var(--ui-text-tertiary)}
 .duty-dec-gap{font-size:9.5px;font-style:normal;color:var(--ui-text-tertiary)}
-.duty-dec-type{font-size:11px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.duty-dec-who{font-size:10.5px;font-weight:650;text-transform:uppercase;letter-spacing:.02em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.duty-dec-who.is-blank{color:var(--ui-text-tertiary)}
-.duty-dec-stage{font-size:11px;font-family:ui-monospace, Menlo, monospace;color:var(--ui-text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.duty-dec-text{color:var(--ui-text-primary);overflow-wrap:anywhere;line-height:1.35}
-.duty-dec-empty{padding:6px 0;color:var(--ui-text-tertiary);font-size:11px}
+.duty-dec-type{font-size:11.5px;font-weight:650;white-space:nowrap}
+.duty-dec-who{margin-left:auto;font-size:9.5px;font-weight:650;text-transform:uppercase;letter-spacing:.03em;white-space:nowrap}
+.duty-dec-say{margin-top:2px;font-size:12px;line-height:1.4;color:var(--ui-text-primary);overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.duty-dec-panel:not(.is-open) .duty-dec-item:nth-child(n+7){display:none}
+.duty-dec-more{margin-top:3px;display:flex;gap:8px}
+.duty-dec-stage{font-size:10.5px;font-family:ui-monospace, Menlo, monospace;color:var(--ui-text-tertiary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.duty-dec-empty{padding:8px 12px;color:var(--ui-text-tertiary);font-size:11px}
 /* Заход лида на шкале — разметка поверх дорожек, а не вторая полоса попытки:
    рейка на уровне текста, засечки начала и конца, слово режима над рейкой, вся
    дорожка тонирована (она другого рода, чем этапы под ней). Идущий заход несёт
@@ -4610,9 +4611,10 @@ const CSS = `
 .duty-deal-body{display:flex;flex-direction:column;gap:12px;min-width:0}
 /* Две колонки карточки дела: документы (растут) и тонкий столбец этапов — ровно
    320 px, не растёт: в нём строки этапов и попыток, а не абзацы. */
-.duty-deal-cols{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:14px;align-items:start;min-width:0}
+.duty-deal-cols{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:14px;align-items:start;min-width:0}
+.duty-deal-rail{display:flex;flex-direction:column;gap:14px;min-width:0}
 /* Узкое окно: колонки друг под другом, документы — первыми, этапы — следом. */
-@media (max-width:1100px){.duty-deal-cols{grid-template-columns:1fr}}
+@media (max-width:1180px){.duty-deal-cols{grid-template-columns:1fr}}
 .duty-deal-spec,.duty-deal-docs,.duty-deal-stages{min-width:0}
 .duty-deal-scale{grid-column:1/-1;min-width:0}
 .duty-spec{margin:0;white-space:pre-wrap;word-break:break-word;font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:11px;line-height:1.5;color:var(--ui-text-secondary);max-height:60vh;overflow:auto;border:1px solid var(--ui-stroke-tertiary);border-radius:6px;padding:8px}
@@ -4775,6 +4777,10 @@ const CSS = `
 .duty-tl-insp.empty{color:var(--ui-text-tertiary);border-style:dashed;background:transparent}
 .duty-tl-insp-dot{width:8px;height:8px;border-radius:2px;background:var(--ui-text-tertiary)}
 .duty-kpi{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px}
+.duty-deal-head-kpi{margin-top:12px;padding-top:11px;border-top:1px solid var(--ui-stroke-tertiary)}
+.duty-deal-head-kpi .duty-kpi{margin:0;gap:22px}
+.duty-deal-head-kpi .duty-kpi-cell{display:flex;flex-direction:column;gap:1px;padding:0;border:0;background:transparent}
+.duty-deal-head-kpi .duty-kpi-v{font-size:16px}
 .duty-kpi-cell{display:grid;grid-auto-flow:column;align-items:baseline;gap:6px;padding:5px 10px;border-radius:7px;border:1px solid var(--ui-stroke-tertiary);background:var(--ui-surface-raised, var(--ui-surface-background))}
 .duty-kpi-v{font-size:15px;font-weight:700;font-variant-numeric:tabular-nums}
 .duty-kpi-l{font-size:10.5px;color:var(--ui-text-tertiary)}
@@ -5603,98 +5609,97 @@ function DealFactSpans({ scale }) {
   )
 }
 
-/** Журнал решений лида — таблица внизу панели шкалы (тот же список, что `duty deal`).
+/** Решения лида — лентой на вертикальной оси в правом рельсе дела (тот же
+ *  список, что `duty deal`).
  *
- *  Колонки `время · вид · кто · этап · что решил` и фильтр по семействам: строка
- *  читается слева направо, «кто» и «когда» стоят на одном месте в каждой строке,
- *  а ширина занята колонками, а не растянутым текстом. Свежие сверху (порядок
- *  даёт шейпер), пустая лента не рисуется вовсе. */
-function DecisionsPanel({ items, plan }) {
+ *  Таблица во всю ширину занимала место и оставляла половину панели пустой.
+ *  Здесь у решений своя ось: точка вида, часы, слово вида, зазор до прошлого,
+ *  автор и слова до трёх строк. Свежие сверху (порядок даёт шейпер), шесть по
+ *  умолчанию — остальные по кнопке. Пустая лента не рисуется вовсе. */
+function DecisionsPanel({ items, plan, dealId }) {
   const [groups, setGroups] = useState([])
+  const [open, setOpen] = useState(false)
   const total = decisionsCount(items)
   const rows = useMemo(() => (total ? shapeDecisions(items) : []), [items, total])
   const filters = useMemo(() => decisionGroups(rows), [rows])
-  const hasStage = rows.some((row) => row.stage)
+  // Раскрытие ленты живёт в состоянии экрана: тик не пересоздаёт DealScreen,
+  // поэтому история не схлопывается на каждом обновлении.
   if (!total) return null
   const on = (group) => {
     setGroups((prev) => (prev.includes(group) ? prev.filter((item) => item !== group) : [...prev, group]))
   }
   const active = groups.length > 0
   const shown = active ? rows.filter((row) => groups.includes(row.group)) : rows
+  const toggle = () => setOpen((prev) => !prev)
   return h(
     'div',
-    { className: 'duty-scale-log' },
+    { className: `duty-panel duty-dec-panel${open ? ' is-open' : ''}` },
     h(
       'div',
-      { className: 'duty-scale-log-h' },
-      h('span', { className: 'duty-scale-log-title', title: plan ? plan.hint : '' }, `решения лида · ${total}`),
-      h('span', { className: 'duty-muted' }, 'свежие сверху'),
-      h('span', { className: 'duty-spacer' }),
+      { className: 'duty-panel-h' },
+      h('span', { className: 'duty-dec-panel-title', title: plan ? plan.hint : '' }, `решения лида · ${total}`),
       h(
-        'div',
-        { className: 'duty-dec-filters', role: 'group', 'aria-label': 'фильтр решений по семействам' },
+        'button',
+        { className: 'duty-dec-toggle', type: 'button', 'aria-expanded': open ? 'true' : 'false', onClick: toggle },
+        open ? 'свежие' : `все ${total}`,
+      ),
+    ),
+    h(
+      'div',
+      { className: 'duty-dec-filters', role: 'group', 'aria-label': 'фильтр решений по семействам' },
+      h(
+        'button',
+        {
+          className: `duty-dec-filter${active ? '' : ' on'}`,
+          type: 'button',
+          'aria-pressed': active ? 'false' : 'true',
+          onClick: () => setGroups([]),
+        },
+        `все ${total}`,
+      ),
+      ...filters.map((filter) =>
         h(
           'button',
           {
-            className: `duty-dec-filter${active ? '' : ' on'}`,
+            key: filter.key,
+            className: `duty-dec-filter${groups.includes(filter.key) ? ' on' : ''}`,
             type: 'button',
-            'aria-pressed': active ? 'false' : 'true',
-            onClick: () => setGroups([]),
+            'aria-pressed': groups.includes(filter.key) ? 'true' : 'false',
+            onClick: () => on(filter.key),
           },
-          `все ${total}`,
-        ),
-        ...filters.map((filter) =>
-          h(
-            'button',
-            {
-              key: filter.key,
-              className: `duty-dec-filter${groups.includes(filter.key) ? ' on' : ''}`,
-              type: 'button',
-              'aria-pressed': groups.includes(filter.key) ? 'true' : 'false',
-              onClick: () => on(filter.key),
-            },
-            `${filter.label} ${filter.count}`,
-          ),
+          `${filter.label} ${filter.count}`,
         ),
       ),
     ),
-    h(
-      'div',
-      { className: `duty-dec-table${hasStage ? '' : ' no-stage'}` },
-      h(
-        'div',
-        { className: 'duty-dec-row is-head', 'aria-hidden': 'true' },
-        h('span', null, 'время'),
-        h('span', null, 'решение'),
-        h('span', null, 'кто'),
-        hasStage ? h('span', null, 'этап') : null,
-        h('span', null, 'что решил'),
-      ),
-      h(
-        'div',
-        { className: 'duty-dec-body' },
-        ...(shown.length
-          ? shown.map((row) =>
+    shown.length
+      ? h(
+          'ol',
+          { className: 'duty-dec-list' },
+          ...shown.map((row) =>
+            h(
+              'li',
+              { className: `duty-dec-item${open ? ' is-open' : ''}`, key: row.key },
+              h('span', { className: 'duty-dec-dot', style: { background: TONE_COLOR[row.tone] || TONE_COLOR.gray } }),
               h(
                 'div',
-                { className: 'duty-dec-row', key: row.key },
-                h(
-                  'span',
-                  { className: 'duty-dec-clock', title: row.ageText === '—' ? '' : `${row.ageText} назад` },
-                  row.clock,
-                  row.gapText ? h('i', { className: 'duty-dec-gap', title: 'прошло после предыдущего решения' }, row.gapText) : null,
-                ),
+                { className: 'duty-dec-when' },
+                h('span', { className: 'duty-dec-clock', title: row.ageText === '—' ? '' : `${row.ageText} назад` }, row.clock),
                 h('span', { className: 'duty-dec-type', style: { color: TONE_COLOR[row.tone] || TONE_COLOR.gray } }, row.typeLabel),
+                row.gapText ? h('i', { className: 'duty-dec-gap', title: 'прошло после предыдущего решения' }, row.gapText) : null,
                 row.authorLabel
-                  ? h('span', { className: 'duty-dec-who', style: { color: TONE_COLOR[row.authorTone] || TONE_COLOR.gray }, title: `автор: ${row.author}` }, row.authorLabel)
-                  : h('span', { className: 'duty-dec-who is-blank', 'aria-hidden': 'true' }, '—'),
-                hasStage ? h('span', { className: 'duty-dec-stage' }, row.stage) : null,
-                h('span', { className: 'duty-dec-text' }, row.text),
+                  ? h(
+                      'span',
+                      { className: 'duty-dec-who', style: { color: TONE_COLOR[row.authorTone] || TONE_COLOR.gray }, title: `автор: ${row.author}` },
+                      row.authorLabel,
+                    )
+                  : null,
               ),
-            )
-          : [h('div', { className: 'duty-dec-empty', key: 'empty' }, 'в этом семействе решений нет')]),
-      ),
-    ),
+              h('div', { className: 'duty-dec-say' }, row.text),
+              row.stage ? h('div', { className: 'duty-dec-more' }, h('span', { className: 'duty-dec-stage', title: `этап: ${row.stage}` }, row.stage)) : null,
+            ),
+          ),
+        )
+      : h('div', { className: 'duty-dec-empty' }, 'в этом семействе решений нет'),
   )
 }
 
@@ -5845,7 +5850,7 @@ function callOf(scale, callId) {
 }
 
 /** Панель шкалы времени: подписанная ось, дорожка на этап, полосы и маркеры. */
-function ScalePanel({ scale, dealId, callSel, onSelectCall, toolFilter, onToggleTool, decisions, plan }) {
+function ScalePanel({ scale, dealId, callSel, onSelectCall, toolFilter, onToggleTool }) {
   const active = Array.isArray(toolFilter) ? toolFilter : []
   // Прокрутка широкой шкалы (Макс, 09.11: «максимальную ширину таймлайна в час,
   // дальше — прокрутку, висим на правой границе»): пока человек не уехал влево
@@ -6066,9 +6071,6 @@ function ScalePanel({ scale, dealId, callSel, onSelectCall, toolFilter, onToggle
         )
       : null,
     scale.facts.attempts.journal ? h('div', { className: 'duty-muted' }, 'полосы собраны из журнала: ответ попыток пуст') : null,
-    // Журнал решений — внизу той же панели: это тот же разговор «что произошло»,
-    // только словами, и он стоит под дорожками, к которым относится.
-    h(DecisionsPanel, { items: decisions, plan }),
   )
 }
 
@@ -6822,6 +6824,9 @@ function DealScreen({ sel, onBack }) {
           deal ? h('span', null, 'действие: ', h('b', null, `${deal.lastActionAgeText} назад`)) : null,
         )
       : null,
+    // KPI — низ той же карточки: числа принадлежат делу, и вторая рамка внутри
+    // шапки делила бы одно на два (как в вебе).
+    detail.data ? h('div', { className: 'duty-deal-head-kpi' }, h(KpiStrip, { scale })) : null,
   )
 
   let body
@@ -6835,15 +6840,20 @@ function DealScreen({ sel, onBack }) {
     // другим нельзя (у дел из `bin/duty create` описания в store нет вовсе).
     // Нет документов — нет колонки: столбец этапов остаётся один на всю ширину.
     const stages = h(CompactStages, { feed, timeline })
+    // Правый рельс дела: решения лида лентой на оси времени, под ними этапы и
+    // попытки — оба списка про одно дело и оба читаются сверху вниз.
+    const rail = h(
+      'div',
+      { className: 'duty-deal-rail' },
+      h(DecisionsPanel, { items: detail.data.decisions, plan: deal && deal.plan, dealId: sel.id }),
+      stages,
+    )
     body = h(
       'div',
       { className: 'duty-deal-body' },
       // Шкала — первой и во всю ширину: это главный факт дела, а спецификация и
-      // столбец этапов — пояснение к нему.
-      h(KpiStrip, { scale }),
-      h(ScalePanel, { scale, dealId: sel.id, callSel, onSelectCall: selectCall, toolFilter, onToggleTool: toggleTool, decisions: detail.data.decisions, plan: deal && deal.plan }),
-      // Решения лида — во всю ширину над колонками: история по времени рядом со
-      // шкалой, а не ещё один узкий столбец.
+      // рельс — пояснение к нему.
+      h(ScalePanel, { scale, dealId: sel.id, callSel, onSelectCall: selectCall, toolFilter, onToggleTool: toggleTool }),
       docs.length
         ? h(
             'div',
@@ -6867,9 +6877,9 @@ function DealScreen({ sel, onBack }) {
                 ),
               ),
             ),
-            stages,
+            rail,
           )
-        : stages,
+        : rail,
     )
   }
 

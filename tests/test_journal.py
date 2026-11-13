@@ -1072,7 +1072,9 @@ def test_now_deal_shape_is_pinned(home: Path, client: TestClient) -> None:
 
     body = client.get("/now").json()
 
-    assert list(body) == ["now", "count", "deals", "repos", "by_state", "crash_outcomes", "errors"]
+    assert list(body) == [
+        "now", "count", "deals", "proposals", "repos", "by_state", "crash_outcomes", "errors",
+    ]
     assert list(body["by_state"]) == list(journal.WAITING_PRIORITY)
     assert body["crash_outcomes"] == list(plugin_api.CRASH_OUTCOMES)
     assert list(body["repos"]) == ["list", "without_repo", "read"]

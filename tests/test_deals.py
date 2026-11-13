@@ -316,14 +316,23 @@ def test_create_parks_the_deal_without_letting_it_start(
             assert kinds(home, deal["id"]) == case["want_kinds"]
             stored = {row["id"]: row for row in deal_rows(home)}
             assert stored[deal["id"]]["status"] == case["want_status"]
-            listed = now_deals(client)[deal["id"]]
-            assert listed["status"] == case["want_status"]
+            blocked = events(home, deal["id"])[-1]
+            parked_as_proposal = (
+                case["want_block"] is not None
+                and blocked["payload"].get("block_kind") == "proposal"
+            )
+            if parked_as_proposal:
+                # Предложение живёт в пуле решений, а не в срезе «что сейчас»
+                # (Max, 14.11): список дел его не показывает, счётчик — называет.
+                assert deal["id"] not in now_deals(client)
+                assert client.get("/now").json()["proposals"]["count"] >= 1
+            else:
+                listed = now_deals(client)[deal["id"]]
+                assert listed["status"] == case["want_status"]
             if case["want_block"] is None:
-                assert listed["waiting"]["state"] != "wait_human"
+                assert now_deals(client)[deal["id"]]["waiting"]["state"] != "wait_human"
                 continue
-            blocked = events(home, deal["id"])[-1]["payload"]
-            assert {key: blocked.get(key) for key in case["want_block"]} == case["want_block"]
-            assert listed["waiting"]["state"] == case["want_waiting"]
+            assert {key: blocked["payload"].get(key) for key in case["want_block"]} == case["want_block"]
 
 
 def test_parked_deal_is_lifted_by_decide_continue_like_unblock(
@@ -343,6 +352,30 @@ def test_parked_deal_is_lifted_by_decide_continue_like_unblock(
     assert kinds(home, deal["id"]) == ["created", "blocked", "unblocked"]
     assert events(home, deal["id"])[-1]["payload"]["previous_kind"] == "proposal"
     assert now_deals(client)[deal["id"]]["waiting"]["state"] != "wait_human"
+
+
+def test_proposal_marker_is_one_rule_for_every_surface(home: Path, client: TestClient) -> None:
+    """Признак предложения один: парковка `proposal` **или** `si:` без старта.
+
+    Ревью `review_fix#1` дела `d_a8213c01` поймало расхождение: поверхность дел
+    брала `block_kind`, сканер improver — `external_ref`, а «ни разу не
+    начиналось» проверял третий код. Здесь проверяется, что оба ключа дают один
+    ответ и что принятое предложение из признака выходит: дело в очереди и без
+    старта — уже не предложение, а работа, которую поднимет диспетчер.
+    """
+    parked = create(client, park_kind="proposal", park_reason="предложение")
+    # Дело, заведённое до `--park-kind`: парковку ставили отдельным вызовом, и
+    # маркер у него `needs_input`. Второй ключ — префикс `si:` плюс «не начиналось».
+    legacy = client.post("/deals", json={"title": "старое предложение",
+                                         "external_ref": "si:2026-11-14-legacy"}).json()
+    mutate(client, "POST", f"/deals/{legacy['id']}/block",
+           json={"kind": "needs_input", "reason": "предложение без маркера"})
+    assert deals.proposal_ids(store(home)) == {parked["id"], legacy["id"]}
+
+    lifted = mutate(client, "POST", f"/deals/{parked['id']}/decide", json={"decision": "continue"})
+    assert lifted["deal"]["status"] == "ready"
+    assert deals.proposal_ids(store(home)) == {legacy["id"]}
+    assert parked["id"] in now_deals(client)
 
 
 def test_decide_stop_archives_a_proposal_and_completes_an_ordinary_deal(

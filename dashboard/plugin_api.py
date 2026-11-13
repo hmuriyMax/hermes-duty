@@ -860,15 +860,27 @@ def _pool_questions(home: Path) -> tuple[dict[str, dict[str, Any]], Optional[str
     truncated = len(rows) > QUESTION_LIMIT
     rows = rows[:QUESTION_LIMIT]
     index: dict[str, dict[str, Any]] = {}
+    # Два прохода, и порядок — не придирка: вопрос принадлежит делу, названному в
+    # его `session_key` (`t_<d_id>`), а упоминание `d_…` в тексте — подсказка.
+    # `d_a8213c01` показывало доказательством вопрос #652 чужого предложения
+    # (`t_d_b6b48334`): текст того вопроса упоминает это дело, и заполнение «кто
+    # первый» отдавало слот подсказке. Сначала точная привязка, потом догадка.
+    text_only: list[tuple[str, dict[str, Any]]] = []
     for row in rows:
-        holders: set[str] = set()
-        deal_id = ask.deal_id_of(str(row.get("session_key") or ""))
+        raw_key = str(row.get("session_key") or "")
+        deal_id = ask.deal_id_of(raw_key)
         if deal_id:
-            holders.add(deal_id)
+            index.setdefault(deal_id, row)
+            continue
+        # Вопрос, не привязанный к своему делу ключом (`t_<d_id>`), мог быть задан
+        # по карточке или ad-hoc: только у таких упоминание `d_…` в тексте —
+        # единственная связь. У привязанного вопроса подсказка из текста чужому
+        # делу достаться не может: тело предложения перечисляет соседние дела.
         blob = f"{row.get('text') or ''} {row.get('text_full') or ''}"
-        holders.update(DEAL_ID_RE.findall(blob))
-        for task_id in holders:
-            index.setdefault(task_id, row)
+        for task_id in DEAL_ID_RE.findall(blob):
+            text_only.append((task_id, row))
+    for task_id, row in text_only:
+        index.setdefault(task_id, row)
     return index, None, truncated
 
 
@@ -1406,24 +1418,34 @@ def _own_deals(
     pool_note: Optional[str],
     journal_events: dict[str, list[dict[str, Any]]],
     journal_note: Optional[str],
-) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    """Активные дела для среза «сейчас»: `(дела, ошибки)`.
+) -> tuple[list[dict[str, Any]], list[dict[str, str]], int]:
+    """Активные дела для среза «сейчас»: `(дела, ошибки, предложений)`.
 
     Отсутствие store — не ошибка, а «дел ещё нет» (`create=False` файла не
     создаёт). Нечитаемый store или журнал — строка в `errors[]`: пустой список без
     причины выглядел бы как «дел нет», а это разные факты.
+
+    Третье число — сколько дел-предложений отброшено (`deals.proposal_ids`).
+    Предложение живёт делом, но работы в нём нет: оно ждёт ответа в пуле, и в
+    срезе «что делается сейчас» ему не место (Max, 14.11). Число показывается
+    счётчиком, а не прячется: «предложений 5» — факт, который читатель ищет.
     """
     try:
         conn = deals.open_store(home, create=False, readonly=True)
     except Exception as exc:  # noqa: BLE001 - свой store не открылся
-        return [], [{"source": DEALS_SOURCE, "reason": f"{type(exc).__name__}: {exc}"}]
+        return [], [{"source": DEALS_SOURCE, "reason": f"{type(exc).__name__}: {exc}"}], 0
     if conn is None:
-        return [], []
+        return [], [], 0
     try:
         if not deals.has_store(conn):
-            return [], []
+            return [], [], 0
+        proposals = deals.proposal_ids(conn)
         out: list[dict[str, Any]] = []
+        skipped = 0
         for row in deals.deal_rows(conn, open_only=True):
+            if str(row["id"]) in proposals:
+                skipped += 1
+                continue
             events = journal_events.get(str(row["id"]), [])
             folded = journal.fold(events, now=now, answer_of=_pool_answer_of(home))
             if not folded["active"]:
@@ -1440,9 +1462,9 @@ def _own_deals(
                     _own_leases(conn, str(row["id"])),
                 )
             )
-        return out, []
+        return out, [], skipped
     except Exception as exc:  # noqa: BLE001 - битый store/журнал
-        return [], [{"source": DEALS_SOURCE, "reason": f"store: {type(exc).__name__}: {exc}"}]
+        return [], [{"source": DEALS_SOURCE, "reason": f"store: {type(exc).__name__}: {exc}"}], 0
     finally:
         conn.close()
 
@@ -1641,7 +1663,7 @@ def collect_now(
     errors: list[dict[str, str]] = list(pool_errors)
     journal_events, journal_note, journal_errors = _journal_context(home)
     errors.extend(journal_errors)
-    items, own_errors = _own_deals(
+    items, own_errors, proposals = _own_deals(
         home, now, questions, pool_note, journal_events, journal_note
     )
     errors.extend(own_errors)
@@ -1667,6 +1689,13 @@ def collect_now(
         "now": now,
         "count": len(items),
         "deals": items,
+        # Дела-предложения в срез не идут, но и не исчезают молча: счётчик
+        # называет, сколько их ждёт в пуле решений (Max, 14.11 — предложения
+        # засоряли общий таймлайн дел).
+        "proposals": {
+            "count": proposals,
+            "note": "предложения stack-improver — в пуле решений (/imsg), не в списке дел",
+        },
         # Группировка вместо списка досок: уникальные непустые `repo` дел плюс
         # число дел без репозитория. Считается по всему store, а не по срезу, —
         # это состав списка, а не его текущая страница.

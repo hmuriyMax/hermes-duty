@@ -1127,6 +1127,12 @@ def render_now(payload: dict[str, Any]) -> str:
     )
     if counted:
         lines.append(f"по состояниям: {counted}")
+    proposals = payload.get("proposals") or {}
+    if proposals.get("count"):
+        lines.append(
+            f"предложений stack-improver в пуле решений: {proposals['count']} — "
+            "не в списке дел, ответить: панель /imsg"
+        )
     lines.extend(_notice_lines(payload))
     deals = payload.get("deals") or []
     if not deals:

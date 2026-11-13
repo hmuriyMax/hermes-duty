@@ -235,6 +235,10 @@ NOW_KEYS = {
     "by_state.working",
     "crash_outcomes",
     "errors",
+    # Дела-предложения в срез не идут, но их число называется (14.11).
+    "proposals",
+    "proposals.count",
+    "proposals.note",
 }
 
 # `/cards`: наблюдение за карточками. Ни дела, ни адреса дела здесь нет.

@@ -546,7 +546,11 @@ def deal_row(conn: sqlite3.Connection, deal_id: str) -> Optional[dict[str, Any]]
 
 
 def deal_rows(
-    conn: sqlite3.Connection, *, repo: Optional[str] = None, open_only: bool = True
+    conn: sqlite3.Connection,
+    *,
+    repo: Optional[str] = None,
+    open_only: bool = True,
+    include_proposals: bool = True,
 ) -> list[dict[str, Any]]:
     """Свои дела (по умолчанию — активные), по возрастанию `created_at`.
 
@@ -554,6 +558,11 @@ def deal_rows(
     без репозитория. Отфильтровать «без репозитория» отдельно этим параметром
     нельзя (`NULL` значил бы «не фильтровать»), и это честно: такой фильтр ставит
     вызывающий по полю строки.
+
+    `include_proposals=False` убирает дела-предложения (`proposal_ids`): с 13.11
+    предложение improver живёт делом, которое ни разу не начиналось, и в списке
+    «что делается сейчас» оно отвечает не на тот вопрос. Место предложения —
+    пул решений, а срез показывает работу.
     """
     sql = f"SELECT {_deal_fields(conn)} FROM deals"
     params: list[Any] = []
@@ -567,7 +576,55 @@ def deal_rows(
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY created_at, id"
-    return [dict(row) for row in conn.execute(sql, tuple(params))]
+    rows = [dict(row) for row in conn.execute(sql, tuple(params))]
+    if include_proposals:
+        return rows
+    proposals = proposal_ids(conn)
+    return [row for row in rows if str(row.get("id")) not in proposals]
+
+
+def proposal_ids(conn: sqlite3.Connection, *, rows: Optional[list[dict[str, Any]]] = None) -> set[str]:
+    """Дела-предложения stack-improver: **один** признак для всех поверхностей.
+
+    Предложение — дело, которое завели, чтобы спросить человека, и которое ни
+    разу не начиналось. Признаков было три (`block_kind='proposal'`,
+    `external_ref='si:…'`, «нет ни `lead_started`, ни `attempt_started`»), и
+    каждая поверхность брала свой — отсюда и расхождение, которое поймало ревью
+    (`review_fix#1` дела `d_54ac8219`). Здесь они сведены в одно место: дело —
+    предложение, если его открытая парковка помечена `proposal` **или** оно
+    названо в `external_ref` префиксом `si:` и не начиналось. Второе условие
+    нужно для дел, заведённых до появления `--park-kind`: маркер парковки у них
+    не проставлен, а префикс есть.
+
+    `rows` — уже прочитанные строки дел (список экономит второй `SELECT`).
+    """
+    source = rows if rows is not None else deal_rows(conn, open_only=True)
+    found: set[str] = set()
+    for row in source:
+        deal_id = str(row.get("id") or "")
+        if not deal_id:
+            continue
+        if _open_block_kind(conn, deal_id) == PROPOSAL_BLOCK_KIND:
+            found.add(deal_id)
+            continue
+        ref = str(row.get(EXTERNAL_REF_FIELD) or "")
+        if (
+            ref.startswith(PROPOSAL_REF_PREFIX)
+            and str(row.get("status") or "") == "blocked"
+            and not _started(conn, deal_id)
+        ):
+            found.add(deal_id)
+    return found
+
+
+def _started(conn: sqlite3.Connection, deal_id: str) -> bool:
+    """Дело начиналось: есть факт лида или попытки. Дешёвая проверка для маркера."""
+    row = conn.execute(
+        "SELECT 1 FROM events WHERE deal_id = ? AND kind IN "
+        "('lead_started', 'attempt_started') LIMIT 1",
+        (deal_id,),
+    ).fetchone()
+    return row is not None
 
 
 def parents_of(conn: sqlite3.Connection, deal_id: str) -> list[dict[str, Any]]:
@@ -1609,6 +1666,10 @@ DECISION_WORDS = (DECISION_CONTINUE, DECISION_STOP)
 # человека по такому делу — «предложения не будет», то есть архив, а не
 # остановленная работа (`stop` обычного дела пишет `completed`).
 PROPOSAL_BLOCK_KIND = "proposal"
+# Внешняя ссылка предложения improver: `si:<дата-слаг>`. Она есть у дел,
+# заведённых до появления `--park-kind`, и остаётся вторым ключом к тому же
+# признаку (`proposal_ids`), а не третьим смыслом.
+PROPOSAL_REF_PREFIX = "si:"
 
 
 def _stop_live_attempts(

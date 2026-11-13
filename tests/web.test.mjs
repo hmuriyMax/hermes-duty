@@ -422,7 +422,7 @@ test('разворот строки и правки экрана дела: пр�
     assert.ok(text.includes(cls), `${name}: у красной полосы нет своего стиля`)
     assert.ok(text.includes(lbl), `${name}: провалившаяся строка не помечена`)
   }
-  assert.match(app, /class: `tl-band t-\$\{view\.band\.tone \|\| 'grey'\}`/, 'веб: фон попытки не знает тона')
+  assert.match(app, /class: `tl-band t-\$\{view\.band\.tone \|\| 'grey'\}/, 'веб: фон попытки не знает тона')
   assert.match(app, /tl-row\$\{view\.failed \? ' is-failed' : ''\}/, 'веб: строка не помечает провал')
   assert.match(plugin, /duty-tl-band t-\$\{view\.band\.tone \|\| 'grey'\}/, 'десктоп: фон попытки не знает тона')
   assert.match(plugin, /duty-tl-row\$\{view\.failed \? ' is-failed' : ''\}/, 'десктоп: строка не помечает провал')

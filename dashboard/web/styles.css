@@ -1455,6 +1455,8 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
  * каскадом. */
 @media (prefers-reduced-motion: reduce) {
   .spec-node.is-live rect { animation: none; }
+  /* Живой этап остаётся отличимым без дыхания: постоянный, но слабый ореол. */
+  .tl-band.is-live { animation: none; box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 26%, transparent), 0 0 9px -1px color-mix(in srgb, var(--accent) 55%, transparent); }
 }
 /* ======================================================= мини-таймлайн (0.0.9)
  *
@@ -1555,6 +1557,9 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
    «идёт прямо сейчас» относится к делу, а какой именно этап работает, видно по
    правому краю полосы. */
 .tl-sausage.is-live { animation: tl-live 2.8s ease-in-out infinite; }
+/* Попытка идёт прямо сейчас: тот же ореол, каким дышит живая сосиска на
+   таймлайне дел, — «этап в работе» узнаётся одним взглядом (Макс, 14.11). */
+.tl-band.is-live { animation: tl-live 2.8s ease-in-out infinite; }
 @keyframes tl-live {
   0%, 100% { box-shadow: 0 0 0 0 transparent, 0 0 7px -2px color-mix(in srgb, var(--accent) 45%, transparent); }
   50% { box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 26%, transparent), 0 0 13px -1px color-mix(in srgb, var(--accent) 78%, transparent); }

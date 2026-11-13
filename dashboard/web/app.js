@@ -2345,7 +2345,7 @@ function attemptRowNode(view, key) {
   if (view.band) {
     plot.append(
       h('span', {
-        class: `tl-band t-${view.band.tone || 'grey'}`,
+        class: `tl-band t-${view.band.tone || 'grey'}${view.open ? ' is-live' : ''}`,
         style: `left:${view.band.leftPct}%;width:${view.band.widthPct}%`,
         'data-tip': view.bandTip,
         'data-key': 'band',

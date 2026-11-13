@@ -2954,6 +2954,9 @@ function attemptView(bar, scale) {
   return {
     full,
     collapsed,
+    // Попытка ещё идёт: поверхность пульсирует её полосу тем же ореолом, каким
+    // дышит живая сосиска на таймлайне дел («идёт прямо сейчас», Макс, 14.11).
+    open: Boolean(b.open),
     // Тон фона — тон исхода попытки: провал виден полосой на дорожке, а не
     // только словом в подписи слева.
     band:
@@ -4279,7 +4282,7 @@ function DutyAttemptRow({ view, toolFilter }) {
     track.push(
       h('span', {
         key: 'band',
-        className: `duty-tl-band t-${view.band.tone || 'grey'}`,
+        className: `duty-tl-band t-${view.band.tone || 'grey'}${view.open ? ' duty-tl-band-live' : ''}`,
         style: { left: `${view.band.leftPct}%`, width: `${view.band.widthPct}%` },
         'data-tip': view.bandTip,
       }),
@@ -4967,6 +4970,7 @@ const CSS = `
 .duty-mtl-sausage.inexact{opacity:.45}
 /* Дело в работе — пульсирующий ореол вокруг всей сосиски, а не вокруг этапа. */
 .duty-mtl-sausage.is-live{animation:duty-mtl-live 2.8s ease-in-out infinite}
+.duty-tl-band.duty-tl-band-live{animation:duty-mtl-live 2.8s ease-in-out infinite}
 @keyframes duty-mtl-live{0%,100%{box-shadow:0 0 0 0 transparent,0 0 7px -2px color-mix(in srgb,var(--ui-accent) 45%,transparent)}50%{box-shadow:0 0 0 1px color-mix(in srgb,var(--ui-accent) 26%,transparent),0 0 13px -1px color-mix(in srgb,var(--ui-accent) 78%,transparent)}}
 /* Роли этапов: цвет — кто работает (имплементер всегда один, ревьюер другой). */
 .duty-mtl-seg{position:absolute;top:0;bottom:0;min-width:2px;background-color:var(--role-fill,var(--role-other))}

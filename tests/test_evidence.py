@@ -750,20 +750,21 @@ def test_nothing_after_a_commit_on_top_of_the_base_is_refused(tmp_path: Path) ->
     assert "не равен базе попытки" in str(verdict.errors[0])
 
 
-def test_nothing_with_the_base_commit_is_accepted(tmp_path: Path) -> None:
-    """Пустота с базовым коммитом в отчёте — не чужая работа, а сама пустота.
+def test_nothing_accepts_the_base_commit_and_its_ancestors(tmp_path: Path) -> None:
+    """Предок базы тоже принимается: это то же доказательство пустоты.
 
-    Живой случай `d_12d5fc44`: контракт требовал доказательства, исполнитель
-    предъявил базу дерева вместе с `nothing` — и получал `commit.foreign`, чей
-    текст велит предъявить `nothing`, уже предъявленный.
+    На `dir`-этапе база закрепляется `_pinned_base`, и скопированный из спеки
+    `base` оказывается предком закреплённой. Сужение до равенства читателя такого
+    отчёта сломало бы — поэтому приём предка закреплён кейсом.
     """
     root = tmp_path / "tree"
-    base = git_repo(root)
+    ancestor = git_repo(root)
+    base = commit(root, name="pinned.txt", text="база закреплена\n")
 
-    verdict = verify(nothing_report(root, commit=base), make_stage(workspace="worktree"), root, root=root, base=base)
-
-    assert (verdict.ok, verdict.kind, [str(issue) for issue in verdict.details]) == (True, None, [])
-    assert verdict.witness == evidence.WITNESS_NOTHING
+    for named in (base, ancestor):
+        verdict = verify(nothing_report(root, commit=named), make_stage(workspace="worktree"), root, root=root, base=base)
+        assert (verdict.ok, verdict.kind, [str(issue) for issue in verdict.details]) == (True, None, [])
+        assert verdict.witness == evidence.WITNESS_NOTHING
 
 
 def test_nothing_with_a_commit_after_the_base_is_refused_by_its_own_rule(tmp_path: Path) -> None:
@@ -775,29 +776,28 @@ def test_nothing_with_a_commit_after_the_base_is_refused_by_its_own_rule(tmp_pat
     verdict = verify(nothing_report(root, commit=work), make_stage(workspace="worktree"), root, root=root, base=base)
 
     assert (verdict.ok, verdict.kind) == (False, "contract")
-    assert evidence.RULE_NOTHING_COMMIT in rules(verdict)
     # Тот же отказ под именем `commit.foreign` читался как «предъяви nothing» —
-    # при уже предъявленном nothing это прямая ложь.
-    assert evidence.RULE_COMMIT_FOREIGN not in rules(verdict)
+    # при уже предъявленном nothing это прямая ложь. Дерево отвечает вторым
+    # правилом: HEAD ушёл вперёд базы.
+    assert rules(verdict) == [evidence.RULE_NOTHING_COMMIT, evidence.RULE_NOTHING_DIRTY]
 
 
 def test_nothing_with_artifacts_is_refused(tmp_path: Path) -> None:
     """Артефакты рядом с пустотой — та же работа, названная файлами: свой отказ."""
     root = tmp_path / "tree"
     base = git_repo(root)
-    payload = root / "note.txt"
-    payload.write_text("файл\n", encoding="utf-8")
+    tracked = root / "a.txt"
 
     report = nothing_report(
         root,
-        artifacts=[{"path": "note.txt", "sha256": evidence._sha256(payload)}],
+        artifacts=[{"path": "a.txt", "sha256": evidence._sha256(tracked)}],
     )
     verdict = verify(report, make_stage(workspace="worktree"), root, root=root, base=base)
 
     assert (verdict.ok, verdict.kind) == (False, "contract")
-    # Незакоммиченный файл делает дерево грязным, и это тоже верно (`nothing.dirty`);
-    # важен отказ по адресу: артефакты — работа, а не пустота.
-    assert evidence.RULE_NOTHING_ARTIFACTS in rules(verdict)
+    # Дерево чисто (`a.txt` закоммичен), HEAD равен базе: единственная причина
+    # отказа — сам артефакт, а не грязное дерево.
+    assert rules(verdict) == [evidence.RULE_NOTHING_ARTIFACTS]
 
 
 def test_nothing_is_refused_on_a_stage_with_its_own_witness(tmp_path: Path) -> None:

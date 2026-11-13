@@ -1087,8 +1087,9 @@ def report_schema(stage: Any) -> dict[str, Any]:
         required = [f"{WITNESS_WORK}|{WITNESS_NOTHING}", "evidence", "summary"]
         nothing_offer = {
             "reason": "вместо commit/artifacts: почему работы не было "
-            "(дерево обязано быть чистым: HEAD = база попытки, git status пуст); "
-            "сам commit при этом не указывай"
+            "(дерево обязано быть чистым: HEAD = база попытки, git status пуст). "
+            "commit можно указать как базу или её предка — это то же доказательство; "
+            "новый коммит с nothing — отказ nothing.commit, артефакты — nothing.artifacts"
         }
     schema: dict[str, Any] = {
         "status": list(STATUSES),

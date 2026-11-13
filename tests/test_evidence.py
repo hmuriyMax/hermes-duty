@@ -651,7 +651,7 @@ def test_report_schema_speaks_the_declared_commands(tmp_path: Path) -> None:
     stage = make_stage(evidence_items=(("go test ./...", 0),), workspace="worktree")
     schema = evidence.report_schema(stage)
     assert schema["status"] == ["done", "blocked", "refused"]
-    assert schema["required_for_done"] == ["commit|artifacts", "evidence", "summary"]
+    assert schema["required_for_done"] == ["commit|artifacts|nothing", "evidence", "summary"]
     assert schema["evidence"] == [{"cmd": "go test ./...", "exit": 0, "started_at": "unix-секунды"}]
     assert "published" not in schema and "verdict" not in schema
 
@@ -750,6 +750,56 @@ def test_nothing_after_a_commit_on_top_of_the_base_is_refused(tmp_path: Path) ->
     assert "не равен базе попытки" in str(verdict.errors[0])
 
 
+def test_nothing_with_the_base_commit_is_accepted(tmp_path: Path) -> None:
+    """Пустота с базовым коммитом в отчёте — не чужая работа, а сама пустота.
+
+    Живой случай `d_12d5fc44`: контракт требовал доказательства, исполнитель
+    предъявил базу дерева вместе с `nothing` — и получал `commit.foreign`, чей
+    текст велит предъявить `nothing`, уже предъявленный.
+    """
+    root = tmp_path / "tree"
+    base = git_repo(root)
+
+    verdict = verify(nothing_report(root, commit=base), make_stage(workspace="worktree"), root, root=root, base=base)
+
+    assert (verdict.ok, verdict.kind, [str(issue) for issue in verdict.details]) == (True, None, [])
+    assert verdict.witness == evidence.WITNESS_NOTHING
+
+
+def test_nothing_with_a_commit_after_the_base_is_refused_by_its_own_rule(tmp_path: Path) -> None:
+    """Работа названа коммитом — значит её и надо назвать работой, а не `nothing`."""
+    root = tmp_path / "tree"
+    base = git_repo(root)
+    work = commit(root)
+
+    verdict = verify(nothing_report(root, commit=work), make_stage(workspace="worktree"), root, root=root, base=base)
+
+    assert (verdict.ok, verdict.kind) == (False, "contract")
+    assert evidence.RULE_NOTHING_COMMIT in rules(verdict)
+    # Тот же отказ под именем `commit.foreign` читался как «предъяви nothing» —
+    # при уже предъявленном nothing это прямая ложь.
+    assert evidence.RULE_COMMIT_FOREIGN not in rules(verdict)
+
+
+def test_nothing_with_artifacts_is_refused(tmp_path: Path) -> None:
+    """Артефакты рядом с пустотой — та же работа, названная файлами: свой отказ."""
+    root = tmp_path / "tree"
+    base = git_repo(root)
+    payload = root / "note.txt"
+    payload.write_text("файл\n", encoding="utf-8")
+
+    report = nothing_report(
+        root,
+        artifacts=[{"path": "note.txt", "sha256": evidence._sha256(payload)}],
+    )
+    verdict = verify(report, make_stage(workspace="worktree"), root, root=root, base=base)
+
+    assert (verdict.ok, verdict.kind) == (False, "contract")
+    # Незакоммиченный файл делает дерево грязным, и это тоже верно (`nothing.dirty`);
+    # важен отказ по адресу: артефакты — работа, а не пустота.
+    assert evidence.RULE_NOTHING_ARTIFACTS in rules(verdict)
+
+
 def test_nothing_is_refused_on_a_stage_with_its_own_witness(tmp_path: Path) -> None:
     """У ревьюера и публикующего свидетель свой: пустота их работу не заменяет."""
     root = tmp_path / "tree"
@@ -785,9 +835,14 @@ def test_foreign_commit_refusal_names_both_readings(tmp_path: Path) -> None:
 
 
 def test_report_schema_tells_the_executor_about_nothing(tmp_path: Path) -> None:
-    """О пустоте исполнитель узнаёт из контракта, а не из отказа `commit.foreign`."""
+    """О пустоте исполнитель узнаёт из контракта, а не из отказа `commit.foreign`.
+
+    Требование читается как выбор: работа (`commit|artifacts`) **или** пустота.
+    Список, который просит `commit|artifacts` и рядом предлагает `nothing`, велит
+    прислать оба поля — ровно тот отчёт, который гейт называл `commit.foreign`.
+    """
     schema = evidence.report_schema(make_stage(workspace="worktree"))
-    assert schema["required_for_done"] == ["commit|artifacts", "evidence", "summary"]
+    assert schema["required_for_done"] == ["commit|artifacts|nothing", "evidence", "summary"]
     assert "reason" in schema["nothing"]
     # У этапов со своим свидетелем пустоты в схеме нет: принимать её там нечем.
     assert "nothing" not in evidence.report_schema(make_stage(role="publisher"))

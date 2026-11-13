@@ -142,6 +142,12 @@ RULE_BUDGET = "budget.tokens"
 RULE_NOTHING_REASON = "nothing.reason"
 RULE_NOTHING_DIRTY = "nothing.dirty"
 RULE_NOTHING_STAGE = "nothing.stage"
+# Пустота — альтернатива работе, а не дополнение: коммит или артефакты рядом с
+# `nothing` означают, что работа была, и отказ называется своим правилом. Судить
+# их правилами работы (`commit.foreign`) нельзя: текст того отказа велит
+# предъявить `nothing`, а исполнитель его уже предъявил.
+RULE_NOTHING_COMMIT = "nothing.commit"
+RULE_NOTHING_ARTIFACTS = "nothing.artifacts"
 
 # Свидетели этапа (0.0.5): «готово» доказывается тем, что этап по своей природе
 # может предъявить, а не одним списком на всех. Обычный этап называет работу
@@ -461,9 +467,10 @@ def _witness_problem(kind: str, result: dict[str, Any]) -> Optional[Issue]:
             "не требуются — работа такого этапа это отчёт",
         )
     if WITNESS_NOTHING in result:
-        # Пустота — альтернатива работе, а не дополнение к ней: `nothing` вместе
-        # с коммитом или артефактами разберёт дерево (`nothing.dirty`), а без
-        # причины он не отвечает, почему править было нечего.
+        # Пустота — альтернатива работе, а не дополнение к ней: причина обязана
+        # назвать, почему править было нечего, а коммит и артефакты рядом с ней
+        # судятся своими правилами (`nothing.commit`, `nothing.artifacts`) —
+        # дерево отвечает следом (`nothing.dirty`).
         if not nothing_reason(result):
             return Issue(
                 _where(WITNESS_NOTHING, key="reason"),
@@ -739,6 +746,74 @@ def _check_nothing(root: Path, base: Optional[str], issues: list[Issue]) -> None
         )
 
 
+def _check_nothing_work(
+    commit: str, artifacts: Any, root: Path, base: Optional[str], issues: list[Issue]
+) -> None:
+    """Работа рядом с пустотой: коммит и артефакты судятся правилами пустоты.
+
+    Отчёт «работы не было» с базовым коммитом — не чужая работа, а сама пустота,
+    названная дважды: контракт требует доказательства, а дерево на чистом месте
+    предъявляет базу. Поэтому предок базы принимается, а работа (новый коммит или
+    перечисленные файлы) называется своим правилом — иначе исполнитель читает
+    `commit.foreign`, чей текст велит предъявить `nothing`, уже предъявленный.
+    """
+    named = artifacts if isinstance(artifacts, list) else []
+    if named:
+        issues.append(
+            Issue(
+                _where("artifacts"),
+                RULE_NOTHING_ARTIFACTS,
+                f"в отчёте nothing, а артефактов {len(named)}: работа была — убери "
+                "nothing и назови её в artifacts",
+            )
+        )
+    if not commit:
+        return
+    resolved = _rev_parse(root, commit)
+    if resolved is None:
+        issues.append(
+            Issue(
+                _where("commit"),
+                RULE_COMMIT_RESOLVE,
+                f"commit={commit!r}: git rev-parse --verify не нашёл коммит в {root}",
+            )
+        )
+        return
+    if not base:
+        return
+    base_sha = _rev_parse(root, str(base))
+    if base_sha is None:
+        issues.append(
+            Issue(
+                _where("commit"),
+                RULE_COMMIT_BASE,
+                f"база {base!r} не резолвится в {root}: предок не проверен",
+                severity=WARNING,
+            )
+        )
+        return
+    ancestor = _is_ancestor(root, resolved, base_sha)
+    if ancestor is None:
+        issues.append(
+            Issue(
+                _where("commit"),
+                RULE_COMMIT_BASE,
+                f"git merge-base не ответил про {resolved[:12]}… и базу {base}: предок не проверен",
+                severity=WARNING,
+            )
+        )
+        return
+    if not ancestor:
+        issues.append(
+            Issue(
+                _where("commit"),
+                RULE_NOTHING_COMMIT,
+                f"commit={resolved[:12]}… не предок базы {base[:12]}…: работа была — "
+                "убери nothing и назови её коммитом",
+            )
+        )
+
+
 def _record_problem(
     record: dict[str, Any], index: int, must: int, attempt_started_at: int, now: int
 ) -> Optional[Issue]:
@@ -909,16 +984,25 @@ def verify(
         return Verdict(ok=False, kind=KIND_CONTRACT, details=issues)
     if status == STATUS_DONE:
         artifacts = result.get("artifacts")
-        _check_artifacts(list(artifacts or []), root_path, issues, measure=measure, tree=tree_path)
         commit = result.get("commit")
         commit_text = commit.strip() if isinstance(commit, str) else ""
-        if commit_text:
-            _check_commit(commit_text, root_path, base, issues)
         # Пустота проверяется только там, где она вообще может быть принята
         # (`_witness_problem` уже отказал этапам со своим свидетелем и назвал
-        # причину): пустое дерево у ревьюера ничего не доказывало бы.
-        if WITNESS_NOTHING in result and witness(stage) == WITNESS_WORK:
+        # причину): пустое дерево у ревьюера ничего бы не доказывало.
+        accepted_nothing = WITNESS_NOTHING in result and witness(stage) == WITNESS_WORK
+        if accepted_nothing:
+            # Принятая пустота переводит коммит и артефакты в другой вопрос: не
+            # «докажи работу», а «работа всё-таки была?». Живой случай d_12d5fc44:
+            # исполнитель сделал ровно то, что велит контракт (`nothing` + база
+            # дерева), а `_check_commit` называл это `commit.foreign` — отказом,
+            # чей текст велит предъявить `nothing`, уже предъявленный. Поэтому
+            # рядом с пустотой судятся её правила, а дерево отвечает следом.
+            _check_nothing_work(commit_text, artifacts, root_path, base, issues)
             _check_nothing(root_path, base, issues)
+        else:
+            _check_artifacts(list(artifacts or []), root_path, issues, measure=measure, tree=tree_path)
+            if commit_text:
+                _check_commit(commit_text, root_path, base, issues)
         records = result.get("evidence")
         if isinstance(records, list):
             # Отсутствие поля целиком уже названо схемой: повторять его на каждой
@@ -992,6 +1076,20 @@ def report_schema(stage: Any) -> dict[str, Any]:
             "stages": "непустой список этапов плана {id, role, kind, needs, evidence, budget}",
             "reason": "одна строка: почему граф именно такой",
         }
+    nothing_offer: dict[str, str] = {}
+    if wanted == WITNESS_WORK:
+        # Пустота — законный исход этапа-производителя, и о ней исполнитель должен
+        # узнать из контракта, а не из отказа `commit.foreign`: «править нечего»
+        # без этого поля читалось как «работа не названа». Требование поэтому
+        # читается как выбор: работа (`commit|artifacts`) **или** пустота. Список,
+        # который обещает `commit|artifacts` и рядом предлагает `nothing`, велит
+        # прислать оба поля — и гейт называл это `commit.foreign`.
+        required = [f"{WITNESS_WORK}|{WITNESS_NOTHING}", "evidence", "summary"]
+        nothing_offer = {
+            "reason": "вместо commit/artifacts: почему работы не было "
+            "(дерево обязано быть чистым: HEAD = база попытки, git status пуст); "
+            "сам commit при этом не указывай"
+        }
     schema: dict[str, Any] = {
         "status": list(STATUSES),
         "required_for_done": required,
@@ -1005,12 +1103,6 @@ def report_schema(stage: Any) -> dict[str, Any]:
         schema["published"] = published
     if plan:
         schema["plan"] = plan
-    if wanted == WITNESS_WORK:
-        # Пустота — законный исход этапа-производителя, и о ней исполнитель должен
-        # узнать из контракта, а не из отказа `commit.foreign`: «править нечего»
-        # без этого поля читалось как «работа не названа».
-        schema["nothing"] = {
-            "reason": "вместо commit/artifacts: почему работы не было "
-            "(дерево обязано быть чистым: HEAD = база попытки, git status пуст)"
-        }
+    if nothing_offer:
+        schema["nothing"] = nothing_offer
     return schema

@@ -624,6 +624,53 @@ def test_question_with_unknown_stage_falls_back_to_the_last_attempt(spec: Any) -
     assert states["impl"].question_id == "284"
 
 
+def lead_asked(question_id: int) -> dict[str, Any]:
+    """Вопрос ЛИДА человеку: адрес есть, этапа в нём нет.
+
+    Так его пишет `duty_ask_human` (`dashboard/tools.py`): роутинг называет
+    адресата и повод, а этапа не знает — лид спрашивает про окружение и ветку,
+    а не от лица попытки.
+    """
+    return ev(
+        "question_asked",
+        question_id=question_id,
+        session_key="t_d_probe",
+        routing={"target": "human", "reason": "authority", "idem": f"lead-ask-{question_id}"},
+    )
+
+
+def test_lead_question_does_not_reopen_the_last_attempt(spec: Any) -> None:
+    """Ответ на вопрос лида не поднимает попытку последнего этапа.
+
+    Живое дело `d_1c53fbd0`: `review` был `done`, лид спросил про грязное дерево
+    и получил ответ — и этап снова стал `pending` («ответ #646: новая попытка 4»),
+    поэтому `close` ждал вечно, хотя работа и ревью были сделаны. Вопрос дела
+    адреса этапа не имеет: ответ на него — справка человеку, а не вход этапа.
+    """
+    journal = [
+        started("impl", 1),
+        ok("impl", 1),
+        lead_asked(646),
+        deal_answered(646, 0, "answered"),
+    ]
+
+    states = transit.stage_states(spec, journal)
+
+    assert states["impl"].state == "done"
+    assert states["impl"].question_id is None
+    assert "новая попытка" not in str(states["impl"].reason or "")
+
+
+def test_lead_question_waits_for_the_human_without_touching_a_stage(spec: Any) -> None:
+    """Открытый вопрос лида — ожидание человека у дела, а не `wait_human` этапа."""
+    journal = [started("impl", 1), ok("impl", 1), lead_asked(646)]
+
+    states = transit.stage_states(spec, journal)
+
+    assert states["impl"].state == "done"
+    assert transit.deal_state(spec, journal) == "wait_human"
+
+
 def test_expired_deal_question_parks_the_stage(spec: Any) -> None:
     """Срок вопроса дела истёк — этап припаркован, а не перезапущен."""
     journal = [started("impl", 1), ok("impl", 1), deal_asked(284), deal_answered(284, 0, "expired")]

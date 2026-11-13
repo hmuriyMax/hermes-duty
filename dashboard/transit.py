@@ -956,6 +956,16 @@ def _addressed(board: _Board, payload: dict[str, Any]) -> tuple[str, int]:
     вопрос адресован, движок знает, кто спросил). При параллельных этапах
     «последняя попытка журнала» — не обязательно спросившая, поэтому объявленный
     адрес важнее догадки. Мусор и незнакомый этап адресом не считаются.
+
+    Адрес **без** `stage` — вопрос дела, а не этапа: так спрашивает лид
+    (`duty_ask_human` про окружение, ветку, грязное дерево) и так спрашивает
+    движок про приёмку графа. Ничья попытка таким вопросом не заканчивалась,
+    поэтому `board.last_attempt` здесь не подсказка, а ошибка: ответ на вопрос
+    лида открывал новую попытку последнего этапа и дело не могло закрыться
+    (живое `d_1c53fbd0`: ответ на «закоммитить или посмотреть самому?» делал
+    `review` снова `pending` — «ответ #646: новая попытка 4»). Запасной путь
+    остаётся для фактов **без** адреса вовсе (вопросы `POST /ask` и журналы до W5)
+    и для адреса с незнакомым этапом.
     """
     routing = payload.get("routing")
     if isinstance(routing, dict):
@@ -963,6 +973,8 @@ def _addressed(board: _Board, payload: dict[str, Any]) -> tuple[str, int]:
         node = board.stages.get(stage_id)
         if node is not None:
             return stage_id, _int(routing.get("attempt")) or node.attempt
+        if "stage" not in routing and routing.get("target"):
+            return "", 0
     return board.last_attempt
 
 

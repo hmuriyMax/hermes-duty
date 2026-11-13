@@ -470,6 +470,41 @@ def test_own_commit_on_top_of_base_is_accepted(tmp_path: Path) -> None:
     assert [issue.rule for issue in verdict.details] == []
 
 
+def test_commit_in_the_deal_dir_is_accepted_with_a_warning(tmp_path: Path) -> None:
+    """Коммит в живом чекауте при `workspace: none` — принят с предупреждением.
+
+    Живой случай `d_a8213c01`: этап работал в каталоге попытки (песочница, не
+    git-репозиторий), а работу зафиксировал в каталоге дела. Гейт искал коммит
+    только в песочнице и отказывал `commit.resolve` уже после того, как всё было
+    сделано: дело вставало контрактом, работа лежала в ветке, а лид шёл на
+    ревизию плана. Вторая мерка — каталог дела: коммит резолвится там, значит он
+    настоящий, но этап работал не там, где проверяют — это предупреждение.
+    """
+    repo = tmp_path / "deal"
+    base = git_repo(repo)
+    fresh = commit(repo)
+    sandbox = tmp_path / "attempt"
+    sandbox.mkdir()
+    built = report(sandbox, commit=fresh)
+    verdict = verify(built, make_stage(workspace="none"), sandbox, base=base, repo=str(repo))
+    assert (verdict.ok, verdict.kind) == (True, None)
+    assert rules(verdict) == []
+    assert warnings(verdict) == [evidence.RULE_COMMIT_RESOLVE]
+    assert "в каталоге дела" in verdict.warnings[0].message
+
+
+def test_commit_that_is_nowhere_is_still_refused(tmp_path: Path) -> None:
+    """Коммита нет ни в песочнице, ни в каталоге дела — отказ остаётся отказом."""
+    repo = tmp_path / "deal"
+    git_repo(repo)
+    sandbox = tmp_path / "attempt"
+    sandbox.mkdir()
+    built = report(sandbox, commit="deadbeef" * 5)
+    verdict = verify(built, make_stage(workspace="none"), sandbox, base="HEAD", repo=str(repo))
+    assert (verdict.ok, verdict.kind) == (False, "contract")
+    assert rules(verdict) == [evidence.RULE_COMMIT_RESOLVE]
+
+
 # -------------------------------------------------------------- 4. evidence
 
 

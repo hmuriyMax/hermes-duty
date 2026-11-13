@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import subprocess
 import sys
@@ -227,3 +228,40 @@ def test_first_attempt_has_nothing_to_continue(tmp_path: Path) -> None:
 
     assert tree is not None and tree.is_dir()
     assert [e for e in store.events if e.get("kind") == "tree_reused"] == []
+
+
+def test_producing_stage_without_artifacts_gets_the_deal_dir_not_the_sandbox(
+    tmp_path: Path,
+) -> None:
+    """`workspace: none` у этапа, который доказывает работу коммитом, — самопротиворечие.
+
+    Живое дело `d_a8213c01`: этап `docs2` с `workspace: none` в деле с `repo`
+    закоммитил работу в живой чекаут, а `commit.resolve` искал коммит в каталоге
+    попытки (песочница, не git-репозиторий) и отказывал контрактом уже после того,
+    как всё было сделано. Свидетель такого этапа — работа, артефактов не объявлено:
+    значит дерево обязано быть, и это каталог дела.
+    """
+    runner = _load("duty_runner_tree_reuse_dir", "runner.py")
+    repo = _repo(tmp_path)
+    spec = _spec(tmp_path, repo)
+    stage = dataclasses.replace(spec.stages[0], workspace="none")
+
+    tree, cwd = runner.prepare_tree(spec, stage, tmp_path / "attempt-1")
+
+    assert tree is None
+    assert cwd == repo
+
+
+def test_stage_with_named_artifacts_keeps_its_sandbox(tmp_path: Path) -> None:
+    """Названные артефакты — законный способ доказать работу вне репозитория."""
+    runner = _load("duty_runner_tree_reuse_artifacts", "runner.py")
+    repo = _repo(tmp_path)
+    spec = _spec(tmp_path, repo)
+    stage = dataclasses.replace(
+        spec.stages[0], workspace="none", artifacts=("report.md",)
+    )
+
+    tree, cwd = runner.prepare_tree(spec, stage, tmp_path / "attempt-1")
+
+    assert tree is None
+    assert cwd == tmp_path / "attempt-1"

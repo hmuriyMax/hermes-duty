@@ -848,6 +848,29 @@ def prepare_tree(
     другой код, и повтор отводят заново (иначе этап проверял бы чужое).
     """
     workdir = Path(workdir)
+    if stage.workspace == "none":
+        # Самопротиворечие спеки: свидетель этапа — работа (`commit|artifacts`),
+        # артефактов не объявлено, значит доказательством может быть только
+        # коммит, — а дерева нет, и коммитить некуда. Живое дело `d_a8213c01`:
+        # этап `docs2` с `workspace: none` в деле с `repo` закоммитил в живой
+        # чекаут, а гейт искал коммит в песочнице и отказал уже после работы.
+        # Лечится там же, где выбирается дерево: производящий этап получает
+        # каталог дела (`dir`), как и умолчание `_with_repo_workspace`. Явно
+        # названные `artifacts` не трогаем — этап вправе доказать работу файлами
+        # вне репозитория.
+        if (
+            spec.repo is not None
+            and not getattr(stage, "artifacts", ())
+            and evidence_module.witness(stage) == evidence_module.WITNESS_WORK
+            and Path(str(spec.repo)).expanduser().is_dir()
+        ):
+            return prepare_tree(
+                spec,
+                dataclasses.replace(stage, workspace="dir"),
+                workdir,
+                base=base,
+                reuse=reuse,
+            )
     if stage.workspace == "worktree":
         repo = Path(str(spec.repo or "")).expanduser()
         if reuse is not None and _tree_is_from(reuse, base if base is not None else spec.base or ""):
@@ -1452,6 +1475,12 @@ def report_plan(
         "source_stage": stage.id,
         "attempt": int(attempt),
     }
+    # Граф после ревизии — целиком, а не только названные этапы. План вправе
+    # назвать один этап и не трогать остальные (умолчание «как было»), но человек
+    # и следующий читатель должны видеть, что ещё живо: `d_a8213c01` — ревизия 4
+    # назвала `docs2` и `review`, и по записи выглядело, будто этапы `docs` и
+    # `commit` выкинули, хотя граф их сохранил.
+    payload["graph"] = list(dict.fromkeys([item.id for item in list(graph) + list(stages)]))
     if cost is not None:
         payload["cost"] = cost
     proposed = _event(
@@ -3025,6 +3054,9 @@ def finish_shell_stage(
                 now=now,
                 root=cwd,
                 base=actual_base or spec.base,
+                # Коммит ищется и в каталоге дела: этап с `workspace: none`
+                # работает в песочнице, а фиксирует работу в живом чекауте.
+                repo=spec.repo,
             )
             if not verdict.ok:
                 outcome, kind, reason = OUTCOME_FAILED, failures.verdict_kind(verdict), verdict.reason()
@@ -4602,6 +4634,8 @@ def finish_agent_stage(
             # База проверки — закреплённый коммит этапа, а не имя из спеки:
             # у `dir` имя сдвигается вместе с работой попытки (`_pinned_base`).
             base=actual_base or spec.base,
+            # Вторая мерка коммита — каталог дела (см. вызов у shell-этапа).
+            repo=spec.repo,
         )
         if not verdict.ok:
             # Класс отказа гейта — из вердикта (`Verdict.kind`, W4), а не из текста:

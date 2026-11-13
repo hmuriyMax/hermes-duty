@@ -634,9 +634,38 @@ def _check_artifacts(
             )
 
 
-def _check_commit(commit: str, root: Path, base: Optional[str], issues: list[Issue]) -> None:
-    """Коммит резолвится в дереве и не был предком базы до попытки."""
+def _check_commit(
+    commit: str,
+    root: Path,
+    base: Optional[str],
+    issues: list[Issue],
+    repo: Optional[Path] = None,
+) -> None:
+    """Коммит резолвится в дереве и не был предком базы до попытки.
+
+    `repo` — каталог дела из спеки: вторая мерка для коммита. Нужна потому, что
+    `workspace: none` у производящего этапа оставляет процесс в каталоге попытки,
+    а работу исполнитель нередко фиксирует в живом чекауте (`d_a8213c01`: коммит
+    `b7608f3` есть в ветке дела, а `commit.resolve` искал его в песочнице и
+    отказал — этап упал контрактом уже после того, как всё было сделано). Коммит,
+    найденный в каталоге дела, принимается, но называется предупреждением: работа
+    в ветке, а этап работал не там, где проверяют.
+    """
     resolved = _rev_parse(root, commit)
+    measured = root
+    if resolved is None and repo is not None and repo != root:
+        found = _rev_parse(repo, commit) if repo.is_dir() else None
+        if found is not None:
+            resolved, measured = found, repo
+            issues.append(
+                Issue(
+                    _where("commit"),
+                    RULE_COMMIT_RESOLVE,
+                    f"commit={commit!r} нашёлся в каталоге дела {repo}, а не в дереве попытки "
+                    f"{root}: этап работал вне дерева — назови workspace: dir или worktree",
+                    severity=WARNING,
+                )
+            )
     if resolved is None:
         issues.append(
             Issue(
@@ -648,18 +677,18 @@ def _check_commit(commit: str, root: Path, base: Optional[str], issues: list[Iss
         return
     if not base:
         return
-    base_sha = _rev_parse(root, str(base))
+    base_sha = _rev_parse(measured, str(base))
     if base_sha is None:
         issues.append(
             Issue(
                 _where("commit"),
                 RULE_COMMIT_BASE,
-                f"база {base!r} не резолвится в {root}: предок не проверен",
+                f"база {base!r} не резолвится в {measured}: предок не проверен",
                 severity=WARNING,
             )
         )
         return
-    ancestor = _is_ancestor(root, resolved, base_sha)
+    ancestor = _is_ancestor(measured, resolved, base_sha)
     if ancestor is None:
         issues.append(
             Issue(
@@ -951,6 +980,7 @@ def verify(
     *,
     root: Optional[Path] = None,
     base: Optional[str] = None,
+    repo: Optional[str] = None,
 ) -> Verdict:
     """Приговор пакету попытки: сверка заявленного с деревом, без запуска команд.
 
@@ -970,6 +1000,9 @@ def verify(
         )
 
     root_path = Path(root if root is not None else workdir).resolve()
+    # Каталог дела — вторая мерка коммита: у `workspace: none` процесс стоит в
+    # каталоге попытки, а коммит исполнитель делает в живом чекауте.
+    repo_path = Path(str(repo)).expanduser().resolve() if repo else None
     # Мерка называется по `workspace` этапа: `worktree` ищет в дереве, `dir` — в
     # каталоге дела, `none` — в каталоге попытки. Это тот же выбор, что делает
     # движок (`runner.prepare_tree`), названный словами в отказе.
@@ -1002,7 +1035,7 @@ def verify(
         else:
             _check_artifacts(list(artifacts or []), root_path, issues, measure=measure, tree=tree_path)
             if commit_text:
-                _check_commit(commit_text, root_path, base, issues)
+                _check_commit(commit_text, root_path, base, issues, repo=repo_path)
         records = result.get("evidence")
         if isinstance(records, list):
             # Отсутствие поля целиком уже названо схемой: повторять его на каждой

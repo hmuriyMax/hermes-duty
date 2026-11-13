@@ -512,7 +512,27 @@ def _spec(events: Iterable[Any]) -> Optional[Any]:
 # ----------------------------------------------------------- текст для сессии
 
 
-def _fact_line(event: dict[str, Any], now: int) -> str:
+def _human_text_of(conn: Any, home: Any) -> Callable[[dict[str, Any]], str]:
+    """Читатель слов человека для дайджеста: текст ответа пула и тело комментария.
+
+    Журнал слов не хранит — у ответа `answer_len`, у комментария `len`. Лиду нужен
+    сам текст: иначе он видит «человек ответил» и не знает, что именно ответил.
+    """
+    def text_of(event: dict[str, Any]) -> str:
+        return deals.human_text(
+            conn,
+            home,
+            str(event.get("deal_id") or ""),
+            str(event.get("kind") or ""),
+            journal.payload_of(event),
+        )
+
+    return text_of
+
+
+def _fact_line(
+    event: dict[str, Any], now: int, text_of: Optional[Callable[[dict[str, Any]], str]] = None
+) -> str:
     """Один факт дела строкой: что произошло, чем кончилось, где отчёт.
 
     Формат — для чтения моделью: время, номер факта, вид и то, что этот вид
@@ -543,11 +563,18 @@ def _fact_line(event: dict[str, Any], now: int) -> str:
         text = _short(payload.get("text") or "", 160)
         return f"{stamp} вопрос {f'#{number}' if number else '(роли)'} → {target or '—'}: {text}"
     if kind == "question_answered":
-        return (
+        line = (
             f"{stamp} ответ на вопрос #{payload.get('question_id') or '—'} "
             f"({payload.get('by') or payload.get('answered_via') or '—'}, "
             f"{payload.get('answer_len') or 0} симв.)"
         )
+        answer = text_of(event) if text_of is not None else ""
+        return f"{line}: {answer}" if answer else line
+    if kind == "commented":
+        # Комментарий человека — указание, а не строка лога: без тела лид его не выполнит.
+        line = f"{stamp} комментарий {payload.get('author') or '—'} ({payload.get('len') or 0} симв.)"
+        body = text_of(event) if text_of is not None else ""
+        return f"{line}: {body}" if body else line
     if kind == "attempt_started":
         return (
             f"{stamp} старт попытки {payload.get('stage')}#{payload.get('attempt')} "
@@ -643,7 +670,12 @@ def _report_path(details: Any) -> str:
     return str(runner.result_path(Path(workdir)))
 
 
-def _facts_lines(events: list[dict[str, Any]], cursor: int, now: int) -> tuple[list[str], int]:
+def _facts_lines(
+    events: list[dict[str, Any]],
+    cursor: int,
+    now: int,
+    text_of: Optional[Callable[[dict[str, Any]], str]] = None,
+) -> tuple[list[str], int]:
     """Строки фактов дела после курсора; второе значение — сколько не поместилось."""
     fresh = [
         event
@@ -652,7 +684,7 @@ def _facts_lines(events: list[dict[str, Any]], cursor: int, now: int) -> tuple[l
     ]
     omitted = max(0, len(fresh) - DIGEST_FACTS_LIMIT)
     shown = fresh[omitted:]
-    return [_fact_line(event, now) for event in shown], omitted
+    return [_fact_line(event, now, text_of) for event in shown], omitted
 
 
 def _attempts_lines(events: list[dict[str, Any]], now: int) -> list[str]:
@@ -765,6 +797,7 @@ def digest(
     resume_limit: int = DEFAULT_MAX_RESUMES,
     now: Any = None,
     run_budget: Optional[int] = None,
+    text_of: Optional[Callable[[dict[str, Any]], str]] = None,
 ) -> str:
     """Дайджест резюма: факты дела после курсора сессии, пути отчётов, попытки, бюджет.
 
@@ -778,7 +811,7 @@ def digest(
     lines.append(f"- бюджет дела: {_budget_line(spec, events)}")
     lines.append(_run_budget_line(run_budget))
     lines += ["", f"## Что произошло после курсора сессии ({cursor})"]
-    facts, omitted = _facts_lines(events, cursor, moment)
+    facts, omitted = _facts_lines(events, cursor, moment, text_of)
     if omitted:
         lines.append(f"(ещё {omitted} фактов старше — они в журнале: `bin/duty why {deal['id']}`)")
     lines.extend(facts or ["(новых фактов нет: сессию подняли по сторожу, а не по событию)"])
@@ -811,6 +844,7 @@ def brief(
     resume_limit: int = DEFAULT_MAX_RESUMES,
     now: Any = None,
     run_budget: Optional[int] = None,
+    text_of: Optional[Callable[[dict[str, Any]], str]] = None,
 ) -> str:
     """Бриф первого запуска: дело, хартия, seed-план, вся история и правила.
 
@@ -844,7 +878,7 @@ def brief(
             "- seed-план — подсказка «как дело задумывали», а не приговор: план создаёшь ты "
             "(`duty_plan`), и вправе его переписать."
         )
-    facts, omitted = _facts_lines(events, 0, moment)
+    facts, omitted = _facts_lines(events, 0, moment, text_of)
     lines += ["", "## История дела"]
     if omitted:
         lines.append(f"(ещё {omitted} фактов старше — они в журнале: `bin/duty why {deal['id']}`)")
@@ -1174,9 +1208,27 @@ def run(
         path = write_query(
             query_path(home, str(deal["id"]), mode, moment),
             (
-                brief(deal, events, st, spec=spec, resume_limit=resume_limit, now=moment, run_budget=budget_sec)
+                brief(
+                    deal,
+                    events,
+                    st,
+                    spec=spec,
+                    resume_limit=resume_limit,
+                    now=moment,
+                    run_budget=budget_sec,
+                    text_of=_human_text_of(conn, home),
+                )
                 if mode == MODE_FIRST
-                else digest(deal, events, st, spec=spec, resume_limit=resume_limit, now=moment, run_budget=budget_sec)
+                else digest(
+                    deal,
+                    events,
+                    st,
+                    spec=spec,
+                    resume_limit=resume_limit,
+                    now=moment,
+                    run_budget=budget_sec,
+                    text_of=_human_text_of(conn, home),
+                )
             ),
         )
         cmd = command(mode, session_id=str(st["session_id"]), query_file=path)

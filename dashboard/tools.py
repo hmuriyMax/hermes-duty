@@ -994,7 +994,7 @@ def wait(
             position = max(position, max(_int(event.get("id")) for event in fresh))
         facts = [event for event in fresh if str(event.get("kind") or "") not in NOISE_KINDS]
         if facts:
-            return {"ok": True, "deal": str(deal["id"]), "events": [_brief(event) for event in facts],
+            return {"ok": True, "deal": str(deal["id"]), "events": [_brief(event, home=home, conn=conn) for event in facts],
                     "cursor": position, "timed_out": False, "answers": answers}
         if tick() >= deadline:
             work = _live_work(conn, str(deal["id"]))
@@ -1059,19 +1059,32 @@ def _live_work(conn: sqlite3.Connection, deal_id: str) -> str:
     return f"{stage or 'попытка'} `{run_id}`"
 
 
-def _brief(event: dict[str, Any]) -> dict[str, Any]:
-    """Событие для лида: `id`, вид, время и payload как есть.
+def _brief(
+    event: dict[str, Any],
+    *,
+    home: Optional[Path] = None,
+    conn: Optional[sqlite3.Connection] = None,
+) -> dict[str, Any]:
+    """Событие для лида: `id`, вид, время и payload.
 
     Payload не пересказывается словами: дайджест лиду отдаёт пути к отчётам, а не
     их текст (`docs/ENGINE-2.0.md`, раздел 11), и вычислять здесь вторую правду
-    значило бы завести её в инструменте.
+    значило бы завести её в инструменте. Исключение — слова ЧЕЛОВЕКА: журнал
+    хранит у ответа `answer_len`, у комментария `len`, а сам текст живёт в пуле и
+    в таблице комментариев. Без него лид видит «ответ был», но не видит «какой», и
+    решает вслепую.
     """
+    kind = str(event.get("kind") or "")
+    payload = journal.payload_of(event)
+    text = deals.human_text(conn, home, str(event.get("deal_id") or ""), kind, payload)
+    if text:
+        payload = {**payload, ("answer" if kind == "question_answered" else "body"): text}
     return {
         "id": _int(event.get("id")),
-        "kind": str(event.get("kind") or ""),
+        "kind": kind,
         "ts": _int(event.get("ts")),
         "source": str(event.get("source") or ""),
-        "payload": journal.payload_of(event),
+        "payload": payload,
     }
 
 

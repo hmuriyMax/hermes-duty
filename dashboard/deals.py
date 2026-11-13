@@ -590,6 +590,85 @@ def children_of(conn: sqlite3.Connection, deal_id: str) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+# Сколько символов человеческого текста видит лид. Текст режется с честной
+# пометкой, а не пересказывается: «человек ответил, 171 символ» — не ответ.
+HUMAN_TEXT_LIMIT = 1500
+
+ASK_MODULE_NAME = "hermes_duty_ask"
+
+
+def _ask() -> Any:
+    """ask.py из `sys.modules` — там же, где его держит остальной код."""
+    loaded = sys.modules.get(ASK_MODULE_NAME)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / "ask.py"
+    spec = importlib.util.spec_from_file_location(ASK_MODULE_NAME, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise ImportError(f"module not found: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[ASK_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def clip_human(text: Any, limit: int = HUMAN_TEXT_LIMIT) -> str:
+    """Слова человека одной строкой, с пометкой об обрезке."""
+    body = " ".join(str(text or "").split())
+    if len(body) <= limit:
+        return body
+    return body[:limit].rstrip() + "… (обрезано)"
+
+
+def comment_body(
+    conn: Optional[sqlite3.Connection], deal_id: str, payload: dict[str, Any]
+) -> str:
+    """Тело комментария по факту `commented`: в журнале только автор и `len`.
+
+    Комментарий ложится строкой в `comments` в той же транзакции, что и факт,
+    поэтому тело берётся оттуда. Совпадение — автор плюс длина; два комментария
+    разных людей подряд так не перепутать, а последняя строка остаётся запасным
+    вариантом (автор в payload может отсутствовать).
+    """
+    if conn is None or not deal_id:
+        return ""
+    rows = comments_of(conn, str(deal_id))
+    if not rows:
+        return ""
+    author = str(payload.get("author") or "")
+    size = payload.get("len")
+    for row in reversed(rows):
+        body = str(row.get("body") or "")
+        same_author = not author or str(row.get("author") or "") == author
+        if same_author and (size is None or len(body) == size):
+            return body
+    return str(rows[-1].get("body") or "")
+
+
+def human_text(
+    conn: Optional[sqlite3.Connection],
+    home: Any,
+    deal_id: str,
+    kind: str,
+    payload: dict[str, Any],
+    *,
+    limit: int = HUMAN_TEXT_LIMIT,
+) -> str:
+    """Слова человека по факту журнала: текст ответа пула или тело комментария.
+
+    Журнал хранит у ответа `answer_len`, у комментария `len` — сам текст живёт в
+    пуле и в таблице комментариев. Лиду этот текст нужен целиком: по одной длине
+    он не знает, что человек выбрал, и спрашивает заново. Нет текста (ответ не
+    получен, комментарий не найден, пул недоступен) — пустая строка, а не ошибка.
+    """
+    text = ""
+    if kind == "question_answered" and home is not None:
+        text = _ask().answer_of(Path(home), payload.get("question_id")) or ""
+    elif kind == "commented":
+        text = comment_body(conn, deal_id, payload)
+    return clip_human(text, limit) if text else ""
+
+
 def comments_of(conn: sqlite3.Connection, deal_id: str) -> list[dict[str, Any]]:
     """Комментарии дела по возрастанию id — таймлайн, а не колонка карточки."""
     rows = conn.execute(

@@ -12,7 +12,12 @@
 4. незакрытый `close` при всех остальных закрытых этапах дело не закрывает — ни
    решением `transit`, ни писателем `deals.close_stages_done`;
 5. граф с закрывающим этапом не закрывается «все этапы пройдены»: это отказ
-   `DealError`, а не тихое закрытие мимо приговора.
+   `DealError`, а не тихое закрытие мимо приговора;
+6. лид закрывает дело через `duty_close` — и работа дела перед `completed`
+   переезжает в рабочую ветку человека: факт `integrated` и строка в `completed`;
+7. неудача переноса (грязный каталог) закрытие не блокирует: факт
+   `integrate_failed` с причиной, `completed` всё равно написан;
+8. перенос, который уже был, не повторяется: второго `integrated` нет.
 
 Часы нигде не читаются — `now` передаётся аргументом, как и в остальных слоях.
 """
@@ -605,3 +610,122 @@ def test_coordinator_seed_validates_and_spawns_lead_profile(tmp_path: Path) -> N
     assert "lead" in command
     # прежнее имя валидно дальше: журналы дел до переименования
     assert rules(issues(tmp_path, GOOD)) == set()
+
+
+# ---------------------- 7. закрытие переносит работу в рабочую ветку человека
+
+# Спека дела с репозиторием: переносить есть куда, и адрес репозитория назван в
+# спеке (`runner` берёт его оттуда же).
+MOVE = """
+duty: перенос при закрытии
+repo: {repo}
+charter:
+  max_stages: 6
+  allowed_roles: [implementer]
+  allowed_kinds: [agent, shell, gate]
+stages:
+  - id: impl
+    role: implementer
+    workspace: none
+    evidence:
+      - {{cmd: "true", must: 0}}
+"""
+
+
+def move_deal(tmp_path: Path, branch: str = "work") -> tuple[Path, Path, sqlite3.Connection, dict[str, Any]]:
+    """Репозиторий, корень, store и дело с рабочей веткой, снятой при заведении.
+
+    Репозиторий одноразовый (`tmp_path`): живой checkout плагина эти тесты не
+    трогают. Ветки `work` и `duty/<id>` заводятся тестом: работа дела лежит поверх
+    рабочей ветки, как её кладёт движок.
+    """
+    repo = init_repo(tmp_path / "repo")
+    home = make_home(tmp_path)
+    spec = write_spec(tmp_path, MOVE.format(repo=repo), name="move.yaml")
+    conn = open_store(home)
+    created = deals.create_deal(
+        conn, repo=str(repo), branch=branch, title="Перенос", body="", now=NOW, spec_path=str(spec.path)
+    )
+    deal = deals.deal_row(conn, str(created["deal"]["id"]))
+    assert deal is not None
+    return repo, home, conn, deal
+
+
+def test_close_moves_the_work_into_the_working_branch(tmp_path: Path) -> None:
+    """`duty_close` переносит работу сам: работа в `work`, строка в `completed`.
+
+    До 0.2.1 закрытое дело оставляло работу в `duty/<id>` — ветке, которую
+    человек не читает. Теперь закрытие зовёт тот же перенос, что `duty_integrate`:
+    перед `completed` пишется `integrated`, а в ответе лиду — куда легла работа.
+    """
+    repo, home, conn, deal = move_deal(tmp_path)
+    git(repo, "checkout", "-b", "work")
+    git(repo, "checkout", "-b", f"duty/{deal['id']}", "work")
+    probe = commit(repo, "probe", "работа дела\n")
+    git(repo, "checkout", "main")
+
+    answer = tools.close(str(deal["id"]), "сделано и проверено", "approve", "close-move", home=home, now=NOW)
+
+    assert answer["closed"] is True
+    assert answer["integrated"] == {"into": "work", "commit": probe, "fast_forward": True}
+    assert git(repo, "rev-parse", "work") == probe
+    events = journal.read_events(conn, str(deal["id"]))
+    assert [event["kind"] for event in events][-2:] == ["integrated", "completed"]
+    closed = journal.closed_fact(events)
+    assert closed is not None
+    assert closed["payload"]["integrated"] == f"duty/{deal['id']} → work @ {probe[:12]} (быстрым переносом)"
+    assert deals.deal_row(conn, str(deal["id"]))["status"] == "done"
+
+
+def test_close_closes_even_when_the_transfer_fails(tmp_path: Path) -> None:
+    """Грязный каталог: перенос отказывает фактом, а дело всё равно закрыто.
+
+    Дело закрывает слово лида, а не состояние дерева: неудача переноса — факт
+    `integrate_failed` с причиной и поле `integrated.error` в ответе, `completed`
+    при этом пишется, и строки о переносе в нём нет.
+    """
+    repo, home, conn, deal = move_deal(tmp_path)
+    git(repo, "checkout", "-b", "work")
+    git(repo, "checkout", "-b", f"duty/{deal['id']}", "work")
+    commit(repo, "probe", "работа дела\n")
+    git(repo, "checkout", "work")
+    before = git(repo, "rev-parse", "work")
+    (repo / "file.txt").write_text("чужая правка\n", encoding="utf-8")
+
+    answer = tools.close(str(deal["id"]), "сделано", "approve", "close-dirty", home=home, now=NOW)
+
+    assert answer["closed"] is True
+    assert "грязный" in answer["integrated"]["error"]
+    events = journal.read_events(conn, str(deal["id"]))
+    failed = [event for event in events if event["kind"] == "integrate_failed"]
+    assert len(failed) == 1
+    assert "грязный" in failed[0]["payload"]["error"]
+    assert failed[0]["payload"]["from"] == f"duty/{deal['id']}"
+    assert failed[0]["payload"]["into"] == "work"
+    closed = journal.closed_fact(events)
+    assert closed is not None
+    assert "integrated" not in closed["payload"]
+    assert git(repo, "rev-parse", "work") == before
+    assert deals.deal_row(conn, str(deal["id"]))["status"] == "done"
+
+
+def test_close_does_not_repeat_a_transfer_that_already_happened(tmp_path: Path) -> None:
+    """Работа уже перенесена: закрытие второго факта не пишет и ветки не двигает."""
+    repo, home, conn, deal = move_deal(tmp_path)
+    git(repo, "checkout", "-b", "work")
+    git(repo, "checkout", "-b", f"duty/{deal['id']}", "work")
+    probe = commit(repo, "probe", "работа дела\n")
+    git(repo, "checkout", "main")
+    moved = tools.integrate(str(deal["id"]), "int-close", home=home, now=NOW)
+    assert moved["integrated"]["commit"] == probe
+
+    answer = tools.close(str(deal["id"]), "сделано", "approve", "close-repeat", home=home, now=NOW)
+
+    assert answer["closed"] is True
+    assert "integrated" not in answer
+    events = journal.read_events(conn, str(deal["id"]))
+    assert [event["kind"] for event in events].count("integrated") == 1
+    assert "integrate_failed" not in [event["kind"] for event in events]
+    assert journal.closed_fact(events) is not None
+    assert git(repo, "rev-parse", "work") == probe
+

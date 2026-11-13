@@ -1654,6 +1654,7 @@ def close_stages_done(
     now: Optional[int] = None,
     cause: str = CLOSE_CAUSE_ALL_STAGES,
     summary: str = "",
+    integrated: str = "",
     kill: Optional[Callable[[int], bool]] = None,
 ) -> dict[str, Any]:
     """Закрыть дело по пройденному графу: одно `completed` и строка дела.
@@ -1664,6 +1665,11 @@ def close_stages_done(
     `cause='lead_closed'` — дело закрыл лид приговором `approve`, и его итог лежит
     в `summary` (`docs/ENGINE-1.0.md`, раздел 9). Второй причины не заводится —
     вид события тот же `completed`, что у `close`/`complete` (`docs/JOURNAL.md`).
+
+    `integrated` — строка о переносе работы дела в рабочую ветку: `duty_close`
+    переносит её перед `completed`, и строка говорит, куда работа легла. Неудача
+    переноса сюда не попадает: у неё свой факт (`integrate_failed`), а закрытие
+    она не отменяет.
 
     Дело с закрывающим этапом (`spec.CLOSE_STAGE`) в графе «все этапы пройдены»
     не закрывает: граф пройден — условие, а «дело кончено» говорит лид. Такой
@@ -1718,6 +1724,10 @@ def close_stages_done(
     text = " ".join(str(summary or "").split())
     if text:
         payload["summary"] = text
+    # Строка переноса — тем же правилом: нет переноса, нет и ключа.
+    moved = " ".join(str(integrated or "").split())
+    if moved:
+        payload["integrated"] = moved
     _stop_live_attempts(
         conn,
         deal,

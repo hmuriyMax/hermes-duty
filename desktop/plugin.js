@@ -4773,7 +4773,7 @@ const CSS = `
 /* Колонки подписи фиксированы: иначе статус разной ширины двигал время в каждой строке. */
 .duty-tl-empty{position:sticky;left:calc(var(--duty-tl-name,150px) + var(--duty-tl-gap,8px) + (100cqw - var(--duty-tl-name,150px) - var(--duty-tl-gap,8px)) / 2);width:0;height:20px;overflow:visible}
 .duty-tl-empty>span{position:absolute;left:0;top:50%;transform:translate(-50%,-50%);white-space:nowrap}
-.duty-tl-att{position:absolute;top:50%;transform:translate(-100%,-50%);display:inline-flex;align-items:center;gap:4px;padding:0 4px 0 2px;height:14px;line-height:14px;white-space:nowrap;font-variant-numeric:tabular-nums;border-radius:3px;background:color-mix(in srgb, var(--ui-bg-primary,#1a1a1a) 86%, transparent);pointer-events:none;z-index:4}
+.duty-tl-att{position:absolute;top:50%;transform:translate(-100%,-50%);display:inline-flex;align-items:center;gap:4px;padding:0 4px 0 2px;height:14px;line-height:14px;white-space:nowrap;font-variant-numeric:tabular-nums;border-radius:3px;background:color-mix(in srgb, var(--ui-bg-primary,#1a1a1a) 86%, transparent);pointer-events:none;z-index:1}
 .duty-tl-att.is-inside{transform:translate(0,-50%);padding:0 2px 0 4px}
 
 .duty-tl-n{font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:10px;color:var(--ui-text-tertiary);text-align:right}
@@ -4812,7 +4812,7 @@ const CSS = `
 .duty-tl-marks{position:absolute;inset:0;pointer-events:none}
 .duty-tl-mark{position:absolute;top:-3px;bottom:-3px;width:3px;transform:translateX(-50%);pointer-events:auto;cursor:pointer}
 .duty-tl-mark.anchor-end,.duty-tl-mark.anchor-start{transform:translateX(-50%)}
-.duty-tl-mark:hover{z-index:40}
+.duty-tl-mark:hover{z-index:2}
 /* Палка тонкая: попадание мышью расширяется невидимым «полем» вокруг. */
 .duty-tl-mark::before{content:'';position:absolute;left:-4px;right:-4px;top:0;bottom:0}
 .duty-tl-mark i{display:block;width:100%;height:100%;border-radius:2px;background:currentColor;opacity:.9}

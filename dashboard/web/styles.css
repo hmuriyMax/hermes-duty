@@ -1178,7 +1178,11 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
   border-radius: 3px;
   background: color-mix(in srgb, var(--card) 86%, transparent);
   pointer-events: none;
-  z-index: 4;
+  /* Лестница наложения в шкале: 0 — сетка и тишина, 1 — содержимое дорожек
+     (подпись попытки поверх своих чипов), 2 — подложка гуттера, 3 — липкий
+     столбец этапа. У подписи был 4, и при прокрутке она с полупрозрачной
+     подложкой проезжала ПОВЕРХ имени этапа (Макс, 14.11). */
+  z-index: 1;
 }
 .tl-att.is-inside { transform: translate(0, -50%); padding: 0 2px 0 4px; }
 

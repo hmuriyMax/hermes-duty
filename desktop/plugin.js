@@ -4421,11 +4421,10 @@ function DutyLeadLane({ leadLane }) {
           { className: 'duty-tl-rows' },
           h(
             'div',
-            { className: 'duty-tl-row is-caption', style: { '--duty-tl-collapsed': '20px', '--duty-tl-full': '20px' } },
+            { className: 'duty-tl-row', style: { '--duty-tl-collapsed': '20px', '--duty-tl-full': '20px' } },
             h(
               'div',
               { className: 'duty-tl-track', title: `${leadLane.text}: полоса на оси — заход лида, от подъёма до выхода` },
-              h('span', { className: 'duty-tl-att is-inside is-caption' }, 'заходы'),
               h('div', { className: 'duty-tl-plot' }, ...runs.map((run, index) => {
                 const color = TONE_COLOR[run.tone] || TONE_COLOR.gray
                 return h(
@@ -4770,11 +4769,10 @@ const CSS = `
  * не нужно, а на hover-развороте чипы доезжают на свои уровни. */
 .duty-tl-row:focus-visible{outline:2px solid var(--ui-accent);outline-offset:1px}
 /* Колонки подписи фиксированы: иначе статус разной ширины двигал время в каждой строке. */
-.duty-tl-empty{padding-left:calc(var(--duty-tl-plot-pad,64px) + 2px)}
+.duty-tl-empty{position:sticky;left:calc(var(--duty-tl-name,150px) + var(--duty-tl-gap,8px));max-width:100%;width:calc(var(--duty-tl-view,100%) - var(--duty-tl-name,150px) - var(--duty-tl-gap,8px));display:flex;justify-content:center;background:var(--ui-bg-primary,#1a1a1a)}
 .duty-tl-att{position:absolute;top:50%;transform:translate(-100%,-50%);display:inline-flex;align-items:center;gap:4px;padding:0 4px 0 2px;height:14px;line-height:14px;white-space:nowrap;font-variant-numeric:tabular-nums;border-radius:3px;background:color-mix(in srgb, var(--ui-bg-primary,#1a1a1a) 86%, transparent);pointer-events:none;z-index:4}
 .duty-tl-att.is-inside{transform:translate(0,-50%);padding:0 2px 0 4px}
-.duty-tl-att.is-caption{color:var(--ui-text-tertiary);font-size:10px}
-.duty-tl-att.is-caption.is-inside{left:var(--duty-tl-plot-pad,64px);transform:translate(-100%,-50%);padding:0 6px 0 0;background:transparent}
+
 .duty-tl-n{font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:10px;color:var(--ui-text-tertiary);text-align:right}
 .duty-tl-st{font-size:10.5px;font-weight:700;color:var(--ui-text-secondary)}
 .duty-tl-st.t-green{color:var(--ui-green)}
@@ -5987,6 +5985,9 @@ function ScalePanel({ scale, dealId, callSel, onSelectCall, toolFilter, onToggle
         for (const head of root.querySelectorAll('.duty-tl-lane-head')) {
           for (const child of head.children) namePx = Math.max(namePx, child.scrollWidth || child.getBoundingClientRect().width || 0)
         }
+        // Видимая ширина шкалы — по ней центруются подписи пустых дорожек.
+        const scrollerEl = root.querySelector('.duty-scale-main')
+        if (scrollerEl) wrap.style.setProperty('--duty-tl-view', `${scrollerEl.clientWidth}px`)
         if (namePx) {
           seen.namePx = Math.max(seen.namePx || 0, namePx)
           wrap.style.setProperty('--duty-tl-name', `${Math.min(300, Math.max(96, Math.ceil(seen.namePx) + 8))}px`)

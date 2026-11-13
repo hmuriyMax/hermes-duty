@@ -1552,7 +1552,8 @@ test('веб: заходы лида стоят на шкале отдельно�
   assert.match(lane.textContent, /lead/, 'у дорожки нет профиля')
   // Заходы лида стоят подписью своей строки в колонке попыток — счётчика в шапке
   // дорожки больше нет (Макс, 14.11).
-  assert.match(lane.querySelector('.tl-row .tl-att').textContent, /заходы/, 'у заходов нет подписи в дорожке')
+  // Подписи «заходы» больше нет: она наслаивалась на полосы (Макс, 14.11).
+  assert.equal(lane.querySelectorAll('.tl-att').length, 0, 'подпись заходов вернулась')
 
   const runs = [...lane.querySelectorAll('.tl-lead-run')]
   assert.equal(runs.length, 2, `полос захода ${runs.length}, а в журнале два`)

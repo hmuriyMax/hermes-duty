@@ -2486,11 +2486,10 @@ function leadLaneNode(leadLane, scale) {
             // Высота захода — 26 px в инлайновых переменных: у строки попытки высота
             // равна `--tl-full` на наведении, и правило из CSS ниже по файлу
             // возвращало бы рейку к 20 px под указателем.
-            { class: 'tl-row is-caption', style: '--tl-collapsed:26px;--tl-full:26px' },
+            { class: 'tl-row', style: '--tl-collapsed:26px;--tl-full:26px' },
             h(
               'div',
               { class: 'tl-track', 'data-tip': `${leadLane.text}: полосы на оси — заходы лида, от подъёма до выхода` },
-              h('span', { class: 'tl-att is-inside is-caption' }, 'заходы'),
               ...runs.map((run, index) =>
                 h(
                   'span',
@@ -3430,6 +3429,10 @@ function fitScaleGutter(root, dealKey) {
   for (const head of root.querySelectorAll('.tl-lane-head')) {
     for (const child of head.children) namePx = Math.max(namePx, child.scrollWidth || child.getBoundingClientRect().width || 0)
   }
+  // Видимая ширина шкалы: по ней центруются подписи пустых дорожек, и при
+  // горизонтальной прокрутке они остаются на месте.
+  const scroller = root.querySelector('.scale-main')
+  if (scroller) wrap.style.setProperty('--tl-view', `${scroller.clientWidth}px`)
   if (!namePx) return
   scaleGutterSeen.namePx = Math.max(scaleGutterSeen.namePx || 0, namePx)
   const named = Math.min(300, Math.max(96, Math.ceil(scaleGutterSeen.namePx) + 8))

@@ -91,7 +91,7 @@ CHARTER_KEYS = (
     "publish",
 )
 PLAN_GATE_KEYS = ("min_stages", "budget_share")
-PUBLISH_KEYS = ("human_gate", "reviewer_role")
+PUBLISH_KEYS = ("human_gate", "reviewer_role", "plan")
 # Что предложение плана вправе сказать про этап, который **уже есть** в графе.
 # Перестановка — это порядок: `needs` и `parallel_with`, и ничего больше. Остальные
 # поля были бы переписыванием этапа, а этап объявляется спекой (`parse_plan`,
@@ -469,15 +469,19 @@ class PlanGate:
 
 @dataclass(frozen=True)
 class Publish:
-    """Публикация в хартии 2.0: кто одобряет и спрашивают ли человека.
+    """Публикация в хартии 2.0: кто одобряет, спрашивают ли человека, кто её объявляет.
 
-    Два поля — то, что дело 2.0 объявляет о своей публикации
+    Поля — то, что дело 2.0 объявляет о своей публикации
     (`docs/ENGINE-2.0.md`, разделы 3 и 8):
 
     - `reviewer_role` — роль, чью работу дело считает ревью; умолчание —
       `REVIEWING_ROLE`, поэтому спека без `publish` ведёт себя как 1.x;
     - `human_gate` — нужен ли вопрос человеку перед публикацией; умолчание
       `true`, как у 1.x, где публикующий этап требует гейта в предках;
+    - `plan` — вправе ли план добавить публикующий этап (2.0). Умолчание `false`:
+      публикацию объявляет seed-спека, а планом она добавляется только по
+      разрешению хартии и только после гейта с вопросом человеку (`parse_plan`,
+      правило `plan.publish`, `docs/ENGINE-2.0.md`, раздел 8);
     - `declared` — блок `publish` в хартии **объявлен**. Без этого признака
       умолчание `human_gate: true` включило бы человеческий гейт у спек 1.x, где
       его не было, и «нет блока — поведение 0.0.8» перестало бы быть правдой.
@@ -492,6 +496,7 @@ class Publish:
 
     human_gate: bool = True
     reviewer_role: str = REVIEWING_ROLE
+    plan: bool = False
     declared: bool = False
     line: int = 0
 
@@ -1010,8 +1015,25 @@ def _parse_publish(
             )
         )
         reviewer_role = REVIEWING_ROLE
+    # `plan` разбирается так же строго, как `human_gate`: строка «да» — не
+    # разрешение хартии, а мусор в ней, и угадывать за человека нечего.
+    plan_allowed = mapping.get("plan", False)
+    if not isinstance(plan_allowed, bool):
+        issues.append(
+            Issue(
+                path,
+                lines.get(prefix + ("publish", "plan"), line),
+                "charter.publish.plan",
+                f"plan={plan_allowed!r}: вправе ли план добавить публикующий этап — true/false",
+            )
+        )
+        plan_allowed = False
     return Publish(
-        human_gate=human_gate, reviewer_role=str(reviewer_role).strip(), declared=True, line=line
+        human_gate=human_gate,
+        reviewer_role=str(reviewer_role).strip(),
+        plan=plan_allowed,
+        declared=True,
+        line=line,
     )
 
 
@@ -2723,6 +2745,66 @@ def parse_plan_cost(raw: Any, *, path: Optional[Path] = None) -> tuple[Optional[
     return {"tokens": int(tokens)}, issues
 
 
+def _publish_gate_ids(
+    needs: Mapping[str, tuple[str, ...]], kinds: Mapping[str, str], stage_id: str
+) -> list[str]:
+    """Гейты в транзитивных `needs` этапа — по объединённому графу (seed плюс план).
+
+    Обход тот же, что у `_ancestors`, но по рёбрам двух коллекций сразу: гейт перед
+    публикацией вправе быть этапом seed, а не предложения. Второй обход по
+    `spec.Spec` здесь не заводится — у плана ещё нет `Spec`.
+    """
+    seen: set[str] = set()
+    stack = list(needs.get(stage_id, ()))
+    while stack:
+        name = stack.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        stack.extend(needs.get(name, ()))
+    return sorted(name for name in seen if kinds.get(name) == GATE_KIND)
+
+
+def _plan_publish_refusal(charter: Charter, stage: Stage, gates: Iterable[Stage]) -> str:
+    """Почему публикацию планом нельзя — или пустая строка, если хартия разрешила.
+
+    Публикация — властное действие, и планом она добавляется только по явному
+    разрешению хартии (`charter.publish.plan: true`) и только после гейта с
+    вопросом человеку (`docs/ENGINE-2.0.md`, раздел 8). Три условия сразу:
+
+    - хартия объявила `charter.publish.plan: true`; молчание хартии — прежний
+      ответ «публикация объявляется seed-спекой»;
+    - роль названа в `charter.allowed_roles` — без имени в хартии публикации
+      планом нет, даже если `allowed_roles` пуст (пусто — молчание, а не «любая
+      роль»: доверять властный этап роли, которую хартия не называла, нельзя);
+    - в транзитивных `needs` этапа есть гейт (`kind: gate`) и у него объявлен
+      `allow`: без `allow` продолжением считается любой вариант, включая «не
+      публиковать» (`runner.gate_allow`).
+
+    Это тот же признак, что у предупреждения `publish-gate` (`_check_publish_gate`),
+    но отказом: спеку судит человек, а план пишет лид, и до запуска у нас есть
+    только форма графа.
+    """
+    publish_decl = getattr(charter, "publish", None)
+    if not bool(getattr(publish_decl, "plan", False)):
+        return "хартия не разрешает публикацию планом (charter.publish.plan не объявлен)"
+    if stage.role not in charter.allowed_roles:
+        named = ", ".join(charter.allowed_roles) or "ни одной"
+        return (
+            f"роль {stage.role!r} не названа в charter.allowed_roles (хартия разрешает {named}): "
+            "публикацию планом хартия разрешает только названной роли"
+        )
+    listed = list(gates)
+    if not listed:
+        return f"в предках этапа нет гейта (kind: {GATE_KIND}) с вопросом человеку"
+    if any(gate.allow for gate in listed):
+        return ""
+    return (
+        f"гейт {listed[0].id!r} не объявляет allow: без него продолжением считается любой "
+        "вариант, включая «не публиковать»"
+    )
+
+
 def parse_plan(
     raw_stages: Any,
     *,
@@ -2741,9 +2823,11 @@ def parse_plan(
     - роль и вид этапа — из `charter.allowed_roles`/`allowed_kinds` (пустой
       `allowed_roles` роль не ограничивает: хартия молчит — действует проверка
       профиля у самой спеки);
-    - публикацию план не добавляет: этап с ролью из `PUBLISHING_ROLES`
-      объявляется в seed-спеке, а `git push` в команде отказывает тем же
-      правилом, что у спеки (`_forbidden_hit`);
+    - публикацию план добавляет только по разрешению хартии: этап с ролью из
+      `PUBLISHING_ROLES` принимается лишь при `charter.publish.plan: true`, роли из
+      `charter.allowed_roles` и гейте с вопросом человеку в транзитивных `needs`
+      (`_plan_publish_refusal`); иначе он объявляется в seed-спеке, а `git push` в
+      команде отказывает тем же правилом, что у спеки (`_forbidden_hit`);
     - этап, который что-то производит (его свидетель — работа: не `gate`, без
       `verdict`, не публикующий), обязан объявить `evidence` с командой: план не
       вправе добавить этап, который закроется без доказательств;
@@ -2912,6 +2996,20 @@ def parse_plan(
                     )
                 )
     seen: set[str] = set()
+    # Граф — seed плюс предложение: перестановка меняет `needs` уже существующего
+    # этапа, поэтому цикл проверяется по объединённым рёбрам, а не только по
+    # добавленным. Иначе `plan.needs: [close]` поверх seed `close.needs: [plan]`
+    # принимался бы и вешал дело в ожидании, которого никто не снимет. Собран он
+    # до проверок этапов: гейт перед публикацией вправе быть этапом seed, и
+    # `plan.publish` смотрит в те же рёбра.
+    merged: dict[str, tuple[str, ...]] = {
+        stage_id: tuple(str(need) for need in getattr(stage, "needs", ()) or ())
+        for stage_id, stage in base.items()
+    }
+    merged.update({stage.id: stage.needs for stage in stages})
+    by_any_id: dict[str, Stage] = dict(base)
+    by_any_id.update({stage.id: stage for stage in stages})
+    kinds = {stage_id: str(getattr(stage, "kind", "") or "") for stage_id, stage in by_any_id.items()}
     for stage in stages:
         moving = stage.id in base
         if stage.id in seen:
@@ -2959,15 +3057,22 @@ def parse_plan(
                 )
             )
         if "role" in fresh and stage.role in PUBLISHING_ROLES:
-            issues.append(
-                Issue(
-                    where,
-                    stage.line,
-                    "plan.publish",
-                    f"этап {stage.id!r} публикует (role: {stage.role}): публикация объявляется "
-                    "в seed-спеке и требует ревью в предках — планом она не добавляется",
+            # Публикация планом — право хартии и только после гейта с вопросом
+            # человеку: форма графа здесь единственное, что видно до запуска
+            # (`_plan_publish_refusal`).
+            gates = [by_any_id[name] for name in _publish_gate_ids(merged, kinds, stage.id)]
+            why = _plan_publish_refusal(charter, stage, gates)
+            if why:
+                issues.append(
+                    Issue(
+                        where,
+                        stage.line,
+                        "plan.publish",
+                        f"этап {stage.id!r} публикует (role: {stage.role}): публикация планом "
+                        "добавляется только при `charter.publish.plan: true` и после гейта с "
+                        f"вопросом человеку — {why}",
+                    )
                 )
-            )
         if "role" in fresh and stage.role in COORDINATOR_ROLES:
             # У добавленного планом этапа `needs` есть всегда, а `close` в графе
             # уже занят (`plan.id`), — значит координаторская роль здесь означает
@@ -3055,15 +3160,8 @@ def parse_plan(
                     "только этап, чью работу можно проверить — объяви evidence {cmd, must}",
                 )
             )
-    # Граф — seed плюс предложение: перестановка меняет `needs` уже существующего
-    # этапа, поэтому цикл проверяется по объединённым рёбрам, а не только по
-    # добавленным. Иначе `plan.needs: [close]` поверх seed `close.needs: [plan]`
-    # принимался бы и вешал дело в ожидании, которого никто не снимет.
-    merged: dict[str, tuple[str, ...]] = {
-        stage_id: tuple(str(need) for need in getattr(stage, "needs", ()) or ())
-        for stage_id, stage in base.items()
-    }
-    merged.update({stage.id: stage.needs for stage in stages})
+    # Рёбра `merged` собраны выше, до проверок этапов: здесь по ним ищется цикл,
+    # замкнутый перестановкой через уже существующие этапы.
     trail: list[str] = []
     state: dict[str, int] = {}  # 1 — в обходе, 2 — обойдён
 

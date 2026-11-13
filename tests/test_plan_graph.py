@@ -9,8 +9,9 @@
 3. `plan_rejected` возвращает этап плана в работу с причиной и `issues[]`, а
    сверх `charter.max_rounds_replan` — `failed(contract)`;
 4. предложение сверх `max_stages` отклоняется, дело не растёт;
-5. `publish` планом не добавляется, этап без `evidence`, который что-то
-   производит, тоже;
+5. `publish` планом не добавляется без разрешения хартии, этап без `evidence`,
+   который что-то производит, тоже; с `charter.publish.plan: true` и гейтом в
+   предках публикация планом принимается;
 6. гейт плана: предложение больше порога — вопрос человеку (`ask()`), до ответа
    `wait_human`; «принять» пишет `plan_accepted` с `by: human`;
 7. реплей: `stage_states` на том же журнале даёт тот же срез целиком;
@@ -556,6 +557,71 @@ def test_plan_cannot_add_publish(tmp_path: Path) -> None:
     assert why == ""
     assert facts[-1]["kind"] == "plan_rejected"
     assert "plan.publish" in " ".join(facts[-1]["payload"]["issues"])
+
+
+# Хартия, которая публикацию планом разрешает: право хартии (`publish.plan`) плюс
+# имя роли в `allowed_roles` — без обоих план публикующий этап не добавляет.
+PUBLISH_SEED = SEED.replace(
+    "  plan_gate: {min_stages: 4}",
+    "  plan_gate: {min_stages: 6}\n"
+    "  allowed_roles: [implementer, publisher]\n"
+    "  allowed_kinds: [agent, gate]\n"
+    "  publish: {plan: true}",
+)
+
+
+def publish_proposal(*, gate: bool = True) -> list[dict[str, Any]]:
+    """Предложение с публикацией: работа, вопрос человеку (если надо), `publisher`."""
+    stages = [plan_stage("impl")]
+    previous = "impl"
+    if gate:
+        stages.append(
+            {
+                "id": "ask-human",
+                "kind": "gate",
+                "needs": [previous],
+                "ask": {"q": "публикуем?", "options": ["да", "нет"]},
+                "allow": ["да"],
+            }
+        )
+        previous = "ask-human"
+    stages.append({"id": "publish", "role": "publisher", "needs": [previous], "workspace": "none"})
+    return stages
+
+
+def test_plan_adds_publish_with_the_charter_and_a_gate(tmp_path: Path) -> None:
+    """Хартия разрешила публикацию планом, гейт в предках — план принимается.
+
+    Три условия сразу: `charter.publish.plan: true`, роль в `allowed_roles`,
+    `kind: gate` с объявленным `allow` в транзитивных `needs`. Проверяется граф
+    после факта — `publish` в нём есть.
+    """
+    seed = write_spec(tmp_path, PUBLISH_SEED, name="publish.yaml")
+    facts, why = report(tmp_path, stages=publish_proposal(), seed=seed)
+
+    assert why == ""
+    assert [fact["kind"] for fact in facts] == ["plan_proposed", "plan_accepted"]
+    assert {stage.id for stage in transit.graph(seed, facts)} >= {"ask-human", "publish"}
+
+
+def test_plan_publish_without_the_charter_is_refused(tmp_path: Path) -> None:
+    """Без `charter.publish.plan: true` — прежний отказ: публикацию объявляет seed."""
+    facts, why = report(tmp_path, stages=publish_proposal())
+
+    assert why == ""
+    assert facts[-1]["kind"] == "plan_rejected"
+    assert "plan.publish" in " ".join(facts[-1]["payload"]["issues"])
+    assert "charter.publish.plan" in " ".join(facts[-1]["payload"]["issues"])
+
+
+def test_plan_publish_without_a_gate_is_refused(tmp_path: Path) -> None:
+    """Хартия разрешила, но гейта с вопросом человеку в предках нет — отказ."""
+    seed = write_spec(tmp_path, PUBLISH_SEED, name="publish.yaml")
+    facts, why = report(tmp_path, stages=publish_proposal(gate=False), seed=seed)
+
+    assert why == ""
+    assert facts[-1]["kind"] == "plan_rejected"
+    assert "гейта (kind: gate)" in " ".join(facts[-1]["payload"]["issues"])
 
 
 def test_plan_stage_without_evidence_is_rejected(tmp_path: Path) -> None:

@@ -144,7 +144,8 @@ charter:
 | `duty_answer` | `stage_id`, `question_id`, `text`, `idempotency_key` | ответ воркеру: продолжает его сессию с ответом и закрывает строку пула (`msgq resolve` тем же `ask.resolve`) | `question_answered` (`by: lead`) |
 | `duty_ask` | `role`, `question`, `wait` | под-попытка роли, ответ строкой лиду | `question_asked`/`question_answered` (`by: role`) |
 | `duty_ask_human` | `question`, `options[]`, `risky` | вопрос в пул (`ask.ask`), дело в `wait_human` | `question_asked` |
-| `duty_close` | `summary`, `verdict`, `idempotency_key` | закрывает дело | `completed` (`cause: lead_closed`) |
+| `duty_close` | `summary`, `verdict`, `idempotency_key` | закрывает дело; перед `completed` переносит работу из `duty/<id>` в рабочую ветку (тот же `integrate`; неудача — факт `integrate_failed`, закрытие не блокируется) | `completed` (`cause: lead_closed`) + `integrated`/`integrate_failed` |
+| `duty_integrate` | `reason`, `idempotency_key` | переносит работу дела из `duty/<id>` в рабочую ветку человека **локальным** merge: `--ff-only`, иначе `--no-ff`; конфликт — `merge --abort` и отказ с именами файлов. Не пушит, не форсит, историю не переписывает | `integrated` (`{from, into, commit, fast_forward, already}`) или отказ без факта |
 | `duty_cancel` | `stage_id`, `reason`, `idempotency_key` | отменяет этап: `pending` — просто факт; идущую попытку гасит (SIGTERM → SIGKILL, лизинг отпущен) | `stage_cancelled` + `attempt_ended(outcome: cancelled)` |
 | `duty_cancel_deal` | `reason`, `idempotency_key` | отменяет дело целиком: гасит все живые попытки, отпускает их лизинги | `completed` (`cause: lead_cancelled`), статус `cancelled` |
 
@@ -444,6 +445,19 @@ charter:
 него (1.x) ведёт себя как раньше — вопрос человеку остаётся формой графа
 (`publish-gate`), а не фактом, который проверяет движок. `ask.risky` сильнее
 хартии: рискованный этап спрашивает человека даже при `human_gate: false`.
+
+**Публикация планом — по хартии и только через гейт.** Публикующий этап
+(`role` из `spec.PUBLISHING_ROLES`) добавляется планом, если хартия сказала
+`charter.publish.plan: true`, роль названа в `charter.allowed_roles`, а в
+транзитивных `needs` стоит гейт (`kind: gate`) с объявленным `allow`. Молчание
+хартии — прежний ответ `plan.publish`: «публикация объявляется seed-спекой».
+Почему так, а не проще: `duty_integrate` переносит работу в ветку человека, но
+сам наружу не выходит, а пуш, MR и тег — властные действия, и решает их человек.
+Поэтому публикация, добавленная планом, стоит **после** гейта: вопрос человеку
+несёт вариант одобрения (`allow`), ответ становится фактом, и жёсткая гарантия
+`duty_start` (раздел 8, таблица выше) проверяет уже его. Форма графа при этом
+остаётся подсказкой для спеки (`publish-gate` — предупреждение) и отказом для
+плана: спеку судит человек, а план пишет тот же лид, что по нему идёт.
 
 Цена: `publish.py` становится функцией от фактов, не только от спеки; ошибка
 теперь видна **до** спавна, а не после отчёта. `review-gate` для `risky`-этапов

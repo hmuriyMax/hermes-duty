@@ -2246,13 +2246,16 @@ PLAN_SCHEMA = {
                 "type": "array",
                 "items": {"type": "object"},
                 "description": (
-                    "этапы плана: {id, title, role, kind, workspace, needs, evidence, retry, budget}; "
+                    "этапы плана: {id, title, role, kind, workspace, needs, evidence, retry, budget, "
+                    "ask, allow, verdict}; "
                     "этап, который что-то производит, обязан объявить evidence {cmd, must}. "
                     "title — имя этапа для человека («сверка доки с кодом»): необязательное, "
                     "в графе и журнале этап остаётся под id. "
                     "id, который уже есть в графе, — не новый этап: needs/parallel_with "
                     "переставляют порядок, а cmd/budget/evidence/retry/kind/role/workspace/title "
-                    "правят этап, который ещё не начинался"
+                    "правят этап, который ещё не начинался. "
+                    "этап роли publisher добавляется только при charter.publish.plan: true, роли в "
+                    "charter.allowed_roles и гейте kind: gate с allow в его needs"
                 ),
             },
             "reason": {"type": "string", "description": "зачем такой план — слова лида, попадают в факт"},

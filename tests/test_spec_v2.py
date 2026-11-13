@@ -203,6 +203,49 @@ def test_v1_seed_spec_passes_and_reaches_the_brief() -> None:
     assert "план создаёшь ты" in text
 
 
+def test_brief_names_the_transfer_and_the_publish_gate() -> None:
+    """Бриф первого захода называет оба шага словами: перенос и публикацию.
+
+    Требование линии 0.2.1: лид видит, что работа переносится в рабочую ветку
+    (`duty_integrate`), что публикация — этап роли `publisher` после ответа
+    человека (гейт `kind: gate` с `ask.q`/`ask.options` и `allow`, а планом она
+    добавляется лишь при `charter.publish.plan: true`), и что пуш, MR и тег без
+    явного «ок» не делаются.
+    """
+    loaded = spec_module.load_spec(FIXTURES / "spec-v2-charter.yaml")
+    deal = {"id": "d_seed0001", "title": "seed", "status": "waiting", "repo": None, "spec": str(loaded.path)}
+    text = lead_module.brief(deal, [], lead_module.state([]), spec=loaded, now=NOW)
+
+    assert "duty_integrate" in text
+    assert "`publisher`" in text and "kind: gate" in text
+    assert "charter.publish.plan: true" in text
+    assert "«ок»" in text
+
+
+def test_digest_names_the_transfer_until_the_journal_knows_it() -> None:
+    """Дайджест резюма: строка про перенос есть, пока факта `integrated` нет.
+
+    Проекция читает только журнал (`leadfeed.integrate_hint`): после переноса
+    строка уходит, а до него лид видит, что работу надо перенести.
+    """
+    loaded = spec_module.load_spec(FIXTURES / "spec-v2-charter.yaml")
+    deal = {"id": "d_seed0001", "title": "seed", "status": "waiting", "repo": None, "spec": str(loaded.path)}
+    moved = {
+        "id": 1,
+        "ts": NOW,
+        "deal_id": "d_seed0001",
+        "kind": "integrated",
+        "payload": {"from": "duty/d_seed0001", "into": "release/v0.2.1", "commit": "a" * 40},
+        "source": "lead",
+    }
+
+    before = lead_module.digest(deal, [], lead_module.state([]), spec=loaded, now=NOW)
+    after = lead_module.digest(deal, [moved], lead_module.state([moved]), spec=loaded, now=NOW)
+
+    assert "duty_integrate" in before
+    assert "duty_integrate" not in after
+
+
 def test_seed_over_the_plan_ceiling_is_refused(tmp_path: Path) -> None:
     """Seed не гниёт: файл не объявляет больше этапов, чем держит хартия."""
     found = spec_module.validate_spec(

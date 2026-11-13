@@ -231,12 +231,13 @@ charter:
       plan_gate: {min_stages: 6, budget_share: 0.6}
       max_attempts: 3         # 2.0: попыток на этап, включая авто-повторы
       max_lead_resumes: 6     # 2.0: сколько раз супервизор поднимает лида
-      publish: {human_gate: true, reviewer_role: reviewer}   # 2.0
+      publish: {human_gate: true, reviewer_role: reviewer, plan: false}   # 2.0
 
 - **Нет блока** — годная спека с дефолтами: `max_stages: 12`,
   `max_rounds_replan: 3`, `allowed_roles: []`, `allowed_kinds: [agent, shell, gate]`,
   `plan_gate` выключен (`min_stages: 0`, `budget_share: 0`), `max_attempts: 3`,
-  `max_lead_resumes: 6`, `publish: {human_gate: true, reviewer_role: reviewer}`.
+  `max_lead_resumes: 6`,
+  `publish: {human_gate: true, reviewer_role: reviewer, plan: false}`.
   Это поведение 0.0.8: старые спеки и старые дела работают без правок файла.
 - **`max_stages`** ≥ 1 — потолок **всего** графа (`spec.parse_plan` считает seed
   вместе с предложением). Предложение сверх потолка отклоняется (`plan_rejected`) —
@@ -275,13 +276,20 @@ charter:
 - **`publish`** — объявление дела о публикации (2.0): `human_gate` — спрашивать ли
   человека перед публикацией (`true` по умолчанию, как в 1.x, где публикующий этап
   требует гейта в предках), `reviewer_role` — роль, чью работу дело считает ревью
-  (по умолчанию `reviewer`). Поля действуют, когда блок объявлен: без него спека
+  (по умолчанию `reviewer`), `plan` — вправе ли план **добавить** публикующий этап
+  (`false` по умолчанию: публикацию объявляет seed-спека). Поля действуют, когда блок
+  объявлен: без него спека
   ведёт себя как 1.x. `reviewer_role` читает гейт публикации (`duty_start`
   требует approve от попытки с этой ролью, и отказ называет её), `human_gate`
   делает ответ человека на гейт **фактом**, который движок проверяет перед
   спавном публикующего этапа; `ask.risky: true` сильнее хартии — рискованный этап
   спрашивает человека и при `human_gate: false`. `spec check` проверяет только форму —
-  булево и непустое имя роли.
+  булево, непустое имя роли и булево `plan`.
+- **`publish.plan: true`** разрешает плану добавить этап роли `publisher` — и только
+  вместе с двумя другими условиями: роль названа в `charter.allowed_roles`, а в
+  транзитивных `needs` этапа стоит гейт (`kind: gate`) с объявленным `allow`. Без
+  хартии и без гейта действует прежнее правило: публикация объявляется seed-спекой
+  (`plan.publish`, `docs/ENGINE-2.0.md`, раздел 8).
 
 **Хартия судит и seed — но не своими правами.** Объявленные файлом `stages` (спека
 1.x) прогоняются через `parse_plan` (`spec.check_seed`), и оттуда берутся отказы,
@@ -294,9 +302,10 @@ charter:
 не должно (`coordinator.scope`).
 
 **Что план добавить не может** (`spec.parse_plan`, те же правила, что у `spec check`):
-публикующий этап (`role` из `PUBLISHING_ROLES`) и команду `git push` — публикация
-объявляется в seed-спеке и требует ревью в предках; этап, который что-то
-производит, без `evidence` с командой; `needs`/`parallel_with` на несуществующий
+публикующий этап (`role` из `PUBLISHING_ROLES`) без разрешения хартии — без
+`charter.publish.plan: true`, без роли в `charter.allowed_roles` или без гейта с
+`allow` в предках публикация объявляется seed-спекой; команду `git push`; этап,
+который что-то производит, без `evidence` с командой; `needs`/`parallel_with` на несуществующий
 этап и цикл внутри предложения (в том числе замкнутый перестановкой через уже
 существующие этапы).
 
@@ -945,7 +954,7 @@ approved_commit`), а не ответа: ответ приходит позже,
 | `close.verdict` | у закрывающего этапа нет `verdict`: этап «просто закончится», и закрывать дело будет нечем |
 | `coordinator.scope` | роль координатора (`coordinator`, прежнее имя — `lead`) стоит на этапе-исполнителе: координатор ведёт дело и закрывает, а работа адресуется роли-исполнителю. Законны ровно две позиции — входной этап (без `needs`) и `close`; планом координатор не добавляется вовсе |
 | `review-gate` (**warning**) | публикующий (`publisher`/`deployer`) или рискованный (`ask.risky: true`) этап без роли ревьюера этого дела (`charter.publish.reviewer_role`, умолчание `reviewer`) в транзитивных `needs`: форма графа — подсказка, а не гарантия (`docs/ENGINE-2.0.md`, раздел 8) |
-| `publish-gate` (**warning**) | публикующий этап без `kind: gate` в транзитивных `needs`; гейт-предок не объявляет `allow` (продолжением стал бы любой вариант, включая «не публиковать») |
+| `publish-gate` (**warning**) | публикующий этап без `kind: gate` в транзитивных `needs`; гейт-предок не объявляет `allow` (продолжением стал бы любой вариант, включая «не публиковать»). Для спеки это подсказка; планом такой этап не добавляется вовсе (`plan.publish`) |
 | `kind` | значение не из `agent`/`shell`/`gate` |
 | `kind.role`, `kind.workspace`, `kind.verdict`, `kind.retry`, `kind.ask` | поле чужого вида: `role` у `shell`/`gate`; `workspace`/`verdict`/`retry` у `gate`; `ask` у `shell`; `ask.allowed`/`ask.to_human`/`ask.max_hops`/`ask.risky` у `gate` |
 | `kind.cmd`, `kind.must`, `kind.artifacts` | `cmd` не строка/пустой или `cmd` у `agent`/`gate`; `must` не целое или у `agent`/`gate`; `artifacts` не список путей или у `agent`/`gate` |
@@ -974,7 +983,7 @@ approved_commit`), а не ответа: ответ приходит позже,
 | `charter.max_attempts` | не целое или меньше 1 (2.0) |
 | `charter.max_lead_resumes` | не целое или меньше нуля (2.0) |
 | `charter.close` | не `lead` и не `stages` (2.0) |
-| `charter.publish` | `publish` не словарь; `human_gate` не булево (`"нет"` — не решение человека); `reviewer_role` не строка или пустая (2.0) |
+| `charter.publish` | `publish` не словарь; `human_gate` не булево (`"нет"` — не решение человека); `reviewer_role` не строка или пустая; `plan` не булево (2.0) |
 | `charter.allowed_roles`, `charter.allowed_kinds` | не список строк; роль не из профилей Hermes; вид не из `agent`/`shell`/`gate` |
 | `charter.plan_gate` | `plan_gate` не словарь; `min_stages` не целое, меньше нуля или выше `max_stages`; `budget_share` не число или вне `[0, 1]` |
 | `plan.stages` | предложение плана не непустой список этапов (одиночный этап из `duty_start` принимается записью, но не словарь — отказ) |
@@ -983,7 +992,7 @@ approved_commit`), а не ответа: ответ приходит позже,
 | `plan.edit` | правка этапа, у которого была попытка («этап `X` уже начинался»): переписать поля начатого этапа планом нельзя — это делает приговор ревью |
 | `plan.needs`, `plan.parallel_with` | ссылка на несуществующий этап; ссылка на себя |
 | `plan.cycle` | цикл в предложенных `needs`, в том числе замкнутый перестановкой через уже существующие этапы |
-| `plan.publish` | план добавляет публикующий этап: публикация объявляется в seed-спеке |
+| `plan.publish` | план добавляет публикующий этап: публикация планом добавляется только при `charter.publish.plan: true` и после гейта с вопросом человеку (роль названа в `charter.allowed_roles`, в транзитивных `needs` — `kind: gate` с `allow`) |
 | `plan.evidence` | добавленный этап что-то производит, а `evidence` пуст |
 | `plan.cost` | `cost` не словарь, `tokens` не положительное целое, лишний ключ в `cost` |
 

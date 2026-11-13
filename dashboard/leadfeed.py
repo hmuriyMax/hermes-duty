@@ -68,6 +68,14 @@ QUESTION_ASKED = "question_asked"
 QUESTION_ANSWERED = "question_answered"
 COMPLETED = "completed"
 
+# Перенос работы дела в рабочую ветку (`dashboard/tools.py`, `integrate`): лид
+# назвал перенос сам, и это такое же решение, как закрытие. `integrated` —
+# перенос состоялся (в том числе «уже был»), `integrate_failed` — не состоялся
+# (грязное дерево, конфликт, ветка не найдена), и закрытие при этом не встало.
+INTEGRATED = "integrated"
+INTEGRATE_FAILED = "integrate_failed"
+INTEGRATE_KINDS = (INTEGRATED, INTEGRATE_FAILED)
+
 # Отмена дела (`docs/ENGINE-2.0.md`, раздел 5): не «плохо закрыто», а «не считается
 # завершённым». Поэтому у отмены своё слово в `cause` и свой статус.
 CANCEL_CAUSE = "lead_cancelled"
@@ -260,6 +268,38 @@ def lead_word(block: Any) -> str:
     if state == STATE_ABSENT:
         return "отсутствует"
     return "не поднимался"
+
+
+def integrate_hint(events: Iterable[Any]) -> str:
+    """Одна строка про перенос работы в рабочую ветку — пока журнал его не знает.
+
+    Работа этапов живёт в `duty/<id>`, а человек читает свою ветку, поэтому
+    перенос (`duty_integrate`) — не украшение, а то, ради чего дело велось.
+    Проекция читает только журнал: `git` здесь не спрашивается, и «переноса не
+    было» значит «в журнале нет факта `integrated`», а не «вершина ветки дела не
+    в рабочей ветке». Оба случая закрываются одинаково — лид зовёт инструмент,
+    который сам скажет, что переносить нечего или что ветки разошлись.
+
+    Пустая строка — перенос уже был или дело закрыто: закрытие переносит работу
+    само (`dashboard/tools.py`, `close`), и спрашивать с лида после него нечего.
+    Неудачный перенос не молчит: лид узнаёт, что повторить и почему.
+    """
+    ordered = _ordered(events)
+    kinds = [str(event.get("kind") or "") for event in ordered]
+    if COMPLETED in kinds or INTEGRATED in kinds:
+        return ""
+    failed = [
+        _payload(event)
+        for event, kind in zip(ordered, kinds)
+        if kind == INTEGRATE_FAILED
+    ]
+    if failed:
+        error = _short(failed[-1].get("error"), 120) or "причина не записана"
+        return f"перенос работы в рабочую ветку не удался ({error}): повтори `duty_integrate` или перенеси руками"
+    return (
+        "работа дела переносится в рабочую ветку `duty_integrate(reason, idempotency_key)` — "
+        "журнал переноса пока не знает"
+    )
 
 
 # ------------------------------------------------------------------ лента решений

@@ -257,6 +257,23 @@ def test_lead_kinds_are_part_of_the_closed_journal_set() -> None:
     assert folded["active"] is False, "поздний факт лида не воскрешает закрытое дело"
 
 
+def test_integrate_hint_speaks_until_the_transfer_happens() -> None:
+    """Строка про перенос: есть до переноса, уходит после, а неудача названа.
+
+    Проекция читает журнал, а не git: «переноса не было» — это отсутствие факта
+    `integrated`. Закрытое дело строку не получает (закрытие переносит само), а
+    неудачный перенос называет причину и не молчит.
+    """
+    moved = fact(2, "integrated", NOW - 800, {"from": "duty/d_aaaaaa", "into": "master", "commit": "a" * 40})
+    failed = fact(2, "integrate_failed", NOW - 800, {"error": "рабочий каталог грязный"})
+    closed = fact(3, "completed", NOW - 700, {"cause": "lead_closed", "status": "done"})
+
+    assert "duty_integrate" in leadfeed.integrate_hint([fact(1, "created", NOW - 900, {"title": "дело"})])
+    assert leadfeed.integrate_hint([fact(1, "created", NOW - 900, {"title": "дело"}), moved]) == ""
+    assert leadfeed.integrate_hint([fact(1, "created", NOW - 900, {"title": "дело"}), closed]) == ""
+    assert "рабочий каталог грязный" in leadfeed.integrate_hint([fact(1, "created", NOW - 900, {}), failed])
+
+
 # ------------------------------------------------------ поверхности: now, deal, why
 
 

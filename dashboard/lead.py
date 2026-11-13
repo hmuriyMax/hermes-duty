@@ -49,6 +49,7 @@ JOURNAL_MODULE_NAME = "hermes_duty_journal"
 DEALS_MODULE_NAME = "hermes_duty_deals"
 SPEC_MODULE_NAME = "hermes_duty_spec"
 STAGEFEED_MODULE_NAME = "hermes_duty_stagefeed"
+LEADFEED_MODULE_NAME = "hermes_duty_leadfeed"
 RUNNER_MODULE_NAME = "hermes_duty_runner"
 ASK_MODULE_NAME = "hermes_duty_ask"
 FAILURES_MODULE_NAME = "hermes_duty_failures"
@@ -77,6 +78,7 @@ journal = _load(JOURNAL_MODULE_NAME, "journal.py")
 deals = _load(DEALS_MODULE_NAME, "deals.py")
 spec_module = _load(SPEC_MODULE_NAME, "spec.py")
 stagefeed = _load(STAGEFEED_MODULE_NAME, "stagefeed.py")
+leadfeed = _load(LEADFEED_MODULE_NAME, "leadfeed.py")
 runner = _load(RUNNER_MODULE_NAME, "runner.py")
 ask = _load(ASK_MODULE_NAME, "ask.py")
 failures = _load(FAILURES_MODULE_NAME, "failures.py")
@@ -790,8 +792,13 @@ def digest(
         "- этапы поднимай инструментами `duty` (`duty_plan`, `duty_start`, `duty_wait`, `duty_close`),",
         "  отчёты бери путями, а не пересказом: полный текст — в файле;",
         "- если ждёшь работу — `duty_wait` с курсором, это дешевле опроса;",
-        "- если дело надо остановить или спросить человека — это `duty_ask_human` и `duty_close`.",
     ]
+    # Перенос работы — одна строка и только пока он не сделан: закрытие переносит
+    # само, но лид, который решил публиковать, обязан назвать перенос до неё.
+    hint = leadfeed.integrate_hint(events)
+    if hint:
+        lines.append(f"- {hint};")
+    lines.append("- если дело надо остановить или спросить человека — это `duty_ask_human` и `duty_close`.")
     return "\n".join(lines) + "\n"
 
 
@@ -849,6 +856,13 @@ def brief(
         "- этапы запускай `duty_start(stage_id, idempotency_key)`; работу жди `duty_wait(cursor, timeout_sec)`;",
         "- вопросы воркеров приходят фактами в `duty_wait`: отвечай `duty_answer`, делегируй `duty_ask`,",
         "  властное — `duty_ask_human`;",
+        "- работу дела переноси в рабочую ветку: `duty_integrate(reason, idempotency_key)` — перенос из",
+        "  `duty/<id>` в ветку, где стоит репозиторий; закрытие переносит само, но назови перенос явно и",
+        "  **до** публикации, иначе работа останется в ветке, которую человек не читает;",
+        "- публикация — только этап роли `publisher`, и только после ответа человека: гейт `kind: gate` с",
+        "  `ask.q`/`ask.options` и `allow`, потом этап публикатора. Планом публикация добавляется лишь при",
+        "  `charter.publish.plan: true` (и с гейтом в `needs`), иначе она объявляется seed-спекой;",
+        "- пуш, MR и тег без явного «ок» человека не делаются;",
         "- закрывай дело сам: `duty_close(summary, verdict, idempotency_key)`;",
     ]
     return "\n".join(lines) + "\n"

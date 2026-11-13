@@ -2104,6 +2104,36 @@ def test_parse_plan_cannot_add_publishing_stage():
     assert "plan.publish" in {issue.rule for issue in found}
 
 
+def test_parse_plan_adds_publish_with_the_charter_and_a_seed_gate():
+    """Публикация планом: право хартии, имя роли и гейт в предках — и ничего меньше.
+
+    Гейт вправе быть этапом seed, а не предложения: `_publish_gate_ids` ходит по
+    рёбрам объединённого графа, поэтому план может сослаться на `ask-human`,
+    объявленный файлом.
+    """
+    gate = spec_module.Stage(
+        id="ask-human",
+        kind="gate",
+        role="",
+        needs=("plan",),
+        allow=("да",),
+        ask=spec_module.Ask(q="публикуем?", options=("да", "нет")),
+    )
+    base = dict(BASE_STAGES, **{"ask-human": gate})
+    charter = spec_module.Charter(
+        allowed_roles=("implementer", "publisher"),
+        publish=spec_module.Publish(plan=True, declared=True),
+    )
+    proposal = [{"id": "publish", "role": "publisher", "workspace": "none", "needs": ["ask-human"]}]
+
+    accepted, issues = spec_module.parse_plan(proposal, charter=charter, base_stages=base)
+    assert [issue.rule for issue in issues] == []
+    assert [stage.id for stage in accepted] == ["publish"]
+
+    _, refused = spec_module.parse_plan(proposal, charter=spec_module.Charter(), base_stages=base)
+    assert "plan.publish" in {issue.rule for issue in refused}
+
+
 def test_parse_plan_cannot_add_the_coordinator_as_a_worker():
     """Координатор ведёт граф, а не работу: этап-исполнитель им — отказ.
 

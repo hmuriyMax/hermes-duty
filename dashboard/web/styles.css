@@ -716,7 +716,7 @@ pre.body {
    шкала читалась и в тёмной, и в светлой теме. */
 /* Ось и сетка начинаются там же, где дорожки: колонка имени этапа слева — одна
  * ширина на всё (--tl-name + gap), иначе шкала «заходила» на подпись. */
-.scale-wrap, .scale-main { min-width: 0; }
+.scale-wrap, .scale-main { container-type: inline-size; min-width: 0; }
 /* Шкала: дорожки слева, легенда семейств — правой колонкой, как в макете `d-merge`
  * (статистика инструментов стояла сбоку справа, а не над дорожками). */
 .scale-wrap { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; align-items: start; --tl-name: 150px; --tl-gap: 8px; --tl-plot-pad: 64px; }
@@ -1273,17 +1273,30 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 .tl-row:not(:has(.tl-band:hover, .tl-call:hover, .tl-att:hover)):not(:focus-visible) .tl-call.tl-dim { opacity: .18; }
 
 /* Пустая дорожка: подпись стоит по центру видимой части шкалы и не уезжает при
-   горизонтальной прокрутке — она про этап, а не про время (Макс, 14.11). */
+   горизонтальной прокрутке — она про этап, а не про время (Макс, 14.11).
+   Ящик липкий и нулевой ширины: текст центруется на нём и вбок не едет, а нулевая
+   ширина даёт липкости весь запас хода (с шириной она упиралась в конец дорожки
+   и уползала влево у правой кромки). */
 .tl-row-empty {
   position: sticky;
-  left: calc(var(--tl-name, 150px) + var(--tl-gap, 8px));
-  max-width: 100%;
-  width: calc(var(--tl-view, 100%) - var(--tl-name, 150px) - var(--tl-gap, 8px));
-  display: flex;
-  justify-content: center;
+  /* 100cqw — видимая ширина шкалы: контейнером объявлен сам скроллер, поэтому
+     подпись переживает и прокрутку, и изменение окна без пересчёта в JS. */
+  left: calc(
+    var(--tl-name, 150px) + var(--tl-gap, 8px) +
+      (100cqw - var(--tl-name, 150px) - var(--tl-gap, 8px)) / 2
+  );
+  width: 0;
+  height: 20px;
+  overflow: visible;
   font-size: 11.5px;
   color: var(--text-3);
-  background: var(--card);
+}
+.tl-row-empty > .tl-row-empty-t {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  white-space: nowrap;
 }
 
 /* --------------------------------------------- плавность дела (вход/уход/сдвиг)

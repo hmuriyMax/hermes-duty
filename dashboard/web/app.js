@@ -2513,7 +2513,7 @@ function leadLaneNode(leadLane, scale) {
             ),
           ),
         )
-      : h('div', { class: 'tl-row-empty' }, 'заходов не было'),
+      : h('div', { class: 'tl-row-empty' }, h('span', { class: 'tl-row-empty-t' }, 'заходов не было')),
   )
 }
 
@@ -2559,7 +2559,7 @@ function laneNode(lane, bars, scale) {
     { class: 'tl-lane', 'data-key': `lane:${lane.key}` },
     head,
     view.empty
-      ? h('div', { class: 'tl-row-empty' }, 'попыток не было')
+      ? h('div', { class: 'tl-row-empty' }, h('span', { class: 'tl-row-empty-t' }, 'попыток не было'))
       : h('div', { class: 'tl-rows' }, ...view.rows.map((row) => attemptRowNode(row.view, `attempt:${row.key}`))),
   )
 }
@@ -3429,10 +3429,6 @@ function fitScaleGutter(root, dealKey) {
   for (const head of root.querySelectorAll('.tl-lane-head')) {
     for (const child of head.children) namePx = Math.max(namePx, child.scrollWidth || child.getBoundingClientRect().width || 0)
   }
-  // Видимая ширина шкалы: по ней центруются подписи пустых дорожек, и при
-  // горизонтальной прокрутке они остаются на месте.
-  const scroller = root.querySelector('.scale-main')
-  if (scroller) wrap.style.setProperty('--tl-view', `${scroller.clientWidth}px`)
   if (!namePx) return
   scaleGutterSeen.namePx = Math.max(scaleGutterSeen.namePx || 0, namePx)
   const named = Math.min(300, Math.max(96, Math.ceil(scaleGutterSeen.namePx) + 8))

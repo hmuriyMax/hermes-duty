@@ -4449,7 +4449,7 @@ function DutyLeadLane({ leadLane }) {
             ),
           ),
         )
-      : h('div', { className: 'duty-tl-empty' }, 'заходов не было'),
+      : h('div', { className: 'duty-tl-empty' }, h('span', null, 'заходов не было')),
   )
 }
 
@@ -4492,7 +4492,7 @@ function DutyLane({ lane, bars, scale, callSel, onSelectCall, toolFilter }) {
       ),
     ),
     view.empty
-      ? h('div', { className: 'duty-tl-empty' }, 'попыток не было')
+      ? h('div', { className: 'duty-tl-empty' }, h('span', null, 'попыток не было'))
       : h(
           'div',
           { className: 'duty-tl-rows' },
@@ -4769,7 +4769,8 @@ const CSS = `
  * не нужно, а на hover-развороте чипы доезжают на свои уровни. */
 .duty-tl-row:focus-visible{outline:2px solid var(--ui-accent);outline-offset:1px}
 /* Колонки подписи фиксированы: иначе статус разной ширины двигал время в каждой строке. */
-.duty-tl-empty{position:sticky;left:calc(var(--duty-tl-name,150px) + var(--duty-tl-gap,8px));max-width:100%;width:calc(var(--duty-tl-view,100%) - var(--duty-tl-name,150px) - var(--duty-tl-gap,8px));display:flex;justify-content:center;background:var(--ui-bg-primary,#1a1a1a)}
+.duty-tl-empty{position:sticky;left:calc(var(--duty-tl-name,150px) + var(--duty-tl-gap,8px) + (100cqw - var(--duty-tl-name,150px) - var(--duty-tl-gap,8px)) / 2);width:0;height:20px;overflow:visible}
+.duty-tl-empty>span{position:absolute;left:0;top:50%;transform:translate(-50%,-50%);white-space:nowrap}
 .duty-tl-att{position:absolute;top:50%;transform:translate(-100%,-50%);display:inline-flex;align-items:center;gap:4px;padding:0 4px 0 2px;height:14px;line-height:14px;white-space:nowrap;font-variant-numeric:tabular-nums;border-radius:3px;background:color-mix(in srgb, var(--ui-bg-primary,#1a1a1a) 86%, transparent);pointer-events:none;z-index:4}
 .duty-tl-att.is-inside{transform:translate(0,-50%);padding:0 2px 0 4px}
 
@@ -4884,7 +4885,7 @@ const CSS = `
 .duty-deal-head-top{align-items:flex-start}
 .duty-deal-head-side{display:flex;align-items:center;gap:8px;flex:none}
 .duty-scale-wrap{display:grid;grid-template-columns:minmax(0, 1fr) auto;gap:14px;align-items:start}
-.duty-scale-main{min-width:0}
+.duty-scale-main{min-width:0;container-type:inline-size}
 .duty-scale-side{display:flex;flex-direction:column;gap:1px;min-width:104px;padding-left:10px;border-left:1px solid var(--ui-stroke-tertiary);font-size:10px;color:var(--ui-text-tertiary);line-height:1.45}
 .duty-spec-strip-name{font-size:10px;color:var(--ui-text-tertiary);text-align:left;white-space:nowrap}
 .duty-spec-graph{display:block;width:auto;height:auto;max-width:100%;overflow:visible;fill:none;stroke:none}
@@ -5985,9 +5986,6 @@ function ScalePanel({ scale, dealId, callSel, onSelectCall, toolFilter, onToggle
         for (const head of root.querySelectorAll('.duty-tl-lane-head')) {
           for (const child of head.children) namePx = Math.max(namePx, child.scrollWidth || child.getBoundingClientRect().width || 0)
         }
-        // Видимая ширина шкалы — по ней центруются подписи пустых дорожек.
-        const scrollerEl = root.querySelector('.duty-scale-main')
-        if (scrollerEl) wrap.style.setProperty('--duty-tl-view', `${scrollerEl.clientWidth}px`)
         if (namePx) {
           seen.namePx = Math.max(seen.namePx || 0, namePx)
           wrap.style.setProperty('--duty-tl-name', `${Math.min(300, Math.max(96, Math.ceil(seen.namePx) + 8))}px`)

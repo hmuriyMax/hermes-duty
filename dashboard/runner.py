@@ -2447,10 +2447,39 @@ def read_result(path: Path) -> tuple[Optional[dict[str, Any]], str]:
 
 RESULT_FENCE_RE = re.compile(r"```(?:json)?[ \t]*\r?\n(.*?)```", re.DOTALL)
 
+# Проза последней реплики рядом с `result.json`: отчёт, который не разобрался,
+# остаётся доказательством работы — иначе папка попытки пуста, а «работы не было».
+REPORT_TXT = "report.txt"
+
 RESCUE_COMMENT = (
     "отчёт не был записан файлом — у роли нет write_file (read-only профиль); "
     "раннер вынул его из финального ответа попытки и записал сам"
 )
+
+
+def _report_object(candidate: str) -> Optional[dict[str, Any]]:
+    """Отчёт из куска ответа: объект целиком или срез от первой `{` до последней `}`.
+
+    Два приёма по одному делу. `strict=False` — в текстах моделей бывают
+    управляющие символы (тот же разбор уже стоит в
+    `~/.hermes/scripts/afk-chatzone-watch.py`): перевод строки внутри `summary`
+    ломал отчёт при строгом `json.loads`. Срез нужен, когда модель обернула
+    объект пояснением — «Итог: {…}», проза внутри фенса. Поле `status`
+    по-прежнему обязательно: без него кусок текста — пример в рассуждении, а не
+    отчёт, и спасать его нельзя.
+    """
+    forms = [candidate]
+    start, end = candidate.find("{"), candidate.rfind("}")
+    if 0 <= start < end:
+        forms.append(candidate[start : end + 1])
+    for form in forms:
+        try:
+            data = json.loads(form, strict=False)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(data, dict) and str(data.get("status") or "").strip():
+            return data
+    return None
 
 
 def rescue_report(result_file: Optional[Path], says: list[str]) -> Optional[str]:
@@ -2471,22 +2500,57 @@ def rescue_report(result_file: Optional[Path], says: list[str]) -> Optional[str]
     path = Path(result_file)
     if path.is_file():
         return None
+    forms: list[str] = []
     for text in reversed(says):
         candidates: list[str] = []
         stripped = text.strip()
         if stripped.startswith("{"):
             candidates.append(stripped)
         candidates.extend(fence.strip() for fence in RESULT_FENCE_RE.findall(text))
-        for candidate in reversed(candidates):
-            try:
-                data = json.loads(candidate)
-            except (TypeError, ValueError):
-                continue
-            if isinstance(data, dict) and str(data.get("status") or "").strip():
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-                return RESCUE_COMMENT
+        forms.extend(reversed(candidates))
+    # Срез прозы — только у ПОСЛЕДНЕЙ непустой реплики и последней формой: фенс
+    # ранней реплики ещё можно защищать как «вот отчёт», а прозу — нет. Иначе
+    # пример формы из рассуждения («вот форма: {…}») выигрывал бы у настоящего
+    # отчёта, который не разобрался, — то есть спасал бы не тот JSON.
+    last = next((text.strip() for text in reversed(says) if text.strip()), "")
+    if "{" in last:
+        forms.append(last)
+    for form in forms:
+        data = _report_object(form)
+        if data is None:
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        return RESCUE_COMMENT
     return None
+
+
+def save_report_text(result_file: Optional[Path], says: list[str]) -> Optional[Path]:
+    """Последняя реплика попытки — файлом `report.txt`, когда отчёт не разобрался.
+
+    Неэкранированную кавычку в `summary` не спасает никакой разбор: такой JSON
+    просто невалиден. Тогда попытка падает контрактом, но её текст остаётся
+    файлом, а причина отказа называет путь — читается «отчёт не в форме», а не
+    «работы не было» (дело d_f50a120f research#1: 25 200 206 токенов и пустая
+    папка попытки). Путь уезжает в `previous_failures` следующей попытки тем же
+    полем `reason`. Писать нечего — `None`.
+    """
+    if result_file is None:
+        return None
+    text = ""
+    for said in reversed(says):
+        text = said.strip()
+        if text:
+            break
+    if not text:
+        return None
+    path = Path(result_file).parent / REPORT_TXT
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text + "\n", encoding="utf-8")
+    except OSError:
+        return None
+    return path
 
 
 def classify(
@@ -4601,6 +4665,15 @@ def finish_agent_stage(
             now=_now_sec(int(clock())),
         )
     result, result_error = read_result(result_file)
+    prose: Optional[Path] = None
+    if result is None:
+        # Отчёт не в форме (не разобрался): проза попытки остаётся файлом, а
+        # причина называет путь. Отказ читается «отчёт не в форме», а не
+        # «работы не было», и путь уезжает в `previous_failures` следующей
+        # попытки — тем же полем `reason` (`_attempt_failures`).
+        prose = save_report_text(result_file, followed.says)
+        if prose is not None:
+            result_error = f"{result_error}; отчёт не в форме: последняя реплика сохранена в {prose}"
     outcome, kind, reason = classify(
         result=result,
         result_error=result_error,
@@ -4751,6 +4824,10 @@ def finish_agent_stage(
             "branch": branch or None,
             "branch_error": branch_error or None,
             "stderr_path": str(stderr_file) if stderr_file is not None else None,
+            # Проза попытки, не ставшая отчётом (не разобралась): путь нужен и
+            # тогда, когда причину написал класс (`infra`) и `result_error` не
+            # дошёл до события, — иначе файл лежит безымянным.
+            "report_path": str(prose) if prose is not None else None,
             "verdict": verdict.as_payload() if verdict is not None else None,
             # Чем этап назвал работу, когда пакет принят (`evidence.witness`):
             # `commit|artifacts`, `verdict` или `published`. Без этого поля в

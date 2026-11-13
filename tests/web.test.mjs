@@ -1458,3 +1458,79 @@ test('веб: заходы лида стоят на шкале отдельно�
   assert.match(runs[1].getAttribute('data-tip'), /резюм/)
   assert.ok(Number.parseFloat(runs[1].style.left) > Number.parseFloat(runs[0].style.left), 'полосы не в порядке времени')
 })
+
+test('веб: отказ плана стоит под графом, раскрывается причинами и уходит после приёмки', async (t) => {
+  // Живое дело d_12d5fc44: план отклоняли дважды, а экран говорил только
+  // «coordinator: running». Причина обязана стоять на экране одной строкой,
+  // полный список — раскрытием, счётчики кругов — в подсказке истории.
+  if (!jsdomRoot()) return t.skip('нет jsdom в ~/.hermes/hermes-agent/node_modules')
+  const { detail, attempts } = verdictClosedDeal()
+  detail.status = 'running'
+  detail.terminal = false
+  detail.deal = {
+    id: DEAL_ID,
+    status: 'running',
+    waiting: { state: 'working', evidence: 'попытка идёт' },
+    plan: {
+      proposals: 2,
+      rejections: 2,
+      limit: 3,
+      exhausted: false,
+      refusal: {
+        at: DEAL_T0 + 60,
+        round: 2,
+        why: 'план ревизии 2 отклонён: отказов 1',
+        issues: ["plan.evidence: этап 'fix' что-то производит, а evidence пуст"],
+        more: 0,
+      },
+    },
+  }
+  detail.decisions = [
+    { kind: 'plan_rejected', at: DEAL_T0 + 60, author: 'lead', text: 'план ревизии 2 отклонён: отказов 1' },
+  ]
+  const doc = await renderDealPanel(detail, attempts)
+
+  const line = doc.querySelector('[data-key="fact:plan"]')
+  assert.ok(line, 'в шапке дела нет строки отказа плана')
+  assert.equal(line.tagName.toLowerCase(), 'details', 'причина не раскрывается')
+  assert.ok(line.closest('.deal-head'), 'строка отказа стоит вне шапки (под графом)')
+  const summary = line.querySelector('summary')
+  assert.match(summary.textContent, /план отклонён: plan\.evidence/, `первая причина не та: ${summary.textContent}`)
+  // Лимит не исчерпан — строка не обещает «больше нет» и не считает чужие круги.
+  assert.ok(!/пересборок плана больше нет/.test(summary.textContent), 'упёршийся лимит назван без причины')
+  const issues = [...line.querySelectorAll('.plan-issues li')].map((item) => item.textContent)
+  assert.deepEqual(issues, ["plan.evidence: этап 'fix' что-то производит, а evidence пуст"], 'полный список причин не раскрыт')
+  // Счётчики истории — в подсказке журнала решений: строка уходит, история нет.
+  const story = doc.querySelector('[data-key="decisions"] .scale-log-title')
+  assert.match(story.getAttribute('title'), /кругов плана: 2, отказов: 2/, 'подсказка истории без счётчиков плана')
+  assert.equal(line.getAttribute('title'), 'кругов плана: 2, отказов: 2')
+
+  // Исчерпанный лимит называется словами, остаток причин — числом.
+  detail.deal.plan = {
+    ...detail.deal.plan,
+    limit: 1,
+    exhausted: true,
+    refusal: { ...detail.deal.plan.refusal, issues: ['a', 'b', 'c', 'd', 'e'], more: 1 },
+  }
+  const tight = await renderDealPanel(detail, attempts)
+  const tightLine = tight.querySelector('[data-key="fact:plan"]')
+  assert.match(tightLine.querySelector('summary').textContent, /план отклонён: a \(\+1\)/, 'остаток причин не посчитан')
+  assert.match(tightLine.querySelector('summary').textContent, /пересборок плана больше нет/)
+  assert.ok(tightLine.className.includes('t-red'), `тон исчерпанного лимита: ${tightLine.className}`)
+  assert.match(tightLine.querySelector('.plan-more').textContent, /ещё 1/)
+
+  // План принят после отказов: строки нет, счётчики в подсказке истории остались.
+  detail.deal.plan = { proposals: 3, rejections: 2, limit: 3, exhausted: false }
+  const accepted = await renderDealPanel(detail, attempts)
+  assert.equal(accepted.querySelector('[data-key="fact:plan"]'), null, 'строка отказа осталась после приёмки плана')
+  assert.match(
+    accepted.querySelector('[data-key="decisions"] .scale-log-title').getAttribute('title'),
+    /кругов плана: 3, отказов: 2/,
+    'история кругов пропала вместе со строкой отказа',
+  )
+
+  // Плана не отклоняли — строки нет вовсе.
+  detail.deal = { id: DEAL_ID, status: 'running', waiting: { state: 'working' } }
+  const clean = await renderDealPanel(detail, attempts)
+  assert.equal(clean.querySelector('[data-key="fact:plan"]'), null, 'строка отказа нарисована без отказа')
+})

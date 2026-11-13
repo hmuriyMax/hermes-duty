@@ -343,6 +343,9 @@ function shapeDeal(deal) {
     // дошёл, бэкенд отвечает «нет фактов» — это честный ответ, а не выдуманное
     // «жив». Слово и доказательство целиком бэкендовы (`leadfeed.status`).
     lead: shapeLead(d.lead),
+    // План дела (`plan`): отказ плана с причинами и счётчики кругов. `null` —
+    // плана не отклоняли; строка экрана рисуется только при `refused`.
+    plan: shapePlan(d.plan),
     attemptAge,
     attemptAgeText: fmtAge(attemptAge),
     attemptNote,
@@ -416,6 +419,53 @@ function shapeLead(block) {
     stale: b.stale === true,
     reason: String(b.reason || ''),
     known: state !== 'unknown',
+  }
+}
+
+/**
+ * Блок `plan` ответа `/deal` — отказ плана на экране дела.
+ *
+ * Бэкенд (`stagefeed.plan`) отдаёт факты журнала: сколько раз лид предлагал
+ * план (`proposals`), сколько раз его отклоняли (`rejections`, `refusals`),
+ * последний ещё не снятый приёмкой отказ (`refusal`) и исчерпан ли лимит
+ * пересборок (`exhausted`). Шейпер собирает из них одну строку: причина —
+ * первая, число остальных — в `(+N)`, полный список — в раскрытии.
+ *
+ * `null` — плана не отклоняли: пустая строка «отказ был, но без причины» хуже,
+ * чем её отсутствие (тот же довод, что у блока `lead`).
+ *
+ * Счётчики (`counts`, `hint`) живут и после приёмки плана: строка с причиной
+ * уходит, а «кругов плана: K, отказов: M» остаётся в подсказке истории —
+ * иначе дело, пережившее два отказа, выглядело бы как пришедшее с первого раза.
+ */
+function shapePlan(block) {
+  const b = block && typeof block === 'object' ? block : null
+  if (!b) return null
+  const proposals = Number(b.proposals) || 0
+  const rejections = Number(b.rejections) || 0
+  const exhausted = b.exhausted === true
+  const refusal = b.refusal && typeof b.refusal === 'object' ? b.refusal : null
+  const issues = (refusal && Array.isArray(refusal.issues) ? refusal.issues : [])
+    .map((item) => String(item || '').trim())
+    .filter(Boolean)
+  const more = refusal ? Number(refusal.more) || 0 : 0
+  const counts = `кругов плана: ${proposals}, отказов: ${rejections}`
+  // «Ещё пробует» и «упёрся» — разные состояния, и второе называет словами:
+  // это вердикт движка по `charter.max_rounds_replan` (`stagefeed.plan`).
+  const note = exhausted ? 'пересборок плана больше нет' : ''
+  const first = issues.length ? issues[0] : refusal ? String(refusal.why || '').trim() : ''
+  return {
+    refused: Boolean(refusal),
+    round: refusal ? Number(refusal.round) || 0 : 0,
+    at: refusal ? numOrNull(refusal.at) : null,
+    issues,
+    more,
+    moreText: more ? `ещё ${more}` : '',
+    counts,
+    note,
+    hint: [counts, note].filter(Boolean).join(' · '),
+    text: refusal ? `план отклонён: ${first || 'причина не записана'}${more ? ` (+${more})` : ''}` : '',
+    tone: exhausted ? 'red' : 'yellow',
   }
 }
 
@@ -4050,6 +4100,7 @@ export {
   fmtClock,
   shapeDeal,
   shapeLead,
+  shapePlan,
   shapeDecisions,
   decisionsCount,
   decisionGroups,

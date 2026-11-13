@@ -44,6 +44,7 @@ import {
   shapeSilences,
   shapeDeal,
   shapeLead,
+  shapePlan,
   shapeDecisions,
   decisionsCount,
   decisionGroups,
@@ -3506,4 +3507,79 @@ test('дорожка лида: без фактов лида дорожка мо�
   const scale = shapeDealTime({ now: 1_600, terminal: true, timeline: [{ kind: 'created', at: 1_000, summary: '' }] }, { attempts: [] })
   assert.deepEqual(scale.leadLane.runs, [])
   assert.equal(scale.leadLane.text, 'заходов не было')
+})
+
+test('план: причина стоит первой, остальные считаются, счётчики остаются в подсказке', () => {
+  // Живое дело d_12d5fc44: два отказа, у первого — шесть строк валидатора.
+  // Экран обязан назвать причину одной строкой и не потерять остальные.
+  const block = {
+    proposals: 3,
+    rejections: 2,
+    limit: 3,
+    exhausted: false,
+    refusal: {
+      at: 1_794_532_252,
+      round: 2,
+      why: 'план ревизии 2 отклонён: отказов 1',
+      issues: ["plan.evidence: этап 'fix' что-то производит, а evidence пуст"],
+      more: 0,
+    },
+  }
+  const plan = shapePlan(block)
+  assert.equal(plan.refused, true)
+  assert.equal(plan.tone, 'yellow')
+  assert.equal(plan.round, 2)
+  assert.equal(plan.text, "план отклонён: plan.evidence: этап 'fix' что-то производит, а evidence пуст")
+  assert.equal(plan.more, 0)
+  assert.equal(plan.moreText, '')
+  // Счётчики читаются и на экране, и в подсказке истории — после приёмки плана.
+  assert.equal(plan.counts, 'кругов плана: 3, отказов: 2')
+  // «Ещё пробует» слов не добавляет: лимит не исчерпан, и выдумывать «2 из 3»
+  // из двух чисел проекция не берётся — это не её счётчик.
+  assert.equal(plan.note, '')
+  assert.equal(plan.hint, 'кругов плана: 3, отказов: 2')
+
+  // Список обрезан числом, а не молча: пять строк плюс «ещё 1».
+  const many = shapePlan({ ...block, refusal: { ...block.refusal, issues: ['a', 'b', 'c', 'd', 'e'], more: 1 } })
+  assert.equal(many.issues.length, 5)
+  assert.equal(many.more, 1)
+  assert.equal(many.moreText, 'ещё 1')
+  assert.match(many.text, /^план отклонён: a \(\+1\)$/)
+
+  // Отказ без строк валидатора называет свою причину (`why`), а не пустоту.
+  const bare = shapePlan({ ...block, refusal: { at: 1, round: 1, why: 'план ревизии 1 отклонён', issues: [], more: 0 } })
+  assert.equal(bare.text, 'план отклонён: план ревизии 1 отклонён')
+
+  // Плана не отклоняли — блока нет вовсе, а не пустая строка.
+  assert.equal(shapePlan(null), null)
+  assert.equal(shapeDeal({ id: 'd_aaaaaa', waiting: { state: 'working' } }).plan, null)
+})
+
+test('план: принятый план убирает строку, история кругов остаётся', () => {
+  const plan = shapePlan({ proposals: 3, rejections: 2, limit: 3, exhausted: false })
+  assert.equal(plan.refused, false, 'после приёмки строка с причиной обязана уйти')
+  assert.equal(plan.text, '')
+  assert.deepEqual(plan.issues, [])
+  assert.equal(plan.counts, 'кругов плана: 3, отказов: 2')
+  assert.equal(plan.hint, 'кругов плана: 3, отказов: 2')
+
+  // `shapeDeal` переносит блок в шапку дела: веб и десктоп читают один шейпер.
+  const row = shapeDeal({ id: 'd_aaaaaa', waiting: { state: 'working' }, plan: { proposals: 1, rejections: 1, limit: 0, refusal: { at: 1, round: 1, why: 'план отклонён', issues: [], more: 0 } } })
+  assert.equal(row.plan.refused, true)
+  assert.equal(row.plan.note, '', 'лимита нет — слов про лимит не выдумывается')
+})
+
+test('план: исчерпанный лимит пересборок назван словами, а не числом', () => {
+  // «Ещё пробует» и «упёрся» — разные состояния: движок сверх
+  // `charter.max_rounds_replan` останавливает дело, и экран обязан это сказать.
+  const plan = shapePlan({
+    proposals: 2,
+    rejections: 1,
+    limit: 1,
+    exhausted: true,
+    refusal: { at: 1, round: 1, why: '', issues: ['plan.evidence: пуст'], more: 0 },
+  })
+  assert.equal(plan.note, 'пересборок плана больше нет')
+  assert.equal(plan.tone, 'red')
+  assert.equal(plan.hint, 'кругов плана: 2, отказов: 1 · пересборок плана больше нет')
 })

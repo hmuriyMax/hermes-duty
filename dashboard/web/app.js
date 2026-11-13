@@ -1981,7 +1981,7 @@ function stageBlockNode(dealId, stage, timeline, rebuild) {
  * первым, а журнальный порядок остался в терминале. Пустая лента не рисуется:
  * «решений нет» на экране свежего дела — шум, а не факт.
  */
-function decisionsSection(items) {
+function decisionsSection(items, plan) {
   const total = decisionsCount(items)
   if (!total) return null
   const rows = shapeDecisions(items)
@@ -2018,7 +2018,7 @@ function decisionsSection(items) {
     h(
       'div',
       { class: 'scale-log-h' },
-      h('span', { class: 'scale-log-title' }, `решения лида · ${total}`),
+      h('span', { class: 'scale-log-title', title: plan ? plan.hint : '' }, `решения лида · ${total}`),
       h('span', { class: 'muted' }, 'свежие сверху'),
       h('span', { class: 'tl-spacer' }),
       // Фильтр — чипы семейств с числами: вопрос к ленте формулируется один раз
@@ -2624,7 +2624,7 @@ function specStrip(spec) {
  * Панель шкалы времени: подписанная ось, дорожка на этап, полосы попыток и лента
  * маркеров. Геометрия приходит посчитанной (`shapeDealTime`); здесь только DOM.
  */
-function scalePanel(scale, decisions) {
+function scalePanel(scale, decisions, plan) {
   // Индекс вызовов: чип и инспектор читают один и тот же вид (`attemptView`).
   dutyCallIndex.clear()
   for (const bar of scale.bars) {
@@ -2776,7 +2776,7 @@ function scalePanel(scale, decisions) {
       // Журнал решений — внизу той же панели, а не второй полосой во всю ширину:
       // это тот же разговор «что произошло», только словами, и он читается сразу
       // под дорожками, к которым относится.
-      decisionsSection(decisions),
+      decisionsSection(decisions, plan),
     ),
   )
   // Фильтр, выбранный в легенде, переживает перерисовку данных: экран
@@ -2863,6 +2863,35 @@ function wireScalePanel(panel) {
   })
 }
 
+/**
+ * Строка отказа плана под графом дела.
+ *
+ * Живое дело d_12d5fc44: план отклоняли дважды (04:09:26 и 04:10:52), а экран
+ * всё это время говорил «coordinator: running» — без плана, без причины, без
+ * счёта кругов. Причина — первая строка отказа, остальные считаются в `(+N)`,
+ * полный список раскрывается: `details`/`summary` живут без обработчика, и
+ * тихий тик, перерисовывая голову, не сбрасывает раскрытие.
+ *
+ * После принятого плана строки нет вовсе (`shapePlan.refused`): счётчики кругов
+ * и отказов остаются в подсказке истории решений (`plan.hint`).
+ */
+function planLine(plan) {
+  return h(
+    'details',
+    { class: `plan-refusal t-${plan.tone}`, 'data-key': 'fact:plan', title: plan.hint },
+    h(
+      'summary',
+      null,
+      plan.text,
+      plan.note ? h('span', { class: 'plan-note' }, ` · ${plan.note}`) : null,
+    ),
+    plan.issues.length
+      ? h('ul', { class: 'plan-issues' }, ...plan.issues.map((item) => h('li', null, item)))
+      : null,
+    plan.moreText ? h('div', { class: 'plan-more muted' }, plan.moreText) : null,
+  )
+}
+
 function viewDeal(dealId) {
   if (dealSnap.error && !dealSnap.data) {
     return h(
@@ -2907,6 +2936,9 @@ function viewDeal(dealId) {
           h('h1', null, data.title || '—'),
         ),
         specStrip(scale.spec),
+        // Отказ плана — строкой под графом: граф говорит «этапы такие», отказ
+        // говорит «почему их до сих пор нет». Строка уходит после приёмки плана.
+        deal && deal.plan && deal.plan.refused ? planLine(deal.plan) : null,
       ),
       h(
         'div',
@@ -2984,7 +3016,7 @@ function viewDeal(dealId) {
     h('div', { style: 'margin-bottom:10px' }, h('a', { href: '#/deal' }, '← к списку дел')),
     head,
     kpiStrip(scale),
-    scalePanel(scale, data.decisions),
+    scalePanel(scale, data.decisions, deal && deal.plan),
     left ? h('div', { class: 'deal-cols' }, left, stages) : stages,
   )
 }

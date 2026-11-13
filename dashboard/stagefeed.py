@@ -28,6 +28,8 @@
   heartbeat'ом, а срок в `attempt_started` — только начальный;
 - `current(...)` — этап и номер попытки для среза `/now`: «что сейчас» видно без
   открытия дела;
+- `plan(...)` — что было с планом: круги, отказы с причинами и «пересборок
+  больше нет», если лимит исчерпан (`charter.max_rounds_replan`);
 - `spec_of(...)` — спека, записанная в журнале при создании дела
   (`created.payload.spec`): путь к графу берётся из журнала, а не угадывается.
 
@@ -102,6 +104,19 @@ LIVE = "live"
 DEAD = "dead"
 UNKNOWN = "unknown"
 
+# Факты плана (`docs/JOURNAL.md`): предложение, решение по нему и переосмысление
+# дела лидом (`plan_rethink` — свой счётчик пересборок, его считает движок).
+# Экран спрашивает журнал о них, потому что «дело стоит» и «дело пробует ещё
+# раз» — разные состояния, и различить их можно только по отказам.
+PLAN_PROPOSED = "plan_proposed"
+PLAN_ACCEPTED = "plan_accepted"
+PLAN_REJECTED = "plan_rejected"
+
+# Сколько причин отказа печатаем списком. Остальные не теряются, а называются
+# числом: отказ живого дела d_12d5fc44 — шесть строк валидатора, и они не должны
+# ни пропадать, ни растягивать строку экрана.
+MAX_PLAN_ISSUES = 5
+
 # Причины, по которым ленты может не быть. Текст уходит в `note` как есть: экран
 # печатает его рядом с пустым списком, поэтому «нет спеки» и «спека не читается»
 # остаются различимыми.
@@ -161,6 +176,106 @@ def spec_of(events: Iterable[Any]) -> Optional[str]:
         if isinstance(path, str) and path.strip():
             return path.strip()
     return None
+
+
+def _plan_engine(events: list[dict[str, Any]]) -> tuple[int, bool]:
+    """Хартийный лимит пересборок и вердикт движка: `(limit, exhausted)`.
+
+    Оба ответа — факты, а не пересчёт проекции. `limit` живёт в хартии спеки, а
+    спека названа журналом (`spec_of`); `exhausted` — то, что движок сам записал
+    в причину этапа плана (`transit._plan_fact`: «репланов N больше
+    max_rounds_replan=M»), когда сверх лимита остановил дело `failed(contract)`.
+
+    Второй счётчик здесь не заводится намеренно. Отказы и переосмысления
+    (`plan_rethink`) жгут общий счётчик `charter.max_rounds_replan`, а свёртка
+    считает его только пока предложение называет этап плана: живой журнал
+    `d_12d5fc44` писал четвёртую ревизию с `source_stage: lead`, такого этапа в
+    графе нет, и движок эти два факта не сосчитал (2 из 3). Свой счётчик дал бы
+    «упёрся» там, где движок ещё шёл, — поэтому экран спрашивает движок.
+    """
+    path = spec_of(events)
+    if not path:
+        return 0, False
+    try:
+        spec = spec_module.load_spec(Path(path).expanduser())
+    except Exception:  # noqa: BLE001 - лимит не повод ронять карточку
+        return 0, False
+    limit = _int(getattr(getattr(spec, "charter", None), "max_rounds_replan", 0))
+    try:
+        states = transit.stage_states(spec, events)
+    except Exception:  # noqa: BLE001 - вердикт движка не повод ронять карточку
+        return limit, False
+    # Нулевой лимит тоже лимит: движку не разрешена ни одна пересборка, и первую
+    # же он встречает причиной «репланов N больше max_rounds_replan=0».
+    stopped = any("max_rounds_replan" in str(state.reason or "") for state in states.values())
+    return limit, stopped
+
+
+def _refusal(event: dict[str, Any], payload: dict[str, Any], round_number: int) -> dict[str, Any]:
+    """Один отказ плана в форме ответа: когда, какой круг и за что.
+
+    Строки `issues` — те же, что напечатал `spec.parse_plan` (тексты отказов не
+    переписываются: экран показывает причину, а не своё её понимание). Сверх
+    `MAX_PLAN_ISSUES` строки считаются полем `more`, а не выбрасываются.
+    """
+    issues = [str(item).strip() for item in payload.get("issues") or () if str(item).strip()]
+    return {
+        "at": _int(event.get("ts")),
+        "round": round_number,
+        "why": str(payload.get("why") or ""),
+        "issues": issues[:MAX_PLAN_ISSUES],
+        "more": max(0, len(issues) - MAX_PLAN_ISSUES),
+    }
+
+
+def plan(events: Iterable[Any]) -> Optional[dict[str, Any]]:
+    """Что было с планом дела: круги, отказы и стоит ли дело из-за отказа.
+
+    `None` — плана не отклоняли ни разу, и говорить нечего: пустой блок читался
+    бы как «отказ был, но без причины».
+
+    `round` отказа — номер `plan_proposed` по порядку (1, 2, …), а не `rev` из
+    журнала: ревизия прыгает (живое дело шло 1 → 2 → 3), а «отказ второго круга»
+    человек читает сразу. Отказ без предложения перед ним получает `0` — «круга
+    нет», а не выдуманный первый.
+
+    `refusal` — последний отказ, **пока он не снят приёмкой**: после
+    `plan_accepted` строка с причиной уходит с экрана, а счётчики `proposals`
+    (кругов) и `rejections` (отказов) остаются в подсказке истории.
+
+    `exhausted` — пересборок плана больше нет: это вердикт движка по
+    `charter.max_rounds_replan` (`_plan_engine`), а не счёт проекции. Разные
+    состояния «ещё пробует» и «упёрся» экран обязан называть разными словами.
+    """
+    events = sorted(
+        (item for item in events or () if isinstance(item, dict)),
+        key=lambda item: _int(item.get("id")),
+    )
+    proposals = 0
+    refusals: list[dict[str, Any]] = []
+    standing = False
+    for event in events:
+        kind = str(event.get("kind") or "")
+        if kind == PLAN_PROPOSED:
+            proposals += 1
+        elif kind == PLAN_ACCEPTED:
+            standing = False
+        elif kind == PLAN_REJECTED:
+            refusals.append(_refusal(event, _payload(event), proposals))
+            standing = True
+    if not refusals:
+        return None
+    limit, exhausted = _plan_engine(events)
+    block: dict[str, Any] = {
+        "proposals": proposals,
+        "rejections": len(refusals),
+        "refusals": refusals,
+        "limit": limit,
+        "exhausted": exhausted,
+    }
+    if standing:
+        block["refusal"] = refusals[-1]
+    return block
 
 
 def _attempts(

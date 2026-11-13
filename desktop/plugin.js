@@ -392,6 +392,9 @@ function shapeDeal(deal) {
     // дошёл, бэкенд отвечает «нет фактов» — это честный ответ, а не выдуманное
     // «жив». Слово и доказательство целиком бэкендовы (`leadfeed.status`).
     lead: shapeLead(d.lead),
+    // План дела (`plan`): отказ плана с причинами и счётчики кругов. `null` —
+    // плана не отклоняли; строка экрана рисуется только при `refused`.
+    plan: shapePlan(d.plan),
     attemptAge,
     attemptAgeText: fmtAge(attemptAge),
     attemptNote,
@@ -465,6 +468,53 @@ function shapeLead(block) {
     stale: b.stale === true,
     reason: String(b.reason || ''),
     known: state !== 'unknown',
+  }
+}
+
+/**
+ * Блок `plan` ответа `/deal` — отказ плана на экране дела.
+ *
+ * Бэкенд (`stagefeed.plan`) отдаёт факты журнала: сколько раз лид предлагал
+ * план (`proposals`), сколько раз его отклоняли (`rejections`, `refusals`),
+ * последний ещё не снятый приёмкой отказ (`refusal`) и исчерпан ли лимит
+ * пересборок (`exhausted`). Шейпер собирает из них одну строку: причина —
+ * первая, число остальных — в `(+N)`, полный список — в раскрытии.
+ *
+ * `null` — плана не отклоняли: пустая строка «отказ был, но без причины» хуже,
+ * чем её отсутствие (тот же довод, что у блока `lead`).
+ *
+ * Счётчики (`counts`, `hint`) живут и после приёмки плана: строка с причиной
+ * уходит, а «кругов плана: K, отказов: M» остаётся в подсказке истории —
+ * иначе дело, пережившее два отказа, выглядело бы как пришедшее с первого раза.
+ */
+function shapePlan(block) {
+  const b = block && typeof block === 'object' ? block : null
+  if (!b) return null
+  const proposals = Number(b.proposals) || 0
+  const rejections = Number(b.rejections) || 0
+  const exhausted = b.exhausted === true
+  const refusal = b.refusal && typeof b.refusal === 'object' ? b.refusal : null
+  const issues = (refusal && Array.isArray(refusal.issues) ? refusal.issues : [])
+    .map((item) => String(item || '').trim())
+    .filter(Boolean)
+  const more = refusal ? Number(refusal.more) || 0 : 0
+  const counts = `кругов плана: ${proposals}, отказов: ${rejections}`
+  // «Ещё пробует» и «упёрся» — разные состояния, и второе называет словами:
+  // это вердикт движка по `charter.max_rounds_replan` (`stagefeed.plan`).
+  const note = exhausted ? 'пересборок плана больше нет' : ''
+  const first = issues.length ? issues[0] : refusal ? String(refusal.why || '').trim() : ''
+  return {
+    refused: Boolean(refusal),
+    round: refusal ? Number(refusal.round) || 0 : 0,
+    at: refusal ? numOrNull(refusal.at) : null,
+    issues,
+    more,
+    moreText: more ? `ещё ${more}` : '',
+    counts,
+    note,
+    hint: [counts, note].filter(Boolean).join(' · '),
+    text: refusal ? `план отклонён: ${first || 'причина не записана'}${more ? ` (+${more})` : ''}` : '',
+    tone: exhausted ? 'red' : 'yellow',
   }
 }
 
@@ -4760,6 +4810,16 @@ const CSS = `
 .duty-spec-node.t-red rect{stroke:var(--ui-red)}
 .duty-spec-node.t-yellow rect{stroke:var(--ui-yellow)}
 .duty-spec-node.t-blue rect{stroke:var(--ui-accent)}
+/* Отказ плана — строкой под графом: причина на экране, полный список по клику.
+   Красный тон — лимит пересборок исчерпан, жёлтый — «ещё пробует». */
+.duty-plan-refusal{margin-top:6px;font-size:12.5px;line-height:1.45;max-width:760px}
+.duty-plan-refusal>summary{cursor:pointer;color:var(--ui-text-secondary)}
+.duty-plan-refusal.t-yellow>summary{color:var(--ui-yellow)}
+.duty-plan-refusal.t-red>summary{color:var(--ui-red)}
+.duty-plan-refusal .duty-plan-note{color:var(--ui-text-tertiary)}
+.duty-plan-refusal .duty-plan-issues{margin:6px 0 0;padding-left:18px;color:var(--ui-text-secondary)}
+.duty-plan-refusal .duty-plan-issues li{margin:2px 0;word-break:break-word}
+.duty-plan-refusal .duty-plan-more{margin-top:4px;font-size:11.5px}
 /* Живой этап дышит: пока попытка идёт, граф не должен выглядеть застывшим. */
 .duty-spec-node.is-live rect{animation:duty-spec-breath 1.6s ease-in-out infinite}
 .duty-spec-node.is-live .duty-spec-state{fill:var(--ui-accent)}
@@ -5532,7 +5592,7 @@ function DealFactSpans({ scale }) {
  *  читается слева направо, «кто» и «когда» стоят на одном месте в каждой строке,
  *  а ширина занята колонками, а не растянутым текстом. Свежие сверху (порядок
  *  даёт шейпер), пустая лента не рисуется вовсе. */
-function DecisionsPanel({ items }) {
+function DecisionsPanel({ items, plan }) {
   const [groups, setGroups] = useState([])
   const total = decisionsCount(items)
   const rows = useMemo(() => (total ? shapeDecisions(items) : []), [items, total])
@@ -5550,7 +5610,7 @@ function DecisionsPanel({ items }) {
     h(
       'div',
       { className: 'duty-scale-log-h' },
-      h('span', { className: 'duty-scale-log-title' }, `решения лида · ${total}`),
+      h('span', { className: 'duty-scale-log-title', title: plan ? plan.hint : '' }, `решения лида · ${total}`),
       h('span', { className: 'duty-muted' }, 'свежие сверху'),
       h('span', { className: 'duty-spacer' }),
       h(
@@ -5719,6 +5779,39 @@ function SpecStrip({ spec }) {
 }
 
 /**
+ * Строка отказа плана под графом — та же, что в вебе (`planLine`).
+ *
+ * Живое дело d_12d5fc44: план отклоняли дважды, а на экране было только
+ * «coordinator: running». Причина стоит первой строкой, полный список
+ * раскрывается: `details`/`summary` — родные элементы React, обработчик не
+ * нужен, и раскрытие переживает тик обновления.
+ *
+ * Принятый план строку убирает: `shapePlan.refused` тогда `false`, а счётчики
+ * кругов и отказов остаются в подсказке журнала решений (`plan.hint`).
+ */
+function DutyPlanRefusal({ plan }) {
+  if (!plan || !plan.refused) return null
+  return h(
+    'details',
+    { className: `duty-plan-refusal t-${plan.tone}`, title: plan.hint },
+    h(
+      'summary',
+      null,
+      plan.text,
+      plan.note ? h('span', { className: 'duty-plan-note' }, ` · ${plan.note}`) : null,
+    ),
+    plan.issues.length
+      ? h(
+          'ul',
+          { className: 'duty-plan-issues' },
+          ...plan.issues.map((item, index) => h('li', { key: `plan-issue-${index}` }, item)),
+        )
+      : null,
+    plan.moreText ? h('div', { className: 'duty-plan-more duty-muted' }, plan.moreText) : null,
+  )
+}
+
+/**
  * Выбранный вызов по ключу `stage:attempt:seq`.
  *
  * Ищется тем же видом, которым рисуются чипы (`attemptView`): второго описания
@@ -5735,7 +5828,7 @@ function callOf(scale, callId) {
 }
 
 /** Панель шкалы времени: подписанная ось, дорожка на этап, полосы и маркеры. */
-function ScalePanel({ scale, dealId, callSel, onSelectCall, toolFilter, onToggleTool, decisions }) {
+function ScalePanel({ scale, dealId, callSel, onSelectCall, toolFilter, onToggleTool, decisions, plan }) {
   const active = Array.isArray(toolFilter) ? toolFilter : []
   // Прокрутка широкой шкалы (Макс, 09.11: «максимальную ширину таймлайна в час,
   // дальше — прокрутку, висим на правой границе»): пока человек не уехал влево
@@ -5958,7 +6051,7 @@ function ScalePanel({ scale, dealId, callSel, onSelectCall, toolFilter, onToggle
     scale.facts.attempts.journal ? h('div', { className: 'duty-muted' }, 'полосы собраны из журнала: ответ попыток пуст') : null,
     // Журнал решений — внизу той же панели: это тот же разговор «что произошло»,
     // только словами, и он стоит под дорожками, к которым относится.
-    h(DecisionsPanel, { items: decisions }),
+    h(DecisionsPanel, { items: decisions, plan }),
   )
 }
 
@@ -6670,6 +6763,9 @@ function DealScreen({ sel, onBack }) {
           h('div', { className: 'duty-deal-title' }, (detail.data && detail.data.title) || sel.titleFull || '—'),
         ),
         detail.data ? h(SpecStrip, { spec: scale.spec }) : null,
+        // Отказ плана — строкой под графом (как в вебе): граф называет этапы,
+        // отказ — почему их до сих пор нет. После приёмки плана строки нет.
+        deal && deal.plan && deal.plan.refused ? h(DutyPlanRefusal, { plan: deal.plan }) : null,
       ),
       h(
         'div',
@@ -6728,7 +6824,7 @@ function DealScreen({ sel, onBack }) {
       // Шкала — первой и во всю ширину: это главный факт дела, а спецификация и
       // столбец этапов — пояснение к нему.
       h(KpiStrip, { scale }),
-      h(ScalePanel, { scale, dealId: sel.id, callSel, onSelectCall: selectCall, toolFilter, onToggleTool: toggleTool, decisions: detail.data.decisions }),
+      h(ScalePanel, { scale, dealId: sel.id, callSel, onSelectCall: selectCall, toolFilter, onToggleTool: toggleTool, decisions: detail.data.decisions, plan: deal && deal.plan }),
       // Решения лида — во всю ширину над колонками: история по времени рядом со
       // шкалой, а не ещё один узкий столбец.
       docs.length

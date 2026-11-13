@@ -1327,6 +1327,21 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
 .spec-node.t-yellow rect { stroke: var(--warn); }
 .spec-node.t-blue rect { stroke: var(--accent); }
 
+/* ------------------------------------------------------------- отказ плана */
+/* Строка под графом: «план отклонён: <первая причина> (+N)». Свёрнута, пока
+ * человек не спросил «а что там было»: причина на экране, подробности — по
+ * клику. Цвет — состояния отказа, а не украшение: исчерпанный лимит
+ * пересборок красный, «ещё пробует» — жёлтый. */
+.plan-refusal { margin: 6px 0 0; font-size: 12.5px; line-height: 1.45; max-width: 760px; }
+.plan-refusal > summary { cursor: pointer; color: var(--text-2); }
+.plan-refusal > summary::marker { color: var(--text-3); }
+.plan-refusal.t-yellow > summary { color: var(--warn); }
+.plan-refusal.t-red > summary { color: var(--danger); }
+.plan-refusal .plan-note { color: var(--text-3); }
+.plan-refusal .plan-issues { margin: 6px 0 0; padding-left: 18px; color: var(--text-2); }
+.plan-refusal .plan-issues li { margin: 2px 0; word-break: break-word; }
+.plan-refusal .plan-more { margin-top: 4px; font-size: 11.5px; }
+
 /* Живой этап дышит: пока попытка идёт, граф не должен выглядеть застывшим. */
 .spec-node.is-live rect { animation: spec-breath 1.6s ease-in-out infinite; }
 .spec-node.is-live .spec-state { fill: var(--accent); }

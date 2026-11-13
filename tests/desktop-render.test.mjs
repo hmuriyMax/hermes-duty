@@ -87,7 +87,7 @@ function moduleForRender(root) {
   const source = read('desktop/plugin.js')
     .replace(/from '@hermes\/plugin-sdk'/, "from './sdk.mjs'")
     .concat(
-      '\nexport { DutyLane, DutyAttemptRow, ScalePanel, KpiStrip, SpecStrip, CallInspector, DutyMiniTimeline, FinishedBlock, shapeFinishedRow, dealTimeline, stageRole, DutyPage, parseWindow, TL_WINDOWS, windowLabel, DecisionsPanel, DutyLeadLane, DealRow, DealFactSpans, shapeDeal, shapeDealTime }\n',
+      '\nexport { DutyLane, DutyAttemptRow, ScalePanel, KpiStrip, SpecStrip, CallInspector, DutyMiniTimeline, FinishedBlock, shapeFinishedRow, dealTimeline, stageRole, DutyPage, parseWindow, TL_WINDOWS, windowLabel, DecisionsPanel, DutyLeadLane, DealRow, DealFactSpans, shapeDeal, shapeDealTime, DutyPlanRefusal, shapePlan }\n',
     )
   const file = join(dir, 'plugin.mjs')
   writeFileSync(file, source)
@@ -1009,7 +1009,7 @@ test('десктоп: экран дела и строка списка беру�
   // «есть в данных, нет на экране».
   const source = read('desktop/plugin.js')
   assert.match(source, /h\(ScalePanel, \{[^}]*decisions: detail\.data\.decisions/, 'экран дела не передаёт решения в панель шкалы')
-  assert.match(source, /h\(DecisionsPanel, \{ items: decisions \}\)/, 'панель шкалы не рисует журнал решений')
+  assert.match(source, /h\(DecisionsPanel, \{ items: decisions, plan \}\)/, 'панель шкалы не рисует журнал решений')
   assert.match(source, /deal\.lead && deal\.lead\.known/, 'строка списка не рисует лида')
   assert.match(source, /duty-lead-note/, 'нет класса строки лида')
   const css = source.replace(/\/\*[\s\S]*?\*\//g, '')
@@ -1038,6 +1038,63 @@ test('десктоп: в строке списка лид стоит под бе
   assert.match(html, /duty-lead-note/, 'в ячейке состояния нет строки лида')
   assert.match(html, /резюм 1 из 6/, 'слово лида не доехало до строки')
   assert.match(html, /журнал: последний факт лида lead_resumed/, 'доказательство лида не в подсказке')
+})
+
+test('десктоп: отказ плана стоит под графом дела — причина, раскрытие, «пересборок больше нет»', async (t) => {
+  // Та же история, что в вебе: строка отказа живёт под графом спеки, а счётчики
+  // кругов остаются в подсказке журнала решений после приёмки плана.
+  const source = read('desktop/plugin.js')
+  assert.match(
+    source,
+    /deal && deal\.plan && deal\.plan\.refused \? h\(DutyPlanRefusal, \{ plan: deal\.plan \}\)/,
+    'экран дела не рисует строку отказа плана под графом',
+  )
+  assert.match(source, /h\(DecisionsPanel, \{ items: decisions, plan \}\)/, 'журнал решений не получает счётчики плана')
+  assert.match(source, /title: plan \? plan\.hint : ''/, 'у подсказки истории нет счётчиков плана')
+  const css = source.replace(/\/\*[\s\S]*?\*\//g, '')
+  assert.match(css, /\.duty-plan-refusal\{/, 'нет правила .duty-plan-refusal')
+  assert.match(css, /\.duty-plan-refusal\.t-red>summary\{/, 'у исчерпанного лимита нет своего тона')
+
+  const root = reactRoot()
+  if (!root) return t.skip('нет React в ~/.hermes/hermes-agent/node_modules')
+  const mod = await import(pathToFileURL(moduleForRender(root)).href)
+  const React = (await import(pathToFileURL(join(root, 'react', 'index.js')).href)).default
+  const { renderToStaticMarkup } = await import(pathToFileURL(join(root, 'react-dom', 'server.node.js')).href)
+  const plan = mod.shapePlan({
+    proposals: 2,
+    rejections: 2,
+    limit: 3,
+    exhausted: false,
+    refusal: {
+      at: 1_794_532_252,
+      round: 2,
+      why: 'план ревизии 2 отклонён: отказов 1',
+      issues: ["plan.evidence: этап 'fix' что-то производит, а evidence пуст"],
+      more: 0,
+    },
+  })
+
+  const html = renderToStaticMarkup(React.createElement(mod.DutyPlanRefusal, { plan }))
+  assert.match(html, /^<details/, `строка не раскрывается: ${html.slice(0, 80)}`)
+  assert.match(html, /план отклонён: plan\.evidence/, 'первая причина не напечатана')
+  assert.match(html, /<li>plan\.evidence: этап &#x27;fix&#x27;/, 'полный список причин не раскрыт')
+  assert.match(html, /кругов плана: 2, отказов: 2/, 'счётчики не в подсказке строки')
+  assert.ok(!/пересборок плана больше нет/.test(html), 'лимит не исчерпан, а экран говорит «больше нет»')
+
+  // Исчерпанный лимит — словами и красным тоном.
+  const tight = renderToStaticMarkup(
+    React.createElement(mod.DutyPlanRefusal, {
+      plan: mod.shapePlan({ ...plan, exhausted: true, limit: 1, refusal: { ...plan, issues: ['a'], more: 2 } }),
+    }),
+  )
+  assert.match(tight, /пересборок плана больше нет/)
+  assert.match(tight, /ещё 2/)
+  assert.match(tight, /t-red/)
+
+  // Принятый план строки не рисует; дело без отказа — тоже.
+  const accepted = mod.shapePlan({ proposals: 3, rejections: 2, limit: 3, exhausted: false })
+  assert.equal(renderToStaticMarkup(React.createElement(mod.DutyPlanRefusal, { plan: accepted })), '')
+  assert.equal(renderToStaticMarkup(React.createElement(mod.DutyPlanRefusal, { plan: null })), '')
 })
 
 test('десктоп: заходы лида — полосами на шкале, первой дорожкой', async (t) => {

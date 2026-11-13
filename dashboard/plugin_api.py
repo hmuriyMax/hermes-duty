@@ -1331,7 +1331,8 @@ def _own_shaped(
     last = events[-1] if events else None
     folded = journal.fold(events, now=now, answer_of=_pool_answer_of(home))
     attempt, lease, attempts = _own_attempt_facts(events, leases or {}, now)
-    return {
+    plan_of = stagefeed.plan(events)
+    shaped = {
         "repo": row.get("repo"),
         "id": str(row["id"]),
         "title": row.get("title"),
@@ -1372,6 +1373,14 @@ def _own_shaped(
         ),
         "_age_sec": _age_sec(row.get("created_at"), now),
     }
+    # План дела (`dashboard/stagefeed.py`): круги, отказы с причинами и «пересборок
+    # больше нет» — рядом с лидом, а не выводом поверхности из текста этапа. Живое
+    # дело d_12d5fc44 отклоняло план дважды, а экран говорил только
+    # «coordinator: running». Плана не отклоняли — поля нет вовсе: `null` читался
+    # бы как «отказ был, но без причины».
+    if plan_of is not None:
+        shaped["plan"] = plan_of
+    return shaped
 
 
 def _own_leases(conn: sqlite3.Connection, task_id: str) -> dict[tuple[str, int], int]:

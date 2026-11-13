@@ -28,6 +28,14 @@ function pluginSource() {
 }
 
 const pluginRoot = new URL('..', import.meta.url).pathname
+
+/**
+ * Шум рантайма, а не ошибка экрана: предупреждения `act()` — артефакт ручного
+ * монтажа, а `ExperimentalWarning: localStorage` печатает node 22+, когда страница
+ * законно трогает хранилище без флага `--localstorage-file`. Страница при этом
+ * рендерится; валить тест из-за предупреждения ядра — значит мерить версию node.
+ */
+const CONSOLE_NOISE = /not wrapped in act|ExperimentalWarning: localStorage is not available/
 /** Окно jsdom последнего монтажа: держим ссылку, чтобы оно не собиралось GC. */
 let keepWindow = null
 const read = (path) => readFileSync(join(pluginRoot, path), 'utf8')
@@ -311,7 +319,7 @@ test('десктоп: экран «Дело» монтируется и рису
   console.error = (...args) => {
     const text = args.map((item) => (item && item.stack) || String(item)).join(' ')
     // Предупреждения act() — артефакт ручного монтажа, а не ошибка экрана.
-    if (!/not wrapped in act/.test(text)) failures.push(text)
+    if (!CONSOLE_NOISE.test(text)) failures.push(text)
   }
 
   try {
@@ -445,7 +453,7 @@ test('десктоп: строки этапов раскрываются кли�
   const origError = console.error
   console.error = (...args) => {
     const text = args.map((item) => (item && item.stack) || String(item)).join(' ')
-    if (!/not wrapped in act/.test(text)) failures.push(text)
+    if (!CONSOLE_NOISE.test(text)) failures.push(text)
   }
 
   const settle = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -839,7 +847,7 @@ test('десктоп: страница — таймлайн и развёрну�
   const origError = console.error
   console.error = (...args) => {
     const text = args.map((item) => (item && item.stack) || String(item)).join(' ')
-    if (!/not wrapped in act/.test(text)) failures.push(text)
+    if (!CONSOLE_NOISE.test(text)) failures.push(text)
   }
 
   const nowFixture = JSON.parse(read('tests/fixtures/now.json'))

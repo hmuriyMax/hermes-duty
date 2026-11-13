@@ -985,8 +985,28 @@ def wait(
             return {"ok": True, "deal": str(deal["id"]), "events": [_brief(event) for event in facts],
                     "cursor": position, "timed_out": False, "answers": answers}
         if tick() >= deadline:
-            return {"ok": True, "deal": str(deal["id"]), "events": [], "cursor": position,
-                    "timed_out": True, "answers": answers}
+            work = _live_work(conn, str(deal["id"]))
+            answer = {
+                "ok": True,
+                "deal": str(deal["id"]),
+                "events": [],
+                "cursor": position,
+                "timed_out": True,
+                "answers": answers,
+            }
+            if work:
+                # Ждать больше нечего: идёт чужой процесс, и новых фактов от него
+                # не будет до его конца. Держать турн до бюджета захода (`overrun`,
+                # 1800 с) — значит 35 минут ничего не делать и получить
+                # `lead_exited(overrun)`; заход закрывается сам, а следующий
+                # подъём прочитает факты и продолжит (`docs/ENGINE-2.0.md`, 10).
+                answer["idle"] = True
+                answer["work"] = work
+                answer["hint"] = (
+                    f"новых фактов нет; идёт {work} — это отдельный процесс, и до его конца "
+                    "фактов не будет. Заверши заход: следующий подъём прочитает журнал и продолжит."
+                )
+            return answer
         pause(min(WAIT_POLL_SEC, max(0.0, deadline - tick())))
 
 
@@ -1000,6 +1020,31 @@ def _sync_answers(conn: sqlite3.Connection, home: Path) -> int:
     """
     report = ask_module.sync_answers(conn, home)
     return max(0, _int((report or {}).get("appended")))
+
+
+def _live_work(conn: sqlite3.Connection, deal_id: str) -> str:
+    """Что сейчас идёт по делу: `этап#попытка`, если попытка открыта и не закрыта.
+
+    Попытка — отдельный процесс со своим лизингом (`duty_start`): пока он жив,
+    лиду ждать нечего, и молчание `duty_wait` — это не «дело стоит», а «работа
+    идёт». Пустая строка — открытых попыток нет, и лид обязан действовать сам.
+    """
+    opened: dict[str, str] = {}
+    for event in journal.read_events(conn, deal_id):
+        kind = str(event.get("kind") or "")
+        payload = journal.payload_of(event)
+        run_id = str(payload.get("run_id") or "")
+        if not run_id:
+            continue
+        if kind == "attempt_started":
+            opened[run_id] = str(payload.get("stage") or "")
+        elif kind == "attempt_ended":
+            opened.pop(run_id, None)
+    if not opened:
+        return ""
+    run_id = sorted(opened)[-1]
+    stage = opened[run_id]
+    return f"{stage or 'попытка'} `{run_id}`"
 
 
 def _brief(event: dict[str, Any]) -> dict[str, Any]:

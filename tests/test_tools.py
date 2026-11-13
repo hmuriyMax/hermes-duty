@@ -733,6 +733,37 @@ def test_wait_skips_telemetry_but_moves_the_cursor(tmp_path: Path) -> None:
     assert answer["cursor"] > position
 
 
+def test_wait_is_idle_when_another_process_runs_the_stage(tmp_path: Path) -> None:
+    """Пустой `duty_wait` при живой попытке велит лиду закрыть заход, а не ждать.
+
+    Лид держит турн ради фактов, а попытка — отдельный процесс (`duty_start`): пока
+    она идёт, новых фактов не будет, и ждать до бюджета захода (`overrun`, 1800 с) —
+    значит ничего не делать 30 минут. Пустой ответ без открытой попытки остаётся
+    прежним: там лид обязан действовать сам.
+    """
+    home = make_home(tmp_path)
+    spec = write_spec(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    position = head(conn, deal)
+    append(conn, deal, ("attempt_started", {"run_id": "impl#1", "stage": "impl", "attempt": 1, "pid": 1}))
+    position = head(conn, deal)
+
+    answer = tools.wait(str(deal["id"]), position, 0, home=home)
+
+    assert answer["timed_out"] is True and answer["events"] == []
+    assert answer["idle"] is True
+    assert "impl" in answer["work"] and "impl#1" in answer["work"]
+    assert "Заверши заход" in answer["hint"]
+
+    # Попытка закрылась — подсказки нет: дело стоит, и это работа лида.
+    append(conn, deal, ("attempt_ended", {"run_id": "impl#1", "stage": "impl", "attempt": 1, "outcome": "done"}))
+    position = head(conn, deal)
+    conn.close()
+    more = tools.wait(str(deal["id"]), position, 0, home=home)
+    assert "idle" not in more and "hint" not in more
+
+
 def test_wait_ceiling_is_three_hundred_seconds(tmp_path: Path) -> None:
     """Потолок `timeout_sec` — 300 с: дольше один вызов турн не держит."""
     home = make_home(tmp_path)

@@ -158,6 +158,17 @@ UNRESUMABLE_EXIT = 3
 # крутилась бы бесконечно.
 MAX_FRESH_RESTARTS = 1
 
+# Выходы, после которых резюм — не «подъём упавшего», а продолжение штатной
+# работы: `overrun` (заход пересидел свой бюджет, сторож его отпустил) и `exit`
+# (лид сам закончил заход, когда ждать стало нечего). Считать их резюмами значит
+# парковать живое дело за то, что попытки идут долго: `d_92177017` — первая же
+# попытка на 20+ минут дала `overrun`, а лимит `charter.max_lead_resumes` — 6.
+# Допуск у них свой (`FREE_RESUME_FACTOR`): штатные выходы не бесконечны, но
+# ограничены вдвое щедрее падений, иначе «нечего ждать → вышел» крутилось бы
+# вечно, не двигая дело.
+FREE_EXIT_REASONS = frozenset({"exit", "overrun"})
+FREE_RESUME_FACTOR = 2
+
 # Телеметрия попытки — не факт о деле: в дайджесте ей нечего делать, иначе лид
 # читал бы сотни строк «вызван инструмент» вместо «этап отчитался».
 NOISE_KINDS = ("attempt_progress",)
@@ -279,6 +290,12 @@ def state(
     `resumes` считается **от последнего `unblocked`**: ответ человека («продолжать»)
     открывает новый цикл, иначе дело, припаркованное на исчерпании резюмов,
     парковалось бы снова на первом же тике после ответа.
+
+    `free` — те же подъёмы, но после штатных выходов (`FREE_EXIT_REASONS`):
+    бюджет захода пересидели или лид сам закончил заход, когда ждать стало нечего.
+    Такой подъём работой не провален, и в лимит `charter.max_lead_resumes` он не
+    идёт; допуск у него свой (`FREE_RESUME_FACTOR`) — иначе «нечего ждать → вышел»
+    крутилось бы вечно.
     """
     ordered = sorted(
         (event for event in events or () if isinstance(event, dict)),
@@ -288,6 +305,7 @@ def state(
     alive = probe or journal.pid_alive
     session = ""
     resumes = 0
+    free = 0
     starts = 0
     cursor = 0
     last_fact_at = 0
@@ -301,12 +319,20 @@ def state(
         if kind == "unblocked":
             # Человек сказал «продолжать»: цикл автоподъёмов начинается заново.
             resumes = 0
+            free = 0
             continue
         if kind == LEAD_KIND_STARTED:
             starts += 1
             mode = str(payload.get("mode") or "")
             if mode == MODE_RESUME:
-                resumes += 1
+                # Штатный выход — не падение: `overrun` (сторож отпустил заход по
+                # бюджету) и `exit` (лид сам закончил, ждать стало нечего) идут в
+                # свой допуск, а не в `max_lead_resumes`.
+                previous = str((last_exit or {}).get("reason") or "")
+                if previous in FREE_EXIT_REASONS:
+                    free += 1
+                else:
+                    resumes += 1
             found = str(payload.get("session_id") or "")
             if found:
                 session = found
@@ -354,6 +380,7 @@ def state(
         "session_cursor": cursor,
         "starts": starts,
         "resumes": resumes,
+        "free": free,
         "open": current is not None,
         "live": live,
         "pid": (current or {}).get("pid"),
@@ -651,15 +678,30 @@ def _budget_line(spec: Any, events: list[dict[str, Any]]) -> str:
     return text
 
 
+def max_free_resumes(resume_limit: int) -> int:
+    """Допуск на подъёмы после штатных выходов (`overrun`/`exit`), а не падений.
+
+    Штатный выход — не провал, поэтому в `charter.max_lead_resumes` он не идёт;
+    но и бесконечным быть не может: лид, который «нечего ждать → вышел» и ничего
+    не делает, крутил бы заходы вечно. Потолок вдвое больше: длинная работа с
+    честными `overrun` должна пережить куда больше шести подъёмов.
+    """
+    return max(1, _int(resume_limit)) * FREE_RESUME_FACTOR
+
+
 def _head_block(deal: dict[str, Any], st: dict[str, Any], spec: Any, resume_limit: int) -> list[str]:
     """Шапка входа сессии: адрес дела, состояние лида, спека, контракт движка."""
+    free = _int(st.get("free"))
+    tail = f", резюмов {st.get('resumes') or 0} из {resume_limit}"
+    if free:
+        tail += f", штатных подъёмов {free} из {max_free_resumes(resume_limit)}"
     lines = [
         f"# Дело {deal['id']}: {_short(deal.get('title') or 'без заголовка', 200)}",
         "",
         f"- статус дела: {deal.get('status') or '—'}; репозиторий: {deal.get('repo') or '—'}",
         f"- спека: {deal.get('spec') or (getattr(spec, 'path', '') if spec is not None else '') or 'не записана'}",
         f"- лид: сессия {st.get('session_id') or 'ещё нет'}, "
-        f"подъёмов {st.get('starts') or 0}, резюмов {st.get('resumes') or 0} из {resume_limit}",
+        f"подъёмов {st.get('starts') or 0}{tail}",
     ]
     last_exit = st.get("last_exit") or {}
     if last_exit:
@@ -668,6 +710,12 @@ def _head_block(deal: dict[str, Any], st: dict[str, Any], spec: Any, resume_limi
             f"(код {last_exit.get('exit_code')}, {_clock_of(last_exit.get('ts'))})"
         )
     lines.append(f"- контракт движка: {ENGINE_DOC}")
+    lines.append(
+        "- ожидание: `duty_wait` возвращает `idle: true` и `work`, когда новых фактов нет, "
+        "а работа идёт своим процессом, — это команда **закончить заход** (выйти, не вызывая "
+        "инструментов): следующий подъём прочитает журнал и продолжит. Держать турн до бюджета "
+        "захода бессмысленно, сторож всё равно остановит его (`overrun`)"
+    )
     return lines
 
 
@@ -1102,6 +1150,11 @@ def run(
             raise LeadError(f"спавн сессии лида не удался: {exc}") from exc
 
         child = int(process.pid)
+        # Резюм после штатного выхода (`overrun`/`exit`) идёт в свой допуск, а не
+        # в `max_lead_resumes`: в факте это видно теми же числами, что и в `state()`.
+        previous = str((st.get("last_exit") or {}).get("reason") or "")
+        free_resume = mode == MODE_RESUME and previous in FREE_EXIT_REASONS
+        counted_resume = mode == MODE_RESUME and not free_resume
         started_payload: dict[str, Any] = {
             "mode": mode,
             "pid": child,
@@ -1113,7 +1166,8 @@ def run(
             # читается как потеря контекста, а причина — отсоединение CLI.
             "dropped_session": dropped or None,
             "run_budget": budget_sec,
-            "resumes": _int(st["resumes"]) + (1 if mode == MODE_RESUME else 0),
+            "resumes": _int(st["resumes"]) + (1 if counted_resume else 0),
+            "free": _int(st.get("free")) + (1 if free_resume else 0),
             "cmd": cmd,
             "query_path": str(path),
             "session_log": str(logs) if logs is not None else None,
@@ -1392,14 +1446,34 @@ def park(
     moment = _now(now)
     last = st.get("last_exit") or {}
     resumes = _int(st.get("resumes"))
+    free = _int(st.get("free"))
+    free_limit = max_free_resumes(limit)
     code = "" if last.get("exit_code") is None else f" (код {last.get('exit_code')})"
-    headline = (
-        f"Лид падает: {resumes} автоподъёмов из {limit}, дело {deal['id']} остановлено. "
-        f"Последний выход — {last.get('reason') or 'причина не записана'}{code}."
-    )
+    if free >= free_limit and resumes < limit:
+        # Штатные выходы не бесконечны: лид поднимался `free_limit` раз после
+        # `overrun`/`exit` и дело не сдвинулось — дальше решает человек, а не
+        # очередной заход.
+        headline = (
+            f"Лид не двигает дело: {free} подъёмов после штатных выходов из {free_limit}, "
+            f"дело {deal['id']} остановлено. Последний выход — {last.get('reason') or 'причина не записана'}{code}."
+        )
+        why = (
+            f"Штатные выходы лида исчерпаны (допуск {free_limit} = 2 × `max_lead_resumes={limit}`): "
+            f"заходы кончаются сами или по бюджету, а работа не продвигается."
+        )
+        park_details = {"attempts": free, "limit": free_limit, "park_reason": failures.REASON_TOO_MANY}
+    else:
+        headline = (
+            f"Лид падает: {resumes} автоподъёмов из {limit}, дело {deal['id']} остановлено. "
+            f"Последний выход — {last.get('reason') or 'причина не записана'}{code}."
+        )
+        why = (
+            f"Резюмы лида исчерпаны (`max_lead_resumes={limit}`): следующий заход "
+            f"ничего не изменит, пока не понятно, почему сессия падает."
+        )
+        park_details = {"attempts": resumes, "limit": int(limit), "park_reason": failures.REASON_TOO_MANY}
     text_full = (
-        f"{headline}\n\nРезюмы лида исчерпаны (`max_lead_resumes={limit}`): следующий заход "
-        f"ничего не изменит, пока не понятно, почему сессия падает.\n"
+        f"{headline}\n\n{why}\n"
         f"Сессия: {st.get('session_id') or 'ещё нет'}; последний выход: "
         f"{last.get('reason') or '—'} (код {last.get('exit_code')}).\n\n"
         f"continue — новый цикл автоподъёмов (счётчик обнулится, лид будет поднят снова); "
@@ -1423,9 +1497,7 @@ def park(
         details={
             "kind": failures.INFRA,
             "stage": "",
-            "attempts": resumes,
-            "limit": int(limit),
-            "park_reason": failures.REASON_TOO_MANY,
+            **park_details,
             "question_id": int(asked.question_id),
             "lead": True,
         },
@@ -1434,6 +1506,7 @@ def park(
     return {
         "question_id": int(asked.question_id),
         "resumes": resumes,
+        "free": free,
         "limit": int(limit),
         "reason": last.get("reason") or "",
     }
@@ -1575,8 +1648,12 @@ def supervise(
                 "limit": limit,
             }
         recovered = _close_dead(conn, deal, events, st, now=moment) if write else None
-        if _int(st["resumes"]) >= limit:
-            known = _existing_park(events, limit)
+        free_limit = max_free_resumes(limit)
+        if _int(st["resumes"]) >= limit or _int(st.get("free")) >= free_limit:
+            # Допуск штатных выходов назван в парковке своим числом: иначе
+            # `_existing_park` не узнал бы уже заданный вопрос.
+            parked_limit = free_limit if _int(st.get("free")) >= free_limit and _int(st["resumes"]) < limit else limit
+            known = _existing_park(events, parked_limit)
             parked = known or (
                 park(conn, deal, st, limit=limit, home=home, now=moment) if write else None
             )

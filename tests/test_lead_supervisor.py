@@ -1345,3 +1345,133 @@ def test_ordinary_crash_still_resumes_the_same_session(tmp_path: Path) -> None:
     mode, _cursor, dropped = lead.next_mode(events, st)
     assert mode == lead.MODE_RESUME
     assert dropped == ""
+
+
+# ---------------------- 11. штатный выход лида не тратит резюмы
+#
+# Живое дело d_92177017 (13.11): первая же попытка шла 20+ минут, лид честно
+# сидел в `duty_wait` и упёрся в бюджет захода — `lead_exited(overrun)` через
+# 2100 с. Резюм после такого выхода — продолжение работы, а не подъём упавшего:
+# считать его резюмом значит запарковать живое дело, где всё идёт хорошо.
+
+
+def overrun_cycle(
+    deal: dict[str, Any],
+    conn: sqlite3.Connection,
+    count: int,
+    *,
+    reason: str = "overrun",
+    opening: bool = True,
+) -> None:
+    """`count` пар «заход ушёл (reason) → резюм»: ровно то, что пишет супервизор.
+
+    Порядок — выход, потом подъём: `state()` считает подъём резюмом по причине
+    **предыдущего** выхода, и пара обязана быть в том же порядке, что в журнале.
+    Причина считается только по выходу, у которого был открытый заход: `opening`
+    пишет первый (бриф), иначе первый выход журнала был бы не про кого.
+    """
+    if opening:
+        append(conn, deal, (lead.LEAD_KIND_STARTED, {"mode": lead.MODE_FIRST, "pid": 1, "cursor": 0}))
+    for index in range(count):
+        append(
+            conn,
+            deal,
+            (
+                lead.LEAD_KIND_EXITED,
+                {"mode": lead.MODE_RESUME, "reason": reason, "exit_code": -15, "session_id": "sess-w"},
+            ),
+            (lead.LEAD_KIND_STARTED, {"mode": lead.MODE_RESUME, "pid": 500 + index, "cursor": index}),
+        )
+
+
+def test_overrun_resume_does_not_spend_the_resume_counter(tmp_path: Path) -> None:
+    """Резюм после `overrun` идёт в свой допуск: `resumes` не растёт, `free` растёт.
+
+    Счётчик `max_lead_resumes` — про падения. Заход, остановленный сторожем по
+    бюджету, ничего не провалил: попытки шли, план цел, и следующий подъём
+    продолжает ту же работу.
+    """
+    home = make_home(tmp_path)
+    spec = write_spec(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    append(
+        conn,
+        deal,
+        (lead.LEAD_KIND_STARTED, {"mode": lead.MODE_FIRST, "pid": 1, "session_id": None, "cursor": 0}),
+        (lead.LEAD_KIND_EXITED, {"mode": lead.MODE_FIRST, "reason": "overrun", "exit_code": -15, "session_id": "sess-w"}),
+    )
+    overrun_cycle(deal, conn, 1, opening=False)
+    events = journal.read_events(conn, str(deal["id"]))
+    st = lead.state(events, now=NOW, probe=dead)
+    conn.close()
+
+    assert st["starts"] == 2
+    assert st["resumes"] == 0, "overrun не падение: счётчик резюмов обязан стоять"
+    assert st["free"] == 1
+
+
+def test_peaceful_exit_resume_is_free_too(tmp_path: Path) -> None:
+    """Лид сам закрыл заход (код 0) → резюм тоже штатный, а не подъём упавшего."""
+    home = make_home(tmp_path)
+    spec = write_spec(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    overrun_cycle(deal, conn, 2, reason="exit")
+    events = journal.read_events(conn, str(deal["id"]))
+    st = lead.state(events, now=NOW, probe=dead)
+    conn.close()
+
+    assert (st["resumes"], st["free"]) == (0, 2)
+
+
+def test_crash_resume_still_counts(tmp_path: Path) -> None:
+    """Падение (`crashed`) — по-прежнему резюм: правило узкое намеренно."""
+    home = make_home(tmp_path)
+    spec = write_spec(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    overrun_cycle(deal, conn, 2, reason="crashed")
+    events = journal.read_events(conn, str(deal["id"]))
+    st = lead.state(events, now=NOW, probe=dead)
+    conn.close()
+
+    assert (st["resumes"], st["free"]) == (2, 0)
+
+
+def test_free_resumes_have_their_own_allowance_and_then_park(tmp_path: Path) -> None:
+    """Штатные подъёмы не бесконечны: свой допуск (2 × резюмов) и своя парковка.
+
+    Без потолка «ждать нечего → вышел» крутило бы заходы вечно, не двигая дело.
+    Парковка отличается словами: дело встало не из-за падений, а из-за того, что
+    подъёмы ничего не меняют.
+    """
+    home = make_home(tmp_path)
+    spec = write_spec(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    free_limit = lead.max_free_resumes(lead.DEFAULT_MAX_RESUMES)
+    overrun_cycle(deal, conn, free_limit)
+    conn.close()
+
+    spawned: list[str] = []
+    tick = lead.supervise(
+        home,
+        str(deal["id"]),
+        now=NOW + 60,
+        probe=dead,
+        spawn=lambda *args: spawned.append(args[1]) or 1,
+    )
+
+    assert tick["action"] == "parked"
+    assert tick["question"]["free"] == free_limit
+    assert spawned == []
+
+    conn = open_store(home)
+    blocked = facts_of(conn, deal, "blocked")
+    conn.close()
+    assert len(blocked) == 1
+    assert blocked[0]["limit"] == free_limit
+    assert "Лид не двигает дело" in blocked[0]["reason"]
+    assert "Лид падает" not in blocked[0]["reason"]
+

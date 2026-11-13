@@ -714,14 +714,14 @@ pre.body {
    длительность, каждый этап — своей дорожкой, поэтому перекрытие видно глазом.
    Цвета — только переменные палитры (`--ok/--warn/--danger/--accent/...`), чтобы
    шкала читалась и в тёмной, и в светлой теме. */
-/* Ось и сетка начинаются там же, где дорожки: колонка подписей слева — одна
- * ширина на всё (--tl-gutter + gap), иначе шкала «заходила» на подписи. */
+/* Ось и сетка начинаются там же, где дорожки: колонка имени этапа слева — одна
+ * ширина на всё (--tl-name + gap), иначе шкала «заходила» на подпись. */
 .scale-wrap, .scale-main { min-width: 0; }
 /* Шкала: дорожки слева, легенда семейств — правой колонкой, как в макете `d-merge`
  * (статистика инструментов стояла сбоку справа, а не над дорожками). */
-.scale-wrap { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; align-items: start; --tl-gutter: 186px; --tl-name: 150px; --tl-gap: 8px; }
+.scale-wrap { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; align-items: start; --tl-name: 150px; --tl-gap: 8px; }
 .scale-side { display: flex; flex-direction: column; gap: 1px; min-width: 104px; padding-left: 10px; border-left: 1px solid var(--border); font-size: 10px; color: var(--text-3); line-height: 1.45; }
-.scale-head { display: grid; grid-template-columns: var(--tl-name, 150px) var(--tl-gutter, 186px) 1fr; gap: var(--tl-gap, 8px); align-items: end; margin-bottom: 6px; }
+.scale-head { display: grid; grid-template-columns: var(--tl-name, 150px) 1fr; gap: var(--tl-gap, 8px); align-items: end; margin-bottom: 6px; }
 /* Легенда — колонкой слева, ровно над колонкой подписей попыток. */
 .scale-keys { display: flex; flex-direction: column; gap: 1px; font-size: 10px; color: var(--text-3); line-height: 1.45; }
 .scale-keys-h { font-size: 9.5px; text-transform: uppercase; letter-spacing: .06em; opacity: .7; }
@@ -733,7 +733,7 @@ pre.body {
 .scale-key.on .scale-key-n { opacity: 1; font-weight: 600; }
 /* Чужие семейства гаснут, а не исчезают: картина дела остаётся целой. */
 .tl-call.tl-dim { opacity: .18; filter: saturate(.35); }
-.tl-row:hover .tl-call.tl-dim { opacity: .3; }
+.tl-row:has(.tl-band:hover, .tl-call:hover, .tl-att:hover) .tl-call.tl-dim { opacity: .3; }
 .tl-call.tl-dim { pointer-events: none; }
 .scale-key-l { overflow: hidden; text-overflow: ellipsis; }
 .scale-key-n { font-family: var(--mono); font-variant-numeric: tabular-nums; opacity: .8; }
@@ -1003,8 +1003,8 @@ pre.body {
   left: -1px;
   top: 0;
   bottom: 0;
-  /* Имя этапа + подписи попыток: подложка накрывает обе колонки гуттера. */
-  width: calc(calc(var(--tl-name, 150px) + var(--tl-gap, 8px) + var(--tl-gutter, 186px) + var(--tl-gap, 8px)) + 1px);
+  /* Подложка — под колонкой имени этапа. */
+  width: calc(var(--tl-name, 150px) + var(--tl-gap, 8px) + 1px);
   background: var(--card);
   border-right: 1px solid var(--border);
   /* Над всем содержимым дорожек (`.tl-lanes` — z1), но под липнущими
@@ -1016,21 +1016,20 @@ pre.body {
 .scale-main.is-wide::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 .scale-main.is-wide::-webkit-scrollbar-track { background: transparent; }
 .scale-main.is-wide .scale-head, .scale-main.is-wide .scale-plot { min-width: calc(var(--tl-zoom, 1) * 100%); }
-/* Липнет гуттер целиком: имя этапа — у левой кромки, подписи попыток — сразу за
-   ним, чтобы при прокрутке шкалы обе колонки оставались на месте. */
+/* Липнет только колонка имени: подписей попыток в гуттере больше нет, они стоят
+   у своих полос в поле шкалы. */
 .scale-main.is-wide .scale-head-gap, .scale-main.is-wide .tl-lane-id { position: sticky; left: 0; z-index: 3; background: var(--card); }
-.scale-main.is-wide .tl-lbl { position: sticky; left: calc(var(--tl-name, 150px) + var(--tl-gap, 8px)); z-index: 3; background: var(--card); }
 .scale-scroll-hint { font-size: 11px; color: var(--text-3); white-space: nowrap; }
 .scale-plot { position: relative; }
 /* Сетка под дорожками: линии по меткам оси, чтобы время читалось поперёк дорожек. */
-.scale-grid { position: absolute; top: -2px; bottom: 0; left: calc(var(--tl-name, 150px) + var(--tl-gap, 8px) + var(--tl-gutter, 186px) + var(--tl-gap, 8px)); right: 0; pointer-events: none; z-index: 0; }
+.scale-grid { position: absolute; top: -2px; bottom: 0; left: calc(var(--tl-name, 150px) + var(--tl-gap, 8px)); right: 0; pointer-events: none; z-index: 0; }
 .scale-grid-line { position: absolute; top: 0; bottom: 0; border-left: 1px dashed color-mix(in srgb, var(--text-3) 34%, transparent); }
 /* Сжатый промежуток оси: два пунктира по краям и подпись посередине — иначе
  * смена масштаба читается как ошибка данных. */
 /* Сжатый простой: полоса со штрихованием и знаками разрыва по краям. Пунктир
    читался как «граница», а не как «время вырезано» (09.11, Макс: «чтобы было
    понятно, что таймлайн тут схлопывается»). */
-.tl-idle-layer { position: absolute; top: -2px; left: calc(var(--tl-name, 150px) + var(--tl-gap, 8px) + var(--tl-gutter, 186px) + var(--tl-gap, 8px)); width: calc(100% - calc(var(--tl-name, 150px) + var(--tl-gap, 8px) + var(--tl-gutter, 186px) + var(--tl-gap, 8px))); height: calc(100% + 2px); z-index: 0; pointer-events: none }
+.tl-idle-layer { position: absolute; top: -2px; left: calc(var(--tl-name, 150px) + var(--tl-gap, 8px)); width: calc(100% - calc(var(--tl-name, 150px) + var(--tl-gap, 8px))); height: calc(100% + 2px); z-index: 0; pointer-events: none }
 .tl-idle-gap { position: absolute; top: 0; bottom: 0; }
 /* Штриховка — единственный знак, что здесь из шкалы вырезано время: диагональ
    в тон сетке, гаснущая к краям, чтобы не спорить с дорожками этапов. */
@@ -1107,16 +1106,15 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 
 .tl-rows { display: flex; flex-direction: column; gap: 4px; }
 
-/* Строка: слева стабильная подпись (ширина не меняется при раскрытии), справа
- * дорожка со штрихами и карта вызовов. */
 /* Строка попытки: свёрнутая показывает первый уровень вызовов и маркеры, полная
  * раскрывается под указателем. Высоты приходят переменными от шейпера
  * (--tl-collapsed/--tl-full), режет их только CSS — без overflow, иначе
- * подсказка чипа, растущая вверх, обрезалась бы вместе с содержимым. */
+ * подсказка чипа, растущая вверх, обрезалась бы вместе с содержимым.
+ * Колонка одна: подпись попытки стоит в самой дорожке, у своей полосы. */
 .tl-row {
   position: relative;
   display: grid;
-  grid-template-columns: var(--tl-gutter, 186px) 1fr;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--tl-gap, 8px);
   align-items: stretch;
   border-radius: 6px;
@@ -1126,26 +1124,34 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 /* Разворот — наведение на ряд попытки целиком: подпись слева и «колбаска» справа
    (Макс, 14.11). Гуттер при развороте не меняется: описания и счётчиков там нет,
    вызовы тоже живут в блоке этапов. */
-.tl-row:hover, .tl-row:focus-visible { height: var(--tl-full, 20px); }
+.tl-row:has(.tl-band:hover, .tl-call:hover, .tl-att:hover), .tl-row:focus-visible { height: var(--tl-full, 20px); }
 /* Глубокие уровни в свёрнутой ленте стоят в один ряд по центру (правило ниже) и
  * на развороте доезжают на свои уровни — разворот включает наведение на полосу
  * попытки («колбаску»), а не на всю строку с подписью. */
 .tl-row:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
-/* Колонки подписи фиксированы: номер, статус, время, надбавка. Иначе «готово»
- * и «вердиктов много» разной ширины двигали время в каждой строке. */
-.tl-lbl {
-  display: grid;
-  grid-template-columns: 26px 1fr auto;
-  align-self: center;
+/* Подпись попытки — у полосы, а не в колонке: номер и исход в одну строку.
+   `is-inside` — когда полоса начинается у самой кромки и слева места нет. */
+.tl-att {
+  position: absolute;
+  top: 50%;
+  transform: translate(-100%, -50%);
+  display: inline-flex;
   align-items: center;
-  gap: 6px;
-  height: 20px; line-height: 20px; white-space: nowrap;
+  gap: 4px;
+  padding: 0 4px 0 2px;
+  height: 14px;
+  line-height: 14px;
+  white-space: nowrap;
   font-variant-numeric: tabular-nums;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--card) 86%, transparent);
+  pointer-events: none;
+  z-index: 4;
 }
-.tl-lbl > * { overflow: hidden; text-overflow: ellipsis; }
+.tl-att.is-inside { transform: translate(0, -50%); padding: 0 2px 0 4px; }
+.tl-att.is-caption { color: var(--text-3); font-size: 10px; }
 .tl-n { font-family: var(--mono); font-size: 10px; color: var(--text-3); text-align: right; }
-.tl-n::before { content: '№'; font-size: 8.5px; opacity: .6; margin-right: 1px; }
 .tl-st { font-size: 10.5px; font-weight: 700; color: var(--text-2); }
 .tl-st.t-green { color: var(--ok); }
 .tl-st.t-red { color: var(--danger); }
@@ -1200,7 +1206,7 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 }
 /* Провалившаяся попытка: красная кромка в подписи и «провал» жирным — строка
  * находится глазом даже когда тонов на дорожке много. */
-.tl-row.is-failed .tl-lbl { border-left: 2px solid var(--danger); padding-left: 6px; margin-left: -8px; }
+.tl-row.is-failed .tl-att .tl-n { color: var(--danger); }
 .tl-row.is-failed .tl-n { color: var(--danger); }
 
 /* Пауза «вопрос → ответ»: время, которое дело стояло на человеке. */
@@ -1252,14 +1258,14 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
  * предел точности, а не выдуманная длина. `--w-log` держим равной ей же:
  * свёрнутая и развёрнутая строка рисуют одинаковую геометрию, разница только в
  * уровнях и прозрачности (Макс, 11.11: «рисовать четную ширину по длине тулкола»). */
-.tl-row:hover .tl-call, .tl-row:focus-visible .tl-call { width: var(--w-log); }
-.tl-row:not(:hover):not(:focus-visible) .tl-call {
+.tl-row:has(.tl-band:hover, .tl-call:hover, .tl-att:hover) .tl-call, .tl-row:focus-visible .tl-call { width: var(--w-log); }
+.tl-row:not(:has(.tl-band:hover, .tl-call:hover, .tl-att:hover)):not(:focus-visible) .tl-call {
   top: calc(50% - 5px) !important; /* чип 10px по центру свёрнутой строки */
   opacity: .45;
 }
-.tl-row:not(:hover):not(:focus-visible) .tl-call.tl-unfinished,
-.tl-row:not(:hover):not(:focus-visible) .tl-call.tl-sel { opacity: 1; }
-.tl-row:not(:hover):not(:focus-visible) .tl-call.tl-dim { opacity: .18; }
+.tl-row:not(:has(.tl-band:hover, .tl-call:hover, .tl-att:hover)):not(:focus-visible) .tl-call.tl-unfinished,
+.tl-row:not(:has(.tl-band:hover, .tl-call:hover, .tl-att:hover)):not(:focus-visible) .tl-call.tl-sel { opacity: 1; }
+.tl-row:not(:has(.tl-band:hover, .tl-call:hover, .tl-att:hover)):not(:focus-visible) .tl-call.tl-dim { opacity: .18; }
 
 .tl-row-empty { font-size: 11.5px; color: var(--text-3); }
 
@@ -1307,7 +1313,7 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
   font-family: var(--mono); font-size: 10.5px; line-height: 1.5;
   opacity: 0; pointer-events: none; transition: opacity .09s ease;
 }
-.tl-call, .tl-band, .tl-lbl, .tl-mark, .tl-wait { cursor: pointer; }
+.tl-call, .tl-band, .tl-mark, .tl-wait { cursor: pointer; }
 .tl-call.tl-sel { box-shadow: inset 0 0 0 1.5px var(--accent), 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent); }
 .tl-call { cursor: pointer; }
 

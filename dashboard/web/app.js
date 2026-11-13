@@ -2317,14 +2317,6 @@ function toneVar(tone) {
  * чипами за место на дорожке.
  */
 function attemptRowNode(view, key) {
-  const label = h(
-    'div',
-    { class: 'tl-lbl', 'data-tip': view.bandTip || view.title || '' },
-    h('span', { class: 'tl-n' }, view.label.number),
-    // Исход попытки — то, что меняется от тика к тику: подсвечивается он, а не
-    // вся дорожка (полоса растёт непрерывно, вспышка на ней была бы миганием).
-    h('span', { class: `tl-st t-${view.label.tone} fresh`, 'data-fresh': key }, view.label.status),
-  )
   const track = h('div', { class: 'tl-track', 'data-key': `track:${key}` })
   if (view.band) {
     track.append(
@@ -2336,6 +2328,27 @@ function attemptRowNode(view, key) {
       }),
     )
   }
+  // Подпись попытки стоит у самой полосы, а не в гуттере: колонка подписей
+  // забирала 186 px у шкалы (Макс, 14.11: «название попытки и её статус рисовать
+  // рядом с колбаской слева»). У левой кромки места слева нет — там подпись
+  // встаёт внутрь полосы.
+  const bandLeft = view.band ? view.band.leftPct : 0
+  const inside = !view.band || bandLeft < 14
+  track.append(
+    h(
+      'span',
+      {
+        class: `tl-att${inside ? ' is-inside' : ''}`,
+        style: `left:${bandLeft}%`,
+        'data-tip': view.bandTip || view.title || '',
+        'data-key': `att:${key}`,
+      },
+      h('span', { class: 'tl-n' }, view.label.number),
+      // Исход попытки — то, что меняется от тика к тику: подсвечивается он, а не
+      // вся дорожка (полоса растёт непрерывно, вспышка на ней была бы миганием).
+      h('span', { class: `tl-st t-${view.label.tone} fresh`, 'data-fresh': key }, view.label.status),
+    ),
+  )
   // Тишина: зазор, где не было ни вызова, ни слова. Полоса попытки остаётся на
   // месте — тишина рисуется поверх неё, иначе «шло» и «молчало» слились бы вновь.
   for (const silence of view.silences || []) {
@@ -2427,7 +2440,6 @@ function attemptRowNode(view, key) {
       style: `--tl-collapsed:${view.collapsed}px;--tl-full:${view.full}px`,
       'data-key': key,
     },
-    label,
     track,
   )
 }
@@ -2470,16 +2482,11 @@ function leadLaneNode(leadLane, scale) {
             // Высота захода — 26 px в инлайновых переменных: у строки попытки высота
             // равна `--tl-full` на наведении, и правило из CSS ниже по файлу
             // возвращало бы рейку к 20 px под указателем.
-            { class: 'tl-row', style: '--tl-collapsed:26px;--tl-full:26px' },
+            { class: 'tl-row is-caption', style: '--tl-collapsed:26px;--tl-full:26px' },
             h(
               'div',
-              { class: 'tl-lbl', 'data-tip': `${leadLane.text}: полосы на оси — заходы лида, от подъёма до выхода` },
-              h('span', { class: 'tl-n' }, '·'),
-              h('span', { class: 'tl-st t-gray' }, 'заходы'),
-            ),
-            h(
-              'div',
-              { class: 'tl-track' },
+              { class: 'tl-track', 'data-tip': `${leadLane.text}: полосы на оси — заходы лида, от подъёма до выхода` },
+              h('span', { class: 'tl-att is-inside is-caption' }, 'заходы'),
               ...runs.map((run, index) =>
                 h(
                   'span',
@@ -3409,38 +3416,20 @@ function fitScaleGutter(root, dealKey) {
   if (!wrap) return
   if (scaleGutterSeen.deal !== dealKey) {
     scaleGutterSeen.deal = dealKey
-    scaleGutterSeen.px = 0
     scaleGutterSeen.namePx = 0
   }
-  let need = 0
-  // Ячейка имени целиком: имя этапа и чип профиля лежат в одной строке —
-  // максимального из детей мало, нужна их сумма (см. `fix-planned-branch`
-  // + «implementer» на d_c8551c18).
-  // Имя этапа меряется собственной шириной: у ячейки `scrollWidth` равен её же
-  // ширине (длинное имя обрезано), и колонка не росла под него вовсе — имена
-  // стояли в 204 px и терялись на середине слова.
-  // Описание не меряется: оно переносится по строкам, и его ширина — не заявка
-  // на колонку.
-  for (const el of root.querySelectorAll('.tl-lbl > *')) {
-    need = Math.max(need, el.scrollWidth || 0)
-  }
-  scaleGutterSeen.px = Math.max(scaleGutterSeen.px, need)
-  // 18px — внутренние отступы ячейки, зазор и запас на красную кромку провала.
-  const px = Math.min(320, Math.max(186, Math.ceil(scaleGutterSeen.px) + 18))
-  wrap.style.setProperty('--tl-gutter', `${px}px`)
-  // Имя этапа — своя колонка слева от подписей попыток: ширина по имени и чипу
-  // профиля вместе (у ячейки `scrollWidth` равен её ширине, поэтому меряем детей).
-  // Имя и профиль стоят друг под другом, поэтому колонка меряется по более
-  // широкому из них, а не по сумме.
+  // В гуттере осталась одна колонка — имя этапа и профиль под ним (Макс, 14.11:
+  // подписи попыток ушли к своим полосам). Ширина — по более широкому из двоих,
+  // ровно по контенту: `scrollWidth` у обрезанного элемента равен его ширине,
+  // поэтому меряем детей, а не ячейку.
   let namePx = 0
   for (const head of root.querySelectorAll('.tl-lane-head')) {
     for (const child of head.children) namePx = Math.max(namePx, child.scrollWidth || child.getBoundingClientRect().width || 0)
   }
-  if (namePx) {
-    scaleGutterSeen.namePx = Math.max(scaleGutterSeen.namePx || 0, namePx)
-    const named = Math.min(300, Math.max(96, Math.ceil(scaleGutterSeen.namePx) + 8))
-    wrap.style.setProperty('--tl-name', `${named}px`)
-  }
+  if (!namePx) return
+  scaleGutterSeen.namePx = Math.max(scaleGutterSeen.namePx || 0, namePx)
+  const named = Math.min(300, Math.max(96, Math.ceil(scaleGutterSeen.namePx) + 8))
+  wrap.style.setProperty('--tl-name', `${named}px`)
 }
 function pinScaleScroll(root) {
   const scroller = root && root.querySelector ? root.querySelector('.scale-main.is-wide') : null

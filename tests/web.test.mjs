@@ -50,10 +50,11 @@ test('левый столбец: шапка дорожки липнет вмес
   // равен её ширине, и колонка не росла под длинное имя (Макс, 14.11).
   // Замер — по коду этапа и подписям попыток. Описание не меряется: оно
   // переносится по строкам, и его ширина — не заявка на колонку.
-  assert.match(app, /querySelectorAll\('\.tl-lbl > \*'\)/, 'веб: подписи попыток не меряются')
-  assert.match(app, /querySelectorAll\('\.tl-lane-head'\)/, 'веб: имя этапа не меряется отдельной колонкой')
+  // Меряется только колонка имени: подписи попыток стоят у своих полос.
+  assert.match(app, /querySelectorAll\('\.tl-lane-head'\)/, 'веб: имя этапа не меряется')
   assert.match(app, /setProperty\('--tl-name'/, 'веб: ширина колонки имени не ставится')
-  assert.match(app, /Math\.min\(320, Math\.max\(186,/, 'веб: нет потолка 320px')
+  assert.doesNotMatch(app, /querySelectorAll\('\.tl-lbl/, 'веб: подписи попыток всё ещё в гуттере')
+  assert.match(app, /Math\.min\(300, Math\.max\(96,/, 'веб: нет потолка колонки имени (96…300)')
   // Описания и счётчиков в гуттере нет вовсе: колонка не меняется при развороте.
   assert.doesNotMatch(css, /\.tl-lane-desc/, 'веб: описание вернулось в дорожку')
   assert.doesNotMatch(css, /\.tl-lane-meta/, 'веб: счётчик вернулся в дорожку')
@@ -76,7 +77,8 @@ test('шкала длиннее часа листается, мы висим н�
   assert.match(css, /\.scale-main\.is-wide \{[\s\S]*?overflow-x: auto/, 'веб: нет горизонтальной прокрутки')
   assert.match(css, /min-width: calc\(var\(--tl-zoom, 1\) \* 100%\)/, 'веб: дорожки не растягиваются до zoom')
   assert.match(css, /\.scale-main\.is-wide \.scale-head-gap, \.scale-main\.is-wide \.tl-lane-id \{ position: sticky/, 'веб: имя этапа не прилипает')
-  assert.match(css, /\.scale-main\.is-wide \.tl-lbl \{ position: sticky; left: calc\(var\(--tl-name, 150px\) \+ var\(--tl-gap, 8px\)\)/, 'веб: подписи попыток не прилипают за колонкой имени')
+  // Колонки подписей попыток в гуттере больше нет: подпись живёт у полосы.
+  assert.doesNotMatch(css, /\.tl-lbl\s*\{/, 'веб: колонка подписей попыток вернулась в гуттер')
   assert.match(pluginSource, /duty-scale-main\$\{wide \? ' is-wide' : ''\}/, 'десктоп: широкая шкала не помечена')
   assert.match(pluginSource, /el\.scrollLeft = el\.scrollWidth/, 'десктоп: нет пина')
   assert.match(pluginSource, /\.duty-scale-main\.is-wide\{overflow-x:auto/, 'десктоп: нет стиля прокрутки')
@@ -97,10 +99,10 @@ test('шкала длиннее часа листается, мы висим н�
   // Ширина столбца монотонна, пока открыто то же дело: тик с пустыми попытками
   // не ужимает столбец обратно (Макс, 10.11: «столбец сужается после первого же
   // обновления»). Повторный замер — после кадров: шрифт догружается позже.
-  assert.match(app, /scaleGutterSeen\.px = Math\.max\(scaleGutterSeen\.px, need\)/, 'веб: ширина не монотонна')
+  assert.match(app, /scaleGutterSeen\.namePx = Math\.max\(scaleGutterSeen\.namePx \|\| 0, namePx\)/, 'веб: ширина не монотонна')
   assert.match(app, /fitScaleGutter\(panel, dealKey\)/, 'веб: замер не привязан к делу')
   assert.match(app, /fitScaleGutter\(panel, dealKey\)\n?[\s\S]{0,80}pinScaleScroll\(panel\)/, 'веб: нет повторного замера после кадров')
-  assert.match(pluginSource, /seen\.px = Math\.max\(seen\.px,/, 'десктоп: ширина не монотонна')
+  assert.match(pluginSource, /seen\.namePx = Math\.max\(seen\.namePx \|\| 0, namePx\)/, 'десктоп: ширина не монотонна')
   // Дорожки без собственного z-index, иначе подписи не поднимаются над подложкой.
   assert.ok(!/\.tl-lanes \{[^}]*z-index/.test(css), 'веб: у дорожек есть свой z-index — подписи под подложкой')
   assert.ok(!/\.duty-tl-lanes\{[^}]*z-index/.test(pluginSource), 'десктоп: у дорожек есть свой z-index')
@@ -126,10 +128,10 @@ test('свёрнутая строка: чипы линейной ширины, �
   // развороте, иначе короткие вызовы становились бы точками.
   assert.match(app, /--w-log:\$\{chip\.widthPct\}%/, 'веб: у чипа нет лог-ширины')
   assert.match(app, /--w-lin:\$\{chip\.widthLinPct/, 'веб: у чипа нет линейной ширины')
-  assert.match(css, /\.tl-row:hover \.tl-call, \.tl-row:focus-visible \.tl-call \{ width: var\(--w-log\)/, 'веб: развёрнутая не возвращает лог')
+  assert.match(css, /\.tl-row:has\(\.tl-band:hover, \.tl-call:hover, \.tl-att:hover\) \.tl-call, \.tl-row:focus-visible \.tl-call \{ width: var\(--w-log\)/, 'веб: развёрнутая не возвращает лог')
   assert.match(app, /width:var\(--w-lin\)/, 'веб: свёрнутая не линейна')
   assert.match(read('desktop/plugin.js'), /width: 'var\(--w-lin\)'/, 'десктоп: свёрнутая не линейна')
-  assert.match(read('desktop/plugin.js'), /\.duty-tl-row:hover \.duty-tl-call,\.duty-tl-row:focus-visible \.duty-tl-call\{width:var\(--w-log\)\}/, 'десктоп: развёрнутая не возвращает лог')
+  assert.match(read('desktop/plugin.js'), /\.duty-tl-row:has\(\.duty-tl-band:hover,\.duty-tl-call:hover,\.duty-tl-att:hover\) \.duty-tl-call,\.duty-tl-row:focus-visible \.duty-tl-call\{width:var\(--w-log\)\}/, 'десктоп: развёрнутая не возвращает лог')
 })
 
 test('палитра инструментов: интеграции и служебные не серые', () => {
@@ -332,11 +334,14 @@ test('разворот строки и правки экрана дела: пр�
     assert.match(text, new RegExp(`height:\\s*var\\(${collapsed}`), `${name}: нет свёрнутой высоты строки`)
     // Разворот включает наведение на полосу попытки (или на чип, который на ней
     // лежит), а не на всю строку с подписью (Макс, 14.11).
+    // Наведение — на «колбаску», на чип, лежащий на ней, или на подпись попытки;
+    // не на всю строку (Макс, 14.11: «наведение давай всё-таки на колбаску»).
     const rowCls = name === 'веб' ? 'tl-row' : 'duty-tl-row'
+    const band = name === 'веб' ? 'tl-band' : 'duty-tl-band'
     assert.match(
       text,
-      new RegExp(`\\.${rowCls}:hover[^{]*\\{[^}]*height:\\s*var\\(${full}`),
-      `${name}: наведение на ряд попытки не раскрывает строку`,
+      new RegExp(`\\.${rowCls}:has\\(\\.${band}:hover,[^{]*\\)[^{]*\\{[^}]*height:\\s*var\\(${full}`),
+      `${name}: наведение на полосу попытки не раскрывает строку`,
     )
     // Свёрнутая строка — нахлёст, а не прятание: все чипы на одной линии и
     // вполсилы, глубокие уровни лежат поверх (Макс, 09.11: «в свернутом виде
@@ -347,7 +352,7 @@ test('разворот строки и правки экрана дела: пр�
     // попытки не наведено».
     assert.match(
       text,
-      /:not\(:hover\):not\(:focus-visible\)\s+[^{]*tl-call[^{]*\{[^}]*top:\s*calc\(50%[^}]*opacity:\s*\.45/,
+      /:not\(:has\([^{]*tl-band:hover[^{]*\)\):not\(:focus-visible\)\s+[^{]*tl-call[^{]*\{[^}]*top:\s*calc\(50%[^}]*opacity:\s*\.45/,
       `${name}: свёрнутая лента не рисуется одной линией`,
     )
   }
@@ -411,8 +416,8 @@ test('разворот строки и правки экрана дела: пр�
   // Провал попытки виден на дорожке: красный фон и кромка в подписи, а не
   // только слово «провал» цветным текстом.
   for (const [name, text, cls, lbl] of [
-    ['веб', css, '.tl-band.t-red', '.tl-row.is-failed .tl-lbl'],
-    ['десктоп', plugin, '.duty-tl-band.t-red', '.duty-tl-row.is-failed .duty-tl-lbl'],
+    ['веб', css, '.tl-band.t-red', '.tl-row.is-failed .tl-att .tl-n'],
+    ['десктоп', plugin, '.duty-tl-band.t-red', '.duty-tl-row.is-failed .duty-tl-att .duty-tl-n'],
   ]) {
     assert.ok(text.includes(cls), `${name}: у красной полосы нет своего стиля`)
     assert.ok(text.includes(lbl), `${name}: провалившаяся строка не помечена`)
@@ -1547,7 +1552,7 @@ test('веб: заходы лида стоят на шкале отдельно�
   assert.match(lane.textContent, /lead/, 'у дорожки нет профиля')
   // Заходы лида стоят подписью своей строки в колонке попыток — счётчика в шапке
   // дорожки больше нет (Макс, 14.11).
-  assert.match(lane.querySelector('.tl-row .tl-lbl').textContent, /заходы/, 'у заходов нет подписи в колонке попыток')
+  assert.match(lane.querySelector('.tl-row .tl-att').textContent, /заходы/, 'у заходов нет подписи в дорожке')
 
   const runs = [...lane.querySelectorAll('.tl-lead-run')]
   assert.equal(runs.length, 2, `полос захода ${runs.length}, а в журнале два`)

@@ -223,7 +223,7 @@ test('десктоп: DutyLane рисует svg-значок, который л�
   const view = modelMod.attemptView(banded, scaleModel)
   const rowHtml = renderToStaticMarkup(React.createElement(mod.DutyAttemptRow, { view }))
   assert.match(rowHtml, /duty-tl-band/, 'нет фона-полосы длительности попытки')
-  assert.match(rowHtml, /duty-tl-lbl[^>]*data-tip/, 'у подписи строки нет подсказки с временем начала/конца')
+  assert.match(rowHtml, /duty-tl-att[^>]*data-tip/, 'у подписи попытки нет подсказки с временем начала/конца')
   assert.doesNotMatch(rowHtml, /duty-tl-tick/, 'в строке остались засечки старта/конца попытки')
   assert.doesNotMatch(rowHtml, /duty-smk-row/, 'вернулись отдельные ряды под шкалой')
 
@@ -643,11 +643,11 @@ test('десктоп: сжатый простой подписан на оси, 
   // колонки подписей (gutter + gap). При left:0 пунктир и подпись встают на
   // ~194 px левее промежутка и мерят проценты по ширине плагина, а не дорожки —
   // то есть подпись опровергает то, что нарисовано.
-  const track = 'left:calc\\(var\\(--duty-tl-name,150px\\) \\+ var\\(--duty-tl-gap,8px\\) \\+ var\\(--duty-tl-gutter, 186px\\) \\+ var\\(--duty-tl-gap, 8px\\)\\)'
+  const track = 'left:calc\\(var\\(--duty-tl-name,150px\\) \\+ var\\(--duty-tl-gap,8px\\)\\)'
   assert.match(css, new RegExp(`\\.duty-tl-idle-layer\\{[^}]*${track}`), 'слой сжатия не сдвинут на колонку подписей')
   assert.match(
     css,
-    /\.duty-tl-idle-layer\{[^}]*width:calc\(100% - var\(--duty-tl-name,150px\) - var\(--duty-tl-gap,8px\) - var\(--duty-tl-gutter, 186px\) - var\(--duty-tl-gap, 8px\)\)/,
+    /\.duty-tl-idle-layer\{[^}]*width:calc\(100% - calc\(var\(--duty-tl-name,150px\) \+ var\(--duty-tl-gap,8px\)\)\)/,
     'ширина слоя сжатия — не ширина дорожки',
   )
   assert.match(css, new RegExp(`\\.duty-scale-grid\\{[^}]*${track}`), 'линии сетки оси сдвинуты относительно подписей')

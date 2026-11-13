@@ -466,27 +466,98 @@ function shapeLead(block) {
 function shapeDecisions(items, limit = 50) {
   const rows = (Array.isArray(items) ? items : []).filter((item) => item && typeof item === 'object')
   const shown = limit && rows.length > limit ? rows.slice(-limit) : rows
-  return shown.map((item, index) => {
-    const author = String(item.author || '')
-    const at = numOrNull(item.at)
-    return {
-      key: `${String(item.kind || 'decision')}-${at === null ? 0 : at}-${index}`,
-      kind: String(item.kind || ''),
-      at,
-      clock: fmtClock(at),
-      ageText: fmtAge(numOrNull(item.age_sec)),
-      text: String(item.text || '—'),
-      stage: String(item.stage || ''),
-      author,
-      authorLabel: LEAD_AUTHOR_LABEL[author] || author,
-      tone: LEAD_AUTHOR_TONE[author] || 'gray',
-    }
-  })
+  // Свежие сверху: лента — журнал решений, и последнее решение человек ищет
+  // первым. Журнальный порядок остаётся в терминале (`duty deal`), где простыня
+  // читается сверху вниз без прокрутки.
+  let previous = null
+  return shown
+    .map((item, index) => {
+      const author = String(item.author || '')
+      const at = numOrNull(item.at)
+      const type = decisionType(item.kind)
+      // Через сколько после прошлого решения — единственная величина, которую
+      // журнал даёт бесплатно и которую иначе считают в голове: «лид думал 12 минут,
+      // потом отклонил план».
+      const gapSec = previous !== null && at !== null ? Math.max(0, at - previous) : null
+      if (at !== null) previous = at
+      return {
+        key: `${String(item.kind || 'decision')}-${at === null ? 0 : at}-${index}`,
+        kind: String(item.kind || ''),
+        at,
+        // Часы до минуты: в журнале решений секунды не читаются, полное время
+        // остаётся в подсказке (возраст факта).
+        clock: fmtClock(at) === '—' ? '—' : fmtClock(at).slice(0, 5),
+        gapSec,
+        gapText: gapSec === null ? '' : `+${fmtDuration(gapSec)}`,
+        ageText: fmtAge(numOrNull(item.age_sec)),
+        text: String(item.text || '—'),
+        stage: String(item.stage || ''),
+        author,
+        authorLabel: LEAD_AUTHOR_LABEL[author] || author,
+        // Тон строки — вид решения; у автора свой тон только как подпись чипа.
+        tone: type.tone,
+        authorTone: LEAD_AUTHOR_TONE[author] || 'gray',
+        typeLabel: type.label,
+        group: type.group,
+      }
+    })
+    .reverse()
 }
 
 /** Заголовок ленты решений: сколько их всего (обрезанная лента не врёт числом). */
 function decisionsCount(items) {
   return Array.isArray(items) ? items.length : 0
+}
+
+/**
+ * Вид решения по факту журнала: слово, тон и семейство.
+ *
+ * Лента — не поток абзацев, а журнал решений, и человек ищет в нём «кто и что
+ * решил», а вид — первое, что он различает глазом. Слово вида — своё у каждого
+ * факта (`план принят` и `план отклонён` — разные решения, а не «план»), тон
+ * берётся из той же палитры, что состояния дела, семейство — для фильтра шапки.
+ * Текст решения остаётся словами бэкенда как есть: он называет подробность,
+ * которую вид не заменяет.
+ */
+const DECISION_TYPES = {
+  plan_accepted: { label: 'план принят', tone: 'green', group: 'plan' },
+  plan_rejected: { label: 'план отклонён', tone: 'yellow', group: 'plan' },
+  attempt_started: { label: 'перезапуск', tone: 'blue', group: 'stage' },
+  stage_cancelled: { label: 'отмена этапа', tone: 'red', group: 'stage' },
+  question_answered: { label: 'ответ', tone: 'purple', group: 'question' },
+  completed: { label: 'закрытие', tone: 'gray', group: 'deal' },
+  lead_started: { label: 'подъём', tone: 'green', group: 'lead' },
+  lead_resumed: { label: 'резюм', tone: 'green', group: 'lead' },
+  lead_exited: { label: 'выход', tone: 'gray', group: 'lead' },
+}
+
+/** Семейства решений: подпись фильтра и порядок чипов в шапке ленты. */
+const DECISION_GROUPS = [
+  { key: 'plan', label: 'план' },
+  { key: 'stage', label: 'этапы' },
+  { key: 'question', label: 'вопросы' },
+  { key: 'lead', label: 'лид' },
+  { key: 'deal', label: 'дело' },
+]
+
+/** Вид решения; факт без вида остаётся фактом — «решение» без выдумки семейства. */
+function decisionType(kind) {
+  return DECISION_TYPES[String(kind || '')] || { label: 'решение', tone: 'gray', group: '' }
+}
+
+/** Фильтры шапки ленты: только семейства, которые в этой ленте есть. */
+function decisionGroups(rows) {
+  const counts = new Map()
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const group = String(row.group || '')
+    if (!group) continue
+    counts.set(group, (counts.get(group) || 0) + 1)
+  }
+  return DECISION_GROUPS.filter((group) => counts.has(group.key)).map((group) => ({
+    key: group.key,
+    label: group.label,
+    count: counts.get(group.key),
+  }))
 }
 
 /** Сколько дел в каждом состоянии — по строкам, а не по ответу бэкенда. */
@@ -4204,21 +4275,19 @@ function DutyLeadLane({ leadLane }) {
                   'span',
                   {
                     key: `lead-run-${index}`,
+                    // Тон задаёт только цвет: рейка, засечки, слово и живая точка
+                    // рисуются currentColor — одна переменная на весь заход.
                     className: `duty-tl-lead-run${run.open ? ' is-open' : ''}${run.stale ? ' is-stale' : ''}`,
-                    // Штриховка «конец не записан» живёт в CSS: инлайновый фон её бы съел.
-                    style: run.stale
-                      ? { left: `${run.startPct}%`, width: `${run.widthPct}%` }
-                      : {
-                          left: `${run.startPct}%`,
-                          width: `${run.widthPct}%`,
-                          background: `color-mix(in srgb, ${color} 16%, transparent)`,
-                          borderColor: `color-mix(in srgb, ${color} 40%, transparent)`,
-                        },
+                    style: { left: `${run.startPct}%`, width: `${run.widthPct}%`, color },
                     title: run.title,
                     'aria-label': run.title,
                     role: 'img',
                   },
-                  run.labeled ? h('span', { className: 'duty-tl-lead-run-label' }, run.label) : null,
+                  h('span', { className: 'duty-tl-lead-rail' }),
+                  h('span', { className: 'duty-tl-lead-cap is-start' }),
+                  h('span', { className: 'duty-tl-lead-cap is-end' }),
+                  run.labeled ? h('span', { className: 'duty-tl-lead-label' }, run.label) : null,
+                  run.open ? h('span', { className: 'duty-tl-lead-head' }) : null,
                 )
               }),
             ),
@@ -4387,23 +4456,47 @@ const CSS = `
 .duty-deal-ico{flex:none;width:15px;height:15px;fill:none;stroke:var(--ui-accent,currentColor);stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
 .duty-deal-facts{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--ui-text-secondary)}
 .duty-deal-facts b{color:var(--ui-text-primary);font-weight:600}
-/* Лента решений лида: время · автор · решение. Время и автор — узкие колонки,
-   текст забирает остаток, чтобы строки не плясали от слова к слову. */
-.duty-decisions-list{display:flex;flex-direction:column;gap:2px;max-height:240px;overflow-y:auto}
-.duty-dec-row{display:grid;grid-template-columns:44px 12px 70px minmax(0,1fr);gap:8px;align-items:baseline;font-size:11.5px;padding:3px 0}
-.duty-dec-row+.duty-dec-row{border-top:1px solid var(--ui-stroke-tertiary)}
-.duty-dec-clock{font-size:11px;font-variant-numeric:tabular-nums;color:var(--ui-text-tertiary);text-align:right}
-.duty-dec-dot{width:7px;height:7px;border-radius:50%;align-self:center;background:var(--ui-text-tertiary)}
-.duty-dec-author{font-size:10.5px;font-weight:650;text-transform:uppercase;letter-spacing:.02em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.duty-dec-author.is-blank{visibility:hidden}
+/* Журнал решений лида — таблица внизу панели шкалы: колонки вместо растянутого
+   текста, свежие сверху, фильтр по семействам в шапке. */
+.duty-scale-log{margin-top:10px;border-top:1px solid var(--ui-stroke-tertiary);padding-top:8px}
+.duty-scale-log-h{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px}
+.duty-scale-log-title{font-size:10.5px;font-weight:650;letter-spacing:.04em;text-transform:uppercase;color:var(--ui-text-secondary)}
+.duty-dec-filters{display:flex;flex-wrap:wrap;gap:4px}
+.duty-dec-filter{height:20px;padding:0 7px;border-radius:999px;cursor:pointer;border:1px solid var(--ui-stroke-tertiary);background:transparent;color:var(--ui-text-secondary);font:inherit;font-size:11px;font-variant-numeric:tabular-nums}
+.duty-dec-filter:hover{color:var(--ui-text-primary);border-color:var(--ui-text-tertiary)}
+.duty-dec-filter.on{color:var(--ui-blue);border-color:color-mix(in srgb, var(--ui-blue) 45%, transparent);background:color-mix(in srgb, var(--ui-blue) 10%, transparent)}
+.duty-dec-table{--duty-dec-cols:58px 112px 62px 104px minmax(0,1fr);max-width:1080px}
+.duty-dec-table.no-stage{--duty-dec-cols:58px 112px 62px minmax(0,1fr)}
+.duty-dec-row{display:grid;grid-template-columns:var(--duty-dec-cols);gap:10px;align-items:baseline;font-size:11.5px;padding:3px 0}
+.duty-dec-row.is-head{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--ui-text-tertiary);padding-bottom:4px;border-bottom:1px solid var(--ui-stroke-tertiary)}
+.duty-dec-body{max-height:232px;overflow-y:auto}
+.duty-dec-body .duty-dec-row+.duty-dec-row{border-top:1px solid var(--ui-stroke-tertiary)}
+.duty-dec-row:hover{background:color-mix(in srgb, var(--ui-text-primary) 6%, transparent)}
+.duty-dec-clock{font-size:11.5px;font-variant-numeric:tabular-nums;color:var(--ui-text-secondary);display:flex;flex-direction:column;align-items:flex-end;line-height:1.25}
+.duty-dec-gap{font-size:9.5px;font-style:normal;color:var(--ui-text-tertiary)}
+.duty-dec-type{font-size:11px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.duty-dec-who{font-size:10.5px;font-weight:650;text-transform:uppercase;letter-spacing:.02em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.duty-dec-who.is-blank{color:var(--ui-text-tertiary)}
+.duty-dec-stage{font-size:11px;font-family:ui-monospace, Menlo, monospace;color:var(--ui-text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .duty-dec-text{color:var(--ui-text-primary);overflow-wrap:anywhere;line-height:1.35}
-/* Заход лида на шкале: полоса от подъёма до выхода, тон — чем кончился заход.
-   «Конец не записан» отличается штриховкой: это не «шёл всё время», а потерянный
-   факт журнала (проба pid в leadfeed.open_pid). */
-.duty-tl-lead-run{position:absolute;top:1px;bottom:1px;border-radius:4px;display:flex;align-items:center;justify-content:center;overflow:hidden;background:color-mix(in srgb, var(--ui-text-tertiary) 18%, transparent);border:1px solid color-mix(in srgb, var(--ui-text-tertiary) 40%, transparent)}
-.duty-tl-lead-run.is-stale{border-style:dashed;background:repeating-linear-gradient(135deg, color-mix(in srgb, var(--ui-text-tertiary) 20%, transparent) 0 4px, transparent 4px 8px)}
-.duty-tl-lead-run.is-open{animation:duty-tl-live 2.8s ease-in-out infinite}
-.duty-tl-lead-run-label{font-size:9.5px;line-height:1;color:var(--ui-text-secondary);white-space:nowrap}
+.duty-dec-empty{padding:6px 0;color:var(--ui-text-tertiary);font-size:11px}
+/* Заход лида на шкале — разметка поверх дорожек, а не вторая полоса попытки:
+   рейка на уровне текста, засечки начала и конца, слово режима над рейкой, вся
+   дорожка тонирована (она другого рода, чем этапы под ней). Идущий заход несёт
+   живую точку на свежем краю; «конец не записан» отличается штрихом и ромбом —
+   дальше журнал молчит (проба pid в leadfeed). */
+.duty-tl-lane-lead{background:color-mix(in srgb, var(--ui-text-primary) 5%, transparent);border-radius:4px}
+.duty-tl-lead-run{position:absolute;top:0;bottom:0}
+.duty-tl-lead-rail{position:absolute;left:0;right:0;top:15px;height:3px;border-radius:2px;background:currentColor;opacity:.85}
+.duty-tl-lead-run.is-open .duty-tl-lead-rail{opacity:1;box-shadow:0 0 0 1px color-mix(in srgb, currentColor 25%, transparent)}
+.duty-tl-lead-cap{position:absolute;top:9px;height:15px;width:2px;border-radius:1px;background:currentColor}
+.duty-tl-lead-cap.is-start{left:0}
+.duty-tl-lead-cap.is-end{right:0}
+.duty-tl-lead-label{position:absolute;left:5px;top:1px;font-size:10px;font-weight:600;line-height:1.2;color:currentColor;opacity:.9;white-space:nowrap;pointer-events:none}
+.duty-tl-lead-head{position:absolute;right:-3px;top:12px;width:9px;height:9px;border-radius:50%;background:currentColor;box-shadow:0 0 0 3px color-mix(in srgb, currentColor 22%, transparent);animation:duty-tl-live 2.8s ease-in-out infinite}
+.duty-tl-lead-run.is-stale .duty-tl-lead-rail{background:repeating-linear-gradient(90deg, currentColor 0 4px, transparent 4px 8px);opacity:.85}
+.duty-tl-lead-run.is-stale .duty-tl-lead-cap.is-end{top:11px;height:11px;width:11px;right:-4px;border-radius:1px;transform:rotate(45deg);background:currentColor}
+
 /* Строка лида в ячейке состояния списка: вторичная подпись под бейджем — столбец
    «состояние» не должен менять ширину от длинного слова. */
 .duty-lead-note{display:block;margin-top:4px;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -5386,33 +5479,96 @@ function DealFactSpans({ scale }) {
   )
 }
 
-/** Лента решений лида (`decisions[]` ответа `/deal`) — тот же список, что в терминале. */
+/** Журнал решений лида — таблица внизу панели шкалы (тот же список, что `duty deal`).
+ *
+ *  Колонки `время · вид · кто · этап · что решил` и фильтр по семействам: строка
+ *  читается слева направо, «кто» и «когда» стоят на одном месте в каждой строке,
+ *  а ширина занята колонками, а не растянутым текстом. Свежие сверху (порядок
+ *  даёт шейпер), пустая лента не рисуется вовсе. */
 function DecisionsPanel({ items }) {
-  // Пустая лента не рисуется: «решений нет» на экране свежего дела — шум, а не
-  // факт (в терминале `duty deal` об этом печатает строку).
+  const [groups, setGroups] = useState([])
   const total = decisionsCount(items)
+  const rows = useMemo(() => (total ? shapeDecisions(items) : []), [items, total])
+  const filters = useMemo(() => decisionGroups(rows), [rows])
+  const hasStage = rows.some((row) => row.stage)
   if (!total) return null
-  const rows = shapeDecisions(items)
+  const on = (group) => {
+    setGroups((prev) => (prev.includes(group) ? prev.filter((item) => item !== group) : [...prev, group]))
+  }
+  const active = groups.length > 0
+  const shown = active ? rows.filter((row) => groups.includes(row.group)) : rows
   return h(
     'div',
-    { className: 'duty-panel' },
-    h('div', { className: 'duty-group-h' }, `решения лида · ${total}`),
+    { className: 'duty-scale-log' },
     h(
       'div',
-      { className: 'duty-decisions-list' },
-      ...rows.map((row) =>
+      { className: 'duty-scale-log-h' },
+      h('span', { className: 'duty-scale-log-title' }, `решения лида · ${total}`),
+      h('span', { className: 'duty-muted' }, 'свежие сверху'),
+      h('span', { className: 'duty-spacer' }),
+      h(
+        'div',
+        { className: 'duty-dec-filters', role: 'group', 'aria-label': 'фильтр решений по семействам' },
         h(
-          'div',
-          { className: 'duty-dec-row', key: row.key },
-          h('span', { className: 'duty-dec-clock', title: row.ageText === '—' ? '' : `${row.ageText} назад` }, row.clock),
-          h('span', { className: 'duty-dec-dot', 'aria-hidden': 'true', style: { background: TONE_COLOR[row.tone] || TONE_COLOR.gray } }),
-          // Ячейка автора есть всегда, даже пустая: иначе текст съезжал в узкую
-          // колонку автора и рвался на 70 px в четыре строки.
-          row.authorLabel
-            ? h('span', { className: 'duty-dec-author', style: { color: TONE_COLOR[row.tone] || TONE_COLOR.gray }, title: row.author }, row.authorLabel)
-            : h('span', { className: 'duty-dec-author is-blank', 'aria-hidden': 'true' }, '·'),
-          h('span', { className: 'duty-dec-text' }, row.text),
+          'button',
+          {
+            className: `duty-dec-filter${active ? '' : ' on'}`,
+            type: 'button',
+            'aria-pressed': active ? 'false' : 'true',
+            onClick: () => setGroups([]),
+          },
+          `все ${total}`,
         ),
+        ...filters.map((filter) =>
+          h(
+            'button',
+            {
+              key: filter.key,
+              className: `duty-dec-filter${groups.includes(filter.key) ? ' on' : ''}`,
+              type: 'button',
+              'aria-pressed': groups.includes(filter.key) ? 'true' : 'false',
+              onClick: () => on(filter.key),
+            },
+            `${filter.label} ${filter.count}`,
+          ),
+        ),
+      ),
+    ),
+    h(
+      'div',
+      { className: `duty-dec-table${hasStage ? '' : ' no-stage'}` },
+      h(
+        'div',
+        { className: 'duty-dec-row is-head', 'aria-hidden': 'true' },
+        h('span', null, 'время'),
+        h('span', null, 'решение'),
+        h('span', null, 'кто'),
+        hasStage ? h('span', null, 'этап') : null,
+        h('span', null, 'что решил'),
+      ),
+      h(
+        'div',
+        { className: 'duty-dec-body' },
+        ...(shown.length
+          ? shown.map((row) =>
+              h(
+                'div',
+                { className: 'duty-dec-row', key: row.key },
+                h(
+                  'span',
+                  { className: 'duty-dec-clock', title: row.ageText === '—' ? '' : `${row.ageText} назад` },
+                  row.clock,
+                  row.gapText ? h('i', { className: 'duty-dec-gap', title: 'прошло после предыдущего решения' }, row.gapText) : null,
+                ),
+                h('span', { className: 'duty-dec-type', style: { color: TONE_COLOR[row.tone] || TONE_COLOR.gray } }, row.typeLabel),
+                row.authorLabel
+                  ? h('span', { className: 'duty-dec-who', style: { color: TONE_COLOR[row.authorTone] || TONE_COLOR.gray }, title: `автор: ${row.author}` }, row.authorLabel)
+                  : h('span', { className: 'duty-dec-who is-blank', 'aria-hidden': 'true' }, '—'),
+                hasStage ? h('span', { className: 'duty-dec-stage' }, row.stage) : null,
+                h('span', { className: 'duty-dec-text' }, row.text),
+              ),
+            )
+          : [h('div', { className: 'duty-dec-empty', key: 'empty' }, 'в этом семействе решений нет')]),
       ),
     ),
   )
@@ -5532,7 +5688,7 @@ function callOf(scale, callId) {
 }
 
 /** Панель шкалы времени: подписанная ось, дорожка на этап, полосы и маркеры. */
-function ScalePanel({ scale, dealId, callSel, onSelectCall, toolFilter, onToggleTool }) {
+function ScalePanel({ scale, dealId, callSel, onSelectCall, toolFilter, onToggleTool, decisions }) {
   const active = Array.isArray(toolFilter) ? toolFilter : []
   // Прокрутка широкой шкалы (Макс, 09.11: «максимальную ширину таймлайна в час,
   // дальше — прокрутку, висим на правой границе»): пока человек не уехал влево
@@ -5753,6 +5909,9 @@ function ScalePanel({ scale, dealId, callSel, onSelectCall, toolFilter, onToggle
         )
       : null,
     scale.facts.attempts.journal ? h('div', { className: 'duty-muted' }, 'полосы собраны из журнала: ответ попыток пуст') : null,
+    // Журнал решений — внизу той же панели: это тот же разговор «что произошло»,
+    // только словами, и он стоит под дорожками, к которым относится.
+    h(DecisionsPanel, { items: decisions }),
   )
 }
 
@@ -6522,10 +6681,9 @@ function DealScreen({ sel, onBack }) {
       // Шкала — первой и во всю ширину: это главный факт дела, а спецификация и
       // столбец этапов — пояснение к нему.
       h(KpiStrip, { scale }),
-      h(ScalePanel, { scale, dealId: sel.id, callSel, onSelectCall: selectCall, toolFilter, onToggleTool: toggleTool }),
+      h(ScalePanel, { scale, dealId: sel.id, callSel, onSelectCall: selectCall, toolFilter, onToggleTool: toggleTool, decisions: detail.data.decisions }),
       // Решения лида — во всю ширину над колонками: история по времени рядом со
       // шкалой, а не ещё один узкий столбец.
-      h(DecisionsPanel, { items: detail.data.decisions }),
       docs.length
         ? h(
             'div',

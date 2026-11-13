@@ -46,6 +46,7 @@ import {
   shapeLead,
   shapeDecisions,
   decisionsCount,
+  decisionGroups,
   shapeDealTime,
   shapeFinished,
   shapeNow,
@@ -3342,7 +3343,7 @@ test('лид: `shapeDeal` переносит блок lead в строку сп�
   assert.equal(shapeDeal({ id: 'd_bbbbbb', waiting: { state: 'working' } }).lead.known, false)
 })
 
-test('решения лида: порядок журнальный, автор подписан, лента обрезается хвостом', () => {
+test('решения лида: свежие сверху, вид назван, автор подписан, лента обрезается хвостом', () => {
   const items = [
     { kind: 'plan_accepted', at: 1_000, author: 'lead', text: 'план создан (3 этапа)' },
     { kind: 'question_answered', at: 1_100, author: 'human', text: 'ответ на вопрос #4 пришёл от человека' },
@@ -3350,20 +3351,49 @@ test('решения лида: порядок журнальный, автор �
     { kind: 'completed', at: 1_300, author: 'lead', text: 'дело закрыто лидом' },
   ]
   const rows = shapeDecisions(items)
-  assert.deepEqual(rows.map((row) => row.text), items.map((item) => item.text))
-  assert.deepEqual(rows.map((row) => row.authorLabel), ['лид', 'человек', '', 'лид'])
-  // Автор назван фактом → у него свой тон; факт автора не называет (перезапуск
-  // этапа пишет движок) → подписи нет вовсе, а не выдуманный «лид».
-  assert.equal(rows[1].tone, 'yellow')
-  assert.equal(rows[2].authorLabel, '')
+  // Свежие сверху: в журнале решений последнее решение ищут первым (журнальный
+  // порядок остался в терминале, `duty deal` печатает его).
+  assert.deepEqual(rows.map((row) => row.text), items.map((item) => item.text).reverse())
+  assert.deepEqual(rows.map((row) => row.authorLabel), ['лид', '', 'человек', 'лид'])
+  // Вид решения — своё слово у каждого факта: по нему строку читают с одного взгляда.
+  assert.deepEqual(rows.map((row) => row.typeLabel), ['закрытие', 'перезапуск', 'ответ', 'план принят'])
+  assert.deepEqual(rows.map((row) => row.group), ['deal', 'stage', 'question', 'plan'])
+  // Тон строки — вид решения, тон автора — отдельно (человек жёлтый, лид синий).
+  assert.equal(rows[2].tone, 'purple')
+  assert.equal(rows[2].authorTone, 'yellow')
+  assert.equal(rows[0].authorTone, 'blue')
+  // Факт, который автора не называет (перезапуск пишет движок), автора не выдумывает.
+  assert.equal(rows[1].authorLabel, '')
 
   const tail = shapeDecisions(items, 2)
-  assert.deepEqual(tail.map((row) => row.text), items.slice(2).map((item) => item.text))
+  assert.deepEqual(tail.map((row) => row.text), items.slice(-2).map((item) => item.text).reverse())
   // Число в заголовке считает всю ленту, а не обрезанную часть.
   assert.equal(decisionsCount(items), 4)
-  assert.equal(rows[0].clock.length, 8)
+  // Часы до минуты: секунды в журнале решений не читаются, полное время — в подсказке.
+  assert.equal(rows[0].clock.length, 5)
+  // Через сколько после прошлого решения: у самого старого пары нет.
+  assert.equal(rows.at(-1).gapSec, null)
+  assert.equal(rows[1].gapSec, 100)
+  assert.equal(rows[1].gapText, '+1 мин')
   assert.equal(shapeDecisions(null).length, 0)
   assert.equal(decisionsCount(undefined), 0)
+})
+
+test('решения лида: семейства для фильтра считаются по строкам ленты', () => {
+  const rows = shapeDecisions([
+    { kind: 'plan_accepted', at: 1_000, author: 'lead', text: 'план' },
+    { kind: 'plan_rejected', at: 1_050, author: 'lead', text: 'план отклонён' },
+    { kind: 'stage_cancelled', at: 1_100, author: 'lead', stage: 'check', text: 'этап отменён' },
+    { kind: 'lead_started', at: 1_150, author: 'lead', text: 'поднят' },
+    // Неизвестный вид не притворяется семейством: в фильтр он не попадает.
+    { kind: 'created', at: 1_200, author: null, text: 'дело создано' },
+  ])
+  assert.deepEqual(decisionGroups(rows), [
+    { key: 'plan', label: 'план', count: 2 },
+    { key: 'stage', label: 'этапы', count: 1 },
+    { key: 'lead', label: 'лид', count: 1 },
+  ])
+  assert.deepEqual(decisionGroups([]), [])
 })
 
 test('дорожка лида: заходы читаются из журнала парами, без выдумки статуса', () => {

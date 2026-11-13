@@ -417,27 +417,98 @@ function shapeLead(block) {
 function shapeDecisions(items, limit = 50) {
   const rows = (Array.isArray(items) ? items : []).filter((item) => item && typeof item === 'object')
   const shown = limit && rows.length > limit ? rows.slice(-limit) : rows
-  return shown.map((item, index) => {
-    const author = String(item.author || '')
-    const at = numOrNull(item.at)
-    return {
-      key: `${String(item.kind || 'decision')}-${at === null ? 0 : at}-${index}`,
-      kind: String(item.kind || ''),
-      at,
-      clock: fmtClock(at),
-      ageText: fmtAge(numOrNull(item.age_sec)),
-      text: String(item.text || '—'),
-      stage: String(item.stage || ''),
-      author,
-      authorLabel: LEAD_AUTHOR_LABEL[author] || author,
-      tone: LEAD_AUTHOR_TONE[author] || 'gray',
-    }
-  })
+  // Свежие сверху: лента — журнал решений, и последнее решение человек ищет
+  // первым. Журнальный порядок остаётся в терминале (`duty deal`), где простыня
+  // читается сверху вниз без прокрутки.
+  let previous = null
+  return shown
+    .map((item, index) => {
+      const author = String(item.author || '')
+      const at = numOrNull(item.at)
+      const type = decisionType(item.kind)
+      // Через сколько после прошлого решения — единственная величина, которую
+      // журнал даёт бесплатно и которую иначе считают в голове: «лид думал 12 минут,
+      // потом отклонил план».
+      const gapSec = previous !== null && at !== null ? Math.max(0, at - previous) : null
+      if (at !== null) previous = at
+      return {
+        key: `${String(item.kind || 'decision')}-${at === null ? 0 : at}-${index}`,
+        kind: String(item.kind || ''),
+        at,
+        // Часы до минуты: в журнале решений секунды не читаются, полное время
+        // остаётся в подсказке (возраст факта).
+        clock: fmtClock(at) === '—' ? '—' : fmtClock(at).slice(0, 5),
+        gapSec,
+        gapText: gapSec === null ? '' : `+${fmtDuration(gapSec)}`,
+        ageText: fmtAge(numOrNull(item.age_sec)),
+        text: String(item.text || '—'),
+        stage: String(item.stage || ''),
+        author,
+        authorLabel: LEAD_AUTHOR_LABEL[author] || author,
+        // Тон строки — вид решения; у автора свой тон только как подпись чипа.
+        tone: type.tone,
+        authorTone: LEAD_AUTHOR_TONE[author] || 'gray',
+        typeLabel: type.label,
+        group: type.group,
+      }
+    })
+    .reverse()
 }
 
 /** Заголовок ленты решений: сколько их всего (обрезанная лента не врёт числом). */
 function decisionsCount(items) {
   return Array.isArray(items) ? items.length : 0
+}
+
+/**
+ * Вид решения по факту журнала: слово, тон и семейство.
+ *
+ * Лента — не поток абзацев, а журнал решений, и человек ищет в нём «кто и что
+ * решил», а вид — первое, что он различает глазом. Слово вида — своё у каждого
+ * факта (`план принят` и `план отклонён` — разные решения, а не «план»), тон
+ * берётся из той же палитры, что состояния дела, семейство — для фильтра шапки.
+ * Текст решения остаётся словами бэкенда как есть: он называет подробность,
+ * которую вид не заменяет.
+ */
+const DECISION_TYPES = {
+  plan_accepted: { label: 'план принят', tone: 'green', group: 'plan' },
+  plan_rejected: { label: 'план отклонён', tone: 'yellow', group: 'plan' },
+  attempt_started: { label: 'перезапуск', tone: 'blue', group: 'stage' },
+  stage_cancelled: { label: 'отмена этапа', tone: 'red', group: 'stage' },
+  question_answered: { label: 'ответ', tone: 'purple', group: 'question' },
+  completed: { label: 'закрытие', tone: 'gray', group: 'deal' },
+  lead_started: { label: 'подъём', tone: 'green', group: 'lead' },
+  lead_resumed: { label: 'резюм', tone: 'green', group: 'lead' },
+  lead_exited: { label: 'выход', tone: 'gray', group: 'lead' },
+}
+
+/** Семейства решений: подпись фильтра и порядок чипов в шапке ленты. */
+const DECISION_GROUPS = [
+  { key: 'plan', label: 'план' },
+  { key: 'stage', label: 'этапы' },
+  { key: 'question', label: 'вопросы' },
+  { key: 'lead', label: 'лид' },
+  { key: 'deal', label: 'дело' },
+]
+
+/** Вид решения; факт без вида остаётся фактом — «решение» без выдумки семейства. */
+function decisionType(kind) {
+  return DECISION_TYPES[String(kind || '')] || { label: 'решение', tone: 'gray', group: '' }
+}
+
+/** Фильтры шапки ленты: только семейства, которые в этой ленте есть. */
+function decisionGroups(rows) {
+  const counts = new Map()
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const group = String(row.group || '')
+    if (!group) continue
+    counts.set(group, (counts.get(group) || 0) + 1)
+  }
+  return DECISION_GROUPS.filter((group) => counts.has(group.key)).map((group) => ({
+    key: group.key,
+    label: group.label,
+    count: counts.get(group.key),
+  }))
 }
 
 /** Сколько дел в каждом состоянии — по строкам, а не по ответу бэкенда. */
@@ -3936,6 +4007,7 @@ export {
   shapeLead,
   shapeDecisions,
   decisionsCount,
+  decisionGroups,
   LEAD_AUTHOR_LABEL,
   LEAD_STATE_TONE,
   shapeFinished,

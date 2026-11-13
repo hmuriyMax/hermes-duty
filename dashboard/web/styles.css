@@ -468,53 +468,105 @@ svg.deal-ico { flex: none; width: 16px; height: 16px; fill: none; stroke: var(--
 .deal-facts b.t-green { color: var(--ok); }
 .deal-facts b.t-gray { color: var(--text-2); }
 
-/* Лента решений лида (`decisions[]` ответа `/deal`): время · автор · решение.
-   Время и автор — узкие колонки фиксированной ширины, текст забирает остаток,
-   чтобы строки не «плясали» по горизонтали от слова к слову. */
-.decisions-list { display: flex; flex-direction: column; gap: 2px; overflow-y: auto; }
-.dec-row { display: grid; grid-template-columns: 44px 12px 70px minmax(0, 1fr); gap: 8px; align-items: baseline; font-size: 12.5px; padding: 3px 0; }
-.dec-row + .dec-row { border-top: 1px solid var(--border); }
-.dec-clock { font-size: 11px; font-variant-numeric: tabular-nums; color: var(--text-3); text-align: right; }
-/* Точка — тон решения из шейпера: строка читается глазом до чтения слов. */
-.dec-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-3); align-self: center; }
-.dec-dot.t-green { background: var(--ok); }
-.dec-dot.t-blue { background: var(--accent); }
-.dec-dot.t-yellow { background: var(--warn); }
-.dec-dot.t-red { background: var(--danger); }
-.dec-dot.t-gray { background: var(--text-3); }
-/* Пустая ячейка автора держит решётку: без неё текст съезжал в узкую колонку
-   автора и рвался на 74 px в 4 строки (замер: 9 строк из 22). */
-.dec-author { font-size: 11px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.dec-author.is-blank { visibility: hidden; }
+/* Журнал решений лида — таблица внизу панели шкалы (`decisions[]` ответа
+   `/deal`). Колонки: время · вид · кто · этап · что решил. Ширина занята
+   колонками, а не растянутым текстом: строка читается слева направо, и глаз
+   находит «кто» и «когда» в одном и том же месте каждой строки. */
+.scale-log { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; }
+.scale-log-h { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.scale-log-title { font-size: 11px; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-2); }
+.dec-filters { display: flex; flex-wrap: wrap; gap: 4px; }
+/* Чип семейства: выключенный — контур, включённый — заливка. «Все» показывается
+   включённым, пока фильтр пуст, поэтому состояние читается в любую секунду. */
+.dec-filter {
+  height: 20px; padding: 0 7px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--border); background: transparent; color: var(--text-2);
+  font: inherit; font-size: 11px; font-variant-numeric: tabular-nums;
+}
+.dec-filter:hover { color: var(--text); border-color: var(--text-3); }
+.dec-filter.on { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); background: var(--accent-soft); }
+/* Ширина таблицы ограничена по мере чтения: свободный текст в 1100 px не
+   читается, а строки-обрубки в 30 знаков оставляли бы пустую половину панели. */
+.dec-table { --dec-cols: 58px 112px 62px minmax(0, 1fr); max-width: 1080px; }
+.dec-row {
+  display: grid; grid-template-columns: var(--dec-cols); gap: 10px;
+  align-items: baseline; font-size: 12.5px; padding: 3px 0;
+}
+.dec-row.is-head {
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-3);
+  padding-bottom: 4px; border-bottom: 1px solid var(--border); position: sticky; top: 0;
+  background: var(--bg); z-index: 1;
+}
+.dec-body { max-height: 232px; overflow-y: auto; }
+.dec-body .dec-row + .dec-row { border-top: 1px solid var(--border); }
+.dec-row:hover { background: color-mix(in srgb, var(--text-3) 8%, transparent); }
+/* Строка, выключенная фильтром, гаснет — но остаётся на месте: пропавшие строки
+   читались бы как «решений не было». */
+.dec-row.is-dim { opacity: 0.28; }
+.dec-clock {
+  font-size: 11.5px; font-variant-numeric: tabular-nums; color: var(--text-2);
+  display: flex; flex-direction: column; align-items: flex-end; line-height: 1.25;
+}
+/* Через сколько после предыдущего решения: мелкая строка под часами — ритм
+   решений виден без арифметики в голове. */
+.dec-gap { font-size: 9.5px; font-style: normal; color: var(--text-3); }
+/* Вид решения — то, что человек различает первым: слово вида в цвете тона. */
+.dec-type { font-size: 11.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dec-who { font-size: 11px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dec-who.is-blank { color: var(--text-3); }
+.dec-stage {
+  font-size: 11px; font-family: var(--mono); color: var(--text-2);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 .dec-text { color: var(--text); overflow-wrap: anywhere; line-height: 1.35; }
-/* Лента листается и стоит на свежем краю (как шкала): выше 240 px она отжимала
-   документы дела, ниже — прятала последние решения. */
-.decisions-list { max-height: 240px; }
 /* Строка лида в ячейке состояния списка: вторичная подпись под бейджем, чтобы
    столбец «состояние» не менял ширину от длинного слова. */
 .lead-note { display: block; margin-top: 4px; font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-/* Заход лида на шкале: полоса от подъёма до выхода. Тон — чем кончился заход
-   (идёт / вышел / упёрся в часы / упал / конец не записан); незакрытый заход
-   подсвечивается, а «конец не записан» отличается штриховкой — это не «шёл всё
-   время», а «журнал потерял факт». */
-.tl-lead-run {
-  position: absolute; top: 1px; bottom: 1px; border-radius: 4px;
-  background: color-mix(in srgb, var(--text-3) 18%, transparent);
-  border: 1px solid color-mix(in srgb, var(--text-3) 40%, transparent);
-  display: flex; align-items: center; justify-content: center; overflow: hidden;
+/* Заход лида на шкале — не полоса попытки, а разметка поверх неё: рейка на
+   уровне текста, засечки начала и конца, слово режима над рейкой. Полоса попытки
+   залита на всю высоту строки, и заход лида, нарисованный так же, читался как ещё
+   один этап; рейка говорит «здесь лид держал дело», не споря с этапами за
+   внимание. Вся дорожка тонирована: она другого рода, чем этапы под ней.
+   Незакрытый заход несёт живую точку на свежем краю, потерянный факт («конец
+   захода не записан») — штрих и ромб. */
+.tl-lane.is-lead {
+  background: color-mix(in srgb, var(--text-3) 5%, transparent);
+  border-radius: 4px;
 }
-.tl-lead-run.t-green { background: color-mix(in srgb, var(--ok) 16%, transparent); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
-.tl-lead-run.t-blue { background: color-mix(in srgb, var(--accent) 14%, transparent); border-color: color-mix(in srgb, var(--accent) 38%, transparent); }
-.tl-lead-run.t-yellow { background: color-mix(in srgb, var(--warn) 16%, transparent); border-color: color-mix(in srgb, var(--warn) 42%, transparent); }
-.tl-lead-run.t-red { background: color-mix(in srgb, var(--danger) 16%, transparent); border-color: color-mix(in srgb, var(--danger) 42%, transparent); }
-.tl-lead-run.is-stale {
-  border-style: dashed;
-  background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--text-3) 20%, transparent) 0 4px, transparent 4px 8px);
+.tl-lead-run { position: absolute; top: 0; bottom: 0; }
+.tl-lead-rail {
+  position: absolute; left: 0; right: 0; top: 15px; height: 3px; border-radius: 2px;
+  background: currentColor; opacity: 0.85;
 }
-.tl-lead-run.is-open { animation: tl-live 2.8s ease-in-out infinite; }
-.tl-lead-run-label { font-size: 9.5px; line-height: 1; color: var(--text-2); white-space: nowrap; }
-.tl-lane.is-lead .tl-lane-name { color: var(--text-2); }
+.tl-lead-run.is-open .tl-lead-rail {
+  opacity: 1;
+  box-shadow: 0 0 0 1px color-mix(in srgb, currentColor 25%, transparent);
+}
+/* Засечки выше рейки: у рейки нет заливки, и без «столбиков» на концах границы
+   захода не видно. */
+.tl-lead-cap { position: absolute; top: 9px; height: 15px; width: 2px; border-radius: 1px; background: currentColor; }
+.tl-lead-cap.is-start { left: 0; }
+.tl-lead-cap.is-end { right: 0; }
+.tl-lead-label {
+  position: absolute; left: 5px; top: 1px; font-size: 10px; font-weight: 600; line-height: 1.2;
+  color: currentColor; opacity: 0.9; white-space: nowrap; pointer-events: none;
+}
+.tl-lead-head {
+  position: absolute; right: -3px; top: 12px; width: 9px; height: 9px; border-radius: 50%;
+  background: currentColor; box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 22%, transparent);
+  animation: tl-live 2.8s ease-in-out infinite;
+}
+/* Потерянный факт: штрих вместо линии и ромб в конце — «дальше журнал молчит». */
+.tl-lead-run.is-stale .tl-lead-rail {
+  background: repeating-linear-gradient(90deg, currentColor 0 4px, transparent 4px 8px);
+  opacity: 0.85;
+}
+.tl-lead-run.is-stale .tl-lead-cap.is-end {
+  top: 11px; height: 11px; width: 11px; right: -4px; border-radius: 1px;
+  transform: rotate(45deg); background: currentColor;
+}
+.tl-lane.is-lead .tl-lane-name { color: var(--text); }
 
 /* Две колонки карточки дела: документы (растут) и тонкий столбец этапов.
    Правая колонка — ровно 320 px и не растёт: в ней живут строки этапов и

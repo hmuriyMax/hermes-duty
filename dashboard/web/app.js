@@ -48,6 +48,7 @@ import {
   shapeDeal,
   shapeDecisions,
   decisionsCount,
+  decisionGroups,
   shapeDealTime,
   shapeFinished,
   shapeFinishedPage,
@@ -1964,47 +1965,135 @@ function stageBlockNode(dealId, stage, timeline, rebuild) {
 }
 
 /**
- * Лента решений лида: план, перезапуски этапов, ответы воркерам, отмена и закрытие.
+ * Журнал решений лида — таблица под шкалой, в той же панели.
  *
  * Источник один — `decisions[]` ответа `/deal` (`dashboard/leadfeed.feed`), тот же
- * список, который печатает `bin/duty deal`. Порядок журнальный, автор подписан
- * там, где его назвал факт. Пустая лента не рисуется: «решений нет» на экране
- * свежего дела — это шум, а не факт (в терминале строка об этом есть).
+ * список, который печатает `bin/duty deal`. Раньше это была отдельная панель во
+ * всю ширину, где строки были почти пустыми: время, автор и текст, растянутый на
+ * 1386 px, — длинная лента без опоры для глаза. Теперь это таблица с колонками
+ * `время · вид · кто · этап · что решил` (этап рисуется только если он в ленте
+ * есть) и фильтром по семействам в шапке: ширина занята колонками, а не пустым
+ * текстом, и по ленте можно спрашивать «а что решалось по этапам».
+ *
+ * Свежие сверху (порядок — шейпер): в журнале решений последнее решение ищут
+ * первым, а журнальный порядок остался в терминале. Пустая лента не рисуется:
+ * «решений нет» на экране свежего дела — шум, а не факт.
  */
-function decisionsBlock(items) {
+function decisionsSection(items) {
   const total = decisionsCount(items)
   if (!total) return null
   const rows = shapeDecisions(items)
-  const list = h(
+  const groups = decisionGroups(rows)
+  const hasStage = rows.some((row) => row.stage)
+  // Решётка по составу: колонка этапа появляется только там, где этапы в ленте
+  // есть, — иначе треть строк стояла бы пустым прочерком.
+  const cols = hasStage ? '58px 112px 62px 104px minmax(0, 1fr)' : '58px 112px 62px minmax(0, 1fr)'
+  const body = h(
     'div',
-    { class: 'panel-b decisions-list' },
+    { class: 'dec-body' },
     ...rows.map((row) =>
       h(
         'div',
-        { class: 'dec-row', key: row.key },
-        h('span', { class: 'dec-clock mono', title: row.ageText ? `${row.ageText} назад` : '' }, row.clock),
-        h('span', { class: `dec-dot t-${row.tone}`, 'aria-hidden': 'true' }),
-        // Ячейка автора есть всегда, даже пустая: решётка не должна зависеть от
-        // того, назвал ли факт автора (иначе текст съезжал в узкую колонку).
+        { class: 'dec-row', key: row.key, 'data-group': row.group, 'data-at': row.at === null ? '' : String(row.at) },
+        h(
+          'span',
+          { class: 'dec-clock mono', title: row.ageText ? `${row.ageText} назад` : '' },
+          row.clock,
+          row.gapText ? h('i', { class: 'dec-gap', title: 'прошло после предыдущего решения' }, row.gapText) : null,
+        ),
+        h('span', { class: `dec-type t-${row.tone}` }, row.typeLabel),
         row.authorLabel
-          ? h('span', { class: `dec-author t-${row.tone}`, title: row.author }, row.authorLabel)
-          : h('span', { class: 'dec-author is-blank', 'aria-hidden': 'true' }, '·'),
+          ? h('span', { class: `dec-who t-${row.authorTone}`, title: `автор: ${row.author}` }, row.authorLabel)
+          : h('span', { class: 'dec-who is-blank', 'aria-hidden': 'true' }, '—'),
+        hasStage ? h('span', { class: 'dec-stage', title: row.stage ? `этап: ${row.stage}` : '' }, row.stage) : null,
         h('span', { class: 'dec-text' }, row.text),
       ),
     ),
   )
-  // Лента стоит на свежем краю, как шкала: журнальный порядок читается сверху
-  // вниз, а последнее решение не должно прятаться под прокруткой после каждого
-  // тихого тика (панель перерисовывается целиком).
-  requestAnimationFrame(() => {
-    list.scrollTop = list.scrollHeight
-  })
-  return h(
+  const section = h(
     'div',
-    { class: 'panel decisions', 'data-key': 'decisions' },
-    h('div', { class: 'panel-h' }, `решения лида · ${total}`),
-    list,
+    { class: 'scale-log', 'data-key': 'decisions' },
+    h(
+      'div',
+      { class: 'scale-log-h' },
+      h('span', { class: 'scale-log-title' }, `решения лида · ${total}`),
+      h('span', { class: 'muted' }, 'свежие сверху'),
+      h('span', { class: 'tl-spacer' }),
+      // Фильтр — чипы семейств с числами: вопрос к ленте формулируется один раз
+      // («что решалось по этапам»), а не перечитыванием всех строк.
+      h(
+        'div',
+        { class: 'dec-filters', role: 'group', 'aria-label': 'фильтр решений по семействам' },
+        h('button', { class: 'dec-filter on', type: 'button', 'data-group': '', 'aria-pressed': 'true' }, `все ${total}`),
+        ...groups.map((group) =>
+          h(
+            'button',
+            { class: 'dec-filter', type: 'button', 'data-group': group.key, 'aria-pressed': 'false' },
+            `${group.label} ${group.count}`,
+          ),
+        ),
+      ),
+    ),
+    h(
+      'div',
+      { class: 'dec-table', style: `--dec-cols:${cols}` },
+      h(
+        'div',
+        { class: 'dec-row is-head', 'aria-hidden': 'true' },
+        h('span', null, 'время'),
+        h('span', null, 'решение'),
+        h('span', null, 'кто'),
+        hasStage ? h('span', null, 'этап') : null,
+        h('span', null, 'что решил'),
+      ),
+      body,
+    ),
   )
+  return section
+}
+
+// Выбранные семейства решений: состояние принадлежит экрану и переживает тихий
+// тик так же, как подсветка инструментов (`dutyToolFilter`).
+const dutyDecisionFilter = new Set()
+
+// Шапка журнала решений слушает клик один раз: морф переиспользует узлы, и без
+// отметки каждый тик добавлял бы ещё один обработчик.
+const wiredDecisionHosts = new WeakSet()
+
+/** Применить фильтр журнала решений к уже нарисованной панели. */
+function applyDecisionFilter(panel) {
+  const active = dutyDecisionFilter.size
+  for (const row of panel.querySelectorAll('.dec-body .dec-row')) {
+    const on = !active || dutyDecisionFilter.has(row.getAttribute('data-group'))
+    row.classList.toggle('is-dim', !on)
+  }
+  for (const chip of panel.querySelectorAll('.dec-filter')) {
+    const group = chip.getAttribute('data-group') || ''
+    const on = group ? dutyDecisionFilter.has(group) : !active
+    chip.classList.toggle('on', on)
+    chip.setAttribute('aria-pressed', on ? 'true' : 'false')
+  }
+}
+
+/** Клик по чипу семейства: включить/выключить его; «все» снимает фильтр. */
+function wireDecisionsPanel(panel) {
+  const host = panel.querySelector('.scale-log-h')
+  if (!host || wiredDecisionHosts.has(host)) return
+  wiredDecisionHosts.add(host)
+  host.addEventListener('click', (event) => {
+    const chip = event.target.closest('.dec-filter')
+    if (!chip) return
+    const group = chip.getAttribute('data-group') || ''
+    if (!group) {
+      dutyDecisionFilter.clear()
+    } else if (dutyDecisionFilter.has(group)) {
+      dutyDecisionFilter.delete(group)
+    } else {
+      dutyDecisionFilter.add(group)
+    }
+    applyDecisionFilter(panel)
+  })
+  applyDecisionFilter(panel)
 }
 
 /**
@@ -2334,7 +2423,10 @@ function leadLaneNode(leadLane, scale) {
           { class: 'tl-rows' },
           h(
             'div',
-            { class: 'tl-row' },
+            // Высота захода — 26 px в инлайновых переменных: у строки попытки высота
+            // равна `--tl-full` на наведении, и правило из CSS ниже по файлу
+            // возвращало бы рейку к 20 px под указателем.
+            { class: 'tl-row', style: '--tl-collapsed:26px;--tl-full:26px' },
             h(
               'div',
               { class: 'tl-lbl', 'data-tip': `${leadLane.text}: полосы на оси — заходы лида, от подъёма до выхода` },
@@ -2355,7 +2447,13 @@ function leadLaneNode(leadLane, scale) {
                     'aria-label': run.title,
                     role: 'img',
                   },
-                  run.labeled ? h('span', { class: 'tl-lead-run-label' }, run.label) : null,
+                  // Рейка + засечки + слово режима: разметка «лид держал дело»,
+                  // а не вторая полоса попытки (см. styles.css).
+                  h('span', { class: 'tl-lead-rail' }),
+                  h('span', { class: 'tl-lead-cap is-start' }),
+                  h('span', { class: 'tl-lead-cap is-end' }),
+                  run.labeled ? h('span', { class: 'tl-lead-label' }, run.label) : null,
+                  run.open ? h('span', { class: 'tl-lead-head' }) : null,
                 ),
               ),
             ),
@@ -2524,7 +2622,7 @@ function specStrip(spec) {
  * Панель шкалы времени: подписанная ось, дорожка на этап, полосы попыток и лента
  * маркеров. Геометрия приходит посчитанной (`shapeDealTime`); здесь только DOM.
  */
-function scalePanel(scale) {
+function scalePanel(scale, decisions) {
   // Индекс вызовов: чип и инспектор читают один и тот же вид (`attemptView`).
   dutyCallIndex.clear()
   for (const bar of scale.bars) {
@@ -2673,11 +2771,16 @@ function scalePanel(scale) {
       // Легенда маркеров: что означают точки внутри строк попыток.
       markerLegend(scale),
       scale.facts.attempts.journal ? h('div', { class: 'muted' }, 'полосы собраны из журнала: ответ попыток пуст') : null,
+      // Журнал решений — внизу той же панели, а не второй полосой во всю ширину:
+      // это тот же разговор «что произошло», только словами, и он читается сразу
+      // под дорожками, к которым относится.
+      decisionsSection(decisions),
     ),
   )
   // Фильтр, выбранный в легенде, переживает перерисовку данных: экран
   // пересобирается по новому кадру, а подсветка остаётся там, где её оставили.
   wireScalePanel(panel)
+  wireDecisionsPanel(panel)
     // «Висим на правой границе»: пока человек не уехал влево, каждый тик держит
   // в кадре свежую кромку. Флаг живёт на элементе — морф его не теряет.
   // Микрозадача, а не setTimeout: панель монтируется в этом же синхронном
@@ -2872,9 +2975,6 @@ function viewDeal(dealId) {
   // попытки раньше повторялась в широкой ленте этапов и в отдельной панели
   // попыток, и страница дела росла на три с половиной экрана.
   const stages = stagesColumn(data.id)
-  // Решения лида — во всю ширину над колонками: это история по времени, рядом со
-  // шкалой, а не ещё один узкий столбец. Список тот же, что печатает `duty deal`.
-  const decisions = decisionsBlock(data.decisions)
 
   return h(
     'div',
@@ -2882,8 +2982,7 @@ function viewDeal(dealId) {
     h('div', { style: 'margin-bottom:10px' }, h('a', { href: '#/deal' }, '← к списку дел')),
     head,
     kpiStrip(scale),
-    scalePanel(scale),
-    decisions,
+    scalePanel(scale, data.decisions),
     left ? h('div', { class: 'deal-cols' }, left, stages) : stages,
   )
 }

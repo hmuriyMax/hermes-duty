@@ -1332,23 +1332,34 @@ test('веб: экран дела показывает лида и его реш
   assert.equal(lead.getAttribute('title'), 'журнал: последний факт лида lead_resumed, пробуждений 2 из 6')
   assert.ok(lead.querySelector('b.t-green'), 'тон живого лида не зелёный')
 
-  // Лента решений: строки, время, автор и текст — в том же порядке, что в журнале.
+  // Журнал решений: таблица внизу панели шкалы, свежие сверху, колонки на месте.
   const panel = doc.querySelector('[data-key="decisions"]')
-  assert.ok(panel, 'нет панели решений лида')
-  assert.match(panel.querySelector('.panel-h').textContent, /решения лида · 2/)
-  const rows = [...panel.querySelectorAll('.dec-row')]
+  assert.ok(panel, 'нет журнала решений лида')
+  assert.ok(panel.closest('[data-key="scale"]'), 'журнал решений стоит вне панели шкалы')
+  assert.match(panel.querySelector('.scale-log-title').textContent, /решения лида · 2/)
+  const rows = [...panel.querySelectorAll('.dec-body .dec-row')]
   assert.deepEqual(
     rows.map((row) => row.querySelector('.dec-text').textContent),
-    ['план создан (3 этапа)', 'ответ на вопрос #4 пришёл от человека'],
+    ['ответ на вопрос #4 пришёл от человека', 'план создан (3 этапа)'],
+    'свежее решение должно стоять первым',
   )
+  // Вид решения — своё слово у каждого факта, а не «решение»: по нему читают строку.
+  assert.deepEqual(rows.map((row) => row.querySelector('.dec-type').textContent), ['ответ', 'план принят'])
   assert.deepEqual(
-    rows.map((row) => (row.querySelector('.dec-author') || { textContent: '' }).textContent),
-    ['лид', 'человек'],
+    rows.map((row) => (row.querySelector('.dec-who') || { textContent: '' }).textContent),
+    ['человек', 'лид'],
   )
-  assert.ok(rows[0].querySelector('.dec-author').className.includes('t-blue'), 'автор-лид не своим тоном')
-  assert.ok(rows[1].querySelector('.dec-author').className.includes('t-yellow'), 'автор-человек не своим тоном')
-  // Время стоит у каждой строки: лента — история, а не список без дат.
-  assert.match(rows[0].querySelector('.dec-clock').textContent, /^\d{2}:\d{2}:\d{2}$/)
+  assert.ok(rows[1].querySelector('.dec-who').className.includes('t-blue'), 'автор-лид не своим тоном')
+  assert.ok(rows[0].querySelector('.dec-who').className.includes('t-yellow'), 'автор-человек не своим тоном')
+  // Время стоит у каждой строки: журнал — история, а не список без дат. Часы до
+  // минуты, а под ними — через сколько после предыдущего решения.
+  const clock = rows[0].querySelector('.dec-clock')
+  assert.match(clock.textContent, /^\d{2}:\d{2}/)
+  assert.match(clock.querySelector('.dec-gap').textContent, /^\+\d/)
+  // Фильтр по семействам: чипы с числами, «все» включён по умолчанию.
+  const chips = [...panel.querySelectorAll('.dec-filter')]
+  assert.deepEqual(chips.map((chip) => chip.textContent), ['все 2', 'план 1', 'вопросы 1'])
+  assert.ok(chips[0].className.includes('on'), 'чип «все» не включён')
 })
 
 test('веб: без фактов лида и без решений экран молчит, а не выдумывает', async (t) => {

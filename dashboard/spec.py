@@ -87,6 +87,7 @@ CHARTER_KEYS = (
     "max_attempts",
     "max_lead_resumes",
     "run_budget_sec",
+    "close",
     "publish",
 )
 PLAN_GATE_KEYS = ("min_stages", "budget_share")
@@ -164,6 +165,39 @@ CLOSE_STAGE = "close"
 # прежняя роль: seed-спеки до переименования валидны и читаются дальше.
 CLOSE_ROLES = ("coordinator", "lead")
 CLOSE_ROLE = "coordinator"
+
+# Кто закрывает дело (2.0): слово лида или «все этапы пройдены».
+# `charter.close: lead` — чартер без seed-этапов: закрытие делает лид
+# (`duty_close`), и движок не закрывает дело сам ни при пустом графе (этапы
+# раскладывает лид), ни по пройденному. `stages` — прежнее правило движка.
+# Не назван — решает граф: этап `close` в seed значит лида (спеки 1.x).
+CLOSE_LEAD = "lead"
+CLOSE_STAGES = "stages"
+CLOSE_MODES = (CLOSE_LEAD, CLOSE_STAGES)
+
+
+def closes_by_lead(spec: Any, stages: Optional[Iterable[Any]] = None) -> bool:
+    """Закрытие — слово лида: `charter.close: lead` или seed-этап `close` в графе.
+
+    Один предикат на движок и поверхности: по нему `transit` не объявляет дело
+    закрытым (пустой граф 2.0 ждёт плана лида, пройденный — его `duty_close`), а
+    `deals.closure_of` отказывает движку писать `all_stages_done`.
+    """
+    mode = getattr(getattr(spec, "charter", None), "close", None)
+    if mode == CLOSE_LEAD:
+        return True
+    if mode == CLOSE_STAGES:
+        return False
+    # Граф приходит в трёх формах: не назван (тогда этапы спеки), этапами
+    # (`view.stages`) и их id (`deals` знает только имена). Все читаются
+    # одинаково — иначе закрытие мимо лида.
+    graph = getattr(spec, "stages", ()) if stages is None else stages
+    for stage in graph or ():
+        name = stage if isinstance(stage, str) else str(getattr(stage, "id", ""))
+        if name == CLOSE_STAGE:
+            return True
+    return False
+
 
 # Роли координатора — те же, что закрывают дело. Правило `coordinator.scope`
 # (решение Макса, 12.11): координаторская роль допустима только на входном этапе
@@ -481,6 +515,10 @@ class Charter:
       `retry` этапа (`dashboard/failures.py`);
     - `max_lead_resumes` — сколько раз супервизор поднимает упавшего лида (2.0;
       читает `lead.max_resumes` этим же полем);
+    - `close` — кто закрывает дело (2.0): `lead` — только лид инструментом
+      `duty_close` (граф без seed-этапов `close`), `stages` — движок по правилу
+      «все этапы пройдены». Не назван — решает граф: есть этап `close`, значит
+      лид (спеки 1.x пишут его в seed);
     - `run_budget_sec` — сколько секунд живёт один заход лида до `overrun` (2.0;
       `0` — бюджета нет: заход держится до тишины `idle` или до конца турна).
       Не назван — действует умолчание движка (`lead.DEFAULT_RUN_BUDGET_SEC`);
@@ -499,6 +537,7 @@ class Charter:
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     max_lead_resumes: int = DEFAULT_MAX_LEAD_RESUMES
     run_budget_sec: Optional[int] = None
+    close: Optional[str] = None
     publish: Publish = Publish()
     declared: bool = False
 
@@ -1069,6 +1108,20 @@ def _parse_charter(
             )
         )
         resumes = DEFAULT_MAX_LEAD_RESUMES
+    close_mode = mapping.get("close")
+    if close_mode is not None:
+        close_mode = str(close_mode).strip()
+        if close_mode not in CLOSE_MODES:
+            issues.append(
+                Issue(
+                    path,
+                    lines.get(prefix + ("charter", "close"), line),
+                    "charter.close",
+                    "close: кто закрывает дело — `lead` (только лид, `duty_close`) "
+                    "или `stages` (движок по правилу «все этапы пройдены»)",
+                )
+            )
+            close_mode = None
     budget = mapping.get("run_budget_sec")
     if budget is not None:
         budget = _int_or_none(budget)
@@ -1092,6 +1145,7 @@ def _parse_charter(
         max_attempts=int(max_attempts),
         max_lead_resumes=int(resumes),
         run_budget_sec=budget,
+        close=close_mode,
         publish=_parse_publish(mapping, path, lines, prefix + ("charter",), issues),
         declared=True,
     )

@@ -462,11 +462,11 @@ def _closed(
     `completed` мимо лида: иначе ушедший движок закрывал бы дело сам.
     """
     stages = [str(stage.id) for stage in transit.graph(deal_spec, events)]
-    cause, summary = deals.closure_of(events, stages)
+    cause, summary = deals.closure_of(events, stages, deal_spec)
     if not cause:
         raise deals.DealError(
-            f"close: закрывающий этап {str(spec_module.CLOSE_STAGE)!r} в графе дела "
-            f"{deal['id']} не закрыт приговором approve — дело закрывает лид, "
+            f"close: дело {deal['id']} закрывает лид (`charter.close: lead` или "
+            f"этап {str(spec_module.CLOSE_STAGE)!r} без приговора approve) — "
             "«все этапы пройдены» этого не заменяет"
         )
     written = 0

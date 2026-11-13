@@ -128,6 +128,20 @@ def test_run_budget_is_read_from_the_charter_and_zero_means_no_ceiling(tmp_path:
     assert spec_module.load_spec(write(tmp_path, "duty: probe\n")).charter.run_budget_sec is None
 
 
+def test_close_key_names_who_closes_the_deal(tmp_path: Path) -> None:
+    """`charter.close` — кто закрывает дело: `lead` (duty_close) или `stages` (движок).
+
+    Не назван — решает граф: закладка `close` в seed значит лида (спеки 1.x).
+    2.0-чартер этапов не объявляет вовсе и говорит это словом `lead`.
+    """
+    assert spec_module.load_spec(write(tmp_path, "duty: probe\ncharter: {close: lead}\n")).charter.close == "lead"
+    assert spec_module.load_spec(write(tmp_path, "duty: probe\ncharter: {close: stages}\n")).charter.close == "stages"
+    legacy = spec_module.load_spec(write(tmp_path, "duty: probe\n"))
+    assert legacy.charter.close is None
+    assert spec_module.closes_by_lead(legacy) is False
+    assert spec_module.closes_by_lead(spec_module.load_spec(write(tmp_path, "duty: p\nstages:\n  - id: close\n    role: coordinator\n"))) is True
+
+
 def test_absent_charter_keys_get_the_1x_defaults(tmp_path: Path) -> None:
     """Спека без `charter` — прежние дефолты: `max_attempts: 3`, `max_lead_resumes: 6`."""
     loaded = spec_module.load_spec(write(tmp_path, "duty: probe\n"))
@@ -149,6 +163,7 @@ def test_absent_charter_keys_get_the_1x_defaults(tmp_path: Path) -> None:
         ("{max_lead_resumes: много}", "charter.max_lead_resumes"),
         ("{run_budget_sec: -5}", "charter.run_budget_sec"),
         ("{run_budget_sec: час}", "charter.run_budget_sec"),
+        ("{close: когда-нибудь}", "charter.close"),
         ("{publish: много}", "charter.publish"),
         ('{publish: {human_gate: "нет"}}', "charter.publish.human_gate"),
         ('{publish: {reviewer_role: ""}}', "charter.publish.reviewer_role"),

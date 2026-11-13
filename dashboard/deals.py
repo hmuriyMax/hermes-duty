@@ -1610,7 +1610,9 @@ def close_deal(
 HUMAN_HOLD_STATUSES = ("blocked", "review")
 
 
-def closure_of(events: Iterable[dict[str, Any]], stages: Iterable[str]) -> tuple[str, str]:
+def closure_of(
+    events: Iterable[dict[str, Any]], stages: Iterable[str], spec: Any = None
+) -> tuple[str, str]:
     """Чем закрывается дело и чьим итогом — `(cause, summary)`.
 
     Чистая функция: граф приходит аргументом, журнал читает вызывающий. Правило
@@ -1625,7 +1627,13 @@ def closure_of(events: Iterable[dict[str, Any]], stages: Iterable[str]) -> tuple
     """
     names = [str(stage) for stage in stages]
     closing = str(_spec().CLOSE_STAGE)
-    if closing not in names:
+    # `charter.close` (2.0): `lead` — дело закрывает только лид, и движку тут
+    # закрывать нечем, даже если этапа `close` в графе нет вовсе; `stages` —
+    # прежнее правило движка; не назван — решает граф (этап `close` в seed).
+    lead_closes = (
+        _spec().closes_by_lead(spec, names) if spec is not None else closing in names
+    )
+    if not lead_closes:
         return CLOSE_CAUSE_ALL_STAGES, ""
     approved = False
     summary = ""

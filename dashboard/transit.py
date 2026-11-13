@@ -1688,6 +1688,11 @@ def next_stage(spec: Any, events: Iterable[Any], now: Any) -> Decision:
     if board.closed:
         return done(board.closed_reason)
     if not view.stages:
+        # Пустой граф 2.0-чартера (`charter.close: lead`, этапов в файле нет):
+        # этапы раскладывает лид, и до его плана решать нечего. «Нет этапов» ≠
+        # «дело закрыто»: иначе такое дело закрывалось бы в момент создания.
+        if spec_module.closes_by_lead(view):
+            return wait(WAIT_PLAN, "этапов в графе нет: план дела пишет лид (duty_plan)")
         return done("в спеке нет этапов: решать нечего")
 
     if board.parked is not None:
@@ -1795,6 +1800,17 @@ def next_stage(spec: Any, events: Iterable[Any], now: Any) -> Decision:
         )
 
     if all(state == DONE for state in states.values()):
+        # Чартер `close: lead` без закрывающего этапа: граф пройден, а дело
+        # закрывает лид своим итогом (`duty_close`) — «все этапы пройдены» этого
+        # не заменяет. Закрывающий этап в графе (спеки 1.x) — прежний путь: он
+        # прошёл, приговор `approve` в журнале, и `deals.closure_of` закроет дело
+        # словом лида.
+        close_stage = any(str(stage.id) == spec_module.CLOSE_STAGE for stage in view.stages)
+        if not close_stage and getattr(getattr(view, "charter", None), "close", None) == spec_module.CLOSE_LEAD:
+            return wait(
+                WAIT_FOR_GATE,
+                "граф пройден: дело закрывает лид своим итогом (duty_close)",
+            )
         return done("все этапы закрыты")
 
     gated = next(stage for stage in view.stages if states[stage.id] != DONE)
@@ -1832,7 +1848,8 @@ def deal_state(spec: Any, events: Iterable[Any]) -> str:
     if board.closed:
         return DONE
     if not view.stages:
-        return DONE
+        # Пустой граф 2.0 — дело ждёт плана лида, а не «закрыто» (`next_stage`).
+        return WAIT_GATE if spec_module.closes_by_lead(view) else DONE
     if board.parked is not None:
         return WAIT_HUMAN
     states = _slice(view, board)

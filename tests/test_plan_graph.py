@@ -924,3 +924,75 @@ def test_plan_events_are_journal_facts(tmp_path: Path) -> None:
     # `attempt_ended`, иначе отказ плана тонет в `done` той же попытки.
     assert order.index("plan_proposed") > order.index("attempt_ended")
     assert order.index("plan_proposed") < order.index("plan_accepted")
+
+
+# ------------------------------ 9. чартер без закладок: `close: lead`
+#
+# 2.0-чартер не объявляет этапов вовсе: их раскладывает лид, а закрытие — его
+# слово. Две ловушки, которые это правило обязано держать: пустой граф не значит
+# «дело закрыто» (иначе дело закрывалось бы в момент создания), а пройденный граф
+# без закладки `close` движок не закрывает сам — итог пишет `duty_close`.
+
+BARE = """
+duty: чартер без закладок
+charter:
+  max_stages: 6
+  close: lead
+"""
+
+
+def close_lead(tmp_path: Path, name: str = "bare.yaml") -> Any:
+    return write_spec(tmp_path, BARE, name=name)
+
+
+def test_an_empty_graph_waits_for_the_lead_plan(tmp_path: Path) -> None:
+    """Пустой чартер: `wait(plan)`, а не `done` — план дела пишет лид.
+
+    «Этапов нет» и «дело закрыто» — разные факты: без этой развилки дело
+    закрывалось бы сразу после создания, ещё до плана.
+    """
+    spec = close_lead(tmp_path)
+    decision = transit.next_stage(spec, events(), NOW)
+
+    assert decision.kind == transit.WAIT
+    assert "план" in decision.reason
+    assert transit.deal_state(spec, events()) == transit.WAIT_GATE
+
+
+def test_a_passed_graph_waits_for_the_lead_word(tmp_path: Path) -> None:
+    """Граф пройден, закладки `close` нет: закрывает лид, движок ждёт.
+
+    Без этого правила `next_stage` сказал бы `done`, прогон закрыл бы дело
+    `cause=all_stages_done`, и итог лида (`summary`) в факте не появился бы.
+    """
+    spec = close_lead(tmp_path)
+    facts = events(
+        ("attempt_started", {"stage": "impl", "attempt": 1, "run_id": "impl#1"}),
+        (
+            "attempt_ended",
+            {"stage": "impl", "attempt": 1, "outcome": "done", "kind": None, "reason": "", "run_id": "impl#1"},
+        ),
+    )
+    plan_facts = events(
+        ("plan_proposed", {"rev": 1, "source_stage": "coordinator", "stages": [
+            {"id": "impl", "role": "implementer", "needs": [], "workspace": "none",
+             "evidence": [{"cmd": "true", "must": 0}]},
+        ]}),
+        ("plan_accepted", {"rev": 1, "by": "lead"}),
+    )
+    journal_events = plan_facts + [
+        {**fact, "id": len(plan_facts) + index} for index, fact in enumerate(facts)
+    ]
+
+    decision = transit.next_stage(spec, journal_events, NOW)
+    assert decision.kind == transit.WAIT, decision.reason
+    assert "закрывает лид" in decision.reason
+
+
+def test_the_engine_refuses_to_close_a_close_lead_deal(tmp_path: Path) -> None:
+    """`close: lead`: движку закрывать нечем — `closure_of` пуст, `_closure` отказ."""
+    spec = close_lead(tmp_path)
+    stages = ["impl"]
+    assert deals.closure_of(events(), stages, spec) == ("", "")
+    # Старое правило без спеки не меняется: граф без `close` — «все этапы пройдены».
+    assert deals.closure_of(events(), stages) == (deals.CLOSE_CAUSE_ALL_STAGES, "")

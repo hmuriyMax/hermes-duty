@@ -488,12 +488,25 @@ def _closure(conn: sqlite3.Connection, deal: Any, spec: Any, now: float) -> dict
     # Чем закрывается дело и чьим итогом — из журнала, а не из памяти прогона:
     # попытку закрывает тот же факт `attempt_ended`, и повторный `run` читает его
     # так же, как первый. Правило одно с проходом отпускания (`release._closed`).
-    cause, summary = deals.closure_of(events, stages)
+    cause, summary = deals.closure_of(events, stages, spec)
     closing = str(spec_module.CLOSE_STAGE)
     if not cause:
-        # Граф с `close`, а приговора `approve` нет: закрывать нечем. Отказ
-        # называется, а не выдаётся за «все этапы пройдены».
+        # Закрывать нечем: либо граф с `close` без приговора `approve`, либо чартер
+        # `close: lead` — закрытие слово лида. Отказ называется, а не выдаётся за
+        # «все этапы пройдены».
         row = deals.deal_row(conn, str(deal["id"])) or {}
+        by_charter = (
+            getattr(getattr(spec, "charter", None), "close", None) == spec_module.CLOSE_LEAD
+        )
+        refused = (
+            "дело закрывает лид (`charter.close: lead`): итог пишет `duty_close`, "
+            "«все этапы пройдены» этого не заменяет"
+            if by_charter
+            else (
+                f"закрывающий этап {closing!r} не закрыт приговором approve: "
+                "дело закрывает лид, «все этапы пройдены» этого не заменяет"
+            )
+        )
         return {
             "written": False,
             "already": False,
@@ -501,10 +514,7 @@ def _closure(conn: sqlite3.Connection, deal: Any, spec: Any, now: float) -> dict
             "at": int(now),
             "stages": stages,
             "status": str(row.get("status") or ""),
-            "refused": (
-                f"закрывающий этап {closing!r} не закрыт приговором approve: "
-                "дело закрывает лид, «все этапы пройдены» этого не заменяет"
-            ),
+            "refused": refused,
         }
     try:
         result = deals.close_stages_done(

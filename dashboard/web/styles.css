@@ -719,7 +719,7 @@ pre.body {
 .scale-wrap, .scale-main { min-width: 0; }
 /* Шкала: дорожки слева, легенда семейств — правой колонкой, как в макете `d-merge`
  * (статистика инструментов стояла сбоку справа, а не над дорожками). */
-.scale-wrap { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; align-items: start; --tl-name: 150px; --tl-gap: 8px; }
+.scale-wrap { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; align-items: start; --tl-name: 150px; --tl-gap: 8px; --tl-plot-pad: 64px; }
 .scale-side { display: flex; flex-direction: column; gap: 1px; min-width: 104px; padding-left: 10px; border-left: 1px solid var(--border); font-size: 10px; color: var(--text-3); line-height: 1.45; }
 .scale-head { display: grid; grid-template-columns: var(--tl-name, 150px) 1fr; gap: var(--tl-gap, 8px); align-items: end; margin-bottom: 6px; }
 /* Легенда — колонкой слева, ровно над колонкой подписей попыток. */
@@ -745,7 +745,8 @@ pre.body {
 .scale-key-dot.t-net { background: var(--danger); }
 .scale-key-dot.t-mcp { background: var(--teal); }
 .scale-key-dot.t-meta { background: var(--pink); }
-.scale-axis { position: relative; height: 15px; }
+/* Полоса под подпись попытки: ось начинается там же, где полосы, — за ней. */
+.scale-axis { position: relative; height: 15px; margin-left: var(--tl-plot-pad, 64px); }
 .scale-head-gap { min-width: 0; }
 .scale-tick { position: absolute; font-size: 11px; color: var(--text-3); white-space: nowrap; font-variant-numeric: tabular-nums; }
 .scale-tick.align-start { transform: translateX(0); }
@@ -1022,14 +1023,14 @@ pre.body {
 .scale-scroll-hint { font-size: 11px; color: var(--text-3); white-space: nowrap; }
 .scale-plot { position: relative; }
 /* Сетка под дорожками: линии по меткам оси, чтобы время читалось поперёк дорожек. */
-.scale-grid { position: absolute; top: -2px; bottom: 0; left: calc(var(--tl-name, 150px) + var(--tl-gap, 8px)); right: 0; pointer-events: none; z-index: 0; }
+.scale-grid { position: absolute; top: -2px; bottom: 0; left: calc(var(--tl-name, 150px) + var(--tl-gap, 8px) + var(--tl-plot-pad, 64px)); right: 0; pointer-events: none; z-index: 0; }
 .scale-grid-line { position: absolute; top: 0; bottom: 0; border-left: 1px dashed color-mix(in srgb, var(--text-3) 34%, transparent); }
 /* Сжатый промежуток оси: два пунктира по краям и подпись посередине — иначе
  * смена масштаба читается как ошибка данных. */
 /* Сжатый простой: полоса со штрихованием и знаками разрыва по краям. Пунктир
    читался как «граница», а не как «время вырезано» (09.11, Макс: «чтобы было
    понятно, что таймлайн тут схлопывается»). */
-.tl-idle-layer { position: absolute; top: -2px; left: calc(var(--tl-name, 150px) + var(--tl-gap, 8px)); width: calc(100% - calc(var(--tl-name, 150px) + var(--tl-gap, 8px))); height: calc(100% + 2px); z-index: 0; pointer-events: none }
+.tl-idle-layer { position: absolute; top: -2px; left: calc(var(--tl-name, 150px) + var(--tl-gap, 8px) + var(--tl-plot-pad, 64px)); width: calc(100% - calc(var(--tl-name, 150px) + var(--tl-gap, 8px) + var(--tl-plot-pad, 64px))); height: calc(100% + 2px); z-index: 0; pointer-events: none }
 .tl-idle-gap { position: absolute; top: 0; bottom: 0; }
 /* Штриховка — единственный знак, что здесь из шкалы вырезано время: диагональ
    в тон сетке, гаснущая к краям, чтобы не спорить с дорожками этапов. */
@@ -1130,8 +1131,8 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
  * попытки («колбаску»), а не на всю строку с подписью. */
 .tl-row:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
-/* Подпись попытки — у полосы, а не в колонке: номер и исход в одну строку.
-   `is-inside` — когда полоса начинается у самой кромки и слева места нет. */
+/* Подпись попытки — слева от своей полосы: номер и исход в одну строку.
+   `is-inside` остался только для подписи заходов лида (там полосы нет). */
 .tl-att {
   position: absolute;
   top: 50%;
@@ -1178,6 +1179,10 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 .tl-ms { font-family: var(--mono); font-size: 10px; color: var(--text-3); text-align: right; }
 
 .tl-track { position: relative; min-height: 20px; }
+/* Полоса под подпись попытки (`#1 готово`): координаты полос и чипов считаются от
+   неё, поэтому номер любой попытки, даже самой первой, встаёт слева от «колбаски»,
+   а не поверх неё. */
+.tl-plot { position: absolute; inset: 0 0 0 var(--tl-plot-pad, 64px); }
 
 /* Фон попытки: длительность видна полосой, а не только по чипам вызовов. */
 .tl-band {

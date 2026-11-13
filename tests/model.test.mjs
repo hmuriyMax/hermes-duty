@@ -3608,3 +3608,22 @@ test('план: исчерпанный лимит пересборок назв�
   assert.equal(plan.tone, 'red')
   assert.equal(plan.hint, 'кругов плана: 2, отказов: 1 · пересборок плана больше нет')
 })
+
+test('шейпер: закладки дела подписаны «делает лид», а не «ждёт хода»', () => {
+  // `coordinator` и `close` — работа лида: план он пишет инструментом, дело
+  // закрывает `duty_close`, попытки для этих этапов не поднимаются. Без подписи
+  // лента выглядит как забытая работа (`d_92177017`: два этапа «без дела»).
+  const feed = shapeStages({
+    stages: [
+      { id: 'coordinator', state: 'done', by_lead: true, attempts: [] },
+      { id: 'close', state: 'pending', by_lead: true, attempts: [] },
+      { id: 'impl', state: 'pending', by_lead: false, attempts: [] },
+    ],
+  })
+  const [coordinator, close, impl] = feed.stages
+
+  assert.equal(coordinator.stateLabel, 'пройден', 'закрытый вход остаётся пройденным')
+  assert.equal(close.stateLabel, 'делает лид')
+  assert.equal(close.tone, 'gray')
+  assert.equal(impl.stateLabel, 'ждёт хода', 'обычный этап ждёт своего хода')
+})

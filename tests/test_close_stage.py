@@ -52,8 +52,10 @@ transit = load_module("hermes_duty_transit", "transit.py")
 runner = load_module("hermes_duty_runner", "runner.py")
 driver = load_module("hermes_duty_driver", "driver.py")
 release = load_module("hermes_duty_release", "release.py")
+tools = load_module("hermes_duty_tools", "tools.py")
 
 from test_runner import Fake  # noqa: E402
+from test_tools_integrate import commit, git, init_repo  # noqa: E402
 
 
 # Спека 1.0: план, работа и закрывающий этап, который возвращает дело на работу.

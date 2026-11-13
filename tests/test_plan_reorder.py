@@ -506,3 +506,115 @@ def test_plan_proposal_keeps_the_seed_order_for_unknown_reorder(tmp_path: Path) 
         "check": ("impl",),
     }
     assert "nowhere" not in journal.payload_of(journal_events[0])["stages"][0]["id"]
+
+
+# ------------------------------- 8. закладки дела: вход и закрытие — работа лида
+#
+# Живое дело d_92177017 (13.11): план лида не назвал вход, и в ленте висели два
+# этапа «без дела» — `coordinator` (его работа — сам план, а план пишет лид
+# инструментом `duty_plan`) и `close` (его работа — приговор лида в `duty_close`).
+# Вторая половина была опаснее косметики: `close` оставался с `needs: [coordinator]`,
+# то есть ребра от работы плана к закрытию не было вовсе.
+
+BOOKENDS = """
+duty: закладки
+charter:
+  max_stages: 8
+  max_rounds_replan: 2
+stages:
+  - id: coordinator
+    role: coordinator
+    workspace: none
+  - id: close
+    role: coordinator
+    needs: [coordinator]
+    workspace: none
+"""
+
+
+def bookends(tmp_path: Path, name: str = "bookends.yaml") -> Any:
+    return write_spec(tmp_path, BOOKENDS, name=name)
+
+
+def report_from(spec: Any, stage_id: str, stages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str]:
+    """`runner.report_plan` от имени названного этапа плана (`report` знает только `plan`)."""
+    stage = spec.stage(stage_id)
+    assert stage is not None
+    return runner.report_plan(
+        {"id": DEAL}, spec, stage, {"plan": {"stages": stages, "reason": "порядок"}}, 1, events=(), now=NOW
+    )
+
+
+def test_close_waits_for_the_tail_of_the_plan(tmp_path: Path) -> None:
+    """`close` получает хвост плана: закрытие не раньше работы, которую план объявил.
+
+    Вход (`coordinator`) закрывается фактом принятия — его работу лид сделал
+    инструментом. Поэтому единственная зависимость `close`, кроме входа, — работа
+    плана; без неё дело можно было закрыть, не начав её.
+    """
+    spec = bookends(tmp_path)
+    facts, why = report_from(spec, "coordinator", [work("impl", needs=())])
+    assert why == ""
+
+    graph = transit.graph(spec, facts)
+    assert needs_of(graph)["close"] == ("coordinator", "impl")
+    assert needs_of(graph)["coordinator"] == ()
+
+    decision = transit.next_stage(spec, facts, NOW)
+    assert decision.stages == ("impl",), decision.reason
+
+
+def test_a_plan_fact_named_by_profile_still_links_the_close(tmp_path: Path) -> None:
+    """Старый журнал с `source_stage: "lead"` читается так же, как новый.
+
+    До правки предложение писало в `source_stage` профиль, и `close` оставался с
+    `needs: [coordinator]`: ребро от плана к закрытию терялось молча.
+    """
+    spec = bookends(tmp_path)
+    facts = events(
+        proposed(1, [work("impl", needs=())], source_stage="lead"),
+        accepted(1),
+    )
+
+    graph = transit.graph(spec, facts)
+    assert needs_of(graph)["close"] == ("coordinator", "impl")
+
+
+def test_accepted_revision_closes_the_plan_stage_from_any_state(tmp_path: Path) -> None:
+    """Принятая ревизия закрывает вход, даже если репланов было больше потолка.
+
+    `max_rounds_replan` ставит этапу плана `failed`; приём ревизии после этого —
+    успех этапа, и он обязан его снять. Иначе закрытое дело объявлялось бы
+    проваленным (`d_92177017`: вход остался `failed` после принятой ревизии 6).
+    """
+    spec = bookends(tmp_path)  # max_rounds_replan: 2
+    facts = events(
+        ("plan_rethink", {"failed_stage": "check", "kind": "contract", "round": 1}),
+        ("plan_rejected", {"rev": 1, "why": "план отклонён"}),
+        ("plan_rejected", {"rev": 2, "why": "план отклонён"}),
+        ("plan_rejected", {"rev": 3, "why": "план отклонён"}),
+    )
+    spent = transit.stage_states(spec, facts)
+    assert spent["coordinator"].state == "failed", "потолок репланов исчерпан"
+
+    # Факт дописывается последним: `events()` нумерует с единицы, и склейка двух
+    # пачек дала бы приём раньше отказов — свёртка читает журнал по `id`.
+    facts = facts + [{**events(("plan_accepted", {"rev": 4, "by": "lead"}))[0], "id": len(facts) + 1}]
+    closed = transit.stage_states(spec, facts)
+    assert closed["coordinator"].state == "done"
+    assert closed["coordinator"].fail_kind == ""
+
+
+def test_stage_slice_marks_the_bookends_as_the_lead_work(tmp_path: Path) -> None:
+    """Срез помечает закладки (`by_lead`): поверхность не рисует их «ждёт хода».
+
+    Иначе лента выглядит как забытая работа: два этапа ждут хода, которого не
+    будет никогда (`d_92177017`, `coordinator` и `close`).
+    """
+    spec = bookends(tmp_path)
+    facts, _why = report_from(spec, "coordinator", [work("impl", needs=())])
+    rows = {row["id"]: row for row in stagefeed.stages(spec, facts, NOW)}
+
+    assert rows["coordinator"]["by_lead"] is True
+    assert rows["close"]["by_lead"] is True
+    assert rows["impl"]["by_lead"] is False

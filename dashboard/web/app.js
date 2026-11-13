@@ -2317,9 +2317,14 @@ function toneVar(tone) {
  * чипами за место на дорожке.
  */
 function attemptRowNode(view, key) {
+  // Внутри дорожки — своя коробка со сдвигом влево: полоса 58 px под подпись
+  // попытки, чтобы номер не ложился на «колбаску» даже у самой первой попытки,
+  // которая начинается с кромки (Макс, 14.11).
   const track = h('div', { class: 'tl-track', 'data-key': `track:${key}` })
+  const plot = h('div', { class: 'tl-plot' })
+  track.append(plot)
   if (view.band) {
-    track.append(
+    plot.append(
       h('span', {
         class: `tl-band t-${view.band.tone || 'grey'}`,
         style: `left:${view.band.leftPct}%;width:${view.band.widthPct}%`,
@@ -2330,15 +2335,14 @@ function attemptRowNode(view, key) {
   }
   // Подпись попытки стоит у самой полосы, а не в гуттере: колонка подписей
   // забирала 186 px у шкалы (Макс, 14.11: «название попытки и её статус рисовать
-  // рядом с колбаской слева»). У левой кромки места слева нет — там подпись
-  // встаёт внутрь полосы.
+  // рядом с колбаской слева»). Полоса под подпись отведена внутри дорожки, поэтому
+  // номер стоит слева от полосы даже у первой попытки, которая началась с кромки.
   const bandLeft = view.band ? view.band.leftPct : 0
-  const inside = !view.band || bandLeft < 14
-  track.append(
+  plot.append(
     h(
       'span',
       {
-        class: `tl-att${inside ? ' is-inside' : ''}`,
+        class: 'tl-att',
         style: `left:${bandLeft}%`,
         'data-tip': view.bandTip || view.title || '',
         'data-key': `att:${key}`,
@@ -2352,7 +2356,7 @@ function attemptRowNode(view, key) {
   // Тишина: зазор, где не было ни вызова, ни слова. Полоса попытки остаётся на
   // месте — тишина рисуется поверх неё, иначе «шло» и «молчало» слились бы вновь.
   for (const silence of view.silences || []) {
-    track.append(
+    plot.append(
       h('span', {
         class: 'tl-silence',
         style: `left:${silence.leftPct}%;width:${silence.widthPct}%`,
@@ -2363,7 +2367,7 @@ function attemptRowNode(view, key) {
   }
   // Пауза «вопрос → ответ» — подсветка времени, которое дело стояло на человеке.
   for (const wait of view.waits) {
-    track.append(
+    plot.append(
       h('span', {
         class: 'tl-wait',
         style: `left:${wait.fromPct}%;width:${wait.widthPct}%`,
@@ -2376,7 +2380,7 @@ function attemptRowNode(view, key) {
   // наложением (CSS), развёрнутая — по уровням (Макс, 14.11: наложение микроколов
   // в свёрнутом виде было намеренным).
   for (const chip of view.chips) {
-    track.append(
+    plot.append(
       h('span', {
         class: `tl-call${chip.unfinished ? ' tl-unfinished' : ''}`,
         'data-level': String(chip.level || 0),
@@ -2397,7 +2401,7 @@ function attemptRowNode(view, key) {
   // отвечают, — «он думал или просто ничего не приходило», поэтому точка это
   // факт телеметрии, а не украшение.
   for (const say of view.sayTicks || []) {
-    track.append(
+    plot.append(
       h('span', {
         class: 'tl-say',
         style: `left:${say.leftPct}%`,
@@ -2429,7 +2433,7 @@ function attemptRowNode(view, key) {
         ),
       )
     }
-    track.append(marks)
+    plot.append(marks)
   }
   return h(
     'div',

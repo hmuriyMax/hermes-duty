@@ -1651,7 +1651,12 @@ function shapeStage(stage, journal, lead) {
   const s = stage && typeof stage === 'object' ? stage : {}
   const byAttempt = journal && typeof journal.get === 'function' ? journal : null
   const leadNote = leadNoteOf(s, lead)
-  const meta = stageMeta(s.state)
+  // Закладки дела (`coordinator`/`close`) — работа лида, а не забытый этап: план
+  // он пишет инструментом (`duty_plan`), дело закрывает `duty_close`, попытки для
+  // этих этапов не запускаются. Экран говорит «делает лид», а не «ждёт хода»:
+  // факт — `stagefeed.stages.by_lead` (`d_92177017` висел двумя «без дела»).
+  const byLead = s.by_lead === true && (s.state === 'pending' || s.state === 'wait_gate')
+  const meta = byLead ? { label: 'делает лид', tone: 'gray' } : stageMeta(s.state)
   const waits = s.waits && typeof s.waits === 'object' ? s.waits : null
   const needs = (Array.isArray(s.needs) ? s.needs : []).map(String)
   const attempts = (Array.isArray(s.attempts) ? s.attempts : []).map((item) => {

@@ -285,6 +285,33 @@ def test_plan_without_evidence_is_rejected_and_the_graph_stands(tmp_path: Path) 
     assert transit.graph(spec, events) == spec.stages
 
 
+def test_plan_names_the_stage_it_belongs_to_not_the_profile(tmp_path: Path) -> None:
+    """`source_stage` предложения — id этапа плана, а не профиль `lead`.
+
+    По этому полю `transit` ищет рёбра seed, которые обязаны ждать хвост плана
+    (`close`), и закрывает этап плана фактом принятия. С профилем ни один этап
+    графа не совпадал: на `d_92177017` `close` остался с `needs: [coordinator]`,
+    а вход висел `pending` до конца дела.
+    """
+    home = make_home(tmp_path)
+    spec = write_spec(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+
+    tools.plan(
+        str(deal["id"]),
+        [{"id": "research", "role": "researcher", "needs": ["impl"], "workspace": "none"}],
+        "скоуп неясен",
+        "plan-1",
+        home=home,
+        now=NOW,
+    )
+
+    events = journal.read_events(conn, str(deal["id"]))
+    proposed = [event for event in events if event["kind"] == transit.PLAN_PROPOSED]
+    assert proposed[-1]["payload"]["source_stage"] == spec_module.PLAN_STAGE
+
+
 def test_plan_accepted_grows_the_graph(tmp_path: Path) -> None:
     """Принятый план становится графом: этап плана есть в срезе дела."""
     home = make_home(tmp_path)

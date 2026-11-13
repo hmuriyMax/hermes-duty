@@ -1700,7 +1700,12 @@ function shapeStage(stage, journal, lead) {
   const s = stage && typeof stage === 'object' ? stage : {}
   const byAttempt = journal && typeof journal.get === 'function' ? journal : null
   const leadNote = leadNoteOf(s, lead)
-  const meta = stageMeta(s.state)
+  // Закладки дела (`coordinator`/`close`) — работа лида, а не забытый этап: план
+  // он пишет инструментом (`duty_plan`), дело закрывает `duty_close`, попытки для
+  // этих этапов не запускаются. Экран говорит «делает лид», а не «ждёт хода»:
+  // факт — `stagefeed.stages.by_lead` (`d_92177017` висел двумя «без дела»).
+  const byLead = s.by_lead === true && (s.state === 'pending' || s.state === 'wait_gate')
+  const meta = byLead ? { label: 'делает лид', tone: 'gray' } : stageMeta(s.state)
   const waits = s.waits && typeof s.waits === 'object' ? s.waits : null
   const needs = (Array.isArray(s.needs) ? s.needs : []).map(String)
   const attempts = (Array.isArray(s.attempts) ? s.attempts : []).map((item) => {
@@ -4337,7 +4342,7 @@ function DutyAttemptRow({ view, callSel, onSelectCall, toolFilter }) {
       'span',
       {
         key: 'att',
-        className: `duty-tl-att${!view.band || bandLeft < 14 ? ' is-inside' : ''}`,
+        className: 'duty-tl-att',
         style: { left: `${bandLeft}%` },
         'data-tip': view.bandTip || view.title || '',
       },
@@ -4379,7 +4384,7 @@ function DutyAttemptRow({ view, callSel, onSelectCall, toolFilter }) {
       className: `duty-tl-row${view.failed ? ' is-failed' : ''}`,
       style: { '--duty-tl-collapsed': `${view.collapsed}px`, '--duty-tl-full': `${view.full}px` },
     },
-    h('div', { className: 'duty-tl-track' }, ...track),
+    h('div', { className: 'duty-tl-track' }, h('div', { className: 'duty-tl-plot' }, ...track)),
   )
 }
 
@@ -4421,7 +4426,7 @@ function DutyLeadLane({ leadLane }) {
               'div',
               { className: 'duty-tl-track', title: `${leadLane.text}: полоса на оси — заход лида, от подъёма до выхода` },
               h('span', { className: 'duty-tl-att is-inside is-caption' }, 'заходы'),
-              ...runs.map((run, index) => {
+              h('div', { className: 'duty-tl-plot' }, ...runs.map((run, index) => {
                 const color = TONE_COLOR[run.tone] || TONE_COLOR.gray
                 return h(
                   'span',
@@ -4441,7 +4446,7 @@ function DutyLeadLane({ leadLane }) {
                   run.labeled ? h('span', { className: 'duty-tl-lead-label' }, run.label) : null,
                   run.open ? h('span', { className: 'duty-tl-lead-head' }) : null,
                 )
-              }),
+              })),
             ),
           ),
         )
@@ -4692,7 +4697,7 @@ const CSS = `
 .duty-md th{background:var(--ui-bg-quaternary);font-weight:600;color:var(--ui-text-primary)}
 .duty-md hr{border:none;border-top:1px solid var(--ui-stroke-tertiary);margin:12px 0}
 .duty-md a{text-decoration:underline;text-underline-offset:2px}
-.duty-scale-axis{position:relative;height:15px;margin:0 0 6px}
+.duty-scale-axis{position:relative;height:15px;margin:0 0 6px;margin-left:var(--duty-tl-plot-pad,64px)}
 .duty-scale-tick{position:absolute;font-size:11px;color:var(--ui-text-tertiary);white-space:nowrap;font-variant-numeric:tabular-nums}
 .duty-scale-tick.align-start{transform:translateX(0)}
 .duty-scale-tick.align-center{transform:translateX(-50%)}
@@ -4703,7 +4708,7 @@ const CSS = `
 
 /* Шкала шире часа: листается по горизонтали, подписи прилипают слева (Макс, 09.11). */
 .duty-scale-main.is-wide{overflow-x:auto;overscroll-behavior-x:contain;scrollbar-width:thin}
-.duty-scale-wrap{position:relative}
+.duty-scale-wrap{position:relative;--duty-tl-plot-pad:64px}
 .duty-tl-gutter-bg{position:absolute;left:-1px;top:0;bottom:0;width:calc(var(--duty-tl-name,150px) + var(--duty-tl-gap,8px) + 1px);background:var(--ui-bg-primary,#1a1a1a);border-right:1px solid var(--ui-border-primary,rgba(127,127,127,.3));z-index:2;pointer-events:none}
 .duty-scale-main.is-wide::-webkit-scrollbar{height:8px}
 .duty-scale-main.is-wide::-webkit-scrollbar-thumb{background:var(--ui-border-primary,rgba(127,127,127,.3));border-radius:4px}
@@ -4715,13 +4720,13 @@ const CSS = `
 /* Ось, сетка и слой сжатий начинаются там же, где дорожка строки, — после
  * колонки подписей. Без этого сдвига пунктир и подпись сжатия встают на 194 px
  * левее промежутка и меряют проценты по ширине плагина, а не дорожки. */
-.duty-scale-grid{position:absolute;top:-2px;bottom:0;left:calc(var(--duty-tl-name,150px) + var(--duty-tl-gap,8px));right:0;pointer-events:none;z-index:0}
+.duty-scale-grid{position:absolute;top:-2px;bottom:0;left:calc(var(--duty-tl-name,150px) + var(--duty-tl-gap,8px) + var(--duty-tl-plot-pad,64px));right:0;pointer-events:none;z-index:0}
 .duty-scale-grid-line{position:absolute;top:0;bottom:0;border-left:1px dashed color-mix(in srgb, var(--ui-text-tertiary) 34%, transparent)}
 /* Сжатый промежуток оси: два пунктира по краям и подпись посередине — иначе
  * смена масштаба читается как ошибка данных. */
 /* Сжатый простой: штрихованная полоса — «здесь шкала рвётся, время вырезано».
    Пунктир по краям читался как граница полосы, двойные засечки — как грязь. */
-.duty-tl-idle-layer{position:absolute;top:-2px;left:calc(var(--duty-tl-name,150px) + var(--duty-tl-gap,8px));width:calc(100% - calc(var(--duty-tl-name,150px) + var(--duty-tl-gap,8px)));height:calc(100% + 2px);z-index:0;pointer-events:none}
+.duty-tl-idle-layer{position:absolute;top:-2px;left:calc(var(--duty-tl-name,150px) + var(--duty-tl-gap,8px) + var(--duty-tl-plot-pad,64px));width:calc(100% - calc(var(--duty-tl-name,150px) + var(--duty-tl-gap,8px) + var(--duty-tl-plot-pad,64px)));height:calc(100% + 2px);z-index:0;pointer-events:none}
 .duty-tl-idle-gap{position:absolute;top:0;bottom:0}
 .duty-tl-idle-band{position:absolute;inset:0;background:repeating-linear-gradient(135deg,color-mix(in srgb,var(--ui-text-tertiary) 38%,transparent) 0 2px,transparent 2px 7px);-webkit-mask-image:linear-gradient(to right,transparent,#000 6px,#000 calc(100% - 6px),transparent);mask-image:linear-gradient(to right,transparent,#000 6px,#000 calc(100% - 6px),transparent);opacity:.8}
 .duty-tl-idle-pill{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);white-space:nowrap;font-size:9px;line-height:1.3;letter-spacing:.02em;font-variant-numeric:tabular-nums;color:var(--ui-text-secondary);background:var(--ui-surface-background);border:1px solid var(--ui-stroke-secondary);border-radius:5px;padding:1px 4px}
@@ -4782,6 +4787,7 @@ const CSS = `
 .duty-tl-call.duty-tl-unfinished,.duty-tl-tick.duty-tl-unfinished{background:transparent !important;box-shadow:inset 0 0 0 1.5px currentColor !important;opacity:.9}
 .duty-tl-track{position:relative;height:100%}
 .duty-tl-track{position:relative;min-height:20px}
+.duty-tl-plot{position:absolute;inset:0 0 0 var(--duty-tl-plot-pad,64px)}
 /* Фон попытки: длительность видна полосой, а не только по чипам вызовов. */
 .duty-tl-band{position:absolute;top:1px;bottom:1px;border-radius:4px;background:color-mix(in srgb, var(--ui-text-tertiary) 13%, transparent);border:1px solid color-mix(in srgb, var(--ui-text-tertiary) 22%, transparent)}
 /* Тишина внутри попытки: ни вызова, ни слова — редкая штриховка поверх полосы. */

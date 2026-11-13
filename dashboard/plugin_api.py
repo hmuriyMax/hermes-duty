@@ -2658,6 +2658,9 @@ def deals_create(home: Path, payload: dict[str, Any], *, source: str = "api") ->
     external_ref = payload.get("external_ref")
     if external_ref is not None and not isinstance(external_ref, str):
         raise deals.DealError("create: 'external_ref' — строка (например jira:RP-14080) или null")
+    branch = payload.get("branch")
+    if branch is not None and not isinstance(branch, str):
+        raise deals.DealError("create: 'branch' — имя рабочей ветки (строка) или null")
     dedup_window = payload.get("dedup_window")
     if dedup_window is not None and (not isinstance(dedup_window, int) or isinstance(dedup_window, bool)):
         raise deals.DealError("create: 'dedup_window' — целое число секунд или null")
@@ -2669,6 +2672,7 @@ def deals_create(home: Path, payload: dict[str, Any], *, source: str = "api") ->
             deals.create_deal(
                 conn,
                 repo=_repo_of(spec, repo),
+                branch=branch,
                 title=str(payload.get("title") or ""),
                 body=str(body or ""),
                 assignee=assignee,
@@ -2979,7 +2983,7 @@ def deals_attach(
 
 @router.post("/deals")
 def create_deal_route(payload: dict[str, Any] = Body(...)) -> Any:
-    """`POST /deals {repo?, title, body?, assignee?, parents?[], spec?, external_ref?}` → дело.
+    """`POST /deals {repo?, branch?, title, body?, assignee?, parents?[], spec?, external_ref?}` → дело.
 
     Отвечает той же формой, что `/deal/{deal_id}`, плюс блок `mutation`. Ошибка
     входа (нет родителя, пустой title, `board` в теле) — 400 с `errors[]`: контракт

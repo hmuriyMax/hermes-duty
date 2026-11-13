@@ -45,6 +45,7 @@ import getpass
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -53,6 +54,10 @@ from typing import Any, Optional
 EXIT_OK = 0
 EXIT_NOT_FOUND = 1
 EXIT_SOURCE = 2
+
+# Сколько секунд CLI ждёт `git`, снимая ветку при заведении дела: локальная
+# команда отвечает мгновенно, а зависший вызов не должен держать `duty create`.
+GIT_PROBE_SEC = 10
 
 # Сколько отказов гейта печатает `duty why` в человеческом выводе: полный список
 # лежит в событии и в `--json`, в терминале нужны первые.
@@ -1664,6 +1669,40 @@ def _mutate(fn: Any, action: str, *args: Any, as_json: bool = False, **kwargs: A
     return _payload_code(payload)
 
 
+def _work_branch(spec_path: Optional[str], repo: Optional[str]) -> Optional[str]:
+    """Рабочая ветка в момент заведения дела: `git rev-parse --abbrev-ref HEAD`.
+
+    Снимает вызывающий, а не store: `dashboard/deals.py` о git не знает и знать
+    не должен, а без записи перенос работы (`duty_integrate`) угадывал бы цель по
+    текущему HEAD — и переключение ветки за время дела увело бы перенос не туда.
+
+    Адрес — тот же, что у дела: `spec.repo`, иначе явный `--repo`. Ветки нет
+    (`None`) у отсоединённого HEAD, в не-репозитории и в каталоге, которого нет на
+    диске: дело без рабочей ветки законно, отказом это не становится.
+    """
+    path = os.path.expanduser(str(repo or "").strip())
+    if spec_path:
+        try:
+            path = os.path.expanduser(str(_load_spec().load_spec(Path(spec_path)).repo or ""))
+        except Exception:  # noqa: BLE001 - спека не разобралась: остаётся явный repo
+            path = os.path.expanduser(str(repo or "").strip())
+    if not path:
+        return None
+    try:
+        done = subprocess.run(
+            ["git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=GIT_PROBE_SEC,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    name = (done.stdout or "").strip()
+    if done.returncode != 0 or not name or name == "HEAD":
+        return None
+    return name
+
+
 def _claim_owner(explicit: Optional[str]) -> str:
     """Владелец для `claim`: явный, иначе профиль агента, иначе пользователь ОС.
 
@@ -2654,6 +2693,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                 # принимает только абсолютный, иначе «откуда взялась спека» не
                 # восстановить из журнала (`docs/SPEC.md`).
                 request["spec"] = str(Path(args.spec).expanduser().resolve())
+            # Рабочая ветка — факт заведения, а не догадка при переносе: снимается
+            # здесь, потому что store о git не знает (`_work_branch`). Нет ветки —
+            # ключа в теле нет, и в журнале остаётся `branch: null`.
+            branch = _work_branch(request.get("spec"), args.repo)
+            if branch:
+                request["branch"] = branch
             payload = _route(api().deals_create, api().hermes_home(), request, source="cli")
             if args.json:
                 # К форме роута добавлен `deal_id` — имя, которым дело называют

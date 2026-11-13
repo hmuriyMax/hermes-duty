@@ -493,6 +493,24 @@ def repo_of(value: Any) -> Optional[str]:
     return str(Path(text).expanduser())
 
 
+def branch_of(value: Any) -> Optional[str]:
+    """Рабочая ветка дела: имя как есть, `None` — ветки нет.
+
+    Ветку снимает вызывающий **в момент заведения** (`dashboard/cli.py`, команда
+    `create`): store о git не знает и знать не должен. Отсюда два значения,
+    которые веткой не считаются: пустая строка (имени нет) и `HEAD` — так
+    `git rev-parse --abbrev-ref` называет отсоединённый HEAD, а «ветка HEAD»
+    стала бы целью переноса, которой не существует. Дело без рабочей ветки
+    законно: перенос тогда спросит git сам (`dashboard/tools.py`, `_working_branch`).
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text == "HEAD":
+        return None
+    return text
+
+
 def external_ref_of(value: Any) -> Optional[str]:
     """Внешнее имя дела: строка без пробелов по краям; `None` — имени нет.
 
@@ -901,6 +919,7 @@ def create_deal(
     conn: sqlite3.Connection,
     *,
     repo: Optional[str] = None,
+    branch: Optional[str] = None,
     title: str,
     body: str = "",
     assignee: Optional[str] = None,
@@ -921,6 +940,13 @@ def create_deal(
     `repo` — репозиторий дела (группировка, не адрес): вызывающий вычисляет его
     из `spec.repo`, иначе из явного `--repo`, иначе оставляет `NULL` — «репозиторий
     не назван». Обязательным он не бывает: дело без репозитория законно.
+
+    `branch` — рабочая ветка человека, снятая **в момент заведения** (`git -C
+    <repo> rev-parse --abbrev-ref HEAD`). Снимает её вызывающий (`dashboard/cli.py`,
+    команда `create`): store о git не знает и знать не должен, а без записи
+    перенос работы (`duty_integrate`) угадывал бы цель по текущему HEAD. Ветка —
+    факт создания рядом с `repo`; `None` (отсоединённый HEAD, не-репозиторий,
+    явное «не названа») — законное дело без рабочей ветки, а не ошибка.
 
     `spec_path` — спека дела (`duty.yaml`), по которой строится лента этапов
     (`docs/SPEC.md`). Путь записывается в `created.payload.spec`, потому что
@@ -951,6 +977,7 @@ def create_deal(
     if not clean_title:
         raise DealError("create: поле 'title' обязательно")
     repo_name = repo_of(repo)
+    branch_name = branch_of(branch)
     spec_file = "" if spec_path is None else str(spec_path).strip()
     if spec_file:
         path = Path(spec_file).expanduser()
@@ -1019,6 +1046,10 @@ def create_deal(
             # а `repo` её заменил, и по журналу видно, к какому репозиторию дело
             # отнесли в момент заведения.
             "repo": repo_name,
+            # Рабочая ветка человека на момент заведения: цель переноса работы
+            # дела (`duty_integrate`). Без неё цель спрашивают у git заново, и
+            # переключение ветки за время дела уводило бы перенос не туда.
+            "branch": branch_name,
             "title": clean_title,
             "assignee": assignee,
             "status": None,
@@ -1029,6 +1060,7 @@ def create_deal(
         source,
         {
             "repo": repo_name,
+            "branch": branch_name,
             "title": clean_title,
             "body": str(body or ""),
             "assignee": assignee,

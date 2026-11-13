@@ -13,6 +13,6 @@ license: MIT
 tags: [orchestration, observability, desktop, duty]
 provides_tools:
   [duty_plan, duty_start, duty_wait, duty_answer, duty_ask, duty_ask_human,
-   duty_cancel, duty_cancel_deal, duty_close]
+   duty_cancel, duty_cancel_deal, duty_integrate, duty_close]
 provides_hooks: []
 requires_env: []

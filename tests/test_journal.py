@@ -496,6 +496,10 @@ def test_fold_closed_deal_is_not_reopened_by_non_state_kinds() -> None:
         "lead_started",
         "lead_resumed",
         "lead_exited",
+        # Перенос работы — факт о дереве, а не о состоянии дела: дело закрывает
+        # слово лида, и неудачный перенос (`integrate_failed`) закрытие не отменяет.
+        "integrated",
+        "integrate_failed",
     )
 
 

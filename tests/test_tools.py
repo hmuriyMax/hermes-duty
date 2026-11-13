@@ -891,7 +891,7 @@ def load_plugin() -> Any:
 
 
 def test_register_declares_the_duty_toolset() -> None:
-    """`register(ctx)` объявляет ровно девять инструментов тулсета `duty`."""
+    """`register(ctx)` объявляет ровно десять инструментов тулсета `duty`."""
     plugin = load_plugin()
     ctx = RecordingContext()
 
@@ -906,6 +906,7 @@ def test_register_declares_the_duty_toolset() -> None:
         "duty_ask_human",
         "duty_cancel",
         "duty_cancel_deal",
+        "duty_integrate",
         "duty_close",
     ]
     assert {tool["toolset"] for tool in ctx.tools} == {"duty"}

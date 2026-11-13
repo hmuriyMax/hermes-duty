@@ -86,6 +86,13 @@ NOISE_KINDS = ("attempt_progress",)
 # `duty_cancel_deal`, возврат в работу — новая ревизия плана.
 CLOSE_VERDICT = "approve"
 
+# Факты переноса работы дела в рабочую ветку человека: `integrated` — работа уже
+# в рабочей ветке (её пишут `duty_integrate` и `duty_close`), `integrate_failed` —
+# перенести не удалось, и причина названа. Второй вид закрытию не мешает: дело
+# закрывает слово лида, а не состояние дерева (`docs/ENGINE-2.0.md`, раздел 8).
+INTEGRATED = "integrated"
+INTEGRATE_FAILED = "integrate_failed"
+
 # Подкаталог полных логов попыток, которые поднял лид: журнал отвечает «чем
 # кончилось», а не заменяет лог.
 ATTEMPT_LOG_SUBDIR = "lead"
@@ -1147,6 +1154,244 @@ def close(
     }
 
 
+# -------------------------------------------------------------- duty_integrate
+
+
+def _created(events: Iterable[Any]) -> dict[str, Any]:
+    """Снимок `created`: что записали при заведении дела (`dashboard/deals.py`).
+
+    Два ключа нужны переносу: `repo` — запасной адрес репозитория, `branch` —
+    ветка, снятая **в момент заведения** (`duty create`). Второго места, где эти
+    два факта записаны, нет: строка store репозиторий помнит, а ветку — нет.
+    """
+    for event in events or ():
+        if str(event.get("kind") or "") == "created":
+            return journal.payload_of(event)
+    return {}
+
+
+def _deal_repo(spec: Any, events: Iterable[Any]) -> Optional[Path]:
+    """Репозиторий для git-операций дела: `spec.repo`, иначе `created.payload.repo`.
+
+    Адрес тот же, что у движка (`runner` берёт `spec.repo`): второй резолвер
+    разошёлся бы с первым на первом деле, где адреса названы по-разному. Снимок
+    `created.payload.repo` годится только существующим каталогом: он бывает
+    группировкой (`deals.repo_of`) и не обязан быть живым репозиторием, а git в
+    несуществующем каталоге — не «пустой ответ», а ошибка вызова.
+    """
+    from_spec = str(getattr(spec, "repo", "") or "").strip()
+    if from_spec:
+        return Path(from_spec).expanduser()
+    recorded = str(_created(events).get("repo") or "").strip()
+    if not recorded:
+        return None
+    path = Path(recorded).expanduser()
+    return path if path.is_dir() else None
+
+
+def _working_branch(events: Iterable[Any], repo: Path) -> str:
+    """Рабочая ветка человека: записанная при заведении, иначе снятая сейчас.
+
+    Записанная (`created.payload.branch`) старше: дело ведут ради работы, которая
+    стояла в этой ветке в момент заведения, и человек вправе переключиться, пока
+    дело идёт. Нет записи — спрашиваем git сейчас; отсоединённый HEAD (`HEAD`)
+    ветки не называет, и это отказ словами, а не догадка.
+    """
+    recorded = str(_created(events).get("branch") or "").strip()
+    if recorded and recorded != "HEAD":
+        return recorded
+    code, out = runner._git_stdout(["rev-parse", "--abbrev-ref", "HEAD"], repo)
+    name = out.strip() if code == 0 else ""
+    if not name or name == "HEAD":
+        raise ToolsError(
+            f"цель не названа: рабочая ветка в created.payload.branch не записана, а HEAD "
+            f"в {repo} отсоединён — переносить некуда"
+        )
+    return name
+
+
+def _conflict_files(repo: Path) -> list[str]:
+    """Файлы конфликта в индексе слияния: их имена и есть подсказка человеку."""
+    code, out = runner._git_stdout(["diff", "--name-only", "--diff-filter=U"], repo)
+    if code != 0:
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def _transfer(repo: Path, deal: dict[str, Any], source: str, into: str, source_tip: str, target_tip: str) -> bool:
+    """Слить ветку дела в рабочую; `True` — быстрым переносом. Отказ — `ToolsError`.
+
+    Три исхода по факту, а не по настройке: рабочая ветка уже содержит вершину
+    дела (это решает вызывающий), рабочая ветка — предок вершины дела (перенос
+    быстрый: `--ff-only`, а если она не текущая — двигается только ссылка),
+    ветки разошлись (`--no-ff` с явным коммитом слияния).
+
+    Слияние делается только в текущую ветку: `git merge` двигает ту ветку, на
+    которой стоит рабочий каталог, и «слить в другую» значило бы сдвинуть чужую.
+    Конфликт отменяется (`git merge --abort`) и называется файлами: перенос в
+    этом случае делает человек (`docs/RUNBOOK.md`).
+    """
+    code, out = runner._git_stdout(["rev-parse", "--abbrev-ref", "HEAD"], repo)
+    checked_out = out.strip() if code == 0 else ""
+    fast_forward = runner._ancestor(repo, target_tip, source_tip) is True
+    if into != checked_out:
+        if not fast_forward:
+            raise ToolsError(
+                f"рабочая ветка {into} не текущая (сейчас {checked_out or 'HEAD отсоединён'}), "
+                "а с веткой дела разошлась: сливает человек — инструмент двигает только ту "
+                "ветку, на которой стоит рабочий каталог"
+            )
+        code, why = runner._git(["branch", "-f", into, source_tip], repo)
+        if code != 0:
+            raise ToolsError(f"перенос {source} → {into}: git branch -f отказал: {why}")
+        return True
+    if fast_forward:
+        code, why = runner._git(["merge", "--ff-only", source_tip], repo)
+        if code != 0:
+            raise ToolsError(f"перенос {source} → {into}: git merge --ff-only отказал: {why}")
+        return True
+    code, why = runner._git(
+        [
+            # `-c` перед подкомандой: коммит слияния не зависит от `user.email` и
+            # подписи, настроенных на машине (так же коммитит движок).
+            "-c", f"user.name={runner.ENGINE_COMMIT_NAME}",
+            "-c", f"user.email={runner.ENGINE_COMMIT_EMAIL}",
+            "-c", "commit.gpgsign=false",
+            "merge", "--no-ff",
+            "-m", f"[{deal['id']}] merge {source}",
+            source_tip,
+        ],
+        repo,
+    )
+    if code == 0:
+        return False
+    files = _conflict_files(repo)
+    aborted, abort_why = runner._git(["merge", "--abort"], repo)
+    dirty_code, left = runner._git_stdout(["status", "--porcelain"], repo)
+    tail = ""
+    if aborted != 0:
+        tail = f"; git merge --abort отказал: {abort_why}"
+    elif dirty_code != 0 or left.strip():
+        tail = "; после abort дерево осталось грязным — разбирается человек"
+    raise ToolsError(
+        f"перенос {source} → {into} конфликтует ({', '.join(files) or why}): слияние отменено "
+        f"(git merge --abort){tail}; перенос делает человек"
+    )
+
+
+def integrate(
+    deal_id: Any,
+    idempotency_key: Any,
+    *,
+    home: Optional[Path] = None,
+    now: Any = None,
+    reason: Any = "",
+) -> dict[str, Any]:
+    """Перенести работу дела из `duty/<id>` в рабочую ветку человека — локальным merge.
+
+    Источник — ветка дела (`runner.deal_branch`), за которую держится вся работа
+    этапов. Цель — рабочая ветка: та, что записана в `created.payload.branch` при
+    заведении, иначе текущая ветка репозитория (`_working_branch`). Репозиторий —
+    `spec.repo`, иначе `created.payload.repo` (`_deal_repo`). Ничего не пушится и
+    не форсится: инструмент сливает локально и историю не переписывает, а
+    `--no-ff` ставит на месте явный коммит слияния, чтобы перенос был виден в
+    `git log`.
+
+    Отказы — до действий: дело закрыто, ветки дела нет, репозиторий не найден,
+    рабочая ветка совпадает с веткой дела, рабочий каталог грязный (`git status
+    --porcelain` непуст — перенос затёр бы чужие правки), рабочая ветка не
+    названа. Конфликт слияния — тоже отказ: `git merge --abort` возвращает
+    дерево, а файлы конфликта называются словами.
+
+    Факт журнала `integrated`: `{from, into, commit, fast_forward, already}`.
+    `commit` — вершина ветки дела, которая теперь содержится в рабочей ветке: по
+    нему `duty_close` видит, что перенос уже был, — быстрый перенос и `--no-ff`
+    дают одно и то же значение. Повтор с тем же `idempotency_key` второго факта не
+    пишет и ничего не двигает.
+    """
+    key = _key(idempotency_key)
+    home = hermes_home(home)
+    moment = _now(now)
+    text = " ".join(str(reason or "").split())
+    conn = _store(home)
+    deal = _deal(conn, deal_id)
+    events = journal.read_events(conn, str(deal["id"]))
+    repeated = _by_idem(events, INTEGRATED, key)
+    if repeated is not None:
+        payload = journal.payload_of(repeated)
+        return {
+            "ok": True,
+            "deal": str(deal["id"]),
+            "integrated": {
+                "from": str(payload.get("from") or ""),
+                "into": str(payload.get("into") or ""),
+                "commit": str(payload.get("commit") or ""),
+                "fast_forward": bool(payload.get("fast_forward")),
+                "already": bool(payload.get("already")),
+            },
+            "repeated": True,
+            "events": 0,
+        }
+    if journal.closed_fact(events) is not None:
+        raise ToolsError(f"дело {deal['id']} закрыто: переносить в нём нечего")
+    spec = _spec(events)
+    repo = _deal_repo(spec, events)
+    if repo is None or not repo.is_dir():
+        raise ToolsError(
+            f"репозиторий дела не найден: {repo or 'адрес не назван'} — переносить работу "
+            "некуда (spec.repo, иначе created.payload.repo)"
+        )
+    source = runner.deal_branch(deal)
+    code, out = runner._git_stdout(["rev-parse", "--verify", f"{source}^{{commit}}"], repo)
+    if code != 0 or not out.strip():
+        raise ToolsError(f"ветки дела {source} нет в {repo}: переносить нечего")
+    source_tip = out.split()[0]
+    into = _working_branch(events, repo)
+    if into == source:
+        raise ToolsError(f"рабочая ветка {into} совпадает с веткой дела: переносить некуда")
+    code, dirty = runner._git_stdout(["status", "--porcelain"], repo)
+    if code != 0:
+        raise ToolsError(f"git status --porcelain в {repo} не ответил: {dirty}")
+    dirty_lines = [line for line in dirty.splitlines() if line.strip()]
+    if dirty_lines:
+        raise ToolsError(
+            f"рабочий каталог {repo} грязный ({len(dirty_lines)} путей): перенос затёр бы "
+            "чужие правки — закоммить или убери их и повтори"
+        )
+    target_tip = runner._sha(repo, into)
+    if not target_tip:
+        raise ToolsError(f"рабочей ветки {into} нет в {repo}: переносить некуда")
+    if runner._ancestor(repo, source_tip, target_tip) is True:
+        already, fast_forward = True, False
+    else:
+        already, fast_forward = False, _transfer(repo, deal, source, into, source_tip, target_tip)
+    payload: dict[str, Any] = {
+        "from": source,
+        "into": into,
+        "commit": source_tip,
+        "fast_forward": fast_forward,
+        "already": already,
+        "by": SOURCE,
+        "idem": key,
+    }
+    if text:
+        payload["reason"] = text
+    fact = _lead_event(deal, INTEGRATED, payload, {"from": source, "into": into, "idem": key}, moment)
+    written = journal.append(conn, [fact])
+    return {
+        "ok": True,
+        "deal": str(deal["id"]),
+        "integrated": {
+            "from": source,
+            "into": into,
+            "commit": source_tip,
+            "fast_forward": fast_forward,
+            "already": already,
+        },
+        "events": _int(written),
+    }
+
+
 # ----------------------------------------------------------------- duty_answer
 
 
@@ -1982,6 +2227,34 @@ CLOSE_SCHEMA = {
     },
 }
 
+INTEGRATE_SCHEMA = {
+    "name": "duty_integrate",
+    "description": (
+        "Перенести работу дела из ветки дела (duty/<id>) в рабочую ветку человека: локальное "
+        "слияние, без пуша, без force и без переписывания истории. Отказывает, ничего не "
+        "двигая: дело закрыто, ветки дела нет, репозиторий дела не найден, рабочая ветка "
+        "совпадает с веткой дела, рабочий каталог грязный. Конфликт отменяется "
+        "(git merge --abort) и называется файлами: перенос в этом случае делает человек. "
+        "Повтор с тем же idempotency_key второго факта не пишет."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "deal": {"type": "string", "description": "id своего дела (d_<hex>)"},
+            "reason": {
+                "type": "string",
+                "description": "зачем перенос — слова лида, попадают в факт",
+                "default": "",
+            },
+            "idempotency_key": {
+                "type": "string",
+                "description": "ключ вызова: повтор не пишет второй факт и ничего не двигает",
+            },
+        },
+        "required": ["deal", "idempotency_key"],
+    },
+}
+
 
 ANSWER_SCHEMA = {
     "name": "duty_answer",
@@ -2199,6 +2472,21 @@ def handle_close(params: dict, **kwargs: Any) -> str:
                 args.get("verdict", CLOSE_VERDICT),
                 args.get("idempotency_key", ""),
                 home=kwargs.get("home"),
+            )
+        )
+    )
+
+
+def handle_integrate(params: dict, **kwargs: Any) -> str:
+    """`duty_integrate`: аргументы модели → ответ строкой; `home` — шов для тестов."""
+    args = params or {}
+    return _json(
+        _run(
+            lambda: integrate(
+                args.get("deal", ""),
+                args.get("idempotency_key", ""),
+                home=kwargs.get("home"),
+                reason=args.get("reason", ""),
             )
         )
     )

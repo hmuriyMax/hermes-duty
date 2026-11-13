@@ -86,6 +86,7 @@ CHARTER_KEYS = (
     "plan_gate",
     "max_attempts",
     "max_lead_resumes",
+    "run_budget_sec",
     "publish",
 )
 PLAN_GATE_KEYS = ("min_stages", "budget_share")
@@ -480,6 +481,9 @@ class Charter:
       `retry` этапа (`dashboard/failures.py`);
     - `max_lead_resumes` — сколько раз супервизор поднимает упавшего лида (2.0;
       читает `lead.max_resumes` этим же полем);
+    - `run_budget_sec` — сколько секунд живёт один заход лида до `overrun` (2.0;
+      `0` — бюджета нет: заход держится до тишины `idle` или до конца турна).
+      Не назван — действует умолчание движка (`lead.DEFAULT_RUN_BUDGET_SEC`);
     - `publish` — роль-ревьюер и вопрос человеку перед публикацией (2.0);
     - `declared` — блок `charter` в спеке **объявлен**. Умолчания действуют и без
       него (потолок 3 — политика движка), но отказ `duty_start` обязан называть,
@@ -494,6 +498,7 @@ class Charter:
     plan_gate: PlanGate = PlanGate()
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     max_lead_resumes: int = DEFAULT_MAX_LEAD_RESUMES
+    run_budget_sec: Optional[int] = None
     publish: Publish = Publish()
     declared: bool = False
 
@@ -1064,6 +1069,20 @@ def _parse_charter(
             )
         )
         resumes = DEFAULT_MAX_LEAD_RESUMES
+    budget = mapping.get("run_budget_sec")
+    if budget is not None:
+        budget = _int_or_none(budget)
+        if budget is None or budget < 0:
+            issues.append(
+                Issue(
+                    path,
+                    lines.get(prefix + ("charter", "run_budget_sec"), line),
+                    "charter.run_budget_sec",
+                    "run_budget_sec: секунды захода лида — целое число не меньше нуля "
+                    "(0 — без бюджета, не назван — умолчание движка)",
+                )
+            )
+            budget = None
     return Charter(
         max_stages=int(max_stages),
         max_rounds_replan=int(rounds),
@@ -1072,6 +1091,7 @@ def _parse_charter(
         plan_gate=_parse_plan_gate(mapping, path, lines, prefix + ("charter",), issues),
         max_attempts=int(max_attempts),
         max_lead_resumes=int(resumes),
+        run_budget_sec=budget,
         publish=_parse_publish(mapping, path, lines, prefix + ("charter",), issues),
         declared=True,
     )

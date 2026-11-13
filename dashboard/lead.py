@@ -111,7 +111,13 @@ SKILL = "project-delivery"
 # держит супервизор по часам — ребенок не умеет ограничивать себя сам, потому что
 # `hermes chat` через живой гейтвей отказывает `--run-budget` (`docs/ENGINE-2.0.md`,
 # раздел 11). Запас лизинга нужен, чтобы штатный выход не выглядел падением.
-DEFAULT_RUN_BUDGET_SEC = 1800
+#
+# Час, а не полчаса: заход лида — это ожидание работы этапов, и попытка на 20–30
+# минут упиралась в потолок (`d_92177017`: `overrun` на 2100-й секунде при живой
+# `impl-cleanup#1`). Хартия дела может назвать свой бюджет (`charter.run_budget_sec`)
+# или снять его совсем (`0`): `idle` (тишина без открытого вызова) и допуск
+# штатных подъёмов остаются потолками и без бюджета захода.
+DEFAULT_RUN_BUDGET_SEC = 3600
 LEASE_GRACE_SEC = 300
 
 # Сколько раз супервизор поднимает упавшего лида (`charter.max_lead_resumes`).
@@ -138,6 +144,22 @@ BLOCKING_GRACE_SEC = 60.0
 # своего потолка не имеют: их сторожит бюджет захода (`overrun`).
 BLOCKING_WAIT = "duty_wait"
 BLOCKING_ASK = "duty_ask"
+
+def budget_of(spec: Any = None, override: Any = None) -> int:
+    """Бюджет захода в секундах: аргумент → хартия → умолчание; `0` — без бюджета.
+
+    Порядок тот же, что у `max_resumes`: явный аргумент (`lead.py run … <sec>`)
+    сильнее файла, файл сильнее движка. Объявленный `0` — не «ноль секунд», а
+    «потолка нет»: заход живёт до конца турна, а сторожат его тишина (`idle`) и
+    допуск штатных подъёмов.
+    """
+    if override is not None:
+        return max(0, _int(override))
+    declared = getattr(getattr(spec, "charter", None), "run_budget_sec", None)
+    if declared is not None:
+        return max(0, _int(declared))
+    return DEFAULT_RUN_BUDGET_SEC
+
 
 # Режимы захода: первый (бриф) и продолжение (дайджест фактов после курсора).
 MODE_FIRST = "brief"
@@ -689,6 +711,19 @@ def max_free_resumes(resume_limit: int) -> int:
     return max(1, _int(resume_limit)) * FREE_RESUME_FACTOR
 
 
+def _run_budget_line(run_budget: Optional[int]) -> str:
+    """Строка о бюджете захода: `0` — не «сейчас», а «потолка нет»."""
+    if run_budget:
+        return (
+            f"- бюджет этого захода: {int(run_budget)} с, после чего сторож остановит заход "
+            "и поднимет резюм"
+        )
+    return (
+        "- бюджет этого захода не ограничен (`charter.run_budget_sec: 0`): заход живёт до конца "
+        "турна, а сторож остановит его только по тишине (`idle`)"
+    )
+
+
 def _head_block(deal: dict[str, Any], st: dict[str, Any], spec: Any, resume_limit: int) -> list[str]:
     """Шапка входа сессии: адрес дела, состояние лида, спека, контракт движка."""
     free = _int(st.get("free"))
@@ -739,10 +774,7 @@ def digest(
     cursor = _int(st.get("session_cursor"))
     lines = _head_block(deal, st, spec, resume_limit)
     lines.append(f"- бюджет дела: {_budget_line(spec, events)}")
-    if run_budget:
-        lines.append(
-            f"- бюджет этого захода: {int(run_budget)} с, после чего сторож остановит заход и поднимет резюм"
-        )
+    lines.append(_run_budget_line(run_budget))
     lines += ["", f"## Что произошло после курсора сессии ({cursor})"]
     facts, omitted = _facts_lines(events, cursor, moment)
     if omitted:
@@ -782,10 +814,7 @@ def brief(
     moment = _now(now)
     lines = _head_block(deal, st, spec, resume_limit)
     lines.append(f"- бюджет дела: {_budget_line(spec, events)}")
-    if run_budget:
-        lines.append(
-            f"- бюджет этого захода: {int(run_budget)} с, после чего сторож остановит заход и поднимет резюм"
-        )
+    lines.append(_run_budget_line(run_budget))
     body = _short(deal.get("body") or "", BRIEF_BODY_LIMIT)
     lines += ["", "## Что за дело", body or "(тело дела не записано)"]
     if spec is not None:
@@ -1086,7 +1115,6 @@ def run(
     применяется к самому вызову по его собственному потолку (`_hang`).
     """
     home = Path(home).expanduser()
-    budget_sec = DEFAULT_RUN_BUDGET_SEC if run_budget is None else max(1, _int(run_budget))
     clock = clock or time.time
     monotonic = monotonic or time.monotonic
     moment = _now(now, clock)
@@ -1102,9 +1130,11 @@ def run(
         # перестал продолжать (потерянный турн), бросается и заменяется брифом.
         mode, cursor, dropped = next_mode(events, st)
         spec = _spec(events)
+        # Бюджет захода решает хартия дела, а не только аргумент: `0` — без потолка.
+        budget_sec = budget_of(spec, run_budget)
         resume_limit = max_resumes(None, spec=spec)
 
-        ttl = budget_sec + LEASE_GRACE_SEC
+        ttl = (budget_sec or DEFAULT_RUN_BUDGET_SEC) + LEASE_GRACE_SEC
         attempt = int(st["starts"]) + 1
         held = lease_of(conn, str(deal["id"]))
         stale = None
@@ -1202,7 +1232,9 @@ def run(
         tokens = 0
         reason = "exit"
         idle_sec = LEAD_IDLE_TIMEOUT_SEC if idle_timeout is None else max(1, _int(idle_timeout))
-        deadline = monotonic() + budget_sec + LEASE_GRACE_SEC
+        # `0` — бюджета нет: deadline не наступает никогда, и заход гасит только
+        # тишина (`idle`): это и есть «снять ограничение по времени».
+        deadline = monotonic() + budget_sec + LEASE_GRACE_SEC if budget_sec else None
         renew_every = max(ttl / 3.0, runner.POLL_SEC)
         last_renew = monotonic()
         last_line_at = monotonic()
@@ -1219,7 +1251,7 @@ def run(
             if line is None:
                 if process.finished():
                     break
-                if monotonic() >= deadline:
+                if deadline is not None and monotonic() >= deadline:
                     reason = "overrun"
                     process.stop()
                     break
@@ -1593,7 +1625,6 @@ def supervise(
     человеку в терминале нужен второй.
     """
     home = Path(home).expanduser()
-    budget_sec = DEFAULT_RUN_BUDGET_SEC if run_budget is None else max(1, _int(run_budget))
     moment = _now(now)
     conn = deals.open_store(home)
     if conn is None:  # pragma: no cover
@@ -1602,9 +1633,13 @@ def supervise(
         deal = _deal(conn, deal_id)
         events = journal.read_events(conn, str(deal["id"]))
         st = state(events, now=moment, probe=probe)
+        spec = _spec(events)
+        # Бюджет захода — тот же, что у самого захода: сторож не должен обещать
+        # потолок, который заход принял бы иначе (`budget_of`: аргумент → хартия).
+        budget_sec = budget_of(spec, run_budget)
         # Потолок нужен во всех ответах: «резюмов 3 из 6» — то, по чему человек
         # решает, скоро ли дело запаркуется.
-        limit = max_resumes(max_resumes_override, spec=_spec(events))
+        limit = max_resumes(max_resumes_override, spec=spec)
         skip = _not_led(deal, events)
         if skip:
             return {
@@ -1697,7 +1732,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if len(words) < 3:
         print("usage: lead.py run <deal_id> <home> [run_budget]", file=sys.stderr)
         return 2
-    budget_sec = _int(words[3]) if len(words) > 3 else DEFAULT_RUN_BUDGET_SEC
+    budget_sec = _int(words[3]) if len(words) > 3 else None
     try:
         report = run(Path(words[2]).expanduser(), words[1], run_budget=budget_sec)
     except Exception:  # noqa: BLE001 - процесс отдельный: причина уходит в лог

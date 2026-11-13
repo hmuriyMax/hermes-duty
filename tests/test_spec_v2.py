@@ -114,6 +114,20 @@ def test_charter_only_spec_parses_the_2_0_ceiling_keys() -> None:
     assert spec_module.validate_spec(loaded, profiles=PROFILES) == []
 
 
+def test_run_budget_is_read_from_the_charter_and_zero_means_no_ceiling(tmp_path: Path) -> None:
+    """`charter.run_budget_sec` — бюджет захода лида; `0` — потолка нет.
+
+    Полчаса не хватало живым делам (`d_92177017`: `overrun` на 2100-й секунде при
+    работающей попытке), поэтому бюджет называет дело, а `0` снимает его совсем:
+    тогда сторожат только тишина (`idle`) и допуск штатных подъёмов.
+    """
+    loaded = spec_module.load_spec(write(tmp_path, "duty: probe\ncharter: {run_budget_sec: 5400}\n"))
+    assert loaded.charter.run_budget_sec == 5400
+    assert spec_module.load_spec(write(tmp_path, "duty: probe\ncharter: {run_budget_sec: 0}\n")).charter.run_budget_sec == 0
+    # Не назван — не «ноль»: действует умолчание движка, а не отсутствие бюджета.
+    assert spec_module.load_spec(write(tmp_path, "duty: probe\n")).charter.run_budget_sec is None
+
+
 def test_absent_charter_keys_get_the_1x_defaults(tmp_path: Path) -> None:
     """Спека без `charter` — прежние дефолты: `max_attempts: 3`, `max_lead_resumes: 6`."""
     loaded = spec_module.load_spec(write(tmp_path, "duty: probe\n"))
@@ -133,6 +147,8 @@ def test_absent_charter_keys_get_the_1x_defaults(tmp_path: Path) -> None:
         ("{max_attempts: много}", "charter.max_attempts"),
         ("{max_lead_resumes: -1}", "charter.max_lead_resumes"),
         ("{max_lead_resumes: много}", "charter.max_lead_resumes"),
+        ("{run_budget_sec: -5}", "charter.run_budget_sec"),
+        ("{run_budget_sec: час}", "charter.run_budget_sec"),
         ("{publish: много}", "charter.publish"),
         ('{publish: {human_gate: "нет"}}', "charter.publish.human_gate"),
         ('{publish: {reviewer_role: ""}}', "charter.publish.reviewer_role"),

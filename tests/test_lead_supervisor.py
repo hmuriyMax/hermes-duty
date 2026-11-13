@@ -294,7 +294,7 @@ def test_first_start_builds_brief_command_and_records_facts(tmp_path: Path) -> N
     brief_path = Path(cmd[cmd.index("--query-file") + 1])
     brief = brief_path.read_text(encoding="utf-8")
     assert "--run-budget" not in cmd
-    assert "бюджет этого захода: 1800 с" in brief
+    assert f"бюджет этого захода: {lead.DEFAULT_RUN_BUDGET_SEC} с" in brief
     # Бриф — про это дело, с путём к контракту движка и к спеке дела.
     assert "Супервизор лида" in brief
     assert str(lead.ENGINE_DOC) in brief
@@ -1475,3 +1475,67 @@ def test_free_resumes_have_their_own_allowance_and_then_park(tmp_path: Path) -> 
     assert "Лид не двигает дело" in blocked[0]["reason"]
     assert "Лид падает" not in blocked[0]["reason"]
 
+
+
+# ---------------------- 12. бюджет захода: хартия, аргумент, «без потолка»
+
+
+def test_run_budget_comes_from_the_charter_then_from_the_argument(tmp_path: Path) -> None:
+    """Бюджет захода: аргумент → `charter.run_budget_sec` → умолчание; `0` — нет потолка.
+
+    Полчаса не хватало живым делам: `d_92177017` упёрся в `overrun` на 2100-й
+    секунде при работающей попытке. Дело вправе назвать свой бюджет, а `0` —
+    снять его совсем; тогда потолками остаются тишина (`idle`) и допуск штатных
+    подъёмов.
+    """
+    class Charter:
+        run_budget_sec = 5400
+
+    class Spec:
+        charter = Charter()
+
+    assert lead.budget_of(None) == lead.DEFAULT_RUN_BUDGET_SEC
+    assert lead.budget_of(Spec()) == 5400
+    assert lead.budget_of(Spec(), 900) == 900
+    assert lead.budget_of(Spec(), 0) == 0
+
+    class NoCeiling:
+        run_budget_sec = 0
+
+    class Free:
+        charter = NoCeiling()
+
+    assert lead.budget_of(Free()) == 0
+
+
+def test_run_without_a_budget_keeps_the_turn_until_the_model_ends_it(tmp_path: Path) -> None:
+    """`run_budget=0` — в факте ноль, в брифе «не ограничен», процесса не гасим.
+
+    Сторож без бюджета не считает часы: заход живёт до конца турна, и `overrun`
+    не пишется вовсе.
+    """
+    home = make_home(tmp_path)
+    spec = write_spec(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    conn.close()
+
+    seen: dict[str, Any] = {}
+    report = lead.run(
+        home,
+        str(deal["id"]),
+        now=NOW,
+        clock=lambda: NOW,
+        monotonic=lambda: 0.0,
+        run_budget=0,
+        spawn=fake_spawn([stream_result("sess-free")], seen=seen),
+    )
+    assert report["reason"] == "exit"
+    brief = Path(seen["cmd"][seen["cmd"].index("--query-file") + 1]).read_text(encoding="utf-8")
+    assert "не ограничен" in brief
+    assert "после чего сторож остановит заход" not in brief
+
+    conn = open_store(home)
+    started = facts_of(conn, deal, lead.LEAD_KIND_STARTED)
+    conn.close()
+    assert started[0]["run_budget"] == 0

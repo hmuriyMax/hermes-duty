@@ -1872,6 +1872,12 @@ class Process:
         self._logs = Path(logs) if logs is not None else None
         self._stdout_log = self._open_log(SHELL_STDOUT_LOG)
         self._stderr_log = self._open_log(SHELL_STDERR_LOG)
+        # Своя группа процессов (`start_new_session`): иначе потомки попытки
+        # остаются в группе движка, и погасить их вместе с вожаком нельзя —
+        # сигнал группе задел бы сам движок (`_signal` его и не посылает). Цена
+        # ошибки видна на живом деле: `d_92177017` пересидел бюджет лида, сторож
+        # убил вожака, а `hermes chat` пережил обёртку и доработал дело ещё час —
+        # переписал план и закрыл его (`docs/ENGINE-2.0.md`, раздел 11).
         self._proc = subprocess.Popen(
             self.cmd,
             cwd=str(cwd),
@@ -1881,6 +1887,7 @@ class Process:
             text=True,
             bufsize=1,
             env=env,
+            start_new_session=True,
         )
         self._out = threading.Thread(target=self._read_stdout, daemon=True)
         self._err = threading.Thread(target=self._read_stderr, daemon=True)
@@ -1983,19 +1990,20 @@ class Process:
             return None
 
     def stop(self, grace: float = KILL_GRACE_SEC) -> Optional[int]:
-        """Остановить попытку: SIGTERM, затем SIGKILL через `grace` секунд."""
+        """Остановить попытку: SIGTERM, затем SIGKILL через `grace` секунд.
+
+        Сигнал идёт **группе** (`_signal`), а не вожаку: `hermes chat` поднимает
+        работу из обёртки, и `terminate()` оставлял её жить своей жизнью —
+        погашенная попытка дописывала журнал и делала работу дальше. Группа у
+        попытки своя (`start_new_session`), поэтому чужой процесс сигнал не
+        получит; если группа всё же не наша, `_signal` бьёт по одному pid.
+        """
         if self._proc.poll() is not None:
             return self._proc.returncode
-        try:
-            self._proc.terminate()
-        except ProcessLookupError:  # pragma: no cover - вышел между poll и terminate
-            pass
+        _signal(self._proc.pid, signal.SIGTERM)
         code = self.wait(grace)
         if code is None:
-            try:
-                self._proc.kill()
-            except ProcessLookupError:  # pragma: no cover - вышел между wait и kill
-                pass
+            _signal(self._proc.pid, signal.SIGKILL)
             code = self.wait(grace)
         return code
 

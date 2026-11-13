@@ -4012,3 +4012,38 @@ def test_nothing_with_a_dirty_tree_fails_the_contract(tmp_path: Path) -> None:
     ended = only(conn, deal, "attempt_ended")
     assert (ended["payload"]["outcome"], ended["payload"]["kind"]) == ("failed", "contract")
     assert "nothing" not in ended["payload"], "отказанный пакет пустоту не заявляет"
+
+
+def test_stop_takes_the_whole_tree_not_only_the_leader(tmp_path: Path) -> None:
+    """`stop()` гасит попытку целиком: вожак и его потомки, а не только вожак.
+
+    `hermes chat` — обёртка: настоящая работа идёт внуком, и `terminate()` по
+    вожаку оставлял внука жить. На живом деле (`d_92177017`, 15:58) сторож
+    записал `lead_exited(overrun)`, а сама сессия лида продолжала работать ещё час:
+    переписала план в 16:29 и закрыла дело в 16:53. Попытка поднимается своей
+    группой (`start_new_session`), поэтому сигнал группе не задевает движок.
+    """
+    workdir = tmp_path / "attempt"
+    workdir.mkdir()
+    process = runner.spawn_process(["/bin/sh", "-c", "/bin/sleep 30 & echo $! ; wait"], workdir, None)
+    grandchild = int(process.next_line(5.0).strip())
+    assert os.getpgid(process.pid) == process.pid, "попытка обязана быть вожакиней своей группы"
+    assert os.getpgid(grandchild) == process.pid, "потомок остаётся в группе попытки"
+
+    code = process.stop(grace=2.0)
+    process.close_logs()
+
+    assert code is not None, "stop() обязан дождаться смерти вожака"
+    assert _dead(process.pid) and _dead(grandchild), "внук не должен пережить остановку"
+    assert _dead(-process.pid), "группы попытки больше нет"
+
+
+def _dead(pid: int) -> bool:
+    """Процесса с таким pid (или группой, если он отрицательный) больше нет."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:  # pragma: no cover - чужой процесс: сигнал не прошёл
+        return False
+    return False

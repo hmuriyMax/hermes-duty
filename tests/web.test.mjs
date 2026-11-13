@@ -35,8 +35,12 @@ test('левый столбец: шапка дорожки липнет вмес
   // а названия этапов и профиль - нет. плюс ширина столбца уже, чем ширина
   // самого широкого контента».
   const css = read('dashboard/web/styles.css')
-  // шапка дорожки — той же решёткой, что строка попытки
-  assert.match(css, /\.tl-lane-h \{ display: grid; grid-template-columns: var\(--tl-gutter, 186px\) 1fr/, 'веб: шапка дорожки не решёткой')
+  // Дорожка — две колонки: имя этапа слева, попытки справа (Макс, 14.11).
+  assert.match(css, /\.tl-lane \{ display: grid; grid-template-columns: var\(--tl-name, 150px\) minmax\(0, 1fr\)/, 'веб: дорожка не двумя колонками')
+  // Ячейка имени занимает всю ширину дорожки (иначе sticky некуда ехать), а
+  // коробка внутри — только колонку имени.
+  assert.match(css, /\.tl-lane > \.tl-lane-h \{ grid-column: 1 \/ -1;[^}]*width: var\(--tl-name, 150px\); justify-self: start; position: sticky; left: 0/, 'веб: имя этапа не липнет к левой кромке')
+  assert.match(css, /\.tl-lane \.tl-rows, \.tl-lane \.tl-row-empty \{ grid-column: 2 \/ -1; grid-row: 1;/, 'веб: попытки не во второй колонке')
   // имя и профиль — одна липнущая ячейка
   assert.match(app, /class: 'tl-lane-id'/, 'веб: имя и профиль не в одной ячейке')
   assert.match(css, /\.scale-main\.is-wide \.tl-lane-id \{ position: sticky/, 'веб: шапка дорожки не липнет')
@@ -46,11 +50,16 @@ test('левый столбец: шапка дорожки липнет вмес
   // равен её ширине, и колонка не росла под длинное имя (Макс, 14.11).
   // Замер — по коду этапа и подписям попыток. Описание не меряется: оно
   // переносится по строкам, и его ширина — не заявка на колонку.
-  assert.match(app, /\.tl-lbl > \*, \.tl-lane-code'/, 'веб: замер не по коду этапа')
+  assert.match(app, /querySelectorAll\('\.tl-lbl > \*'\)/, 'веб: подписи попыток не меряются')
+  assert.match(app, /querySelectorAll\('\.tl-lane-head'\)/, 'веб: имя этапа не меряется отдельной колонкой')
+  assert.match(app, /setProperty\('--tl-name'/, 'веб: ширина колонки имени не ставится')
   assert.match(app, /Math\.min\(320, Math\.max\(186,/, 'веб: нет потолка 320px')
-  assert.match(css, /\.tl-lane-id \{ display: flex; flex-direction: column/, 'веб: имя и счёт снова в одной строке')
+  // Описания и счётчиков в гуттере нет вовсе: колонка не меняется при развороте.
+  assert.doesNotMatch(css, /\.tl-lane-desc/, 'веб: описание вернулось в дорожку')
+  assert.doesNotMatch(css, /\.tl-lane-meta/, 'веб: счётчик вернулся в дорожку')
   assert.match(pluginSource, /duty-tl-lane-id/, 'десктоп: нет ячейки имени')
-  assert.match(pluginSource, /duty-tl-lane-h\{display:grid;grid-template-columns:var\(--duty-tl-gutter,186px\) 1fr/, 'десктоп: шапка не решёткой')
+  assert.match(pluginSource, /duty-tl-lane\{display:grid;grid-template-columns:var\(--duty-tl-name,150px\) minmax\(0,1fr\)/, 'десктоп: дорожка не двумя колонками')
+  assert.match(pluginSource, /setProperty\('--duty-tl-name'/, 'десктоп: ширина колонки имени не ставится')
   assert.match(pluginSource, /--duty-tl-gutter/, 'десктоп: нет подгона ширины')
 })
 
@@ -66,7 +75,8 @@ test('шкала длиннее часа листается, мы висим н�
   assert.match(app, /el\.__tlPinned = el\.scrollLeft \+ el\.clientWidth >= el\.scrollWidth - 8/, 'веб: нет снятия пина при ручном уезде')
   assert.match(css, /\.scale-main\.is-wide \{[\s\S]*?overflow-x: auto/, 'веб: нет горизонтальной прокрутки')
   assert.match(css, /min-width: calc\(var\(--tl-zoom, 1\) \* 100%\)/, 'веб: дорожки не растягиваются до zoom')
-  assert.match(css, /\.scale-main\.is-wide \.scale-head-gap, \.scale-main\.is-wide \.tl-lbl, \.scale-main\.is-wide \.tl-lane-id \{ position: sticky/, 'веб: подписи не прилипают')
+  assert.match(css, /\.scale-main\.is-wide \.scale-head-gap, \.scale-main\.is-wide \.tl-lane-id \{ position: sticky/, 'веб: имя этапа не прилипает')
+  assert.match(css, /\.scale-main\.is-wide \.tl-lbl \{ position: sticky; left: calc\(var\(--tl-name, 150px\) \+ var\(--tl-gap, 8px\)\)/, 'веб: подписи попыток не прилипают за колонкой имени')
   assert.match(pluginSource, /duty-scale-main\$\{wide \? ' is-wide' : ''\}/, 'десктоп: широкая шкала не помечена')
   assert.match(pluginSource, /el\.scrollLeft = el\.scrollWidth/, 'десктоп: нет пина')
   assert.match(pluginSource, /\.duty-scale-main\.is-wide\{overflow-x:auto/, 'десктоп: нет стиля прокрутки')
@@ -116,10 +126,10 @@ test('свёрнутая строка: чипы линейной ширины, �
   // развороте, иначе короткие вызовы становились бы точками.
   assert.match(app, /--w-log:\$\{chip\.widthPct\}%/, 'веб: у чипа нет лог-ширины')
   assert.match(app, /--w-lin:\$\{chip\.widthLinPct/, 'веб: у чипа нет линейной ширины')
-  assert.match(css, /\.tl-row:has\(\.tl-band:hover, \.tl-call:hover\) \.tl-call, \.tl-row:focus-visible \.tl-call \{ width: var\(--w-log\)/, 'веб: развёрнутая не возвращает лог')
+  assert.match(css, /\.tl-row:hover \.tl-call, \.tl-row:focus-visible \.tl-call \{ width: var\(--w-log\)/, 'веб: развёрнутая не возвращает лог')
   assert.match(app, /width:var\(--w-lin\)/, 'веб: свёрнутая не линейна')
   assert.match(read('desktop/plugin.js'), /width: 'var\(--w-lin\)'/, 'десктоп: свёрнутая не линейна')
-  assert.match(read('desktop/plugin.js'), /\.duty-tl-row:has\(\.duty-tl-band:hover,\.duty-tl-call:hover\) \.duty-tl-call,\.duty-tl-row:focus-visible \.duty-tl-call\{width:var\(--w-log\)\}/, 'десктоп: развёрнутая не возвращает лог')
+  assert.match(read('desktop/plugin.js'), /\.duty-tl-row:hover \.duty-tl-call,\.duty-tl-row:focus-visible \.duty-tl-call\{width:var\(--w-log\)\}/, 'десктоп: развёрнутая не возвращает лог')
 })
 
 test('палитра инструментов: интеграции и служебные не серые', () => {
@@ -322,23 +332,22 @@ test('разворот строки и правки экрана дела: пр�
     assert.match(text, new RegExp(`height:\\s*var\\(${collapsed}`), `${name}: нет свёрнутой высоты строки`)
     // Разворот включает наведение на полосу попытки (или на чип, который на ней
     // лежит), а не на всю строку с подписью (Макс, 14.11).
-    const band = name === 'веб' ? 'tl-band' : 'duty-tl-band'
     const rowCls = name === 'веб' ? 'tl-row' : 'duty-tl-row'
     assert.match(
       text,
-      new RegExp(`\\.${rowCls}:has\\(\\.${band}:hover,[^{]*\\)[^{]*\\{[^}]*height:\\s*var\\(${full}`),
-      `${name}: наведение на полосу попытки не раскрывает строку`,
+      new RegExp(`\\.${rowCls}:hover[^{]*\\{[^}]*height:\\s*var\\(${full}`),
+      `${name}: наведение на ряд попытки не раскрывает строку`,
     )
     // Свёрнутая строка — нахлёст, а не прятание: все чипы на одной линии и
     // вполсилы, глубокие уровни лежат поверх (Макс, 09.11: «в свернутом виде
     // будем рисовать все квадратики с наложением… прозрачностью»). Рамки у
     // чипов больше нет: перекрытие читается плотностью цвета.
     assert.doesNotMatch(text, /box-shadow:\s*inset\s+0\s+0\s+0\s+1px\s+rgba\(0,\s*0,\s*0,\s*\.22\)/, `${name}: рамка чипа вернулась`)
-    // Свёрнутая лента: чипы одной линией по центру, вполсилы. Условие —
-    // «на полосу не наведено», а не «на строку».
+    // Свёрнутая лента: чипы одной линией по центру, вполсилы. Условие — «на ряд
+    // попытки не наведено».
     assert.match(
       text,
-      /:not\(:has\([^{]*tl-band:hover[^{]*\)\):not\(:focus-visible\)\s+[^{]*tl-call[^{]*\{[^}]*top:\s*calc\(50%[^}]*opacity:\s*\.45/,
+      /:not\(:hover\):not\(:focus-visible\)\s+[^{]*tl-call[^{]*\{[^}]*top:\s*calc\(50%[^}]*opacity:\s*\.45/,
       `${name}: свёрнутая лента не рисуется одной линией`,
     )
   }
@@ -825,8 +834,9 @@ test('веб: строка этапа зовёт этап именем, а `id` 
   const lane = codes.find((item) => item.textContent === 'research')
   assert.ok(lane, `дорожка шкалы не зовёт этап кодом: ${codes.map((item) => item.textContent).join(' | ')}`)
   assert.equal(lane.getAttribute('title'), 'этап: research', 'подсказка дорожки не несёт `id`')
-  const descs = [...doc.querySelectorAll('.tl-lane-desc')].map((item) => item.textContent)
-  assert.ok(descs.includes('Собрать требования'), `описание этапа не в дорожке: ${descs.join(' | ')}`)
+  // Описание из спеки в дорожку не выводится никогда (Макс, 14.11): шкала зовёт
+  // этап кодом, описание читают в блоке этапов.
+  assert.equal(doc.querySelectorAll('.tl-lane-desc').length, 0, 'описание вернулось в дорожку')
 })
 
 /* ------------------ страница дела обновляется сама и тихо (0.0.8) --------- */
@@ -1535,7 +1545,9 @@ test('веб: заходы лида стоят на шкале отдельно�
   assert.equal(lanes[0], lane, 'дорожка лида стоит не первой')
   assert.match(lane.textContent, /лид/, 'дорожка не подписана')
   assert.match(lane.textContent, /lead/, 'у дорожки нет профиля')
-  assert.match(lane.textContent, /2 захода · резюм 1/, `мета дорожки: ${lane.textContent}`)
+  // Заходы лида стоят подписью своей строки в колонке попыток — счётчика в шапке
+  // дорожки больше нет (Макс, 14.11).
+  assert.match(lane.querySelector('.tl-row .tl-lbl').textContent, /заходы/, 'у заходов нет подписи в колонке попыток')
 
   const runs = [...lane.querySelectorAll('.tl-lead-run')]
   assert.equal(runs.length, 2, `полос захода ${runs.length}, а в журнале два`)

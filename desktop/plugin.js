@@ -4398,7 +4398,6 @@ function DutyLeadLane({ leadLane }) {
             'lead',
           ),
         ),
-        h('span', { className: 'duty-tl-lane-meta' }, leadLane ? leadLane.text : ''),
       ),
     ),
     runs.length
@@ -4481,10 +4480,6 @@ function DutyLane({ lane, bars, scale, callSel, onSelectCall, toolFilter }) {
               )
             : null,
         ),
-        view.id && view.name && view.name !== view.id
-          ? h('span', { className: 'duty-tl-lane-desc', title: view.name }, view.name)
-          : null,
-        h('span', { className: 'duty-tl-lane-meta' }, view.meta),
       ),
     ),
     view.empty
@@ -4704,30 +4699,34 @@ const CSS = `
 /* Шкала шире часа: листается по горизонтали, подписи прилипают слева (Макс, 09.11). */
 .duty-scale-main.is-wide{overflow-x:auto;overscroll-behavior-x:contain;scrollbar-width:thin}
 .duty-scale-wrap{position:relative}
-.duty-tl-gutter-bg{position:absolute;left:-1px;top:0;bottom:0;width:calc(var(--duty-tl-gutter,186px) + var(--duty-tl-gap,8px) + 1px);background:var(--ui-bg-primary,#1a1a1a);border-right:1px solid var(--ui-border-primary,rgba(127,127,127,.3));z-index:2;pointer-events:none}
+.duty-tl-gutter-bg{position:absolute;left:-1px;top:0;bottom:0;width:calc(var(--duty-tl-name,150px) + var(--duty-tl-gap,8px) + var(--duty-tl-gutter,186px) + var(--duty-tl-gap,8px) + 1px);background:var(--ui-bg-primary,#1a1a1a);border-right:1px solid var(--ui-border-primary,rgba(127,127,127,.3));z-index:2;pointer-events:none}
 .duty-scale-main.is-wide::-webkit-scrollbar{height:8px}
 .duty-scale-main.is-wide::-webkit-scrollbar-thumb{background:var(--ui-border-primary,rgba(127,127,127,.3));border-radius:4px}
 .duty-scale-main.is-wide::-webkit-scrollbar-track{background:transparent}
 .duty-scale-main.is-wide .duty-scale-head,.duty-scale-main.is-wide .duty-scale-plot{min-width:calc(var(--tl-zoom,1)*100%)}
-.duty-scale-main.is-wide .duty-scale-head-gap,.duty-scale-main.is-wide .duty-tl-lbl,.duty-scale-main.is-wide .duty-tl-lane-id{position:sticky;left:0;z-index:3;background:var(--ui-bg-primary,#1a1a1a)}
+.duty-scale-main.is-wide .duty-scale-head-gap,.duty-scale-main.is-wide .duty-tl-lane-id{position:sticky;left:0;z-index:3;background:var(--ui-bg-primary,#1a1a1a)}
+.duty-scale-main.is-wide .duty-tl-lbl{position:sticky;left:calc(var(--duty-tl-name,150px) + var(--duty-tl-gap,8px));z-index:3;background:var(--ui-bg-primary,#1a1a1a)}
 .duty-scale-scroll-hint{font-size:11px;color:var(--ui-text-tertiary,#888);white-space:nowrap}
 .duty-scale-plot{position:relative}
 /* Ось, сетка и слой сжатий начинаются там же, где дорожка строки, — после
  * колонки подписей. Без этого сдвига пунктир и подпись сжатия встают на 194 px
  * левее промежутка и меряют проценты по ширине плагина, а не дорожки. */
-.duty-scale-grid{position:absolute;top:-2px;bottom:0;left:calc(var(--duty-tl-gutter, 186px) + var(--duty-tl-gap, 8px));right:0;pointer-events:none;z-index:0}
+.duty-scale-grid{position:absolute;top:-2px;bottom:0;left:calc(var(--duty-tl-name,150px) + var(--duty-tl-gap,8px) + var(--duty-tl-gutter, 186px) + var(--duty-tl-gap, 8px));right:0;pointer-events:none;z-index:0}
 .duty-scale-grid-line{position:absolute;top:0;bottom:0;border-left:1px dashed color-mix(in srgb, var(--ui-text-tertiary) 34%, transparent)}
 /* Сжатый промежуток оси: два пунктира по краям и подпись посередине — иначе
  * смена масштаба читается как ошибка данных. */
 /* Сжатый простой: штрихованная полоса — «здесь шкала рвётся, время вырезано».
    Пунктир по краям читался как граница полосы, двойные засечки — как грязь. */
-.duty-tl-idle-layer{position:absolute;top:-2px;left:calc(var(--duty-tl-gutter, 186px) + var(--duty-tl-gap, 8px));width:calc(100% - var(--duty-tl-gutter, 186px) - var(--duty-tl-gap, 8px));height:calc(100% + 2px);z-index:0;pointer-events:none}
+.duty-tl-idle-layer{position:absolute;top:-2px;left:calc(var(--duty-tl-name,150px) + var(--duty-tl-gap,8px) + var(--duty-tl-gutter, 186px) + var(--duty-tl-gap, 8px));width:calc(100% - var(--duty-tl-name,150px) - var(--duty-tl-gap,8px) - var(--duty-tl-gutter, 186px) - var(--duty-tl-gap, 8px));height:calc(100% + 2px);z-index:0;pointer-events:none}
 .duty-tl-idle-gap{position:absolute;top:0;bottom:0}
 .duty-tl-idle-band{position:absolute;inset:0;background:repeating-linear-gradient(135deg,color-mix(in srgb,var(--ui-text-tertiary) 38%,transparent) 0 2px,transparent 2px 7px);-webkit-mask-image:linear-gradient(to right,transparent,#000 6px,#000 calc(100% - 6px),transparent);mask-image:linear-gradient(to right,transparent,#000 6px,#000 calc(100% - 6px),transparent);opacity:.8}
 .duty-tl-idle-pill{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);white-space:nowrap;font-size:9px;line-height:1.3;letter-spacing:.02em;font-variant-numeric:tabular-nums;color:var(--ui-text-secondary);background:var(--ui-surface-background);border:1px solid var(--ui-stroke-secondary);border-radius:5px;padding:1px 4px}
 .duty-tl-lanes{position:relative;display:flex;flex-direction:column;gap:10px}
-.duty-tl-lane{display:flex;flex-direction:column;gap:4px}
-.duty-tl-lane + .duty-tl-lane{border-top:1px solid var(--ui-border-primary, rgba(127,127,127,.2));padding-top:10px}
+.duty-tl-lane{display:grid;grid-template-columns:var(--duty-tl-name,150px) minmax(0,1fr);column-gap:var(--duty-tl-gap,8px);align-items:start}
+.duty-tl-lane>.duty-tl-lane-h{grid-column:1/-1;grid-row:1;width:var(--duty-tl-name,150px);justify-self:start;position:sticky;left:0;z-index:3;background:var(--ui-bg-primary,#1a1a1a)}
+.duty-tl-lane + .duty-tl-lane{border-top:1px solid var(--ui-border-primary, rgba(127,127,127,.2));padding-top:10px;margin-top:4px}
+.duty-tl-lane .duty-tl-lane-h{display:flex;align-items:center;min-height:20px;padding-bottom:2px;min-width:0}
+.duty-tl-lane .duty-tl-rows,.duty-tl-lane .duty-tl-row-empty{grid-column:2/-1;grid-row:1;min-width:0}
 /* Плавность дела: чипы и метки доезжают до новых процентов, дорожки и этапы —
  * вход/уход. Значение одно на все движения, чтобы панель не дышала вразнобой.
  * Обновления прилетают раз в 5 с: без переходов шкала дёргалась бы на каждом тике. */
@@ -4740,11 +4739,10 @@ const CSS = `
 @media (prefers-reduced-motion:reduce){.duty-stage-block,.duty-tl-lane{animation:none}.duty-scale-tick,.duty-scale-grid-line,.duty-tl-idle-gap,.duty-tl-call,.duty-tl-wait,.duty-tl-say,.duty-tl-lane,.duty-tl-row,.duty-stage-block,.duty-att-row{transition:none!important}}
 .duty-tl-lane-h{display:grid;grid-template-columns:var(--duty-tl-gutter,186px) 1fr;gap:var(--duty-tl-gap,8px);align-items:center;min-height:20px}
 .duty-tl-lane-id{display:flex;flex-direction:column;align-items:stretch;gap:0;min-width:0}
-.duty-tl-lane-head{display:flex;align-items:center;gap:6px;min-width:0}
-.duty-tl-lane-desc,.duty-tl-lane-meta{max-height:0;opacity:0;overflow:hidden;white-space:normal;transition:max-height .18s ease,opacity .16s ease,margin-top .18s ease}
+.duty-tl-lane-head{display:flex;flex-direction:column;align-items:flex-start;gap:2px;min-width:0}
+.duty-tl-lane-head>.duty-tl-lane-code{flex:none;max-width:100%}
 .duty-tl-lane-meta{font-size:10.5px;color:var(--ui-text-tertiary);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.duty-tl-lane:has(.duty-tl-band:hover,.duty-tl-call:hover) .duty-tl-lane-desc{max-height:2.9em;opacity:1;margin-top:1px}
-.duty-tl-lane:has(.duty-tl-band:hover,.duty-tl-call:hover) .duty-tl-lane-meta{max-height:1.7em;opacity:1;margin-top:1px}
+
 .duty-tl-lane-name{font-size:12.5px;font-weight:600;color:var(--ui-text-primary);letter-spacing:.01em;min-width:0;flex:0 1 auto;overflow:hidden;text-overflow:ellipsis}
 .duty-tl-lane-code{font-size:12.5px;font-weight:650;color:var(--ui-text-primary);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .duty-tl-lane-desc{font-size:11px;line-height:1.3;color:var(--ui-text-secondary);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
@@ -4756,7 +4754,7 @@ const CSS = `
 .duty-tl-kind-gate{color:var(--ui-yellow);border-color:var(--ui-yellow);background:color-mix(in srgb, var(--ui-yellow) 12%, transparent)}
 .duty-tl-rows{display:flex;flex-direction:column;gap:4px}
 .duty-tl-row{position:relative;display:grid;grid-template-columns:var(--duty-tl-gutter, 186px) 1fr;gap:var(--duty-tl-gap, 8px);align-items:stretch;border-radius:6px;height:var(--duty-tl-collapsed, 20px);transition:height .12s ease}
-.duty-tl-row:has(.duty-tl-band:hover,.duty-tl-call:hover),.duty-tl-row:focus-visible{height:var(--duty-tl-full, 20px)}
+.duty-tl-row:hover,.duty-tl-row:focus-visible{height:var(--duty-tl-full, 20px)}
 /* Глубокие уровни вызовов видны только в раскрытой строке: visibility, а не display —
  * чипы позиционированы абсолютно, разметка не прыгает, подсказки не обрезаются. */
 /* Глубокие уровни в свёрнутой строке лежат внахлёст с остальными: прятать их
@@ -4825,11 +4823,11 @@ const CSS = `
 /* Свёрнутая строка: все вызовы на одной линии, внахлёст и вполсилы — плотность
  * работы, а не россыпь квадратиков; наведение раскрывает строку, и чипы
  * доезжают на свои уровни. */
-.duty-tl-row:has(.duty-tl-band:hover,.duty-tl-call:hover) .duty-tl-call,.duty-tl-row:focus-visible .duty-tl-call{width:var(--w-log)}
-.duty-tl-row:not(:has(.duty-tl-band:hover,.duty-tl-call:hover)):not(:focus-visible) .duty-tl-call{top:calc(50% - 5px)!important;opacity:.45}
-.duty-tl-row:not(:has(.duty-tl-band:hover,.duty-tl-call:hover)):not(:focus-visible) .duty-tl-call.duty-tl-unfinished,
-.duty-tl-row:not(:has(.duty-tl-band:hover,.duty-tl-call:hover)):not(:focus-visible) .duty-tl-call.duty-tl-sel{opacity:1}
-.duty-tl-row:not(:has(.duty-tl-band:hover,.duty-tl-call:hover)):not(:focus-visible) .duty-tl-call.duty-tl-dim{opacity:.18}
+.duty-tl-row:hover .duty-tl-call,.duty-tl-row:focus-visible .duty-tl-call{width:var(--w-log)}
+.duty-tl-row:not(:hover):not(:focus-visible) .duty-tl-call{top:calc(50% - 5px)!important;opacity:.45}
+.duty-tl-row:not(:hover):not(:focus-visible) .duty-tl-call.duty-tl-unfinished,
+.duty-tl-row:not(:hover):not(:focus-visible) .duty-tl-call.duty-tl-sel{opacity:1}
+.duty-tl-row:not(:hover):not(:focus-visible) .duty-tl-call.duty-tl-dim{opacity:.18}
 /* Подсказка — общий слой для чипа, полосы попытки, подписи и маркера. */
 .duty-tl-tip{position:fixed;left:0;top:0;z-index:9999;padding:3px 7px;border-radius:5px;white-space:normal;max-width:280px;width:max-content;text-align:left;background:var(--ui-surface-raised, var(--ui-surface-background));color:var(--ui-text-primary);border:1px solid var(--ui-stroke-tertiary);box-shadow:0 8px 20px rgba(0,0,0,.38);font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:10.5px;line-height:1.5;opacity:0;pointer-events:none;transition:opacity .09s ease}
 .duty-tl-call,.duty-tl-band,.duty-tl-lbl,.duty-tl-mark,.duty-tl-wait{cursor:pointer}
@@ -4847,7 +4845,7 @@ const CSS = `
 .duty-kpi-l{font-size:10.5px;color:var(--ui-text-tertiary)}
 .duty-kpi-n{font-size:10px;color:var(--ui-text-tertiary);opacity:.8}
 /* Ось и сетка начинаются там же, где дорожки: колонка подписей — одна ширина. */
-.duty-scale-head{display:grid;grid-template-columns:var(--duty-tl-gutter, 186px) 1fr;gap:var(--duty-tl-gap, 8px);align-items:end;margin-bottom:6px;--duty-tl-gutter:186px;--duty-tl-gap:8px}
+.duty-scale-head{display:grid;grid-template-columns:var(--duty-tl-name,150px) var(--duty-tl-gutter, 186px) 1fr;gap:var(--duty-tl-gap, 8px);align-items:end;margin-bottom:6px;--duty-tl-name:150px;--duty-tl-gutter:186px;--duty-tl-gap:8px}
 .duty-scale-keys{display:flex;flex-direction:column;gap:1px;font-size:10px;color:var(--ui-text-tertiary);line-height:1.45}
 .duty-scale-keys-h{font-size:9.5px;text-transform:uppercase;letter-spacing:.06em;opacity:.7}
 .duty-scale-key{display:grid;grid-template-columns:7px 1fr auto;align-items:center;gap:5px;white-space:nowrap;cursor:pointer;border-radius:4px;padding:1px 3px;margin:0 -3px}
@@ -4858,7 +4856,7 @@ const CSS = `
 .duty-scale-key.on .duty-scale-key-n{opacity:1;font-weight:600}
 /* Чужие семейства гаснут, а не исчезают: картина дела остаётся целой. */
 .duty-tl-call.duty-tl-dim{opacity:.18;filter:saturate(.35);pointer-events:none}
-.duty-tl-row:has(.duty-tl-band:hover,.duty-tl-call:hover) .duty-tl-call.duty-tl-dim{opacity:.3}
+.duty-tl-row:hover .duty-tl-call.duty-tl-dim{opacity:.3}
 .duty-scale-key-l{overflow:hidden;text-overflow:ellipsis}
 .duty-scale-key-n{font-family:var(--ui-font-mono, ui-monospace, monospace);font-variant-numeric:tabular-nums;opacity:.8}
 .duty-scale-key-dot{width:7px;height:7px;border-radius:2px;background:var(--ui-text-tertiary)}
@@ -5969,17 +5967,27 @@ function ScalePanel({ scale, dealId, callSel, onSelectCall, toolFilter, onToggle
         if (seen.deal !== dealKey) {
           seen.deal = dealKey
           seen.px = 0
+          seen.namePx = 0
         }
         let need = 0
         // Ячейка имени целиком: имя этапа и чип профиля в одной строке —
         // максимального из детей мало, нужна их сумма (fix-planned-branch
         // + «implementer» на d_c8551c18).
-        for (const cell of root.querySelectorAll('.duty-tl-lbl > *, .duty-tl-lane-code')) {
+        for (const cell of root.querySelectorAll('.duty-tl-lbl > *')) {
           need = Math.max(need, cell.scrollWidth || 0)
         }
         seen.px = Math.max(seen.px, need)
         // 18px — отступы ячейки, зазор и запас на красную кромку провала.
         wrap.style.setProperty('--duty-tl-gutter', `${Math.min(320, Math.max(186, Math.ceil(seen.px) + 18))}px`)
+        // Имя этапа — своя колонка слева от подписей попыток (см. веб).
+        let namePx = 0
+        for (const head of root.querySelectorAll('.duty-tl-lane-head')) {
+          for (const child of head.children) namePx = Math.max(namePx, child.scrollWidth || child.getBoundingClientRect().width || 0)
+        }
+        if (namePx) {
+          seen.namePx = Math.max(seen.namePx || 0, namePx)
+          wrap.style.setProperty('--duty-tl-name', `${Math.min(300, Math.max(96, Math.ceil(seen.namePx) + 8))}px`)
+        }
       }
     }
     if (!el || el.__tlPinned === false) return

@@ -643,11 +643,11 @@ test('десктоп: сжатый простой подписан на оси, 
   // колонки подписей (gutter + gap). При left:0 пунктир и подпись встают на
   // ~194 px левее промежутка и мерят проценты по ширине плагина, а не дорожки —
   // то есть подпись опровергает то, что нарисовано.
-  const track = 'left:calc\\(var\\(--duty-tl-gutter, 186px\\) \\+ var\\(--duty-tl-gap, 8px\\)\\)'
+  const track = 'left:calc\\(var\\(--duty-tl-name,150px\\) \\+ var\\(--duty-tl-gap,8px\\) \\+ var\\(--duty-tl-gutter, 186px\\) \\+ var\\(--duty-tl-gap, 8px\\)\\)'
   assert.match(css, new RegExp(`\\.duty-tl-idle-layer\\{[^}]*${track}`), 'слой сжатия не сдвинут на колонку подписей')
   assert.match(
     css,
-    /\.duty-tl-idle-layer\{[^}]*width:calc\(100% - var\(--duty-tl-gutter, 186px\) - var\(--duty-tl-gap, 8px\)\)/,
+    /\.duty-tl-idle-layer\{[^}]*width:calc\(100% - var\(--duty-tl-name,150px\) - var\(--duty-tl-gap,8px\) - var\(--duty-tl-gutter, 186px\) - var\(--duty-tl-gap, 8px\)\)/,
     'ширина слоя сжатия — не ширина дорожки',
   )
   assert.match(css, new RegExp(`\\.duty-scale-grid\\{[^}]*${track}`), 'линии сетки оси сдвинуты относительно подписей')

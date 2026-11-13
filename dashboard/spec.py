@@ -47,6 +47,10 @@ STAGE_KEYS = (
     "id",
     "kind",
     "role",
+    # Имя этапа для человека: план вправе назвать этап («сверка доки с кодом»),
+    # граф и журнал знают его по `id`. Необязательный ключ: спека без него
+    # читается как раньше, а пустое имя — «этап безымянный», а не «сотри имя».
+    "title",
     "workspace",
     "needs",
     "parallel_with",
@@ -97,7 +101,10 @@ REORDER_KEYS = ("id", "needs", "parallel_with")
 # попытки, и переписать её вправе приговор ревью, а не план (`plan.edit`).
 # «Не начинался» — факт журнала, а не слово лида: по этапу нет `attempt_started`
 # (`transit.started_stages`), и отвечает на это вызывающий, у которого есть журнал.
-EDIT_KEYS = ("cmd", "budget", "evidence", "retry", "kind", "role", "workspace")
+# `title` — в этом же наборе: имя этапа лид вправе поправить до начала работы. Но
+# пустое имя — не правка, а «этап безымянный»: названное раньше имя оно не стирает
+# (`parse_plan`).
+EDIT_KEYS = ("cmd", "budget", "evidence", "retry", "kind", "role", "workspace", "title")
 STAGE_EDIT_KEYS = REORDER_KEYS + EDIT_KEYS
 # Цена предложения (`docs/ENGINE-1.0.md`, раздел 5): план называет свою стоимость в
 # токенах сам, а не выводится из этапных бюджетов. Ключ один — «токены»; лимиты по
@@ -505,6 +512,10 @@ class Stage:
 
     id: str
     role: str
+    # Имя этапа для человека («сверка доки с кодом»): граф и журнал знают этап по
+    # `id`, а имя читает лид в брифе и поверхность дела. Пусто — этап безымянный,
+    # и это законно: спека 0.0.8 имён не объявляет и читается без правок файла.
+    title: str = ""
     kind: str = DEFAULT_STAGE_KIND
     # Умолчание зависит от `needs` (см. `_parse_stage`): этап с предшественником
     # получает дерево, вход — нет. `workspace_default` помнит, что значения в
@@ -1098,6 +1109,15 @@ def _parse_stage(
     if not isinstance(cmd, str):
         issues.append(Issue(path, lines.get(prefix + ("cmd",), line), "kind.cmd", "cmd — строка команды"))
         cmd = ""
+    # Имя этапа необязательно: нет ключа — этап безымянный, а не отказ. Строка
+    # другого типа — отказ, как у `cmd`: имя читает человек, и число вместо него
+    # он увидит как имя.
+    title = mapping.get("title", "")
+    if not isinstance(title, str):
+        issues.append(
+            Issue(path, lines.get(prefix + ("title",), line), "title", "title — строка названия этапа")
+        )
+        title = ""
     must = _int_or_none(mapping.get("must", DEFAULT_SHELL_MUST))
     if must is None:
         issues.append(
@@ -1162,6 +1182,7 @@ def _parse_stage(
     return Stage(
         id=stage_id,
         role=role if isinstance(role, str) else "",
+        title=title,
         kind=kind,
         workspace=workspace,
         workspace_default=workspace_default,
@@ -2665,14 +2686,16 @@ def parse_plan(
       не «как было». Неназванное поле перестановка не трогает: запись без
       `parallel_with` оставляет параллель этапа из графа.
     - Правка неначатого этапа называет ещё `cmd`, `budget`, `evidence`, `retry`,
-      `kind`, `role`, `workspace` (`EDIT_KEYS`): лид, который ошибся в своём же
+      `kind`, `role`, `workspace`, `title` (`EDIT_KEYS`): лид, который ошибся в своём же
       этапе, правит его, а не заводит второй рядом (RP-14338: три ревизии
       отклонены, обошёл этапом `check2`, мёртвый `check` остался в графе). Запись
       сводится с полями этапа графа (`base_stages`), а любое другое поле —
       `plan.id` («план не переписывает этап»). Зависимости правка сохраняет:
       `needs`/`parallel_with` берутся из записи только тогда, когда она их
       назвала, — иначе одна правка `cmd` обнулила бы порядок, и этап пошёл бы
-      вне графа.
+      вне графа. Имя (`title`) — та же природа: пустое имя в правке значит
+      «этап безымянный», а не «сотри имя», поэтому названный `title` остаётся у
+      этапа, пока правка не назовёт непустое.
 
     Переставлять и править можно только этап, который **не начинался**:
     `started_ids` — id с фактом попытки, и такая запись получает отказ
@@ -2767,6 +2790,11 @@ def parse_plan(
         # названный `needs` называет порядок целиком (`needs: []` — «вход»), а
         # неназванный оставляет зависимости из графа.
         changes = {name: getattr(stage, name) for name in EDIT_KEYS if name in declared}
+        # Пустое имя в правке — «этап безымянный», а не «сотри имя»: названное
+        # раньше `title` остаётся у этапа. Иначе правка `cmd` у названного этапа
+        # (или запись без `title` вовсе) стёрла бы имя, которого она не касалась.
+        if not changes.get("title"):
+            changes.pop("title", None)
         if "workspace" in changes:
             changes["workspace_default"] = stage.workspace_default
         order = {name: getattr(stage, name) for name in REORDER_KEYS[1:] if name in declared}

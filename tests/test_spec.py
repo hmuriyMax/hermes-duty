@@ -143,6 +143,42 @@ def test_defaults_when_field_absent():
     assert impl.ask is None
 
 
+def test_stage_title_is_optional(tmp_path: Path):
+    """`title` — необязательное имя этапа: без него спека читается как раньше.
+
+    Имя читает человек (бриф лида, поверхность дела), а граф знает этап по `id`,
+    поэтому спека 0.0.8 без имён остаётся годной, а этап без имени получает
+    пустую строку. Названное имя доезжает до этапа тем же разбором — иначе ключ
+    был бы неизвестен спеке и отказывал бы правилом `unknown-key`.
+    """
+    bare = write(
+        tmp_path,
+        """
+        duty: probe
+        stages:
+          - id: impl
+            role: implementer
+        """,
+    )
+    loaded = spec_module.load_spec(bare)
+    assert [stage.title for stage in loaded.stages] == [""]
+    assert spec_module.validate_spec(loaded, profiles=PROFILES) == []
+    named = write(
+        tmp_path,
+        """
+        duty: probe
+        stages:
+          - id: impl
+            role: implementer
+            title: Правка движка
+        """,
+        name="named.yaml",
+    )
+    loaded = spec_module.load_spec(named)
+    assert loaded.stages[0].title == "Правка движка"
+    assert spec_module.validate_spec(loaded, profiles=PROFILES) == []
+
+
 # ------------------------------------------------------- загрузчик: путь и YAML
 
 
@@ -2276,7 +2312,36 @@ def test_parse_plan_restating_the_same_value_is_not_an_edit():
     assert stages[0].role == "coordinator"
 
 
-def test_parse_plan_reorder_of_a_started_stage_is_refused():
+@pytest.mark.parametrize(
+    ("record", "want_title"),
+    [
+        ({"id": "feed", "cmd": "go vet ./..."}, "Правка движка"),
+        ({"id": "feed", "title": "", "cmd": "go vet ./..."}, "Правка движка"),
+        ({"id": "feed", "title": "Правка входа", "cmd": "go vet ./..."}, "Правка входа"),
+    ],
+)
+def test_parse_plan_edit_of_a_titled_stage_keeps_the_title(record: dict[str, Any], want_title: str) -> None:
+    """Правка неначатого этапа имя не стирает: пустое имя — «этап безымянный».
+
+    Имя этапа — поле правки (`EDIT_KEYS`), но не такое, как `cmd`: запись без
+    `title` приходит пустой строкой (`_parse_stage`), и «пусто» здесь значит «не
+    назвал», а не «сотри». Поэтому правка `cmd` названного этапа имя сохраняет,
+    явно пустое имя — тоже, и только непустое переписывает. Отказом это не
+    считается ни в одном из случаев: seed-этап правилам «план добавляет» не
+    подчиняется.
+    """
+    base = {
+        **BASE_STAGES,
+        "feed": spec_module.Stage(
+            id="feed", role="implementer", title="Правка движка", needs=("plan",), workspace="worktree"
+        ),
+    }
+    stages, found = spec_module.parse_plan([record], charter=spec_module.Charter(), base_stages=base)
+    assert found == []
+    assert (stages[0].cmd, stages[0].title) == ("go vet ./...", want_title)
+
+
+def test_parse_plan_reorder_of_a_started_stage_is_refused() -> None:
     """Этап, у которого была попытка, план не переставляет — это дело приговора."""
     stages, found = spec_module.parse_plan(
         [{"id": "close", "needs": []}],

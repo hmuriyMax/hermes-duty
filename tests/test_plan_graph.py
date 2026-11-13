@@ -319,6 +319,30 @@ def test_plan_accepted_grows_the_graph(tmp_path: Path) -> None:
     assert decision.pair == [("research", 1)]
 
 
+def test_plan_title_reaches_the_graph(tmp_path: Path) -> None:
+    """Имя этапа плана доезжает до графа: его читают бриф лида и поверхность дела.
+
+    `graph` разбирает предложение тем же `spec.parse_plan`, поэтому имя — такой же
+    факт графа, как `role` или `needs`: запись с `title` принята без отказов, а
+    этап в графе назван. Этапы без имени остаются безымянными (пустая строка), а
+    не наследуют имя соседа.
+    """
+    spec = seed_spec(tmp_path)
+    stages = proposal({**plan_stage("research"), "title": "Сверка доки с кодом"})
+    journal_events = events(
+        ("attempt_started", {"stage": "plan", "attempt": 1, "run_id": "plan#1"}),
+        ("attempt_ended", ended("plan")),
+        ("plan_proposed", {"rev": 1, "stages": stages, "reason": "скоуп", "source_stage": "plan", "attempt": 1}),
+        accepted(1),
+    )
+
+    assert {stage.id: stage.title for stage in transit.graph(spec, journal_events)} == {
+        "plan": "",
+        "close": "",
+        "research": "Сверка доки с кодом",
+    }
+
+
 def test_replay_gives_the_same_slice(tmp_path: Path) -> None:
     """Реплей: тот же журнал в обратном порядке — тот же срез целиком.
 

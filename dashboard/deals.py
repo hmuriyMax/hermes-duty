@@ -1604,6 +1604,11 @@ STATUS_CANCELLED = "cancelled"
 DECISION_CONTINUE = "continue"
 DECISION_STOP = "stop"
 DECISION_WORDS = (DECISION_CONTINUE, DECISION_STOP)
+# Класс парковки, которым заводится предложение stack-improver (`bin/duty create
+# --park-kind proposal`): дело лежит и ждёт человека, ни разу не начинаясь. Отказ
+# человека по такому делу — «предложения не будет», то есть архив, а не
+# остановленная работа (`stop` обычного дела пишет `completed`).
+PROPOSAL_BLOCK_KIND = "proposal"
 
 
 def _stop_live_attempts(
@@ -2020,6 +2025,13 @@ def decide_deal(
     `cause='stopped_by_human'`. Своего набора правил здесь нет — команда только
     выбирает, какой из двух путей позвать, чтобы человеку не помнить два.
 
+    Исключение одно и названо: дело, запаркованное как **предложение**
+    (`block_kind='proposal'`, `bin/duty create --park-kind proposal`), на `stop`
+    уходит в архив, а не в `completed`: «Отклонить» в пуле решений — это «идеи не
+    будет», а `stopped_by_human` читалось бы как оборванная работа, которой у
+    предложения не было. Факт тот же, что у `bin/duty archive` — один отказ, одна
+    история.
+
     `stop` разрешён и на **бегущем** деле, если у него нет живого драйвера: нет
     лизинга либо его срок прошёл (`live_lease_of`). Живой случай: попытка погибла
     при рестарте гейтвея, драйвера нет, а лизинг живёт ещё полчаса — остановить
@@ -2076,6 +2088,14 @@ def decide_deal(
             answer_of=answer_of,
             now=now,
         )
+    if _open_block_kind(conn, str(deal["id"])) == PROPOSAL_BLOCK_KIND:
+        # Отказ человека по делу-предложению — это архив, а не остановка работы:
+        # `stop` закрывает дело `completed` с `cause='stopped_by_human'`, то есть
+        # «работу оборвали», а работы у предложения не было вовсе — человек
+        # сказал «не надо». Пишется тем же фактом, что `bin/duty archive`
+        # (`completed` со `status="archived"`), иначе у двух путей отказа
+        # («Отклонить» из пула и `duty archive`) была бы разная история.
+        return patch_deal(conn, deal_id, status="archived", source=source, now=now)
     return close_deal(
         conn, str(deal["id"]), reason=reason, cause=CLOSE_CAUSE_STOP, source=source, now=now
     )

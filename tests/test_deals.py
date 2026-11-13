@@ -345,6 +345,47 @@ def test_parked_deal_is_lifted_by_decide_continue_like_unblock(
     assert now_deals(client)[deal["id"]]["waiting"]["state"] != "wait_human"
 
 
+def test_decide_stop_archives_a_proposal_and_completes_an_ordinary_deal(
+    home: Path, client: TestClient, subtests: pytest.Subtests
+) -> None:
+    """«Отклонить» по предложению — архив, `stop` обычного дела — `completed`.
+
+    У предложения работы не было: человек сказал «идеи не будет», и это архив
+    (`completed` со `status="archived"` — тот же факт, что пишет `duty archive`).
+    Обычное запаркованное дело на `stop` по-прежнему закрывается `completed` с
+    `cause='stopped_by_human'`: там останавливают начатую работу.
+    """
+    cases = [
+        {
+            "name": "proposal",
+            "park": {"park_kind": "proposal", "park_reason": "предложение"},
+            "want_status": "archived",
+            "want_completed": {"status": "archived"},
+        },
+        {
+            "name": "ordinary",
+            "park": {"kind": "needs_input", "reason": "нужен человек"},
+            "want_status": "done",
+            "want_completed": {"cause": "stopped_by_human", "reason": ""},
+        },
+    ]
+    for case in cases:
+        with subtests.test(case["name"]):
+            deal = create(client, **case["park"])
+            if case["park"].get("kind"):
+                deal = mutate(client, "POST", f"/deals/{deal['id']}/block", json=case["park"])
+            assert deal["status"] == "blocked"
+
+            stopped = mutate(client, "POST", f"/deals/{deal['id']}/decide",
+                             json={"decision": "stop"})
+
+            assert stopped["status"] == case["want_status"]
+            assert kinds(home, deal["id"]) == ["created", "blocked", "completed"]
+            payload = events(home, deal["id"])[-1]["payload"]
+            assert {key: payload.get(key) for key in case["want_completed"]} == case["want_completed"]
+            assert deal["id"] not in now_deals(client)
+
+
 def test_create_with_unknown_parent_is_error_not_500(home: Path, client: TestClient) -> None:
     """Несуществующий родитель — `errors[]` и 400, а не падение роута."""
     response = client.post("/deals", json={"repo": BOARD, "title": "ребёнок", "parents": ["d_deadbeef"]})

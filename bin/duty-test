@@ -30,10 +30,19 @@ if [ -z "$PY" ]; then
             break
         fi
     done
-fi
-if [ -z "$PY" ]; then
-    echo "bin/duty-test: нет python с pytest (задай HERMES_PYTHON)" >&2
-    exit 2
+    if [ -z "$PY" ]; then
+        echo "bin/duty-test: нет python с pytest (задай HERMES_PYTHON)" >&2
+        exit 2
+    fi
+else
+    # Явный HERMES_PYTHON — не индульгенция: гейт обещает «2 — нет интерпретатора»,
+    # а не «красный прогон из-за чужого совета». Проверка та же, что у автопоиска,
+    # иначе `HERMES_PYTHON=/usr/bin/python3` (без pytest) даёт ложный красный гейт,
+    # а `HERMES_PYTHON=/nope` — «line 41: No such file».
+    if ! "$PY" -c 'import pytest' >/dev/null 2>&1; then
+        echo "bin/duty-test: HERMES_PYTHON=$PY не умеет pytest — задай интерпретатор с pytest" >&2
+        exit 2
+    fi
 fi
 
 status=0
@@ -41,11 +50,17 @@ echo "== pytest ($PY)"
 "$PY" -m pytest tests/ -q -p no:randomly "$@" || status=1
 
 if command -v node >/dev/null 2>&1; then
-    for suite in tests/model.test.mjs tests/markup.test.mjs tests/web.test.mjs tests/desktop-render.test.mjs; do
-        [ -f "$suite" ] || continue
-        echo "== node $suite"
-        node "$suite" || status=1
-    done
+    # Глоб, а не список по именам: новый сьют должен попасть в гейт сам, а пропуск
+    # отсутствующего файла — прозвучать, а не случиться молча.
+    suites=$(ls tests/*.test.mjs 2>/dev/null || true)
+    if [ -z "$suites" ]; then
+        echo "== node: нет tests/*.test.mjs — node-гейты нечего гонять" >&2
+    else
+        for suite in $suites; do
+            echo "== node $suite"
+            node "$suite" || status=1
+        done
+    fi
 else
     echo "== node: нет в PATH, node-тесты пропущены" >&2
 fi

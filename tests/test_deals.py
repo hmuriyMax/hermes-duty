@@ -270,6 +270,81 @@ def test_create_writes_deal_row_and_created_event(home: Path, client: TestClient
     assert created["payload"]["title"] == "своё дело"
 
 
+def test_create_parks_the_deal_without_letting_it_start(
+    home: Path, client: TestClient, subtests: pytest.Subtests
+) -> None:
+    """`park_kind` заводит дело сразу `blocked`: лид по нему не поднимается.
+
+    Двух вызовов (`create`, затем `block`) для этого мало — диспетчер ходит раз в
+    минуту и поднимает лида всякому незакрытому делу, а начатое дело
+    предложением stack-improver уже не считается. Поэтому парковка обязана
+    лежать в той же транзакции, что и создание.
+    """
+    cases = [
+        {
+            "name": "park",
+            "payload": {"park_kind": "proposal", "park_reason": "лежит и ждёт человека"},
+            "want_status": "blocked",
+            "want_kinds": ["created", "blocked"],
+            "want_block": {"block_kind": "proposal", "reason": "лежит и ждёт человека", "author": "api"},
+            "want_waiting": "wait_human",
+        },
+        {
+            # Пустой kind — не отказ, а умолчание `needs_input`: парковку завели,
+            # класс не назвали.
+            "name": "empty kind",
+            "payload": {"park_kind": "  ", "park_reason": "без класса"},
+            "want_status": "blocked",
+            "want_kinds": ["created", "blocked"],
+            "want_block": {"block_kind": "needs_input", "reason": "без класса", "author": "api"},
+            "want_waiting": "wait_human",
+        },
+        {
+            "name": "no park",
+            "payload": {},
+            "want_status": "ready",
+            "want_kinds": ["created"],
+            "want_block": None,
+            "want_waiting": None,
+        },
+    ]
+    for case in cases:
+        with subtests.test(case["name"]):
+            deal = create(client, **case["payload"])
+
+            assert deal["status"] == case["want_status"]
+            assert kinds(home, deal["id"]) == case["want_kinds"]
+            stored = {row["id"]: row for row in deal_rows(home)}
+            assert stored[deal["id"]]["status"] == case["want_status"]
+            listed = now_deals(client)[deal["id"]]
+            assert listed["status"] == case["want_status"]
+            if case["want_block"] is None:
+                assert listed["waiting"]["state"] != "wait_human"
+                continue
+            blocked = events(home, deal["id"])[-1]["payload"]
+            assert {key: blocked.get(key) for key in case["want_block"]} == case["want_block"]
+            assert listed["waiting"]["state"] == case["want_waiting"]
+
+
+def test_parked_deal_is_lifted_by_decide_continue_like_unblock(
+    home: Path, client: TestClient
+) -> None:
+    """«Принять» на деле-предложении поднимает его тем же путём, что `unblock`.
+
+    `decide continue` — это тот же факт, что `duty unblock`: дело возвращается в
+    очередь (`ready`, гейт открыт), и только тогда диспетчер поднимет по нему
+    лида. Проверяется весь цикл предложения: запарковано → принято → в очереди.
+    """
+    deal = create(client, park_kind="proposal", park_reason="предложение")
+
+    lifted = mutate(client, "POST", f"/deals/{deal['id']}/decide", json={"decision": "continue"})
+
+    assert lifted["deal"]["status"] == "ready"
+    assert kinds(home, deal["id"]) == ["created", "blocked", "unblocked"]
+    assert events(home, deal["id"])[-1]["payload"]["previous_kind"] == "proposal"
+    assert now_deals(client)[deal["id"]]["waiting"]["state"] != "wait_human"
+
+
 def test_create_with_unknown_parent_is_error_not_500(home: Path, client: TestClient) -> None:
     """Несуществующий родитель — `errors[]` и 400, а не падение роута."""
     response = client.post("/deals", json={"repo": BOARD, "title": "ребёнок", "parents": ["d_deadbeef"]})

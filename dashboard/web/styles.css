@@ -1093,7 +1093,9 @@ pre.body {
 /* Дорожка этапа — две колонки в гуттере: слева имя этапа и профиль, справа
    попытки (каждая своей подписью, сколько их — столько строк рядом). Имя стоит
    один раз и не двигается (Макс, 14.11). */
-.tl-lane { display: grid; grid-template-columns: var(--tl-name, 150px) minmax(0, 1fr); column-gap: var(--tl-gap, 8px); align-items: start; }
+/* Попытки встают по центру блока «этап + профиль»: подпись попытки и статус не
+   выше своего столбца (Макс, 14.11). */
+.tl-lane { display: grid; align-items: center; grid-template-columns: var(--tl-name, 150px) minmax(0, 1fr); column-gap: var(--tl-gap, 8px); }
 /* Имя этапа липнет к левой кромке: ячейка занимает всю ширину дорожки, а коробка
    внутри — только колонку имени. Иначе sticky некуда ехать: он не выходит за
    родителя, и колонка уезжала вместе со шкалой (Макс, 14.11). */
@@ -1456,7 +1458,7 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
 @media (prefers-reduced-motion: reduce) {
   .spec-node.is-live rect { animation: none; }
   /* Живой этап остаётся отличимым без дыхания: постоянный, но слабый ореол. */
-  .tl-band.is-live { animation: none; box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 26%, transparent), 0 0 9px -1px color-mix(in srgb, var(--accent) 55%, transparent); }
+  .tl-band.is-live::after { animation: none; opacity: .8; }
 }
 /* ======================================================= мини-таймлайн (0.0.9)
  *
@@ -1558,8 +1560,25 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
    правому краю полосы. */
 .tl-sausage.is-live { animation: tl-live 2.8s ease-in-out infinite; }
 /* Попытка идёт прямо сейчас: тот же ореол, каким дышит живая сосиска на
-   таймлайне дел, — «этап в работе» узнаётся одним взглядом (Макс, 14.11). */
-.tl-band.is-live { animation: tl-live 2.8s ease-in-out infinite; }
+   таймлайне дел, — «этап в работе» узнаётся одним взглядом (Макс, 14.11).
+   Дышит отдельный слой прозрачностью: анимировать box-shadow на полосе внутри
+   горизонтально прокручиваемой дорожки — это перерисовка на каждом кадре, и при
+   пролистывании ореол отставал и мазал (Макс, 14.11: «спецэффекты»). */
+.tl-band.is-live::after {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 26%, transparent),
+    0 0 12px -1px color-mix(in srgb, var(--accent) 78%, transparent);
+  opacity: 0;
+  animation: tl-live-fade 2.8s ease-in-out infinite;
+  pointer-events: none;
+}
+@keyframes tl-live-fade {
+  0%, 100% { opacity: 0; }
+  50% { opacity: 1; }
+}
 @keyframes tl-live {
   0%, 100% { box-shadow: 0 0 0 0 transparent, 0 0 7px -2px color-mix(in srgb, var(--accent) 45%, transparent); }
   50% { box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 26%, transparent), 0 0 13px -1px color-mix(in srgb, var(--accent) 78%, transparent); }

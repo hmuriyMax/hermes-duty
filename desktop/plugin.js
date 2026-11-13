@@ -4732,7 +4732,7 @@ const CSS = `
 .duty-tl-idle-band{position:absolute;inset:0;background:repeating-linear-gradient(135deg,color-mix(in srgb,var(--ui-text-tertiary) 38%,transparent) 0 2px,transparent 2px 7px);-webkit-mask-image:linear-gradient(to right,transparent,#000 6px,#000 calc(100% - 6px),transparent);mask-image:linear-gradient(to right,transparent,#000 6px,#000 calc(100% - 6px),transparent);opacity:.8}
 .duty-tl-idle-pill{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);white-space:nowrap;font-size:9px;line-height:1.3;letter-spacing:.02em;font-variant-numeric:tabular-nums;color:var(--ui-text-secondary);background:var(--ui-surface-background);border:1px solid var(--ui-stroke-secondary);border-radius:5px;padding:1px 4px}
 .duty-tl-lanes{padding-bottom:12px;position:relative;display:flex;flex-direction:column;gap:10px}
-.duty-tl-lane{display:grid;grid-template-columns:var(--duty-tl-name,150px) minmax(0,1fr);column-gap:var(--duty-tl-gap,8px);align-items:start}
+.duty-tl-lane{display:grid;align-items:center;grid-template-columns:var(--duty-tl-name,150px) minmax(0,1fr);column-gap:var(--duty-tl-gap,8px)}
 .duty-tl-lane>.duty-tl-lane-h{grid-column:1/-1;grid-row:1;width:var(--duty-tl-name,150px);justify-self:start;position:sticky;left:0;z-index:3;background:var(--ui-bg-primary,#1a1a1a)}
 .duty-tl-lane + .duty-tl-lane{border-top:1px solid var(--ui-border-primary, rgba(127,127,127,.2));padding-top:10px;margin-top:4px}
 .duty-tl-lane .duty-tl-lane-h{display:flex;align-items:center;min-height:20px;padding-bottom:2px;min-width:0}
@@ -4970,7 +4970,9 @@ const CSS = `
 .duty-mtl-sausage.inexact{opacity:.45}
 /* Дело в работе — пульсирующий ореол вокруг всей сосиски, а не вокруг этапа. */
 .duty-mtl-sausage.is-live{animation:duty-mtl-live 2.8s ease-in-out infinite}
-.duty-tl-band.duty-tl-band-live{animation:duty-mtl-live 2.8s ease-in-out infinite}
+.duty-tl-band.duty-tl-band-live::after{content:'';position:absolute;inset:-1px;border-radius:inherit;box-shadow:0 0 0 1px color-mix(in srgb,var(--ui-accent) 26%,transparent),0 0 12px -1px color-mix(in srgb,var(--ui-accent) 78%,transparent);opacity:0;animation:duty-tl-live-fade 2.8s ease-in-out infinite;pointer-events:none}
+@keyframes duty-tl-live-fade{0%,100%{opacity:0}50%{opacity:1}}
+@media (prefers-reduced-motion: reduce){.duty-tl-band.duty-tl-band-live::after{animation:none;opacity:.8}}
 @keyframes duty-mtl-live{0%,100%{box-shadow:0 0 0 0 transparent,0 0 7px -2px color-mix(in srgb,var(--ui-accent) 45%,transparent)}50%{box-shadow:0 0 0 1px color-mix(in srgb,var(--ui-accent) 26%,transparent),0 0 13px -1px color-mix(in srgb,var(--ui-accent) 78%,transparent)}}
 /* Роли этапов: цвет — кто работает (имплементер всегда один, ревьюер другой). */
 .duty-mtl-seg{position:absolute;top:0;bottom:0;min-width:2px;background-color:var(--role-fill,var(--role-other))}

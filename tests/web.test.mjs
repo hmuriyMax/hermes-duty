@@ -36,7 +36,8 @@ test('левый столбец: шапка дорожки липнет вмес
   // самого широкого контента».
   const css = read('dashboard/web/styles.css')
   // Дорожка — две колонки: имя этапа слева, попытки справа (Макс, 14.11).
-  assert.match(css, /\.tl-lane \{ display: grid; grid-template-columns: var\(--tl-name, 150px\) minmax\(0, 1fr\)/, 'веб: дорожка не двумя колонками')
+  // Попытки стоят по центру блока «этап + профиль»: подпись попытки не выше столбца.
+  assert.match(css, /\.tl-lane \{ display: grid; align-items: center; grid-template-columns: var\(--tl-name, 150px\) minmax\(0, 1fr\)/, 'веб: дорожка не двумя колонками')
   // Ячейка имени занимает всю ширину дорожки (иначе sticky некуда ехать), а
   // коробка внутри — только колонку имени.
   assert.match(css, /\.tl-lane > \.tl-lane-h \{ grid-column: 1 \/ -1;[^}]*width: var\(--tl-name, 150px\); justify-self: start; position: sticky; left: 0/, 'веб: имя этапа не липнет к левой кромке')
@@ -59,7 +60,7 @@ test('левый столбец: шапка дорожки липнет вмес
   assert.doesNotMatch(css, /\.tl-lane-desc/, 'веб: описание вернулось в дорожку')
   assert.doesNotMatch(css, /\.tl-lane-meta/, 'веб: счётчик вернулся в дорожку')
   assert.match(pluginSource, /duty-tl-lane-id/, 'десктоп: нет ячейки имени')
-  assert.match(pluginSource, /duty-tl-lane\{display:grid;grid-template-columns:var\(--duty-tl-name,150px\) minmax\(0,1fr\)/, 'десктоп: дорожка не двумя колонками')
+  assert.match(pluginSource, /duty-tl-lane\{display:grid;align-items:center;grid-template-columns:var\(--duty-tl-name,150px\) minmax\(0,1fr\)/, 'десктоп: дорожка не двумя колонками')
   assert.match(pluginSource, /setProperty\('--duty-tl-name'/, 'десктоп: ширина колонки имени не ставится')
   assert.match(pluginSource, /--duty-tl-gutter/, 'десктоп: нет подгона ширины')
 })

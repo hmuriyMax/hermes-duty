@@ -828,7 +828,35 @@ pre.body {
   color: inherit;
 }
 
-.scale-legend { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; font-size: 11.5px; }
+/* Легенда: язык строки слева (полоса, чипы, тишина), факты этого дела справа.
+   Каждый пункт — образец плюс слово: без образца легенда ничего не объясняла. */
+.scale-legend {
+  display: flex;
+  gap: 6px 16px;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-top: 9px;
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+.scale-legend-item { display: inline-flex; align-items: center; gap: 6px; }
+.scale-legend-sw { width: 22px; height: 9px; border-radius: 3px; flex: none; }
+.scale-legend-sw.is-band { background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 55%, transparent), color-mix(in srgb, var(--accent) 30%, transparent)); }
+.scale-legend-sw.is-call {
+  height: 11px;
+  background:
+    linear-gradient(90deg, var(--accent) 0 4px, transparent 4px 6px, var(--purple) 6px 12px, transparent 12px 14px, var(--warn) 14px 19px, transparent 19px 21px, var(--ok) 21px 22px);
+}
+.scale-legend-sw.is-silence {
+  background: repeating-linear-gradient(45deg, color-mix(in srgb, var(--text-3) 45%, transparent) 0 1.5px, transparent 1.5px 4px);
+}
+/* Засечка факта: та же палка, что стоит на дорожке, в тоне своего вида. */
+.scale-legend-stick { width: 3px; height: 12px; border-radius: 2px; flex: none; background: var(--text-3); }
+.scale-legend-stick.t-blue { background: var(--accent); }
+.scale-legend-stick.t-green { background: var(--ok); }
+.scale-legend-stick.t-red { background: var(--danger); }
+.scale-legend-stick.t-yellow { background: var(--warn); }
+.scale-legend-stick.t-gray { background: var(--text-3); }
 .scale-legend .muted { color: var(--text-3); }
 
 /* Относительной полосы попытки больше нет: длительность видна на общей оси дела
@@ -1061,7 +1089,7 @@ pre.body {
 /* Без `z-index` у дорожек: с ним дорожки — свой stacking context, и липнущие
  * подписи (z3) не поднимаются над подложкой столбца (z2). Порядок над сеткой
  * (z0) и сжатым просто держится порядком в дереве. */
-.tl-lanes { position: relative; display: flex; flex-direction: column; gap: 10px; }
+.tl-lanes { padding-bottom: 12px; position: relative; display: flex; flex-direction: column; gap: 10px; }
 /* Дорожка этапа — две колонки в гуттере: слева имя этапа и профиль, справа
    попытки (каждая своей подписью, сколько их — столько строк рядом). Имя стоит
    один раз и не двигается (Макс, 14.11). */
@@ -1269,7 +1297,6 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
   opacity: .45;
 }
 .tl-row:not(:has(.tl-band:hover, .tl-call:hover, .tl-att:hover)):not(:focus-visible) .tl-call.tl-unfinished,
-.tl-row:not(:has(.tl-band:hover, .tl-call:hover, .tl-att:hover)):not(:focus-visible) .tl-call.tl-sel { opacity: 1; }
 .tl-row:not(:has(.tl-band:hover, .tl-call:hover, .tl-att:hover)):not(:focus-visible) .tl-call.tl-dim { opacity: .18; }
 
 /* Пустая дорожка: подпись стоит по центру видимой части шкалы и не уезжает при
@@ -1344,22 +1371,7 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
   opacity: 0; pointer-events: none; transition: opacity .09s ease;
 }
 .tl-call, .tl-band, .tl-mark, .tl-wait { cursor: pointer; }
-.tl-call.tl-sel { box-shadow: inset 0 0 0 1.5px var(--accent), 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent); }
 .tl-call { cursor: pointer; }
-
-.tl-insp-host { margin-top: 10px; }
-.tl-insp {
-  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-  min-height: 26px; padding: 4px 9px; border-radius: 6px;
-  border: 1px solid var(--border); background: var(--card);
-  font-size: 11.5px;
-}
-.tl-insp.empty { color: var(--text-3); border-style: dashed; background: transparent; }
-.tl-insp-dot { width: 8px; height: 8px; border-radius: 2px; background: var(--text-3); }
-.tl-insp-dot.t-green { background: var(--ok); }
-.tl-insp-dot.t-red { background: var(--danger); }
-.tl-insp-dot.t-yellow { background: var(--warn); }
-.tl-insp-dot.t-blue { background: var(--accent); }
 
 /* ---------------------------------------------------- KPI-строка в шапке дела */
 .duty-kpi { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; }

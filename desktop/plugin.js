@@ -4270,7 +4270,7 @@ function dutyTipBind() {
   window.addEventListener('resize', follow)
 }
 
-function DutyAttemptRow({ view, callSel, onSelectCall, toolFilter }) {
+function DutyAttemptRow({ view, toolFilter }) {
   // Подсветка семейства: чужие вызовы гаснут, но остаются на месте — картина
   // дела не рассыпается, просто читается другое.
   const active = Array.isArray(toolFilter) ? toolFilter : []
@@ -4323,11 +4323,10 @@ function DutyAttemptRow({ view, callSel, onSelectCall, toolFilter }) {
     list.map((chip) =>
       h('span', {
         key: `call-${chip.id}`,
-        className: `duty-tl-call${chip.unfinished ? ' duty-tl-unfinished' : ''}${callSel === chip.id ? ' duty-tl-sel' : ''}${active.length && !active.includes(chip.tone) ? ' duty-tl-dim' : ''}`,
+        className: `duty-tl-call${chip.unfinished ? ' duty-tl-unfinished' : ''}${active.length && !active.includes(chip.tone) ? ' duty-tl-dim' : ''}`,
         'data-level': String(chip.level || 0),
         'data-tip': chip.tip || chip.title,
         'aria-label': chip.tip || chip.title,
-        onClick: onSelectCall ? (event) => { event.stopPropagation(); onSelectCall(chip.id) } : undefined,
         style: chip.unfinished
           ? { left: `${chip.leftPct}%`, '--w-log': `${chip.widthPct}%`, '--w-lin': `${chip.widthLinPct ?? chip.widthPct}%`, width: 'var(--w-lin)', top: `${chip.top}px`, color: dutyToneVar(chip.tone) }
           : { left: `${chip.leftPct}%`, '--w-log': `${chip.widthPct}%`, '--w-lin': `${chip.widthLinPct ?? chip.widthPct}%`, width: 'var(--w-lin)', top: `${chip.top}px`, background: dutyToneVar(chip.tone) },
@@ -4454,7 +4453,7 @@ function DutyLeadLane({ leadLane }) {
 }
 
 /** Дорожка этапа: имя, значок вида, сводка и строки попыток. */
-function DutyLane({ lane, bars, scale, callSel, onSelectCall, toolFilter }) {
+function DutyLane({ lane, bars, scale, toolFilter }) {
   const view = laneView(lane, bars, scale)
   return h(
     'div',
@@ -4497,7 +4496,7 @@ function DutyLane({ lane, bars, scale, callSel, onSelectCall, toolFilter }) {
           'div',
           { className: 'duty-tl-rows' },
           ...view.rows.map((row) =>
-            h(DutyAttemptRow, { key: row.key, view: row.view, callSel, onSelectCall, toolFilter }),
+            h(DutyAttemptRow, { key: row.key, view: row.view, toolFilter }),
           ),
         ),
   )
@@ -4729,7 +4728,7 @@ const CSS = `
 .duty-tl-idle-gap{position:absolute;top:0;bottom:0}
 .duty-tl-idle-band{position:absolute;inset:0;background:repeating-linear-gradient(135deg,color-mix(in srgb,var(--ui-text-tertiary) 38%,transparent) 0 2px,transparent 2px 7px);-webkit-mask-image:linear-gradient(to right,transparent,#000 6px,#000 calc(100% - 6px),transparent);mask-image:linear-gradient(to right,transparent,#000 6px,#000 calc(100% - 6px),transparent);opacity:.8}
 .duty-tl-idle-pill{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);white-space:nowrap;font-size:9px;line-height:1.3;letter-spacing:.02em;font-variant-numeric:tabular-nums;color:var(--ui-text-secondary);background:var(--ui-surface-background);border:1px solid var(--ui-stroke-secondary);border-radius:5px;padding:1px 4px}
-.duty-tl-lanes{position:relative;display:flex;flex-direction:column;gap:10px}
+.duty-tl-lanes{padding-bottom:12px;position:relative;display:flex;flex-direction:column;gap:10px}
 .duty-tl-lane{display:grid;grid-template-columns:var(--duty-tl-name,150px) minmax(0,1fr);column-gap:var(--duty-tl-gap,8px);align-items:start}
 .duty-tl-lane>.duty-tl-lane-h{grid-column:1/-1;grid-row:1;width:var(--duty-tl-name,150px);justify-self:start;position:sticky;left:0;z-index:3;background:var(--ui-bg-primary,#1a1a1a)}
 .duty-tl-lane + .duty-tl-lane{border-top:1px solid var(--ui-border-primary, rgba(127,127,127,.2));padding-top:10px;margin-top:4px}
@@ -4838,15 +4837,10 @@ const CSS = `
 .duty-tl-row:has(.duty-tl-band:hover,.duty-tl-call:hover,.duty-tl-att:hover) .duty-tl-call,.duty-tl-row:focus-visible .duty-tl-call{width:var(--w-log)}
 .duty-tl-row:not(:has(.duty-tl-band:hover,.duty-tl-call:hover,.duty-tl-att:hover)):not(:focus-visible) .duty-tl-call{top:calc(50% - 5px)!important;opacity:.45}
 .duty-tl-row:not(:has(.duty-tl-band:hover,.duty-tl-call:hover,.duty-tl-att:hover)):not(:focus-visible) .duty-tl-call.duty-tl-unfinished,
-.duty-tl-row:not(:has(.duty-tl-band:hover,.duty-tl-call:hover,.duty-tl-att:hover)):not(:focus-visible) .duty-tl-call.duty-tl-sel{opacity:1}
 .duty-tl-row:not(:has(.duty-tl-band:hover,.duty-tl-call:hover,.duty-tl-att:hover)):not(:focus-visible) .duty-tl-call.duty-tl-dim{opacity:.18}
 /* Подсказка — общий слой для чипа, полосы попытки, подписи и маркера. */
 .duty-tl-tip{position:fixed;left:0;top:0;z-index:9999;padding:3px 7px;border-radius:5px;white-space:normal;max-width:280px;width:max-content;text-align:left;background:var(--ui-surface-raised, var(--ui-surface-background));color:var(--ui-text-primary);border:1px solid var(--ui-stroke-tertiary);box-shadow:0 8px 20px rgba(0,0,0,.38);font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:10.5px;line-height:1.5;opacity:0;pointer-events:none;transition:opacity .09s ease}
 .duty-tl-call,.duty-tl-band,.duty-tl-mark,.duty-tl-wait{cursor:pointer}
-.duty-tl-call.duty-tl-sel{box-shadow:inset 0 0 0 1.5px var(--ui-accent),0 0 0 2px color-mix(in srgb, var(--ui-accent) 35%, transparent)}
-.duty-tl-insp{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-height:26px;margin-top:10px;padding:4px 9px;border-radius:6px;border:1px solid var(--ui-stroke-tertiary);background:var(--ui-surface-raised, var(--ui-surface-background));font-size:11.5px}
-.duty-tl-insp.empty{color:var(--ui-text-tertiary);border-style:dashed;background:transparent}
-.duty-tl-insp-dot{width:8px;height:8px;border-radius:2px;background:var(--ui-text-tertiary)}
 .duty-kpi{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px}
 .duty-deal-head-kpi{margin-top:12px;padding-top:11px;border-top:1px solid var(--ui-stroke-tertiary)}
 .duty-deal-head-kpi .duty-kpi{margin:0;gap:22px}
@@ -4932,7 +4926,17 @@ const CSS = `
 .duty-scale-marker:focus-visible{outline:2px solid var(--ui-accent);outline-offset:2px}
 .duty-scale-wait{position:absolute;bottom:0;height:0;border-top:2px dashed currentColor;transform:translateY(-4px);color:var(--ui-yellow)}
 .duty-scale-wait-k{position:absolute;left:4px;top:-14px;font-size:10.5px;white-space:nowrap}
-.duty-scale-legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px;font-size:11.5px}
+.duty-scale-legend{display:flex;gap:6px 16px;flex-wrap:wrap;align-items:center;margin-top:9px;font-size:11.5px;color:var(--ui-text-secondary,var(--ui-text-tertiary))}
+.duty-scale-legend-item{display:inline-flex;align-items:center;gap:6px}
+.duty-scale-legend-sw{width:22px;height:9px;border-radius:3px;flex:none;display:inline-block}
+.duty-scale-legend-sw.is-band{background:linear-gradient(90deg,color-mix(in srgb,var(--ui-accent) 55%,transparent),color-mix(in srgb,var(--ui-accent) 30%,transparent))}
+.duty-scale-legend-sw.is-call{height:11px;background:linear-gradient(90deg,var(--ui-accent) 0 4px,transparent 4px 6px,var(--purple,var(--ui-accent)) 6px 12px,transparent 12px 14px,var(--ui-warn,var(--ui-accent)) 14px 19px,transparent 19px 21px,var(--ui-ok,var(--ui-accent)) 21px 22px)}
+.duty-scale-legend-sw.is-silence{background:repeating-linear-gradient(45deg,color-mix(in srgb,var(--ui-text-tertiary) 45%,transparent) 0 1.5px,transparent 1.5px 4px)}
+.duty-scale-legend-stick{width:3px;height:12px;border-radius:2px;flex:none;display:inline-block;background:var(--ui-text-tertiary)}
+.duty-scale-legend-stick.duty-t-blue{background:var(--ui-accent)}
+.duty-scale-legend-stick.duty-t-green{background:var(--ui-ok,var(--ui-accent))}
+.duty-scale-legend-stick.duty-t-red{background:var(--ui-red,var(--ui-accent))}
+.duty-scale-legend-stick.duty-t-yellow{background:var(--ui-warn,var(--ui-accent))}
 /* ------------------------- мини-таймлайн и листание завершённых (0.0.9)
  *
  * Геометрия приходит из шейпера: здесь только раскладка. Сетка — один слой под
@@ -5648,16 +5652,6 @@ function CompactStages({ feed, timeline }) {
 
 // Глиф маркера — только значок: слово и время приходят из шейпера (`label`,
 // `title`), чтобы подпись не разъезжалась между десктопом и вебом.
-const MARKER_GLYPH = {
-  question: '?',
-  answer: '+',
-  verdict: 'v',
-  budget: '!',
-  published: '↑',
-  closed: '■',
-  started: '',
-  ended: '',
-}
 
 /** Строка фактов шапки дела: те же числа, что в вебе (`shapeDealTime`). */
 function DealFactSpans({ scale }) {
@@ -5789,22 +5783,6 @@ function DecisionsPanel({ items, plan, dealId }) {
   )
 }
 
-/** Инспектор вызова: инструмент, начало, длительность, место в деле. */
-function CallInspector({ call }) {
-  if (!call) {
-    return h('div', { className: 'duty-tl-insp empty' }, 'выбери вызов на дорожке — покажу инструмент, начало и длительность')
-  }
-  return h(
-    'div',
-    { className: 'duty-tl-insp' },
-    h('span', { className: 'duty-tl-insp-dot', style: { background: TONE_COLOR[call.tone] || TONE_COLOR.gray } }),
-    h('b', null, call.name),
-    h('span', { className: 'duty-mono' }, call.clock),
-    h('span', null, call.msText),
-    h('span', { className: 'duty-muted' }, `${call.stage} · попытка ${call.attempt}${call.seq === null ? '' : ` · вызов ${call.seq}`}`),
-  )
-}
-
 /** KPI-строка дела: пять чисел шапки, все — из шейпера (`scale.kpi`). */
 function KpiStrip({ scale }) {
   if (!scale.kpi || !scale.kpi.length) return null
@@ -5919,24 +5897,8 @@ function DutyPlanRefusal({ plan }) {
   )
 }
 
-/**
- * Выбранный вызов по ключу `stage:attempt:seq`.
- *
- * Ищется тем же видом, которым рисуются чипы (`attemptView`): второго описания
- * вызова у инспектора нет.
- */
-function callOf(scale, callId) {
-  if (!callId) return null
-  for (const bar of scale.bars) {
-    for (const chip of attemptView(bar, scale).chips) {
-      if (chip.id === callId) return chip
-    }
-  }
-  return null
-}
-
 /** Панель шкалы времени: подписанная ось, дорожка на этап, полосы и маркеры. */
-function ScalePanel({ scale, dealId, callSel, onSelectCall, toolFilter, onToggleTool }) {
+function ScalePanel({ scale, dealId, toolFilter, onToggleTool }) {
   const active = Array.isArray(toolFilter) ? toolFilter : []
   // Прокрутка широкой шкалы (Макс, 09.11: «максимальную ширину таймлайна в час,
   // дальше — прокрутку, висим на правой границе»): пока человек не уехал влево
@@ -6104,8 +6066,6 @@ function ScalePanel({ scale, dealId, callSel, onSelectCall, toolFilter, onToggle
                 lane,
                 bars: scale.bars.filter((bar) => bar.lane === index),
                 scale,
-                callSel,
-                onSelectCall,
                 toolFilter: active,
               }),
             ),
@@ -6142,20 +6102,31 @@ function ScalePanel({ scale, dealId, callSel, onSelectCall, toolFilter, onToggle
         ),
       ),
     ),
-    h(CallInspector, { call: callOf(scale, callSel) }),
-    kinds.length
-      ? h(
-          'div',
-          { className: 'duty-scale-legend' },
-          ...kinds.map((marker) =>
-            h(
-              'span',
-              { key: `lg-${marker.type}`, style: { color: TONE_COLOR[marker.tone] || TONE_COLOR.gray } },
-              `${MARKER_GLYPH[marker.type] || '•'} ${marker.label}`,
-            ),
-          ),
-        )
-      : null,
+    // Постоянная часть объясняет язык строки, дальше — только факты этого дела.
+    h(
+      'div',
+      { className: 'duty-scale-legend' },
+      ...[
+        { key: 'band', sw: 'band', label: 'полоса попытки — этап шёл' },
+        { key: 'call', sw: 'call', label: 'вызов инструмента, цвет — вид' },
+        { key: 'silence', sw: 'silence', label: 'штриховка — тишина: ни вызова, ни слова' },
+      ].map((item) =>
+        h(
+          'span',
+          { key: `lg-${item.key}`, className: 'duty-scale-legend-item' },
+          h('i', { className: `duty-scale-legend-sw is-${item.sw}` }),
+          item.label,
+        ),
+      ),
+      ...kinds.map((marker) =>
+        h(
+          'span',
+          { key: `lg-${marker.type}`, className: 'duty-scale-legend-item' },
+          h('i', { className: `duty-scale-legend-stick duty-t-${marker.tone}` }),
+          marker.label,
+        ),
+      ),
+    ),
     scale.facts.attempts.journal ? h('div', { className: 'duty-muted' }, 'полосы собраны из журнала: ответ попыток пуст') : null,
   )
 }
@@ -6828,12 +6799,6 @@ function DealScreen({ sel, onBack }) {
   // Лента этапов приходит тем же ответом `/deal` (`stages`), что и голова дела:
   // одна ручка — один кадр, этапы не могут отставать от фактов дела.
   const feed = useMemo(() => shapeStages(detail.data), [detail.data])
-  // Выбранный вызов живёт на экране дела: клик по чипу открывает инспектор, но
-  // строку попытки не разворачивает — развёртка осталась под указателем.
-  const [callSel, setCallSel] = useState('')
-  const selectCall = useCallback((id) => {
-    setCallSel((prev) => (prev === id ? '' : id))
-  }, [])
   // Подсветка семейства инструментов: набор тонов из легенды. Клик по семейству
   // гасит остальные вызовы, повторный — снимает подсветку.
   const [toolFilter, setToolFilter] = useState([])
@@ -6939,7 +6904,7 @@ function DealScreen({ sel, onBack }) {
       { className: 'duty-deal-body' },
       // Шкала — первой и во всю ширину: это главный факт дела, а спецификация и
       // рельс — пояснение к нему.
-      h(ScalePanel, { scale, dealId: sel.id, callSel, onSelectCall: selectCall, toolFilter, onToggleTool: toggleTool }),
+      h(ScalePanel, { scale, dealId: sel.id, toolFilter, onToggleTool: toggleTool }),
       docs.length
         ? h(
             'div',

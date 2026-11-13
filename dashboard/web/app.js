@@ -2175,7 +2175,7 @@ function stagesColumn(dealId) {
 const MARKER_GLYPH = {
   question: '?',
   answer: '+',
-  verdict: 'v',
+  verdict: '✓',
   budget: '!',
   published: '↑',
   closed: '■',
@@ -2257,14 +2257,22 @@ function markerNode(marker, index) {
 }
 
 /**
- * Легенда маркеров: только те виды, что реально есть в журнале этого дела.
+ * Легенда шкалы: из чего она собрана и что означают метки этого дела.
  *
- * Группа называет все свои виды: легенда, знающая только голову группы, у дела,
- * закрытого приговором, потеряла бы «закрыто» — а именно его человек и ищет.
+ * Постоянная часть (полоса, чипы, тишина) объясняет сам язык строки — без неё
+ * легенда перечисляла только факты и не отвечала, что такое полоса и штриховка
+ * (Макс, 14.11: «легенда неинформативная»). Дальше — только те виды маркеров,
+ * что реально есть в журнале: группа называет все свои виды, иначе у дела,
+ * закрытого приговором, «закрыто» пропало бы.
  */
 function markerLegend(scale) {
+  const fixed = [
+    { key: 'band', swatch: 'band', label: 'полоса попытки — этап шёл' },
+    { key: 'call', swatch: 'call', label: 'вызов инструмента, цвет — вид' },
+    { key: 'silence', swatch: 'silence', label: 'штриховка — тишина: ни вызова, ни слова' },
+  ]
   const seen = []
-  for (const marker of scale.markers) {
+  for (const marker of scale.markers || []) {
     if (marker.tick) continue
     const types = marker.grouped && marker.types.length ? marker.types : [marker.type]
     const labels = marker.grouped && marker.labels.length ? marker.labels : [marker.label]
@@ -2274,16 +2282,27 @@ function markerLegend(scale) {
       seen.push({ type, tone, label: labels[i] || marker.label })
     }
   }
-  if (!seen.length) return null
   return h(
     'div',
     { class: 'scale-legend' },
-    ...seen.map((marker) =>
-      h('span', { class: `t-${marker.tone}`, 'data-key': `legend:${marker.type}` }, `${MARKER_GLYPH[marker.type] || '•'} ${marker.label}`),
+    ...fixed.map((item) =>
+      h(
+        'span',
+        { class: 'scale-legend-item', 'data-key': `legend:${item.key}` },
+        h('i', { class: `scale-legend-sw is-${item.swatch}` }),
+        item.label,
+      ),
     ),
-    // Про засечки старта/конца здесь молчим: их больше нет, длительность
-    // показывает фон попытки, а факты — палки-маркеры.
-
+    // Факты на шкале — вертикальные засечки, а не значки: легенда показывает то
+    // же, что видно на дорожке (Макс, 14.11: «v — вердикт — такого не видел»).
+    ...seen.map((marker) =>
+      h(
+        'span',
+        { class: 'scale-legend-item', 'data-key': `legend:${marker.type}` },
+        h('i', { class: `scale-legend-stick t-${marker.tone}` }),
+        marker.label,
+      ),
+    ),
   )
 }
 
@@ -2587,17 +2606,6 @@ function applyToolFilter(panel) {
   }
 }
 
-// Выбранный вызов и его данные: выбор живёт на экране «Дело» и переживает
-// перерисовку панели. Ключ — `stage:attempt:seq` из шейпера, индекс собирается
-// при отрисовке шкалы: у поверхности нет своего знания о вызовах.
-let dutySelectedCallId = ''
-const dutyCallIndex = new Map()
-
-/** Выбранный вызов или `null`; индекс наполняет `scalePanel`. */
-function selectedCall() {
-  return dutySelectedCallId ? dutyCallIndex.get(dutySelectedCallId) || null : null
-}
-
 /** KPI-строка дела: пять чисел шапки, все — из шейпера (`scale.kpi`). */
 function kpiStrip(scale) {
   return h(
@@ -2612,27 +2620,6 @@ function kpiStrip(scale) {
         item.note ? h('span', { class: 'duty-kpi-n' }, item.note) : null,
       ),
     ),
-  )
-}
-
-/**
- * Инспектор вызова: что за инструмент, когда начался, сколько шёл.
- *
- * Экран показывает факты вызова, а не «открывает» попытку второй раз: строка
- * попытки остаётся свёрнутой, развёртка живёт только под указателем.
- */
-function inspectorNode(call) {
-  if (!call) {
-    return h('div', { class: 'tl-insp empty' }, 'выбери вызов на дорожке — покажу инструмент, начало и длительность')
-  }
-  return h(
-    'div',
-    { class: 'tl-insp' },
-    h('span', { class: `tl-insp-dot t-${call.tone}` }),
-    h('b', null, call.name),
-    h('span', { class: 'mono muted' }, call.clock),
-    h('span', null, call.msText),
-    h('span', { class: 'muted' }, `${call.stage} · попытка ${call.attempt}${call.seq === null ? '' : ` · вызов ${call.seq}`}`),
   )
 }
 
@@ -2683,11 +2670,6 @@ function specStrip(spec) {
  * маркеров. Геометрия приходит посчитанной (`shapeDealTime`); здесь только DOM.
  */
 function scalePanel(scale) {
-  // Индекс вызовов: чип и инспектор читают один и тот же вид (`attemptView`).
-  dutyCallIndex.clear()
-  for (const bar of scale.bars) {
-    for (const chip of attemptView(bar, scale).chips) dutyCallIndex.set(chip.id, chip)
-  }
   if (scale.empty) {
     return h(
       'div',
@@ -2827,7 +2809,6 @@ function scalePanel(scale) {
           ),
         ),
       ),
-      h('div', { class: 'tl-insp-host' }, inspectorNode(selectedCall(scale))),
       // Легенда маркеров: что означают точки внутри строк попыток.
       markerLegend(scale),
       scale.facts.attempts.journal ? h('div', { class: 'muted' }, 'полосы собраны из журнала: ответ попыток пуст') : null,
@@ -2901,19 +2882,6 @@ function wireScalePanel(panel) {
     toggleTool(key)
   })
 
-  // Клик по вызову выбирает его, но не разворачивает строку попытки: развёртка
-  // живёт под указателем, а выбор — в инспекторе под шкалой.
-  panel.addEventListener('click', (event) => {
-    const chip = event.target.closest && event.target.closest('.tl-call')
-    const host = panel.querySelector('.tl-insp-host')
-    if (!chip || !host || chip.classList.contains('tl-dim')) return
-    const id = chip.getAttribute('data-call-id') || ''
-    dutySelectedCallId = dutySelectedCallId === id ? '' : id
-    for (const el of panel.querySelectorAll('.tl-call.tl-sel')) el.classList.remove('tl-sel')
-    if (dutySelectedCallId) chip.classList.add('tl-sel')
-    host.replaceChildren(inspectorNode(selectedCall()))
-    if (document.activeElement && document.activeElement.blur) document.activeElement.blur()
-  })
 }
 
 /**
@@ -3149,15 +3117,10 @@ function markFresh(keys) {
   }
 }
 
-// Фильтр легенды и выбранный вызов — состояние экрана, а не ответа: после патча
-// узлы приходят «чистыми», и отметки надо вернуть, иначе подсветка гаснет на
-// каждом тике.
+// Фильтр легенды — состояние экрана, а не ответа: после патча узлы приходят
+// «чистыми», и подсветку надо вернуть, иначе она гаснет на каждом тике.
 function syncScaleState() {
   applyToolFilter(app)
-  for (const chip of app.querySelectorAll('.tl-call')) {
-    const on = Boolean(dutySelectedCallId) && chip.getAttribute('data-call-id') === dutySelectedCallId
-    chip.classList.toggle('tl-sel', on)
-  }
 }
 
 /**

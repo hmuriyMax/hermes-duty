@@ -87,7 +87,7 @@ function moduleForRender(root) {
   const source = read('desktop/plugin.js')
     .replace(/from '@hermes\/plugin-sdk'/, "from './sdk.mjs'")
     .concat(
-      '\nexport { DutyLane, DutyAttemptRow, ScalePanel, KpiStrip, SpecStrip, CallInspector, DutyMiniTimeline, FinishedBlock, shapeFinishedRow, dealTimeline, stageRole, DutyPage, parseWindow, TL_WINDOWS, windowLabel, DecisionsPanel, DutyLeadLane, DealRow, DealFactSpans, shapeDeal, shapeDealTime, DutyPlanRefusal, shapePlan }\n',
+      '\nexport { DutyLane, DutyAttemptRow, ScalePanel, KpiStrip, SpecStrip, DutyMiniTimeline, FinishedBlock, shapeFinishedRow, dealTimeline, stageRole, DutyPage, parseWindow, TL_WINDOWS, windowLabel, DecisionsPanel, DutyLeadLane, DealRow, DealFactSpans, shapeDeal, shapeDealTime, DutyPlanRefusal, shapePlan }\n',
       // Экран дела монтируется вместе с подменой `rest`: иначе строка этапа
       // проверялась бы регуляркой по исходнику, а не рендером.
       '\nexport function __setRest(fn) { rest = fn }\nexport { DealScreen }\n',
@@ -248,12 +248,8 @@ test('десктоп: DutyLane рисует svg-значок, который л�
     assert.match(specHtml, /duty-spec-id[^<]*<\/text>[\s\S]{0,160}duty-spec-state/, 'в узле нет второй строки с состоянием')
   }
 
-  // Инспектор: пустой зовёт выбрать вызов, с вызовом называет инструмент и время.
-  const emptyInsp = renderToStaticMarkup(React.createElement(mod.CallInspector, { call: null }))
-  assert.match(emptyInsp, /выбери вызов/, 'пустой инспектор не подсказывает, что делать')
-  const chip = scaleModel.bars.flatMap((bar) => modelMod.attemptView(bar, scaleModel).chips)[0]
-  const insp = renderToStaticMarkup(React.createElement(mod.CallInspector, { call: chip }))
-  assert.ok(insp.includes(chip.name) && insp.includes(chip.clock), 'инспектор не называет инструмент и время')
+  // Инспектора вызова больше нет: он дублировал блок этапов (Макс, 14.11).
+  assert.doesNotMatch(pluginSource(), /CallInspector|duty-tl-insp/, 'инспектор вызова вернулся')
 
   // Разворот строки не должен держаться фокусом внутри (клик по чипу): только :hover.
   assert.doesNotMatch(

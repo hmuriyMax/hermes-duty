@@ -775,6 +775,11 @@ def stages(spec: Any, events: Iterable[Any], now: Any) -> list[dict[str, Any]]:
                 "parallel_with": [str(other) for other in getattr(stage, "parallel_with", ()) or ()],
                 "added_by": "" if stage.id in seeded else PLAN_ADDED_BY,
                 "reason": state.reason,
+                # «Работы не было» (0.2.1): этап пройден исходом `nothing`, и это
+                # не провал. Пустая строка — этап закрыт работой или не закрыт:
+                # экран печатает причину словами (`«работы не было: <причина>»`),
+                # а не выводит её из текста `reason`.
+                "nothing_reason": state.nothing,
                 "failures": {kind: count for kind, count in state.failures},
                 "waits": _waits(
                     state.state,

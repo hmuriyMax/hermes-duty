@@ -88,6 +88,9 @@ function moduleForRender(root) {
     .replace(/from '@hermes\/plugin-sdk'/, "from './sdk.mjs'")
     .concat(
       '\nexport { DutyLane, DutyAttemptRow, ScalePanel, KpiStrip, SpecStrip, CallInspector, DutyMiniTimeline, FinishedBlock, shapeFinishedRow, dealTimeline, stageRole, DutyPage, parseWindow, TL_WINDOWS, windowLabel, DecisionsPanel, DutyLeadLane, DealRow, DealFactSpans, shapeDeal, shapeDealTime, DutyPlanRefusal, shapePlan }\n',
+      // Экран дела монтируется вместе с подменой `rest`: иначе строка этапа
+      // проверялась бы регуляркой по исходнику, а не рендером.
+      '\nexport function __setRest(fn) { rest = fn }\nexport { DealScreen }\n',
     )
   const file = join(dir, 'plugin.mjs')
   writeFileSync(file, source)
@@ -1130,4 +1133,97 @@ test('десктоп: заходы лида — полосами на шкале
   // Пустая дорожка говорит словом, а не рисует ноль полос молча.
   const empty = renderToStaticMarkup(React.createElement(mod.DutyLeadLane, { leadLane: { runs: [], text: 'заходов не было' } }))
   assert.match(empty, /заходов не было/)
+})
+
+test('десктоп: пройденный без работы этап назван словами под строкой', async (t) => {
+  // Та же история, что в вебе: дело d_12d5fc44, этап `fix` прошёл, а править в
+  // нём было нечего. Строка этапа обязана сказать это причиной — иначе «пройден»
+  // читается как «работа сделана», и правку ищут там, где её нет.
+  const source = read('desktop/plugin.js')
+  assert.match(source, /if \(view\.nothingText\)/, 'экран не рисует строку «работы не было»')
+  assert.match(source, /duty-stage-note/, 'нет класса строки пустоты')
+  const css = source.replace(/\/\*[\s\S]*?\*\//g, '')
+  assert.match(css, /\.duty-stage-note\{/, 'нет правила .duty-stage-note')
+
+  const root = reactRoot()
+  if (!root) return t.skip('нет React в ~/.hermes/hermes-agent/node_modules')
+  if (!existsSync(join(root, 'jsdom', 'package.json'))) return t.skip('нет jsdom')
+  const React = (await import(pathToFileURL(join(root, 'react', 'index.js')).href)).default
+  const { createRoot } = await import(pathToFileURL(join(root, 'react-dom', 'client.js')).href)
+  const { JSDOM } = await import(pathToFileURL(join(root, 'jsdom', 'lib', 'api.js')).href)
+  const mod = await import(pathToFileURL(moduleForRender(root)).href)
+
+  const dom = new JSDOM('<!doctype html><div id="root"></div>', { url: 'http://localhost/' })
+  globalThis.window = dom.window
+  globalThis.document = dom.window.document
+  Object.defineProperty(globalThis, 'navigator', { value: dom.window.navigator, configurable: true })
+  globalThis.HTMLElement = dom.window.HTMLElement
+  globalThis.Element = dom.window.Element
+  globalThis.Node = dom.window.Node
+  globalThis.requestAnimationFrame = (cb) => setTimeout(() => cb(Date.now()), 0)
+  globalThis.cancelAnimationFrame = (id) => clearTimeout(id)
+
+  const at = 1_700_000_480
+  mod.__setRest(async (path) => {
+    if (String(path).startsWith('/deal/')) {
+      return {
+        repo: 'hermes-duty',
+        title: 'аудит тикета',
+        status: 'running',
+        body: '',
+        spec_text: '',
+        stages: [
+          {
+            id: 'fix',
+            title: 'Правка по расхождениям',
+            kind: 'agent',
+            role: 'implementer',
+            needs: [],
+            state: 'done',
+            nothing_reason: 'research ответил: расхождений с тикетом нет',
+            attempts: [{ n: 1, run_id: 'fix#1', outcome: 'done', started_at: 1_700_000_001, finished_at: at, duration_sec: 479 }],
+          },
+        ],
+        timeline: [{ kind: 'created', at: 1_700_000_000, summary: '' }],
+      }
+    }
+    if (String(path).includes('/attempts')) {
+      return { attempts: [{ run_id: 'fix#1', stage: 'fix', outcome: 'done', duration_sec: 479 }] }
+    }
+    return {}
+  })
+
+  const container = dom.window.document.getElementById('root')
+  const mounted = createRoot(container)
+  const failures = []
+  const origError = console.error
+  console.error = (...args) => {
+    const text = args.map((item) => (item && item.stack) || String(item)).join(' ')
+    if (!CONSOLE_NOISE.test(text)) failures.push(text)
+  }
+  try {
+    mounted.render(
+      React.createElement(mod.DealScreen, {
+        sel: { id: 'd_fixture', titleFull: 'аудит тикета', repo: 'hermes-duty' },
+        onBack: () => {},
+      }),
+    )
+    await new Promise((resolve) => setTimeout(resolve, 800))
+
+    assert.equal(failures.length, 0, `экран дела упал: ${failures[0] || ''}`.slice(0, 600))
+    const note = container.querySelector('.duty-stage-note')
+    assert.ok(note, 'под этапом нет строки «работы не было»')
+    assert.equal(note.textContent, 'работы не было: research ответил: расхождений с тикетом нет')
+    const block = container.querySelector('.duty-stage-block')
+    assert.equal(block.querySelectorAll('.duty-stage-wait').length, 0, 'пустота выдана за ожидание')
+    assert.match(block.textContent, /пройден/, 'этап без работы не назван пройденным')
+  } finally {
+    console.error = origError
+    try {
+      mounted.unmount()
+    } catch {
+      /* не смонтировалось — размонтировать нечего */
+    }
+    keepWindow = dom.window
+  }
 })

@@ -79,6 +79,9 @@ journal = load_module("hermes_duty_journal", "journal.py")
 deals = load_module("hermes_duty_deals", "deals.py")
 spec_module = load_module("hermes_duty_spec", "spec.py")
 transit = load_module("hermes_duty_transit", "transit.py")
+# Лента этапов: у неё отдельный вход (`snapshot`), и «работы не было» видно
+# строкой этапа, а не догадкой поверхности (`stagefeed.stages[].nothing_reason`).
+stagefeed = load_module("hermes_duty_stagefeed", "stagefeed.py")
 
 
 # ------------------------------------------------------------------ фикстуры
@@ -3931,3 +3934,81 @@ def test_lettered_options_come_from_the_question_markup(tmp_path: Path) -> None:
     assert runner._lettered_options("Как поступить: (a) перепланировать; (b) принять; (c) иное.") == ["a", "b", "c"]
     assert runner._lettered_options("повтор (a) и снова (a)") == ["a"]
     assert runner._lettered_options("без вариантов") == []
+
+
+# ------------------------------------------------------- пустота (0.2.1)
+
+
+def test_nothing_closes_the_stage_done_and_says_why(tmp_path: Path) -> None:
+    """«Работы не было» — исход этапа: попытка `done`, факт называет причину.
+
+    Живое дело `d_12d5fc44`: этап `fix` стоял в плане, а править в нём было
+    нечего — исполнитель предъявил базовый коммит, гейт назвал его чужим
+    (`commit.foreign`), и честное «делать нечего» упало контрактом. Здесь тот же
+    случай назван своим свидетелем: пустое дерево, причина в отчёте, исход `done`.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    repo = git_repo(tmp_path)
+    spec = worktree_spec(tmp_path, repo)
+    base = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    reason = "research ответил: расхождений с тикетом нет, править нечего"
+    fake = Fake(
+        result={
+            "status": "done",
+            "evidence": [],
+            "summary": "правок не требуется",
+            "nothing": {"reason": reason},
+        }
+    )
+
+    report = run(conn, spec, deal, home, fake)
+
+    assert (report["outcome"], report["kind"]) == ("done", None)
+    assert report["nothing"] == {"reason": reason}
+    ended = only(conn, deal, "attempt_ended")
+    assert ended["payload"]["outcome"] == "done"
+    assert ended["payload"]["kind"] is None, "пустота не класс отказа"
+    assert ended["payload"]["nothing"] == {"reason": reason}
+    assert ended["payload"]["reason"] == f"работы не было: {reason}"
+    assert ended["payload"]["details"]["witness"] == "nothing"
+    # Работы после базы не появилось — и следующий этап отводится от той же базы.
+    assert ended["payload"]["commit"] == base
+
+    facts = events(conn, deal)
+    state = transit.stage_states(spec, facts)[spec.stage("impl").id]
+    assert (state.state, state.nothing) == ("done", reason)
+    assert state.reason == f"попытка 1: работы не было: {reason}"
+    assert dict(state.failures) == {}, "пустота не считается отказом этапа"
+
+    feed = stagefeed.snapshot(facts, NOW + 60, spec_path=str(spec.path))
+    stage = next(item for item in feed["stages"] if item["id"] == "impl")
+    assert (stage["state"], stage["nothing_reason"]) == ("done", reason)
+
+
+def test_nothing_with_a_dirty_tree_fails_the_contract(tmp_path: Path) -> None:
+    """Назвал пустоту, а правка в дереве — `failed(contract)` с `nothing.dirty`."""
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = worktree_spec(tmp_path, git_repo(tmp_path))
+    fake = Fake(
+        files={"правка.txt": "работа\n"},
+        result={
+            "status": "done",
+            "evidence": [],
+            "summary": "правок не требуется",
+            "nothing": {"reason": "расхождений нет"},
+        },
+    )
+
+    report = run(conn, spec, deal, home, fake)
+
+    assert (report["outcome"], report["kind"]) == ("failed", "contract")
+    assert "nothing.dirty" in report["reason"]
+    ended = only(conn, deal, "attempt_ended")
+    assert (ended["payload"]["outcome"], ended["payload"]["kind"]) == ("failed", "contract")
+    assert "nothing" not in ended["payload"], "отказанный пакет пустоту не заявляет"

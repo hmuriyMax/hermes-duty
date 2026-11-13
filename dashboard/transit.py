@@ -28,7 +28,7 @@
 | `kind` | `payload` | что значит для этапа |
 |---|---|---|
 | `attempt_started` | `stage`, `attempt`, `run_id`, `pid` | попытка идёт: `running` |
-| `attempt_ended` | `stage`, `attempt`, `outcome`, `kind` | `outcome` из `OK_OUTCOMES` → `done`, иначе провал класса `kind` |
+| `attempt_ended` | `stage`, `attempt`, `outcome`, `kind`, `nothing` | `outcome` из `OK_OUTCOMES` → `done` (с `nothing: {reason}` — этап пройден, работы в нём не было); иначе провал класса `kind` |
 | `question_asked` | `stage`, `attempt`, `question_id` | ждёт человека: `wait_human` |
 | `question_answered` | `stage`, `question_id`, `answered_via`, `answer_len` | ответ → новая попытка; истёкший срок → `parked` |
 | `completed` | `stage` | этап закрыт: `done` |
@@ -324,6 +324,9 @@ class StageState:
     failures: tuple[tuple[str, int], ...] = ()
     reason: str = ""
     retry_at: Optional[int] = None
+    # Причина пустоты (`nothing` в факте попытки): этап пройден, а работы в нём не
+    # было. Пусто — этап закрыт работой или не закрыт (0.2.1, §5).
+    nothing: str = ""
 
     @property
     def terminal(self) -> bool:
@@ -459,6 +462,10 @@ class _Stage:
     run_id: str = ""
     since: int = 0
     reason: str = ""
+    # Причина пустоты (`attempt_ended.payload.nothing.reason`), если попытка
+    # закрыла этап исходом «работы не было». Пусто — этап закрыт работой или не
+    # закрыт вовсе. Экран называет этим словом пройденный этап, а не провалом.
+    nothing: str = ""
     # Время последнего отказа: от него считается пауза перед повтором
     # (`retry_at`). Ноль — отказа не было.
     failed_at: int = 0
@@ -742,6 +749,20 @@ def _verdict_changes(board: _Board, spec: Any, node: _Stage, payload: dict[str, 
         _reopen(board, spec, target, extra=(node.id,))
 
 
+def _nothing_of(payload: dict[str, Any]) -> str:
+    """Причина пустоты из факта `attempt_ended`: строка или пусто.
+
+    Пустота — законный исход этапа-производителя (`nothing: {reason}` в отчёте,
+    проверенный гейтом по дереву): этап пройден, работы в нём не было. Пустая
+    причина или её отсутствие — не пустота: без слов экран сказал бы «работы не
+    было» и не ответил, почему (docs/ENGINE-2.0.md, раздел 5).
+    """
+    nothing = payload.get("nothing")
+    if not isinstance(nothing, dict):
+        return ""
+    return str(nothing.get("reason") or "").strip()
+
+
 def _stage_event(
     spec: Any, board: _Board, node: _Stage, kind: str, payload: dict[str, Any], at: int = 0
 ) -> None:
@@ -774,6 +795,9 @@ def _stage_event(
     if kind == "attempt_ended":
         node.attempt = max(node.attempt, _int(payload.get("attempt")) or node.attempt)
         board.last_attempt = (node.id, node.attempt)
+        # Пустота прошлой попытки живёт до этой: этап, закрытый работой после
+        # «работы не было», не должен продолжать называть себя пустым.
+        node.nothing = ""
         outcome = str(payload.get("outcome") or "").strip().lower()
         fail_kind = str(payload.get("kind") or "").strip()
         if outcome == CANCELLED_OUTCOME:
@@ -796,7 +820,9 @@ def _stage_event(
             # Новое закрытие этапа закрывает и старый приговор: приговор прошлого
             # раунда не должен пропускать работу, которую ещё никто не смотрел.
             node.verdict = None
-            node.reason = f"попытка {node.attempt}: {outcome or 'ok'}"
+            node.nothing = _nothing_of(payload)
+            word = f"работы не было: {node.nothing}" if node.nothing else f"{outcome or 'ok'}"
+            node.reason = f"попытка {node.attempt}: {word}"
             return
         fail_kind = fail_kind or UNCLASSIFIED
         stage_spec = _stage_spec(spec, node.id)
@@ -814,6 +840,7 @@ def _stage_event(
         node.state = DONE
         node.question_id = None
         node.verdict = None  # закрытие этапа закрывает и приговор прошлого раунда
+        node.nothing = ""
         node.reason = "этап закрыт событием completed"
         return
 
@@ -824,6 +851,7 @@ def _stage_event(
         node.state = FAILED
         node.question_id = None
         node.verdict = None
+        node.nothing = ""
         reason = str(payload.get("reason") or "").strip()
         node.reason = "этап отменён лидом" + (f": {reason}" if reason else "")
         return
@@ -1562,6 +1590,9 @@ def stage_states(spec: Any, events: Iterable[Any]) -> dict[str, StageState]:
             failures=tuple(sorted(node.failures.items())),
             reason=reason,
             retry_at=_pause_until(stage, board),
+            # Пустота едет срезом, а не выводится из текста причины: экран зовёт
+            # пройденный этап словами, а провал — красным.
+            nothing=node.nothing,
         )
     return result
 

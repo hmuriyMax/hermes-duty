@@ -674,3 +674,120 @@ def test_non_object_report_is_refused(tmp_path: Path) -> None:
     verdict = verify(["готово"], make_stage(), tmp_path)
     assert (verdict.ok, verdict.kind) == (False, "contract")
     assert rules(verdict) == [evidence.RULE_REPORT]
+
+
+# ------------------------------------------------------- 9. пустота (0.2.1)
+
+
+def nothing_report(root: Path, **fields: Any) -> dict[str, Any]:
+    """Отчёт этапа-производителя, которому править было нечего.
+
+    Дерева он не касается вовсе: `nothing` — альтернатива работе, а не
+    дополнение к ней, поэтому ни коммита, ни артефактов в нём нет.
+    """
+    built: dict[str, Any] = {
+        "status": "done",
+        "evidence": [],
+        "summary": "править нечего: расхождений нет",
+        "nothing": {"reason": "research ответил: расхождений с тикетом нет"},
+    }
+    built.update(fields)
+    return built
+
+
+def test_nothing_on_a_clean_tree_is_accepted(tmp_path: Path) -> None:
+    """«Работы не было» с причиной на нетронутом дереве — этап закрыт, не провал.
+
+    Живое дело `d_12d5fc44`: этап `fix` падал `commit.foreign` просто потому, что
+    работы для него не было. Здесь тот же случай, но названный своим свидетелем.
+    """
+    root = tmp_path / "tree"
+    base = git_repo(root)
+    stage = make_stage(workspace="worktree")
+
+    verdict = verify(nothing_report(root), stage, root, root=root, base=base)
+
+    assert (verdict.ok, verdict.kind, [str(issue) for issue in verdict.details]) == (True, None, [])
+    assert verdict.witness == evidence.WITNESS_NOTHING
+    assert evidence.nothing_reason(nothing_report(root)) == "research ответил: расхождений с тикетом нет"
+
+
+def test_nothing_without_a_reason_is_refused(tmp_path: Path) -> None:
+    """Пустота без причины — отказ `nothing.reason`: «делать нечего» ничего не объясняет."""
+    root = tmp_path / "tree"
+    base = git_repo(root)
+
+    for broken in ({"nothing": {"reason": "   "}}, {"nothing": True}, {"nothing": {}}):
+        verdict = verify(nothing_report(root, **broken), make_stage(workspace="worktree"), root, root=root, base=base)
+        assert (verdict.ok, verdict.kind) == (False, "contract"), broken
+        assert rules(verdict) == [evidence.RULE_NOTHING_REASON], broken
+        assert verdict.errors[0].where == "result.json:nothing.reason"
+
+
+def test_nothing_with_a_dirty_tree_is_refused(tmp_path: Path) -> None:
+    """Назвал пустоту, а в дереве изменения — отказ `nothing.dirty`, а не приём."""
+    root = tmp_path / "tree"
+    base = git_repo(root)
+    (root / "правка.txt").write_text("работа\n", encoding="utf-8")
+
+    verdict = verify(nothing_report(root), make_stage(workspace="worktree"), root, root=root, base=base)
+
+    assert (verdict.ok, verdict.kind) == (False, "contract")
+    assert rules(verdict) == [evidence.RULE_NOTHING_DIRTY]
+    assert "в дереве изменения" in str(verdict.errors[0])
+
+
+def test_nothing_after_a_commit_on_top_of_the_base_is_refused(tmp_path: Path) -> None:
+    """Работа закоммичена, а отчёт говорит «править нечего» — `nothing.dirty`."""
+    root = tmp_path / "tree"
+    base = git_repo(root)
+    commit(root)
+
+    verdict = verify(nothing_report(root), make_stage(workspace="worktree"), root, root=root, base=base)
+
+    assert (verdict.ok, verdict.kind) == (False, "contract")
+    assert rules(verdict) == [evidence.RULE_NOTHING_DIRTY]
+    assert "не равен базе попытки" in str(verdict.errors[0])
+
+
+def test_nothing_is_refused_on_a_stage_with_its_own_witness(tmp_path: Path) -> None:
+    """У ревьюера и публикующего свидетель свой: пустота их работу не заменяет."""
+    root = tmp_path / "tree"
+    base = git_repo(root)
+    reviewing = make_stage(role="reviewer", verdict=spec_module.Verdict(approve="next", changes="impl"))
+    publishing = make_stage(role="publisher")
+
+    for stage in (reviewing, publishing):
+        verdict = verify(nothing_report(root), stage, root, root=root, base=base)
+        assert (verdict.ok, verdict.kind) == (False, "contract"), stage.id
+        assert rules(verdict) == [evidence.RULE_NOTHING_STAGE]
+        assert verdict.errors[0].where == "result.json:nothing"
+
+
+def test_foreign_commit_refusal_names_both_readings(tmp_path: Path) -> None:
+    """`commit.foreign` знает два чтения: чужое готовое или работу, которой не было.
+
+    Раньше текст называл только первое и толкал исполнителя искать несуществующий
+    коммит — третий `fix#1` живого дела `d_12d5fc44` искал его 8 минут.
+    """
+    root = tmp_path / "tree"
+    base = git_repo(root)
+    built = report(root, commit=base)
+
+    verdict = verify(built, make_stage(workspace="worktree"), root, base=base)
+
+    assert (verdict.ok, verdict.kind) == (False, "contract")
+    assert rules(verdict) == [evidence.RULE_COMMIT_FOREIGN]
+    message = str(verdict.errors[0])
+    assert "чужое готовое" in message
+    assert "работы для этапа не было" in message
+    assert "nothing: {reason}" in message
+
+
+def test_report_schema_tells_the_executor_about_nothing(tmp_path: Path) -> None:
+    """О пустоте исполнитель узнаёт из контракта, а не из отказа `commit.foreign`."""
+    schema = evidence.report_schema(make_stage(workspace="worktree"))
+    assert schema["required_for_done"] == ["commit|artifacts", "evidence", "summary"]
+    assert "reason" in schema["nothing"]
+    # У этапов со своим свидетелем пустоты в схеме нет: принимать её там нечем.
+    assert "nothing" not in evidence.report_schema(make_stage(role="publisher"))

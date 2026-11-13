@@ -1951,6 +1951,10 @@ function stageBlockNode(dealId, stage, timeline, rebuild) {
       ),
     )
   }
+  // «Работы не было» — исход пройденного этапа, а не провал: строка стоит под
+  // этапом тем же шрифтом, что «ждёт», но не жёлтым (`stage-note`), потому что
+  // ждать нечего и чинить нечего.
+  if (view.nothingText) nodes.push(h('div', { class: 'stage-note' }, view.nothingText))
   if (!open) return h('div', { class: 'stage-block', 'data-key': `block:${stageKey}` }, ...nodes)
   if (!bars.length) nodes.push(h('div', { class: 'att-none muted' }, 'попыток нет'))
   bars.forEach((bar, index) => {

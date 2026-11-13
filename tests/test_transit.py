@@ -818,6 +818,34 @@ def test_now_changes_only_the_wording(spec: Any) -> None:
     assert soon.reason != late.reason  # возраст вопроса назван по-разному
 
 
+def test_nothing_closes_the_stage_and_does_not_look_like_a_refusal(spec: Any) -> None:
+    """«Работы не было» — пройденный этап, а не отказ: счётчика отказа нет.
+
+    Живое дело `d_12d5fc44`: честное «делать нечего» падало контрактом и уводило
+    дело в `plan_rethink` — успех выглядел аварией. Здесь тот же факт закрывает
+    этап и открывает следующий, а причина едет словом, а не классом отказа.
+    """
+    facts = [
+        started("impl"),
+        ev(
+            "attempt_ended",
+            "impl",
+            attempt=1,
+            outcome="done",
+            kind=None,
+            nothing={"reason": "research ответил: расхождений нет"},
+        ),
+    ]
+
+    state = transit.stage_states(spec, facts)["impl"]
+
+    assert (state.state, state.nothing) == ("done", "research ответил: расхождений нет")
+    assert state.reason == "попытка 1: работы не было: research ответил: расхождений нет"
+    assert state.failures == (), "пустота не считается отказом этапа"
+    decision = transit.next_stage(spec, facts, now=NOW)
+    assert (decision.kind, decision.stages) == ("run", ("verify",)), "граф не пошёл дальше"
+
+
 def test_stage_kinds_are_journal_kinds() -> None:
     """Виды, которые читает слой, существуют в закрытом наборе журнала.
 

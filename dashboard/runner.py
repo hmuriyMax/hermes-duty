@@ -4577,6 +4577,12 @@ def finish_agent_stage(
     # `attempt_ended`, чтобы отказ гейта был в журнале тем же фактом, что и смерть.
     now = _now_sec(int(clock()))
     verdict = None
+    # Пустота: этап-производитель вправе предъявить `nothing: {reason}` вместо
+    # коммита — «править было нечего». Гейт её уже проверил по дереву
+    # (`evidence._check_nothing`), здесь она становится фактом попытки: иначе в
+    # журнале видно только «принято», и следующий читатель ищет работу, которой
+    # не было (живое дело `d_12d5fc44`).
+    nothing: Optional[str] = None
     if outcome == OUTCOME_DONE and not parked and result is not None:
         verdict = evidence_module.verify(
             result,
@@ -4593,6 +4599,9 @@ def finish_agent_stage(
             # Класс отказа гейта — из вердикта (`Verdict.kind`, W4), а не из текста:
             # `contract` для несходящегося пакета, `capability` для бюджета.
             outcome, kind, reason = OUTCOME_FAILED, failures.verdict_kind(verdict), verdict.reason()
+        elif verdict.witness == evidence_module.WITNESS_NOTHING:
+            nothing = evidence_module.nothing_reason(result)
+            reason = f"работы не было: {nothing}"
 
     # Публикация (0.0.5): «опубликовано» — заявка исполнителя, факт даёт origin.
     # Сверка идёт до коммита в дереве и до `attempt_ended`: подтверждённый sha
@@ -4710,6 +4719,12 @@ def finish_agent_stage(
     }
     if result is not None:
         payload["result"] = result
+    if nothing is not None:
+        # Пустота — исход, а не провал: факт называет причину рядом с `commit`,
+        # который в этом случае равен базе (работы после базы не появилось).
+        # Форма та же, что в отчёте (`nothing: {reason}`), — читать журнал и
+        # контракт учат одинаково.
+        payload["nothing"] = {"reason": nothing}
     ended = _event(
         deal,
         "attempt_ended",
@@ -4773,6 +4788,8 @@ def finish_agent_stage(
         "tree": str(tree) if tree is not None else None,
         "base": actual_base,
         "commit": committed or None,
+        # Пустота — исход этапа, а не его провал: `{"reason": …}` или None.
+        "nothing": {"reason": nothing} if nothing is not None else None,
         "session_id": followed.session_id or session_id or "",
         "usage_tokens": followed.usage,
         "tools": followed.tools,

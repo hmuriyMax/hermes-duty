@@ -1718,6 +1718,13 @@ function shapeStage(stage, journal, lead) {
     addedBy,
     addedByText: addedBy ? `добавлен ${addedBy === 'lead' ? 'лидом' : `ролью ${addedBy}`}` : '',
     reason: String(s.reason || ''),
+    // «Работы не было» (`stagefeed.stages.nothing_reason`): этап пройден, а работы
+    // в нём не нашлось — правок не требовалось. Это исход, а не провал, поэтому
+    // слова идут отдельным полем, а не выводятся из текста `reason`: провал
+    // печатается красным, а пустота — обычной строкой под этапом.
+    nothingText: String(s.nothing_reason || '').trim()
+      ? `работы не было: ${String(s.nothing_reason).trim()}`
+      : '',
     waits,
     waitKind: kind,
     questionId,
@@ -1929,6 +1936,10 @@ function compactStageView(stage) {
     // дело может стоять на человеке, и это не деталь.
     waitText: String(s.waitText || ''),
     waitHref: String(s.questionHref || ''),
+    // «Работы не было» — видимая строка пройденного этапа (шейпер `shapeStage`):
+    // дело, где править было нечего, не должно выглядеть одинаково с делом, где
+    // этап просто закрыт.
+    nothingText: String(s.nothingText || ''),
     openByDefault: open,
     toggleTitle: `${open ? 'свернуть' : 'развернуть'} попытки этапа ${name}`,
   }

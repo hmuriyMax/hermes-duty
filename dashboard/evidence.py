@@ -15,7 +15,10 @@
 
 1. **Схема отчёта**: `status` из закрытого набора; для `done` обязательны
    `evidence`, `summary` и **свидетель этапа** (`witness`): `commit`|`artifacts`
-   у обычного этапа, `verdict` у этапа с приговором, `published` у публикующего.
+   у обычного этапа, `verdict` у этапа с приговором, `published` у публикующего,
+   `report` у роли без терминала, `plan` у этапа плана; вместо работы
+   этап-производитель вправе предъявить пустоту (`nothing: {reason}`), и тогда
+   дерево обязано это подтвердить (`HEAD` = база попытки, `git status` пуст).
    Лишнее поле — предупреждение, а не отказ: исполнитель вправе добавить контекст.
 2. **Артефакты**: путь относительный и не выводит из дерева попытки, файл есть,
    `sha256` заявлен целиком и совпадает с содержимым. У отсутствующего файла
@@ -112,6 +115,10 @@ REPORT_KEYS = (
     # (`runner.report_plan` по `spec.parse_plan`); гейт пакета проверяет форму —
     # этап плана не предъявляет работу в дереве (`docs/ENGINE-1.0.md`, раздел 4).
     "plan",
+    # Пустота (0.2.1): {reason} — «работы для этапа не было». Законный исход
+    # этапа-производителя, а не уход от работы: гейт сверяет его с деревом, а
+    # причина называет, почему править было нечего (`nothing.dirty`).
+    "nothing",
 )
 
 # Имена правил: ими отказ называется в `details` и в `duty why`, чтобы человек
@@ -132,6 +139,9 @@ RULE_EVIDENCE_STALE = "evidence.stale"
 RULE_EVIDENCE_FUTURE = "evidence.future"
 RULE_EVIDENCE_SUBSTITUTED = "evidence.substituted"
 RULE_BUDGET = "budget.tokens"
+RULE_NOTHING_REASON = "nothing.reason"
+RULE_NOTHING_DIRTY = "nothing.dirty"
+RULE_NOTHING_STAGE = "nothing.stage"
 
 # Свидетели этапа (0.0.5): «готово» доказывается тем, что этап по своей природе
 # может предъявить, а не одним списком на всех. Обычный этап называет работу
@@ -152,6 +162,17 @@ WITNESS_PLAN = "plan"
 # ни закрыть (свидетель работы) — поэтому лид делал сверку сам в этапе
 # координатора.
 WITNESS_REPORT = "report"
+# Этап-производитель, которому править было нечего (0.2.1): `nothing: {reason}`
+# вместо `commit|artifacts`. Живое дело `d_12d5fc44`: `research` ответил
+# «расхождений нет», лид оставил в плане `fix`, исполнитель честно ничего не
+# менял и предъявил базовый коммит — гейт назвал это чужим готовым
+# (`commit.foreign`), дело встало `contract` → `plan_rethink`, а лид закрыл его
+# словами «этап упал контрактом, потому что работы не было». В контракте не было
+# законного способа сказать «делать нечего», и цена выяснения — 8 минут, 4.9 млн
+# токенов и 79 вызовов. Лазейкой он при этом не становится: `HEAD` обязан совпасть
+# с базой попытки, `git status` — быть пустым, а причина — называть, почему править
+# было нечего (`nothing.reason`, `nothing.dirty`).
+WITNESS_NOTHING = "nothing"
 
 # Имя отчёта в тексте отказа: `result.json:evidence[0].exit` читается как
 # `file:line` спеки, только «строка» здесь — путь внутри отчёта.
@@ -367,6 +388,20 @@ def witness(stage: Any) -> str:
     return WITNESS_WORK
 
 
+def nothing_reason(result: dict[str, Any]) -> str:
+    """Причина пустоты из отчёта: строка или пусто, если её нет.
+
+    Причина — часть контракта, а не украшение: «работы не было» без неё не
+    отвечает на вопрос «почему», и следующий, кто откроет дело, пойдёт искать
+    работу заново. Функция одна на гейт и на движок: отказ `nothing.reason` и
+    факт `attempt_ended` обязаны читать причину одинаково.
+    """
+    nothing = result.get(WITNESS_NOTHING)
+    if not isinstance(nothing, dict):
+        return ""
+    return str(nothing.get("reason") or "").strip()
+
+
 def _witness_problem(kind: str, result: dict[str, Any]) -> Optional[Issue]:
     """Чем свидетель этапа не предъявлен; `None` — предъявлен в своей форме.
 
@@ -374,6 +409,18 @@ def _witness_problem(kind: str, result: dict[str, Any]) -> Optional[Issue]:
     публикующем этапе отправляло исполнителя искать работу, которую тот и не
     делал (живой прогон TF3-c: `publish` и `review` отказывали всегда).
     """
+    if kind in (WITNESS_VERDICT, WITNESS_PUBLISHED, WITNESS_PLAN, WITNESS_REPORT):
+        # У этих этапов свидетель свой, и пустота его не заменяет: ревьюер,
+        # публикующий и этап плана обязаны предъявить приговор, публикацию или
+        # план — «работы не было» от них означало бы, что этап не сделал свою
+        # работу, а не что работы для него не нашлось.
+        if WITNESS_NOTHING in result:
+            return Issue(
+                _where(WITNESS_NOTHING),
+                RULE_NOTHING_STAGE,
+                f"свидетель этого этапа — {kind}, а не ничего: nothing принимается "
+                "только у этапа-производителя (commit|artifacts)",
+            )
     if kind == WITNESS_VERDICT:
         if isinstance(result.get("verdict"), dict):
             return None
@@ -413,6 +460,18 @@ def _witness_problem(kind: str, result: dict[str, Any]) -> Optional[Issue]:
             "этап без терминала: нужен summary с находками; commit/artifacts "
             "не требуются — работа такого этапа это отчёт",
         )
+    if WITNESS_NOTHING in result:
+        # Пустота — альтернатива работе, а не дополнение к ней: `nothing` вместе
+        # с коммитом или артефактами разберёт дерево (`nothing.dirty`), а без
+        # причины он не отвечает, почему править было нечего.
+        if not nothing_reason(result):
+            return Issue(
+                _where(WITNESS_NOTHING, key="reason"),
+                RULE_NOTHING_REASON,
+                "nothing без reason: назови одной строкой, почему работы не было "
+                "(например: «research ответил: расхождений нет»)",
+            )
+        return None
     commit = result.get("commit")
     claimed_commit = commit.strip() if isinstance(commit, str) else ""
     artifacts = result.get("artifacts")
@@ -609,7 +668,73 @@ def _check_commit(commit: str, root: Path, base: Optional[str], issues: list[Iss
             Issue(
                 _where("commit"),
                 RULE_COMMIT_FOREIGN,
-                f"commit={commit} уже был предком базы {base} до попытки — это чужое готовое",
+                f"commit={commit} уже был предком базы {base} до попытки: либо это чужое "
+                "готовое, либо работы для этапа не было — тогда предъяви "
+                "nothing: {reason} вместо commit",
+            )
+        )
+
+
+def _check_nothing(root: Path, base: Optional[str], issues: list[Issue]) -> None:
+    """Пустота проверяема или её нет: `HEAD` равен базе, а `git status` пуст.
+
+    «Работы не было» — законный исход этапа-производителя, но только если дерево
+    это подтверждает. Иначе свидетель стал бы способом уйти от работы: сказать
+    «править нечего» и не править. Поэтому доказательство берётся у самого дерева
+    (`git status --porcelain` и `HEAD` против базы попытки), а не из слов отчёта.
+    """
+    code, out = _git(["status", "--porcelain"], root)
+    if code != 0:
+        issues.append(
+            Issue(
+                _where(WITNESS_NOTHING),
+                RULE_NOTHING_DIRTY,
+                f"git status --porcelain не ответил в {root}: {out or code} — "
+                "пустота не доказана",
+            )
+        )
+        return
+    if out.strip():
+        issues.append(
+            Issue(
+                _where(WITNESS_NOTHING),
+                RULE_NOTHING_DIRTY,
+                f"ты назвал пустоту, а в дереве изменения: {out[:120]}",
+            )
+        )
+        return
+    if not base:
+        # База не объявлена — сравнивать `HEAD` не с чем. Дерево при этом чисто:
+        # этого достаточно, чтобы «работы не было» не осталось без проверки.
+        return
+    head = _rev_parse(root, "HEAD")
+    base_sha = _rev_parse(root, str(base))
+    if base_sha is None:
+        issues.append(
+            Issue(
+                _where(WITNESS_NOTHING),
+                RULE_COMMIT_BASE,
+                f"база {base!r} не резолвится в {root}: HEAD с базой не сверен",
+                severity=WARNING,
+            )
+        )
+        return
+    if head is None:
+        issues.append(
+            Issue(
+                _where(WITNESS_NOTHING),
+                RULE_NOTHING_DIRTY,
+                f"HEAD не резолвится в {root}: пустота не доказана",
+            )
+        )
+        return
+    if head != base_sha:
+        issues.append(
+            Issue(
+                _where(WITNESS_NOTHING),
+                RULE_NOTHING_DIRTY,
+                f"ты назвал пустоту, а в дереве работа после базы: HEAD {head[:12]}… "
+                f"не равен базе попытки {base_sha[:12]}…",
             )
         )
 
@@ -789,6 +914,11 @@ def verify(
         commit_text = commit.strip() if isinstance(commit, str) else ""
         if commit_text:
             _check_commit(commit_text, root_path, base, issues)
+        # Пустота проверяется только там, где она вообще может быть принята
+        # (`_witness_problem` уже отказал этапам со своим свидетелем и назвал
+        # причину): пустое дерево у ревьюера ничего не доказывало бы.
+        if WITNESS_NOTHING in result and witness(stage) == WITNESS_WORK:
+            _check_nothing(root_path, base, issues)
         records = result.get("evidence")
         if isinstance(records, list):
             # Отсутствие поля целиком уже названо схемой: повторять его на каждой
@@ -805,8 +935,12 @@ def verify(
         _check_budget(result, stage, issues)
 
     # Свидетель, которым этап называет работу (`witness`): у `blocked`/`refused`
-    # пакета нет вовсе, и называть там нечего.
-    accepted = witness(stage) if status == STATUS_DONE else None
+    # пакета нет вовсе, и называть там нечего. Принятая пустота называется своим
+    # свидетелем: в журнале должно быть видно, что этап закрыт не работой, а
+    # `nothing` — иначе «принято» сливается с «работой».
+    accepted = None
+    if status == STATUS_DONE:
+        accepted = WITNESS_NOTHING if WITNESS_NOTHING in result else witness(stage)
     errors = [issue for issue in issues if issue.severity == ERROR]
     if not errors:
         return Verdict(ok=True, kind=None, details=issues, witness=accepted)
@@ -871,4 +1005,12 @@ def report_schema(stage: Any) -> dict[str, Any]:
         schema["published"] = published
     if plan:
         schema["plan"] = plan
+    if wanted == WITNESS_WORK:
+        # Пустота — законный исход этапа-производителя, и о ней исполнитель должен
+        # узнать из контракта, а не из отказа `commit.foreign`: «править нечего»
+        # без этого поля читалось как «работа не названа».
+        schema["nothing"] = {
+            "reason": "вместо commit/artifacts: почему работы не было "
+            "(дерево обязано быть чистым: HEAD = база попытки, git status пуст)"
+        }
     return schema

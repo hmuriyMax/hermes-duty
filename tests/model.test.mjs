@@ -1456,6 +1456,39 @@ test('сжатие простоя: дело без полос (только со
   assert.equal(published.pct, Math.round(((4000 - 1) / 7199) * 1000) / 10, 'ось без полос перестала быть линейной')
 })
 
+test('этап без работы: «работы не было» стоит словами, а не провалом', () => {
+  // Живое дело d_12d5fc44: лид оставил в плане этап fix, а править в нём было
+  // нечего. Этап пройден (`done`), и экран обязан назвать это исходом с причиной,
+  // а не оставить строку «готово» без объяснения.
+  const feed = shapeStages({
+    stages: [
+      {
+        id: 'fix',
+        title: 'Правка по расхождениям',
+        state: 'done',
+        nothing_reason: 'research ответил: расхождений с тикетом нет',
+        attempts: [{ n: 1, run_id: 'fix:1', outcome: 'done', started_at: 1_000, finished_at: 1_060 }],
+      },
+    ],
+  })
+  const stage = feed.stages[0]
+  assert.equal(
+    stage.nothingText,
+    'работы не было: research ответил: расхождений с тикетом нет',
+    'пустота названа не словами',
+  )
+  assert.equal(stage.state, 'done', 'этап без работы — пройденный, а не провалившийся')
+  assert.equal(compactStageView(stage).nothingText, stage.nothingText, 'столбец этапов потерял строку')
+
+  // Этап, закрытый работой, строки не получает: пустая строка — не «работы не было».
+  const worked = shapeStages({ stages: [{ id: 'impl', state: 'done', attempts: [] }] }).stages[0]
+  assert.equal(worked.nothingText, '')
+  assert.equal(compactStageView(worked).nothingText, '')
+  // Причина без слов (старый факт) не выдумывается: `nothing_reason` пустой.
+  const bare = shapeStages({ stages: [{ id: 'impl', state: 'done', nothing_reason: '  ' }] }).stages[0]
+  assert.equal(bare.nothingText, '')
+})
+
 test('слова вместо машинных значений: исход попытки, причина закрытия, статус дела', () => {
   // Исход попытки в ленте этапа — словом, а не значением store.
   const detail = {

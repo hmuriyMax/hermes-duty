@@ -1767,6 +1767,13 @@ function shapeStage(stage, journal, lead) {
     addedBy,
     addedByText: addedBy ? `добавлен ${addedBy === 'lead' ? 'лидом' : `ролью ${addedBy}`}` : '',
     reason: String(s.reason || ''),
+    // «Работы не было» (`stagefeed.stages.nothing_reason`): этап пройден, а работы
+    // в нём не нашлось — правок не требовалось. Это исход, а не провал, поэтому
+    // слова идут отдельным полем, а не выводятся из текста `reason`: провал
+    // печатается красным, а пустота — обычной строкой под этапом.
+    nothingText: String(s.nothing_reason || '').trim()
+      ? `работы не было: ${String(s.nothing_reason).trim()}`
+      : '',
     waits,
     waitKind: kind,
     questionId,
@@ -1978,6 +1985,10 @@ function compactStageView(stage) {
     // дело может стоять на человеке, и это не деталь.
     waitText: String(s.waitText || ''),
     waitHref: String(s.questionHref || ''),
+    // «Работы не было» — видимая строка пройденного этапа (шейпер `shapeStage`):
+    // дело, где править было нечего, не должно выглядеть одинаково с делом, где
+    // этап просто закрыт.
+    nothingText: String(s.nothingText || ''),
     openByDefault: open,
     toggleTitle: `${open ? 'свернуть' : 'развернуть'} попытки этапа ${name}`,
   }
@@ -4522,6 +4533,7 @@ const CSS = `
    расхождение «этап идёт, а лида нет»: заметнее обычного слова журнала. */
 .duty-stage-lead{margin-left:0;padding:2px 2px 4px 12px;font-size:11px;color:var(--ui-text-tertiary);word-break:break-word}
 .duty-stage-lead.is-warn{color:var(--ui-yellow);font-weight:600}
+.duty-stage-note{margin-left:0;padding:2px 2px 4px 12px;font-size:11px;color:var(--ui-text-tertiary);word-break:break-word}
 .duty-tabs{display:flex;gap:2px;margin-left:6px}
 .duty-tab{height:22px;padding:0 9px;border-radius:999px;border:1px solid transparent;background:transparent;color:var(--ui-text-tertiary);font:inherit;font-size:11px;cursor:pointer;white-space:nowrap}
 .duty-tab:hover{background:color-mix(in srgb, var(--ui-text-primary) 8%, transparent);color:var(--ui-text-primary)}
@@ -5503,6 +5515,11 @@ function CompactStages({ feed, timeline }) {
           view.waitHref ? h('a', { href: view.waitHref }, view.waitText) : view.waitText,
         ),
       )
+    }
+    // «Работы не было» — исход пройденного этапа, а не провал: строка видна, но
+    // не жёлтая (`duty-stage-wait` — там ждут человека) и не красная.
+    if (view.nothingText) {
+      children.push(h('div', { key: 'nothing', className: 'duty-stage-note' }, view.nothingText))
     }
     if (!bars.length && open) children.push(h('div', { key: 'none', className: 'duty-muted duty-att-none' }, 'попыток нет'))
     if (open) {

@@ -1534,3 +1534,60 @@ test('веб: отказ плана стоит под графом, раскры
   const clean = await renderDealPanel(detail, attempts)
   assert.equal(clean.querySelector('[data-key="fact:plan"]'), null, 'строка отказа нарисована без отказа')
 })
+
+test('веб: пройденный без работы этап назван словами под строкой', async (t) => {
+  // Дело d_12d5fc44: этап fix прошёл, а править в нём было нечего. Экран обязан
+  // сказать это словами с причиной — «готово» без объяснения читалось как
+  // «работа сделана», и лид искал правку, которой не было.
+  if (!jsdomRoot()) return t.skip('нет jsdom в ~/.hermes/hermes-agent/node_modules')
+  const at = DEAL_T0 + 480
+  const detail = {
+    id: DEAL_ID,
+    title: 'аудит тикета',
+    repo: '/x/hermes-duty',
+    status: 'running',
+    terminal: false,
+    now: at,
+    created_at: DEAL_T0,
+    timeline: [{ kind: 'created', at: DEAL_T0, summary: '' }],
+    stages: [
+      {
+        id: 'fix',
+        title: 'Правка по расхождениям',
+        kind: 'agent',
+        role: 'implementer',
+        state: 'done',
+        needs: [],
+        nothing_reason: 'research ответил: расхождений с тикетом нет',
+        attempts: [
+          {
+            n: 1,
+            run_id: `${DEAL_ID}:fix#1`,
+            stage: 'fix',
+            outcome: 'done',
+            started_at: DEAL_T0 + 1,
+            finished_at: at,
+            duration_sec: 479,
+          },
+        ],
+      },
+    ],
+  }
+  const attempts = {
+    now: at,
+    attempts: [{ stage: 'fix', attempt: 1, start: DEAL_T0 + 1, end: at, status: 'done', outcome: 'done', duration_sec: 479 }],
+  }
+
+  const doc = await renderDealPanel(detail, attempts)
+
+  const block = doc.querySelector('.stage-block')
+  assert.ok(block, 'этапа нет на экране')
+  const note = block.querySelector('.stage-note')
+  assert.ok(note, 'под этапом нет строки «работы не было»')
+  assert.equal(note.textContent, 'работы не было: research ответил: расхождений с тикетом нет')
+  // Это не провал: бейдж этапа зелёный и называет этап пройденным.
+  const badge = block.querySelector('.badge')
+  assert.equal(badge.textContent, 'пройден', `состояние этапа: ${badge.textContent}`)
+  assert.ok(badge.className.includes('t-green'), `этап без работы покрашен как провал: ${badge.className}`)
+  assert.equal(block.querySelectorAll('.stage-wait').length, 0, 'пустота выдана за ожидание')
+})

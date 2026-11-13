@@ -1007,6 +1007,8 @@ def create_deal(
     spec_path: Optional[str] = None,
     external_ref: Optional[str] = None,
     dedup_window: Optional[int] = None,
+    park_kind: Optional[str] = None,
+    park_reason: str = "",
     now: Optional[int] = None,
 ) -> dict[str, Any]:
     """Завести своё дело: строка store плюс событие `created` в одной транзакции.
@@ -1015,6 +1017,16 @@ def create_deal(
     закрыты, иначе `todo` (`docs/OWNERSHIP.md`: «`ready` ставится, когда все
     родители `done`»). Родитель, которого нет, или родитель из пространства
     `t_…` — ошибка входа, а не 500: гейт обязан считаться по своим делам.
+
+    `park_kind` — завести дело СРАЗУ запаркованным (`blocked`), не выпуская его
+    в очередь ни на миг. Двух вызовов (`create`, потом `block`) для этого мало:
+    диспетчер ходит раз в минуту и поднимает лида всякому незакрытому делу, так
+    что между ними дело успевает начаться — а начатое дело предложением уже не
+    считается (маркер предложения требует «ни разу не начиналось»). Парковка
+    пишется тем же событием-фактом, что у `set_blocked` (`blocked` с
+    `block_kind`), но внутри транзакции создания: снаружи видно либо дело
+    `blocked` с парковкой, либо ничего. `park_reason` — причина парковки, она же
+    текст вопроса человеку.
 
     `repo` — репозиторий дела (группировка, не адрес): вызывающий вычисляет его
     из `spec.repo`, иначе из явного `--repo`, иначе оставляет `NULL` — «репозиторий
@@ -1160,9 +1172,35 @@ def create_deal(
                 "INSERT INTO deal_links (parent_id, child_id) VALUES (?, ?)", (parent_id, deal_id)
             )
         status = "ready" if gate_open(conn, deal_id) else "todo"
+        events = [created]
+        if park_kind is not None:
+            # Парковка при создании: дело не выходит в очередь вовсе, поэтому
+            # статус считается здесь и `ready`/`gate_opened` уже не пишутся —
+            # при запаркованном деле «гейт открыт» ничего не значит, работа не
+            # начнётся, пока человек не снимет парковку.
+            status = "blocked"
+            block_kind = " ".join(str(park_kind).split()) or "needs_input"
+            text = " ".join(str(park_reason).split())
+            events.append(
+                _event(
+                    deal,
+                    "blocked",
+                    {"block_kind": block_kind, "reason": text, "author": source},
+                    source,
+                    {
+                        "kind": block_kind,
+                        "reason": text,
+                        "author": source,
+                        # Якорь — снимок создания: он последний факт другого
+                        # класса, и повтор создания с теми же аргументами
+                        # схлопнется по ключу, а не запишет вторую парковку.
+                        "anchor": str(created["idempotency_key"]),
+                    },
+                    now,
+                )
+            )
         _set_status(conn, deal, status, now)
         created["payload"]["status"] = status
-        events = [created]
         if status == "ready" and parent_ids:
             # Гейт был открыт уже в момент создания, и переход пишется фактом
             # рядом со снимком `created`: по одному снимку «родители были» нельзя

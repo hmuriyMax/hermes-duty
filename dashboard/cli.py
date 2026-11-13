@@ -588,6 +588,18 @@ def build_parser() -> argparse.ArgumentParser:
             "не дублируется, закрытое — не воскрешается"
         ),
     )
+    create.add_argument(
+        "--park-kind",
+        help=(
+            "завести дело сразу запаркованным (blocked) с этим block_kind, например "
+            "proposal: дело не выйдет в очередь ни на миг, лид по нему не поднимется"
+        ),
+    )
+    create.add_argument(
+        "--park-reason",
+        default="",
+        help="причина парковки при создании (с `--park-kind`); она же текст вопроса человеку",
+    )
 
     comment = command("comment", "комментарий в своё дело")
     comment.add_argument("deal_id")
@@ -2688,6 +2700,16 @@ def main(argv: Optional[list[str]] = None) -> int:
                 request["assignee"] = args.assignee
             if args.external_ref:
                 request["external_ref"] = args.external_ref
+            if args.park_kind:
+                # Парковка при создании: дело заводится blocked в одной
+                # транзакции, поэтому диспетчер не успевает поднять по нему лида
+                # (предложение stack-improver обязано лежать и ждать человека).
+                request["park_kind"] = args.park_kind
+                request["park_reason"] = args.park_reason or ""
+            elif args.park_reason:
+                print("! --park-reason без --park-kind: причина без парковки не значит ничего",
+                      file=sys.stderr)
+                return EXIT_SOURCE
             if args.spec:
                 # Путь разворачивается здесь, как у `duty spec check`: store
                 # принимает только абсолютный, иначе «откуда взялась спека» не

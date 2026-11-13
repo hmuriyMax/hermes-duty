@@ -2664,6 +2664,14 @@ def deals_create(home: Path, payload: dict[str, Any], *, source: str = "api") ->
     dedup_window = payload.get("dedup_window")
     if dedup_window is not None and (not isinstance(dedup_window, int) or isinstance(dedup_window, bool)):
         raise deals.DealError("create: 'dedup_window' — целое число секунд или null")
+    park_kind = payload.get("park_kind")
+    if park_kind is not None and not isinstance(park_kind, str):
+        raise deals.DealError(
+            "create: 'park_kind' — строка (block_kind парковки, например proposal) или null"
+        )
+    park_reason = payload.get("park_reason")
+    if park_reason is not None and not isinstance(park_reason, str):
+        raise deals.DealError("create: 'park_reason' — строка (причина парковки)")
     conn = _store_for_write(home)
     try:
         return _mutation(
@@ -2681,6 +2689,8 @@ def deals_create(home: Path, payload: dict[str, Any], *, source: str = "api") ->
                 spec_path=spec,
                 external_ref=external_ref,
                 dedup_window=dedup_window,
+                park_kind=park_kind,
+                park_reason=str(park_reason or ""),
             ),
         )
     finally:

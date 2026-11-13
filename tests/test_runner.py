@@ -1284,6 +1284,70 @@ def test_written_result_is_not_rescued(tmp_path: Path) -> None:
     assert "commented" not in kinds(conn, deal)
 
 
+def test_unescaped_quote_report_is_rescued_as_prose(tmp_path: Path) -> None:
+    """Отчёт с неэкранированной кавычкой не разбирается — его проза ложится файлом.
+
+    Кейс d_f50a120f research#1: 25 200 206 токенов работы, вердикт текстом, JSON
+    невалиден (неэкранированную кавычку не берёт никакой `json.loads`), и в папке
+    попытки не оставалось ничего. Теперь последняя реплика — `report.txt`,
+    причина отказа называет путь («отчёт не в форме», а не «работы не было»), а
+    путь уезжает в `previous_failures` следующей попытки.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = write_spec(
+        tmp_path,
+        """
+        duty: probe
+        stages:
+          - id: impl
+            role: implementer
+            workspace: none
+            retry: {max: 1, on: [infra, contract]}
+        """,
+    )
+    said = 'Итог разведки:\n{"status": "done", "summary": "проверил "шапку" — всё зелено"}'
+    fake = Fake(result=None, exit_code=0, lines=[{"type": "text", "text": said}])
+
+    report = runner.run_attempts(conn, spec, deal, "impl", 1, home=home, spawn=fake, clock=lambda: NOW)
+
+    assert (report["outcome"], report["kind"], report["attempt"]) == ("failed", "contract", 2)
+    prose = runner.result_path(runner.attempt_dir(home, deal, "impl", 1)).parent / runner.REPORT_TXT
+    assert prose.read_text(encoding="utf-8") == said + "\n", "проза попытки — файлом, а не пустая папка"
+    ended = [item for item in events(conn, deal) if str(item["kind"]) == "attempt_ended"][0]["payload"]
+    assert "отчёт не в форме" in ended["reason"]
+    assert str(prose) in ended["reason"], "причина называет путь, а не «работы не было»"
+    command = fake.calls[1]["cmd"]
+    contract = json.loads(Path(command[command.index("--query-file") + 1]).read_text(encoding="utf-8"))
+    assert str(prose) in contract["previous_failures"][0]["reason"]
+
+
+def test_fenced_report_with_prose_is_rescued(tmp_path: Path) -> None:
+    """Отчёт в фенсе с пояснением до и после объекта — спасён, перевод строки тоже.
+
+    Два отказа разбора в одном ответе: проза внутри фенса и управляющий символ в
+    `summary` (строгий `json.loads` такие строки не берёт). Срез от первой `{` до
+    последней `}` и `strict=False` возвращают отчёт файлом — попытка
+    закрывается своим вердиктом, а не контрактом.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = plan_spec(tmp_path)
+    expected = dict(RESCUE_REPORT)
+    expected["summary"] = "разведка\nзавершена, план готов"
+    body = json.dumps(expected, ensure_ascii=False).replace("\\n", "\n")
+    said = f"Проверяю заметку.\n```json\nВот отчёт:\n{body}\nБольше ничего не нашлось.\n```\n"
+    fake = Fake(result=None, exit_code=0, lines=[{"type": "text", "text": said}])
+
+    report = run_stage(conn, spec, deal, home, fake)
+
+    assert (report["outcome"], report["kind"]) == ("done", None)
+    result_file = runner.result_path(runner.attempt_dir(home, deal, "plan", 1))
+    assert json.loads(result_file.read_text(encoding="utf-8")) == expected
+
+
 def test_plan_contract_teaches_the_proposal_form(tmp_path: Path) -> None:
     """Границы этапа плана называют форму предложения — до первого отказа хартии.
 

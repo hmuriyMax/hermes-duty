@@ -119,7 +119,7 @@ charter:
   allowed_roles: [researcher, implementer, tester, reviewer, documenter, publisher]
   allowed_kinds: [agent, shell, gate]
   max_stages: 12          # потолок плана
-  max_attempts: 3         # попыток на этап, включая авто-повторы
+  max_attempts: 5         # попыток на этап, включая авто-повторы
   max_lead_resumes: 6     # сколько раз супервизор поднимает упавшего лида
   plan_gate: {min_stages: 5, budget_share: 0.3}
   publish: {human_gate: true, reviewer_role: reviewer}
@@ -229,13 +229,13 @@ charter:
       allowed_roles: [researcher, implementer, tester, reviewer, documenter]
       allowed_kinds: [agent, shell, gate]
       plan_gate: {min_stages: 6, budget_share: 0.6}
-      max_attempts: 3         # 2.0: попыток на этап, включая авто-повторы
+      max_attempts: 5         # 2.0: попыток на этап, включая авто-повторы
       max_lead_resumes: 6     # 2.0: сколько раз супервизор поднимает лида
       publish: {human_gate: true, reviewer_role: reviewer, plan: false}   # 2.0
 
 - **Нет блока** — годная спека с дефолтами: `max_stages: 12`,
   `max_rounds_replan: 3`, `allowed_roles: []`, `allowed_kinds: [agent, shell, gate]`,
-  `plan_gate` выключен (`min_stages: 0`, `budget_share: 0`), `max_attempts: 3`,
+  `plan_gate` выключен (`min_stages: 0`, `budget_share: 0`), `max_attempts: 5`,
   `max_lead_resumes: 6`,
   `publish: {human_gate: true, reviewer_role: reviewer, plan: false}`.
   Это поведение 0.0.8: старые спеки и старые дела работают без правок файла.
@@ -388,7 +388,7 @@ charter:
 | `needs` | `[]` | этапы-предшественники: этап начинается, когда они закончены |
 | `parallel_with` | `[]` | этапы, которые можно вести одновременно (порядок не задаёт); сразу идут не больше `MAX_PARALLEL` (2) — см. «Два этапа одновременно» |
 | `evidence` | `[]` | список `{cmd, must, timeout_sec}`: что движок проверит сам |
-| `retry` | `{max: 1, on: [infra]}` | `{max, on}`: сколько раз повторять и на каких классах отказов. Повторяет движок сам, и только `infra`/`contract` — `capability` не повторяется никогда (`AUTO_ON` в `dashboard/failures.py`, `docs/ENGINE-2.0.md`, раздел 7). `on` набор **сужает**, но не расширяет: `retry.on: [capability]` повторов не включает. Класс без объявления не повторяется; `max: 0` — повторов нет, первый отказ паркует дело (`docs/JOURNAL.md`) |
+| `retry` | `{max: 4, on: [infra]}` | `{max, on}`: сколько раз повторять и на каких классах отказов. Повторяет движок сам, и только `infra`/`contract` — `capability` не повторяется никогда (`AUTO_ON` в `dashboard/failures.py`, `docs/ENGINE-2.0.md`, раздел 7). `on` набор **сужает**, но не расширяет: `retry.on: [capability]` повторов не включает. Класс без объявления не повторяется; `max: 0` — повторов нет, первый отказ паркует дело (`docs/JOURNAL.md`) |
 | `budget` | нет | `{tokens, minutes}`: бюджет одной попытки (у дела — свой потолок, см. «`budget` в корне») |
 | `ask` | нет | адрес вопросов: `{allowed, to_human, max_hops}` либо `{q, options, risky}` (у `gate` — только `{q, options}`) |
 | `allow` | все `ask.options` | только `kind: gate`: ответы, которые считают этап продолжением; ответ вне списка — отказ `contract` |

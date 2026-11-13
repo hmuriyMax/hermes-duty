@@ -2066,7 +2066,7 @@ def failure_log(home: Path, deal_id: str) -> dict[str, Any]:
                 "at": at,
                 "attempts": attempts_of_class,
                 "limit": failures.park_limit(rule, policy) if rule else policy.max,
-                "counter": failures.counter(kind, attempts_of_class, policy.max),
+                "counter": failures.counter(kind, attempts_of_class, failures.limit_for(policy, kind)),
                 "retry_at": None if rule else failures.retry_at(attempts_of_class, at),
                 "park": rule,
                 "reason": str(item.get("reason") or ""),

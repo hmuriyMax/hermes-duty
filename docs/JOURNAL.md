@@ -586,10 +586,10 @@ approved_commit}`.
 
 | источник | класс | повторяется по умолчанию | что видно человеку |
 |---|---|---|---|
-| таймаут попытки | `infra` | да, `max: 1` | `attempt_ended.kind=infra`, `reason` с пределом времени |
-| код выхода ≠ 0 без `result.json` | `infra` | да, `max: 1` | `kind=infra`, `reason` с кодом выхода |
-| спавн вернул ошибку (нет процесса) | `infra` | да, `max: 1` | `kind=infra`, текст ошибки спавна |
-| шаг-команда умер от сигнала (`shell`, код `128 + N` или отрицательный) | `infra` | да, `max: 1` | `kind=infra`, `reason` вида «команда не дожила: код 143 (сигнал 15)» и `details.signal: 15` |
+| таймаут попытки | `infra` | да, `max: 4` | `attempt_ended.kind=infra`, `reason` с пределом времени |
+| код выхода ≠ 0 без `result.json` | `infra` | да, `max: 4` | `kind=infra`, `reason` с кодом выхода |
+| спавн вернул ошибку (нет процесса) | `infra` | да, `max: 4` | `kind=infra`, текст ошибки спавна |
+| шаг-команда умер от сигнала (`shell`, код `128 + N` или отрицательный) | `infra` | да, `max: 4` | `kind=infra`, `reason` вида «команда не дожила: код 143 (сигнал 15)» и `details.signal: 15` |
 | шаг-команда: сломан инструмент проверки (`shell`, подпись из `TOOLCHAIN_SIGNATURES` в stderr) | `capability` | нет | `kind=capability`, `reason` называет подпись, `details.stderr_head` — первые ~300 знаков stderr |
 | код 0 и `result.json` нет | `contract` | нет | `kind=contract`, где искали файл |
 | `status: "refused"` | `contract` | нет | `kind=contract`, `summary` исполнителя |
@@ -600,7 +600,7 @@ approved_commit}`.
 | класс не определён | `UNCLASSIFIED` | нет | `kind` пуст: честное «класса нет», а не догадка |
 
 Лимиты — в спеке этапа: `retry: {max: N, on: [infra, contract]}`; умолчание
-`{max: 1, on: [infra]}` (`docs/SPEC.md`). Счётчик — **на этап и на класс**:
+`{max: 4, on: [infra]}` (`docs/SPEC.md`). Счётчик — **на этап и на класс**:
 два отказа `contract` не съедают лимит `infra`. Исчерпание даёт `failed(kind)` в
 срезе и **парковку** дела, а не новый круг. Объявленный набор (`retry.on`)
 **сужает** набор движка (`failures.AUTO_ON` — `infra`, `contract`), но не

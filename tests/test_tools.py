@@ -481,7 +481,7 @@ def test_start_refuses_past_the_default_ceiling_without_a_charter(tmp_path: Path
     )
     conn = open_store(home)
     deal = make_deal(conn, spec)
-    for attempt in (1, 2, 3):
+    for attempt in (1, 2, 3, 4, 5):
         append(
             conn,
             deal,
@@ -499,11 +499,11 @@ def test_start_refuses_past_the_default_ceiling_without_a_charter(tmp_path: Path
 
     assert spec.charter.declared is False, "спека без блока `charter`"
     reason = refusal(
-        tools.start, str(deal["id"]), "impl", "start-4", home=home, spawn=fake_spawn(spawned), ack_sec=0
+        tools.start, str(deal["id"]), "impl", "start-6", home=home, spawn=fake_spawn(spawned), ack_sec=0
     )
 
-    assert "попыток 3 из 3" in reason
-    assert "потолком по умолчанию 3" in reason
+    assert "попыток 5 из 5" in reason
+    assert "потолком по умолчанию 5" in reason
     assert "`charter` не объявлен" in reason
     assert "хартией" not in reason
     assert spawned == []

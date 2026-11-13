@@ -360,7 +360,12 @@ def test_unknown_verdict_kind_reads_contract() -> None:
 
 
 def test_policy_default_matches_the_contract(tmp_path: Path) -> None:
-    """Этап без `retry` живёт по умолчанию: `{max: 1, on: [infra]}`."""
+    """Этап без `retry` живёт по умолчанию: `{max: 4, on: [infra]}`.
+
+    Четыре повтора — это пять попыток этапа, ровно `spec.DEFAULT_MAX_ATTEMPTS`:
+    класс `infra` не должен упираться в один повтор, иначе потолок хартии
+    недостижим, а исчерпанная серия уходит лиду вместо повтора на месте.
+    """
     spec = write_spec(
         tmp_path,
         """
@@ -373,7 +378,7 @@ stages:
 
     policy = failures.policy(stage_of(spec))
 
-    assert (policy.max, policy.on) == (1, ("infra",))
+    assert (policy.max, policy.on) == (4, ("infra",))
     assert policy.allows("infra") and not policy.allows("contract")
 
 
@@ -916,11 +921,11 @@ def test_plan_stage_never_rethinks_itself(tmp_path: Path) -> None:
     conn = open_store(home)
     deal = make_deal(conn)
     spec = plan_impl_spec(tmp_path)
-    failed_attempt(conn, deal, 1, "infra", stage="plan")
-    failed_attempt(conn, deal, 2, "infra", stage="plan")
+    for attempt in range(1, 6):
+        failed_attempt(conn, deal, attempt, "infra", stage="plan")
 
     report = runner.park_exhausted(
-        conn, spec, deal, stage_of(spec, "plan"), 2, "infra", "упал", home=home, clock=lambda: NOW
+        conn, spec, deal, stage_of(spec, "plan"), 5, "infra", "упал", home=home, clock=lambda: NOW
     )
 
     assert report is not None

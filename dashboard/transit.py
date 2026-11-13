@@ -1793,7 +1793,11 @@ def next_stage(spec: Any, events: Iterable[Any], now: Any) -> Decision:
             WAIT_RETRY,
             "этап {!r}: пауза перед повтором после отказа {}, повтор не раньше чем через {}с".format(
                 stage.id,
-                failures.counter(node.fail_kind, node.failures.get(node.fail_kind, 0), failures.policy(stage).max),
+                failures.counter(
+                    node.fail_kind,
+                    node.failures.get(node.fail_kind, 0),
+                    failures.limit_for(failures.policy(stage), node.fail_kind),
+                ),
                 max(0, until - seconds),
             ),
             retry_at=until,

@@ -466,3 +466,46 @@ def test_attempt_process_leads_the_retry_series(tmp_path: Path, monkeypatch: Any
     assert seen["idem"] == "ключ-лида", "ключ лида доезжает до первой попытки серии"
     assert seen["answer"] is None
 
+def test_default_policy_retries_in_the_same_stage_up_to_five_attempts(tmp_path: Path) -> None:
+    """Умолчание — пять попыток этапа НА МЕСТЕ, а не новый этап после двух.
+
+    Живое дело `d_a8213c01`: две попытки `docs` убил дренаж гейтвея, класс `infra`
+    исчерпался за один повтор, и лид завёл новый id `docs2` — старый этап остался
+    в графе упавшим. Умолчание политики (4 повтора) и потолок хартии (5 попыток)
+    согласованы, поэтому исчерпание серии требует пяти падений подряд.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = write_spec(
+        tmp_path,
+        """
+        duty: потолок по умолчанию
+        stages:
+          - id: impl
+            role: implementer
+            workspace: none
+        """,
+    )
+    fake = Fake(exit_code=1)
+
+    report = runner.run_attempts(conn, spec, deal, "impl", 1, home=home, spawn=fake, clock=lambda: NOW)
+
+    assert spec_module.attempts_ceiling(spec) == 5, "потолок по умолчанию — пять попыток"
+    assert (report["attempt"], report["retries"]) == (5, 4)
+    assert report["retry"] is False
+    assert [row["attempt"] for row in attempts_started(conn, deal)] == [1, 2, 3, 4, 5]
+
+
+def test_counter_limit_names_the_class_that_has_no_retries(tmp_path: Path) -> None:
+    """Счётчик отказа показывает предел ЭТОГО класса: `contract` без повторов — 1/1.
+
+    `policy.max` в счётчике — число повторов объявленного класса; у класса, которого
+    нет в `on`, повторов нет вовсе, и «1/4 contract» обещало бы второй шанс, которого
+    движок не даст.
+    """
+    policy = failures.Policy(max=4, on=(failures.INFRA,))
+
+    assert failures.limit_for(policy, failures.INFRA) == 4
+    assert failures.limit_for(policy, failures.CONTRACT) == 1
+    assert failures.counter(failures.CONTRACT, 1, failures.limit_for(policy, failures.CONTRACT)) == "1/1 contract"

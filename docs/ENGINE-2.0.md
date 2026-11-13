@@ -99,7 +99,7 @@ charter:
   allowed_roles: [researcher, planner, implementer, tester, reviewer, documenter, publisher, staging-tester]
   allowed_kinds: [agent, shell, gate]
   max_stages: 12          # потолок плана
-  max_attempts: 3         # попыток на этап (включая авто-повторы)
+  max_attempts: 5         # попыток на этап (включая авто-повторы)
   max_lead_resumes: 6     # сколько раз супервизор поднимает упавшего лида
   plan_gate: {min_stages: 5, budget_share: 0.3}
   publish: {human_gate: true, reviewer_role: reviewer}  # кто одобряет публикацию и спрашивают ли человека (§8)
@@ -666,7 +666,7 @@ charter:
 
 - бюджет дела — в хартии, проверяется в `duty_start` и в попытке;
 - `max_stages` (12) — потолок плана, проверяет `parse_plan`;
-- `max_attempts` (3) на этап считает движок, включая авто-повторы: `duty_start`
+- `max_attempts` (5) на этап считает движок, включая авто-повторы: `duty_start`
   отказывает, когда серия этапа исчерпана («попыток N из M»), а `run_attempts` не
   поднимает повтор за потолком хартии — `retry.max` этапа только сужает серию
   внутри этого потолка;

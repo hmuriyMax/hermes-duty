@@ -151,19 +151,37 @@ function stateMeta(state, humanKind) {
 }
 
 
+// Роль координатора и профиль, под которым она живёт: отдельного профиля
+// `coordinator` в Hermes нет (`dashboard/spec.py`, `PROFILE_ALIASES`), процесс
+// координатора — это профиль `lead`. `lead` в списке — прежняя роль координатора:
+// seed-спеки до переименования читаются дальше (`COORDINATOR_ROLES`).
+const COORDINATOR_ROLE = 'coordinator'
+const LEAD_PROFILE = 'lead'
+const LEAD_ROLES = [COORDINATOR_ROLE, LEAD_PROFILE]
+// Подпись исполнителя координаторского этапа: роль рядом с профилем, иначе
+// `coordinator` ищут в списке профилей Hermes и не находят.
+const LEAD_ROLE_LABEL = 'лид (координатор)'
+
 /**
- * Подпись профиля этапа: роль, а если спавнится другим профилем — пара.
+ * Подпись исполнителя этапа — одна на обе поверхности.
  *
- * `coordinator` в Hermes не существует: он живёт под профилем `lead`
- * (spec.PROFILE_ALIASES). Показывать только роль значило бы обещать профиль,
- * которого нет, — подпись называет оба: `coordinator (профиль lead)`.
+ * Веб берёт этот файл как шейпер (`/web/hermes-duty/model.js`), десктоп носит его
+ * вшитым (`bin/duty-model-sync`), поэтому слова «кто исполняет этап» живут здесь,
+ * а не в разметке каждой поверхности.
+ *
+ * Роль `coordinator` исполняется профилем `lead`, поэтому подписана парой
+ * «лид (координатор)»: `coordinator` в Hermes не существует, а `lead` без роли не
+ * говорит, что это координатор дела. Остальные роли — имя профиля как есть
+ * (`implementer`, `reviewer`, `lead`); профиль не назван — говорим ролью, и только
+ * когда нет ни того, ни другого — «профиль».
  */
-function profileText(stage) {
-  const role = String((stage && stage.role) || '').trim()
-  const profile = String((stage && stage.profile) || '').trim()
-  if (!role && !profile) return 'профиль'
-  if (!profile || profile === role) return role || profile
-  return `${role} (профиль ${profile})`
+function executorText(stage) {
+  const s = stage && typeof stage === 'object' ? stage : {}
+  const role = String(s.role || '').trim()
+  const profile = String(s.profile || '').trim()
+  if (role === COORDINATOR_ROLE) return LEAD_ROLE_LABEL
+  if (profile) return profile
+  return role || 'профиль'
 }
 
 /** Русская форма числа: `1 вопрос`, `2 вопроса`, `5 вопросов`. */
@@ -1511,15 +1529,44 @@ function shapeStageAttempt(attempt, events) {
 }
 
 /**
+ * Состояние лида рядом с этапом, который лид исполняет.
+ *
+ * `lead` — блок `lead` ответа `/deal`, уже снятый `shapeLead` с проекции
+ * `dashboard/leadfeed.status`: состояние лида здесь не пересчитывается и процесс
+ * не спрашивается, шейпер только ставит слово рядом с этапом.
+ *
+ * Идущий этап координатора без живого лида — расхождение, а не два факта рядом:
+ * «этап идёт» и «лид отсутствует» отдельными строками читались бы как
+ * противоречие (живое дело `d_12d5fc44`: шапка говорила «лида нет», этап — «идёт»).
+ * Поэтому такая пара называется одной фразой. Остальные состояния называются
+ * словом бэкенда («лид: жив», «лид: отсутствует · резюм 2 из 6»).
+ *
+ * Этап не координаторский — `null`: у чужих этапов лид дела не исполнитель, и
+ * строка «лид: …» рядом с ними была бы шумом.
+ */
+function leadNoteOf(stage, lead) {
+  const s = stage && typeof stage === 'object' ? stage : {}
+  const block = lead && typeof lead === 'object' ? lead : null
+  if (!block) return null
+  if (!LEAD_ROLES.includes(String(s.role || '').trim())) return null
+  const evidence = String(block.evidence || '') || 'состояние лида по журналу'
+  if (String(s.state || '') === 'running' && block.state !== 'live') {
+    return { text: 'лид не запущен, а этап идёт', warn: true, title: evidence }
+  }
+  return { text: String(block.text || ''), warn: false, title: evidence }
+}
+
+/**
  * Этап дела: имя, роль, состояние, номер попытки, ожидание, попытки, evidence.
  *
  * Ожидание вопроса вынесено отдельной строкой с `question_id` и ссылкой на
  * панель пула (`/imsg`): вопрос живёт там, где на него отвечают, а лента — нет.
  * Своей кнопки «ответить»/«перезапустить» экран не заводит: он ничего не решает.
  */
-function shapeStage(stage, journal) {
+function shapeStage(stage, journal, lead) {
   const s = stage && typeof stage === 'object' ? stage : {}
   const byAttempt = journal && typeof journal.get === 'function' ? journal : null
+  const leadNote = leadNoteOf(s, lead)
   const meta = stageMeta(s.state)
   const waits = s.waits && typeof s.waits === 'object' ? s.waits : null
   const needs = (Array.isArray(s.needs) ? s.needs : []).map(String)
@@ -1560,6 +1607,12 @@ function shapeStage(stage, journal) {
     // значок графа берут его отсюда, а не угадывают по имени этапа.
     kind: String(s.kind || 'agent'),
     role: String(s.role || '—'),
+    // Профиль Hermes, под которым этап спавнится (`stagefeed.stages`): подпись
+    // исполнителя (`executorText`) называет его, а не угадывает по имени этапа.
+    profile: String(s.profile || ''),
+    // Состояние лида рядом с координаторским этапом (`leadNoteOf`): `null` — этап
+    // исполняет не лид дела (или блок лида не пришёл), и строки у этапа нет.
+    leadNote,
     state: String(s.state || ''),
     stateLabel: meta.label,
     tone: meta.tone,
@@ -1630,7 +1683,15 @@ function shapeStages(payload) {
   // `timeline`. Раскладываем их по номеру попытки здесь, чтобы поверхность не
   // склеивала два источника сама.
   const journal = stageJournal(data.timeline)
-  const stages = (Array.isArray(data.stages) ? data.stages : []).map((stage) => shapeStage(stage, journal))
+  // Блок лида тот же, что читает шапка (`deal.lead` → `dashboard/leadfeed.status`):
+  // рядом с координаторским этапом он называется тем же словом, а не вторым
+  // расчётом состояния. У закрытого дела блока нет (`deal` = `null`), и строка у
+  // этапа не рисуется — выдумывать «лида нет» из отсутствия факта нельзя.
+  const leadBlock = data.deal && typeof data.deal === 'object' ? data.deal.lead : null
+  const lead = leadBlock ? shapeLead(leadBlock) : null
+  const stages = (Array.isArray(data.stages) ? data.stages : []).map((stage) =>
+    shapeStage(stage, journal, lead),
+  )
   const attempts = stages.reduce((sum, stage) => sum + stage.attemptsCount, 0)
   return {
     spec: String(data.spec || ''),
@@ -1747,17 +1808,23 @@ function compactStageView(stage) {
   const open = standing || failed
   const id = String(s.id || '—')
   const kind = String(s.kind || 'agent')
+  const leadNote = s.leadNote && typeof s.leadNote === 'object' ? s.leadNote : null
   return {
     id,
-    // Вид этапа: у агентских — роль (`implementer`), у остальных — сам вид
-    // (`shell`, `gate`) из спеки. Та же подпись, что у дорожки шкалы. Если роль
-    // спавнится чужим профилем (`coordinator` → `lead`), называем оба: иначе
-    // «профиль coordinator» ищут в Hermes и не находят.
-    kindText: kind === 'agent' ? profileText(s) : kind,
+    // Вид этапа: у агентских — подпись исполнителя (`executorText`: для
+    // координатора «лид (координатор)», иначе имя профиля), у остальных — сам вид
+    // (`shell`, `gate`) из спеки. Та же подпись, что у дорожки шкалы: одна
+    // функция на обе поверхности и на оба места.
+    kindText: kind === 'agent' ? executorText(s) : kind,
     attemptsText: count ? `${count} ${plural(count, 'попытка', 'попытки', 'попыток')}` : 'попыток нет',
     stateLabel: meta.label,
     tone: meta.tone,
     needsText: String(s.needsText || ''),
+    // Состояние лида — у координаторского этапа, а не только в шапке: человек
+    // ищет «кто сейчас работает» в списке этапов (`leadNoteOf`).
+    leadText: leadNote ? String(leadNote.text || '') : '',
+    leadWarn: leadNote ? leadNote.warn === true : false,
+    leadTitle: leadNote ? String(leadNote.title || '') : '',
     // Вопрос человеку остаётся видимой строкой под этапом, а не подсказкой:
     // дело может стоять на человеке, и это не деталь.
     waitText: String(s.waitText || ''),
@@ -1981,6 +2048,10 @@ const IDLE_LABEL_EDGE_PCT = 12
 // Уже этого промежуток не подписывается пилюлей — остаётся штрихование и
 // подсказка: пилюля шире среза и наезжала бы на соседний простой.
 const IDLE_LABEL_MIN_PCT = 4
+
+// Подпись внутри полосы захода лида («с нуля»/«резюм») ставится только там, где
+// она влезает: на узком срезе слово наезжало бы на соседний заход.
+const LEAD_LABEL_MIN_PCT = 5
 
 // Подпись и тон маркера: журнал назвал событие — экран назвал его тем же словом.
 // `tick` — тонкая засечка старта/закрытия попытки (их на оси много); остальные
@@ -2791,7 +2862,7 @@ function laneView(lane, bars, scale) {
   return {
     name: String((lane && lane.label) || '—'),
     kind: first ? String(first.kind || 'agent') : '',
-    kindText: first ? (first.kind === 'agent' ? profileText(first) : String(first.kind)) : '',
+    kindText: first ? (first.kind === 'agent' ? executorText(first) : String(first.kind)) : '',
     icon: first ? KIND_ICON[first.kind] || KIND_ICON.shell : '',
     meta,
     empty: list.length === 0,
@@ -3139,6 +3210,12 @@ function shapeDealTime(detail, attemptsPayload) {
       answer_text: e.answer_text ? String(e.answer_text) : '',
       cause: e.cause ? String(e.cause) : '',
       stages: Array.isArray(e.stages) ? e.stages.map(String) : [],
+      // Факты лида: режим, причина выхода, pid и код — из полей ответа
+      // (`plugin_api._timeline`), не из разбора `summary`.
+      mode: e.mode ? String(e.mode) : '',
+      reason: e.reason ? String(e.reason) : '',
+      pid: numOrNull(e.pid),
+      exit_code: numOrNull(e.exit_code),
     }
   })
   const closedInJournal = events.some((event) => markerType(event.kind, event.summary) === 'closed')
@@ -3480,6 +3557,92 @@ function shapeDealTime(detail, attemptsPayload) {
     }
   }
 
+  // Заходы лида: полосы на шкале, чтобы «кто ведёт дело» было видно во времени,
+  // а не только подписью в шапке. Пара фактов `lead_started`/`lead_resumed` →
+  // `lead_exited` — один заход; незакрытый тянется до `now` у живого дела, а у
+  // закрытого читается как «конец захода не записан» (обёртку убили снаружи,
+  // парного факта нет). Это отдельная дорожка, а не попытка этапа: у лида нет
+  // исхода этапа и нет вызовов, и подмешивать его в `attemptView` значило бы
+  // выдумать ему статус.
+  const leadRuns = []
+  {
+    let open = null
+    for (const event of events) {
+      const kind = event.kind
+      if (kind === 'lead_started' || kind === 'lead_resumed') {
+        // Два подъёма без выхода между ними — не норма, но журнал мог потерять
+        // факт: прежний заход закрывается началом следующего, без выдумки причины.
+        if (open) open.end = event.at
+        // Резюм приходит и видом факта (`lead_resumed`), и режимом подъёма
+        // (`lead_started` + mode=resume): журнал писал по-разному, а считать
+        // пробуждения надо одинаково.
+        const mode = String(event.mode || '')
+        open = {
+          start: event.at,
+          resumed: kind === 'lead_resumed' || mode === 'resume',
+          mode,
+          pid: numOrNull(event.pid),
+          reason: '',
+          exitCode: null,
+          end: null,
+        }
+        leadRuns.push(open)
+        continue
+      }
+      if (kind === 'lead_exited' && open) {
+        open.end = event.at
+        open.reason = String(event.reason || '')
+        open.exitCode = numOrNull(event.exit_code)
+        open = null
+      }
+    }
+  }
+  // Тон полосы — чем кончился заход: идёт — зелёный, штатный выход — синий,
+  // упёрся в часы — жёлтый, упал — красный, конец не записан — серый.
+  const LEAD_TONE = { exit: 'blue', overrun: 'yellow', crashed: 'red', process_gone: 'gray', idle: 'yellow' }
+  for (const run of leadRuns) {
+    const openNow = run.end === null || run.end === undefined
+    const stale = openNow && !live
+    const stop = openNow ? (live && now !== null ? now : null) : run.end
+    run.open = openNow && live
+    run.stale = stale
+    run.startPct = pctOf(run.start)
+    run.endPct = stop === null ? run.startPct : pctOf(stop)
+    run.widthPct = Math.max(BAR_MIN_PCT, Math.round((run.endPct - run.startPct) * 10) / 10)
+    run.durationSec = stop === null ? null : Math.max(0, stop - run.start)
+    run.clockStart = fmtClock(run.start)
+    run.clockEnd = stop === null ? '—' : fmtClock(stop)
+    run.modeText = run.resumed ? 'резюм' : run.mode === 'brief' ? 'с нуля' : run.mode || 'поднят'
+    run.tone = run.open
+      ? 'green'
+      : stale
+        ? 'gray'
+        : LEAD_TONE[run.reason] || 'blue'
+    // Слово внутри полосы — только там, где оно влезает: на узкой полосе подпись
+    // наезжала бы на соседнюю (та же мера, что у пилюль простоя).
+    run.label = run.modeText
+    run.labeled = run.widthPct >= LEAD_LABEL_MIN_PCT
+    const tail = run.open
+      ? 'идёт'
+      : stale
+        ? 'конец захода не записан'
+        : run.reason
+          ? `ушёл: ${run.reason}${run.exitCode ? ` (код ${run.exitCode})` : ''}`
+          : 'ушёл'
+    const interval = run.durationSec === null ? run.clockStart : `${run.clockStart}–${run.clockEnd} (${fmtDuration(run.durationSec)})`
+    run.title = `лид: поднят ${interval} · ${run.modeText}${run.pid ? `, pid ${run.pid}` : ''} · ${tail}`
+    run.ariaLabel = run.title
+  }
+  const leadResumes = leadRuns.filter((run) => run.resumed).length
+  const leadLane = {
+    runs: leadRuns,
+    count: leadRuns.length,
+    resumes: leadResumes,
+    text: leadRuns.length
+      ? `${leadRuns.length} ${plural(leadRuns.length, 'заход', 'захода', 'заходов')}${leadResumes ? ` · резюм ${leadResumes}` : ''}`
+      : 'заходов не было',
+  }
+
   // Шапка дела: числа из ответа, ни одного нового расчёта на бэкенде.
   const answered = markers.filter((marker) => marker.type === 'answer').length
   const waiting = pending.length
@@ -3621,7 +3784,7 @@ function shapeDealTime(detail, attemptsPayload) {
   return {
     now,
     live,
-    empty: bars.length === 0 && markers.length === 0,
+    empty: bars.length === 0 && markers.length === 0 && leadRuns.length === 0,
     // Карта оси — единственная формула координат: полосы, маркеры, засечки,
     // пауза вопроса и чипы вызовов (`attemptView` → `layoutCalls`) берут время
     // отсюда. Второй формулы нет: иначе сжатый простой развёл бы чип и маркер
@@ -3651,6 +3814,9 @@ function shapeDealTime(detail, attemptsPayload) {
     },
     lanes,
     bars,
+    // Заходы лида — отдельной дорожкой над этапами: полосы уже с координатами,
+    // поверхность только рисует (`leadLane.runs`).
+    leadLane,
     markers: groupedMarkers,
     waitSpans,
     // Сжатые промежутки оси — уже с координатами: поверхность ничего не считает.
@@ -3992,6 +4158,76 @@ function DutyAttemptRow({ view, callSel, onSelectCall, toolFilter }) {
   )
 }
 
+/** Дорожка лида: полосы заходов на оси — над этапами, потому что «кто ведёт дело»
+ *  отвечает первым. Лид не резидент: cron поднимает его, заход кончается выходом,
+ *  и полоса показывает ровно это (идёт/вышел/упал/конец не записан). */
+function DutyLeadLane({ leadLane }) {
+  const runs = (leadLane && leadLane.runs) || []
+  return h(
+    'div',
+    { className: 'duty-tl-lane duty-tl-lane-lead' },
+    h(
+      'div',
+      { className: 'duty-tl-lane-h' },
+      h(
+        'div',
+        { className: 'duty-tl-lane-id' },
+        h('span', { className: 'duty-tl-lane-name', title: 'лид: процесс, который ведёт дело' }, 'лид'),
+        h(
+          'span',
+          { className: 'duty-tl-kind duty-tl-kind-agent', title: 'профиль: lead' },
+          h('svg', { className: 'duty-tl-kind-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' }, h('path', { d: KIND_ICON.agent })),
+          'lead',
+        ),
+      ),
+      h('span', { className: 'duty-tl-lane-meta' }, leadLane ? leadLane.text : ''),
+    ),
+    runs.length
+      ? h(
+          'div',
+          { className: 'duty-tl-rows' },
+          h(
+            'div',
+            { className: 'duty-tl-row', style: { '--duty-tl-collapsed': '20px', '--duty-tl-full': '20px' } },
+            h(
+              'div',
+              { className: 'duty-tl-lbl', title: `${leadLane.text}: полоса на оси — заход лида, от подъёма до выхода` },
+              h('span', { className: 'duty-tl-n' }, '·'),
+              h('span', { className: 'duty-tl-st' }, 'заходы'),
+            ),
+            h(
+              'div',
+              { className: 'duty-tl-track' },
+              ...runs.map((run, index) => {
+                const color = TONE_COLOR[run.tone] || TONE_COLOR.gray
+                return h(
+                  'span',
+                  {
+                    key: `lead-run-${index}`,
+                    className: `duty-tl-lead-run${run.open ? ' is-open' : ''}${run.stale ? ' is-stale' : ''}`,
+                    // Штриховка «конец не записан» живёт в CSS: инлайновый фон её бы съел.
+                    style: run.stale
+                      ? { left: `${run.startPct}%`, width: `${run.widthPct}%` }
+                      : {
+                          left: `${run.startPct}%`,
+                          width: `${run.widthPct}%`,
+                          background: `color-mix(in srgb, ${color} 16%, transparent)`,
+                          borderColor: `color-mix(in srgb, ${color} 40%, transparent)`,
+                        },
+                    title: run.title,
+                    'aria-label': run.title,
+                    role: 'img',
+                  },
+                  run.labeled ? h('span', { className: 'duty-tl-lead-run-label' }, run.label) : null,
+                )
+              }),
+            ),
+          ),
+        )
+      : h('div', { className: 'duty-tl-empty' }, 'заходов не было'),
+  )
+}
+
 /** Дорожка этапа: имя, значок вида, сводка и строки попыток. */
 function DutyLane({ lane, bars, scale, callSel, onSelectCall, toolFilter }) {
   const view = laneView(lane, bars, scale)
@@ -4117,6 +4353,11 @@ const CSS = `
 /* Ожидание человека — видимой строкой под этапом: дело может стоять на нём. */
 .duty-stage-wait{margin-left:0;padding:2px 2px 4px 12px;font-size:11px;color:var(--ui-yellow);word-break:break-word}
 .duty-stage-wait a{color:var(--ui-yellow);text-decoration:underline}
+/* Состояние лида — той же видимой строкой у координаторского этапа: шапка
+   отвечает «кто ведёт дело» отдельно, а ищут это в списке этапов. is-warn —
+   расхождение «этап идёт, а лида нет»: заметнее обычного слова журнала. */
+.duty-stage-lead{margin-left:0;padding:2px 2px 4px 12px;font-size:11px;color:var(--ui-text-tertiary);word-break:break-word}
+.duty-stage-lead.is-warn{color:var(--ui-yellow);font-weight:600}
 .duty-tabs{display:flex;gap:2px;margin-left:6px}
 .duty-tab{height:22px;padding:0 9px;border-radius:999px;border:1px solid transparent;background:transparent;color:var(--ui-text-tertiary);font:inherit;font-size:11px;cursor:pointer;white-space:nowrap}
 .duty-tab:hover{background:color-mix(in srgb, var(--ui-text-primary) 8%, transparent);color:var(--ui-text-primary)}
@@ -4148,12 +4389,21 @@ const CSS = `
 .duty-deal-facts b{color:var(--ui-text-primary);font-weight:600}
 /* Лента решений лида: время · автор · решение. Время и автор — узкие колонки,
    текст забирает остаток, чтобы строки не плясали от слова к слову. */
-.duty-decisions-list{display:flex;flex-direction:column;gap:2px;max-height:320px;overflow-y:auto}
-.duty-dec-row{display:grid;grid-template-columns:58px 70px minmax(0,1fr);gap:8px;align-items:baseline;font-size:11.5px;padding:2px 0}
+.duty-decisions-list{display:flex;flex-direction:column;gap:2px;max-height:240px;overflow-y:auto}
+.duty-dec-row{display:grid;grid-template-columns:44px 12px 70px minmax(0,1fr);gap:8px;align-items:baseline;font-size:11.5px;padding:3px 0}
 .duty-dec-row+.duty-dec-row{border-top:1px solid var(--ui-stroke-tertiary)}
-.duty-dec-clock{font-size:11px;font-variant-numeric:tabular-nums;color:var(--ui-text-tertiary)}
-.duty-dec-author{font-size:10.5px;font-weight:650;text-transform:uppercase;letter-spacing:.02em}
-.duty-dec-text{color:var(--ui-text-primary);overflow-wrap:anywhere}
+.duty-dec-clock{font-size:11px;font-variant-numeric:tabular-nums;color:var(--ui-text-tertiary);text-align:right}
+.duty-dec-dot{width:7px;height:7px;border-radius:50%;align-self:center;background:var(--ui-text-tertiary)}
+.duty-dec-author{font-size:10.5px;font-weight:650;text-transform:uppercase;letter-spacing:.02em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.duty-dec-author.is-blank{visibility:hidden}
+.duty-dec-text{color:var(--ui-text-primary);overflow-wrap:anywhere;line-height:1.35}
+/* Заход лида на шкале: полоса от подъёма до выхода, тон — чем кончился заход.
+   «Конец не записан» отличается штриховкой: это не «шёл всё время», а потерянный
+   факт журнала (проба pid в leadfeed.open_pid). */
+.duty-tl-lead-run{position:absolute;top:1px;bottom:1px;border-radius:4px;display:flex;align-items:center;justify-content:center;overflow:hidden;background:color-mix(in srgb, var(--ui-text-tertiary) 18%, transparent);border:1px solid color-mix(in srgb, var(--ui-text-tertiary) 40%, transparent)}
+.duty-tl-lead-run.is-stale{border-style:dashed;background:repeating-linear-gradient(135deg, color-mix(in srgb, var(--ui-text-tertiary) 20%, transparent) 0 4px, transparent 4px 8px)}
+.duty-tl-lead-run.is-open{animation:duty-tl-live 2.8s ease-in-out infinite}
+.duty-tl-lead-run-label{font-size:9.5px;line-height:1;color:var(--ui-text-secondary);white-space:nowrap}
 /* Строка лида в ячейке состояния списка: вторичная подпись под бейджем — столбец
    «состояние» не должен менять ширину от длинного слова. */
 .duty-lead-note{display:block;margin-top:4px;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -5027,6 +5277,23 @@ function CompactStages({ feed, timeline }) {
         h('span', { className: 'duty-stage-row-tog' }, open ? '▾' : '▸'),
       ),
     ]
+    // Состояние лида — строкой у координаторского этапа, а не только в шапке:
+    // «кто сейчас работает» ищут в списке этапов. Слово то же, что у шапки
+    // (`leadfeed.status`), а расхождение «этап идёт, лида нет» называется одной
+    // фразой (`leadNoteOf` в шейпере), а не двумя спорящими фактами.
+    if (view.leadText) {
+      children.push(
+        h(
+          'div',
+          {
+            key: 'lead',
+            className: view.leadWarn ? 'duty-stage-lead is-warn' : 'duty-stage-lead',
+            title: view.leadTitle || 'состояние лида по журналу',
+          },
+          view.leadText,
+        ),
+      )
+    }
     // Ожидание человека остаётся видимой строкой: дело может стоять на нём.
     if (view.waitText) {
       children.push(
@@ -5138,9 +5405,12 @@ function DecisionsPanel({ items }) {
           'div',
           { className: 'duty-dec-row', key: row.key },
           h('span', { className: 'duty-dec-clock', title: row.ageText === '—' ? '' : `${row.ageText} назад` }, row.clock),
+          h('span', { className: 'duty-dec-dot', 'aria-hidden': 'true', style: { background: TONE_COLOR[row.tone] || TONE_COLOR.gray } }),
+          // Ячейка автора есть всегда, даже пустая: иначе текст съезжал в узкую
+          // колонку автора и рвался на 70 px в четыре строки.
           row.authorLabel
             ? h('span', { className: 'duty-dec-author', style: { color: TONE_COLOR[row.tone] || TONE_COLOR.gray }, title: row.author }, row.authorLabel)
-            : null,
+            : h('span', { className: 'duty-dec-author is-blank', 'aria-hidden': 'true' }, '·'),
           h('span', { className: 'duty-dec-text' }, row.text),
         ),
       ),
@@ -5423,6 +5693,7 @@ function ScalePanel({ scale, dealId, callSel, onSelectCall, toolFilter, onToggle
           h(
             'div',
             { className: 'duty-tl-lanes' },
+            h(DutyLeadLane, { key: 'lane-lead', leadLane: scale.leadLane }),
             ...scale.lanes.map((lane, index) =>
               h(DutyLane, {
                 key: `lane-${lane.key}`,

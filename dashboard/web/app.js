@@ -30,6 +30,7 @@ import {
   ALL_REPOS,
   WITHOUT_REPO_LABEL,
   attemptView,
+  KIND_ICON,
   laneView,
   filterNow,
   dealTimeline,
@@ -1922,6 +1923,22 @@ function stageBlockNode(dealId, stage, timeline, rebuild) {
       h('span', { class: 'stage-row-tog' }, open ? '▾' : '▸'),
     ),
   ]
+  // Состояние лида — строкой у координаторского этапа, а не только в шапке:
+  // «кто сейчас работает» ищут в списке этапов. Слово то же, что у шапки
+  // (`leadfeed.status`), а расхождение «этап идёт, лида нет» называется одной
+  // фразой (`leadNoteOf` в шейпере), а не двумя спорящими фактами.
+  if (view.leadText) {
+    nodes.push(
+      h(
+        'div',
+        {
+          class: `stage-lead${view.leadWarn ? ' is-warn' : ''}`,
+          title: view.leadTitle || 'состояние лида по журналу',
+        },
+        view.leadText,
+      ),
+    )
+  }
   if (view.waitText) {
     nodes.push(
       h(
@@ -1958,23 +1975,35 @@ function decisionsBlock(items) {
   const total = decisionsCount(items)
   if (!total) return null
   const rows = shapeDecisions(items)
+  const list = h(
+    'div',
+    { class: 'panel-b decisions-list' },
+    ...rows.map((row) =>
+      h(
+        'div',
+        { class: 'dec-row', key: row.key },
+        h('span', { class: 'dec-clock mono', title: row.ageText ? `${row.ageText} назад` : '' }, row.clock),
+        h('span', { class: `dec-dot t-${row.tone}`, 'aria-hidden': 'true' }),
+        // Ячейка автора есть всегда, даже пустая: решётка не должна зависеть от
+        // того, назвал ли факт автора (иначе текст съезжал в узкую колонку).
+        row.authorLabel
+          ? h('span', { class: `dec-author t-${row.tone}`, title: row.author }, row.authorLabel)
+          : h('span', { class: 'dec-author is-blank', 'aria-hidden': 'true' }, '·'),
+        h('span', { class: 'dec-text' }, row.text),
+      ),
+    ),
+  )
+  // Лента стоит на свежем краю, как шкала: журнальный порядок читается сверху
+  // вниз, а последнее решение не должно прятаться под прокруткой после каждого
+  // тихого тика (панель перерисовывается целиком).
+  requestAnimationFrame(() => {
+    list.scrollTop = list.scrollHeight
+  })
   return h(
     'div',
     { class: 'panel decisions', 'data-key': 'decisions' },
     h('div', { class: 'panel-h' }, `решения лида · ${total}`),
-    h(
-      'div',
-      { class: 'panel-b decisions-list' },
-      ...rows.map((row) =>
-        h(
-          'div',
-          { class: 'dec-row', key: row.key },
-          h('span', { class: 'dec-clock mono muted', title: row.ageText ? `${row.ageText} назад` : '' }, row.clock),
-          row.authorLabel ? h('span', { class: `dec-author t-${row.tone}`, title: row.author }, row.authorLabel) : null,
-          h('span', { class: 'dec-text' }, row.text),
-        ),
-      ),
-    ),
+    list,
   )
 }
 
@@ -2273,6 +2302,69 @@ function attemptRowNode(view, key) {
   )
 }
 
+/** Дорожка лида: одна строка над этапами, полоса на каждый заход. Лид не резидент:
+ *  cron поднимает его раз в минуту, и на шкале видно ровно это — где он работал, чем
+ *  кончился заход, идёт ли он сейчас. Отдельная дорожка, а не попытка этапа: у лида
+ *  нет исхода этапа, и `attemptRowNode` выдумал бы ему статус. */
+function leadLaneNode(leadLane, scale) {
+  const runs = leadLane.runs || []
+  const head = h(
+    'div',
+    { class: 'tl-lane-h' },
+    h(
+      'div',
+      { class: 'tl-lane-id' },
+      h('span', { class: 'tl-lane-name', title: 'лид: процесс, который ведёт дело' }, 'лид'),
+      h(
+        'span',
+        { class: 'tl-kind tl-kind-agent', title: 'профиль: lead' },
+        h('svg', { class: 'tl-kind-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' }, h('path', { d: KIND_ICON.agent })),
+        'lead',
+      ),
+    ),
+    h('span', { class: 'tl-lane-meta', 'data-fresh': 'lane:lead' }, leadLane.text),
+  )
+  return h(
+    'div',
+    { class: 'tl-lane is-lead', 'data-key': 'lane:lead' },
+    head,
+    runs.length
+      ? h(
+          'div',
+          { class: 'tl-rows' },
+          h(
+            'div',
+            { class: 'tl-row' },
+            h(
+              'div',
+              { class: 'tl-lbl', 'data-tip': `${leadLane.text}: полосы на оси — заходы лида, от подъёма до выхода` },
+              h('span', { class: 'tl-n' }, '·'),
+              h('span', { class: 'tl-st t-gray' }, 'заходы'),
+            ),
+            h(
+              'div',
+              { class: 'tl-track' },
+              ...runs.map((run, index) =>
+                h(
+                  'span',
+                  {
+                    class: `tl-lead-run t-${run.tone}${run.open ? ' is-open' : ''}${run.stale ? ' is-stale' : ''}`,
+                    'data-key': `lead-run:${index}`,
+                    style: `left:${run.startPct}%;width:${run.widthPct}%`,
+                    'data-tip': run.title,
+                    'aria-label': run.title,
+                    role: 'img',
+                  },
+                  run.labeled ? h('span', { class: 'tl-lead-run-label' }, run.label) : null,
+                ),
+              ),
+            ),
+          ),
+        )
+      : h('div', { class: 'tl-row-empty' }, 'заходов не было'),
+  )
+}
+
 /** Дорожка этапа: имя, значок вида, состояние и строки попыток. */
 function laneNode(lane, bars, scale) {
   const view = laneView(lane, bars, scale)
@@ -2539,6 +2631,9 @@ function scalePanel(scale) {
         h(
         'div',
         { class: 'tl-lanes' },
+        // Заходы лида — над этапами: «кто ведёт дело» отвечает первым, а не
+        // выясняется подписью в шапке.
+        leadLaneNode(scale.leadLane, scale),
         ...scale.lanes.map((lane, index) =>
           laneNode(
             lane,

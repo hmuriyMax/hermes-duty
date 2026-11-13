@@ -79,7 +79,7 @@ function moduleForRender(root) {
   const source = read('desktop/plugin.js')
     .replace(/from '@hermes\/plugin-sdk'/, "from './sdk.mjs'")
     .concat(
-      '\nexport { DutyLane, DutyAttemptRow, ScalePanel, KpiStrip, SpecStrip, CallInspector, DutyMiniTimeline, FinishedBlock, shapeFinishedRow, dealTimeline, stageRole, DutyPage, parseWindow, TL_WINDOWS, windowLabel, DecisionsPanel, DealRow, DealFactSpans, shapeDeal }\n',
+      '\nexport { DutyLane, DutyAttemptRow, ScalePanel, KpiStrip, SpecStrip, CallInspector, DutyMiniTimeline, FinishedBlock, shapeFinishedRow, dealTimeline, stageRole, DutyPage, parseWindow, TL_WINDOWS, windowLabel, DecisionsPanel, DutyLeadLane, DealRow, DealFactSpans, shapeDeal, shapeDealTime }\n',
     )
   const file = join(dir, 'plugin.mjs')
   writeFileSync(file, source)
@@ -1009,4 +1009,39 @@ test('десктоп: в строке списка лид стоит под бе
   assert.match(html, /duty-lead-note/, 'в ячейке состояния нет строки лида')
   assert.match(html, /резюм 1 из 6/, 'слово лида не доехало до строки')
   assert.match(html, /журнал: последний факт лида lead_resumed/, 'доказательство лида не в подсказке')
+})
+
+test('десктоп: заходы лида — полосами на шкале, первой дорожкой', async (t) => {
+  // Лид не резидент: cron поднимает его, заход кончается выходом. На шкале это
+  // полосы над этапами — иначе «кто ведёт дело» видно только подписью в шапке.
+  const root = reactRoot()
+  if (!root) return t.skip('нет React в ~/.hermes/hermes-agent/node_modules')
+  const mod = await import(pathToFileURL(moduleForRender(root)).href)
+  const React = (await import(pathToFileURL(join(root, 'react', 'index.js')).href)).default
+  const { renderToStaticMarkup } = await import(pathToFileURL(join(root, 'react-dom', 'server.node.js')).href)
+
+  const scale = mod.shapeDealTime(
+    {
+      now: 1_600,
+      terminal: false,
+      timeline: [
+        { kind: 'created', at: 1_000, summary: '' },
+        { kind: 'lead_started', at: 1_050, summary: 'поднят (с нуля), pid 111', mode: 'brief', pid: 111 },
+        { kind: 'lead_exited', at: 1_150, summary: 'ушёл: overrun', reason: 'overrun' },
+        { kind: 'lead_resumed', at: 1_300, summary: 'поднят (резюм), pid 222', mode: 'resume', pid: 222 },
+      ],
+    },
+    { attempts: [] },
+  )
+  const html = renderToStaticMarkup(React.createElement(mod.DutyLeadLane, { leadLane: scale.leadLane }))
+  assert.match(html, /duty-tl-lane-lead/, 'дорожка лида не нарисована')
+  assert.match(html, /2 захода · резюм 1/, `мета дорожки: ${html}`)
+  assert.equal((html.match(/class="duty-tl-lead-run[\s"]/g) || []).length, 2, `полос не две: ${html.slice(0, 400)}`)
+  assert.match(html, /is-open/, 'идущий заход не помечен')
+  assert.match(html, /ушёл: overrun/, 'причина выхода не в подсказке')
+  assert.ok(!/undefined/.test(html), 'в разметке осталось undefined')
+
+  // Пустая дорожка говорит словом, а не рисует ноль полос молча.
+  const empty = renderToStaticMarkup(React.createElement(mod.DutyLeadLane, { leadLane: { runs: [], text: 'заходов не было' } }))
+  assert.match(empty, /заходов не было/)
 })

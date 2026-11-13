@@ -1169,6 +1169,26 @@ def _timeline(
             answer_text = payload.get("answer")
             if isinstance(answer_text, str) and answer_text:
                 row["answer_text"] = answer_text
+        # Факты лида: `summary` из общего разбора — префикс JSON (`{"mode": "brief",
+        # "pid": …`), который человеку ничего не говорит. Для них выжимка пишется
+        # словами, а поля (режим, причина выхода, pid) называются отдельно — из них
+        # шкала рисует полосы заходов (`shapeDealTime` → `leadLane`).
+        if kind in ("lead_started", "lead_resumed", "lead_exited"):
+            mode = str(payload.get("mode") or "")
+            reason = str(payload.get("reason") or "")
+            pid = payload.get("pid")
+            row["mode"] = mode or None
+            row["reason"] = reason or None
+            row["pid"] = pid
+            row["exit_code"] = payload.get("exit_code")
+            mode_word = {"brief": "с нуля", "resume": "резюм"}.get(mode, mode)
+            if kind == "lead_exited":
+                words = f"ушёл: {reason}" if reason else "ушёл"
+                if row.get("exit_code") not in (None, 0):
+                    words += f" (код {row['exit_code']})"
+            else:
+                words = "поднят" + (f" ({mode_word})" if mode_word else "") + (f", pid {pid}" if pid else "")
+            row["summary"] = words
         rows.append(row)
     return rows
 

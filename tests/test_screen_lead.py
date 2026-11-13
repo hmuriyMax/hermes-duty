@@ -451,3 +451,28 @@ def test_stats_says_no_data_when_lead_tokens_are_not_measured(home: Path, client
     assert body["totals"]["coordination"]["tokens"] is None
     assert body["totals"]["coordination"]["share"] is None
     assert "координация лида: нет данных" in cli.render_stats(body)
+
+
+def test_timeline_names_lead_facts_in_words() -> None:
+    """Факты лида в таймлайне говорят словами, а не префиксом JSON.
+
+    Общий `_payload_summary` отдаёт начало payload'а — для подъёма это
+    `{"mode": "brief", "pid": …`, что человеку на шкале ничего не говорит. Шкала
+    рисует по этим строкам полосы заходов, поэтому режим/причина/pid называются
+    полями, а выжимка — словами.
+    """
+    rows = plugin_api._timeline(
+        [
+            {"kind": "lead_started", "recorded_at": 100, "payload": {"mode": "resume", "pid": 59632}},
+            {"kind": "lead_exited", "recorded_at": 200, "payload": {"reason": "overrun", "exit_code": None}},
+            {"kind": "lead_exited", "recorded_at": 300, "payload": {"reason": "crashed", "exit_code": 2}},
+        ],
+        now=400,
+    )
+    started, overrun, crashed = rows
+    assert started["summary"] == "поднят (резюм), pid 59632", started["summary"]
+    assert started["mode"] == "resume" and started["pid"] == 59632
+    assert overrun["summary"] == "ушёл: overrun", overrun["summary"]
+    assert overrun["reason"] == "overrun"
+    assert crashed["summary"] == "ушёл: crashed (код 2)", crashed["summary"]
+    assert crashed["exit_code"] == 2

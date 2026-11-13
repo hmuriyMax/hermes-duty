@@ -22,6 +22,11 @@ const read = (path) => readFileSync(new URL(path, root), 'utf8')
 
 const html = read('dashboard/web/index.html')
 const app = read('dashboard/web/app.js')
+
+// jsdom не даёт requestAnimationFrame в глобалах, а рендер ленты решений просит
+// кадр (прокрутка к свежему краю). Один кадр на весь файл: колбэк может прийти
+// после теста — узел уже отцеплен, и запись scrollTop безвредна.
+globalThis.requestAnimationFrame = (cb) => setImmediate(() => cb(0))
 const api = read('dashboard/plugin_api.py')
 const pluginSource = read('desktop/plugin.js')
 
@@ -1365,4 +1370,43 @@ test('веб: без фактов лида и без решений экран �
   assert.match(lead.textContent, /лид: нет фактов/)
   assert.ok(!lead.querySelector('b.t-green'), 'у дела без лида зелёный тон')
   assert.equal(doc.querySelector('[data-key="decisions"]'), null, 'пустая лента решений нарисована')
+})
+
+test('веб: заходы лида стоят на шкале отдельной дорожкой над этапами', async (t) => {
+  if (!jsdomRoot()) return t.skip('нет jsdom в ~/.hermes/hermes-agent/node_modules')
+
+  const doc = await renderDealPanel(
+    {
+      id: 'd_0123456789abcdef',
+      title: 'дело с лидом',
+      status: 'running',
+      terminal: false,
+      now: 1_600,
+      timeline: [
+        { kind: 'created', at: 1_000, summary: '' },
+        { kind: 'lead_started', at: 1_050, summary: 'поднят (с нуля), pid 111', mode: 'brief', pid: 111 },
+        { kind: 'lead_exited', at: 1_150, summary: 'ушёл: overrun', reason: 'overrun' },
+        { kind: 'lead_resumed', at: 1_300, summary: 'поднят (резюм), pid 222', mode: 'resume', pid: 222 },
+      ],
+      stages: [{ id: 'impl', needs: [] }],
+      lead: { state: 'live', resumes: 1, text: 'лид: жив', evidence: 'журнал' },
+    },
+    { attempts: [] },
+  )
+
+  const lane = doc.querySelector("[data-key='lane:lead']")
+  assert.ok(lane, 'дорожки лида нет на шкале')
+  // Дорожка первая: «кто ведёт дело» отвечает до этапов.
+  const lanes = [...doc.querySelectorAll('.tl-lanes .tl-lane')]
+  assert.equal(lanes[0], lane, 'дорожка лида стоит не первой')
+  assert.match(lane.textContent, /лид/, 'дорожка не подписана')
+  assert.match(lane.textContent, /lead/, 'у дорожки нет профиля')
+  assert.match(lane.textContent, /2 захода · резюм 1/, `мета дорожки: ${lane.textContent}`)
+
+  const runs = [...lane.querySelectorAll('.tl-lead-run')]
+  assert.equal(runs.length, 2, `полос захода ${runs.length}, а в журнале два`)
+  assert.ok(runs[0].className.includes('t-yellow'), `тон первого захода: ${runs[0].className}`)
+  assert.ok(runs[1].className.includes('is-open'), 'идущий заход не помечен')
+  assert.match(runs[1].getAttribute('data-tip'), /резюм/)
+  assert.ok(Number.parseFloat(runs[1].style.left) > Number.parseFloat(runs[0].style.left), 'полосы не в порядке времени')
 })

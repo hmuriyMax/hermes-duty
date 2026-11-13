@@ -3365,3 +3365,63 @@ test('решения лида: порядок журнальный, автор �
   assert.equal(shapeDecisions(null).length, 0)
   assert.equal(decisionsCount(undefined), 0)
 })
+
+test('дорожка лида: заходы читаются из журнала парами, без выдумки статуса', () => {
+  const scale = shapeDealTime(
+    {
+      now: 1_600,
+      terminal: false,
+      timeline: [
+        { kind: 'created', at: 1_000, summary: '' },
+        { kind: 'lead_started', at: 1_050, summary: 'поднят (с нуля), pid 111', mode: 'brief', pid: 111 },
+        { kind: 'lead_exited', at: 1_150, summary: 'ушёл: overrun', reason: 'overrun' },
+        { kind: 'lead_resumed', at: 1_300, summary: 'поднят (резюм), pid 222', mode: 'resume', pid: 222 },
+        { kind: 'lead_exited', at: 1_400, summary: 'ушёл: crashed (код 2)', reason: 'crashed', exit_code: 2 },
+        { kind: 'lead_resumed', at: 1_500, summary: 'поднят (резюм), pid 333', mode: 'resume', pid: 333 },
+      ],
+    },
+    { attempts: [] },
+  )
+  const runs = scale.leadLane.runs
+  assert.equal(runs.length, 3, 'три подъёма — три полосы')
+  assert.deepEqual(runs.map((run) => run.tone), ['yellow', 'red', 'green'], 'тон — чем кончился заход')
+  assert.equal(runs[0].labeled, true, 'широкий заход подписывается словом режима')
+  assert.equal(runs[0].label, 'с нуля')
+  assert.equal(runs[1].label, 'резюм')
+  assert.equal(runs[2].open, true, 'последний заход без выхода читается как идущий')
+  assert.match(runs[2].title, /идёт/, 'открытый заход назван идущим')
+  assert.equal(runs[2].endPct, 100, 'открытый заход доходит до правого края оси (now)')
+  assert.match(runs[1].title, /ушёл: crashed \(код 2\)/, 'причина выхода доезжает словами')
+  assert.match(runs[2].title, /pid 333/)
+  assert.equal(scale.leadLane.text, '3 захода · резюм 2')
+  // Дорожка не притворяется этапом: этапов в этом деле нет вовсе.
+  assert.deepEqual(scale.lanes.map((lane) => lane.key), [])
+})
+
+test('дорожка лида: заход без факта выхода у закрытого дела — потерянный факт, а не «шёл всё время»', () => {
+  const scale = shapeDealTime(
+    {
+      now: 1_600,
+      terminal: true,
+      timeline: [
+        { kind: 'created', at: 1_000, summary: '' },
+        { kind: 'lead_started', at: 1_050, summary: 'поднят (с нуля), pid 59632', mode: 'brief', pid: 59632 },
+        { kind: 'completed', at: 1_550, summary: 'закрыто лидом' },
+      ],
+    },
+    { attempts: [] },
+  )
+  const [run] = scale.leadLane.runs
+  assert.equal(run.stale, true, 'у закрытого дела незакрытый заход помечен как потерянный')
+  assert.equal(run.open, false)
+  assert.equal(run.tone, 'gray')
+  assert.equal(run.durationSec, null, 'длительность не выдумывается')
+  assert.equal(run.widthPct, 2, 'полоса стоит минимальной шириной на моменте подъёма')
+  assert.match(run.title, /конец захода не записан/)
+})
+
+test('дорожка лида: без фактов лида дорожка молчит, а не рисует пустую полосу', () => {
+  const scale = shapeDealTime({ now: 1_600, terminal: true, timeline: [{ kind: 'created', at: 1_000, summary: '' }] }, { attempts: [] })
+  assert.deepEqual(scale.leadLane.runs, [])
+  assert.equal(scale.leadLane.text, 'заходов не было')
+})

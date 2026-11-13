@@ -14,6 +14,12 @@
 #   bin/duty-test -k close    # аргументы уходят в pytest (узкий прогон для отладки)
 set -u
 
+# Чужой PYTHONPATH ломает гейты: в окружении агента может висеть site-packages
+# другого питона (живой случай: пакеты py3.14 поверх venv-питона 3.11 → `pydantic_core`
+# не импортируется и весь pytest падает с «15 errors during collection», хотя код цел).
+# Гейт не должен зависеть от того, кто его позвал, поэтому окружение чистим здесь.
+unset PYTHONPATH
+
 cd "$(dirname "$0")/.." || exit 2
 
 PY="${HERMES_PYTHON:-}"

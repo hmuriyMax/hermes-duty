@@ -559,7 +559,7 @@ test('две колонки дела: документы растут, рель�
   assert.match(rule[1], /align-items:\s*start/, 'колонки тянутся друг под друга')
   // Рельс — вертикальный стек: лента решений над этапами, обе панели во всю его ширину.
   assert.match(css, /\.deal-rail \{ display: flex; flex-direction: column; gap: 14px; min-width: 0; \}/, 'рельс не собран столбцом')
-  assert.match(css, /@media \(max-width: 1180px\) \{[\s\S]{0,120}\.deal-cols \{ grid-template-columns: 1fr; \}/, 'узкое окно не складывает колонки в одну')
+  assert.match(css, /@media \(max-width: 1040px\) \{[\s\S]{0,120}\.deal-cols \{ grid-template-columns: 1fr; \}/, 'узкое окно не складывает колонки в одну')
 
   const plugin = read('desktop/plugin.js')
   const dutyRule = /\.duty-deal-cols\{([^}]*)\}/.exec(plugin)
@@ -567,7 +567,7 @@ test('две колонки дела: документы растут, рель�
   assert.match(dutyRule[1], /grid-template-columns:minmax\(0,1fr\) 340px/, 'десктоп: правая колонка не 340 px или растёт')
   assert.match(dutyRule[1], /gap:14px/, 'десктоп: зазор не 14 px')
   assert.match(dutyRule[1], /align-items:start/, 'десктоп: колонки тянутся')
-  assert.match(plugin, /@media \(max-width:1180px\)\{\.duty-deal-cols\{grid-template-columns:1fr\}\}/, 'десктоп: узкое окно не складывает колонки')
+  assert.match(plugin, /@media \(max-width:1040px\)\{\.duty-deal-cols\{grid-template-columns:1fr\}\}/, 'десктоп: узкое окно не складывает колонки')
 })
 
 test('панели попыток больше нет ни в вебе, ни на десктопе', () => {

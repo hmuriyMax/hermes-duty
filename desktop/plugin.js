@@ -4572,7 +4572,7 @@ const CSS = `
 .duty-dec-filter{height:20px;padding:0 7px;border-radius:999px;cursor:pointer;border:1px solid var(--ui-stroke-tertiary);background:transparent;color:var(--ui-text-secondary);font:inherit;font-size:11px;font-variant-numeric:tabular-nums}
 .duty-dec-filter:hover{color:var(--ui-text-primary);border-color:var(--ui-text-tertiary)}
 .duty-dec-filter.on{color:var(--ui-text-primary);border-color:color-mix(in srgb, var(--ui-blue) 55%, transparent);background:color-mix(in srgb, var(--ui-blue) 10%, transparent)}
-.duty-dec-list{list-style:none;margin:0;padding:6px 0 8px;position:relative}
+.duty-dec-list{list-style:none;margin:0;padding:6px 0 8px;position:relative;max-width:640px}
 .duty-dec-list::before{content:'';position:absolute;left:17px;top:12px;bottom:14px;width:1px;background:var(--ui-stroke-tertiary)}
 .duty-dec-item{position:relative;padding:7px 12px 7px 32px}
 .duty-dec-item+.duty-dec-item{border-top:1px solid color-mix(in srgb, var(--ui-stroke-tertiary) 55%, transparent)}
@@ -4614,7 +4614,7 @@ const CSS = `
 .duty-deal-cols{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:14px;align-items:start;min-width:0}
 .duty-deal-rail{display:flex;flex-direction:column;gap:14px;min-width:0}
 /* Узкое окно: колонки друг под другом, документы — первыми, этапы — следом. */
-@media (max-width:1180px){.duty-deal-cols{grid-template-columns:1fr}}
+@media (max-width:1040px){.duty-deal-cols{grid-template-columns:1fr}}
 .duty-deal-spec,.duty-deal-docs,.duty-deal-stages{min-width:0}
 .duty-deal-scale{grid-column:1/-1;min-width:0}
 .duty-spec{margin:0;white-space:pre-wrap;word-break:break-word;font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:11px;line-height:1.5;color:var(--ui-text-secondary);max-height:60vh;overflow:auto;border:1px solid var(--ui-stroke-tertiary);border-radius:6px;padding:8px}

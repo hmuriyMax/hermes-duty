@@ -491,6 +491,9 @@ svg.deal-ico { flex: none; width: 16px; height: 16px; fill: none; stroke: var(--
 }
 .dec-filter:hover { color: var(--text); border-color: var(--text-3); }
 .dec-filter.on { color: var(--text); border-color: color-mix(in srgb, var(--accent) 55%, transparent); background: var(--accent-soft); }
+/* Мера чтения ленты: в сложенной раскладке рельс становится во всю ширину, и
+   строка в 900 px читается хуже, чем в 300. */
+.dec-list { max-width: 640px; }
 /* Ось ленты: одна линия на все записи — по ней видно, что записи идут во
    времени, а точки на ней различают виды решений цветом. */
 .dec-list { list-style: none; margin: 0; padding: 6px 0 8px; position: relative; }
@@ -579,7 +582,7 @@ svg.deal-ico { flex: none; width: 16px; height: 16px; fill: none; stroke: var(--
 .deal-rail { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
 
 /* Узкое окно: колонки друг под другом, документы — первыми, этапы — следом. */
-@media (max-width: 1180px) {
+@media (max-width: 1040px) {
   .deal-cols { grid-template-columns: 1fr; }
   input[type="search"] { width: 100%; }
 }

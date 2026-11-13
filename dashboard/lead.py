@@ -1447,6 +1447,35 @@ def _not_led(deal: dict[str, Any], events: list[dict[str, Any]]) -> str:
     return ""
 
 
+def plan_wake(events: Iterable[Any]) -> int:
+    """id факта, после которого граф ждёт плана, а лида не поднимали; `0` — не ждёт.
+
+    Падение этапа контрактом (`plan_rethink`) и отказ плана (`plan_rejected`)
+    оставляют дело без графа: дальше двигает только лид. Супервизор до этого
+    пропускал такой журнал, если рядом шла попытка («лид жив» по `_live_runtime`),
+    и дело шло дальше штатным конвейером без переплана (`d_92177017`, 16:29:
+    `check-lint` упал кодом 127, ревизию плана писал ручной чат лида).
+
+    Поднимаем **один раз на факт**: `lead_started` после него уже значит «лида
+    будили», и второй заход на тот же повод был бы дублем.
+    """
+    waiting = 0
+    woken = 0
+    for event in sorted(
+        (item for item in events or () if isinstance(item, dict)),
+        key=lambda item: _int(item.get("id")),
+    ):
+        kind = str(event.get("kind") or "")
+        stamp = _int(event.get("id"))
+        if kind in ("plan_rethink", "plan_rejected"):
+            waiting = stamp
+        elif kind == "plan_accepted":
+            waiting = 0
+        elif kind == LEAD_KIND_STARTED:
+            woken = stamp
+    return waiting if waiting > woken else 0
+
+
 def _existing_park(events: list[dict[str, Any]], limit: int) -> Optional[dict[str, Any]]:
     """Уже записанная парковка по исчерпанию резюмов — чтобы не спрашивать дважды."""
     parked = journal.parked_of(events)
@@ -1656,7 +1685,12 @@ def supervise(
         # Без этой проверки сторож поднял бы второй заход поверх работающего
         # рантайма и удвоил бы работу по делу.
         runtime = _live_runtime(events, probe=probe)
-        if runtime:
+        # Граф ждёт плана — повод сильнее живой попытки: штатный конвейер доведёт
+        # этапы до конца, но переплан делает только лид, и без него дело стоит на
+        # `plan_rethink` (`plan_wake`). Живую попытку это не трогает: лид работает
+        # рядом с ней, `duty_start` сам следит за слотами.
+        waiting_plan = plan_wake(events)
+        if runtime and not waiting_plan:
             return {
                 "deal": str(deal["id"]),
                 "action": "alive",
@@ -1704,6 +1738,7 @@ def supervise(
         # сторожа не должен обещать резюм, который заход заменит брифом.
         mode, _cursor, dropped = next_mode(events, st)
         pid = (spawn or _spawn_supervisor)(home, str(deal["id"]), budget_sec) if write else None
+        reason = "граф ждёт плана: план переделывает лид" if waiting_plan else ""
         return {
             "deal": str(deal["id"]),
             "action": "started" if write else "would_start",
@@ -1714,6 +1749,8 @@ def supervise(
             "lead": st,
             "limit": limit,
             "recovered_exit": recovered,
+            "reason": reason,
+            "waiting_plan": waiting_plan or 0,
         }
     finally:
         conn.close()

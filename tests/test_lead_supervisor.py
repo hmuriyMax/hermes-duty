@@ -1539,3 +1539,90 @@ def test_run_without_a_budget_keeps_the_turn_until_the_model_ends_it(tmp_path: P
     started = facts_of(conn, deal, lead.LEAD_KIND_STARTED)
     conn.close()
     assert started[0]["run_budget"] == 0
+
+
+# ---------------------- 13. граф ждёт плана — лид нужен и при живой попытке
+#
+# Живое дело d_92177017 (16:29): `check-lint` упал кодом 127, движок записал
+# `plan_rethink`, а супервизор на каждом тике отвечал «лид жив» — рядом шла другая
+# попытка (`check-test`, затем `review`). Дело шло дальше штатным конвейером, а
+# переплан ждал ручного чата лида.
+
+
+def rethink_events(conn: sqlite3.Connection, deal: dict[str, Any], *extra: tuple[str, dict[str, Any]]) -> None:
+    """Падение этапа контрактом: попытка провалилась и движок вернул план лиду."""
+    append(
+        conn,
+        deal,
+        (
+            "attempt_started",
+            {"run_id": "check-lint#1", "stage": "check-lint", "attempt": 1, "pid": 900},
+        ),
+        (
+            "attempt_ended",
+            {"run_id": "check-lint#1", "stage": "check-lint", "attempt": 1, "outcome": "failed"},
+        ),
+        ("plan_rethink", {"failed_stage": "check-lint", "kind": "contract", "attempt": 1, "round": 1}),
+        *extra,
+    )
+
+
+def test_plan_wake_is_one_per_fact(tmp_path: Path) -> None:
+    """`plan_wake` называет ровно тот факт, после которого плана нет, а лида не звали."""
+    home = make_home(tmp_path)
+    spec = write_spec(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    rethink_events(conn, deal)
+    events = journal.read_events(conn, str(deal["id"]))
+    rethink_id = max(int(event["id"]) for event in events if str(event["kind"]) == "plan_rethink")
+    assert lead.plan_wake(events) == rethink_id
+
+    append(conn, deal, (lead.LEAD_KIND_STARTED, {"mode": lead.MODE_RESUME, "pid": 77, "cursor": rethink_id}))
+    woken = journal.read_events(conn, str(deal["id"]))
+    assert lead.plan_wake(woken) == 0, "после подъёма лида тот же повод второй раз не срабатывает"
+
+    append(conn, deal, ("plan_accepted", {"rev": 9, "by": "lead"}))
+    closed = journal.read_events(conn, str(deal["id"]))
+    assert lead.plan_wake(closed) == 0, "принятый план снимает ожидание"
+    conn.close()
+
+
+def test_lead_is_raised_for_the_plan_even_while_an_attempt_runs(tmp_path: Path) -> None:
+    """Живая попытка — не причина ждать: переплан делает только лид.
+
+    Конвейер этапов лида не требует и доведёт соседние проверки до конца, а граф
+    после `plan_rethink` стоит без плана. Поэтому сторож поднимает заход **вместе**
+    с живой попыткой, а не вместо неё; лизинг попыток не общий, `duty_start`
+    следит за слотами сам.
+    """
+    home = make_home(tmp_path)
+    spec = write_spec(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    rethink_events(conn, deal)
+    # Соседняя проверка идёт своим процессом.
+    append(conn, deal, ("attempt_started", {"run_id": "check-test#1", "stage": "check-test", "attempt": 1, "pid": 901}))
+    conn.close()
+
+    spawned: list[str] = []
+    tick = lead.supervise(
+        home,
+        str(deal["id"]),
+        now=NOW + 60,
+        probe=alive,
+        spawn=lambda *args: spawned.append(args[1]) or 1,
+        ps=lambda: "",
+    )
+
+    assert tick["action"] == "started"
+    assert tick["waiting_plan"] > 0
+    assert "ждёт плана" in tick["reason"]
+    assert len(spawned) == 1
+
+    # Повторный тик: лид по этому поводу уже поднят — второй заход не нужен.
+    conn = open_store(home)
+    append(conn, deal, (lead.LEAD_KIND_STARTED, {"mode": lead.MODE_RESUME, "pid": 902, "cursor": 0}))
+    conn.close()
+    again = lead.supervise(home, str(deal["id"]), now=NOW + 90, probe=alive, spawn=lambda *args: 2, ps=lambda: "")
+    assert again["action"] == "alive"

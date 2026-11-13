@@ -1213,9 +1213,28 @@ def graph(spec: Any, events: Iterable[Any]) -> tuple[Any, ...]:
             # (приёмка проверяет тем же разбором): такая ревизия графа не
             # меняет, но и принятое раньше не отменяет.
             return current
-        plan_stage = str(payload.get("source_stage") or "") or PLAN_STAGE
+        plan_stage = _plan_stage_in(current, payload.get("source_stage"))
         current = _relinked(current, tuple(stages), plan_stage)
     return current
+
+
+def _plan_stage_in(stages: Iterable[Any], claimed: Any) -> str:
+    """id этапа плана среди этапов графа: названный предложением, иначе вход.
+
+    Предложение плана называет свой этап (`source_stage`), но имя принимается,
+    только если такой этап в графе есть. Журналы, записанные до правки, держат
+    там профиль (`"lead"`): по нему `_relinked` не находил ни одного ребра seed и
+    `close` оставался с `needs: [coordinator]` — без ребра от работы плана к
+    закрытию (`d_92177017`).
+    """
+    known = {str(getattr(stage, "id", "")) for stage in stages}
+    name = str(claimed or "")
+    if name and name in known:
+        return name
+    for fallback in (PLAN_STAGE, *PLAN_STAGE_LEGACY):
+        if fallback in known:
+            return fallback
+    return PLAN_STAGE
 
 
 def _relinked(seed: tuple[Any, ...], proposed: tuple[Any, ...], plan_stage: str) -> tuple[Any, ...]:
@@ -1265,7 +1284,11 @@ def _plan_stage_of(board: _Board) -> str:
     Старые seed-графы называют вход `plan` (`PLAN_STAGE_LEGACY`): ищем новое имя,
     потом прежнее — журналы дел до переименования читаются дальше.
     """
-    if board.plan_stage:
+    # Названное предложением имя принимается, только если это этап графа: журналы
+    # до правки писали в `source_stage` профиль (`"lead"`), и поиск этапа по
+    # такому имени возвращал `None` — принятый план не закрывал вход, а `close`
+    # не получал хвост плана в `needs` (`d_92177017`).
+    if board.plan_stage and board.plan_stage in board.stages:
         return board.plan_stage
     for name in (PLAN_STAGE, *PLAN_STAGE_LEGACY):
         if name in board.stages:
@@ -1330,9 +1353,16 @@ def _plan_fact(board: _Board, spec: Any, kind: str, payload: dict[str, Any], at:
         # больше нечего (гейт снят), а `question_answered` до этого мог вернуть
         # этап в `pending` — вторая попытка плана при принятой ревизии не нужна.
         board.plan_gate = None
-        if node is not None and node.state in (WAIT_HUMAN, PENDING):
+        if node is not None:
+            # Принятая ревизия закрывает этап плана из любого состояния: план,
+            # который лид в итоге принял, и есть успех этапа. Иначе превышенный
+            # `max_rounds_replan` (он ставит `failed`) залипал бы навсегда — на
+            # `d_92177017` вход остался `failed` после принятой ревизии 6, и
+            # `next_stage` объявил бы закрытое дело проваленным.
             node.state = DONE
             node.question_id = None
+            node.fail_kind = ""
+            node.failed_at = 0
             node.reason = f"план ревизии {rev or '—'} принят"
         return
     if kind == PLAN_GATE:

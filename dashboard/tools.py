@@ -479,7 +479,12 @@ def plan(
             "rev": rev,
             "stages": stages if isinstance(stages, list) else [],
             "reason": str(reason or "").strip(),
-            "source_stage": SOURCE,
+            # id этапа, чей это план, а не имя профиля: `transit` по этому полю
+            # ищет рёбра seed, которые обязаны ждать хвост плана (`close`), и
+            # закрывает этап плана фактом принятия. С `SOURCE` (`"lead"`) ни один
+            # этап графа не совпадал: `close` оставался с `needs: [coordinator]`,
+            # а координатор висел `pending` до конца дела (`d_92177017`).
+            "source_stage": spec_module.PLAN_STAGE,
             "idem": key,
         },
         {"rev": rev, "idem": key},
@@ -1093,6 +1098,14 @@ def close(
     оставило бы работающие процессы без хозяина. Повтор с тем же итогом
     второго `completed` не пишет: ключ факта считается от `cause`
     (`deals.close_stages_done`), а другой итог по закрытому делу — отказ.
+
+    Работу дела закрытие переносит само (`_close_integration`): перед
+    `completed` зовётся тот же `integrate`, что у `duty_integrate`, и работа из
+    `duty/<id>` ложится в рабочую ветку — закрытое дело не оставляет её в ветке,
+    которую человек не читает. Переноса нет, когда переносить нечего
+    (`_pending_transfer`); неудача переноса (грязный каталог, конфликт, ветка не
+    найдена) — факт `integrate_failed` и `"integrated": {"error": ...}` в ответе,
+    а закрытие идёт дальше: дело закрывает слово лида, а не состояние дерева.
     """
     _key(idempotency_key)
     word = str(verdict or "").strip().lower()
@@ -1132,6 +1145,10 @@ def close(
             "summary": before,
         }
     spec = _spec(events)
+    # Перенос работы в рабочую ветку — до `completed`: дело закрывается, а работа
+    # остаётся в `duty/<id>` (в ветке, которую никто не читает) — так 0.2.1 и
+    # закрывала дела. Неудача переноса закрытие не блокирует, но называется.
+    integrated, line = _close_integration(conn, spec, deal, events, moment, home)
     try:
         applied = deals.close_stages_done(
             conn,
@@ -1139,12 +1156,13 @@ def close(
             stages=[stage.id for stage in transit.graph(spec, events)],
             cause=deals.CLOSE_CAUSE_LEAD,
             summary=text,
+            integrated=line,
             source=SOURCE,
             now=moment,
         )
     except deals.DealError as exc:
         raise ToolsError(str(exc)) from exc
-    return {
+    answer = {
         "ok": True,
         "deal": str(deal["id"]),
         "closed": True,
@@ -1152,6 +1170,9 @@ def close(
         "summary": text,
         "events": _int(applied.get("events")),
     }
+    if integrated:
+        answer["integrated"] = integrated
+    return answer
 
 
 # -------------------------------------------------------------- duty_integrate
@@ -1390,6 +1411,93 @@ def integrate(
         },
         "events": _int(written),
     }
+
+
+# --------------------------------------- закрытие переносит работу
+
+
+def _pending_transfer(spec: Any, deal: dict[str, Any], events: Iterable[Any]) -> str:
+    """Вершина ветки дела, если её ещё нет в рабочей ветке; пусто — переносить нечего.
+
+    Закрытие переносит работу само, но не всякому делу есть что переносить, и
+    пустой ответ здесь — норма, а не отказ: у дела может не быть репозитория
+    (`spec.repo` не каталог), ветки дела (ни один этап не коммитил), а вершина
+    дела может уже лежать в рабочей ветке. Прежний перенос — тот же ответ «работа
+    на месте»: факт `integrated` с этой вершиной значит, что второй перенос того
+    же коммита журналу не нужен.
+
+    Ветка не названа (отсоединённый HEAD без записи в `created`) — не «нечего
+    переносить»: возвращается вершина, и `integrate` отказывает словами, а
+    закрытие пишет `integrate_failed`.
+    """
+    repo = _deal_repo(spec, events)
+    if repo is None or not repo.is_dir():
+        return ""
+    source = runner.deal_branch(deal)
+    code, out = runner._git_stdout(["rev-parse", "--verify", f"{source}^{{commit}}"], repo)
+    if code != 0 or not out.strip():
+        return ""
+    tip = out.split()[0]
+    for event in events or ():
+        if str(event.get("kind") or "") != INTEGRATED:
+            continue
+        if str(journal.payload_of(event).get("commit") or "") == tip:
+            return ""
+    try:
+        into = _working_branch(events, repo)
+    except ToolsError:
+        return tip
+    target = runner._sha(repo, into)
+    if not target:
+        return tip
+    if runner._ancestor(repo, tip, target) is True:
+        return ""
+    return tip
+
+
+def _close_integration(
+    conn: sqlite3.Connection,
+    spec: Any,
+    deal: dict[str, Any],
+    events: Iterable[Any],
+    now: int,
+    home: Path,
+) -> tuple[dict[str, Any], str]:
+    """Перенести работу дела в рабочую ветку перед записью `completed`.
+
+    Логики переноса здесь нет: закрытие зовёт тот же `integrate`, что
+    `duty_integrate`, — второй копии слияния в плагине не заводится. Здесь три
+    вещи, которых нет у инструмента: «переносить нечего» — это не вызов и не
+    факт (`_pending_transfer`), ключ вызова привязан к вершине ветки дела
+    (`close:<id>:<commit>` — работа, вставшая после переноса, переносится снова),
+    а неудача переноса — факт `integrate_failed` и `error` в ответе, но **не
+    отказ**: дело закрывает слово лида, а не состояние дерева.
+
+    Ответ — пара: что сказать лиду (`{}`, `{error}`, `{into, commit,
+    fast_forward}`) и строка для факта `completed` (пустая, если переноса не было
+    или он не удался).
+    """
+    tip = _pending_transfer(spec, deal, events)
+    if not tip:
+        return {}, ""
+    source = runner.deal_branch(deal)
+    key = f"close:{deal['id']}:{tip}"
+    try:
+        moved = integrate(str(deal["id"]), key, home=home, now=now, reason="перенос при закрытии дела")
+    except (ToolsError, runner.RunnerError) as exc:
+        error = str(exc) or type(exc).__name__
+        payload: dict[str, Any] = {"error": error, "from": source, "by": SOURCE, "idem": key}
+        repo = _deal_repo(spec, events)
+        if repo is not None:
+            try:
+                payload["into"] = _working_branch(events, repo)
+            except ToolsError:
+                pass
+        journal.append(conn, [_lead_event(deal, INTEGRATE_FAILED, payload, {"error": error}, now)])
+        return {"error": error}, ""
+    answer = {name: moved["integrated"][name] for name in ("into", "commit", "fast_forward")}
+    how = "быстрым переносом" if answer["fast_forward"] else "слиянием"
+    return answer, f"{source} → {answer['into']} @ {str(answer['commit'])[:12]} ({how})"
 
 
 # ----------------------------------------------------------------- duty_answer
@@ -2212,6 +2320,8 @@ CLOSE_SCHEMA = {
     "name": "duty_close",
     "description": (
         "Закрыть дело итогом лида: факт completed с cause=lead_closed и твоим summary. "
+        "Перед закрытием работа дела переносится в рабочую ветку (как duty_integrate); "
+        "неудача переноса закрытие не отменяет — в ответе будет integrated.error. "
         "Требует приговора approve; живые попытки — отказ (сначала погаси их duty_cancel). "
         "Повтор с тем же итогом второго факта не пишет."
     ),

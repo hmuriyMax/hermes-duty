@@ -774,6 +774,15 @@ def stages(spec: Any, events: Iterable[Any], now: Any) -> list[dict[str, Any]]:
                 "needs": list(state.needs),
                 "parallel_with": [str(other) for other in getattr(stage, "parallel_with", ()) or ()],
                 "added_by": "" if stage.id in seeded else PLAN_ADDED_BY,
+                # Закладка дела: вход (`coordinator`, 1.x `plan`) и закрытие
+                # (`close`) — работа лида, а не этап, который кто-то запустит.
+                # План он пишет инструментом (`duty_plan`), дело закрывает
+                # `duty_close`; попытки для этих этапов в 2.0 не поднимаются.
+                # Экран говорит «делает лид» вместо «ждёт хода» — иначе две
+                # закладки висят в ленте как забытая работа (`d_92177017`).
+                "by_lead": bool(
+                    spec_module.is_plan_stage(stage.id) or stage.id == spec_module.CLOSE_STAGE
+                ),
                 "reason": state.reason,
                 # «Работы не было» (0.2.1): этап пройден исходом `nothing`, и это
                 # не провал. Пустая строка — этап закрыт работой или не закрыт:

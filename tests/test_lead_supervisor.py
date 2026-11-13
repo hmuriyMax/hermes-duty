@@ -1202,3 +1202,146 @@ def test_real_spawn_gives_the_child_both_homes_and_keeps_its_stream(tmp_path: Pa
     assert started[0]["session_log"] == str(stream)
     assert exited[0]["session_id"] == "sess-fake"
     assert exited[0]["usage_tokens"] == 7
+
+
+# --------------------------- 10. непригодная сессия: бриф вместо резюма
+#
+# Живое дело d_cf918495: гейтвей перезапустился посреди турна лида, сессия встала
+# «paused» (турн потерян), и каждый `--resume` отсоединялся за секунду с кодом 3.
+# Супервизор считал это падением работы и жёг `max_lead_resumes`, хотя принятый
+# план и готовая работа были целы. Теперь такая сессия бросается: следующий заход
+# — бриф с историей дела целиком, а брошенная сессия названа фактом.
+
+
+def test_unusable_session_is_replaced_by_a_fresh_brief(tmp_path: Path) -> None:
+    """Последний заход отсоединился (код 3) → следующий заход — бриф, не резюм.
+
+    Проверяется, что сторож и сам заход принимают одно решение (`next_mode`):
+    команда без `--resume` и со скиллом, бриф содержит историю дела с нуля,
+    `lead_started.dropped_session` называет брошенную сессию, а счётчик резюмов
+    не растёт — отсоединение не работа лида.
+    """
+    home = make_home(tmp_path)
+    spec = write_spec(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    conn.close()
+
+    # Первый заход называет сессию.
+    lead.run(
+        home,
+        str(deal["id"]),
+        now=NOW,
+        clock=lambda: NOW,
+        monotonic=lambda: 0.0,
+        spawn=fake_spawn([stream_result("sess-lost")]),
+    )
+    # Резюм, который CLI отсоединил: ни одного факта работы, код 3, та же сессия.
+    second = lead.run(
+        home,
+        str(deal["id"]),
+        now=NOW + 10,
+        clock=lambda: NOW + 10,
+        monotonic=lambda: 0.0,
+        spawn=fake_spawn([], exit_code=lead.UNRESUMABLE_EXIT),
+    )
+    assert second["mode"] == lead.MODE_RESUME
+    assert second["exit_code"] == lead.UNRESUMABLE_EXIT
+
+    # Сторож: решение — бриф, и это видно в ответе до запуска.
+    tick = lead.supervise(home, str(deal["id"]), now=NOW + 20, probe=dead, write=False)
+    assert tick["action"] == "would_start"
+    assert tick["mode"] == lead.MODE_FIRST
+    assert tick["dropped_session"] == "sess-lost"
+
+    # Сам заход: та же сессия, но продолжать её нечем — свежий бриф с историей.
+    seen: dict[str, Any] = {}
+    third = lead.run(
+        home,
+        str(deal["id"]),
+        now=NOW + 30,
+        clock=lambda: NOW + 30,
+        monotonic=lambda: 0.0,
+        spawn=fake_spawn([stream_result("sess-fresh")], seen=seen),
+    )
+    assert third["mode"] == lead.MODE_FIRST
+    cmd = seen["cmd"]
+    assert "--resume" not in cmd
+    assert cmd[1:6] == ["chat", "-p", "lead", "-s", "project-delivery"]
+    brief = Path(cmd[cmd.index("--query-file") + 1]).read_text(encoding="utf-8")
+    # История с нуля: бриф, а не дайджест от курсора сессии.
+    assert "## История дела" in brief
+    assert "после курсора сессии" not in brief
+
+    conn = open_store(home)
+    started = facts_of(conn, deal, lead.LEAD_KIND_STARTED)
+    exited = facts_of(conn, deal, lead.LEAD_KIND_EXITED)
+    conn.close()
+    assert [row["mode"] for row in started] == [lead.MODE_FIRST, lead.MODE_RESUME, lead.MODE_FIRST]
+    assert started[2]["dropped_session"] == "sess-lost"
+    assert started[2]["resumes"] == started[1]["resumes"]
+    assert exited[1]["exit_code"] == lead.UNRESUMABLE_EXIT
+    assert exited[1]["session_id"] == "sess-lost"
+
+
+def test_second_unusable_session_falls_back_to_resume_and_the_resume_counter(tmp_path: Path) -> None:
+    """Второй подряд свежий бриф не выдаётся: дальше — резюм и счётчик резюмов.
+
+    Восстановление из поломки обвязки разрешено `MAX_FRESH_RESTARTS` раз за цикл.
+    Дальше пара «непригодная сессия → свежий бриф» крутилась бы бесконечно, и
+    исчерпание `max_lead_resumes` перестало бы парковать дело.
+    """
+    home = make_home(tmp_path)
+    spec = write_spec(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+
+    append(
+        conn,
+        deal,
+        (
+            lead.LEAD_KIND_STARTED,
+            {"mode": lead.MODE_FIRST, "pid": 1, "session_id": None, "cursor": 0},
+        ),
+        (lead.LEAD_KIND_EXITED, {"mode": lead.MODE_FIRST, "reason": "exit", "exit_code": 0, "session_id": "sess-a"}),
+        (
+            lead.LEAD_KIND_STARTED,
+            {"mode": lead.MODE_RESUME, "pid": 2, "session_id": "sess-a", "cursor": 0},
+        ),
+        (lead.LEAD_KIND_EXITED, {"mode": lead.MODE_RESUME, "reason": "crashed", "exit_code": 3, "session_id": "sess-a"}),
+        # Свежий бриф уже был выдан — сессия та же и снова не резюмится.
+        (
+            lead.LEAD_KIND_STARTED,
+            {"mode": lead.MODE_FIRST, "pid": 3, "session_id": "sess-a", "dropped_session": "sess-a", "cursor": 0},
+        ),
+        (lead.LEAD_KIND_EXITED, {"mode": lead.MODE_FIRST, "reason": "crashed", "exit_code": 3, "session_id": "sess-a"}),
+    )
+    events = journal.read_events(conn, str(deal["id"]))
+    st = lead.state(events, now=NOW, probe=dead)
+    conn.close()
+
+    mode, cursor, dropped = lead.next_mode(events, st)
+    assert mode == lead.MODE_RESUME
+    assert dropped == ""
+    assert cursor == st["session_cursor"]
+
+
+def test_ordinary_crash_still_resumes_the_same_session(tmp_path: Path) -> None:
+    """Обычное падение (код ≠ 3) — по-прежнему резюм: правило узкое намеренно."""
+    home = make_home(tmp_path)
+    spec = write_spec(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    append(
+        conn,
+        deal,
+        (lead.LEAD_KIND_STARTED, {"mode": lead.MODE_FIRST, "pid": 1, "session_id": None, "cursor": 0}),
+        (lead.LEAD_KIND_EXITED, {"mode": lead.MODE_FIRST, "reason": "crashed", "exit_code": -9, "session_id": "sess-k"}),
+    )
+    events = journal.read_events(conn, str(deal["id"]))
+    st = lead.state(events, now=NOW, probe=dead)
+    conn.close()
+
+    mode, _cursor, dropped = lead.next_mode(events, st)
+    assert mode == lead.MODE_RESUME
+    assert dropped == ""

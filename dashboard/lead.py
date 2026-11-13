@@ -143,6 +143,21 @@ BLOCKING_ASK = "duty_ask"
 MODE_FIRST = "brief"
 MODE_RESUME = "resume"
 
+# Код выхода `hermes chat`, которым CLI отсоединяется от сессии, которую нельзя
+# продолжать без человека: турн потерян (гейтвей перезапустился посреди него) или
+# сессия запаркована за ним. Такой резюм не удаётся **никогда** — сессия просит
+# интерактивный `/discard`, а одноразовый вызов только повторяет отсоединение.
+# Живое дело d_cf918495: гейтвей перезапустился в 14:35 посреди турна, и четыре
+# резюма по секунде сожгли счётчик, хотя принятый план и живая работа были целы.
+UNRESUMABLE_EXIT = 3
+
+# Сколько раз за цикл (от последнего `unblocked`) дело можно начинать заново
+# вместо резюма непригодной сессии. Один: второй подряд свежий бриф — это уже не
+# «сломанная сессия», а падение самой работы, и его считает счётчик резюмов
+# (`charter.max_lead_resumes`), иначе пара «непригодная сессия → свежий бриф»
+# крутилась бы бесконечно.
+MAX_FRESH_RESTARTS = 1
+
 # Телеметрия попытки — не факт о деле: в дайджесте ей нечего делать, иначе лид
 # читал бы сотни строк «вызван инструмент» вместо «этап отчитался».
 NOISE_KINDS = ("attempt_progress",)
@@ -349,6 +364,66 @@ def state(
         "last_exit": last_exit,
         "last_fact_at": last_fact_at,
     }
+
+
+def next_mode(events: Iterable[Any], st: dict[str, Any]) -> tuple[str, int, str]:
+    """Режим следующего захода: `(режим, курсор, брошенная сессия или "")`.
+
+    Резюм — не единственный способ продолжить дело. Если последний заход кончился
+    отсоединением CLI (`UNRESUMABLE_EXIT`), сессию продолжать нельзя: она просит
+    интерактивный `/discard`, которого у супервизора нет, и каждый следующий
+    `--resume` только повторяет отсоединение за секунду. Такой заход не сделал
+    работы вовсе — тратить на него счётчик `charter.max_lead_resumes` значит
+    парковать живое дело с целым планом (кейс d_cf918495).
+
+    Поэтому непригодная сессия бросается: следующий заход — **бриф** с историей
+    дела целиком (`brief` читает журнал с нуля, ничего не теряется), а брошенная
+    сессия называется в факте `lead_started.dropped_session`. Отсоединение —
+    признак поломки обвязки, а не работы, и восстановлений разрешено
+    `MAX_FRESH_RESTARTS` за цикл; дальше дело идёт обычным путём резюмов.
+
+    Первого захода это не касается: сессии ещё нет, и режим — бриф без брошенных.
+    """
+    session = str(st.get("session_id") or "")
+    if not session:
+        return MODE_FIRST, 0, ""
+    if _unresumable(st) and _fresh_starts(events) <= MAX_FRESH_RESTARTS:
+        return MODE_FIRST, 0, session
+    return MODE_RESUME, _int(st.get("session_cursor")), ""
+
+
+def _unresumable(st: dict[str, Any]) -> bool:
+    """Сессию нельзя продолжить: последний заход кончился отсоединением CLI.
+
+    Сверяется, что отсоединение относится к **той же** сессии, которую предстоит
+    резюмировать: выход по коду 3 у захода, который шёл в другой сессии, ничего
+    не говорит о текущей.
+    """
+    last = st.get("last_exit") or {}
+    if _int(last.get("exit_code")) != UNRESUMABLE_EXIT:
+        return False
+    dropped = str(last.get("session_id") or "")
+    return bool(dropped) and dropped == str(st.get("session_id") or "")
+
+
+def _fresh_starts(events: Iterable[Any]) -> int:
+    """Сколько раз дело начинали с нуля в текущем цикле (от последнего `unblocked`).
+
+    Первый бриф считается: `MAX_FRESH_RESTARTS` — это добавка к нему, а не общий
+    потолок. Ответ человека («продолжать») открывает новый цикл и обнуляет
+    счётчик — ровно как у счётчика резюмов (`state`).
+    """
+    count = 0
+    for event in events or ():
+        if not isinstance(event, dict):
+            continue
+        kind = str(event.get("kind") or "")
+        if kind == "unblocked":
+            count = 0
+            continue
+        if kind == LEAD_KIND_STARTED and str(journal.payload_of(event).get("mode") or "") == MODE_FIRST:
+            count += 1
+    return count
 
 
 def max_resumes(override: Any = None, *, spec: Any = None) -> int:
@@ -975,8 +1050,9 @@ def run(
         deal = _deal(conn, deal_id)
         events = journal.read_events(conn, str(deal["id"]))
         st = state(events, now=moment)
-        mode = MODE_RESUME if st["session_id"] else MODE_FIRST
-        cursor = _int(st["session_cursor"]) if mode == MODE_RESUME else 0
+        # Режим решает `next_mode`, а не наличие сессии: сессия, которую CLI
+        # перестал продолжать (потерянный турн), бросается и заменяется брифом.
+        mode, cursor, dropped = next_mode(events, st)
         spec = _spec(events)
         resume_limit = max_resumes(None, spec=spec)
 
@@ -1033,6 +1109,9 @@ def run(
             "session_id": str(st["session_id"]) or None,
             "cursor": head(events),
             "resumed_from": cursor if mode == MODE_RESUME else None,
+            # Брошенная сессия называется фактом: «начал с нуля» без причины
+            # читается как потеря контекста, а причина — отсоединение CLI.
+            "dropped_session": dropped or None,
             "run_budget": budget_sec,
             "resumes": _int(st["resumes"]) + (1 if mode == MODE_RESUME else 0),
             "cmd": cmd,
@@ -1509,13 +1588,16 @@ def supervise(
                 "question": parked,
                 "already": bool(known),
             }
-        mode = MODE_RESUME if st["session_id"] else MODE_FIRST
+        # Режим объявляется тем же `next_mode`, что и у самого захода: ответ
+        # сторожа не должен обещать резюм, который заход заменит брифом.
+        mode, _cursor, dropped = next_mode(events, st)
         pid = (spawn or _spawn_supervisor)(home, str(deal["id"]), budget_sec) if write else None
         return {
             "deal": str(deal["id"]),
             "action": "started" if write else "would_start",
             "mode": mode,
             "session_id": st["session_id"],
+            "dropped_session": dropped or None,
             "pid": pid,
             "lead": st,
             "limit": limit,

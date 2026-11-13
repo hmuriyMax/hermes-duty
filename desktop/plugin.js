@@ -1952,6 +1952,33 @@ function compactStageView(stage) {
   const attempts = Array.isArray(s.attempts) ? s.attempts : []
   const count = Number(s.attemptsCount) || attempts.length
   const failed = attempts.some((attempt) => attempt && attempt.tone === 'red')
+  // Токены и обращения к инструментам по всем попыткам этапа (`null` — телеметрия
+  // их не записала, и это не ноль).
+  const sumOf = (key) => {
+    let total = 0
+    let seen = false
+    for (const attempt of attempts) {
+      const value = numOrNull(attempt && attempt[key])
+      if (value === null) continue
+      total += value
+      seen = true
+    }
+    return seen ? total : null
+  }
+  const toolsSum = sumOf('tools')
+  const tokensSum = sumOf('tokens')
+  const statsText = [
+    toolsSum ? `${fmtCount(toolsSum)} ${plural(toolsSum, 'вызов', 'вызова', 'вызовов')}` : '',
+    tokensSum ? `${fmtCount(tokensSum)} ${plural(tokensSum, 'токен', 'токена', 'токенов')}` : '',
+  ]
+    .filter(Boolean)
+    .join(' · ')
+  const statsTitle = [
+    toolsSum ? `${toolsSum} обращений к инструментам за ${attempts.length} ${plural(attempts.length, 'попытку', 'попытки', 'попыток')}` : '',
+    tokensSum ? `${tokensSum} токенов израсходовано` : '',
+  ]
+    .filter(Boolean)
+    .join(' · ')
   const standing = ['running', 'wait_human', 'wait_gate', 'parked', 'failed'].includes(state)
   const open = standing || failed
   const id = String(s.id || '—')
@@ -1973,6 +2000,11 @@ function compactStageView(stage) {
     // функция на обе поверхности и на оба места.
     kindText: kind === 'agent' ? executorText(s) : kind,
     attemptsText: count ? `${count} ${plural(count, 'попытка', 'попытки', 'попыток')}` : 'попыток нет',
+    // Сводка работы этапа: вызовы инструментов и токены, сложенные по попыткам.
+    // Эти числа жили только в подсказке шкалы и в раскрытой попытке; строка этапа
+    // без них читалась как «этап есть, работы нет» (Макс, 14.11).
+    statsText,
+    statsTitle,
     stateLabel: meta.label,
     tone: meta.tone,
     needsText: String(s.needsText || ''),
@@ -2557,7 +2589,7 @@ function layoutCalls(calls, options) {
   const width = Number(opts.width) || 1000
   const levelH = Number(opts.levelH) || 12
   const top = Number(opts.top) || 0
-  const maxLevels = Math.max(1, Number(opts.maxLevels) || 16)
+  const maxLevels = Math.max(1, Number(opts.maxLevels) || 5)
   const gap = Number(opts.gap) || 2
   const span = from === null || to === null ? 0 : to - from
   // Позиция вызова — та же карта оси, что у полос и маркеров (`pctOf` из
@@ -2596,8 +2628,9 @@ function layoutCalls(calls, options) {
   // бы утверждать «0 мс»: длительности нет, а не она нулевая. Отдельная ширина и
   // флаг `unfinished` дают поверхности возможность показать это иначе.
   const UNFINISHED_W = 5
-  // Сначала — место каждого вызова на карте оси, потом склейка всплесков.
-  const spots = []
+  const lastEnd = []
+  const chips = []
+  let clipped = 0
   for (const call of list) {
     let px = Math.max(0, Math.min(width, pxOf(call.at)))
     const unfinished = call.ms === null || call.ms === undefined
@@ -2613,42 +2646,12 @@ function layoutCalls(calls, options) {
     if (clampLeftPx !== null && px < clampLeftPx) {
       px = Math.min(clampLeftPx, (clampRightPx !== null ? clampRightPx : width) - size)
     }
-    spots.push({ call, px, size, unfinished })
-  }
-  // Всплеск — вызовы, которые на этой карте стоят вплотную: между ними меньше
-  // MERGE_GAP виртуальных пикселей. Сто пятьдесят восемь чипов по 2 px в одну
-  // попытку не читаются никак: ряды кончаются, и они ложатся друг на друга
-  // (`d_92177017`, Макс, 14.11: «наслоения в шкале времени»). Всплеск рисуется
-  // одной полосой, а его точное число вызовов уходит в подсказку и в счёт
-  // попытки — факт не теряется, теряется только его пиксельная дробь.
-  const MERGE_GAP = 4
-  const groups = []
-  // `merge: false` — раскладка по отдельным вызовам: её показывает развёрнутая
-  // строка, где у каждого вызова свой уровень и своя подсказка.
-  const merging = opts.merge !== false
-  for (const spot of spots) {
-    const last = groups[groups.length - 1]
-    const end = last ? last.px + last.size : null
-    if (merging && last && spot.px - end < MERGE_GAP) {
-      last.size = Math.max(last.size, spot.px + spot.size - last.px)
-      last.calls.push(spot.call)
-      last.unfinished = last.unfinished || spot.unfinished
-      continue
-    }
-    groups.push({ px: spot.px, size: spot.size, calls: [spot.call], unfinished: spot.unfinished })
-  }
-  const lastEnd = []
-  const chips = []
-  let clipped = 0
-  for (const group of groups) {
-    const px = group.px
-    const size = group.size
+    const linSize = size
     let level = lastEnd.findIndex((end) => px - end >= gap)
     if (level < 0) {
       if (lastEnd.length >= maxLevels) {
-        // Уровни кончились даже после склейки (больше шестнадцати рядов на одну
-        // попытку) — полосу всё равно показываем: прятать факт хуже, чем
-        // наложить его на соседа. Число наложенных считает `clipped`.
+        // Уровни кончились — вызов всё равно показываем: прятать факт хуже, чем
+        // наложить его на соседа. Число наложенных считается в `clipped`.
         level = lastEnd.indexOf(Math.min(...lastEnd))
         clipped += 1
       } else {
@@ -2657,17 +2660,15 @@ function layoutCalls(calls, options) {
     }
     lastEnd[level] = px + size
     chips.push({
-      call: group.calls[0],
-      calls: group.calls,
-      count: group.calls.length,
+      call,
       left: Math.round(px * 10) / 10,
       width: size,
       leftPct: Math.round((px / width) * 10000) / 100,
       widthPct: Math.round((size / width) * 10000) / 100,
-      widthLinPct: Math.round((size / width) * 10000) / 100,
+      widthLinPct: Math.round((linSize / width) * 10000) / 100,
       level,
       top: top + level * levelH,
-      unfinished: group.unfinished,
+      unfinished,
     })
   }
   const levels = lastEnd.length
@@ -2706,12 +2707,7 @@ const TL = {
   collapsed: 20,
   levelH: 12,
   top: 6,
-  // Потолок уровней ряда. Пять было мало: на живом деле `d_92177017` попытка
-  // набрала 108 вызовов и требовала шести рядов — шестой ложился поверх первого,
-  // и дорожка читалась как «наслоения» (Макс, 14.11). Потолок остался, но высокий:
-  // ряд растёт вниз, пока вызовы не перестанут сталкиваться, и только после
-  // шестнадцатого ряда наложение считается приемлемым (крайний случай).
-  maxLevels: 16,
+  maxLevels: 5,
   pad: 8,
   // Зазор, с которого молчание стоит называть тишиной: полминуты — обычная
   // пауза между вызовами, а не простой, и рисовать её значило бы шуметь.
@@ -2805,27 +2801,6 @@ function attemptView(bar, scale) {
         maxLevels: TL.maxLevels,
       })
     : { chips: [], height: TL.top + TL.levelH, clipped: 0 }
-  // Развёрнутая строка показывает каждый вызов своим чипом, свёрнутая — полосы
-  // всплесков. Вторая раскладка считается только если склейка что-то склеила.
-  const merged = layout.chips.some((chip) => (Number(chip.count) || 1) > 1)
-  const detailLayout = merged
-    ? layoutCalls(calls, {
-        from: axis.start,
-        to: axis.end,
-        toPct: scale && typeof scale.pctOf === 'function' ? scale.pctOf : null,
-        clamp: { leftPct: b.leftPct, rightPct: b.endPct },
-        levelH: TL.levelH,
-        top: TL.top,
-        maxLevels: TL.maxLevels,
-        merge: false,
-      })
-    : layout
-  // Раскладка по отдельным вызовам годится, только если она читается: у попытки
-  // на 161 вызов в двадцатисекундном окне все чипы встают в один пиксель, и
-  // «развернуть» значит нарисовать стену наложений. Тогда остаются полосы
-  // всплесков с числом в подсказке — факт тот же, картинка честная.
-  const detailUsable = merged && detailLayout.clipped === 0 && detailLayout.levels <= 6
-  const detail = detailUsable ? detailLayout : layout
   const omitted = numOrNull(b.callsOmitted) || 0
   const says = Array.isArray(b.says) ? b.says : []
   const saysOmitted = numOrNull(b.saysOmitted) || 0
@@ -2833,18 +2808,11 @@ function attemptView(bar, scale) {
   const notes = []
   if (saysOmitted) notes.push(`ещё ${fmtCount(saysOmitted)} ${plural(saysOmitted, 'фраза', 'фразы', 'фраз')} не показано (потолок)`)
   if (omitted) notes.push(`ещё ${fmtCount(omitted)} ${plural(omitted, 'вызов', 'вызова', 'вызовов')} не показано (потолок)`)
-  // Одна разметка чипа на обе раскладки: свёрнутая лента (всплески) и
-  // развёрнутая строка (отдельные вызовы) отличаются только раскладкой.
-  const chipView = (chip) => {
+  const chips = layout.chips.map((chip) => {
     const call = chip.call || {}
     // Подсказка и инспектор читают одни и те же поля: имя инструмента, время
     // начала и длительность. Поверхность ничего не досчитывает.
-    const count = Number(chip.count) || 1
-    const tip = count > 1
-      // Всплеск: полоса — не один вызов, а N подряд. Подсказка называет число и
-      // крайние инструменты, чтобы полоса не читалась как «один длинный вызов».
-      ? `${count} вызовов подряд · ${call.clock || '—'}–${(chip.calls[chip.calls.length - 1] || {}).clock || '—'} · ${call.name || '—'}…${(chip.calls[chip.calls.length - 1] || {}).name || '—'}`
-      : `${call.name || '—'} · ${call.clock || '—'} · ${call.msText || '—'}`
+    const tip = `${call.name || '—'} · ${call.clock || '—'} · ${call.msText || '—'}`
     return {
       // Идентификатор вызова — ключ выбора в инспекторе (`stage:attempt:seq`).
       id: `${b.stage || '—'}:${b.number || '—'}:${call.seq === null || call.seq === undefined ? '—' : call.seq}`,
@@ -2861,14 +2829,10 @@ function attemptView(bar, scale) {
       level: chip.level,
       tone: toolTone(call.name),
       unfinished: chip.unfinished === true,
-      count,
-      burst: count > 1,
       tip,
       title: tip,
     }
-  }
-  const chips = layout.chips.map(chipView)
-  const chipsDetail = detail === layout ? [] : detail.chips.map(chipView)
+  })
   const status = b.outcomeText || (b.open ? b.leaseText : b.outcome || b.status || b.durationText)
 
   // Сказанное и тишина — на той же кусочной карте оси, что чипы и маркеры: одна
@@ -2980,9 +2944,7 @@ function attemptView(bar, scale) {
   // Наслоения шли не от свёрнутой высоты, а от того, что в свёрнутой ленте сотни
   // двухпиксельных чипов стояли в одних и тех же пикселях — их разводит склейка
   // всплесков выше, а не высота строки.
-  // Полная высота — по более высокой раскладке: развёрнутая строка держит
-  // отдельные вызовы, и уровней у них больше, чем у полос всплесков.
-  const full = Math.max(TL.collapsed, layout.height + TL.pad, detail.height + TL.pad)
+  const full = Math.max(TL.collapsed, layout.height + TL.pad)
   const collapsed = Math.min(full, TL.collapsed)
   return {
     full,
@@ -3007,8 +2969,6 @@ function attemptView(bar, scale) {
       unfinished: chip.unfinished,
     })),
     chips,
-    // Отдельные вызовы для развёрнутой строки; пусто, когда склейки не было.
-    chipsDetail,
     marks,
     waits,
     // Сказанное агентом и тишина: две вещи, которые на пустой полосе выглядели
@@ -4358,13 +4318,13 @@ function DutyAttemptRow({ view, callSel, onSelectCall, toolFilter }) {
       }),
     )
   }
-  // Два слоя чипов: свёрнутая лента — полосы всплесков, развёрнутая строка —
-  // каждый вызов своим чипом. Показывает один слой CSS по наведению на полосу.
-  const chipNodes = (list, detailLayer) =>
+  // Чип — один вызов: свёрнутая лента кладёт их одной линией с наложением,
+  // развёрнутая — по уровням.
+  const chipNodes = (list) =>
     list.map((chip) =>
       h('span', {
-        key: `call-${detailLayer ? 'd' : 'b'}-${chip.id}`,
-        className: `duty-tl-call${chip.unfinished ? ' duty-tl-unfinished' : ''}${chip.burst ? ' duty-tl-burst' : ''}${detailLayer ? ' duty-tl-detail' : ''}${callSel === chip.id ? ' duty-tl-sel' : ''}${active.length && !active.includes(chip.tone) ? ' duty-tl-dim' : ''}`,
+        key: `call-${chip.id}`,
+        className: `duty-tl-call${chip.unfinished ? ' duty-tl-unfinished' : ''}${callSel === chip.id ? ' duty-tl-sel' : ''}${active.length && !active.includes(chip.tone) ? ' duty-tl-dim' : ''}`,
         'data-level': String(chip.level || 0),
         'data-tip': chip.tip || chip.title,
         'aria-label': chip.tip || chip.title,
@@ -4374,8 +4334,7 @@ function DutyAttemptRow({ view, callSel, onSelectCall, toolFilter }) {
           : { left: `${chip.leftPct}%`, '--w-log': `${chip.widthPct}%`, '--w-lin': `${chip.widthLinPct ?? chip.widthPct}%`, width: 'var(--w-lin)', top: `${chip.top}px`, background: dutyToneVar(chip.tone) },
       }),
     )
-  track.push(...chipNodes(view.chips, false))
-  if (view.chipsDetail && view.chipsDetail.length) track.push(...chipNodes(view.chipsDetail, true))
+  track.push(...chipNodes(view.chips))
   if (view.marks.length) {
     track.push(
       h(
@@ -4428,20 +4387,18 @@ function DutyLeadLane({ leadLane }) {
       h(
         'div',
         { className: 'duty-tl-lane-id' },
-        h('span', { className: 'duty-tl-lane-name', title: 'лид: процесс, который ведёт дело' }, 'лид'),
-        // Вид и счёт — второй строкой под именем: в одну строку они отбирали у
-        // имени всю ширину, и длинное имя ложилось на счёт (Макс, 14.11).
         h(
           'span',
-          { className: 'duty-tl-lane-sub' },
+          { className: 'duty-tl-lane-head' },
+          h('span', { className: 'duty-tl-lane-code duty-mono', title: 'лид: процесс, который ведёт дело' }, 'лид'),
           h(
             'span',
             { className: 'duty-tl-kind duty-tl-kind-agent', title: 'профиль: lead' },
             h('svg', { className: 'duty-tl-kind-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' }, h('path', { d: KIND_ICON.agent })),
             'lead',
           ),
-          h('span', { className: 'duty-tl-lane-meta' }, leadLane ? leadLane.text : ''),
         ),
+        h('span', { className: 'duty-tl-lane-meta' }, leadLane ? leadLane.text : ''),
       ),
     ),
     runs.length
@@ -4502,14 +4459,12 @@ function DutyLane({ lane, bars, scale, callSel, onSelectCall, toolFilter }) {
       h(
         'div',
         { className: 'duty-tl-lane-id' },
-        // Крупно — id этапа, ниже — описание из спеки в две строки (см. веб).
-        h('span', { className: 'duty-tl-lane-code duty-mono', title: view.id ? `этап: ${view.id}` : view.name }, view.id || view.name),
-        view.id && view.name && view.name !== view.id
-          ? h('span', { className: 'duty-tl-lane-desc', title: view.name }, view.name)
-          : null,
+        // Свёрнутая дорожка — одна строка: код этапа и вид. Описание и счёт
+        // выезжают при развороте (см. веб).
         h(
           'span',
-          { className: 'duty-tl-lane-sub' },
+          { className: 'duty-tl-lane-head' },
+          h('span', { className: 'duty-tl-lane-code duty-mono', title: view.id ? `этап: ${view.id}` : view.name }, view.id || view.name),
           view.kind
             ? h(
                 'span',
@@ -4525,8 +4480,11 @@ function DutyLane({ lane, bars, scale, callSel, onSelectCall, toolFilter }) {
                 view.kindText,
               )
             : null,
-          h('span', { className: 'duty-tl-lane-meta' }, view.meta),
         ),
+        view.id && view.name && view.name !== view.id
+          ? h('span', { className: 'duty-tl-lane-desc', title: view.name }, view.name)
+          : null,
+        h('span', { className: 'duty-tl-lane-meta' }, view.meta),
       ),
     ),
     view.empty
@@ -4781,12 +4739,16 @@ const CSS = `
 .duty-tl-lane{animation:duty-fade-in .32s ease both}
 @media (prefers-reduced-motion:reduce){.duty-stage-block,.duty-tl-lane{animation:none}.duty-scale-tick,.duty-scale-grid-line,.duty-tl-idle-gap,.duty-tl-call,.duty-tl-wait,.duty-tl-say,.duty-tl-lane,.duty-tl-row,.duty-stage-block,.duty-att-row{transition:none!important}}
 .duty-tl-lane-h{display:grid;grid-template-columns:var(--duty-tl-gutter,186px) 1fr;gap:var(--duty-tl-gap,8px);align-items:center;min-height:20px}
-.duty-tl-lane-id{display:flex;flex-direction:column;align-items:stretch;gap:1px;min-width:0;white-space:nowrap}
-.duty-tl-lane-sub{display:flex;align-items:center;gap:6px;min-width:0}
+.duty-tl-lane-id{display:flex;flex-direction:column;align-items:stretch;gap:0;min-width:0}
+.duty-tl-lane-head{display:flex;align-items:center;gap:6px;min-width:0}
+.duty-tl-lane-desc,.duty-tl-lane-meta{max-height:0;opacity:0;overflow:hidden;white-space:normal;transition:max-height .18s ease,opacity .16s ease,margin-top .18s ease}
+.duty-tl-lane-meta{font-size:10.5px;color:var(--ui-text-tertiary);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.duty-tl-lane:has(.duty-tl-band:hover,.duty-tl-call:hover) .duty-tl-lane-desc{max-height:2.9em;opacity:1;margin-top:1px}
+.duty-tl-lane:has(.duty-tl-band:hover,.duty-tl-call:hover) .duty-tl-lane-meta{max-height:1.7em;opacity:1;margin-top:1px}
 .duty-tl-lane-name{font-size:12.5px;font-weight:600;color:var(--ui-text-primary);letter-spacing:.01em;min-width:0;flex:0 1 auto;overflow:hidden;text-overflow:ellipsis}
-.duty-tl-lane-code{font-size:12.5px;font-weight:650;color:var(--ui-text-primary);min-width:0;overflow:hidden;text-overflow:ellipsis}
-.duty-tl-lane-desc{font-size:11px;line-height:1.3;color:var(--ui-text-secondary);min-width:0;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-.duty-tl-lane-meta{margin-left:auto;font-size:11px;color:var(--ui-text-tertiary);font-variant-numeric:tabular-nums;white-space:nowrap;min-width:0;overflow:hidden;text-overflow:ellipsis}
+.duty-tl-lane-code{font-size:12.5px;font-weight:650;color:var(--ui-text-primary);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.duty-tl-lane-desc{font-size:11px;line-height:1.3;color:var(--ui-text-secondary);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+
 .duty-tl-kind{display:inline-flex;align-items:center;gap:5px;height:19px;padding:0 7px;border-radius:5px;border:1px solid var(--ui-border-primary, rgba(127,127,127,.3));background:var(--ui-bg-quaternary);font-size:10.5px;font-weight:600;color:var(--ui-text-secondary)}
 .duty-tl-kind-ico{width:12px;height:12px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
 .duty-tl-kind-agent{color:var(--ui-text-primary);border-color:var(--ui-blue);background:color-mix(in srgb, var(--ui-blue) 12%, transparent)}
@@ -4813,10 +4775,7 @@ const CSS = `
 /* Суммарное число вызовов попытки: факт, а не предупреждение — тон нейтральный.
  * Жёлтым помечается только усечённое потолком: у части вызовов чипа нет. */
 /* Вызов без результата: полый чип — длительности нет, а не ноль. */
-.duty-tl-call.duty-tl-burst{background-image:repeating-linear-gradient(135deg,rgba(255,255,255,.55) 0 1px,transparent 1px 3px)}
-.duty-tl-row:not(:has(.duty-tl-band:hover,.duty-tl-call:hover)):not(:focus-visible) .duty-tl-call.duty-tl-detail{display:none}
-.duty-tl-row:has(.duty-tl-band:hover,.duty-tl-call:hover) .duty-tl-call.duty-tl-burst,
-.duty-tl-row:focus-visible .duty-tl-call.duty-tl-burst{display:none}
+
 .duty-tl-call.duty-tl-unfinished,.duty-tl-tick.duty-tl-unfinished{background:transparent !important;box-shadow:inset 0 0 0 1.5px currentColor !important;opacity:.9}
 .duty-tl-track{position:relative;height:100%}
 .duty-tl-track{position:relative;min-height:20px}
@@ -5597,8 +5556,9 @@ function CompactStages({ feed, timeline }) {
           : null,
         h(
           'span',
-          { className: 'duty-stage-row-meta' },
+          { className: 'duty-stage-row-meta', title: view.statsTitle || '' },
           view.attemptsText,
+          view.statsText ? ` · ${view.statsText}` : '',
           view.kindText ? ` · ${view.kindText}` : '',
         ),
       ),
@@ -6014,7 +5974,7 @@ function ScalePanel({ scale, dealId, callSel, onSelectCall, toolFilter, onToggle
         // Ячейка имени целиком: имя этапа и чип профиля в одной строке —
         // максимального из детей мало, нужна их сумма (fix-planned-branch
         // + «implementer» на d_c8551c18).
-        for (const cell of root.querySelectorAll('.duty-tl-lbl > *, .duty-tl-lane-code, .duty-tl-lane-desc, .duty-tl-lane-sub')) {
+        for (const cell of root.querySelectorAll('.duty-tl-lbl > *, .duty-tl-lane-code')) {
           need = Math.max(need, cell.scrollWidth || 0)
         }
         seen.px = Math.max(seen.px, need)

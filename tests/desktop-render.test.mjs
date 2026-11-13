@@ -414,9 +414,7 @@ test('десктоп: этапы и дорожки анимированы на �
   // Чипы keyed id вызова: React правит тот же узел, и CSS-переезд к новым
   // процентам играется, а не пересоздаётся. Ушедшие этапы доигрывают уход
   // снимком с is-leaving, вход — duty-fade-in.
-  // Ключ устойчив и уникален в пределах своего слоя: у всплеска и у отдельного
-  // вызова один и тот же id, и без метки слоя React склеил бы их.
-  assert.match(pluginSource(), /key: `call-\$\{detailLayer \? 'd' : 'b'\}-\$\{chip\.id\}`/, 'чипы не имеют устойчивого ключа')
+  assert.match(pluginSource(), /key: `call-\$\{chip\.id\}`/, 'чипы не имеют устойчивого ключа')
   assert.match(pluginSource(), /is-leaving/, 'уход этапа не анимируется')
   assert.match(pluginSource(), /duty-fade-in/, 'нет анимации входа')
   assert.match(pluginSource(), /duty-scale-tick,\.duty-scale-grid-line/, 'метки оси не переезжают плавно')

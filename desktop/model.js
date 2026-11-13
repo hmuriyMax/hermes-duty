@@ -1903,6 +1903,33 @@ function compactStageView(stage) {
   const attempts = Array.isArray(s.attempts) ? s.attempts : []
   const count = Number(s.attemptsCount) || attempts.length
   const failed = attempts.some((attempt) => attempt && attempt.tone === 'red')
+  // Токены и обращения к инструментам по всем попыткам этапа (`null` — телеметрия
+  // их не записала, и это не ноль).
+  const sumOf = (key) => {
+    let total = 0
+    let seen = false
+    for (const attempt of attempts) {
+      const value = numOrNull(attempt && attempt[key])
+      if (value === null) continue
+      total += value
+      seen = true
+    }
+    return seen ? total : null
+  }
+  const toolsSum = sumOf('tools')
+  const tokensSum = sumOf('tokens')
+  const statsText = [
+    toolsSum ? `${fmtCount(toolsSum)} ${plural(toolsSum, 'вызов', 'вызова', 'вызовов')}` : '',
+    tokensSum ? `${fmtCount(tokensSum)} ${plural(tokensSum, 'токен', 'токена', 'токенов')}` : '',
+  ]
+    .filter(Boolean)
+    .join(' · ')
+  const statsTitle = [
+    toolsSum ? `${toolsSum} обращений к инструментам за ${attempts.length} ${plural(attempts.length, 'попытку', 'попытки', 'попыток')}` : '',
+    tokensSum ? `${tokensSum} токенов израсходовано` : '',
+  ]
+    .filter(Boolean)
+    .join(' · ')
   const standing = ['running', 'wait_human', 'wait_gate', 'parked', 'failed'].includes(state)
   const open = standing || failed
   const id = String(s.id || '—')
@@ -1924,6 +1951,11 @@ function compactStageView(stage) {
     // функция на обе поверхности и на оба места.
     kindText: kind === 'agent' ? executorText(s) : kind,
     attemptsText: count ? `${count} ${plural(count, 'попытка', 'попытки', 'попыток')}` : 'попыток нет',
+    // Сводка работы этапа: вызовы инструментов и токены, сложенные по попыткам.
+    // Эти числа жили только в подсказке шкалы и в раскрытой попытке; строка этапа
+    // без них читалась как «этап есть, работы нет» (Макс, 14.11).
+    statsText,
+    statsTitle,
     stateLabel: meta.label,
     tone: meta.tone,
     needsText: String(s.needsText || ''),
@@ -2508,7 +2540,7 @@ function layoutCalls(calls, options) {
   const width = Number(opts.width) || 1000
   const levelH = Number(opts.levelH) || 12
   const top = Number(opts.top) || 0
-  const maxLevels = Math.max(1, Number(opts.maxLevels) || 16)
+  const maxLevels = Math.max(1, Number(opts.maxLevels) || 5)
   const gap = Number(opts.gap) || 2
   const span = from === null || to === null ? 0 : to - from
   // Позиция вызова — та же карта оси, что у полос и маркеров (`pctOf` из
@@ -2547,8 +2579,9 @@ function layoutCalls(calls, options) {
   // бы утверждать «0 мс»: длительности нет, а не она нулевая. Отдельная ширина и
   // флаг `unfinished` дают поверхности возможность показать это иначе.
   const UNFINISHED_W = 5
-  // Сначала — место каждого вызова на карте оси, потом склейка всплесков.
-  const spots = []
+  const lastEnd = []
+  const chips = []
+  let clipped = 0
   for (const call of list) {
     let px = Math.max(0, Math.min(width, pxOf(call.at)))
     const unfinished = call.ms === null || call.ms === undefined
@@ -2564,42 +2597,12 @@ function layoutCalls(calls, options) {
     if (clampLeftPx !== null && px < clampLeftPx) {
       px = Math.min(clampLeftPx, (clampRightPx !== null ? clampRightPx : width) - size)
     }
-    spots.push({ call, px, size, unfinished })
-  }
-  // Всплеск — вызовы, которые на этой карте стоят вплотную: между ними меньше
-  // MERGE_GAP виртуальных пикселей. Сто пятьдесят восемь чипов по 2 px в одну
-  // попытку не читаются никак: ряды кончаются, и они ложатся друг на друга
-  // (`d_92177017`, Макс, 14.11: «наслоения в шкале времени»). Всплеск рисуется
-  // одной полосой, а его точное число вызовов уходит в подсказку и в счёт
-  // попытки — факт не теряется, теряется только его пиксельная дробь.
-  const MERGE_GAP = 4
-  const groups = []
-  // `merge: false` — раскладка по отдельным вызовам: её показывает развёрнутая
-  // строка, где у каждого вызова свой уровень и своя подсказка.
-  const merging = opts.merge !== false
-  for (const spot of spots) {
-    const last = groups[groups.length - 1]
-    const end = last ? last.px + last.size : null
-    if (merging && last && spot.px - end < MERGE_GAP) {
-      last.size = Math.max(last.size, spot.px + spot.size - last.px)
-      last.calls.push(spot.call)
-      last.unfinished = last.unfinished || spot.unfinished
-      continue
-    }
-    groups.push({ px: spot.px, size: spot.size, calls: [spot.call], unfinished: spot.unfinished })
-  }
-  const lastEnd = []
-  const chips = []
-  let clipped = 0
-  for (const group of groups) {
-    const px = group.px
-    const size = group.size
+    const linSize = size
     let level = lastEnd.findIndex((end) => px - end >= gap)
     if (level < 0) {
       if (lastEnd.length >= maxLevels) {
-        // Уровни кончились даже после склейки (больше шестнадцати рядов на одну
-        // попытку) — полосу всё равно показываем: прятать факт хуже, чем
-        // наложить его на соседа. Число наложенных считает `clipped`.
+        // Уровни кончились — вызов всё равно показываем: прятать факт хуже, чем
+        // наложить его на соседа. Число наложенных считается в `clipped`.
         level = lastEnd.indexOf(Math.min(...lastEnd))
         clipped += 1
       } else {
@@ -2608,17 +2611,15 @@ function layoutCalls(calls, options) {
     }
     lastEnd[level] = px + size
     chips.push({
-      call: group.calls[0],
-      calls: group.calls,
-      count: group.calls.length,
+      call,
       left: Math.round(px * 10) / 10,
       width: size,
       leftPct: Math.round((px / width) * 10000) / 100,
       widthPct: Math.round((size / width) * 10000) / 100,
-      widthLinPct: Math.round((size / width) * 10000) / 100,
+      widthLinPct: Math.round((linSize / width) * 10000) / 100,
       level,
       top: top + level * levelH,
-      unfinished: group.unfinished,
+      unfinished,
     })
   }
   const levels = lastEnd.length
@@ -2657,12 +2658,7 @@ const TL = {
   collapsed: 20,
   levelH: 12,
   top: 6,
-  // Потолок уровней ряда. Пять было мало: на живом деле `d_92177017` попытка
-  // набрала 108 вызовов и требовала шести рядов — шестой ложился поверх первого,
-  // и дорожка читалась как «наслоения» (Макс, 14.11). Потолок остался, но высокий:
-  // ряд растёт вниз, пока вызовы не перестанут сталкиваться, и только после
-  // шестнадцатого ряда наложение считается приемлемым (крайний случай).
-  maxLevels: 16,
+  maxLevels: 5,
   pad: 8,
   // Зазор, с которого молчание стоит называть тишиной: полминуты — обычная
   // пауза между вызовами, а не простой, и рисовать её значило бы шуметь.
@@ -2756,27 +2752,6 @@ function attemptView(bar, scale) {
         maxLevels: TL.maxLevels,
       })
     : { chips: [], height: TL.top + TL.levelH, clipped: 0 }
-  // Развёрнутая строка показывает каждый вызов своим чипом, свёрнутая — полосы
-  // всплесков. Вторая раскладка считается только если склейка что-то склеила.
-  const merged = layout.chips.some((chip) => (Number(chip.count) || 1) > 1)
-  const detailLayout = merged
-    ? layoutCalls(calls, {
-        from: axis.start,
-        to: axis.end,
-        toPct: scale && typeof scale.pctOf === 'function' ? scale.pctOf : null,
-        clamp: { leftPct: b.leftPct, rightPct: b.endPct },
-        levelH: TL.levelH,
-        top: TL.top,
-        maxLevels: TL.maxLevels,
-        merge: false,
-      })
-    : layout
-  // Раскладка по отдельным вызовам годится, только если она читается: у попытки
-  // на 161 вызов в двадцатисекундном окне все чипы встают в один пиксель, и
-  // «развернуть» значит нарисовать стену наложений. Тогда остаются полосы
-  // всплесков с числом в подсказке — факт тот же, картинка честная.
-  const detailUsable = merged && detailLayout.clipped === 0 && detailLayout.levels <= 6
-  const detail = detailUsable ? detailLayout : layout
   const omitted = numOrNull(b.callsOmitted) || 0
   const says = Array.isArray(b.says) ? b.says : []
   const saysOmitted = numOrNull(b.saysOmitted) || 0
@@ -2784,18 +2759,11 @@ function attemptView(bar, scale) {
   const notes = []
   if (saysOmitted) notes.push(`ещё ${fmtCount(saysOmitted)} ${plural(saysOmitted, 'фраза', 'фразы', 'фраз')} не показано (потолок)`)
   if (omitted) notes.push(`ещё ${fmtCount(omitted)} ${plural(omitted, 'вызов', 'вызова', 'вызовов')} не показано (потолок)`)
-  // Одна разметка чипа на обе раскладки: свёрнутая лента (всплески) и
-  // развёрнутая строка (отдельные вызовы) отличаются только раскладкой.
-  const chipView = (chip) => {
+  const chips = layout.chips.map((chip) => {
     const call = chip.call || {}
     // Подсказка и инспектор читают одни и те же поля: имя инструмента, время
     // начала и длительность. Поверхность ничего не досчитывает.
-    const count = Number(chip.count) || 1
-    const tip = count > 1
-      // Всплеск: полоса — не один вызов, а N подряд. Подсказка называет число и
-      // крайние инструменты, чтобы полоса не читалась как «один длинный вызов».
-      ? `${count} вызовов подряд · ${call.clock || '—'}–${(chip.calls[chip.calls.length - 1] || {}).clock || '—'} · ${call.name || '—'}…${(chip.calls[chip.calls.length - 1] || {}).name || '—'}`
-      : `${call.name || '—'} · ${call.clock || '—'} · ${call.msText || '—'}`
+    const tip = `${call.name || '—'} · ${call.clock || '—'} · ${call.msText || '—'}`
     return {
       // Идентификатор вызова — ключ выбора в инспекторе (`stage:attempt:seq`).
       id: `${b.stage || '—'}:${b.number || '—'}:${call.seq === null || call.seq === undefined ? '—' : call.seq}`,
@@ -2812,14 +2780,10 @@ function attemptView(bar, scale) {
       level: chip.level,
       tone: toolTone(call.name),
       unfinished: chip.unfinished === true,
-      count,
-      burst: count > 1,
       tip,
       title: tip,
     }
-  }
-  const chips = layout.chips.map(chipView)
-  const chipsDetail = detail === layout ? [] : detail.chips.map(chipView)
+  })
   const status = b.outcomeText || (b.open ? b.leaseText : b.outcome || b.status || b.durationText)
 
   // Сказанное и тишина — на той же кусочной карте оси, что чипы и маркеры: одна
@@ -2931,9 +2895,7 @@ function attemptView(bar, scale) {
   // Наслоения шли не от свёрнутой высоты, а от того, что в свёрнутой ленте сотни
   // двухпиксельных чипов стояли в одних и тех же пикселях — их разводит склейка
   // всплесков выше, а не высота строки.
-  // Полная высота — по более высокой раскладке: развёрнутая строка держит
-  // отдельные вызовы, и уровней у них больше, чем у полос всплесков.
-  const full = Math.max(TL.collapsed, layout.height + TL.pad, detail.height + TL.pad)
+  const full = Math.max(TL.collapsed, layout.height + TL.pad)
   const collapsed = Math.min(full, TL.collapsed)
   return {
     full,
@@ -2958,8 +2920,6 @@ function attemptView(bar, scale) {
       unfinished: chip.unfinished,
     })),
     chips,
-    // Отдельные вызовы для развёрнутой строки; пусто, когда склейки не было.
-    chipsDetail,
     marks,
     waits,
     // Сказанное агентом и тишина: две вещи, которые на пустой полосе выглядели

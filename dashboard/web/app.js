@@ -1924,8 +1924,11 @@ function stageBlockNode(dealId, stage, timeline, rebuild) {
       view.name && view.name !== view.id ? h('span', { class: 'stage-row-desc', title: view.name }, view.name) : null,
       h(
         'span',
-        { class: 'stage-row-meta' },
+        { class: 'stage-row-meta', title: view.statsTitle || '' },
         h('span', { class: 'fresh', 'data-fresh': `stage:${stageKey}` }, view.attemptsText),
+        // Работа этапа: вызовы инструментов и токены — те же числа, что в
+        // раскрытой попытке, но видны без раскрытия.
+        view.statsText ? ` · ${view.statsText}` : '',
         view.kindText ? ` · ${view.kindText}` : '',
       ),
     ),
@@ -2356,12 +2359,13 @@ function attemptRowNode(view, key) {
       }),
     )
   }
-  // Два слоя чипов: свёрнутая лента (всплески одной полосой) и развёрнутая строка
-  // (каждый вызов своим чипом). Показывается один — CSS по наведению на полосу.
-  const chipNodes = (list, detailLayer) =>
-    list.map((chip) =>
+  // Чип — один вызов. Свёрнутая лента кладёт их одной линией с осознанным
+  // наложением (CSS), развёрнутая — по уровням (Макс, 14.11: наложение микроколов
+  // в свёрнутом виде было намеренным).
+  for (const chip of view.chips) {
+    track.append(
       h('span', {
-        class: `tl-call${chip.unfinished ? ' tl-unfinished' : ''}${chip.burst ? ' tl-burst' : ''}${detailLayer ? ' tl-detail' : ''}`,
+        class: `tl-call${chip.unfinished ? ' tl-unfinished' : ''}`,
         'data-level': String(chip.level || 0),
         'data-tone': chip.tone,
         'data-key': `call:${chip.id}`,
@@ -2375,8 +2379,7 @@ function attemptRowNode(view, key) {
         'data-call-id': chip.id,
       }),
     )
-  track.append(...chipNodes(view.chips, false))
-  if (view.chipsDetail && view.chipsDetail.length) track.append(...chipNodes(view.chipsDetail, true))
+  }
   // Сказанное агентом: точки на верхней кромке строки. Вопрос, на который они
   // отвечают, — «он думал или просто ничего не приходило», поэтому точка это
   // факт телеметрии, а не украшение.
@@ -2441,18 +2444,18 @@ function leadLaneNode(leadLane, scale) {
     h(
       'div',
       { class: 'tl-lane-id' },
-      h('span', { class: 'tl-lane-name', title: 'лид: процесс, который ведёт дело' }, 'лид'),
       h(
         'span',
-        { class: 'tl-lane-sub' },
+        { class: 'tl-lane-head' },
+        h('span', { class: 'tl-lane-code mono', title: 'лид: процесс, который ведёт дело' }, 'лид'),
         h(
           'span',
           { class: 'tl-kind tl-kind-agent', title: 'профиль: lead' },
           h('svg', { class: 'tl-kind-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' }, h('path', { d: KIND_ICON.agent })),
           'lead',
         ),
-        h('span', { class: 'tl-lane-meta', 'data-fresh': 'lane:lead' }, leadLane.text),
       ),
+      h('span', { class: 'tl-lane-meta', 'data-fresh': 'lane:lead' }, leadLane.text),
     ),
   )
   return h(
@@ -2517,16 +2520,14 @@ function laneNode(lane, bars, scale) {
     h(
       'div',
       { class: 'tl-lane-id' },
-      // Крупно — `id` этапа (`impl-v3`): по нему этап ищут в журнале и графе.
-      // Описание из спеки («чистка API-слоя: интерфейс sCompanyInfo, main.go,
-      // моки») — строкой ниже мелким шрифтом: в одну строку оно вытесняло и
-      // значок вида, и счёт (Макс, 14.11).
-      h('span', { class: 'tl-lane-code mono', title: view.id ? `этап: ${view.id}` : view.name }, view.id || view.name),
-      view.id && view.name && view.name !== view.id
-        ? h('span', { class: 'tl-lane-desc', title: view.name }, view.name)
-        : null,
-      // Вид и счёт — последней строкой колонки.
-      h('span', { class: 'tl-lane-sub' },
+      // Свёрнутая дорожка — одна строка: `id` этапа и вид исполнителя. Описание из
+      // спеки и счёт попыток появляются при развороте (наведение на полосу):
+      // постоянные три строки делали дорожку высокой, и этапы уезжали вниз
+      // (Макс, 14.11).
+      h(
+        'span',
+        { class: 'tl-lane-head' },
+        h('span', { class: 'tl-lane-code mono', title: view.id ? `этап: ${view.id}` : view.name }, view.id || view.name),
       view.kind
         ? h(
             'span',
@@ -2542,8 +2543,13 @@ function laneNode(lane, bars, scale) {
             view.kindText,
           )
         : null,
-      h('span', { class: 'tl-lane-meta fresh', 'data-fresh': `lane:${lane.key}` }, view.meta),
       ),
+      // Описание из спеки — многострочно: это фраза, а не код, и в одну строку она
+      // растягивала колонку на 320 px и всё равно обрезалась.
+      view.id && view.name && view.name !== view.id
+        ? h('span', { class: 'tl-lane-desc', title: view.name }, view.name)
+        : null,
+      h('span', { class: 'tl-lane-meta fresh', 'data-fresh': `lane:${lane.key}` }, view.meta),
     ),
   )
   return h(
@@ -3420,7 +3426,9 @@ function fitScaleGutter(root, dealKey) {
   // Имя этапа меряется собственной шириной: у ячейки `scrollWidth` равен её же
   // ширине (длинное имя обрезано), и колонка не росла под него вовсе — имена
   // стояли в 204 px и терялись на середине слова.
-  for (const el of root.querySelectorAll('.tl-lbl > *, .tl-lane-code, .tl-lane-desc, .tl-lane-sub')) {
+  // Описание не меряется: оно переносится по строкам, и его ширина — не заявка
+  // на колонку.
+  for (const el of root.querySelectorAll('.tl-lbl > *, .tl-lane-code')) {
     need = Math.max(need, el.scrollWidth || 0)
   }
   scaleGutterSeen.px = Math.max(scaleGutterSeen.px, need)

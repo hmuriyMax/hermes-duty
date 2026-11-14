@@ -1380,6 +1380,24 @@ test('веб: одиночный маркер остаётся прежним �
 
 /* ------------------------------- лид на экране дела: состояние и решения (2.0) */
 
+test('провод обмена с ролью: путь до дорожки адресата на обеих поверхностях', () => {
+  const css = read('dashboard/web/styles.css')
+  // Провод рисуется по разметке: у дорожки — роль, у палки — номер обмена.
+  for (const [name, source] of [['веб', app], ['десктоп', pluginSource]]) {
+    assert.match(source, /data-lane-role/, `${name}: дорожка не знает своей роли`)
+    assert.match(source, /data-ask-span/, `${name}: палка не знает своего обмена`)
+    assert.match(source, /wireLeg|dutyWireLeg/, `${name}: нет стойки провода`)
+    assert.match(source, /ResizeObserver/, `${name}: провод не пересчитывается на разворот строки`)
+  }
+  // Путь «туда и обратно»: две стойки и перекладина по дорожке адресата.
+  assert.match(css, /\.tl-wire-leg \{[^}]*border-left: 1.5px dashed/, 'веб: стойка провода не пунктир')
+  assert.match(css, /\.tl-wire-cross \{[^}]*border-top: 1.5px dashed/, 'веб: нет перекладины провода')
+  assert.match(pluginSource, /\.duty-tl-wire-leg\{[^}]*border-left:1\.5px dashed/, 'десктоп: стойка провода не пунктир')
+  assert.match(pluginSource, /\.duty-tl-wire-cross\{[^}]*border-top:1\.5px dashed/, 'десктоп: нет перекладины провода')
+  // Провод заменил местную стрелку, а не встал рядом с ней.
+  assert.match(css, /\.tl-mark\.is-arrow\.is-wired i \{ display: none; \}/, 'веб: у палки остались два знака')
+})
+
 test('адрес вопроса: обмен с ролью — стрелка на обеих поверхностях, пауза человека — разрыв', () => {
   const css = read('dashboard/web/styles.css')
   // Обе поверхности рисуют один знак: стрелка в сторону адресата.

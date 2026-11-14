@@ -2452,6 +2452,17 @@ function attemptRowNode(view, key) {
             'data-tip': mark.title,
             'aria-label': mark.ariaLabel,
             'data-key': `mark:${mark.type}:${mark.pct}`,
+            // Адрес обмена: по нему провод идёт до дорожки адресата, а по номеру
+            // момента поверхность находит пару «вопрос → ответ».
+            ...(mark.role
+              ? {
+                  'data-ask-role': mark.role,
+                  'data-ask-what': mark.type,
+                  ...(mark.spanIndex === null || mark.spanIndex === undefined
+                    ? {}
+                    : { 'data-ask-span': String(mark.spanIndex) }),
+                }
+              : {}),
           },
           ...bars,
         ),
@@ -2499,7 +2510,7 @@ function leadLaneNode(leadLane, scale) {
   )
   return h(
     'div',
-    { class: 'tl-lane is-lead', 'data-key': 'lane:lead' },
+    { class: 'tl-lane is-lead', 'data-key': 'lane:lead', 'data-lane-role': 'lead' },
     head,
     runs.length
       ? h(
@@ -2580,7 +2591,9 @@ function laneNode(lane, bars, scale) {
   )
   return h(
     'div',
-    { class: 'tl-lane', 'data-key': `lane:${lane.key}` },
+    // Роль дорожки — адрес провода вопроса: по ней поверхность находит, куда
+    // вести линию от момента вопроса (`drawAskWires`).
+    { class: 'tl-lane', 'data-key': `lane:${lane.key}`, 'data-lane-role': lane.role || '' },
     head,
     view.empty
       ? h('div', { class: 'tl-row-empty' }, h('span', { class: 'tl-row-empty-t' }, 'попыток не было'))
@@ -2831,6 +2844,7 @@ function scalePanel(scale) {
   const dealKey = String(route.id || '')
   queueMicrotask(() => {
     fitScaleGutter(panel, dealKey)
+    drawAskWires(panel, scale)
     if (scale.axis.zoom > 1) pinScaleScroll(panel)
   })
   // Повторный замер после кадров: подгрузившийся шрифт и дорисованные в морфе
@@ -2841,6 +2855,7 @@ function scalePanel(scale) {
     requestAnimationFrame(() =>
       requestAnimationFrame(() => {
         fitScaleGutter(panel, dealKey)
+        drawAskWires(panel, scale)
         if (scale.axis.zoom > 1) pinScaleScroll(panel)
       }),
     )
@@ -3402,6 +3417,117 @@ function fitScaleGutter(root, dealKey) {
   const named = Math.min(300, Math.max(96, Math.ceil(scaleGutterSeen.namePx) + 8))
   wrap.style.setProperty('--tl-name', `${named}px`)
 }
+/**
+ * Провода обмена с ролью: путь от палки вопроса до дорожки адресата и обратно.
+ *
+ * Адрес вопроса — это не значок у палки, а линия до того, кого спросили (Макс,
+ * 14.11: «я думал, стрелка будет красиво прямо до адресата идти»). Форма пути —
+ * «туда и обратно»: подъём от момента вопроса к дорожке адресата, перекладина по
+ * ней до момента ответа и спуск обратно, с наконечниками на обоих концах. Так
+ * пара читается одним заходом, а не двумя палками рядом.
+ *
+ * Геометрию знает только DOM: дорожки разной высоты, строки раскрываются по
+ * наведению, шкала листается. Проценты оси дают x (их считает шейпер), высоты
+ * дают y (их знает вёрстка). Поэтому пересчёт идёт после отрисовки и по
+ * наблюдателю за размером дорожек, а не по кадрам.
+ */
+function drawAskWires(root, scale) {
+  if (!root || !root.querySelector) return
+  const lanes = root.querySelector('.tl-lanes')
+  if (!lanes) return
+  // Шейпер кладём на сам узел: наблюдатель за размером держит только его, а
+  // пересчёт после разворота строки обязан видеть те же пары.
+  if (scale) lanes.__tlWireScale = scale
+  const shaped = lanes.__tlWireScale
+  if (!lanes.__tlWireWatch && typeof ResizeObserver === 'function') {
+    lanes.__tlWireWatch = new ResizeObserver(() => {
+      const owner = lanes.closest('.scale-wrap') || lanes.closest('.panel')
+      if (owner) drawAskWires(owner)
+    })
+    lanes.__tlWireWatch.observe(lanes)
+  }
+  for (const old of lanes.querySelectorAll(':scope > .tl-wire')) old.remove()
+  for (const mark of lanes.querySelectorAll('.tl-mark.is-wired')) mark.classList.remove('is-wired')
+  const spans = shaped && Array.isArray(shaped.roleSpans) ? shaped.roleSpans : []
+  if (!spans.length) return
+  const box = lanes.getBoundingClientRect()
+  // Пока панель не в документе, все прямоугольники нулевые и вести провод некуда.
+  // Короткий повтор вместо кадра: `requestAnimationFrame` в фоновой вкладке не
+  // приходит вовсе, а отрисовка — не повод ставить таймер в петлю опроса.
+  if (box.width < 1 || lanes.clientWidth < 1) {
+    if (typeof ResizeObserver === 'function' && (lanes.__tlWireRetry || 0) < 3) {
+      lanes.__tlWireRetry = (lanes.__tlWireRetry || 0) + 1
+      setTimeout(() => {
+        const owner = lanes.closest('.scale-wrap') || lanes.closest('.panel')
+        if (owner) drawAskWires(owner)
+      }, 40)
+    }
+    return
+  }
+  lanes.__tlWireRetry = 0
+  for (const [index, span] of spans.entries()) {
+    if (!span || !span.role) continue
+    const role = String(span.role)
+    // Пара «вопрос → ответ» находится по номеру обмена, а не по времени: у двух
+    // вопросов один момент бывает совпасть до процента.
+    const ask = lanes.querySelector(`.tl-mark[data-ask-span="${index}"]`)
+    const lane = lanes.querySelector(`[data-lane-role="${CSS.escape(role)}"]`)
+    if (!ask || !lane) continue
+    const row = ask.closest('.tl-row')
+    const plot = ask.closest('.tl-plot')
+    if (!row || !plot) continue
+    // Адресат — строка его дорожки, а если попыток нет — сама дорожка: прийти
+    // надо к тому, кого спросили, а не в пустоту рядом.
+    const targetRow = lane.querySelector('.tl-row') || lane
+    const plotBox = plot.getBoundingClientRect()
+    const rowBox = row.getBoundingClientRect()
+    const targetBox = targetRow.getBoundingClientRect()
+    const x1 = Math.round(plotBox.left + (Number(span.fromPct) / 100) * plotBox.width - box.left)
+    const x2 = span.toPct === null || span.toPct === undefined
+      ? x1
+      : Math.round(plotBox.left + (Number(span.toPct) / 100) * plotBox.width - box.left)
+    const yAsk = Math.round(rowBox.top + rowBox.height / 2 - box.top)
+    const yTarget = Math.round(targetBox.top + targetBox.height / 2 - box.top)
+    // Путь короче восьми пикселей — это не дорога, а точка: рисовать нечего.
+    if (Math.abs(yTarget - yAsk) < 8 || !x1) continue
+    const up = yTarget < yAsk
+    const wire = document.createElement('div')
+    wire.className = `tl-wire${span.open ? ' is-open' : ''}`
+    wire.setAttribute('aria-hidden', 'true')
+    wire.setAttribute('data-tip', span.title || '')
+    // Стойка у момента вопроса: отсюда ушёл вопрос, сюда вернулся ответ.
+    wire.append(wireLeg(x1, yAsk, yTarget, up, span.open ? 'tail' : 'both'))
+    if (!span.open && Math.abs(x2 - x1) > 2) {
+      wire.append(wireCross(Math.min(x1, x2), yTarget, Math.abs(x2 - x1)))
+      // Обратная стойка — у момента ответа: она приходит ОТ адресата к этапу.
+      wire.append(wireLeg(x2, yAsk, yTarget, !up, 'back'))
+    }
+    lanes.append(wire)
+    // Местная стрелка у палки стала бы вторым знаком того же пути.
+    ask.classList.add('is-wired')
+  }
+}
+
+/** Стойка провода: линия от строки до адресата, с наконечником и точкой начала. */
+function wireLeg(x, yAsk, yTarget, up, kind) {
+  const leg = document.createElement('span')
+  leg.className = `tl-wire-leg ${up ? 'dir-up' : 'dir-down'} is-${kind}`
+  leg.style.left = `${x}px`
+  leg.style.top = `${Math.min(yAsk, yTarget)}px`
+  leg.style.height = `${Math.abs(yTarget - yAsk)}px`
+  return leg
+}
+
+/** Перекладина в дорожке адресата: от момента вопроса до момента ответа. */
+function wireCross(left, y, width) {
+  const cross = document.createElement('span')
+  cross.className = 'tl-wire-cross'
+  cross.style.left = `${left}px`
+  cross.style.top = `${y}px`
+  cross.style.width = `${width}px`
+  return cross
+}
+
 function pinScaleScroll(root) {
   const scroller = root && root.querySelector ? root.querySelector('.scale-main.is-wide') : null
   if (!scroller) return
@@ -3440,6 +3566,38 @@ document.addEventListener(
   },
   { capture: true },
 )
+// Строка раскрывается под указателем: высоты дорожек меняются, и концы провода
+// уезжают вместе с ними. Пересчёт — по наведению с запасом на переход (0.28 s):
+// `transitionend` приходит не всегда (строка могла быть уже раскрыта), а кадры в
+// фоновой вкладке не рисуются.
+document.addEventListener(
+  'pointerover',
+  (event) => {
+    const row = event.target instanceof Element ? event.target.closest('.tl-row') : null
+    const owner = row ? row.closest('.scale-wrap') : null
+    if (!owner) return
+    clearTimeout(owner.__tlWireHover)
+    owner.__tlWireHover = setTimeout(() => drawAskWires(owner), 340)
+  },
+  true,
+)
+// Строка раскрылась под указателем — высоты дорожек изменились, и концы провода
+// уехали бы вместе с ними. Пересчёт по концу перехода, а не на каждом кадре:
+// раскрытие анимировано, и считать геометрию в середине анимации незачем.
+document.addEventListener(
+  'transitionend',
+  (event) => {
+    if (!(event.target instanceof Element)) return
+    if (!event.target.classList || !event.target.classList.contains('tl-row')) return
+    if (event.propertyName !== 'height') return
+    const panel = event.target.closest('.panel, .scale-wrap')
+    if (panel) drawAskWires(panel)
+  },
+  true,
+)
+window.addEventListener('resize', () => {
+  for (const panel of document.querySelectorAll('.scale-wrap')) drawAskWires(panel)
+})
 bindTipLayer()
 ticker = setInterval(tickStamp, 1000)
 tickStamp()

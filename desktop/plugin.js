@@ -2421,6 +2421,7 @@ function markerGroups(markers) {
       // Адрес головы группы: у пары «вопрос → ответ» он один, и группа рисуется
       // той же стрелкой, что одиночный обмен.
       address: first.address || null,
+      spanIndex: first.spanIndex === undefined ? null : first.spanIndex,
       tone: first.tone,
       tick: false,
       anchor: first.anchor,
@@ -3014,6 +3015,11 @@ function attemptView(bar, scale) {
     anchor: marker.anchor,
     // Стрелка обмена с ролью: направление считает шейпер, поверхность рисует.
     arrow: askArrow(marker, b, scale),
+    // Имя адресата: по нему поверхность находит дорожку и ведёт провод до неё.
+    role: marker.address && marker.address.kind === 'role' ? marker.address.role : '',
+    // Номер обмена (`roleSpans`): по нему поверхность находит пару «вопрос →
+    // ответ» и ведёт путь от палки вопроса до дорожки адресата.
+    spanIndex: marker.spanIndex === undefined ? null : marker.spanIndex,
     title: marker.title,
     ariaLabel: marker.ariaLabel,
   }))
@@ -3801,6 +3807,10 @@ function shapeDealTime(detail, attemptsPayload) {
   // это и есть «сколько человек думает», а не догадка о его решении.
   const markers = []
   const pending = []
+  // Обмены с ролью: пара «вопрос → ответ» — один заход к адресату и обратно.
+  // Поверхность ведёт по ней путь до дорожки адресата (`drawAskWires`): адрес
+  // вопроса — это не значок у палки, а линия до того, кого спросили (Макс, 14.11).
+  const roleSpans = []
   for (const event of events) {
     const type = markerType(event.kind, event.summary)
     if (!type) continue
@@ -3839,7 +3849,24 @@ function shapeDealTime(detail, attemptsPayload) {
       waitPct: 0,
       waitText: '',
     }
-    if (type === 'question') pending.push(marker)
+    if (type === 'question') {
+      pending.push(marker)
+      // Вопрос роли заводит обмен сразу: пока ответа нет, путь известен только
+      // туда, и он рисуется — «вопрос висит у лида» видно без подсказки.
+      if (address && address.kind === 'role') {
+        marker.spanIndex = roleSpans.length
+        roleSpans.push({
+          role: address.role,
+          who: address.who,
+          fromPct: marker.pct,
+          toPct: null,
+          fromClock: marker.clock,
+          toClock: '',
+          open: true,
+          title: `${marker.clock} → сейчас: ${marker.label}, ответа нет`,
+        })
+      }
+    }
     // Ответ закрывает первый неотвеченный вопрос: порядок событий и есть порядок
     // ответов, а `question_id` в выжимке бывает обрезан.
     else if (type === 'answer' && pending.length) {
@@ -3854,6 +3881,17 @@ function shapeDealTime(detail, attemptsPayload) {
         marker.tone = ASK_ROLE_TONE
         marker.title = `${clock} · ${marker.label}${body ? ` — ${body}` : ''}`
         marker.ariaLabel = marker.title
+      }
+      // Обмен с ролью закрыт: путь «туда и обратно» известен целиком. Подпись
+      // берётся у ответа уже с адресом — иначе в описании пути остался бы
+      // «ответ человека» на ответ роли.
+      if (question.address && question.address.kind === 'role' && question.spanIndex !== undefined) {
+        const span = roleSpans[question.spanIndex]
+        span.toPct = marker.pct
+        span.toClock = marker.clock
+        span.open = false
+        span.title = `${question.clock} → ${marker.clock}: ${question.label} — ${marker.label}`
+        marker.spanIndex = question.spanIndex
       }
     }
     markers.push(marker)
@@ -4164,6 +4202,8 @@ function shapeDealTime(detail, attemptsPayload) {
     // поверхность только рисует (`leadLane.runs`).
     leadLane,
     markers: groupedMarkers,
+    // Обмены с ролью: пары «вопрос → ответ» для пути до дорожки адресата.
+    roleSpans,
     waitSpans,
     // Сжатые промежутки оси — уже с координатами: поверхность ничего не считает.
     idle,
@@ -4948,6 +4988,21 @@ const CSS = `
 .duty-tl-mark.t-blue{color:var(--ui-blue)}
 .duty-tl-mark.t-gray{color:var(--ui-text-tertiary)}
 .duty-tl-mark.t-purple{color:var(--ui-purple)}
+/* Провод обмена с ролью: путь от палки вопроса до дорожки адресата и обратно.
+   «Туда и обратно» — одна форма на пару: подъём, перекладина по дорожке
+   адресата, спуск. Пунктир говорит «это связь, а не содержимое дорожки». */
+.duty-tl-wire{position:absolute;left:0;top:0;width:0;height:0;z-index:1;pointer-events:none}
+.duty-tl-wire-leg{position:absolute;width:0;border-left:1.5px dashed color-mix(in srgb,var(--ui-purple) 62%,transparent)}
+.duty-tl-wire-leg.is-tail{border-left-style:dotted;opacity:.8}
+.duty-tl-wire-leg::after{content:'';position:absolute;left:-4.5px;width:0;height:0;border-left:4.5px solid transparent;border-right:4.5px solid transparent}
+.duty-tl-wire-leg.dir-up::after{top:-2px;border-bottom:6px solid color-mix(in srgb,var(--ui-purple) 88%,transparent)}
+.duty-tl-wire-leg.dir-down::after{bottom:-2px;border-top:6px solid color-mix(in srgb,var(--ui-purple) 88%,transparent)}
+.duty-tl-wire-leg::before{content:'';position:absolute;left:-2.5px;width:5px;height:5px;border-radius:50%;background:color-mix(in srgb,var(--ui-purple) 85%,transparent)}
+.duty-tl-wire-leg.dir-up::before{bottom:-2px}
+.duty-tl-wire-leg.dir-down::before{top:-2px}
+.duty-tl-wire-cross{position:absolute;height:0;border-top:1.5px dashed color-mix(in srgb,var(--ui-purple) 62%,transparent)}
+/* Провод уже показывает направление: местная стрелка у палки — второй знак. */
+.duty-tl-mark.duty-tl-wired i{display:none}
 /* Стрелка обмена с ролью: вопрос идёт К адресату, ответ — ОБРАТНО. */
 .duty-tl-mark.is-arrow{width:11px}
 .duty-tl-mark.is-arrow i{background:none;position:relative}
@@ -6047,6 +6102,85 @@ function DutyPlanRefusal({ plan }) {
 }
 
 /** Панель шкалы времени: подписанная ось, дорожка на этап, полосы и маркеры. */
+/**
+ * Провода обмена с ролью: путь от палки вопроса до дорожки адресата и обратно.
+ *
+ * Адрес вопроса — линия до того, кого спросили, а не значок у палки (Макс,
+ * 14.11: «я думал, стрелка будет красиво прямо до адресата идти»). Форма пути —
+ * «туда и обратно»: подъём от момента вопроса к дорожке адресата, перекладина по
+ * ней до момента ответа и спуск обратно. Проценты оси дают x (их считает шейпер),
+ * высоты дают y (их знает вёрстка), поэтому пересчёт идёт после отрисовки и по
+ * наблюдателю за размером дорожек.
+ */
+function drawAskWires(lanes, scale) {
+  if (!lanes || !lanes.querySelector) return
+  if (scale) lanes.__dutyWireScale = scale
+  const shaped = lanes.__dutyWireScale
+  if (!lanes.__dutyWireWatch && typeof ResizeObserver === 'function') {
+    lanes.__dutyWireWatch = new ResizeObserver(() => drawAskWires(lanes))
+    lanes.__dutyWireWatch.observe(lanes)
+  }
+  for (const old of lanes.querySelectorAll(':scope > .duty-tl-wire')) old.remove()
+  for (const mark of lanes.querySelectorAll('.duty-tl-wired')) mark.classList.remove('duty-tl-wired')
+  const spans = shaped && Array.isArray(shaped.roleSpans) ? shaped.roleSpans : []
+  if (!spans.length) return
+  const box = lanes.getBoundingClientRect()
+  spans.forEach((span, index) => {
+    if (!span || !span.role) return
+    const role = String(span.role)
+    // Пара «вопрос → ответ» находится по номеру обмена, а не по времени.
+    const ask = lanes.querySelector(`.duty-tl-mark[data-ask-span="${index}"]`)
+    const lane = lanes.querySelector(`[data-lane-role="${role.replace(/"/g, '')}"]`)
+    if (!ask || !lane) return
+    const row = ask.closest('.duty-tl-row')
+    const plot = ask.closest('.duty-tl-plot')
+    if (!row || !plot) return
+    const target = lane.querySelector('.duty-tl-row') || lane
+    const plotBox = plot.getBoundingClientRect()
+    const rowBox = row.getBoundingClientRect()
+    const targetBox = target.getBoundingClientRect()
+    const x1 = Math.round(plotBox.left + (Number(span.fromPct) / 100) * plotBox.width - box.left)
+    const x2 = span.toPct === null || span.toPct === undefined
+      ? x1
+      : Math.round(plotBox.left + (Number(span.toPct) / 100) * plotBox.width - box.left)
+    const yAsk = Math.round(rowBox.top + rowBox.height / 2 - box.top)
+    const yTarget = Math.round(targetBox.top + targetBox.height / 2 - box.top)
+    if (Math.abs(yTarget - yAsk) < 8 || !x1) return
+    const up = yTarget < yAsk
+    const wire = document.createElement('div')
+    wire.className = 'duty-tl-wire'
+    wire.setAttribute('aria-hidden', 'true')
+    wire.setAttribute('data-tip', span.title || '')
+    wire.append(dutyWireLeg(x1, yAsk, yTarget, up, span.open ? 'tail' : 'both'))
+    if (!span.open && Math.abs(x2 - x1) > 2) {
+      wire.append(dutyWireCross(Math.min(x1, x2), yTarget, Math.abs(x2 - x1)))
+      wire.append(dutyWireLeg(x2, yAsk, yTarget, !up, 'back'))
+    }
+    lanes.append(wire)
+    ask.classList.add('duty-tl-wired')
+  })
+}
+
+/** Стойка провода: линия от строки до адресата, с наконечником и точкой начала. */
+function dutyWireLeg(x, yAsk, yTarget, up, kind) {
+  const leg = document.createElement('span')
+  leg.className = `duty-tl-wire-leg ${up ? 'dir-up' : 'dir-down'} is-${kind}`
+  leg.style.left = `${x}px`
+  leg.style.top = `${Math.min(yAsk, yTarget)}px`
+  leg.style.height = `${Math.abs(yTarget - yAsk)}px`
+  return leg
+}
+
+/** Перекладина в дорожке адресата: от момента вопроса до момента ответа. */
+function dutyWireCross(left, y, width) {
+  const cross = document.createElement('span')
+  cross.className = 'duty-tl-wire-cross'
+  cross.style.left = `${left}px`
+  cross.style.top = `${y}px`
+  cross.style.width = `${width}px`
+  return cross
+}
+
 function ScalePanel({ scale, dealId, toolFilter, onToggleTool }) {
   const active = Array.isArray(toolFilter) ? toolFilter : []
   // Прокрутка широкой шкалы (Макс, 09.11: «максимальную ширину таймлайна в час,
@@ -6054,6 +6188,8 @@ function ScalePanel({ scale, dealId, toolFilter, onToggleTool }) {
   // сам, каждый тик держит в кадре свежую кромку.
   const scrollRef = useRef(null)
   const rootRef = useRef(null)
+  // Дорожки: на них живут провода обмена с ролью (`drawAskWires`).
+  const lanesRef = useRef(null)
   // «Уехал влево» — только жест человека: колесо с горизонтальной составляющей
   // или перетаскивание скроллбара. Программные скроллы (наш пин, восстановление
   // позиции браузером после F5) пин не снимают (Макс, 09.11: после обновления
@@ -6103,6 +6239,8 @@ function ScalePanel({ scale, dealId, toolFilter, onToggleTool }) {
         }
       }
     }
+    // Провода обмена с ролью: геометрия нужна после отрисовки и замера гуттера.
+    drawAskWires(lanesRef.current, scale)
     if (!el || el.__tlPinned === false) return
     el.scrollLeft = el.scrollWidth
   })

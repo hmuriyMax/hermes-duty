@@ -2372,6 +2372,7 @@ function markerGroups(markers) {
       // Адрес головы группы: у пары «вопрос → ответ» он один, и группа рисуется
       // той же стрелкой, что одиночный обмен.
       address: first.address || null,
+      spanIndex: first.spanIndex === undefined ? null : first.spanIndex,
       tone: first.tone,
       tick: false,
       anchor: first.anchor,
@@ -2965,6 +2966,11 @@ function attemptView(bar, scale) {
     anchor: marker.anchor,
     // Стрелка обмена с ролью: направление считает шейпер, поверхность рисует.
     arrow: askArrow(marker, b, scale),
+    // Имя адресата: по нему поверхность находит дорожку и ведёт провод до неё.
+    role: marker.address && marker.address.kind === 'role' ? marker.address.role : '',
+    // Номер обмена (`roleSpans`): по нему поверхность находит пару «вопрос →
+    // ответ» и ведёт путь от палки вопроса до дорожки адресата.
+    spanIndex: marker.spanIndex === undefined ? null : marker.spanIndex,
     title: marker.title,
     ariaLabel: marker.ariaLabel,
   }))
@@ -3752,6 +3758,10 @@ function shapeDealTime(detail, attemptsPayload) {
   // это и есть «сколько человек думает», а не догадка о его решении.
   const markers = []
   const pending = []
+  // Обмены с ролью: пара «вопрос → ответ» — один заход к адресату и обратно.
+  // Поверхность ведёт по ней путь до дорожки адресата (`drawAskWires`): адрес
+  // вопроса — это не значок у палки, а линия до того, кого спросили (Макс, 14.11).
+  const roleSpans = []
   for (const event of events) {
     const type = markerType(event.kind, event.summary)
     if (!type) continue
@@ -3790,7 +3800,24 @@ function shapeDealTime(detail, attemptsPayload) {
       waitPct: 0,
       waitText: '',
     }
-    if (type === 'question') pending.push(marker)
+    if (type === 'question') {
+      pending.push(marker)
+      // Вопрос роли заводит обмен сразу: пока ответа нет, путь известен только
+      // туда, и он рисуется — «вопрос висит у лида» видно без подсказки.
+      if (address && address.kind === 'role') {
+        marker.spanIndex = roleSpans.length
+        roleSpans.push({
+          role: address.role,
+          who: address.who,
+          fromPct: marker.pct,
+          toPct: null,
+          fromClock: marker.clock,
+          toClock: '',
+          open: true,
+          title: `${marker.clock} → сейчас: ${marker.label}, ответа нет`,
+        })
+      }
+    }
     // Ответ закрывает первый неотвеченный вопрос: порядок событий и есть порядок
     // ответов, а `question_id` в выжимке бывает обрезан.
     else if (type === 'answer' && pending.length) {
@@ -3805,6 +3832,17 @@ function shapeDealTime(detail, attemptsPayload) {
         marker.tone = ASK_ROLE_TONE
         marker.title = `${clock} · ${marker.label}${body ? ` — ${body}` : ''}`
         marker.ariaLabel = marker.title
+      }
+      // Обмен с ролью закрыт: путь «туда и обратно» известен целиком. Подпись
+      // берётся у ответа уже с адресом — иначе в описании пути остался бы
+      // «ответ человека» на ответ роли.
+      if (question.address && question.address.kind === 'role' && question.spanIndex !== undefined) {
+        const span = roleSpans[question.spanIndex]
+        span.toPct = marker.pct
+        span.toClock = marker.clock
+        span.open = false
+        span.title = `${question.clock} → ${marker.clock}: ${question.label} — ${marker.label}`
+        marker.spanIndex = question.spanIndex
       }
     }
     markers.push(marker)
@@ -4115,6 +4153,8 @@ function shapeDealTime(detail, attemptsPayload) {
     // поверхность только рисует (`leadLane.runs`).
     leadLane,
     markers: groupedMarkers,
+    // Обмены с ролью: пары «вопрос → ответ» для пути до дорожки адресата.
+    roleSpans,
     waitSpans,
     // Сжатые промежутки оси — уже с координатами: поверхность ничего не считает.
     idle,

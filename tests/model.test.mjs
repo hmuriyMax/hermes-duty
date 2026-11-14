@@ -772,12 +772,41 @@ test('обмен с ролью: стрелка к адресату, ответ �
   assert.equal(answers[1].label, 'ответ человека', 'ответ человека не назван')
   // Пауза «стояло на человеке» — только у вопроса в пул.
   assert.equal(scale.waitSpans.length, 1, `пауз ${scale.waitSpans.length}: обмен ролей ушёл в простой`)
+  // Обмен с ролью — пара для провода до дорожки адресата: закрытая знает оба
+  // конца пути, у неё есть подпись «когда спросили — когда ответили».
+  assert.equal(scale.roleSpans.length, 1, `обменов с ролью ${scale.roleSpans.length}`)
+  assert.equal(scale.roleSpans[0].role, 'lead', 'адресат обмена потерян')
+  assert.equal(scale.roleSpans[0].open, false, 'закрытый обмен остался открытым')
+  assert.ok(scale.roleSpans[0].toPct > scale.roleSpans[0].fromPct, 'концы обмена не по порядку')
   // Стрелка: лид выше этапов — вопрос вверх, ответ обратно вниз.
   const view = attemptView(scale.bars[0], scale)
   const arrows = view.marks.filter((mark) => mark.arrow).map((mark) => `${mark.type}:${mark.arrow}`)
   assert.deepEqual(arrows, ['question:up', 'answer:down'], `стрелки: ${arrows.join(', ')}`)
   // У вопроса человеку стрелки нет — он остаётся палкой.
   assert.equal(view.marks.filter((mark) => mark.type === 'question' && !mark.arrow).length, 1)
+})
+
+test('обмен с ролью без ответа остаётся открытым — путь известен только туда', () => {
+  const scale = shapeDealTime(
+    {
+      now: 1_600,
+      terminal: false,
+      timeline: [
+        { kind: 'created', at: 1_000, summary: '' },
+        { kind: 'question_asked', at: 1_400, summary: '', routing: 'role:lead' },
+      ],
+      stages: [{ id: 'impl', role: 'implementer', needs: [] }],
+    },
+    { attempts: [{ stage: 'impl', attempt: 1, start: 1_100, end: 1_500, status: 'running' }] },
+  )
+  assert.equal(scale.roleSpans.length, 1, 'вопрос без ответа не завёл обмен')
+  assert.equal(scale.roleSpans[0].open, true, 'обмен без ответа закрыт')
+  assert.equal(scale.roleSpans[0].toPct, null, 'у открытого обмена появился конец')
+  // Вопрос без ответа ждёт адресата по имени, а не «ответа» вообще.
+  const asks = scale.markers.filter((marker) => marker.type === 'question')
+  assert.equal(asks[0].waitText, 'ждёт ответа лида', `ожидание: ${asks[0].waitText}`)
+  // Паузы «на человеке» тут нет: дело стоит на лиде, а не на человеке.
+  assert.equal(scale.waitSpans.length, 0, 'обмен с ролью ушёл в простой на человеке')
 })
 
 test('стрелка адресата: роль ниже спрашивающего смотрит вниз, неизвестная — вбок', () => {

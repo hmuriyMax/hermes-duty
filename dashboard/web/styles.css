@@ -1948,3 +1948,390 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
   }
   .more-btn:hover:not([disabled]) { transform: none; }
 }
+
+/* ==================================================== мобильный вид (390 px)
+ *
+ * Ниже — единственный блок, который знает про телефон. Десктопная вёрстка не
+ * тронута ни строкой: всё, что здесь написано, живёт под `max-width: 720px`, а
+ * блок стоит последним, чтобы перебить прежние узкие правила (760/1040 px)
+ * равной специфичностью.
+ *
+ * Правила игры (контракт `/Users/mshchemilkin/.hermes/plans/2026-11-14-mobile-ui-spec.md`):
+ *   - одна колонка, отступы 12–16 px, тап-цель ≥ 44 px, текст ≥ 15 px
+ *     (служебные подписи — 13 px), длинные значения переносятся, а не режутся
+ *     эллипсисом;
+ *   - никакой горизонтальной прокрутки у страницы: широкие таблицы становятся
+ *     карточками, подписи колонок приходят из `::before`, а не из `thead`;
+ *   - `display: none` получает только второстепенное (шапка-штамп, граф спеки,
+ *     сетка мини-таймлайна) — на десктопе всё это остаётся как было;
+ *   - палитра и токены те же: тёмная тема здесь ничего не переопределяет.
+ */
+@media (max-width: 720px) {
+  /* Полоса прокрутки страницы гасится `clip`, а не `hidden`: `hidden` на
+     `html`/`body` заводит свой скролл-контейнер, и липкая шапка перестаёт
+     липнуть. `clip` режет тот же лишний пиксель, не ломая `sticky`. */
+  html, body { max-width: 100%; overflow-x: hidden; overflow-x: clip; }
+  body { font-size: 15px; }
+
+  main { padding: 12px 12px 40px; }
+
+  /* ---------- шапка страницы ----------
+     Три строки в 390 px (лого, вкладки, штамп) съедали 119 px экрана. Лого,
+     возврат в Hub и кнопка обновления встают в одну строку, вкладки — во вторую
+     во всю ширину: палец попадает в них без прицела. */
+  .top { padding: 8px 12px; gap: 8px; flex-wrap: wrap; }
+  .hub {
+    order: 0; display: inline-flex; align-items: center; justify-content: center;
+    min-height: 44px; padding: 0 12px; font-size: 15px;
+  }
+  .brand { order: 1; font-size: 16px; }
+  .brand small { font-size: 13px; }
+  .tabs { order: 3; flex: 1 0 100%; gap: 8px; overflow-x: auto; overscroll-behavior-x: contain; }
+  .tabs a {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-height: 44px; padding: 0 14px; font-size: 15px; flex: none;
+  }
+  .top-right { order: 2; width: auto; margin-left: auto; gap: 8px; }
+  .human { font-size: 13px; }
+  /* Штамп «обновлено» — тот же факт, что и подпись в шапке панели: на мобиле
+     он один, чтобы строка шапки не уезжала за край. */
+  .stamp { display: none; }
+  .icon-btn { width: 44px; height: 44px; font-size: 18px; }
+
+  /* ---------- поиск и фильтры ---------- */
+  .filters { gap: 8px; margin-bottom: 12px; }
+  input[type="search"], select {
+    width: 100%; min-height: 44px; padding: 10px 12px; font-size: 15px;
+  }
+  /* Ряд фильтров листается сам, страница — нет. */
+  .chips { flex-wrap: nowrap; overflow-x: auto; overscroll-behavior-x: contain; padding-bottom: 2px; }
+  .chip { flex: none; min-height: 44px; padding: 0 14px; font-size: 15px; }
+
+  /* ---------- общие мелочи ---------- */
+  .sec-h { margin: 16px 0 8px; flex-wrap: wrap; }
+  .sec-h h2 { font-size: 15px; }
+  .sec-h .num { font-size: 13px; }
+  .mono { font-size: 13px; overflow-wrap: anywhere; }
+  .muted { font-size: inherit; }
+  .note, .banner { font-size: 15px; flex-wrap: wrap; }
+  .banner .icon-btn { margin-left: auto; }
+  .empty { padding: 20px 14px; font-size: 15px; }
+  .empty ul { font-size: 15px; }
+  .grp, .panel { margin-bottom: 12px; border-radius: 10px; }
+  .panel-h { padding: 10px 12px; font-size: 13px; flex-wrap: wrap; row-gap: 4px; }
+  .panel-h .refreshed { font-size: 13px; }
+  .panel-b { padding: 12px; }
+  .skel-title, .skel-row, .skel-cell { margin: 6px 0; }
+
+  /* ---------- мини-таймлайн дел ----------
+     Полотно было четыре колонки (подпись, шкала, длительность, состояние): в
+     354 px шкала схлопывалась в ноль и дел на ней не было видно вовсе. На
+     телефоне строка — карточка: подпись сверху, шкала во всю ширину, под ней
+     длительность и состояние. */
+  .tl-mini { --tl-cols: minmax(0, 1fr); --tl-meta: 66px; margin-bottom: 12px; }
+  .tl-body { padding: 2px 12px 4px; }
+  .tl-mini .panel-h { padding-bottom: 8px; }
+  .tl-window { font-size: 13px; }
+  .tl-omitted { font-size: 13px; margin-left: 0; }
+  .tl-window-pick { flex: 1 0 100%; gap: 4px; overflow-x: auto; }
+  .tl-window-btn { min-width: 44px; min-height: 44px; padding: 0 10px; font-size: 13px; }
+  .tl-window-input { width: 84px; min-height: 44px; padding: 0 10px; font-size: 13px; }
+  /* Сетка остаётся общим слоем (вертикали одни на все строки, правый край —
+     «сейчас»), но кончается там же, где дорожки: справа стоит столбец меты
+     (`--tl-meta`), по нему линии не идут — иначе они чертят под подписями. */
+  .tl-mini .tl-grid { grid-template-columns: minmax(0, 1fr); gap: 0; right: calc(var(--tl-meta) + 10px); }
+  .tl-mini .tl-grid-gap { display: none; }
+  .tl-mini .tl-grid-track { grid-column: 1; }
+  .tl-mini-row {
+    grid-template-columns: minmax(0, 1fr) var(--tl-meta);
+    grid-template-areas: 'lbl age' 'track state';
+    gap: 6px 10px;
+    padding: 8px 0;
+    font-size: 15px;
+    border-top: 1px solid var(--border);
+  }
+  .tl-mini-row:first-of-type { border-top: none; }
+  .tl-mini-lbl { grid-area: lbl; overflow: visible; }
+  .tl-repo { font-size: 13px; white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
+  .tl-title { font-size: 15px; white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; display: flex; align-items: center; min-height: 44px; }
+  .tl-mini-track { grid-area: track; height: 44px; }
+  /* Сосиска тянется на всю высоту дорожки: 44 px — это палец, а не краска.
+     Видимая полоса остаётся прежней толщины (`::before` и сегменты), поэтому
+     рисунок не грубеет. */
+  .tl-sausage { top: 0; bottom: 0; background: transparent; }
+  .tl-sausage::before {
+    content: ''; position: absolute; left: 0; right: 0; top: 14px; bottom: 14px;
+    border-radius: 3px; background: color-mix(in srgb, var(--text-3) 20%, transparent);
+  }
+  .tl-sausage .tl-seg { top: 14px; bottom: 14px; }
+  .tl-mini-age { grid-area: age; font-size: 13px; text-align: right; align-self: start; }
+  .tl-mini-state { grid-area: state; font-size: 13px; text-align: right; align-self: center; white-space: normal; overflow: visible; text-overflow: clip; }
+  /* Полоса делений на телефоне убрана: 24 подписи в 264 px наезжают друг на
+     друга, а те же границы окна целиком написаны в шапке панели («13.11 22:00 →
+     22:00 · окно 1 дн»). Дорожки остаются на общей сетке. */
+  .tl-axis { display: none; }
+  .tl-legend { font-size: 13px; padding: 8px 12px 12px; }
+
+  /* ---------- группы дел: таблица становится карточками ----------
+     Восемь колонок в 354 px — это восемь обрезков по три буквы. На мобиле строка
+     идёт карточкой: заголовок дела, под ним состояние, ниже — метаданные
+     подписями (`::before`, а не `thead`: шапку таблицы на телефоне не читают). */
+  .grp-h { padding: 10px 12px; font-size: 15px; flex-wrap: wrap; }
+  .grp-h .n { font-size: 13px; }
+  .grp-k { max-width: 100%; white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; font-size: 13px; }
+  .grp-s { display: none; }
+  .grp-table, .grp-table tbody, .grp-table tr, .grp-table td { display: block; }
+  .grp-table colgroup, .grp-table thead { display: none; }
+  .grp-table tbody tr.row {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px;
+    padding: 12px; min-height: 44px;
+  }
+  .grp-table tbody tr.row + tr.row { border-top: 1px solid var(--border); }
+  .grp-table td {
+    padding: 0; border: 0; min-width: 0;
+    font-size: 13px; color: var(--text-2);
+    white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere;
+  }
+  .grp-table td.ttl {
+    order: 1; flex: 1 1 100%; max-width: none;
+    font-size: 15px; line-height: 1.35; font-weight: 600; color: var(--text);
+    white-space: normal; overflow: visible; text-overflow: clip;
+  }
+  /* Состояние — вторая строка карточки: бейдж и слово о лиде. */
+  .grp-table td:nth-child(8) { order: 2; flex: 1 1 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .grp-table td:nth-child(1) { order: 3; }
+  .grp-table td:nth-child(3) { order: 4; }
+  .grp-table td:nth-child(4) { order: 5; }
+  .grp-table td:nth-child(5) { order: 6; }
+  .grp-table td:nth-child(6) { order: 7; }
+  .grp-table td:nth-child(7) { order: 8; }
+  .grp-table td:nth-child(n+3)::before { color: var(--text-3); }
+  .grp-table td:nth-child(3)::before { content: 'исполнитель '; }
+  .grp-table td:nth-child(4)::before { content: 'этап '; }
+  .grp-table td:nth-child(5)::before { content: 'попытка '; }
+  .grp-table td:nth-child(6)::before { content: 'лизинг '; }
+  .grp-table td:nth-child(7)::before { content: 'действие '; }
+  .grp-table td.mono { font-size: 13px; }
+  .grp-table td.stage-now { color: var(--accent); }
+  .grp-table .lead-note { font-size: 13px; }
+  .grp-table .badge { font-size: 13px; }
+
+  /* ---------- завершённые ---------- */
+  .finished-head { flex-wrap: wrap; row-gap: 4px; }
+  .finished-count, .finished-hint { font-size: 13px; }
+  .finished-group .grp-h .n { font-size: 13px; }
+  .finished-group .grp-more { padding: 8px 0 12px; }
+  .finished-group .grp-more .more-btn { font-size: 15px; min-height: 44px; padding: 0 20px; }
+  /* Десять колонок закрытого дела — те же карточки, что у активных. */
+  .finished-group .grp-table td:nth-child(3) { order: 1; flex: 1 1 100%; font-size: 15px; font-weight: 600; color: var(--text); }
+  .finished-group .grp-table td:nth-child(4) { order: 2; flex: 1 1 100%; display: flex; gap: 8px; align-items: center; }
+  .finished-group .grp-table td:nth-child(1) { order: 3; }
+  .finished-group .grp-table td:nth-child(2) { order: 4; }
+  .finished-group .grp-table td:nth-child(5) { order: 5; }
+  .finished-group .grp-table td:nth-child(6) { order: 6; }
+  .finished-group .grp-table td:nth-child(7) { order: 7; }
+  .finished-group .grp-table td:nth-child(8) { order: 8; flex: 1 1 100%; }
+  .finished-group .grp-table td:nth-child(9) { order: 9; flex: 1 1 100%; }
+  .finished-group .grp-table td:nth-child(10) { order: 10; flex: 1 1 100%; }
+  .finished-group .grp-table td:nth-child(5)::before { content: 'попыток '; }
+  .finished-group .grp-table td:nth-child(6)::before { content: 'вопросов '; }
+  .finished-group .grp-table td:nth-child(7)::before { content: 'длительность '; }
+  .finished-group .grp-table td:nth-child(8)::before { content: 'причина '; }
+  .finished-group .grp-table td:nth-child(9)::before { content: 'этапы '; }
+  .finished-group .grp-table td:nth-child(10)::before { content: 'публикация '; }
+  .finished-group .grp-table td:nth-child(3)::before,
+  .finished-group .grp-table td:nth-child(4)::before { content: none; }
+  .finished-group .grp-table tr.skel-tr { padding: 12px; }
+  .finished-group .grp-table .skel-cell { width: 100%; }
+  .more-btn, .pager .chip { font-size: 15px; min-height: 44px; padding: 0 18px; }
+  .pager { padding: 12px; gap: 8px; }
+  .pager .muted { font-size: 13px; }
+
+  /* ---------- дело: шапка ----------
+     Имя дела, граф и статус стояли двумя колонками: в 320 px заголовок
+     выжимался до трёх слов на строку. Статус уходит под заголовок. */
+  .deal-head { padding: 12px; margin-bottom: 12px; }
+  .deal-head-top { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .deal-head-side { justify-content: flex-start; }
+  .deal-head h1 { font-size: 20px; overflow-wrap: anywhere; }
+  .deal-head .mono.muted { font-size: 13px; overflow-wrap: anywhere; }
+  .deal-title-row { gap: 8px; align-items: flex-start; }
+  svg.deal-ico { margin-top: 3px; }
+  .deal-facts { font-size: 15px; gap: 6px 14px; }
+  .deal-facts b { white-space: normal; overflow-wrap: anywhere; }
+  .deal-head-kpi { margin-top: 10px; padding-top: 10px; }
+  .deal-head-kpi .duty-kpi { gap: 10px 18px; }
+  .duty-kpi-cell { min-height: 44px; padding: 4px 0; }
+  .deal-head-kpi .duty-kpi-v, .duty-kpi-v { font-size: 18px; }
+  .duty-kpi-l, .duty-kpi-n { font-size: 13px; }
+  .why-evidence { font-size: 15px; }
+  /* Граф спеки — картинка узлов по 9.5 px: на телефоне она не читается ни в
+     каком масштабе, а тот же план этапов перечислен списком ниже. Второстепенное
+     уходит только здесь; на десктопе граф на месте. */
+  .spec-strip { display: none; }
+  .badge { font-size: 13px; padding: 3px 9px; min-height: 24px; }
+  .plan-refusal { font-size: 15px; }
+  .plan-refusal > summary { min-height: 44px; display: flex; align-items: center; }
+  .plan-refusal .plan-more { font-size: 13px; }
+  a[href="#/deal"] { display: inline-flex; align-items: center; min-height: 44px; font-size: 15px; }
+
+  /* ---------- дело: шкала времени ----------
+     Подпись этапа и его попытки стояли двумя колонками (150 px имени + 64 px
+     зазора под подпись попытки): на шкалу оставалось 106 px. На телефоне имя
+     этапа уходит строкой над дорожкой, шкала занимает всю ширину, а зазор
+     остаётся только под подпись самой попытки (`#1 идёт`). */
+  .scale-wrap { grid-template-columns: minmax(0, 1fr); gap: 12px; --tl-name: 0px !important; --tl-plot-pad: 78px; }
+  .scale-main { width: 100%; }
+  .scale-head { grid-template-columns: minmax(0, 1fr); }
+  .scale-head-gap { display: none; }
+  .scale-axis { margin-left: var(--tl-plot-pad); height: 18px; }
+  .scale-tick { font-size: 13px; }
+  /* Средние деления на 250 px наезжают друг на друга: остаются края — «нач.» и
+     «кон.», а промежуточное время читается по сетке дорожек. */
+  .scale-axis .scale-tick.align-center { display: none; }
+  /* Подложка левого столбца — только для режима прокрутки, где имя липнет:
+     здесь имя стоит своей строкой, и слой закрыл бы шкалу. */
+  .tl-gutter-bg { display: none; }
+  .scale-main.is-wide .tl-lane-id { position: static; }
+  .scale-grid { left: var(--tl-plot-pad); }
+  .tl-idle-layer { left: var(--tl-plot-pad); width: calc(100% - var(--tl-plot-pad)); }
+  .tl-idle-pill { font-size: 13px; }
+  .tl-lanes { gap: 8px; padding-bottom: 8px; }
+  .tl-lane { grid-template-columns: minmax(0, 1fr); row-gap: 6px; }
+  .tl-lane > .tl-lane-h { grid-column: 1 / -1; grid-row: 1; width: auto; position: static; }
+  .tl-lane .tl-rows, .tl-lane .tl-row-empty { grid-column: 1 / -1; grid-row: 2; }
+  .tl-lane + .tl-lane { padding-top: 8px; margin-top: 2px; }
+  .tl-lane-h { min-height: 24px; }
+  .tl-lane-head { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .tl-lane-code { font-size: 15px; white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
+  .tl-kind { height: auto; min-height: 22px; font-size: 13px; padding: 2px 8px; }
+  .tl-n, .tl-st { font-size: 13px; }
+  .tl-lead-label, .tl-lead-run .tl-lead-label { font-size: 13px; }
+  .tl-row-empty { position: static; width: auto; height: 24px; font-size: 13px; }
+  .tl-row-empty > .tl-row-empty-t { position: static; transform: none; white-space: normal; }
+  /* Легенда семейств — не колонкой справа, а рядом чипов под шкалой: каждый
+     чип — тап-цель (он переключает подсветку вызовов). */
+  .scale-side {
+    flex-direction: row; flex-wrap: wrap; gap: 8px;
+    min-width: 0; margin-top: 2px; padding: 12px 0 0;
+    border-left: 0; border-top: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .scale-keys-h { flex: 1 0 100%; font-size: 13px; }
+  .scale-key {
+    grid-template-columns: 8px auto auto; gap: 6px;
+    min-height: 44px; padding: 0 12px; margin: 0;
+    border: 1px solid var(--border); border-radius: 999px;
+    font-size: 13px;
+  }
+  .scale-key-l { overflow: visible; text-overflow: clip; }
+  .scale-key-dot { width: 8px; height: 8px; }
+  .scale-scroll-hint { font-size: 13px; }
+  .scale-legend { font-size: 13px; gap: 6px 14px; }
+  .scale-legend-sw, .scale-legend-stick, .scale-legend-arrow { flex: none; }
+  .smk-row { grid-template-columns: 110px minmax(0, 1fr); }
+  .smk-name { font-size: 13px; }
+
+  /* ---------- дело: решения лида ----------
+     Четыре колонки в 352 px: «этап» имел ширину 0, вид решения резался
+     эллипсисом. Запись идёт карточкой: часы и вид в первой строке, автор
+     второй, слова — ниже и целиком (клампа на телефоне нет). */
+  .dec-panel-title { font-size: 13px; }
+  .dec-toggle { height: 44px; min-width: 44px; padding: 0 12px; font-size: 13px; }
+  .dec-filters { flex-wrap: nowrap; overflow-x: auto; gap: 8px; padding: 10px 12px 0; }
+  .dec-filter { height: 44px; min-height: 44px; padding: 0 12px; font-size: 13px; flex: none; }
+  .dec-thead { display: none; }
+  .dec-table { padding: 4px 0; }
+  .dec-row {
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-areas: 'time kind' 'who who' 'say say';
+    column-gap: 10px; row-gap: 2px;
+    padding: 10px 12px;
+  }
+  .dec-time { grid-area: time; font-size: 13px; }
+  .dec-kind { grid-area: kind; font-size: 15px; white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
+  .dec-who { grid-area: who; font-size: 13px; white-space: normal; overflow: visible; text-overflow: clip; }
+  .dec-stage { grid-area: stage; font-size: 13px; white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
+  .dec-say {
+    grid-area: say; margin-top: 4px; font-size: 15px;
+    display: block; -webkit-line-clamp: unset; overflow: visible; overflow-wrap: anywhere;
+  }
+  /* Превью «шесть записей» считается по строкам панели, а не по высоте: на
+     мобиле те же шесть, но каждая карточкой выше — обрезки здесь нет. */
+
+  /* ---------- дело: этапы и попытки ----------
+     Строка этапа была 12 px, попытка — 24 px в одну строку с обрезкой исхода.
+     На телефоне это карточки: код этапа, описание из спеки целиком, статистика
+     переносом; попытка — отдельная строка высотой с палец. */
+  .stages-spec { font-size: 13px; padding: 8px 12px 0; }
+  .stages-list { padding: 0 0 6px; }
+  .stage-row { padding: 10px 12px; gap: 3px 8px; font-size: 15px; min-height: 44px; }
+  .stage-row-code { font-size: 15px; white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
+  .stage-row-desc { font-size: 15px; line-height: 1.35; display: block; -webkit-line-clamp: unset; overflow: visible; }
+  .stage-row-meta { font-size: 13px; white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
+  .stage-row-tog, .att-row-tog { font-size: 13px; }
+  .att-row { height: auto; min-height: 44px; margin-left: 8px; font-size: 15px; white-space: normal; flex-wrap: wrap; }
+  .att-row-n, .att-row-dur { font-size: 15px; }
+  .att-row-out { white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
+  .att-stats { font-size: 13px; white-space: normal; overflow-wrap: anywhere; }
+  .att-ev { flex-wrap: wrap; font-size: 13px; margin-left: 8px; }
+  .att-ev-cmd { font-size: 13px; white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
+  .att-summary { font-size: 15px; margin-left: 8px; }
+  .att-log, .att-none { font-size: 13px; margin-left: 8px; }
+  .att-error { font-size: 13px; margin-left: 8px; max-height: none; }
+  .stage-wait, .stage-lead, .stage-note { font-size: 15px; padding: 2px 12px 6px; }
+
+  /* ---------- дело: документы ----------
+     Внутренняя прокрутка в 60vh на телефоне — ловушка: палец листает панель
+     вместо страницы. Документ идёт в потоке целиком. */
+  .md { font-size: 15px; max-height: none; overflow: visible; }
+  .md h1 { font-size: 19px; }
+  .md h2 { font-size: 17px; }
+  .md h3 { font-size: 16px; }
+  .md h4 { font-size: 13px; }
+  .md code { font-size: 13px; overflow-wrap: anywhere; }
+  .md pre { overflow-x: auto; }
+  .md pre code { font-size: 13px; }
+  .md table { font-size: 13px; overflow-x: auto; }
+  .panel-b.doc-src { font-size: 13px; max-height: none; overflow-x: auto; overflow-y: visible; }
+  .panel-doc .panel-h { font-size: 13px; }
+
+  /* ---------- «почему стоит» ---------- */
+  .why-grid { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .why-card { padding: 12px; }
+  .why-card h3 { font-size: 17px; overflow-wrap: anywhere; }
+  .why-foot { font-size: 13px; gap: 8px 12px; }
+  .why-foot a { display: inline-flex; align-items: center; min-height: 44px; font-size: 15px; }
+
+  /* ---------- «здоровье» ---------- */
+  .kpis { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .kpi { padding: 12px; }
+  .kpi .k { font-size: 13px; }
+  .kpi .v { font-size: 26px; }
+  .kpi .s { font-size: 13px; }
+  .tax-row { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: 'name num' 'bar bar'; gap: 4px 10px; font-size: 13px; }
+  .tax-row .name { grid-area: name; font-size: 13px; white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
+  .tax-row .tbar { grid-area: bar; }
+  .tax-row .tnum { grid-area: num; font-size: 13px; }
+  /* Таблица «по репозиториям» — те же карточки: семь числовых колонок в 352 px
+     не читаются ни в каком виде. */
+  .panel > table, .panel > table > tbody, .panel > table tr, .panel > table td { display: block; }
+  .panel > table colgroup, .panel > table thead { display: none; }
+  .panel > table tr {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px;
+    padding: 12px;
+  }
+  .panel > table tr + tr { border-top: 1px solid var(--border); }
+  .panel > table td {
+    padding: 0; border: 0; font-size: 13px; color: var(--text-2);
+    white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere;
+  }
+  .panel > table td:nth-child(1) { flex: 1 1 100%; font-size: 15px; font-weight: 600; color: var(--text); }
+  .panel > table td:nth-child(n+2)::before { color: var(--text-3); }
+  .panel > table td:nth-child(2)::before { content: 'дел '; }
+  .panel > table td:nth-child(3)::before { content: 'попыток '; }
+  .panel > table td:nth-child(4)::before { content: 'с первой попытки '; }
+  .panel > table td:nth-child(5)::before { content: 'ожидание p50 / p90 '; }
+  .panel > table td:nth-child(6)::before { content: 'ожиданий '; }
+  .panel > table td:nth-child(7)::before { content: 'неполнота '; }
+}

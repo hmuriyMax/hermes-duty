@@ -118,7 +118,7 @@ budget: {tokens: 3000000, minutes: 480}
 charter:
   allowed_roles: [researcher, implementer, tester, reviewer, documenter, publisher]
   allowed_kinds: [agent, shell, gate]
-  max_stages: 12          # потолок плана
+  max_stages: 24          # потолок плана
   max_attempts: 5         # попыток на этап, включая авто-повторы
   max_lead_resumes: 6     # сколько раз супервизор поднимает упавшего лида
   plan_gate: {min_stages: 5, budget_share: 0.3}
@@ -224,7 +224,7 @@ charter:
 `duty.yaml` не переписывает никогда.
 
     charter:
-      max_stages: 12          # потолок графа: seed + принятые планом этапы
+      max_stages: 24          # потолок графа: seed + принятые планом этапы
       max_rounds_replan: 3    # сколько отказов плана переживает этап `plan`
       allowed_roles: [researcher, implementer, tester, reviewer, documenter]
       allowed_kinds: [agent, shell, gate]
@@ -233,7 +233,7 @@ charter:
       max_lead_resumes: 6     # 2.0: сколько раз супервизор поднимает лида
       publish: {human_gate: true, reviewer_role: reviewer, plan: false}   # 2.0
 
-- **Нет блока** — годная спека с дефолтами: `max_stages: 12`,
+- **Нет блока** — годная спека с дефолтами: `max_stages: 24`,
   `max_rounds_replan: 3`, `allowed_roles: []`, `allowed_kinds: [agent, shell, gate]`,
   `plan_gate` выключен (`min_stages: 0`, `budget_share: 0`), `max_attempts: 5`,
   `max_lead_resumes: 6`,

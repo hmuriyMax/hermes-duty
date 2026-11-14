@@ -1845,7 +1845,7 @@ def test_charter_defaults_when_block_absent(tmp_path: Path):
     """Спека без `charter` годна и получает дефолты: 12 этапов, 3 реплана, гейт выключен."""
     loaded = spec_module.load_spec(write(tmp_path, charter_spec("")))
     charter = loaded.charter
-    assert charter.max_stages == 12
+    assert charter.max_stages == 24
     assert charter.max_rounds_replan == 3
     assert charter.allowed_roles == ()
     assert charter.allowed_kinds == ("agent", "shell", "gate")

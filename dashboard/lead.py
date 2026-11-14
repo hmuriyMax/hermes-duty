@@ -864,7 +864,7 @@ def brief(
         lines += ["", "## Хартия и seed-план"]
         if charter is not None:
             lines.append(
-                f"- потолок плана: {getattr(charter, 'max_stages', DEFAULT_MAX_RESUMES)} этапов; "
+                f"- потолок плана: {getattr(charter, 'max_stages', spec_module.DEFAULT_MAX_STAGES)} этапов; "
                 f"роли: {', '.join(getattr(charter, 'allowed_roles', ()) or ()) or 'не ограничены'}; "
                 f"виды: {', '.join(getattr(charter, 'allowed_kinds', ()) or ()) or '—'}"
             )

@@ -1992,10 +1992,13 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
     min-height: 44px; padding: 0 14px; font-size: 15px; flex: none;
   }
   .top-right { order: 2; width: auto; margin-left: auto; gap: 8px; }
-  .human { font-size: 13px; }
-  /* Штамп «обновлено» — тот же факт, что и подпись в шапке панели: на мобиле
-     он один, чтобы строка шапки не уезжала за край. */
-  .stamp { display: none; }
+  /* «N вопросов» — первой строкой справа, штамп «обновлено» — рядом, 13 px.
+     Штамп не гаснет: на списке он единственный признак свежести страницы (шапка
+     панели шкалы с тем же «обновлено 22:14» есть только на экране дела). Чтобы
+     пара влезла в 366 px рядом с кнопкой, длинная строка про вопросы
+     переносится, а не выжимает штамп за край. */
+  .human { font-size: 13px; min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+  .stamp { font-size: 13px; flex: none; }
   .icon-btn { width: 44px; height: 44px; font-size: 18px; }
 
   /* ---------- поиск и фильтры ---------- */
@@ -2079,7 +2082,16 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
   .grp-h { padding: 10px 12px; font-size: 15px; flex-wrap: wrap; }
   .grp-h .n { font-size: 13px; }
   .grp-k { max-width: 100%; white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; font-size: 13px; }
+  /* Сводка состояний группы — второстепенное (у каждой строки свой бейдж) и
+     гаснет. Но этим же классом печатается ОШИБКА загрузки группы («ошибка: …»):
+     без неё отказ выглядит как короткий или пустой список без причины, поэтому
+     `.danger` остаётся — своей строкой, переносом и тоном ошибки. */
   .grp-s { display: none; }
+  .grp-s.danger {
+    display: block; order: 3; flex: 1 1 100%; margin-left: 0;
+    font-size: 13px; color: var(--danger);
+    white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere;
+  }
   .grp-table, .grp-table tbody, .grp-table tr, .grp-table td { display: block; }
   .grp-table colgroup, .grp-table thead { display: none; }
   .grp-table tbody tr.row {
@@ -2229,13 +2241,12 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
   .scale-scroll-hint { font-size: 13px; }
   .scale-legend { font-size: 13px; gap: 6px 14px; }
   .scale-legend-sw, .scale-legend-stick, .scale-legend-arrow { flex: none; }
-  .smk-row { grid-template-columns: 110px minmax(0, 1fr); }
-  .smk-name { font-size: 13px; }
 
   /* ---------- дело: решения лида ----------
      Четыре колонки в 352 px: «этап» имел ширину 0, вид решения резался
      эллипсисом. Запись идёт карточкой: часы и вид в первой строке, автор
-     второй, слова — ниже и целиком (клампа на телефоне нет). */
+     второй, этап третьей (подписью — заголовок таблицы на телефоне скрыт),
+     слова — ниже и целиком (клампа на телефоне нет). */
   .dec-panel-title { font-size: 13px; }
   .dec-toggle { height: 44px; min-width: 44px; padding: 0 12px; font-size: 13px; }
   .dec-filters { flex-wrap: nowrap; overflow-x: auto; gap: 8px; padding: 10px 12px 0; }
@@ -2244,7 +2255,7 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
   .dec-table { padding: 4px 0; }
   .dec-row {
     grid-template-columns: auto minmax(0, 1fr);
-    grid-template-areas: 'time kind' 'who who' 'say say';
+    grid-template-areas: 'time kind' 'who who' 'stage stage' 'say say';
     column-gap: 10px; row-gap: 2px;
     padding: 10px 12px;
   }
@@ -2252,6 +2263,11 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
   .dec-kind { grid-area: kind; font-size: 15px; white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
   .dec-who { grid-area: who; font-size: 13px; white-space: normal; overflow: visible; text-overflow: clip; }
   .dec-stage { grid-area: stage; font-size: 13px; white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
+  /* Подпись «этап» — вместо скрытого заголовка колонки: иначе код этапа в
+     карточке читается как третья строка автора. У записи без этапа ячейка
+     пустая, и подпись не печатается вовсе — строки под неё не остаётся. */
+  .dec-stage::before { content: 'этап '; color: var(--text-3); }
+  .dec-stage:empty { display: none; }
   .dec-say {
     grid-area: say; margin-top: 4px; font-size: 15px;
     display: block; -webkit-line-clamp: unset; overflow: visible; overflow-wrap: anywhere;

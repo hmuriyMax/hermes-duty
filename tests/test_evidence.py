@@ -294,6 +294,36 @@ def test_documenter_witness_is_the_report(tmp_path: Path) -> None:
     assert silent.ok is False
 
 
+def test_done_needs_no_evidence_when_the_stage_declared_none(tmp_path: Path) -> None:
+    """Этап без объявленных команд не требует `evidence`: контракт и гейт — одно.
+
+    Живое: `verify` дела d_a216d50b (14.11) объявил `evidence: []`, контракт
+    попытки назвал обязательными только `report`/`summary`, researcher так и
+    отчитался — и гейт отказал «доказательства объявленных команд не
+    предъявлены». Команд не было: отказ был неправдой, а попытка потерялась на
+    отсутствующем пустом списке и увела план в пересборку.
+    """
+    stage = make_stage(role="researcher")
+    assert evidence.report_schema(stage)["required_for_done"] == [evidence.WITNESS_REPORT, "summary"]
+
+    verdict = verify({"status": "done", "report": "сверил код: расхождений нет", "summary": "сверено"}, stage, tmp_path)
+
+    assert verdict.ok is True, [str(issue) for issue in verdict.errors]
+
+
+def test_done_without_evidence_is_refused_when_commands_were_declared(tmp_path: Path) -> None:
+    """Объявленные команды без доказательств — отказ: «готово» не голословно."""
+    stage = make_stage(evidence_items=(("go test ./...", 0),), workspace="worktree")
+    built = report(tmp_path)
+    built.pop("evidence")
+
+    verdict = verify(built, stage, tmp_path)
+
+    assert (verdict.ok, verdict.kind) == (False, "contract")
+    assert verdict.errors[0].where == "result.json:evidence"
+    assert "доказательства объявленных команд не предъявлены" in str(verdict.errors[0])
+
+
 def test_documenter_evidence_command_still_runs(tmp_path: Path) -> None:
     """Команда-доказательство по документу проверяется, даже если роль без дерева.
 

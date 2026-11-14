@@ -532,13 +532,21 @@ def _check_schema(result: dict[str, Any], stage: Any, issues: list[Issue]) -> Op
     if problem is not None:
         issues.append(problem)
     if "evidence" not in result:
-        issues.append(
-            Issue(
-                _where("evidence"),
-                RULE_REQUIRED,
-                "status: done без evidence: доказательства объявленных команд не предъявлены",
+        # Контракт попытки называет обязательным то, что спросит гейт. У этапа
+        # без объявленных команд (`research`/`docs`: роль без терминала) схема
+        # отчёта просит только `report`/`summary` — и отказ «доказательства
+        # объявленных команд не предъявлены» был неправдой: команд не было,
+        # а попытка терялась на отсутствующем пустом списке (живое: verify
+        # d_a216d50b 14.11, researcher прислал done по своей же схеме).
+        declared = tuple(getattr(stage, "evidence", ()) or ())
+        if declared:
+            issues.append(
+                Issue(
+                    _where("evidence"),
+                    RULE_REQUIRED,
+                    "status: done без evidence: доказательства объявленных команд не предъявлены",
+                )
             )
-        )
     elif not isinstance(result.get("evidence"), list):
         issues.append(Issue(_where("evidence"), RULE_REQUIRED, "evidence — список {cmd, exit, started_at}"))
     if not str(result.get("summary") or "").strip():

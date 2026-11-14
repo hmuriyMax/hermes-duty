@@ -2220,6 +2220,55 @@ const MARKER_META = {
   ended: { label: 'конец попытки', tone: 'gray', tick: true, anchor: 'middle' },
 }
 
+// Адрес вопроса. `routing.target` журнала — `human`, `human_routing_failed`,
+// `role:<имя>`, `spec_default:<значение>` (`dashboard/routing.py`). Всё, что не
+// роль, — человек: вопрос без адресата уходит в пул, и экран не выдумывает ему
+// роль. Подпись «вопрос человеку» на вопрос лиду была неправдой (Макс, 14.11).
+const ASK_ROLE_PREFIX = 'role:'
+// Тон обмена с ролью: палки вопроса и ответа человеку остаются жёлтой и зелёной,
+// а обмен ролей читается своим цветом — это не ожидание человека.
+const ASK_ROLE_TONE = 'purple'
+// Падежи для роли в подписи. Прочие роли называются своими именами (они
+// английские), и падеж им не выдумывается: «вопрос роли researcher».
+const ASK_ROLE_WORD = { lead: { to: 'лиду', from: 'лида', who: 'лида' } }
+
+/**
+ * Адрес вопроса по `routing.target`: кому он задан и как это называется.
+ *
+ * `kind` — `human` (пул) или `role` (роль названа); `role` — имя роли для поиска
+ * её дорожки на шкале; `label` — слова для подписи маркера; `who` — родительный
+ * падеж для «ждёт ответа …».
+ */
+function askAddress(target) {
+  const raw = String(target || '').trim()
+  const role = raw.startsWith(ASK_ROLE_PREFIX) ? raw.slice(ASK_ROLE_PREFIX.length) : ''
+  if (!role) {
+    return {
+      kind: 'human',
+      role: '',
+      target: raw,
+      who: 'человека',
+      label: { question: 'вопрос человеку', answer: 'ответ человека' },
+    }
+  }
+  const word = ASK_ROLE_WORD[role]
+  return {
+    kind: 'role',
+    role,
+    target: raw,
+    who: word ? word.who : `роли ${role}`,
+    label: {
+      question: word ? `вопрос ${word.to}` : `вопрос роли ${role}`,
+      answer: word ? `ответ ${word.from}` : `ответ роли ${role}`,
+    },
+  }
+}
+
+/** Вопрос ушёл в пул: только у него есть пауза «стояло на человеке». */
+function isHumanAsk(marker) {
+  return !marker || !marker.address || marker.address.kind === 'human'
+}
+
 // Причина закрытия по-русски: `cause` из журнала — машинное слово, экран его
 // не показывает, но и не выдумывает: незнакомая причина остаётся как есть.
 const CLOSE_CAUSE_WORD = {
@@ -2320,6 +2369,9 @@ function markerGroups(markers) {
       clock: first.clock,
       label,
       labels: item.members.map((member) => member.label),
+      // Адрес головы группы: у пары «вопрос → ответ» он один, и группа рисуется
+      // той же стрелкой, что одиночный обмен.
+      address: first.address || null,
       tone: first.tone,
       tick: false,
       anchor: first.anchor,
@@ -2335,6 +2387,7 @@ function markerGroups(markers) {
         type: member.type,
         label: member.label,
         tone: member.tone,
+        address: member.address || null,
         anchor: member.anchor,
         clock: member.clock,
         text: member.text,
@@ -2730,6 +2783,34 @@ const DEAL_ICON =
   'M4.7 11.3 11.3 4.7'
 
 /**
+ * Куда показывает стрелка обмена с ролью.
+ *
+ * Дорожки стоят сверху вниз в порядке графа, а дорожка лида — над всеми этапами,
+ * поэтому «вопрос лиду» — стрелка вверх, а ответ — обратно вниз. Роль ищется по
+ * своей дорожке (`lanes[].role`): адресат выше спрашивающего — вверх, ниже —
+ * вниз, та же дорожка — вбок. Роли, которой нет среди дорожек, направление не
+ * выдумывается: стрелка вбок честнее, чем «наверх».
+ */
+function askArrow(marker, bar, scale) {
+  const address = marker && marker.address
+  if (!address || address.kind !== 'role') return null
+  const lanes = scale && Array.isArray(scale.lanes) ? scale.lanes : []
+  const own = bar && typeof bar.lane === 'number' ? bar.lane : -1
+  // Лид — не этап: его дорожка всегда над этапами, и в `lanes` его нет.
+  const at =
+    address.role === 'lead'
+      ? -1
+      : lanes.findIndex((lane) => String((lane && lane.role) || '') === address.role)
+  let dir
+  if (at < 0 && address.role !== 'lead') dir = 'side'
+  else if (at === own) dir = 'side'
+  else dir = at < own ? 'up' : 'down'
+  // Ответ идёт обратно: обмен один, а направления у вопроса и ответа разные.
+  if (marker.type === 'answer') dir = dir === 'up' ? 'down' : dir === 'down' ? 'up' : 'side'
+  return dir
+}
+
+/**
  * Вид строки попытки: подпись, штрихи, чипы и суммарное число вызовов.
  *
  * `badge` — сколько вызовов инструментов было у попытки: показанные плюс
@@ -2882,6 +2963,8 @@ function attemptView(bar, scale) {
     // Якорь едет вместе с маркером: палка вывода стоит ПЕРЕД своим моментом,
     // иначе вердикт читается как начало следующего этапа.
     anchor: marker.anchor,
+    // Стрелка обмена с ролью: направление считает шейпер, поверхность рисует.
+    arrow: askArrow(marker, b, scale),
     title: marker.title,
     ariaLabel: marker.ariaLabel,
   }))
@@ -3366,6 +3449,13 @@ function shapeDealTime(detail, attemptsPayload) {
       summary: String(e.summary || ''),
       question_text: e.question_text ? String(e.question_text) : '',
       answer_text: e.answer_text ? String(e.answer_text) : '',
+      // Адрес вопроса: `plugin_api._timeline` кладёт сюда `routing.target`
+      // журнала (`human`, `role:<имя>`). Без него вопрос роли читался бы как
+      // вопрос человеку — подпись, тон и пауза были бы неправдой.
+      routing:
+        typeof e.routing === 'string'
+          ? e.routing
+          : String((e.routing && typeof e.routing === 'object' && e.routing.target) || ''),
       cause: e.cause ? String(e.cause) : '',
       stages: Array.isArray(e.stages) ? e.stages.map(String) : [],
       // Факты лида: режим, причина выхода, pid и код — из полей ответа
@@ -3550,10 +3640,18 @@ function shapeDealTime(detail, attemptsPayload) {
       String((stage && stage.title) || '').trim(),
     ]),
   )
+  // Роль этапа: по ней адрес вопроса находит СВОЮ дорожку, и стрелка обмена
+  // показывает направление (выше дорожки адресат или ниже).
+  const stageRoles = new Map(
+    (Array.isArray(d.stages) ? d.stages : []).map((stage) => [
+      String((stage && stage.id) || ''),
+      String((stage && stage.role) || ''),
+    ]),
+  )
   const addLane = (key) => {
     if (!key || laneIndex.has(key)) return
     laneIndex.set(key, lanes.length)
-    lanes.push({ key, label: stageTitles.get(key) || key, id: key, count: 0 })
+    lanes.push({ key, label: stageTitles.get(key) || key, id: key, count: 0, role: stageRoles.get(key) || '' })
   }
   const graphKeys = (Array.isArray(d.stages) ? d.stages : []).map((stage) => String((stage && stage.id) || ''))
   const firstStart = new Map()
@@ -3659,22 +3757,30 @@ function shapeDealTime(detail, attemptsPayload) {
     if (!type) continue
     const meta = MARKER_META[type]
     const clock = fmtClock(event.at)
+    // Адрес вопроса и ответа: журнал пишет его в `routing.target`, бэкенд отдаёт
+    // тем же полем строки. Вопрос роли — не вопрос человеку, и подпись обязана
+    // называть адресата (Макс, 14.11: «вопрос человеку не совсем актуально»).
+    const address = type === 'question' || type === 'answer' ? askAddress(event.routing) : null
+    const label = address ? address.label[type === 'question' ? 'question' : 'answer'] : meta.label
     // Подпись маркера — слова, а не payload: номер вопроса и JSON причины
     // человеку ничего не говорят. Текст вопроса и ответа даёт бэкенд
     // (`question_text`/`answer_text` из пула), причину закрытия — поля `cause`.
     const body = markerBody(type, event)
-    const title = `${clock} · ${meta.label}${body ? ` — ${body}` : ''}`
+    const title = `${clock} · ${label}${body ? ` — ${body}` : ''}`
     const marker = {
       type,
       kind: event.kind,
       at: event.at,
       pct: pctOf(event.at),
       clock,
-      label: meta.label,
-      tone: meta.tone,
+      label,
+      tone: address && address.kind === 'role' ? ASK_ROLE_TONE : meta.tone,
       tick: meta.tick,
       anchor: meta.anchor,
       summary: event.summary,
+      // Адрес: `human` — палка и разрыв на время ожидания, `role:<имя>` — стрелка
+      // к адресату и обратно (`askArrow`).
+      address,
       // Человеческое тело подписи: вопрос/ответ текстом, причина закрытия
       // словами. Пауза «вопрос → ответ» называет им сам вопрос.
       text: body,
@@ -3687,7 +3793,20 @@ function shapeDealTime(detail, attemptsPayload) {
     if (type === 'question') pending.push(marker)
     // Ответ закрывает первый неотвеченный вопрос: порядок событий и есть порядок
     // ответов, а `question_id` в выжимке бывает обрезан.
-    else if (type === 'answer' && pending.length) pending.shift().answered = true
+    else if (type === 'answer' && pending.length) {
+      const question = pending.shift()
+      question.answered = true
+      // Ответ без своего адреса наследует адрес вопроса: «вопрос → ответ» — один
+      // обмен, и адресат у него один. Иначе подпись пары разъезжалась бы там, где
+      // к ответу не приложен `routing`.
+      if (question.address && question.address.kind === 'role' && (!address || address.kind !== 'role')) {
+        marker.address = question.address
+        marker.label = question.address.label.answer
+        marker.tone = ASK_ROLE_TONE
+        marker.title = `${clock} · ${marker.label}${body ? ` — ${body}` : ''}`
+        marker.ariaLabel = marker.title
+      }
+    }
     markers.push(marker)
   }
   // Паузы «вопрос → ответ»: считается на всю ось, потому что ответ часто
@@ -3699,17 +3818,21 @@ function shapeDealTime(detail, attemptsPayload) {
     for (const marker of markers) {
       if (marker.type === 'question') asked = marker
       else if (marker.type === 'answer' && asked) {
-        waitSpans.push({
-          fromAt: asked.at,
-          toAt: marker.at,
-          fromPct: asked.pct,
-          widthPct: Math.max(0.4, Math.round((marker.pct - asked.pct) * 10) / 10),
-          title: `${asked.clock} → ${marker.clock}: ждал человека${asked.text ? ` — ${asked.text}` : ''}`,
-        })
+        // Пауза «стояло на человеке» — только у вопроса в пул: обмен с ролью
+        // человеком не был, и штриховать его как ожидание значило бы соврать.
+        if (isHumanAsk(asked)) {
+          waitSpans.push({
+            fromAt: asked.at,
+            toAt: marker.at,
+            fromPct: asked.pct,
+            widthPct: Math.max(0.4, Math.round((marker.pct - asked.pct) * 10) / 10),
+            title: `${asked.clock} → ${marker.clock}: ждал человека${asked.text ? ` — ${asked.text}` : ''}`,
+          })
+        }
         asked = null
       }
     }
-    if (asked && now !== null) {
+    if (asked && now !== null && isHumanAsk(asked)) {
       waitSpans.push({
         fromAt: asked.at,
         toAt: now,
@@ -3721,7 +3844,9 @@ function shapeDealTime(detail, attemptsPayload) {
   }
 
   for (const marker of pending) {
-    marker.waitText = 'ждёт ответа'
+    // Ждёт ответа — и у кого: «ждёт ответа лида», «ждёт ответа роли researcher».
+    // Вопрос в пул остаётся «ждёт ответа»: человека подпись не называет.
+    marker.waitText = marker.address && marker.address.kind === 'role' ? `ждёт ответа ${marker.address.who}` : 'ждёт ответа'
     if (now !== null && marker.at > 0) {
       marker.waitPct = Math.max(0, Math.round((pctOf(now) - marker.pct) * 10) / 10)
       marker.title = `${marker.title} · ждёт ответа ${fmtAge(now - marker.at)}`
@@ -4147,6 +4272,9 @@ export {
   stageMeta,
   finishedStatusMeta,
   humanCounts,
+  askAddress,
+  askArrow,
+  isHumanAsk,
   humanLine,
   executorText,
   LEAD_ROLE_LABEL,

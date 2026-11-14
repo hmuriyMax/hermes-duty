@@ -847,6 +847,13 @@ pre.body {
   background:
     linear-gradient(90deg, var(--accent) 0 4px, transparent 4px 6px, var(--purple) 6px 12px, transparent 12px 14px, var(--warn) 14px 19px, transparent 19px 21px, var(--ok) 21px 22px);
 }
+.scale-legend-sw.is-wait {
+  background:
+    repeating-linear-gradient(45deg, color-mix(in srgb, var(--warn) 45%, transparent) 0 1.5px, transparent 1.5px 5px),
+    var(--card);
+  border-left: 1px dashed color-mix(in srgb, var(--warn) 72%, transparent);
+  border-right: 1px dashed color-mix(in srgb, var(--warn) 72%, transparent);
+}
 .scale-legend-sw.is-silence {
   background: repeating-linear-gradient(45deg, color-mix(in srgb, var(--text-3) 45%, transparent) 0 1.5px, transparent 1.5px 4px);
 }
@@ -857,6 +864,14 @@ pre.body {
 .scale-legend-stick.t-red { background: var(--danger); }
 .scale-legend-stick.t-yellow { background: var(--warn); }
 .scale-legend-stick.t-gray { background: var(--text-3); }
+.scale-legend-stick.t-purple { background: var(--purple); }
+/* Стрелка обмена с ролью в легенде; знак тот же, что на дорожке. */
+.scale-legend-arrow { width: 3px; height: 12px; position: relative; flex: none; background: currentColor; }
+.scale-legend-arrow::before {
+  content: ''; position: absolute; top: -4px; left: 50%; margin-left: -3.5px; width: 0; height: 0;
+  border-left: 3.5px solid transparent; border-right: 3.5px solid transparent; border-bottom: 5px solid currentColor;
+}
+.scale-legend-arrow.t-purple { color: var(--purple); }
 .scale-legend .muted { color: var(--text-3); }
 
 /* Относительной полосы попытки больше нет: длительность видна на общей оси дела
@@ -1248,11 +1263,17 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 .tl-row.is-failed .tl-att .tl-n { color: var(--danger); }
 .tl-row.is-failed .tl-n { color: var(--danger); }
 
-/* Пауза «вопрос → ответ»: время, которое дело стояло на человеке. */
+/* Пауза «вопрос → ответ»: время, которое дело стояло на человеке. Полоса
+ * попытки здесь РВЁТСЯ (работа стояла), а внутри разрыва — редкая штриховка
+ * ожидания: она идёт поперёк штриховки тишины, поэтому два разных простоя не
+ * читаются одним знаком (Макс, 14.11). */
 .tl-wait {
-  position: absolute; top: 1px; bottom: 1px; border-radius: 3px;
-  background: color-mix(in srgb, var(--warn) 26%, transparent);
-  border-left: 1.5px solid var(--warn); border-right: 1.5px solid var(--warn);
+  position: absolute; top: 0; bottom: 0;
+  background:
+    repeating-linear-gradient(45deg, color-mix(in srgb, var(--warn) 38%, transparent) 0 1.5px, transparent 1.5px 6px),
+    var(--card);
+  border-left: 1px dashed color-mix(in srgb, var(--warn) 72%, transparent);
+  border-right: 1px dashed color-mix(in srgb, var(--warn) 72%, transparent);
 }
 /* Маркеры событий — внутри строки той попытки, где событие произошло. */
 /* Маркеры журнала — вертикальные палки на всю высоту строки: точка на нижней
@@ -1272,6 +1293,35 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 .tl-mark.t-yellow { color: var(--warn); }
 .tl-mark.t-blue { color: var(--accent); }
 .tl-mark.t-gray { color: var(--text-3); }
+/* Обмен с ролью: не человек и не вердикт — свой тон. */
+.tl-mark.t-purple { color: var(--purple); }
+/* Стрелка обмена с ролью: вопрос идёт К адресату, ответ — ОБРАТНО. Палка
+ * говорит «здесь событие», а у адресованного вопроса есть направление, и оно
+ * читается знаком, а не подсказкой (Макс, 14.11: «запрос лиду — стрелка к лиду,
+ * ответ от лида — стрелка обратно»). */
+.tl-mark.is-arrow { width: 11px; }
+.tl-mark.is-arrow i { background: none; position: relative; }
+.tl-mark.is-arrow i::before {
+  content: ''; position: absolute; left: 50%; width: 1.5px; margin-left: -.75px;
+  background: currentColor; opacity: .95;
+}
+.tl-mark.is-arrow i::after {
+  content: ''; position: absolute; left: 50%; width: 0; height: 0; margin-left: -3.5px;
+  border-left: 3.5px solid transparent; border-right: 3.5px solid transparent;
+}
+.tl-mark.is-arrow.dir-up i::before { top: 6px; bottom: 0; }
+.tl-mark.is-arrow.dir-up i::after { top: 0; border-bottom: 5px solid currentColor; }
+.tl-mark.is-arrow.dir-down i::before { top: 0; bottom: 6px; }
+.tl-mark.is-arrow.dir-down i::after { bottom: 0; border-top: 5px solid currentColor; }
+/* Роль без своей дорожки и обмен внутри одной: вбок — «к роли», без выдумки о
+ * том, выше она или ниже. */
+.tl-mark.is-arrow.dir-side i::before { top: 50%; left: 0; right: 4px; width: auto; height: 1.5px; margin: 0; transform: translateY(-50%); }
+.tl-mark.is-arrow.dir-side i::after {
+  top: 50%; right: 0; left: auto; margin: 0; transform: translateY(-50%);
+  border: 0; border-top: 3.5px solid transparent; border-bottom: 3.5px solid transparent;
+  border-left: 5px solid currentColor;
+}
+
 /* Группа маркеров одной точки оси: у группы не один тип, а несколько, поэтому
  * палка на каждого участника — столбиком на том же `left`. Ширину набирает сам
  * столбик, время при этом одно: сдвинуть палки значило бы соврать про журнал. */

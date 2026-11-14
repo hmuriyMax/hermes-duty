@@ -1380,6 +1380,22 @@ test('веб: одиночный маркер остаётся прежним �
 
 /* ------------------------------- лид на экране дела: состояние и решения (2.0) */
 
+test('адрес вопроса: обмен с ролью — стрелка на обеих поверхностях, пауза человека — разрыв', () => {
+  const css = read('dashboard/web/styles.css')
+  // Обе поверхности рисуют один знак: стрелка в сторону адресата.
+  for (const [name, source] of [['веб', app], ['десктоп', pluginSource]]) {
+    assert.match(source, /mark\.arrow \? ` is-arrow dir-\$\{mark\.arrow\}`/, `${name}: маркер не получает стрелку адресата`)
+    assert.match(source, /address\.kind === 'role'/, `${name}: легенда не знает об обмене с ролью`)
+  }
+  // Пауза «стояло на человеке» — разрыв полосы со штриховкой внутри, а не заливка.
+  assert.match(css, /\.tl-wait \{[^}]*repeating-linear-gradient\(45deg[^}]*var\(--card\)/, 'веб: пауза не рвёт полосу штриховкой')
+  assert.match(css, /\.tl-wait \{[^}]*border-left: 1px dashed/, 'веб: у разрыва нет рваной кромки')
+  assert.match(pluginSource, /\.duty-tl-wait\{[^}]*repeating-linear-gradient\(45deg/, 'десктоп: пауза не рвёт полосу штриховкой')
+  // Тон обмена с ролью свой: он не человек и не вердикт.
+  assert.match(css, /\.tl-mark\.t-purple \{ color: var\(--purple\); \}/, 'веб: нет тона обмена с ролью')
+  assert.match(pluginSource, /\.duty-tl-mark\.t-purple\{color:var\(--ui-purple\)\}/, 'десктоп: нет тона обмена с ролью')
+})
+
 test('веб: экран дела показывает лида и его решения — данные бэкенда доезжают до DOM', async (t) => {
   // Макс, 12.11: «почему в UI не видно постоянно работающего лида?» — ответ `/deal`
   // отдавал `deal.lead` и `decisions[]`, но ни веб, ни десктоп их не читали.

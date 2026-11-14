@@ -2270,6 +2270,7 @@ function markerLegend(scale) {
     { key: 'band', swatch: 'band', label: 'полоса попытки — этап шёл' },
     { key: 'call', swatch: 'call', label: 'вызов инструмента, цвет — вид' },
     { key: 'silence', swatch: 'silence', label: 'штриховка — тишина: ни вызова, ни слова' },
+    { key: 'wait', swatch: 'wait', label: 'разрыв и штриховка — ждали человека' },
   ]
   const seen = []
   for (const marker of scale.markers || []) {
@@ -2279,7 +2280,9 @@ function markerLegend(scale) {
     for (const [i, type] of types.entries()) {
       if (seen.some((item) => item.type === type)) continue
       const tone = marker.grouped && marker.members[i] ? marker.members[i].tone : marker.tone
-      seen.push({ type, tone, label: labels[i] || marker.label })
+      // Обмен с ролью — стрелка: легенда показывает тот же знак, что на дорожке.
+      const role = Boolean(marker.address && marker.address.kind === 'role')
+      seen.push({ type, tone, label: labels[i] || marker.label, role })
     }
   }
   return h(
@@ -2299,7 +2302,7 @@ function markerLegend(scale) {
       h(
         'span',
         { class: 'scale-legend-item', 'data-key': `legend:${marker.type}` },
-        h('i', { class: `scale-legend-stick t-${marker.tone}` }),
+        h('i', { class: marker.role ? `scale-legend-arrow t-${marker.tone}` : `scale-legend-stick t-${marker.tone}` }),
         marker.label,
       ),
     ),
@@ -2442,7 +2445,9 @@ function attemptRowNode(view, key) {
         h(
           'span',
           {
-            class: `tl-mark t-${mark.tone} anchor-${mark.anchor || 'middle'}${mark.grouped ? ' is-grouped' : ''}`,
+            // Обмен с ролью — стрелка в сторону адресата, а не палка: у вопроса
+            // роли есть направление, у вопроса человеку его нет (Макс, 14.11).
+            class: `tl-mark t-${mark.tone} anchor-${mark.anchor || 'middle'}${mark.grouped ? ' is-grouped' : ''}${mark.arrow ? ` is-arrow dir-${mark.arrow}` : ''}`,
             style: `left:${mark.pct}%`,
             'data-tip': mark.title,
             'aria-label': mark.ariaLabel,

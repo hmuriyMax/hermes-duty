@@ -61,6 +61,8 @@ import {
   stageRole,
   TL_ROLE_SHADES,
   shapeStages,
+  askAddress,
+  askArrow,
   stageMeta,
   stateLabel,
   stateMeta,
@@ -710,6 +712,86 @@ test('маркеры: событие принадлежит одной попы�
   // Ответ человеку, пришедший в промежутке между попытками, остаётся у той, где спросили.
   const answerRow = rows.findIndex((marks) => marks.some((title) => title.includes('13:30:00') || title.includes('ответ')))
   assert.ok(answerRow >= 0, 'ответ человека не попал ни в одну строку')
+})
+
+/* --------------------- адрес вопроса: человек или роль (0.2.1) --------- */
+
+// «Вопрос человеку» — не единственный адрес: этап спрашивает лида, и лид отвечает
+// сам, без пула. Подпись, тон и знак пары берутся из `routing.target` журнала
+// (`dashboard/routing.py`: `human`, `human_routing_failed`, `role:<имя>`).
+test('адрес вопроса: подпись и род адресата по `routing.target`', () => {
+  const cases = [
+    ['human', 'human', 'вопрос человеку', 'ответ человека', 'человека'],
+    // Потерянный адресат уходит в пул — это по-прежнему человек.
+    ['human_routing_failed', 'human', 'вопрос человеку', 'ответ человека', 'человека'],
+    // Вопроса без разметки нет: пустой `routing` — вопрос человеку.
+    ['', 'human', 'вопрос человеку', 'ответ человека', 'человека'],
+    ['role:lead', 'role', 'вопрос лиду', 'ответ лида', 'лида'],
+    // Имя роли английское: падеж ему не выдумывается, адресат называется прямо.
+    ['role:researcher', 'role', 'вопрос роли researcher', 'ответ роли researcher', 'роли researcher'],
+  ]
+  for (const [target, kind, question, answer, who] of cases) {
+    const address = askAddress(target)
+    assert.equal(address.kind, kind, `вид адреса для ${target}`)
+    assert.equal(address.label.question, question, `вопрос для ${target}`)
+    assert.equal(address.label.answer, answer, `ответ для ${target}`)
+    assert.equal(address.who, who, `родительный падеж для ${target}`)
+  }
+  assert.equal(askAddress('role:lead').role, 'lead', 'имя роли потеряно')
+})
+
+test('обмен с ролью: стрелка к адресату, ответ — обратно; паузы на человеке нет', () => {
+  const scale = shapeDealTime(
+    {
+      now: 1_900,
+      terminal: false,
+      timeline: [
+        { kind: 'created', at: 1_000, summary: '' },
+        // Этап impl спрашивает лида и получает ответ — без человека.
+        { kind: 'question_asked', at: 1_300, summary: '', routing: 'role:lead', question_text: 'куда класть раздел?' },
+        { kind: 'question_answered', at: 1_340, summary: '', answer_text: 'в Unreleased' },
+        // И отдельно спрашивает человека: у этого вопроса пауза на человеке есть.
+        { kind: 'question_asked', at: 1_500, summary: '', routing: 'human' },
+        { kind: 'question_answered', at: 1_700, summary: '', routing: 'human' },
+      ],
+      stages: [
+        { id: 'impl', role: 'implementer', needs: [] },
+        { id: 'review', role: 'reviewer', needs: ['impl'] },
+      ],
+    },
+    { attempts: [{ stage: 'impl', attempt: 1, start: 1_200, end: 1_800, status: 'done', outcome: 'done' }] },
+  )
+  const asks = scale.markers.filter((marker) => marker.type === 'question')
+  assert.equal(asks.length, 2, 'вопросы потерялись')
+  assert.equal(asks[0].label, 'вопрос лиду', 'вопрос лиду назван человеку')
+  assert.equal(asks[0].tone, 'purple', 'обмен с ролью не отличается тоном')
+  assert.equal(asks[1].label, 'вопрос человеку', 'вопрос в пул подписан ролью')
+  const answers = scale.markers.filter((marker) => marker.type === 'answer')
+  // Адрес ответа наследуется от вопроса: у пары один адресат.
+  assert.equal(answers[0].label, 'ответ лида', 'ответ лида не назван')
+  assert.equal(answers[1].label, 'ответ человека', 'ответ человека не назван')
+  // Пауза «стояло на человеке» — только у вопроса в пул.
+  assert.equal(scale.waitSpans.length, 1, `пауз ${scale.waitSpans.length}: обмен ролей ушёл в простой`)
+  // Стрелка: лид выше этапов — вопрос вверх, ответ обратно вниз.
+  const view = attemptView(scale.bars[0], scale)
+  const arrows = view.marks.filter((mark) => mark.arrow).map((mark) => `${mark.type}:${mark.arrow}`)
+  assert.deepEqual(arrows, ['question:up', 'answer:down'], `стрелки: ${arrows.join(', ')}`)
+  // У вопроса человеку стрелки нет — он остаётся палкой.
+  assert.equal(view.marks.filter((mark) => mark.type === 'question' && !mark.arrow).length, 1)
+})
+
+test('стрелка адресата: роль ниже спрашивающего смотрит вниз, неизвестная — вбок', () => {
+  const lane = (role) => ({ role })
+  const bar = { lane: 0 }
+  const ask = (role, type = 'question') => ({ type, address: { kind: 'role', role } })
+  assert.equal(askArrow(ask('reviewer'), bar, { lanes: [lane('implementer'), lane('reviewer')] }), 'down')
+  assert.equal(askArrow(ask('implementer'), bar, { lanes: [lane('implementer')] }), 'side')
+  // Роли нет среди дорожек: направление не выдумывается.
+  assert.equal(askArrow(ask('researcher'), bar, { lanes: [lane('implementer')] }), 'side')
+  // Лид — не этап: его дорожка над этапами всегда, даже если её нет в `lanes`.
+  assert.equal(askArrow(ask('lead'), { lane: 7 }, { lanes: [] }), 'up')
+  // Вопрос человеку стрелки не получает вовсе.
+  assert.equal(askArrow({ type: 'question', address: { kind: 'human' } }, bar, { lanes: [] }), null)
 })
 
 test('плотная попытка: 158 вызовов остаются вызовами, свёрнутая лента ниже полной', () => {

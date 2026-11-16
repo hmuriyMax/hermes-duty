@@ -29,12 +29,13 @@
 
 ## Политика
 
-`retry: {max: N, on: [infra, contract]}` (по умолчанию `max: 1, on: [infra]`) —
+`retry: {max: N, on: [infra, contract]}` (по умолчанию `max: 4, on: [infra, contract]`,
+у `contract` потолок класса — один повтор, `CONTRACT_MAX_RETRIES`) —
 сколько раз повторять отказ **этого** класса. Счётчик считается на этап и на класс:
 `infra` и `contract` — разные причины, и общий счётчик склеил бы их в один.
 
-Без объявления движок повторяет только `infra` (`DEFAULT_ON`): остальные классы
-называются в спеке поимённо. Спека может **сузить** набор, но не расширить:
+Без объявления движок повторяет `infra` и `contract` (`DEFAULT_ON`): остальные
+классы называются в спеке поимённо. Спека может **сузить** набор, но не расширить:
 `retry.on` читается в пересечении с классами, которые движок повторяет вообще
 (`AUTO_ON` — `infra` и `contract`). `capability` не повторяется никогда: стена
 (бюджет, доступ, роль) повтором не рассасывается, и `retry.on: [capability]`
@@ -72,6 +73,11 @@ CLASSES = ("infra", "contract", "capability")
 INFRA = "infra"
 CONTRACT = "contract"
 CAPABILITY = "capability"
+
+# Вид этапа-гейта (`spec.GATE_KIND`): этап ничего не исполняет, он задаёт вопрос
+# человеку и читает ответ. Имя вида нужно здесь, потому что политика повторов
+# зависит от него (`policy`): отказ гейта — слово человека, а не форма отчёта.
+GATE_KIND = "gate"
 
 # Класса в событии нет. Это не догадка о причине, а честное имя отсутствия
 # класса: такой отказ не ретраится, потому что `retry.on` его не называет.
@@ -189,7 +195,23 @@ REFUSED_STATUSES = ("refused", "rejected")
 # (живое дело d_a8213c01: две попытки `docs` убил дренаж гейтвея, а четвёртой
 # попытки в том же этапе не было — лид заводил новый id `docs2`).
 DEFAULT_MAX = 4
-DEFAULT_ON = (INFRA,)
+# Классы, которые движок повторяет **без объявления** в спеке. До 0.2.1 здесь был
+# только `infra`, и живой журнал показал цену: из 54 парковок 44 пришли с
+# `(max=1, on=[infra])`, где классом отказа был `contract` — то есть роль
+# отчиталась не по форме, а второго шанса не было вовсе (петля «отчёт не по
+# схеме → попытки исчерпаны → дело лиду», хотя схема лежит в контракте попытки).
+# `AUTO_ON` всегда разрешал `contract`; объявление `retry.on` в плане сужало набор
+# до одного `infra`, и лид этим набором сам себе закрывал повтор. Теперь `contract`
+# — умолчание наравне с `infra`, а объявление в плане может его только убрать.
+DEFAULT_ON = (INFRA, CONTRACT)
+
+# Сколько повторов даёт класс `contract`. Больше одного не даём осознанно: причина
+# такого отказа — форма отчёта, а схема и причина прошлого отказа уезжают в бриф
+# следующей попытки (`build_contract` → `previous_failures`). Второй повтор того
+# же класса означает, что роль не читает схему, и третий не поможет — а стоит он
+# полного процесса и префикса. `infra` этим потолком не ограничен: там причина
+# внешняя (`retry.max`, по умолчанию 4).
+CONTRACT_MAX_RETRIES = 1
 
 # Классы, которые движок повторяет сам (`docs/ENGINE-2.0.md`, раздел 7). Это
 # политика **движка**, а не спеки: `retry.on` этапа набор сужает, но расширить не
@@ -322,7 +344,8 @@ class Policy:
 def policy(stage_spec: Any) -> Policy:
     """Политика этапа из спеки; объявления нет — политика по умолчанию.
 
-    `retry` в спеке не задан → `{max: 1, on: [infra]}` (спека-источник,
+    `retry` в спеке не задан → `{max: 4, on: [infra, contract]}` (`DEFAULT_MAX`,
+    `DEFAULT_ON`; у `contract` поверх этого действует `CONTRACT_MAX_RETRIES`, см.
     `docs/SPEC.md`). Отрицательный `max` читается как ноль: повторов не будет,
     а не «сколько-нибудь». Объявленные классы сужаются до `AUTO_ON`: набор
     повторов — политика движка (`docs/ENGINE-2.0.md`, раздел 7), спека может
@@ -331,7 +354,14 @@ def policy(stage_spec: Any) -> Policy:
     (`spec._check_retry`), а здесь чужое имя просто не стало бы повтором.
     """
     retry = getattr(stage_spec, "retry", None)
+    kind = str(getattr(stage_spec, "kind", "") or "")
     if retry is None:
+        # Гейт (`kind: gate`) не повторяется по контракту вовсе: его отказ — это
+        # ответ ЧЕЛОВЕКА, прочитанный и отвергнутый (`allow`), а не форма отчёта.
+        # Повтор прочитал бы тот же ответ из пула и отказал тем же словом: попытка
+        # и деньги в никуда (tests/test_driver.py, «ответ вне allow»).
+        if kind == GATE_KIND:
+            return Policy(on=tuple(item for item in DEFAULT_ON if item != CONTRACT))
         return Policy()
     maximum = getattr(retry, "max", DEFAULT_MAX)
     declared = tuple(str(kind) for kind in (getattr(retry, "on", None) or ()))
@@ -355,16 +385,31 @@ def retry_at(attempts: int, failed_at: int) -> int:
     return _int(failed_at) + backoff(attempts)
 
 
+def _class_limit(policy_: Policy, kind: str) -> int:
+    """Сколько повторов даёт этот класс: `policy.max`, но `contract` — не больше одного.
+
+    Потолок класса — не то же, что потолок этапа: `max` объявляет лид (по умолчанию
+    4), а `contract` упирается в `CONTRACT_MAX_RETRIES` — форма отчёта, которую
+    роль не прочитала в схеме, третьим повтором не лечится (`dashboard/failures.py`,
+    `CONTRACT_MAX_RETRIES`).
+    """
+    limit = max(0, _int(policy_.max))
+    if str(kind or "") == CONTRACT:
+        return min(limit, CONTRACT_MAX_RETRIES)
+    return limit
+
+
 def retriable(policy_: Policy, kind: str, attempts: int) -> bool:
     """Есть ли ещё попытка для этого класса: класс объявлен и лимит не исчерпан.
 
     `attempts` — сколько отказов **этого** класса уже случилось (включая
     последний). `max: 2` значит «две повторные попытки», то есть отказ
-    ретраится, пока `attempts <= max`.
+    ретраится, пока `attempts <= max`; у `contract` потолок класса свой
+    (`_class_limit`).
     """
     if not policy_.allows(kind):
         return False
-    return _int(attempts) <= max(0, _int(policy_.max))
+    return _int(attempts) <= _class_limit(policy_, kind)
 
 
 def limit_for(policy_: Policy, kind: str) -> int:
@@ -374,7 +419,9 @@ def limit_for(policy_: Policy, kind: str) -> int:
     «1» (одна попытка без повторов), а не `policy.max`: иначе экран показывал бы
     «1/4 contract» там, где второго шанса нет и не будет.
     """
-    return max(0, _int(policy_.max)) if policy_.allows(str(kind or UNCLASSIFIED)) else 1
+    if not policy_.allows(str(kind or UNCLASSIFIED)):
+        return 1
+    return _class_limit(policy_, str(kind or UNCLASSIFIED))
 
 
 def counter(kind: str, attempts: int, limit: int) -> str:
@@ -397,9 +444,16 @@ def decide_park(*, kind: str, attempts: int, total: int, policy_: Policy) -> Opt
     return REASON_RETRIES
 
 
-def park_limit(reason: str, policy_: Policy) -> int:
-    """Лимит, который показать рядом со счётчиком: предохранитель или класс."""
-    return MAX_ROUNDS_PER_DEAL if reason == REASON_TOO_MANY else max(0, _int(policy_.max))
+def park_limit(reason: str, policy_: Policy, kind: str = "") -> int:
+    """Лимит, который показать рядом со счётчиком: предохранитель или класс.
+
+    Класс называется, потому что у `contract` свой потолок (`CONTRACT_MAX_RETRIES`):
+    без него счётчик печатал бы «2/4 contract» на парковке, где второго шанса уже
+    не будет.
+    """
+    if reason == REASON_TOO_MANY:
+        return MAX_ROUNDS_PER_DEAL
+    return _class_limit(policy_, kind)
 
 
 # ------------------------------------------------------------ факты из журнала

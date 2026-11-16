@@ -559,7 +559,7 @@ sqlite3 "file:$HOME/.hermes/duty/duty.db?mode=ro" \
 Отказ классифицируется политикой (`dashboard/failures.py`): `infra` — процесс не
 дожил, `contract` — отчёт не по контракту или его нет, `capability` — стена
 (бюджет, доступ). Повтор разрешён спекой этапа
-(`retry: {max: N, on: [...]}`, умолчание `{max: 4, on: [infra]}`), между
+(`retry: {max: N, on: [...]}`, умолчание `{max: 4, on: [infra, contract]}`), между
 попытками — пауза от 30 с до 5 мин, движок при этом не спит: дело ждёт
 `retry_at`, а `next_stage` отвечает `wait("retry")`.
 

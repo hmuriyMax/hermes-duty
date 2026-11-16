@@ -107,7 +107,23 @@ REORDER_KEYS = ("id", "needs", "parallel_with")
 # пустое имя — не правка, а «этап безымянный»: названное раньше имя оно не стирает
 # (`parse_plan`).
 EDIT_KEYS = ("cmd", "budget", "evidence", "retry", "kind", "role", "workspace", "title")
+# Правка неначатого этапа покрывает **весь** набор полей, который лид объявил бы
+# заново: у этапа без единой попытки нет истории, которую она переписала бы, и
+# `must`/`verdict`/`artifacts`/`ask`/`allow` — такие же намерения, как `cmd`.
+# До этой правки набор был уже набора спеки, и выхода у лида не оставалось: код
+# возврата команды или блок приговора поправить было нечем, а ревизия отклонялась
+# ЦЕЛИКОМ, поэтому лид заводил этап-дубль (`check` рядом с `check2`, живое дело
+# d_ff4c3c3f: три ревизии, два отказа `plan.id`, мёртвый `check` в графе).
+EDIT_KEYS = EDIT_KEYS + ("must", "verdict", "artifacts", "ask", "allow")
 STAGE_EDIT_KEYS = REORDER_KEYS + EDIT_KEYS
+# Удаление этапа из графа: запись `{id, remove: true}`. Нужна ровно затем, чтобы
+# освободить место под `charter.max_stages`: ревизия, заменившая этап дублем, не
+# могла убрать мёртвый, и потолок маленькой хартии оказывался занят навсегда
+# (d_76b269ce: правку начатого этапа план не делает, а граф расти не может —
+# лид жёг раунды между двумя отказами). Удаляются только этапы, которых нет в
+# seed-каркасе и у которых нет ни одной попытки: сделанное возвращает приговор
+# ревью, а вход/закрытие объявляет спека, а не план.
+REMOVE_KEYS = ("id", "remove")
 # Цена предложения (`docs/ENGINE-1.0.md`, раздел 5): план называет свою стоимость в
 # токенах сам, а не выводится из этапных бюджетов. Ключ один — «токены»; лимиты по
 # этапам как политика в 0.1.0 не объявляются.
@@ -1464,6 +1480,16 @@ def auto_classes() -> tuple[str, ...]:
     return tuple(module.AUTO_ON) if module is not None else ()
 
 
+def default_retry_max() -> int:
+    """Сколько повторов даёт этап без объявления `retry` (`failures.DEFAULT_MAX`).
+
+    Нужно предупреждению `retry.max`: объявление `retry` **заменяет** умолчание, и
+    автор спеки должен видеть, что именно он сузил, а не сравнивать с памятью.
+    """
+    module = _failures_module()
+    return int(getattr(module, "DEFAULT_MAX", 0)) if module is not None else 0
+
+
 def known_profiles(root: Optional[Path] = None) -> frozenset[str]:
     """Профили Hermes: `$HERMES_HOME/profiles/*` плюс `default`, снимок один раз на процесс.
 
@@ -1694,6 +1720,21 @@ def _forbidden_hit(cmd: str) -> Optional[str]:
     """
     lowered = " ".join(str(cmd or "").lower().split())
     return next((prefix for prefix in FORBIDDEN_CMD_PREFIXES if lowered.startswith(prefix)), None)
+
+
+# Обёртки, которые роль физически не может выполнить: её профиль запускает
+# инструмент, а гард терминала (`plugins/role-access`) режет `sh -c`/`bash -c`,
+# подстановки `$(…)` и редиректы. Команда в такой форме доезжает до гейта
+# подменённой («эквивалент» вместо строки спеки) и падает `evidence.substituted` —
+# доказательство тратится на спор о форме. Список читается по имени обёртки, а не
+# «что там в строке», чтобы отказ называл причину.
+SHELL_WRAPPERS = ("sh -c", "bash -c", "zsh -c", "sh -lc", "bash -lc")
+
+
+def _shell_wrapper_hit(cmd: str) -> Optional[str]:
+    """Обёртка оболочки в начале команды: `evidence` роли её не выполнит."""
+    lowered = " ".join(str(cmd or "").lower().split())
+    return next((wrapper for wrapper in SHELL_WRAPPERS if lowered.startswith(wrapper)), None)
 
 
 def _check_evidence(spec: Spec) -> list[Issue]:
@@ -2286,6 +2327,26 @@ def _check_retry(spec: Spec) -> list[Issue]:
             issues.append(
                 Issue(spec.path, stage.lines.get("retry.max", line), "retry.max", "retry.max должен быть целым не меньше нуля")
             )
+        elif retry.max <= 1 and any(kind in auto_classes() for kind in retry.on):
+            # `max: 1` — это «одна повторная попытка» только у класса, который
+            # вообще повторяется; но объявление `retry` **заменяет** умолчание
+            # движка (`failures.policy`), а не дополняет его: лид, писавший
+            # `retry: {max: 1, on: [infra]}` ради «аккуратности», сам себе снимал
+            # второй шанс у `contract` — 44 из 54 парковок в живом журнале пришли
+            # именно так. Предупреждение, а не отказ: объявление законно, но
+            # автор спеки должен знать, что оно сужает умолчание.
+            issues.append(
+                Issue(
+                    spec.path,
+                    stage.lines.get("retry.max", line),
+                    "retry.max",
+                    f"retry.max={retry.max} сужает умолчание движка "
+                    f"({default_retry_max()}): без объявления этап повторил бы "
+                    f"{', '.join(auto_classes()) or '—'} до {default_retry_max()} раз. "
+                    "Убери `retry` целиком, если особой политики нет",
+                    WARNING,
+                )
+            )
         if not retry.on:
             issues.append(
                 Issue(
@@ -2703,6 +2764,97 @@ def _with_repo_workspace(stage: Stage, repo: Optional[str]) -> Stage:
     return replace(stage, workspace="dir")
 
 
+def _same_order(existing: Stage, stage: Stage, declared: Mapping[str, Any]) -> bool:
+    """Перестановка называет порядок, который уже в графе: `needs`/`parallel_with` те же.
+
+    Сравниваются только **названные** поля: перестановка, которая молчит про
+    `parallel_with`, его и не трогает (`parse_plan`), поэтому «как было» — это
+    равенство по объявленным полям, а не по всем.
+    """
+    for name in REORDER_KEYS[1:]:
+        if name not in declared:
+            continue
+        if tuple(getattr(stage, name) or ()) != tuple(getattr(existing, name) or ()):
+            return False
+    return True
+
+
+def _plan_remove(
+    declared: Mapping[str, Any],
+    *,
+    index: int,
+    where: Path,
+    base: Mapping[str, Stage],
+    started: Iterable[str],
+    removed: set[str],
+    issues: list[Issue],
+) -> None:
+    """Запись удаления `{id, remove: true}`: какие удаления законны, а какие нет.
+
+    Удаление — единственный способ **освободить** `charter.max_stages`: заменённый
+    дублем этап иначе занимает потолок навсегда, и лид оказывается между двумя
+    отказами («правку начатого не принимаю» / «граф расти не может»).
+
+    Законно: этап есть в графе, у него нет ни одной попытки, и это не каркас дела
+    (вход-координатор и `close` объявляет спека — без них дело не закрыть).
+    Незаконно и называется своим правилом: неизвестный id, начатый этап, этап
+    каркаса, лишние поля рядом с `id`/`remove`.
+    """
+    beyond = sorted(set(declared) - set(REMOVE_KEYS))
+    if beyond:
+        issues.append(
+            Issue(
+                where,
+                index + 1,
+                "plan.remove",
+                f"удаление называет только {'/'.join(REMOVE_KEYS)}, а поля "
+                f"{', '.join(beyond)} переписывают этап — правку делает запись без `remove`",
+            )
+        )
+        return
+    stage_id = declared.get("id")
+    if not isinstance(stage_id, str) or not stage_id:
+        issues.append(Issue(where, index + 1, "plan.remove", "удаление называет id этапа"))
+        return
+    if stage_id in removed:
+        issues.append(Issue(where, index + 1, "plan.remove", f"этап {stage_id!r} удаляется дважды"))
+        return
+    if stage_id not in base:
+        issues.append(
+            Issue(
+                where,
+                index + 1,
+                "plan.remove",
+                f"этап {stage_id!r} удалить нельзя: его нет в графе — удалять можно только "
+                "уже объявленный этап",
+            )
+        )
+        return
+    if stage_id in {str(value) for value in started}:
+        issues.append(
+            Issue(
+                where,
+                index + 1,
+                "plan.remove.started",
+                f"этап {stage_id!r} уже начинался: сделанное возвращает приговор ревью, а не "
+                "удаление из графа",
+            )
+        )
+        return
+    if is_plan_stage(stage_id) or stage_id == CLOSE_STAGE:
+        issues.append(
+            Issue(
+                where,
+                index + 1,
+                "plan.remove.frame",
+                f"этап {stage_id!r} — каркас дела (вход/закрытие): его объявляет спека, план "
+                "его не удаляет",
+            )
+        )
+        return
+    removed.add(stage_id)
+
+
 def parse_plan_cost(raw: Any, *, path: Optional[Path] = None) -> tuple[Optional[dict[str, int]], list[Issue]]:
     """Цена предложения плана: `{tokens: N}` или `None`, если цену не назвали.
 
@@ -2817,6 +2969,8 @@ def parse_plan(
     started_ids: Iterable[str] = (),
     repo: Optional[str] = None,
     path: Optional[Path] = None,
+    removed_out: Optional[set[str]] = None,
+    replay: bool = False,
 ) -> tuple[tuple[Stage, ...], list[Issue]]:
     """Предложение плана → этапы и отказы; непустые отказы — план не принимается.
 
@@ -2865,12 +3019,26 @@ def parse_plan(
     Ход, ради которого эта проверка существует, — вернуть в работу то, что уже
     сделано, в обход `verdict.changes`.
 
+    **Удаление.** Запись `{id, remove: true}` (`REMOVE_KEYS`) снимает этап с графа —
+    только неначатый и не каркасный. Это единственный способ освободить
+    `charter.max_stages` под новый этап: замена этапа дублем иначе занимала потолок
+    навсегда (`d_76b269ce`: правку начатого план не делает, а граф расти не может).
+    Принятые id копятся в `removed_out` — по нему читатель графа (`transit.graph`)
+    убирает этап из `base_stages` следующей ревизии; сама ревизия удаления в
+    `stages` ничего не добавляет.
+
     `base_stages` — этапы уже существующего графа (seed плюс принятые ревизии): на
     них плану ссылаться можно, из них берутся `needs` для проверки цикла, который
     замыкает перестановка, ими дополняется правка, и по ним видно, что правка
     действительно изменила. `started_ids` читает вызывающий, у которого есть
     журнал (`runner.report_plan`): сама проверка структуры графа от попыток не
     зависит, и принятый план, чей этап потом начали, остаётся графом.
+
+    `replay` — чтение журнала, а не гейт (`transit.graph` пересобирает граф из
+    принятых ревизий). Правило `plan.evidence.shell` судит то, что предлагают
+    СЕЙЧАС: в живом журнале шесть дел приняли ревизии с `sh -c` в `evidence`, и
+    отказ на перечитывании откатил бы их граф к seed — то есть стёр бы этапы,
+    которые уже работали.
 
     **Один этап.** `raw_stages` вправе быть одной записью, а не списком: в 2.0
     этап проверяется там, где его запускают (`duty_start`), и требований к нему те
@@ -2891,11 +3059,26 @@ def parse_plan(
     base: dict[str, Stage] = {str(stage_id): stage for stage_id, stage in (base_stages or {}).items()}
     started = {str(stage_id) for stage_id in started_ids}
     stages: list[Stage] = []
+    removed: set[str] = set()
     for index, raw in enumerate(raw_stages):
         # Какие поля назвала запись — видно только у сырого словаря, а разбирать
         # перестановку иначе нечем: `_parse_stage` заполняет умолчания.
         declared = _mapping(raw) or {}
         declared_id = declared.get("id")
+        if declared.get("remove") is True:
+            # Удаление этапа — не этап, поэтому разбирается до `_parse_stage`:
+            # ключ `remove` в наборе полей этапа запрещён (`unknown-key`), и запись
+            # удаления иначе падала бы формой, а не своим правилом.
+            _plan_remove(
+                declared,
+                index=index,
+                where=where,
+                base=base,
+                started=started,
+                removed=removed,
+                issues=issues,
+            )
+            continue
         existing = base.get(declared_id) if isinstance(declared_id, str) else None
         moving = existing is not None
         try:
@@ -2930,6 +3113,15 @@ def parse_plan(
                         "ревью, а не план",
                     )
                 )
+            elif existing is not None and _same_order(existing, stage, declared):
+                # Перестановка, которая ничего не переставляет, — не отказ, а
+                # no-op: запись называет те же `needs`/`parallel_with`, что уже в
+                # графе, и граф от неё не меняется. Раньше отказ приходил и здесь,
+                # и лид, назвавший этап «как есть» (напр. чтобы сказать, что он
+                # остаётся), получал `plan.reorder` и терял ревизию целиком
+                # (d_2fc749fb rev4: `plan` с `needs: []` и `close` с `needs:
+                # ["plan"]` — ровно граф, отказ, дело запарковано).
+                continue
             else:
                 issues.append(
                     Issue(
@@ -2973,7 +3165,17 @@ def parse_plan(
         )
         for stage in stages
     }
-    known = set(base) | {stage.id for stage in stages}
+    known = (set(base) | {stage.id for stage in stages}) - removed
+    if removed:
+        # Удаление снимает этап с графа, значит и рёбра на него больше некуда
+        # вести: этап, которому удалённый нужен, остался бы ждать навсегда
+        # (`transit.next_stage` считает `needs` по графу, а не по журналу).
+        # Судятся только рёбра ЭТОГО предложения: у графа прежних ревизий рёбра
+        # дописывает сам движок («последние из плана» → `needs` seed-этапа), и
+        # требовать от лида переписать то, что он не объявлял, значило бы
+        # запретить удаление ровно там, где оно нужно (потолок занят мёртвым
+        # этапом, а наследник ссылается на него движковым ребром).
+        _check_removed_edges(stages, removed, where=where, issues=issues)
     # Ссылки проверяются у всех записей, включая перестановки: `needs` и
     # `parallel_with` — ровно то, чем перестановка и распоряжается.
     for stage in stages:
@@ -2990,6 +3192,11 @@ def parse_plan(
                     )
                     continue
                 if value in known:
+                    continue
+                if value in removed:
+                    # Удаление и рёбра на удалённое — один разговор: `plan.remove.needs`
+                    # уже сказал «назови новое ребро», второй отказ про «несуществующий
+                    # этап» говорил бы то же самое другими словами.
                     continue
                 issues.append(
                     Issue(
@@ -3009,9 +3216,10 @@ def parse_plan(
     merged: dict[str, tuple[str, ...]] = {
         stage_id: tuple(str(need) for need in getattr(stage, "needs", ()) or ())
         for stage_id, stage in base.items()
+        if stage_id not in removed
     }
     merged.update({stage.id: stage.needs for stage in stages})
-    by_any_id: dict[str, Stage] = dict(base)
+    by_any_id: dict[str, Stage] = {stage_id: stage for stage_id, stage in base.items() if stage_id not in removed}
     by_any_id.update({stage.id: stage for stage in stages})
     kinds = {stage_id: str(getattr(stage, "kind", "") or "") for stage_id, stage in by_any_id.items()}
     for stage in stages:
@@ -3119,6 +3327,26 @@ def parse_plan(
                     Issue(where, stage.line, "evidence.cmd", f"у этапа {stage.id!r} доказательство с пустым cmd")
                 )
                 continue
+            shell_wrapper = None if replay else _shell_wrapper_hit(evidence.cmd)
+            if shell_wrapper is not None and stage.kind != SHELL_KIND:
+                # Роль — не оболочка: профиль этапа запускает инструмент, а гард
+                # терминала (`plugins/role-access`) режет `sh -c` и подстановки.
+                # Команда, которую роль физически не может выполнить, приводит к
+                # подмене («эквивалент» вместо строки спеки) и отказу
+                # `evidence.substituted` — то есть доказательство тратится на
+                # спор о форме (25 объявленных `sh -c` в живых планах). Отказ на
+                # входе плана: объяви команду напрямую.
+                issues.append(
+                    Issue(
+                        where,
+                        stage.line,
+                        "plan.evidence.shell",
+                        f"evidence этапа {stage.id!r} завёрнуто в {shell_wrapper!r}: роль "
+                        "запускает инструмент, а не оболочку — объяви команду напрямую "
+                        "(без `sh -c`, `bash -c` и подстановок `$(…)`)",
+                    )
+                )
+                continue
             hit = _forbidden_hit(evidence.cmd)
             if hit is None:
                 continue
@@ -3205,16 +3433,54 @@ def parse_plan(
         )
         break
     if len(known) > charter.max_stages:
+        # Отказ называет не только «не растёт», но и ЧЕМ занято место: лид иначе
+        # добавляет ещё один этап поверх мёртвых и жжёт ревизию (d_76b269ce:
+        # «правку начатого не принимаю» и «граф расти не может» без третьего хода).
         issues.append(
             Issue(
                 where,
                 1,
                 "charter.max_stages",
                 f"план растит граф до {len(known)} этапов, а хартия держит не больше "
-                f"{charter.max_stages}: дело не растёт",
+                f"{charter.max_stages}: дело не растёт. Место занимают "
+                f"{', '.join(sorted(known))} — неначатый лишний этап снимается записью "
+                "{id, remove: true}, а не дублем рядом",
             )
         )
+    if removed_out is not None:
+        removed_out.update(removed)
     return tuple(stages), issues
+
+
+def _check_removed_edges(
+    stages: Iterable[Stage],
+    removed: set[str],
+    *,
+    where: Path,
+    issues: list[Issue],
+) -> None:
+    """Удалённый этап не должен оставаться чужим `needs`/`parallel_with` В ПРЕДЛОЖЕНИИ.
+
+    Иначе этап-наследник ждал бы вечно (`transit.next_stage` считает готовность по
+    графу), поэтому запись, которая сама назвала удаляемый этап, обязана назвать
+    новое ребро. Рёбра, которых предложение не объявляло, снимает читатель графа
+    (`transit._relinked`): их дописывает движок, и требовать их переписать значило
+    бы запретить удаление.
+    """
+    for stage in stages:
+        for name in ("needs", "parallel_with"):
+            for value in getattr(stage, name) or ():
+                if str(value) not in removed:
+                    continue
+                issues.append(
+                    Issue(
+                        where,
+                        stage.line_of(name),
+                        "plan.remove.needs",
+                        f"{name} этапа {stage.id!r} ссылается на удаляемый этап {value!r}: "
+                        "назови новое ребро в том же предложении",
+                    )
+                )
 
 
 # ------------------------------------------------------- seed спеки как план

@@ -4989,8 +4989,9 @@ def run_attempts(
     """Попытка этапа и авто-повторы движка поверх неё (`docs/ENGINE-2.0.md`, §7).
 
     Какие классы повторяются — политика этапа внутри политики движка: без `retry`
-    в спеке повторяется только `infra` (`failures.DEFAULT_ON`), а объявленный
-    набор **сужается** до `failures.AUTO_ON` (`infra`, `contract`) — `capability`
+    в спеке повторяются `infra` и `contract` (`failures.DEFAULT_ON`; у `contract`
+    потолок класса — один повтор), а объявленный набор **сужается** до
+    `failures.AUTO_ON` (`infra`, `contract`) — `capability`
     не повторяется никогда, и спека с `on: [capability]` получает предупреждение
     `retry.on`, а не лишний повтор (`dashboard/failures.py`, `spec._check_retry`).
     Серию ограничивают `retry.max` и предохранитель на дело.
@@ -5204,7 +5205,7 @@ def park_exhausted(
     rethink = _rethink_park(conn, spec, deal, stage, attempt, kind, reason, total, events, clock, retries=retries)
     if rethink is not None:
         return rethink
-    limit = failures.park_limit(rule, policy)
+    limit = failures.park_limit(rule, policy, kind)
     counter = failures.counter(kind, attempts, limit)
     retried = _retries_text(retries)
     if rule == failures.REASON_TOO_MANY:

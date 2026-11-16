@@ -899,6 +899,56 @@ def test_foreign_commit_refusal_names_both_readings(tmp_path: Path) -> None:
     assert "nothing: {reason}" in message
 
 
+def test_a_verdict_stage_may_name_a_foreign_commit_as_a_reference(tmp_path: Path) -> None:
+    """Ревьюер, назвавший проверяемый коммит, не присваивает чужую работу.
+
+    У вердиктного этапа свидетель — `verdict`, а контракт прямо говорит
+    «commit/artifacts не требуются». Названный коммит там означает «вот что я
+    смотрел», и судить его как работу значило падать за точность формулировки:
+    живое дело `d_3b6306a1` — шесть попыток ревью и ~23 млн токенов на отказе
+    `commit.foreign`. Коммит-предок базы у такого этапа законен; у этапа-работы
+    тот же отчёт остаётся отказом (соседний кейс).
+    """
+    root = tmp_path / "tree"
+    base = git_repo(root)
+    review = make_stage(
+        workspace="worktree",
+        role="reviewer",
+        verdict=spec_module.Verdict(approve="next", changes="impl"),
+    )
+    built = report(root, commit=base, verdict={"action": "approve", "target": "next", "reason": "проверил"})
+
+    verdict = verify(built, review, root, base=base)
+
+    assert (verdict.ok, verdict.kind, rules(verdict)) == (True, None, []), [str(issue) for issue in verdict.details]
+
+
+def test_a_verdict_stage_naming_an_unresolvable_commit_is_a_warning(tmp_path: Path) -> None:
+    """Ссылка на коммит, которого в дереве нет, — предупреждение, а не отказ.
+
+    Ссылка не доказывает работу (свидетель — `verdict`), а дерево попытки может
+    быть shallow или чужим: отказ за недоступный для резолва sha означал бы
+    «одобрение не принимается, потому что ревьюер честно назвал, что смотрел».
+    """
+    root = tmp_path / "tree"
+    base = git_repo(root)
+    review = make_stage(
+        workspace="worktree",
+        role="reviewer",
+        verdict=spec_module.Verdict(approve="next", changes="impl"),
+    )
+    built = report(
+        root,
+        commit="0123456789abcdef0123456789abcdef01234567",
+        verdict={"action": "approve", "target": "next", "reason": "проверил"},
+    )
+
+    verdict = verify(built, review, root, base=base)
+
+    assert verdict.ok, [str(issue) for issue in verdict.details]
+    assert warnings(verdict) == [evidence.RULE_COMMIT_RESOLVE]
+
+
 def test_report_schema_tells_the_executor_about_nothing(tmp_path: Path) -> None:
     """О пустоте исполнитель узнаёт из контракта, а не из отказа `commit.foreign`.
 

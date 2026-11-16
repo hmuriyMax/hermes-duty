@@ -1313,6 +1313,31 @@ stages:
     assert spec_module.errors(found) == []
 
 
+def test_retry_max_one_is_warning_not_error(tmp_path: Path):
+    """`retry.max` меньше умолчания — предупреждение: объявление СУЖАЕТ политику.
+
+    Умолчание с 0.2.1 — `{max: 4, on: [infra, contract]}`. Спека, объявившая
+    `max: 1`, получает ровно один повтор и только для `infra` (объявленный `on`
+    заменяет умолчание целиком, а не дополняет его): 44 из 54 живых парковок
+    пришли из такого файла и классом отказа был `contract`. Отказ здесь был бы
+    ломкой старых файлов — предупреждение называет цену строки.
+    """
+    path = write(
+        tmp_path,
+        """duty: probe
+stages:
+  - id: impl
+    role: implementer
+    retry: {max: 1, on: [infra]}
+""",
+    )
+    found = spec_module.validate_spec(spec_module.load_spec(path), profiles=PROFILES)
+
+    assert [(issue.rule, issue.line, issue.severity) for issue in found] == [("retry.max", 5, "warning")]
+    assert "сужает" in found[0].message and "contract" in found[0].message
+    assert spec_module.errors(found) == []
+
+
 # --------------------------------------------------------------- строка отказа
 
 
@@ -2035,15 +2060,35 @@ def test_parse_plan_needs_may_point_at_the_seed():
 
 
 def test_parse_plan_does_not_redefine_existing_id():
-    """`id` из seed планом не переопределяется: поля вне `STAGE_EDIT_KEYS` — отказ.
+    """`id` из seed планом не переопределяется: поле вне набора правки — отказ.
 
-    Роль, вид и evidence у неначатого этапа править можно (`EDIT_KEYS`), а
-    `verdict`, `ask`, `must` объявляет спека: приговор и вопрос — не то, что
-    лид переписывает планом.
+    Роль, вид, evidence, `must`, `verdict`, `ask` и `allow` у неначатого этапа
+    править МОЖНО (`EDIT_KEYS` = набор спеки): у этапа без единой попытки нет
+    истории, которую правка переписала бы, а без этого лид заводил этап-дубль
+    (`check2` рядом с `check`, дело d_ff4c3c3f). Чужое имя остаётся отказом
+    `plan.id`: план не приносит полей, которых у этапа нет вовсе.
     """
-    for extra in ({"verdict": {"approve": "next", "changes": "feed"}}, {"must": 7}, {"ask": {"q": "?"}}):
+    for extra in ({"line": 3}, {"unknown": 1}, {"source": "plan"}):
         _, found = plan([{"id": "close", "needs": [], **extra}])
         assert "plan.id" in {issue.rule for issue in found}, extra
+
+
+def test_parse_plan_edits_must_and_verdict_of_a_not_started_stage():
+    """`must`/`verdict`/`ask` неначатого этапа — правка, а не повод для дубля.
+
+    Отказ `plan.id` на эти поля стоил лиду трёх ревизий: поправить код возврата
+    своего же `check` было нечем, и в графе рядом с живым `check` заводился
+    `check2` (d_ff4c3c3f, d_d980cd3d).
+    """
+    stages, found = plan(
+        [{"id": "check", "must": 7, "verdict": {"approve": "next", "changes": "feed"},
+          "ask": {"allowed": ["researcher"]}}]
+    )
+    assert found == [], [issue.message for issue in found]
+    edited = next(stage for stage in stages if stage.id == "check")
+    assert edited.must == 7
+    assert edited.verdict is not None and edited.verdict.approve == "next"
+    assert edited.ask is not None and edited.ask.allowed == ("researcher",)
 
 
 def test_parse_plan_duplicate_id_inside_proposal():
@@ -2189,6 +2234,54 @@ def test_parse_plan_cannot_add_a_publishing_command():
     assert "cmd.forbidden" in {issue.rule for issue in found}
 
 
+def test_parse_plan_evidence_cannot_wrap_the_command_in_a_shell():
+    """`sh -c`/`bash -c` в evidence этапа-работы — отказ на входе плана.
+
+    Роль запускает инструмент, а гард терминала профиля режет `sh -c` и
+    подстановки `$(…)`: команда доезжает до гейта подменённой («эквивалент» вместо
+    строки спеки) и падает `evidence.substituted` — доказательство тратится на
+    спор о форме (25 объявленных `sh -c` в живых планах). Отказ называет обёртку и
+    говорит, что делать. У этапа-оболочки (`kind: shell`) движок запускает команду
+    сам, там обёртка законна (соседний кейс).
+    """
+    _, found = plan(
+        [{"id": "docs", "role": "implementer", "needs": ["plan"],
+          "evidence": [{"cmd": "sh -c 'go test ./...'", "must": 0}]}]
+    )
+    assert [issue.rule for issue in found] == ["plan.evidence.shell"], [issue.message for issue in found]
+    assert "sh -c" in found[0].message and "напрямую" in found[0].message
+
+
+def test_parse_plan_evidence_allows_a_shell_stage_to_wrap():
+    """`kind: shell` исполняет движок: `bash -c` в его `cmd` — не подмена роли."""
+    _, found = plan(
+        [{"id": "gate-cmd", "kind": "shell", "cmd": "bash -c 'true'", "needs": ["plan"]}]
+    )
+    assert "plan.evidence.shell" not in {issue.rule for issue in found}, [issue.message for issue in found]
+
+
+def test_replay_does_not_reject_a_historically_accepted_shell_wrapper():
+    """Перечитывание журнала не судит форму: гейт — предложение, а не история.
+
+    Шесть живых дел приняли ревизии с `sh -c` в `evidence` до правила. Отказ при
+    перечитывании (`transit.graph`) откатил бы граф к seed и стёр бы этапы,
+    которые уже работали, — поэтому `replay=True` правило не применяет.
+    """
+    raw = [{"id": "docs", "role": "implementer", "needs": ["plan"],
+            "evidence": [{"cmd": "sh -c 'go test ./...'", "must": 0}]}]
+
+    live, found = spec_module.parse_plan(
+        raw, charter=spec_module.Charter(), base_stages=BASE_STAGES
+    )
+    assert [issue.rule for issue in found] == ["plan.evidence.shell"]
+
+    replayed, found_replay = spec_module.parse_plan(
+        raw, charter=spec_module.Charter(), base_stages=BASE_STAGES, replay=True
+    )
+    assert found_replay == [], [issue.message for issue in found_replay]
+    assert [stage.id for stage in replayed] == ["docs"]
+
+
 def test_parse_plan_evidence_command_cannot_publish():
     _, found = plan([{"id": "impl", "role": "implementer",
                       "evidence": [{"cmd": "git push", "must": 0}]}])
@@ -2260,14 +2353,21 @@ def test_parse_plan_parallel_with_is_declared_by_the_plan():
 
 
 def test_parse_plan_reorder_names_only_needs_and_parallel_with():
-    """Перестановка этапа из графа не переписывает его: `must` в ней — отказ.
+    """Перестановка НАЧАТОГО этапа не переписывает его: `must` в ней — отказ.
 
     Порядок (`needs`/`parallel_with`) — единственное, что перестановка вправе
-    назвать. Поля, которых у правки нет (`must`, `artifacts`, `ask`, `verdict`),
-    этап переписывают: их объявляет спека.
+    назвать у этапа, который уже работал. У неначатого этапа `must` — законная
+    правка (`EDIT_KEYS`), и различие здесь именно в факте попытки, а не в наборе
+    полей: сделанное возвращает приговор ревью, а не план.
     """
-    _, found = plan([{"id": "close", "must": 7, "needs": []}])
-    assert "plan.id" in {issue.rule for issue in found}
+    stages, found = spec_module.parse_plan(
+        [{"id": "feed", "must": 7, "needs": ["plan"]}],
+        charter=spec_module.Charter(),
+        base_stages=BASE_STAGES,
+        started_ids=("feed",),
+    )
+    assert "plan.edit" in {issue.rule for issue in found}, [issue.message for issue in found]
+    assert stages == ()
 
 
 def test_parse_plan_edit_of_a_not_started_stage_changes_its_fields():

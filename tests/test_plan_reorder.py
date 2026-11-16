@@ -385,12 +385,32 @@ def test_reorder_of_a_started_stage_is_refused(tmp_path: Path) -> None:
 
 
 def test_reorder_cannot_rewrite_the_stage_it_moves(tmp_path: Path) -> None:
-    """Перестановка называет порядок: `must` в ней — отказ, его объявляет спека."""
+    """Перестановка начатого этапа называет порядок: `must` в ней — отказ `plan.edit`."""
     spec = write_spec(tmp_path, SEED)
-    facts, _why = report(spec, [{"id": "check", "must": 7, "needs": ["plan"]}])
+    facts, _why = report(
+        spec, [{"id": "impl", "must": 7, "needs": ["plan"]}], journal_events=events(started("impl"))
+    )
 
     assert facts[-1]["kind"] == "plan_rejected"
-    assert any("plan.id" in issue for issue in facts[-1]["payload"]["issues"])
+    assert any("plan.edit" in issue for issue in facts[-1]["payload"]["issues"])
+
+
+def test_noop_reorder_of_a_started_stage_is_accepted(tmp_path: Path) -> None:
+    """Запись «как есть» у начатого этапа — не отказ: граф от неё не меняется.
+
+    Лид, назвавший этап с теми же `needs`, что уже в графе, терял ревизию целиком
+    (`d_2fc749fb` rev4: `plan` с `needs: []` и `close` с `needs: ["plan"]` — ровно
+    граф, `plan.reorder`, дело запарковано). Отказ остаётся на реальную смену
+    порядка — её и проверяет соседний кейс.
+    """
+    spec = write_spec(tmp_path, SEED)
+    facts, why = report(
+        spec, [{"id": "impl", "needs": ["plan"]}], journal_events=events(started("impl"))
+    )
+
+    assert why == ""
+    assert [fact["kind"] for fact in facts] == ["plan_proposed", "plan_accepted"], facts
+    assert needs_of(transit.graph(spec, facts))["impl"] == ("plan",)
 
 
 # ---------------------------------------------- 4. параллель из предложения

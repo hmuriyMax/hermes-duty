@@ -719,6 +719,31 @@ def _check_commit(
         )
 
 
+def _check_commit_reference(commit: str, root: Path, issues: list[Issue]) -> None:
+    """Коммит, названный этапом со своим свидетелем: ссылка, а не доказательство.
+
+    У вердиктного/публикующего этапа и у роли с отчётом коммит ничего не
+    доказывает — он называет, ЧТО смотрели (`docs/ENGINE-2.0.md`, свидетель).
+    Поэтому проверяется ровно одно: имя резолвится в дереве. Ни «предок базы»
+    (`commit.foreign`), ни поиск в каталоге дела здесь не судятся: текст
+    `commit.foreign` велит предъявить работу, которой от этого этапа никто не
+    требует, — и одобрение падало за точность формулировки (d_3b6306a1).
+    Нерезолвящееся имя — предупреждение: оно не отказ, потому что ссылка может
+    вести на коммит, которого в песочнице этапа нет (дерево shallow, чужой реф).
+    """
+    if _rev_parse(root, commit) is not None:
+        return
+    issues.append(
+        Issue(
+            _where("commit"),
+            RULE_COMMIT_RESOLVE,
+            f"commit={commit!r}: ссылка не резолвится в {root} — этап со своим свидетелем "
+            "не доказывает работу коммитом, но имя должно указывать на существующий коммит",
+            severity=WARNING,
+        )
+    )
+
+
 def _check_nothing(root: Path, base: Optional[str], issues: list[Issue]) -> None:
     """Пустота проверяема или её нет: `HEAD` равен базе, а `git status` пуст.
 
@@ -1043,7 +1068,20 @@ def verify(
         else:
             _check_artifacts(list(artifacts or []), root_path, issues, measure=measure, tree=tree_path)
             if commit_text:
-                _check_commit(commit_text, root_path, base, issues, repo=repo_path)
+                # Коммит — свидетель РАБОТЫ (`witness` = `commit|artifacts`). У
+                # вердиктного этапа, у публикующего, у этапа плана и у роли с
+                # отчётом свидетель свой (`verdict`/`published`/`plan`/`report`),
+                # и контракт прямо говорит «commit/artifacts не требуются». Но
+                # названный коммит там — обычное дело: ревьюер пишет «смотрел
+                # вот этот», — и судить его как присвоение работы значило отказывать
+                # одобрение за точность (живое дело d_3b6306a1: шесть попыток
+                # ревью и ~23 млн токенов на отказе `commit.foreign`). Поэтому у
+                # таких этапов коммит читается как ССЫЛКА: спрашиваем только,
+                # резолвится ли он в дереве.
+                if witness(stage) == WITNESS_WORK:
+                    _check_commit(commit_text, root_path, base, issues, repo=repo_path)
+                else:
+                    _check_commit_reference(commit_text, root_path, issues)
         records = result.get("evidence")
         if isinstance(records, list):
             # Отсутствие поля целиком уже названо схемой: повторять его на каждой

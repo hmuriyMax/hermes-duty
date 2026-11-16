@@ -25,6 +25,7 @@ import json
 import hashlib
 import sqlite3
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, Optional
 
@@ -360,11 +361,14 @@ def test_unknown_verdict_kind_reads_contract() -> None:
 
 
 def test_policy_default_matches_the_contract(tmp_path: Path) -> None:
-    """Этап без `retry` живёт по умолчанию: `{max: 4, on: [infra]}`.
+    """Этап без `retry` живёт по умолчанию: `{max: 4, on: [infra, contract]}`.
 
     Четыре повтора — это пять попыток этапа, ровно `spec.DEFAULT_MAX_ATTEMPTS`:
     класс `infra` не должен упираться в один повтор, иначе потолок хартии
     недостижим, а исчерпанная серия уходит лиду вместо повтора на месте.
+    `contract` в умолчании с 0.2.1: 44 из 54 живых парковок пришли с
+    `(max=1, on=[infra])`, где классом отказа был `contract`, — роль отчиталась не
+    по схеме, а второго шанса не было. Повтор у него один (`CONTRACT_MAX_RETRIES`).
     """
     spec = write_spec(
         tmp_path,
@@ -378,7 +382,23 @@ stages:
 
     policy = failures.policy(stage_of(spec))
 
-    assert (policy.max, policy.on) == (4, ("infra",))
+    assert (policy.max, policy.on) == (4, ("infra", "contract"))
+    assert policy.allows("infra") and policy.allows("contract")
+    assert failures.limit_for(policy, "infra") == 4
+    assert failures.limit_for(policy, "contract") == 1
+    assert not policy.allows("capability")
+
+
+def test_policy_of_a_gate_stage_does_not_retry_contract(tmp_path: Path) -> None:
+    """Гейт по контракту не повторяется: его отказ — ответ человека вне `allow`.
+
+    Повтор прочитал бы из пула тот же ответ и отказал тем же словом — попытка и
+    токены в никуда (`kind: gate`, tests/test_driver.py «ответ вне allow»).
+    """
+    gate = SimpleNamespace(kind="gate", retry=None)
+
+    policy = failures.policy(gate)
+
     assert policy.allows("infra") and not policy.allows("contract")
 
 

@@ -548,7 +548,7 @@ approved_commit}`.
 |---|---|---|---|
 | 1 | `status` ∈ {`done`, `blocked`, `refused`}; для `done` есть свидетель этапа (`commit`\|`artifacts`, `verdict` или `published` — по `evidence.witness`), `evidence`, `summary`; лишнее поле — предупреждение | `status`, `required`, `extra` | `contract` |
 | 2 | артефакт: относительный путь внутри дерева попытки, файл есть, `sha256` полный и совпадает; отказ называет мерку («искали относительно дерево/каталог попытки») и подсказывает `workspace: worktree`, если файл нашёлся в дереве попытки | `artifact.path`, `artifact.missing`, `artifact.sha256` | `contract` |
-| 3 | `git rev-parse --verify <commit>^{commit}` в дереве; коммит не предок базы (предок = «принёс чужое готовое») | `commit.resolve`, `commit.foreign`; `commit.base` — предупреждение, если база не резолвится | `contract` |
+| 3 | `git rev-parse --verify <commit>^{commit}` в дереве; коммит не предок базы (предок = «принёс чужое готовое») — **только у этапа, чей свидетель работа** (`commit`/`artifacts`). У вердиктного этапа (`verdict`) названный коммит — ссылка «вот что я смотрел»: проверяется резолв, нерезолв — предупреждение `commit.resolve`, отказа нет | `commit.resolve`, `commit.foreign` (работа); `commit.resolve` (ссылка) | `contract` |
 | 4 | по каждой `{cmd, must}` из `stage.evidence` есть запись с тем же `cmd`, `exit == must` и `started_at` ≥ начала попытки (и не позже «сейчас») | `evidence.missing`, `evidence.exit`, `evidence.stale`, `evidence.future` | `contract` |
 | 5 | `cmd` совпадает со спекой посимвольно после нормализации пробелов: «почти та же команда» | `evidence.substituted` | `contract` |
 | 6 | `usage.total_tokens` больше `stage.budget.tokens` — работа сделана, но за рамками | `budget.tokens` | `capability` |
@@ -600,7 +600,7 @@ approved_commit}`.
 | класс не определён | `UNCLASSIFIED` | нет | `kind` пуст: честное «класса нет», а не догадка |
 
 Лимиты — в спеке этапа: `retry: {max: N, on: [infra, contract]}`; умолчание
-`{max: 4, on: [infra]}` (`docs/SPEC.md`). Счётчик — **на этап и на класс**:
+`{max: 4, on: [infra, contract]}` (`docs/SPEC.md`). Счётчик — **на этап и на класс**:
 два отказа `contract` не съедают лимит `infra`. Исчерпание даёт `failed(kind)` в
 срезе и **парковку** дела, а не новый круг. Объявленный набор (`retry.on`)
 **сужает** набор движка (`failures.AUTO_ON` — `infra`, `contract`), но не

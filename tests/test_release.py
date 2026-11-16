@@ -441,7 +441,10 @@ def test_release_reads_plan_stages_the_file_does_not_know(tmp_path: Path) -> Non
     seed(conn, deal, "attempt_ended", {"stage": "plan", "attempt": 1, "outcome": "done", "kind": None, "reason": "", "run_id": "plan#1"}, key="t:plan:end")
     seed(conn, deal, "plan_proposed", {"rev": 1, "stages": [{"id": "review", "role": "tester", "needs": ["plan"], "workspace": "none", "evidence": [{"cmd": "true", "must": 0}]}], "reason": "", "source_stage": "plan", "attempt": 1}, key="t:propose")
     seed(conn, deal, "plan_accepted", {"rev": 1, "by": "engine"}, key="t:accept")
-    end_attempt(conn, deal, stage="review", attempt=1, outcome="failed", kind="contract", reason="evidence.missing")
+    # Класс `capability` — стена, он не повторяется никогда (`failures.AUTO_ON`):
+    # кейс проверяет, что этап ПЛАНА находится для отпускания, а не политику
+    # повторов (`contract` с 0.2.1 повторяется один раз и дал бы `run`).
+    end_attempt(conn, deal, stage="review", attempt=1, outcome="failed", kind="capability", reason="budget")
     mark_running(conn, deal)
     assert transit.next_stage(spec, events(conn, deal), NOW + 300).kind == transit.DECISION_FAILED
 

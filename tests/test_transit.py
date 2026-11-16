@@ -478,12 +478,12 @@ def test_unclassified_failure_is_not_retried(spec: Any) -> None:
 
 
 def test_failure_without_retry_spec_uses_default_policy(tmp_path: Path) -> None:
-    """Этап без `retry` живёт по умолчанию: `{max: 1, on: [infra]}` (docs/SPEC.md).
+    """Этап без `retry` живёт по умолчанию: `{max: 4, on: [infra, contract]}`.
 
-    Политика — часть контракта, а не удобство: `infra` повторяется один раз и без
-    объявления, а `contract` не повторяется вовсе, потому что умолчание называет
-    только инфра-сбой. Пустая политика вместо объявленной заводила бы второй
-    набор правил в спеке и в коде.
+    Политика — часть контракта, а не удобство: `infra` повторяется без объявления,
+    и `contract` тоже — но один раз (`failures.CONTRACT_MAX_RETRIES`): схема отчёта
+    и причина прошлого отказа уезжают в бриф следующей попытки, а третий повтор
+    того же класса означает, что роль схему не читает.
     """
     spec = write_spec(
         tmp_path,
@@ -499,7 +499,10 @@ def test_failure_without_retry_spec_uses_default_policy(tmp_path: Path) -> None:
 
     contract = [started("impl", 1), crashed("impl", 1, "contract")]
     decision = transit.next_stage(spec, contract, NOW)
-    assert (decision.kind, decision.fail_kind) == ("failed", "contract")
+    assert (decision.kind, decision.pair) == ("run", [("impl", 2)]), "первый contract — повтор"
+
+    twice = contract + [started("impl", 2), crashed("impl", 2, "contract")]
+    assert transit.next_stage(spec, twice, NOW).kind == "failed", "повтор contract один"
 
 
 # ------------------------------------------------------------------ правило 5

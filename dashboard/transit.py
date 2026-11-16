@@ -64,7 +64,7 @@ payload: события дел его не пишут.
    одному, порядок — объявления в спеке;
 4. провал попытки → следующая попытка того же этапа, пока для этого класса не
    исчерпан лимит политики (`dashboard/failures.py`: `retry.max`, по умолчанию
-   `{max: 1, on: [infra]}`); между попытками — пауза от 30 с с потолком 5 мин, и
+   `{max: 4, on: [infra, contract]}`, у `contract` потолок класса — один повтор); между попытками — пауза от 30 с с потолком 5 мин, и
    до `retry_at` решение — `wait("retry", retry_at)`, а не `run`; исчерпан →
    `failed` этапа, а движок паркует дело (`blocked` с `block_kind='parked'`);
 5. вопрос в журнале без ответа → `wait`; ответ → новая попытка (номер растёт);
@@ -1214,11 +1214,14 @@ def graph(spec: Any, events: Iterable[Any]) -> tuple[Any, ...]:
     current = seed
     for rev in revisions:
         payload = proposals[rev]
+        removed: set[str] = set()
         stages, issues = spec_module.parse_plan(
             payload.get("stages"),
             charter=charter,
             base_stages={stage.id: stage for stage in current},
             repo=getattr(spec, "repo", None),
+            removed_out=removed,
+            replay=True,
         )
         if issues:
             # Отказ у принятой ревизии — журнал, которого движок не писал бы
@@ -1226,7 +1229,7 @@ def graph(spec: Any, events: Iterable[Any]) -> tuple[Any, ...]:
             # меняет, но и принятое раньше не отменяет.
             return current
         plan_stage = _plan_stage_in(current, payload.get("source_stage"))
-        current = _relinked(current, tuple(stages), plan_stage)
+        current = _relinked(current, tuple(stages), plan_stage, removed=removed)
     return current
 
 
@@ -1249,7 +1252,30 @@ def _plan_stage_in(stages: Iterable[Any], claimed: Any) -> str:
     return PLAN_STAGE
 
 
-def _relinked(seed: tuple[Any, ...], proposed: tuple[Any, ...], plan_stage: str) -> tuple[Any, ...]:
+def _without_needs(stage: Any, drop: set[str]) -> Any:
+    """Этап без рёбер на удалённое: снятие этапа снимает и его рёбра.
+
+    Рёбра дописывает движок («последние из плана» → `needs` seed-этапа), поэтому
+    лид, снимающий мёртвый этап, не объявлял их и переписать не может. Оставить их
+    — оставить этап ждать того, чего в графе больше нет
+    (`transit.next_stage` считает готовность по рёбрам).
+    """
+    changed = {}
+    for name in ("needs", "parallel_with"):
+        values = tuple(str(value) for value in (getattr(stage, name, ()) or ()))
+        kept = tuple(value for value in values if value not in drop)
+        if kept != values:
+            changed[name] = kept
+    return dataclasses.replace(stage, **changed) if changed else stage
+
+
+def _relinked(
+    seed: tuple[Any, ...],
+    proposed: tuple[Any, ...],
+    plan_stage: str,
+    *,
+    removed: Optional[set[str]] = None,
+) -> tuple[Any, ...]:
     """Seed плюс план: изменения применены, этапы seed ждут «последние» из плана.
 
     Запись предложения с `id` из seed — перестановка или правка, и `parse_plan`
@@ -1266,6 +1292,15 @@ def _relinked(seed: tuple[Any, ...], proposed: tuple[Any, ...], plan_stage: str)
     никто из добавленных не зависит, — «последние из плана».
     """
     seeded = {stage.id for stage in seed}
+    # Удалённые ревизией этапы снимаются с графа: `parse_plan` их уже отсёк, а
+    # здесь их надо убрать и из `seed` этого шага (`seed` — граф предыдущих
+    # ревизий), иначе «план не удаляет» продолжало бы держать мёртвый этап и
+    # потолок `charter.max_stages` оставался бы занятым навсегда.
+    drop = {str(stage_id) for stage_id in (removed or ())}
+    if drop:
+        seed = tuple(_without_needs(stage, drop) for stage in seed if stage.id not in drop)
+        proposed = tuple(_without_needs(stage, drop) for stage in proposed if stage.id not in drop)
+        seeded -= drop
     moving = {stage.id: stage for stage in proposed if stage.id in seeded}
     added = tuple(stage for stage in proposed if stage.id not in seeded)
     ordered: list[Any] = []

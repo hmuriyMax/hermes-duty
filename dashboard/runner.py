@@ -5572,6 +5572,8 @@ def _role_question_fact(
     now: int,
     *,
     idem: str = "",
+    asked_by: str = "",
+    source: str = ENGINE_SOURCE,
 ) -> dict[str, Any]:
     """Вопрос, ушедший роли: `question_asked` без пула.
 
@@ -5580,17 +5582,28 @@ def _role_question_fact(
     контракта, а журнал хранит его текст и адрес. `routing.hops` — номер
     передачи по цепочке (`max_hops`): он же потом считается `hops_done`.
 
+    `routing.by` — кто задал вопрос: `lead` у вопроса лида (`duty_ask`) или `id`
+    этапа, чья попытка спросила. Без него вопрос лида неотличим от вопроса этапа:
+    у вопроса лида `routing.stage` синтетический (`ASK_STAGE`), и подпись «вопрос
+    роли researcher» читалась как «спросил researcher» (Макс, 17.11).
+
+    `source` — писатель факта: у вопроса лида это `lead`, а не движок. Факт
+    обязан называть того, кто его записал, иначе «кто спросил» ищется по коду.
+
     `idem` — ключ вызова лида (`duty_ask`): он едет в факт и в ключ события, как
     у остальных инструментов, поэтому повтор вопроса второго факта не пишет. У
     движка ключа нет, и его факты остаются прежними.
     """
+    routing_: dict[str, Any] = {
+        **address.as_payload(),
+        "stage": stage.id,
+        "attempt": int(attempt),
+        "hops": int(hops) + 1,
+    }
+    if asked_by:
+        routing_["by"] = asked_by
     payload: dict[str, Any] = {
-        "routing": {
-            **address.as_payload(),
-            "stage": stage.id,
-            "attempt": int(attempt),
-            "hops": int(hops) + 1,
-        },
+        "routing": routing_,
         "text": text,
     }
     text_full = question.get("text_full")
@@ -5600,7 +5613,7 @@ def _role_question_fact(
     if idem:
         payload["idem"] = idem
         args["idem"] = idem
-    return _event(deal, "question_asked", payload, args, now)
+    return _event(deal, "question_asked", payload, args, now, source=source)
 
 
 def _role_answer_fact(
@@ -5615,6 +5628,7 @@ def _role_answer_fact(
     reason: str = "",
     *,
     idem: str = "",
+    source: str = ENGINE_SOURCE,
 ) -> dict[str, Any]:
     """Ответ роли: `question_answered` с автором-ролью, а не с пулом.
 
@@ -5647,7 +5661,7 @@ def _role_answer_fact(
     if idem:
         payload["idem"] = idem
         args["idem"] = idem
-    return _event(deal, "question_answered", payload, args, now)
+    return _event(deal, "question_answered", payload, args, now, source=source)
 
 
 def role_answer_before(events: Iterable[Any], stage_id: str, attempt: int) -> Optional[str]:
@@ -5707,7 +5721,22 @@ def _asked_role(
     (`authority: true`) или не ответила, и вопрос уходит человеку обычным путём.
     """
     now = _now_sec(int(clock()))
-    journal.append(conn, [_role_question_fact(deal, stage, attempt, text, question, address, hops, now)])
+    journal.append(
+        conn,
+        [
+            _role_question_fact(
+                deal,
+                stage,
+                attempt,
+                text,
+                question,
+                address,
+                hops,
+                now,
+                asked_by=str(getattr(stage, "id", "") or ""),
+            )
+        ],
+    )
     answer = ask_role(
         conn,
         spec,
@@ -5852,7 +5881,14 @@ def _parked(
         text,
         question.get("text_full") if isinstance(question, dict) else None,
         options or None,
-        routing={**address.as_payload(), "stage": stage.id, "attempt": int(attempt)},
+        routing={
+            **address.as_payload(),
+            "stage": stage.id,
+            "attempt": int(attempt),
+            # Кто спросил — тот же `by`, что у вопроса роли: поверхность обязана
+            # назвать автора вопроса, а не только адресата.
+            "by": str(getattr(stage, "id", "") or ""),
+        },
     )
     deals.set_blocked(
         conn,
@@ -5992,13 +6028,18 @@ def recover_role_questions(
         ],
     )
     address = routing.Target(routing.HUMAN, reason=routing.REASON_ROLE_FAILED)
+    # Автор вопроса переезжает вместе с ним: передача роли оборвалась, но спросил
+    # тот же, кто и до неё.
+    marked: dict[str, Any] = {**address.as_payload(), "stage": stage_id, "attempt": attempt}
+    if str(address_of.get("by") or ""):
+        marked["by"] = str(address_of.get("by"))
     asked = ask.ask(
         conn,
         {**deal, "home": Path(home)},
         text,
         str(payload.get("text_full") or "") or None,
         None,
-        routing={**address.as_payload(), "stage": stage_id, "attempt": attempt},
+        routing=marked,
     )
     deals.set_blocked(
         conn,

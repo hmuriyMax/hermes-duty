@@ -384,6 +384,9 @@ def test_lead_asks_a_role_and_gets_the_answer_as_a_string(tmp_path: Path) -> Non
     assert asked[0]["text"] == "в каком формате отдавать отчёт?"
     assert asked[0]["routing"]["stage"] == "impl"
     assert asked[0]["routing"]["hops"] == 2
+    # Автор вопроса — лид: у вопроса лида `stage` синтетический (`ask`/этап, чей
+    # вопрос ждал ответа), и без `by` подпись читалась как «спросил тот этап».
+    assert asked[0]["routing"]["by"] == "lead"
     # Текст вопроса — без номера пула: этот канал его не заводит.
     assert "question_id" not in asked[0]
     role_answer = [item for item in facts(conn, deal, "question_answered") if item.get("by") == "researcher"]
@@ -422,6 +425,101 @@ def test_lead_ask_reports_a_redirect_to_the_human(tmp_path: Path) -> None:
     assert len(closed) == 1
     assert closed[0]["answered_via"] == "redirected"
     assert "answer" not in closed[0]
+
+
+def test_lead_ask_names_the_lead_as_author_and_writer(tmp_path: Path) -> None:
+    """Вопрос лида подписан автором: `source=lead` и `routing.by=lead`.
+
+    Этап у вопроса лида синтетический (`ask`, а при ждущем вопросе — чужой этап
+    `impl`), поэтому «кто спросил» из одного `routing.stage` не читается: подпись
+    «вопрос роли researcher» понималась как «спросил researcher» (живое дело,
+    17.11). Автор — факт журнала, а не догадка поверхности.
+    """
+    home = make_home(tmp_path)
+    spec = write_spec(tmp_path, SEED)
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    seed_worker_question(conn, deal, 41)
+    role = RoleAnswer(text="ответ")
+
+    tools.ask(
+        str(deal["id"]),
+        "researcher",
+        "в каком формате отдавать отчёт?",
+        "ask-author",
+        home=home,
+        spawn=role,
+        clock=lambda: NOW + 10,
+    )
+
+    asked = [
+        event
+        for event in journal.read_events(conn, str(deal["id"]))
+        if str(event["kind"]) == "question_asked"
+        and str(journal.payload_of(event).get("routing", {}).get("by") or "") == "lead"
+    ]
+    assert len(asked) == 1, "вопрос лида называет автора"
+    assert asked[0]["source"] == "lead", "факт лида пишет лид, а не движок"
+    answered = [
+        event
+        for event in journal.read_events(conn, str(deal["id"]))
+        if str(event["kind"]) == "question_answered"
+        and str(journal.payload_of(event).get("by") or "") == "researcher"
+    ]
+    assert len(answered) == 1
+    assert answered[0]["source"] == "lead", "ответ на вопрос лида — тоже факт лида"
+
+
+def test_a_repeated_lead_ask_writes_no_second_question(tmp_path: Path) -> None:
+    """Повтор `duty_ask` с тем же ключом не пишет второй `question_asked`.
+
+    Передача оборвалась между фактами: вопрос лёг в журнал, ответа нет (лид упал
+    на спавне роли). Повтор того же вызова доводит передачу, но второй вопрос не
+    пишет — иначе он засчитывался бы вторым хопом (`hops_done`), а дело показывало
+    бы два вопроса там, где спросили один раз.
+    """
+    home = make_home(tmp_path)
+    spec = write_spec(tmp_path, SEED)
+    conn = open_store(home)
+    deal = make_deal(conn, spec)
+    seed_worker_question(conn, deal, 41)
+    lost = runner._role_question_fact(
+        deal,
+        spec_module.Stage(id="impl", role="researcher", workspace="none"),
+        1,
+        "в каком формате отдавать отчёт?",
+        {"text": "в каком формате отдавать отчёт?"},
+        runner.routing.Target(
+            runner.routing.ROLE, value="researcher", reason=runner.routing.REASON_DECLARED
+        ),
+        1,
+        NOW + 5,
+        idem="ask-repeat",
+        asked_by="lead",
+        source="lead",
+    )
+    journal.append(conn, [lost])
+
+    role = RoleAnswer(text="ответ на повтор")
+    report = tools.ask(
+        str(deal["id"]),
+        "researcher",
+        "в каком формате отдавать отчёт?",
+        "ask-repeat",
+        home=home,
+        spawn=role,
+        clock=lambda: NOW + 20,
+    )
+
+    assert report["ok"] is True
+    asked = [
+        item
+        for item in facts(conn, deal, "question_asked")
+        if item.get("routing", {}).get("target") == "role:researcher"
+    ]
+    assert len(asked) == 1, "повтор вопроса не пишет второй факт"
+    assert asked[0]["routing"]["hops"] == 2, "номер передачи прежний"
+    assert report["hops"] == 2, "ответ ложится той же передачей"
 
 
 # --------------------------------------------------- 3. вопрос человеку в пул

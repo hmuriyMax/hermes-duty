@@ -559,9 +559,19 @@ def _fact_line(
     if kind == "question_asked":
         routing = payload.get("routing") or {}
         target = routing.get("target") if isinstance(routing, dict) else ""
+        # Автор вопроса: у вопроса лида `routing.stage` синтетический (`ask`), и
+        # строка «вопрос (роли) → role:researcher» не говорила, кто спросил.
+        asker = str(routing.get("by") or "") if isinstance(routing, dict) else ""
+        if asker == "lead":
+            head = "вопрос лида"
+        elif asker:
+            head = f"вопрос этапа {asker}"
+        else:
+            head = "вопрос (роли)"
         number = payload.get("question_id")
+        mark = f" #{number}" if number else ""
         text = _short(payload.get("text") or "", 160)
-        return f"{stamp} вопрос {f'#{number}' if number else '(роли)'} → {target or '—'}: {text}"
+        return f"{stamp} {head}{mark} → {target or '—'}: {text}"
     if kind == "question_answered":
         line = (
             f"{stamp} ответ на вопрос #{payload.get('question_id') or '—'} "

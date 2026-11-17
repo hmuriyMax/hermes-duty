@@ -134,9 +134,14 @@ def test_the_lead_answers_the_stage_question_and_the_answer_is_a_fact(tmp_path: 
         "stage": "impl",
         "attempt": 1,
         "hops": 1,
+        # Автор вопроса — этап, чья попытка спросила: без него вопрос этапа
+        # неотличим от вопроса лида (у того `stage` синтетический).
+        "by": "impl",
     }
     assert asked["text"] == "какой формат отчёта?"
     assert "question_id" not in asked and "session_key" not in asked, "пула у вопроса роли нет"
+    # Писатель факта — движок: вопрос задала попытка, а не лид.
+    assert only(conn, deal, "question_asked")["source"] == "engine"
     answered = only(conn, deal, "question_answered")["payload"]
     assert answered["by"] == "lead"
     assert answered["hops"] == 1
@@ -249,6 +254,9 @@ def test_authority_in_the_role_answer_sends_the_question_to_the_human(tmp_path: 
     assert len(forwarded) == 2, "сначала вопрос роли, потом вопрос человеку"
     assert forwarded[1]["payload"]["routing"]["target"] == "human"
     assert forwarded[1]["payload"]["routing"]["reason"] == "role_redirected"
+    # Автор переадресованного вопроса — тот же этап: вопрос шёл от него, и смена
+    # адресата автора не меняет.
+    assert forwarded[1]["payload"]["routing"]["by"] == "impl"
     answered = only(conn, deal, "question_answered")["payload"]
     assert answered["by"] == "lead"
     assert answered["answered_via"] == "redirected"

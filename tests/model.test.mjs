@@ -63,6 +63,7 @@ import {
   shapeStages,
   askAddress,
   askArrow,
+  questionLabel,
   stageMeta,
   stateLabel,
   stateMeta,
@@ -738,6 +739,58 @@ test('адрес вопроса: подпись и род адресата по 
     assert.equal(address.who, who, `родительный падеж для ${target}`)
   }
   assert.equal(askAddress('role:lead').role, 'lead', 'имя роли потеряно')
+})
+
+// Автор вопроса — отдельный факт журнала (`routing.by` → `asked_by` ответа):
+// без него «вопрос роли researcher» читался как «спросил researcher» (17.11).
+test('автор вопроса: подпись называет, кто спросил', () => {
+  const researcher = askAddress('role:researcher')
+  const human = askAddress('human')
+  assert.equal(
+    questionLabel(researcher, researcher.label.question, 'lead'),
+    'вопрос лида → researcher',
+    'вопрос лида назван адресатом, а не автором',
+  )
+  assert.equal(
+    questionLabel(researcher, researcher.label.question, 'impl'),
+    'вопрос этапа impl → researcher',
+    'вопрос этапа назван его id',
+  )
+  assert.equal(
+    questionLabel(human, human.label.question, 'lead'),
+    'вопрос лида → человеку',
+    'вопрос лида человеку потерял адресата',
+  )
+  // Факт без автора (журнал до 0.2.1) остаётся прежней подписью, а не пустой.
+  assert.equal(
+    questionLabel(researcher, researcher.label.question, ''),
+    'вопрос роли researcher',
+    'прежняя подпись изменилась',
+  )
+  // Сквозной путь: поле `asked_by` ответа бэкенда доезжает до подписи маркера.
+  const scale = shapeDealTime(
+    {
+      now: 1_900,
+      terminal: false,
+      timeline: [
+        { kind: 'created', at: 1_000, summary: '' },
+        {
+          kind: 'question_asked',
+          at: 1_300,
+          summary: '',
+          routing: 'role:researcher',
+          asked_by: 'lead',
+          question_text: 'в каком формате отчёт?',
+        },
+      ],
+    },
+    { attempts: [] },
+  )
+  assert.equal(
+    scale.markers[0].label,
+    'вопрос лида → researcher',
+    'автор вопроса не доехал до подписи',
+  )
 })
 
 test('обмен с ролью: стрелка к адресату, ответ — обратно; паузы на человеке нет', () => {

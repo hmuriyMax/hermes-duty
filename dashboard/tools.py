@@ -2043,13 +2043,40 @@ def ask(
         payload = journal.payload_of(repeated)
         return {**_ask_result(payload, name), "repeated": True}
     spec = _spec(events)
-    stage, attempt, hops = _ask_target(conn, deal, events, name)
+    prior = _by_idem(events, "question_asked", key)
+    if prior is not None:
+        # Повтор того же вызова вопроса не пишет второй `question_asked`: этап,
+        # попытка и номер передачи берутся у прежнего факта, иначе повтор после
+        # оборванной передачи засчитывался бы вторым хопом (`hops_done`), а в
+        # журнале стоял бы дубль вопроса.
+        address_of = journal.payload_of(prior).get("routing")
+        marked_as = address_of if isinstance(address_of, dict) else {}
+        stage = spec_module.Stage(
+            id=str(marked_as.get("stage") or ASK_STAGE), role=name, workspace="none"
+        )
+        attempt = max(1, _int(marked_as.get("attempt")))
+        hops = max(0, _int(marked_as.get("hops")) - 1)
+    else:
+        stage, attempt, hops = _ask_target(conn, deal, events, name)
     address = routing.Target(routing.ROLE, value=name, reason=routing.REASON_DECLARED)
     moment = int(tick())
-    asked = runner._role_question_fact(
-        deal, stage, attempt, word, {"text": word}, address, hops, moment, idem=key
-    )
-    journal.append(conn, [asked])
+    if prior is None:
+        asked = runner._role_question_fact(
+            deal,
+            stage,
+            attempt,
+            word,
+            {"text": word},
+            address,
+            hops,
+            moment,
+            idem=key,
+            # Автор вопроса — лид: у вопроса лида `routing.stage` синтетический
+            # (`ASK_STAGE`), и без `by` он читается как вопрос этапа с этим id.
+            asked_by=SOURCE,
+            source=SOURCE,
+        )
+        journal.append(conn, [asked])
     result = runner.ask_role(
         conn,
         spec,
@@ -2067,7 +2094,7 @@ def ask(
     if result["ok"] and not result["authority"]:
         text = str(result["answer"] or "")
         answered = runner._role_answer_fact(
-            deal, stage.id, attempt, name, hops + 1, text, "", after, idem=key
+            deal, stage.id, attempt, name, hops + 1, text, "", after, idem=key, source=SOURCE
         )
         journal.append(conn, [answered])
         return {**_ask_result(journal.payload_of(answered), name), "workdir": result["workdir"]}
@@ -2089,6 +2116,7 @@ def ask(
         after,
         reason=why,
         idem=key,
+        source=SOURCE,
     )
     journal.append(conn, [closed])
     return {**_ask_result(journal.payload_of(closed), name), "authority": bool(result["ok"])}
@@ -2204,7 +2232,7 @@ def ask_human(
     address = routing.Target(
         routing.HUMAN, reason=routing.REASON_RISKY if dangerous else routing.REASON_AUTHORITY
     )
-    marked: dict[str, Any] = {**address.as_payload(), "idem": key}
+    marked: dict[str, Any] = {**address.as_payload(), "idem": key, "by": SOURCE}
     if stage_id:
         marked.update({"stage": stage_id, "attempt": attempt})
     try:

@@ -1155,6 +1155,11 @@ def _timeline(
         if kind == "question_asked":
             row["question_id"] = payload.get("question_id")
             row["routing"] = (payload.get("routing") or {}).get("target") if isinstance(payload.get("routing"), dict) else None
+            # Кто спросил: `lead` у вопроса лида, `id` этапа у вопроса попытки.
+            # Поверхность рисует адресата в подписи, и без автора `routing.stage`
+            # читался как «спросил этап с этим id» (Макс, 17.11).
+            asked_by = (payload.get("routing") or {}).get("by") if isinstance(payload.get("routing"), dict) else None
+            row["asked_by"] = str(asked_by) if asked_by else None
         elif kind == "question_answered":
             row["question_id"] = payload.get("question_id")
             row["answered_via"] = payload.get("answered_via")

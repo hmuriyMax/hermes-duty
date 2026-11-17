@@ -1597,6 +1597,9 @@ def test_factual_question_is_addressed_to_the_declared_role(tmp_path: Path) -> N
         "stage": "impl",
         "attempt": 1,
         "hops": 1,
+        # Автор вопроса — этап, чья попытка спросила (`routing.by`): подпись
+        # поверхности обязана назвать, кто спросил, а не только кого.
+        "by": "impl",
     }
     assert [call["cmd"][call["cmd"].index("-p") + 1] for call in fake.calls] == [
         "implementer",

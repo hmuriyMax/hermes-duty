@@ -2319,6 +2319,22 @@ function askAddress(target) {
   }
 }
 
+/**
+ * Подпись вопроса вместе с автором: «вопрос лида → researcher».
+ *
+ * Адресат и раньше был в подписи, автора не было вовсе — и «вопрос роли
+ * researcher» читался как «спросил researcher» (Макс, 17.11). Журнал называет
+ * автора полем `routing.by` (`lead` или `id` этапа), и подпись обязана его
+ * повторить, а не оставлять догадке.
+ */
+function questionLabel(address, label, askedBy) {
+  const by = String(askedBy || '').trim()
+  if (!by) return label
+  const who = by === 'lead' ? 'вопрос лида' : `вопрос этапа ${by}`
+  const to = address && address.kind === 'role' ? address.role : 'человеку'
+  return `${who} → ${to}`
+}
+
 /** Вопрос ушёл в пул: только у него есть пауза «стояло на человеке». */
 function isHumanAsk(marker) {
   return !marker || !marker.address || marker.address.kind === 'human'
@@ -3517,6 +3533,10 @@ function shapeDealTime(detail, attemptsPayload) {
         typeof e.routing === 'string'
           ? e.routing
           : String((e.routing && typeof e.routing === 'object' && e.routing.target) || ''),
+      // Кто спросил: `lead` или `id` этапа (`routing.by` журнала, поле
+      // `asked_by` бэкенда). Без автора подпись «вопрос роли researcher»
+      // читалась как «спросил researcher» (Макс, 17.11).
+      asked_by: e.asked_by ? String(e.asked_by) : '',
       cause: e.cause ? String(e.cause) : '',
       stages: Array.isArray(e.stages) ? e.stages.map(String) : [],
       // Факты лида: режим, причина выхода, pid и код — из полей ответа
@@ -3826,7 +3846,13 @@ function shapeDealTime(detail, attemptsPayload) {
     // тем же полем строки. Вопрос роли — не вопрос человеку, и подпись обязана
     // называть адресата (Макс, 14.11: «вопрос человеку не совсем актуально»).
     const address = type === 'question' || type === 'answer' ? askAddress(event.routing) : null
-    const label = address ? address.label[type === 'question' ? 'question' : 'answer'] : meta.label
+    // Автор вопроса — перед адресатом: «вопрос лида → researcher». У ответа
+    // автора в подписи нет — ответчик назван в `by`, и он же адресат обмена.
+    const label = address
+      ? type === 'question'
+        ? questionLabel(address, address.label.question, event.asked_by)
+        : address.label.answer
+      : meta.label
     // Подпись маркера — слова, а не payload: номер вопроса и JSON причины
     // человеку ничего не говорят. Текст вопроса и ответа даёт бэкенд
     // (`question_text`/`answer_text` из пула), причину закрытия — поля `cause`.

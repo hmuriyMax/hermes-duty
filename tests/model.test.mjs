@@ -3166,11 +3166,13 @@ test('мини-таймлайн: дело — одна сосиска, этап�
       { stage: 'check', attempt: 1, start: TL_NOW - 2 * 3600, end: null, outcome: null },
     ],
   }
-  const view = dealTimeline([deal], [], TL_NOW, spans)
+  // Окно — шесть часов: сосиска занимает правую половину, потому что дело
+  // началось три часа назад. Ось — выбранное окно, а не время дела (Макс, 16.11).
+  const view = dealTimeline([deal], [], TL_NOW, spans, 6 * 3600)
   const row = view.rows[0]
-  // Сосиска начинается там, где дело началось: ось равна времени дела.
-  assert.equal(row.bar.leftPct, 0)
-  assert.equal(row.bar.widthPct, 100)
+  assert.match(view.windowText, /окно 6 ч/, `окно не 6 ч: ${view.windowText}`)
+  assert.equal(row.bar.leftPct, 50)
+  assert.equal(row.bar.widthPct, 50)
   // Доли этапов считаются внутри сосиски и стыкуются без зазора и наложения.
   assert.equal(row.segments.length, 2)
   assert.equal(row.segments[0].leftPct, 0)
@@ -3329,6 +3331,30 @@ test('мини-таймлайн: окно не длиннее суток, нач
   assert.match(view.windowText, /окно 1 дн/)
 })
 
+test('мини-таймлайн: ось — ровно выбранное окно, пустые часы слева не срезаются', () => {
+  // Дело началось двадцать минут назад. При окне 12 ч шкала обязана покрыть все
+  // двенадцать часов: подрезка до первого дела читалась как обрезанный левый
+  // край (Макс, 16.11: «если стоит 12ч, то пусть уж 12ч и будет»).
+  const deal = tlDeal('d_fresh', {
+    createdAt: TL_NOW - 20 * 60,
+    state: 'working',
+    stateLabel: 'работает',
+    tone: 'blue',
+  })
+  const view = dealTimeline([deal], [], TL_NOW, {}, 12 * 3600)
+  const row = view.rows[0]
+  assert.match(view.windowText, /окно 12 ч/, `окно не 12 ч: ${view.windowText}`)
+  // Двадцать минут у правого края двенадцатичасового окна — это 97.22% слева.
+  assert.equal(row.bar.leftPct, 97.22, `сосиска стоит не по окну: ${row.bar.leftPct}`)
+  assert.equal(row.bar.widthPct, 2.78, `ширина сосиски не по окну: ${row.bar.widthPct}`)
+  // Первое деление оси — не позже начала окна плюс шаг, а не «от дела».
+  const axisFrom = TL_NOW - 12 * 3600
+  for (const tick of view.ticks) {
+    const expected = ((tick.at - axisFrom) / (12 * 3600)) * 100
+    assert.ok(Math.abs(tick.leftPct - expected) < 0.05, `деление смещено: ${tick.leftPct} vs ${expected}`)
+  }
+})
+
 test('мини-таймлайн: без границ этапов сосиска заливается тоном состояния', () => {
   const deal = tlDeal('d_d', { state: 'working', stateLabel: 'работает', tone: 'blue' })
   const row = dealTimeline([deal], [], TL_NOW, {}).rows[0]
@@ -3358,10 +3384,12 @@ test('мини-таймлайн: на суточном окне деления �
   const view = dealTimeline([deal], [], TL_NOW, {})
   assert.equal(view.grid.stepSec, 3600, 'шаг делений на суточном окне не часовой')
   assert.ok(view.ticks.length >= 10, `делений слишком мало: ${view.ticks.length}`)
-  // Подпись — время без секунд; позиция каждого деления совпадает с началом шага.
+  // Ось — сутки окна, а не время дела: дело началось 15 часов назад, и левее
+  // него на шкале ещё девять часов, где дел не было (Макс, 16.11).
+  const axisFrom = TL_NOW - TL_WINDOW_SEC
   for (const tick of view.ticks) {
     assert.match(tick.label, /^\d\d:\d\d$/, `подпись деления не время: ${tick.label}`)
-    const expected = ((tick.at - from) / (TL_NOW - from)) * 100
+    const expected = ((tick.at - axisFrom) / (TL_NOW - axisFrom)) * 100
     assert.ok(Math.abs(tick.leftPct - expected) < 0.05, `деление смещено: ${tick.leftPct} vs ${expected}`)
   }
 })

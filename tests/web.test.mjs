@@ -1730,3 +1730,201 @@ test('веб: пройденный без работы этап назван с�
   assert.ok(badge.className.includes('t-green'), `этап без работы покрашен как провал: ${badge.className}`)
   assert.equal(block.querySelectorAll('.stage-wait').length, 0, 'пустота выдана за ожидание')
 })
+
+/* ---------------------- ввод в поиск: фокус переживает перерисовку ------- */
+
+/**
+ * Страница «Сейчас» в jsdom с УПРАВЛЯЕМЫМИ таймерами: ввод проверяется тем же
+ * путём, что у человека — символ, debounce, перерисовка, — поэтому таймеры не
+ * глушатся совсем (как в `renderDealPanel`), а копятся в очередь и запускаются
+ * по задержке. Опрос экрана (10 с) в очередь тоже попадает, но не запускается:
+ * тесту нужен только debounce поиска.
+ */
+async function mountNowPage(nowFixture, options = {}) {
+  const root = jsdomRoot()
+  const { JSDOM } = await import(pathToFileURL(join(root, 'jsdom', 'lib', 'api.js')).href)
+  const dir = mkdtempSync(join(tmpdir(), 'duty-web-now-'))
+  writeFileSync(join(dir, 'app.js'), app)
+  writeFileSync(join(dir, 'model.js'), read('desktop/model.js'))
+  const dom = new JSDOM(
+    '<!doctype html><main id="app"></main><span id="stamp"></span><span id="ver"></span><span id="human"></span>' +
+      '<nav id="tabs"><a data-tab="now"></a><a data-tab="why"></a><a data-tab="health"></a></nav><button id="refresh"></button>',
+    { url: 'http://localhost/#/now' },
+  )
+  globalThis.window = dom.window
+  globalThis.document = dom.window.document
+  globalThis.Node = dom.window.Node
+  globalThis.Element = dom.window.Element
+  globalThis.localStorage = dom.window.localStorage
+  globalThis.location = dom.window.location
+  globalThis.requestAnimationFrame = (cb) => setImmediate(() => cb(0))
+
+  const saved = {
+    fetch: globalThis.fetch,
+    setTimeout: globalThis.setTimeout,
+    setInterval: globalThis.setInterval,
+    clearTimeout: globalThis.clearTimeout,
+    clearInterval: globalThis.clearInterval,
+  }
+  const queue = []
+  // `/spans` считается как на бэкенде: не больше SPAN_LIMIT дел за запрос,
+  // сверх потолка — 400 (это и ловит тест на пачки).
+  const SPAN_LIMIT = 40
+  const spansCalls = []
+  globalThis.fetch = async (url, opts) => {
+    const href = String(url)
+    if (!href.includes('/spans')) {
+      return { ok: true, status: 200, json: async () => nowFixture }
+    }
+    const raw = decodeURIComponent((href.match(/ids=([^&]*)/) || [])[1] || '')
+    const ids = raw.split(',').filter(Boolean)
+    spansCalls.push(ids)
+    if (ids.length > SPAN_LIMIT) {
+      return { ok: false, status: 400, json: async () => ({ detail: `ids: не больше ${SPAN_LIMIT}` }) }
+    }
+    const spans = {}
+    for (const id of ids) if (options.spans && options.spans[id]) spans[id] = options.spans[id]
+    return { ok: true, status: 200, json: async () => ({ now: nowFixture.now, count: ids.length, spans, missing: [] }) }
+  }
+  globalThis.setTimeout = (fn, ms) => {
+    queue.push({ fn, ms })
+    return queue.length
+  }
+  globalThis.setInterval = () => 0
+  globalThis.clearTimeout = () => {}
+  globalThis.clearInterval = () => {}
+
+  // Глобалы НЕ возвращаются сразу: debounce поиска читает `setTimeout` в момент
+  // нажатия, поэтому подмена должна жить до конца сценария (её снимает `restore`).
+  try {
+    await import(pathToFileURL(join(dir, 'app.js')).href)
+    // Первый тик — ответ /now и первая отрисовка: это микрозадачи, не таймеры.
+    for (let i = 0; i < 50 && !dom.window.document.querySelector('.filters input'); i += 1) {
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+  } catch (err) {
+    Object.assign(globalThis, saved)
+    throw err
+  }
+
+  return {
+    window: dom.window,
+    document: dom.window.document,
+    /** Какие id уехали в каждый запрос `/spans` — по порядку. */
+    spansCalls,
+    restore: () => Object.assign(globalThis, saved),
+    /** Запустить накопленные таймеры с этой задержкой (debounce поиска, 240 мс). */
+    async flush(ms) {
+      const due = queue.filter((item) => item.ms === ms)
+      for (const item of due) {
+        queue.splice(queue.indexOf(item), 1)
+        item.fn()
+      }
+      await new Promise((resolve) => setImmediate(resolve))
+    },
+  }
+}
+
+test('веб: поиск не теряет ввод на перерисовке — фокус, текст и результат остаются', async (t) => {
+  if (!jsdomRoot()) return t.skip('нет jsdom в ~/.hermes/hermes-agent/node_modules')
+
+  const nowFixture = JSON.parse(read('tests/fixtures/now.json'))
+  const page = await mountNowPage(nowFixture)
+  try {
+    const field = () => page.document.querySelector('.filters input')
+    assert.ok(field(), 'поля поиска нет на «Сейчас»')
+
+    const rows = () => page.document.querySelectorAll('.grp tbody tr.row').length
+    const all = rows()
+    assert.ok(all > 1, `список дел пуст: строк ${all}`)
+
+    // Человек встал в поиск и набрал слово: debounce перерисовывает страницу.
+    const needle = 'flaky'
+    field().focus()
+    field().value = needle
+    field().dispatchEvent(new page.window.Event('input', { bubbles: true }))
+    await page.flush(240)
+
+    // Главное: перерисовка не отобрала поле. Раньше узел заменялся, фокус уходил
+    // в body, и следующая буква не доезжала до страницы (Макс, 16.11).
+    assert.equal(page.document.activeElement, field(), 'после перерисовки фокус не в поле поиска')
+    assert.equal(field().value, needle, 'набранное не пережило перерисовку')
+    // И запрос действительно применён: строка с этим словом осталась, остальные ушли.
+    const left = rows()
+    assert.ok(left >= 1 && left < all, `фильтр не применился: было ${all}, стало ${left}`)
+    assert.match(
+      page.document.querySelector('.grp tbody').textContent,
+      /flaky/i,
+      'в отфильтрованном списке нет искомого дела',
+    )
+  } finally {
+    page.restore()
+  }
+})
+
+test('веб: границы этапов спрашиваются пачками — иначе потолок /spans рубит таймлайн', async (t) => {
+  if (!jsdomRoot()) return t.skip('нет jsdom в ~/.hermes/hermes-agent/node_modules')
+
+  // Сорок пять дел на экране: активные плюс пятёрка на проект переваливают за
+  // потолок ручки. Один общий запрос получал 400, ошибка глушилась, и дорожки
+  // рисовались одним тоном без этапов — на каждом обновлении заново (Макс, 16.11).
+  const nowFixture = JSON.parse(read('tests/fixtures/now.json'))
+  const total = 45
+  const deal = (index) => ({
+    ...nowFixture.deals[index % nowFixture.deals.length],
+    id: `d_bulk${String(index).padStart(4, '0')}`,
+    title: `дело ${index}`,
+    repo: `~/go/src/x/repo-${index % 6}`,
+    created_at: nowFixture.now - 3600 - index * 60,
+  })
+  const many = { ...nowFixture, deals: Array.from({ length: total }, (_, i) => deal(i)) }
+  many.count = many.deals.length
+  // У каждого дела свой этап: видно, что пачка не потерялась на отрисовке.
+  const spans = {}
+  for (const item of many.deals) {
+    spans[item.id] = [
+      { stage: 'impl', attempt: 1, start: nowFixture.now - 3300, end: nowFixture.now - 1800, outcome: 'done' },
+      { stage: 'review', attempt: 1, start: nowFixture.now - 1800, end: null, outcome: null },
+    ]
+  }
+
+  const page = await mountNowPage(many, { spans })
+  try {
+    for (let i = 0; i < 60 && page.spansCalls.length === 0; i += 1) {
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+    // Каждая пачка — в пределах потолка бэкенда, ни одного ответа 400.
+    assert.ok(page.spansCalls.length >= 2, `запросов /spans: ${page.spansCalls.length}, ожидалось минимум два`)
+    for (const ids of page.spansCalls) {
+      assert.ok(ids.length <= 40, `в запросе ${ids.length} дел при потолке 40`)
+    }
+    // Все запрошенные дела покрыты запросами: пачки идут по всему набору.
+    const asked = new Set(page.spansCalls.flat())
+    assert.ok(asked.size >= 41, `запросы покрыли ${asked.size} дел из ${total}`)
+    // На таймлайне строк не больше своего потолка (TL_MAX_ROWS) — и у каждой,
+    // про которую спросили, этапы нарисованы.
+    const painted = [...page.document.querySelectorAll('.tl-mini-row')].length
+    assert.ok(painted >= 5, `дорожек на таймлайне ${painted}`)
+    for (const row of page.document.querySelectorAll('.tl-mini-row')) {
+      const id = row.getAttribute('data-key').slice(3)
+      if (!asked.has(id)) continue
+      assert.ok(row.querySelectorAll('.tl-seg').length >= 1, `у дела ${id} нет полос этапов`)
+    }
+  } finally {
+    page.restore()
+  }
+})
+
+test('обе поверхности просят границы этапов пачками, а не одним запросом', () => {
+  // Веб и десктоп ходят в одну ручку с одним потолком: разъехавшись, они дадут
+  // «на вебе этапы есть, на десктопе нет» (или наоборот).
+  for (const [label, source, marker] of [
+    ['веб', app, /for \(let from = 0; from < pending\.length; from \+= SPAN_BATCH\)/],
+    ['десктоп', pluginSource, /for \(let from = 0; from < missing\.length; from \+= SPAN_BATCH\)/],
+  ]) {
+    assert.match(source, /const SPAN_BATCH = 40/, `${label}: нет потолка пачки`)
+    assert.match(source, marker, `${label}: /spans не спрашивается пачками`)
+  }
+  // И потолок пачки не должен разъезжаться с потолком ручки.
+  assert.match(api, /SPAN_MAX_DEALS = 40/, 'бэкенд: потолок /spans не 40')
+})

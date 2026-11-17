@@ -25,6 +25,10 @@ const REFRESH_MS = 10_000
 // всех досок дороже среза «сейчас», поэтому обновляется реже.
 const STATS_REFRESH_MS = 30_000
 const SEARCH_DEBOUNCE_MS = 240
+// Потолок ручки `/spans` (`SPAN_MAX_DEALS` в dashboard/plugin_api.py): больше
+// сорока дел за запрос она отвергает 400-й. Рисуется за раз больше — поэтому
+// границы этапов спрашиваются пачками (см. `useSpans`).
+const SPAN_BATCH = 40
 const REQUEST_TIMEOUT_MS = 20_000
 
 // Экраны страницы, в порядке спеки: «Сейчас» — срез, «Завершённые» — список
@@ -946,10 +950,12 @@ function dealTimeline(activeDeals, finishedDeals, now, spansById, windowSec) {
     return raw
   }
   const starts = visible.map(startOf).filter((value) => value !== null)
-  // Ось — по фактическим делам, но не длиннее суток: пустые часы слева
-  // (когда дела начались час назад) растянули бы сосиски в нитки.
-  const earliest = starts.length ? Math.min(...starts) : null
-  const axisFrom = windowFrom !== null ? (earliest === null ? windowFrom : Math.max(windowFrom, earliest)) : earliest
+  // Ось — ровно выбранное окно: 12 ч значит 12 ч, а не «от первого дела».
+  // Подрезка до самого раннего дела (было до 16.11) экономила пустые часы слева,
+  // но левый край шкалы читался как обрезанный: «окно 12 ч», а на оси сорок
+  // минут. Пустое место слева — это факт «дел не было», а не потерянная часть
+  // рисунка (Макс, 16.11).
+  const axisFrom = windowFrom !== null ? windowFrom : starts.length ? Math.min(...starts) : null
   const span = axisFrom === null || axisTo === null ? 0 : Math.max(1, axisTo - axisFrom)
   const pct = (at) => Math.max(0, Math.min(100, ((at - axisFrom) / span) * 100))
   const legendSec = { done: 0, running: 0, failed: 0 }
@@ -5449,7 +5455,12 @@ function useFinishedPages(enabled) {
 }
 
 /**
- * Границы этапов для дорожек таймлайна: один запрос на все показанные дела.
+ * Границы этапов для дорожек таймлайна: запросы пачками по потолку бэкенда.
+ *
+ * Потолок ручки `/spans` — 40 дел за запрос, а дорожек рисуется больше (активные
+ * плюс завершённые). Один общий запрос получал 400, ошибка глушилась, и этапы на
+ * дорожках не появлялись вовсе (Макс, 16.11). Дальше — пачками; по ответу пачки
+ * досчитываем дела без журнальных событий: пустой список — тоже ответ.
  *
  * Ошибка не глушит таймлайн — дорожки рисуются одним тоном состояния, без
  * разбивки на этапы.
@@ -5466,15 +5477,20 @@ function useSpans(ids) {
   useEffect(() => {
     alive.current = true
     if (!key) return () => { alive.current = false }
-    const wanted = key.split(',')
-    if (wanted.every((id) => known.current[id] !== undefined)) return () => { alive.current = false }
+    const missing = key.split(',').filter((id) => known.current[id] === undefined)
+    if (!missing.length) return () => { alive.current = false }
     void (async () => {
       try {
-        const payload = await rest(`/spans?ids=${encodeURIComponent(key)}`, { timeoutMs: REQUEST_TIMEOUT_MS })
-        const spans = payload && typeof payload.spans === 'object' && payload.spans ? payload.spans : {}
-        if (!alive.current) return
-        known.current = { ...known.current, ...spans }
-        setMap((prev) => ({ ...prev, ...spans }))
+        for (let from = 0; from < missing.length; from += SPAN_BATCH) {
+          const batch = missing.slice(from, from + SPAN_BATCH)
+          const payload = await rest(`/spans?ids=${encodeURIComponent(batch.join(','))}`, { timeoutMs: REQUEST_TIMEOUT_MS })
+          if (!alive.current) return
+          const spans = payload && typeof payload.spans === 'object' && payload.spans ? payload.spans : {}
+          const filled = { ...spans }
+          for (const id of batch) if (filled[id] === undefined) filled[id] = []
+          known.current = { ...known.current, ...filled }
+          setMap((prev) => ({ ...prev, ...filled }))
+        }
       } catch {
         // Молча: разбивка на этапы — украшение, а не факт, на котором стоит экран.
       }

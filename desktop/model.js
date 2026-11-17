@@ -897,10 +897,12 @@ function dealTimeline(activeDeals, finishedDeals, now, spansById, windowSec) {
     return raw
   }
   const starts = visible.map(startOf).filter((value) => value !== null)
-  // Ось — по фактическим делам, но не длиннее суток: пустые часы слева
-  // (когда дела начались час назад) растянули бы сосиски в нитки.
-  const earliest = starts.length ? Math.min(...starts) : null
-  const axisFrom = windowFrom !== null ? (earliest === null ? windowFrom : Math.max(windowFrom, earliest)) : earliest
+  // Ось — ровно выбранное окно: 12 ч значит 12 ч, а не «от первого дела».
+  // Подрезка до самого раннего дела (было до 16.11) экономила пустые часы слева,
+  // но левый край шкалы читался как обрезанный: «окно 12 ч», а на оси сорок
+  // минут. Пустое место слева — это факт «дел не было», а не потерянная часть
+  // рисунка (Макс, 16.11).
+  const axisFrom = windowFrom !== null ? windowFrom : starts.length ? Math.min(...starts) : null
   const span = axisFrom === null || axisTo === null ? 0 : Math.max(1, axisTo - axisFrom)
   const pct = (at) => Math.max(0, Math.min(100, ((at - axisFrom) / span) * 100))
   const legendSec = { done: 0, running: 0, failed: 0 }

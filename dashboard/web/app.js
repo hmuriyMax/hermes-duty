@@ -914,25 +914,41 @@ function timelineBlock(model) {
 }
 
 /**
- * Границы этапов для дорожек: один запрос на все показанные дела.
+ * Границы этапов для дорожек: запросы пачками, по потолку бэкенда.
+ *
+ * `SPAN_MAX_DEALS` (40) — потолок ручки `/spans`, а рисуется за раз больше:
+ * активные дела плюс пятёрка на проект переваливают за сорок. Один общий запрос
+ * получал 400, ошибка глушилась («украшение»), и дорожки оставались без этапов —
+ * на каждом обновлении заново (Макс, 16.11). Поэтому — пачками, и по ответу
+ * пачки досчитываем дела без журнальных событий: пустой список — тоже ответ,
+ * спрашивать их снова каждый тик незачем.
  *
  * Спрашивается то, что нарисовано (активные и первая пятёрка каждого проекта), а
  * не весь store: подсказка этапов у строки, которую не видно, никому не нужна.
  * Ошибка не глушит таймлайн — дорожки рисуются одним тоном состояния.
  */
+const SPAN_BATCH = 40
+
 async function loadTimelineSpans(ids) {
   const wanted = [...new Set(ids.filter(Boolean))]
-  const known = Object.keys(timelineSpans)
-  if (wanted.length && wanted.every((id) => known.includes(id))) return
-  if (!wanted.length) return
-  try {
-    const payload = await api(`/spans?ids=${encodeURIComponent(wanted.join(','))}`)
-    const spans = payload && typeof payload.spans === 'object' && payload.spans ? payload.spans : {}
-    for (const [id, list] of Object.entries(spans)) timelineSpans[id] = list
-    render()
-  } catch (err) {
-    // Молча: подсказка этапов — украшение, а не факт, на котором стоит страница.
+  const known = new Set(Object.keys(timelineSpans))
+  const pending = wanted.filter((id) => !known.has(id))
+  if (!pending.length) return
+  let painted = 0
+  for (let from = 0; from < pending.length; from += SPAN_BATCH) {
+    const batch = pending.slice(from, from + SPAN_BATCH)
+    try {
+      const payload = await api(`/spans?ids=${encodeURIComponent(batch.join(','))}`)
+      const spans = payload && typeof payload.spans === 'object' && payload.spans ? payload.spans : {}
+      for (const [id, list] of Object.entries(spans)) timelineSpans[id] = list
+      for (const id of batch) if (!timelineSpans[id]) timelineSpans[id] = []
+      painted += batch.length
+    } catch (err) {
+      // Молча: подсказка этапов — украшение, а не факт, на котором стоит страница.
+    }
   }
+  // Один рендер на все пачки: страница не мигает после каждой.
+  if (painted) render()
 }
 
 
@@ -3290,7 +3306,55 @@ function parseRoute() {
   return { name: 'now' }
 }
 
+/**
+ * Фокус переживает перерисовку.
+ *
+ * `render()` собирает страницу заново, поэтому заменённое поле теряет и фокус, и
+ * каретку. Заметно это ровно там, где человек печатает: поиск перерисовывается
+ * своим же debounce (240 мс после последнего символа), фокус снимается посреди
+ * слова, и каждая следующая буква уходит в никуда — поле выглядит «неактивным»
+ * (Макс, 16.11). Поэтому до сборки запоминаем, что набирали, а после — возвращаем
+ * ввод в то же поле по его ключу: плейсхолдер и есть то, чем поля отличаются.
+ */
+function fieldKey(el) {
+  return el.getAttribute('data-key') || el.getAttribute('placeholder') || el.id || el.className || el.tagName
+}
+
+function keepEditing() {
+  const el = document.activeElement
+  if (!el || !app.contains(el)) return null
+  if (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA') return null
+  const snap = { key: fieldKey(el), value: el.value, start: null, end: null }
+  try {
+    snap.start = el.selectionStart
+    snap.end = el.selectionEnd
+  } catch {
+    // у поля без выделения каретку не спросить — тогда только фокус
+  }
+  return snap
+}
+
+function resumeEditing(snap) {
+  if (!snap) return
+  for (const el of app.querySelectorAll('input, textarea')) {
+    if (fieldKey(el) !== snap.key) continue
+    // Набранное перерисовка не съедает: у поля окна таймлайна значение не
+    // приходит из состояния, и без этой строки ввод пропадал вместе с фокусом.
+    if (snap.value && el.value !== snap.value) el.value = snap.value
+    el.focus()
+    if (snap.start !== null && el.setSelectionRange) {
+      try {
+        el.setSelectionRange(snap.start, snap.end)
+      } catch {
+        // поле без выделения — фокус уже вернули
+      }
+    }
+    return
+  }
+}
+
 function render() {
+  const editing = keepEditing()
   const body = clear(app)
   if (route.name === 'now') body.append(viewNow())
   else if (route.name === 'why') body.append(viewWhy())
@@ -3304,6 +3368,7 @@ function render() {
   // Счётчик «вопросов + блокировок» — про срез «сейчас»: на других экранах он
   // показывал бы число от прошлого снимка.
   if (humanEl && route.name !== 'now') humanEl.textContent = ''
+  resumeEditing(editing)
 }
 
 /**

@@ -240,7 +240,7 @@ function morphChildren(oldParent, newParent) {
 }
 
 /** Семейства узлов, чьё появление и уход стоят анимации: этапы и попытки. */
-const ENTERING_RE = /^(lane:|attempt:|track:|stage:|att:)/
+const ENTERING_RE = /^(lane:|attempt:|track:|stage:|att:|block:)/
 
 function tagEntering(el) {
   const key = el.getAttribute('data-key') || ''
@@ -1911,11 +1911,14 @@ function attRowNodes(stage, bar, key, open, rebuild) {
 function stageBlockNode(dealId, stage, timeline, rebuild) {
   const view = compactStageView(stage)
   const stageKey = `${dealId}:${view.id}`
-  const open = rowOpen(stageOpen, stageShown, stageKey, view.openByDefault)
+  // По умолчанию свёрнуты все этапы, включая текущий и упавший (Макс, 18.11):
+  // раскрытие — это чтение попыток, а не состояние дела, и оно не должно
+  // разворачиваться само на каждом обновлении. Состояние этапа видно в бейдже.
+  const open = rowOpen(stageOpen, stageShown, stageKey, false)
   if (open) stageShown.add(stageKey)
   // Умолчание раскрытия на текущем кадре: клик читает его отсюда, чтобы после
   // тихого обновления не спорить с устаревшим замыканием.
-  stageDefaults.set(stageKey, view.openByDefault)
+  stageDefaults.set(stageKey, false)
   const bars = stageColumnBars(stage, timeline)
   const nodes = [
     h(
@@ -1929,7 +1932,19 @@ function stageBlockNode(dealId, stage, timeline, rebuild) {
           stageOpen.set(stageKey, !current)
           if (current) stageShown.delete(stageKey)
           else stageShown.add(stageKey)
-          rebuild()
+          // Кадр не пересобираем: пересборка заменила бы узел, и переход высоты
+          // не сыграл бы — этап раскрывался бы рывком. Класс и атрибуты правим
+          // здесь же, а следующий тик обновления нарисует то же состояние (Макс,
+          // 18.11: «разворачивались с анимацией»).
+          const block = document.querySelector(`.stage-block[data-key="block:${stageKey}"]`)
+          if (!block) return
+          block.classList.toggle('is-open', !current)
+          block.querySelector('.stage-row')?.classList.toggle('open', !current)
+          block.querySelector('.stage-body')?.setAttribute('aria-hidden', current ? 'true' : 'false')
+          const row = block.querySelector('.stage-row')
+          if (row) row.setAttribute('aria-expanded', current ? 'false' : 'true')
+          const tog = block.querySelector('.stage-row-tog')
+          if (tog) tog.textContent = current ? '▸' : '▾'
         },
       },
       // Крупно — код этапа: по нему ищут в журнале и графе. Описание из спеки
@@ -1978,8 +1993,11 @@ function stageBlockNode(dealId, stage, timeline, rebuild) {
   // этапом тем же шрифтом, что «ждёт», но не жёлтым (`stage-note`), потому что
   // ждать нечего и чинить нечего.
   if (view.nothingText) nodes.push(h('div', { class: 'stage-note' }, view.nothingText))
-  if (!open) return h('div', { class: 'stage-block', 'data-key': `block:${stageKey}` }, ...nodes)
-  if (!bars.length) nodes.push(h('div', { class: 'att-none muted' }, 'попыток нет'))
+  // Тело рендерится всегда и лежит в DOM свёрнутым (`grid-template-rows: 0fr`):
+  // раскрытие — это смена класса, поэтому браузер анимирует высоту, а пересборка
+  // кадра ничего не рвёт (морф сохраняет узлы по `data-key`).
+  const body = nodes.splice(1)
+  if (!bars.length) body.push(h('div', { class: 'att-none muted' }, 'попыток нет'))
   bars.forEach((bar, index) => {
     // Ключ попытки — её номер, а не место в списке: новая попытка сдвинула бы
     // индексы, и раскрытие переехало бы на чужую строку.
@@ -1988,9 +2006,18 @@ function stageBlockNode(dealId, stage, timeline, rebuild) {
     attDefaults.set(attKey, barView.openByDefault)
     const attOpenNow = rowOpen(attOpen, attShown, attKey, barView.openByDefault)
     if (attOpenNow) attShown.add(attKey)
-    nodes.push(...attRowNodes(stage, bar, attKey, attOpenNow, rebuild))
+    body.push(...attRowNodes(stage, bar, attKey, attOpenNow, rebuild))
   })
-  return h('div', { class: 'stage-block', 'data-key': `block:${stageKey}` }, ...nodes)
+  return h(
+    'div',
+    { class: open ? 'stage-block is-open' : 'stage-block', 'data-key': `block:${stageKey}` },
+    ...nodes,
+    h(
+      'div',
+      { class: 'stage-body', 'aria-hidden': open ? 'false' : 'true' },
+      h('div', { class: 'stage-body-inner' }, ...body),
+    ),
+  )
 }
 
 /**
@@ -2354,7 +2381,7 @@ function toneVar(tone) {
  * время начала, конца и длительность живут в подсказке строки — они не спорят с
  * чипами за место на дорожке.
  */
-function attemptRowNode(view, key) {
+function attemptRowNode(view, key, hint = '') {
   // Внутри дорожки — своя коробка со сдвигом влево: полоса 58 px под подпись
   // попытки, чтобы номер не ложился на «колбаску» даже у самой первой попытки,
   // которая начинается с кромки (Макс, 14.11).
@@ -2385,6 +2412,12 @@ function attemptRowNode(view, key) {
         'data-tip': view.bandTip || view.title || '',
         'data-key': `att:${key}`,
       },
+      // Название этапа — у каждой своей попытки: в гуттере слева живёт только
+      // профиль (Макс, 18.11). Подсказка имени — человеческое описание этапа из
+      // шейпера: имя из спеки, исполнитель, команда shell-этапа, `id` для журнала.
+      view.tag ? h('span', { class: 'tl-lane-tag mono', title: hint }, view.tag) : null,
+      // Номер попытки — тем же стилем, что имя этапа: `reviewer #1` читается как
+      // одно название, а не как имя с мелким хвостом (Макс, 18.11).
       h('span', { class: 'tl-n' }, view.label.number),
       // Исход попытки — то, что меняется от тика к тику: подсвечивается он, а не
       // вся дорожка (полоса растёт непрерывно, вспышка на ней была бы миганием).
@@ -2491,7 +2524,7 @@ function attemptRowNode(view, key) {
     // Свёрнутая высота показывает первый уровень вызовов и маркеры, полная
     // раскрывается под указателем. Числа — из шейпера, CSS только переключает.
     {
-      class: `tl-row${view.failed ? ' is-failed' : ''}`,
+      class: `tl-row${view.failed ? ' is-failed' : ''}${view.shell ? ' is-shell' : ''}`,
       style: `--tl-collapsed:${view.collapsed}px;--tl-full:${view.full}px`,
       'data-key': key,
     },
@@ -2505,115 +2538,133 @@ function attemptRowNode(view, key) {
  *  нет исхода этапа, и `attemptRowNode` выдумал бы ему статус. */
 function leadLaneNode(leadLane, scale) {
   const runs = leadLane.runs || []
-  const head = h(
-    'div',
-    { class: 'tl-lane-h' },
-    h(
-      'div',
-      { class: 'tl-lane-id' },
-      h(
-        'span',
-        { class: 'tl-lane-head' },
-        h('span', { class: 'tl-lane-code mono', title: 'лид: процесс, который ведёт дело' }, 'лид'),
-        h(
-          'span',
-          { class: 'tl-kind tl-kind-agent', title: 'профиль: lead' },
-          h('svg', { class: 'tl-kind-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' }, h('path', { d: KIND_ICON.agent })),
-          'lead',
-        ),
-      ),
-    ),
-  )
+  // Лид — такая же зона, как профили этапов: рельс с именем по центру зоны, а не
+  // шапка строкой сверху. Иначе единственная подпись «лид» висела не по центру
+  // своей полосы (Макс, 18.11).
   return h(
     'div',
-    { class: 'tl-lane is-lead', 'data-key': 'lane:lead', 'data-lane-role': 'lead' },
-    head,
-    runs.length
-      ? h(
-          'div',
-          { class: 'tl-rows' },
-          h(
-            'div',
-            // Высота захода — 26 px в инлайновых переменных: у строки попытки высота
-            // равна `--tl-full` на наведении, и правило из CSS ниже по файлу
-            // возвращало бы рейку к 20 px под указателем.
-            { class: 'tl-row', style: '--tl-collapsed:26px;--tl-full:26px' },
-            h(
+    { class: 'tl-group-block is-lead', 'data-key': 'block:lead', 'data-group': 'lead', 'data-role': 'lead' },
+    h(
+      'div',
+      { class: 'tl-group-rail', title: 'лид: процесс, который ведёт дело' },
+      // Лид — управляющий: свой значок, а не «ещё один агент» (Макс, 18.11).
+      h(
+        'svg',
+        { class: 'tl-group-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' },
+        h('path', { d: KIND_ICON.lead }),
+      ),
+      h('span', { class: 'tl-group-name' }, 'лид'),
+    ),
+    h(
+      'div',
+      { class: 'tl-group-body' },
+      h(
+        'div',
+        { class: 'tl-lane is-lead', 'data-key': 'lane:lead', 'data-lane-role': 'lead' },
+        runs.length
+          ? h(
               'div',
-              { class: 'tl-track', 'data-tip': `${leadLane.text}: полосы на оси — заходы лида, от подъёма до выхода` },
-              ...runs.map((run, index) =>
+              { class: 'tl-rows' },
+              h(
+                'div',
+                // Высота захода — 26 px в инлайновых переменных: у строки попытки
+                // высота равна `--tl-full` на наведении, и правило из CSS ниже по
+                // файлу возвращало бы рейку к 20 px под указателем.
+                { class: 'tl-row', style: '--tl-collapsed:26px;--tl-full:26px' },
                 h(
-                  'span',
-                  {
-                    class: `tl-lead-run t-${run.tone}${run.open ? ' is-open' : ''}${run.stale ? ' is-stale' : ''}`,
-                    'data-key': `lead-run:${index}`,
-                    style: `left:${run.startPct}%;width:${run.widthPct}%`,
-                    'data-tip': run.title,
-                    'aria-label': run.title,
-                    role: 'img',
-                  },
-                  // Рейка + засечки + слово режима: разметка «лид держал дело»,
-                  // а не вторая полоса попытки (см. styles.css).
-                  h('span', { class: 'tl-lead-rail' }),
-                  h('span', { class: 'tl-lead-cap is-start' }),
-                  h('span', { class: 'tl-lead-cap is-end' }),
-                  run.labeled ? h('span', { class: 'tl-lead-label' }, run.label) : null,
-                  run.open ? h('span', { class: 'tl-lead-head' }) : null,
+                  'div',
+                  { class: 'tl-track', 'data-tip': `${leadLane.text}: полосы на оси — заходы лида, от подъёма до выхода` },
+                  ...runs.map((run, index) =>
+                    h(
+                      'span',
+                      {
+                        class: `tl-lead-run t-${run.tone}${run.open ? ' is-open' : ''}${run.stale ? ' is-stale' : ''}`,
+                        'data-key': `lead-run:${index}`,
+                        style: `left:${run.startPct}%;width:${run.widthPct}%`,
+                        'data-tip': run.title,
+                        'aria-label': run.title,
+                        role: 'img',
+                      },
+                      // Рейка + засечки + слово режима: разметка «лид держал дело»,
+                      // а не вторая полоса попытки (см. styles.css).
+                      h('span', { class: 'tl-lead-rail' }),
+                      h('span', { class: 'tl-lead-cap is-start' }),
+                      h('span', { class: 'tl-lead-cap is-end' }),
+                      run.labeled ? h('span', { class: 'tl-lead-label' }, run.label) : null,
+                      run.open ? h('span', { class: 'tl-lead-head' }) : null,
+                    ),
+                  ),
                 ),
               ),
-            ),
-          ),
-        )
-      : h('div', { class: 'tl-row-empty' }, h('span', { class: 'tl-row-empty-t' }, 'заходов не было')),
+            )
+          : h('div', { class: 'tl-row-empty' }, h('span', { class: 'tl-row-empty-t' }, 'заходов не было')),
+      ),
+    ),
   )
 }
 
-/** Дорожка этапа: имя, значок вида, состояние и строки попыток. */
-function laneNode(lane, bars, scale) {
-  const view = laneView(lane, bars, scale)
-  // Шапка дорожки — той же решёткой, что строка попытки: имя и профиль живут
-  // в левой колонке и прилипают при прокрутке вместе с подписями попыток
-  // (Макс, 09.11: «попытки закреплены, а названия этапов и профиль — нет»).
-  const head = h(
+/**
+ * Блок группы дорожек: рельс профиля слева, попытки справа.
+ *
+ * Дело держит 5–10 этапов и 3–4 роли. Группа читается тремя якорями: рельс с
+ * профилем и счётчиками (слева, по всей высоте зоны), подложка во всю ширину и
+ * волосяная линия на границе зоны. Счётчики переехали в левую колонку, потому что
+ * в полотне они стояли над полосами и мешали читать шкалу (Макс, 18.11:
+ * «количество этапов/попыток на роль переместить в колонку левую»).
+ */
+function laneGroupBlock(group, lanes, scale) {
+  return h(
     'div',
-    { class: 'tl-lane-h' },
+    {
+      class: `tl-group-block${group.role ? '' : ' is-engine'}`,
+      'data-key': `block:${group.key}`,
+      'data-group': group.key,
+      // Цвет зоны выбирается по роли: палитра та же, что у полос на главной.
+      'data-role': group.roleKey || 'other',
+    },
+    laneGroupRail(group),
     h(
       'div',
-      { class: 'tl-lane-id' },
-      // В дорожке — только имя этапа и вид исполнителя. Описание из спеки в
-      // колонку не выводится никогда: это фраза, она растягивала колонку и всё
-      // равно обрезалась, а читают её в блоке этапов (Макс, 14.11).
-      h(
-        'span',
-        { class: 'tl-lane-head' },
-        h('span', { class: 'tl-lane-code mono', title: view.id ? `этап: ${view.id}` : view.name }, view.id || view.name),
-      view.kind
-        ? h(
-            'span',
-            {
-              class: `tl-kind tl-kind-${view.kind}`,
-              title: view.kind === 'agent' ? `профиль: ${view.kindText}` : view.kind,
-            },
-            h(
-              'svg',
-              { class: 'tl-kind-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' },
-              h('path', { d: view.icon }),
-            ),
-            view.kindText,
-          )
-        : null,
-      ),
+      { class: 'tl-group-body' },
+      ...lanes.map(([lane, bars]) => laneNode(lane, bars, scale)),
     ),
   )
+}
+
+/** Рельс профиля: значок роли, её имя и счёт этапов и попыток. Липнет к кромке. */
+function laneGroupRail(group) {
+  return h(
+    'div',
+    { class: 'tl-group-rail', 'data-tip': group.hint },
+    h(
+      'svg',
+      { class: 'tl-group-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' },
+      h('path', { d: group.icon || '' }),
+    ),
+    h('span', { class: 'tl-group-name' }, group.label),
+    // Этапы и попытки — одной строкой: так табличка роли складывается в три строки
+    // и влезает даже в зону из одного этапа (Макс, 18.11).
+    h('span', { class: 'tl-group-meta' }, group.summary),
+  )
+}
+
+/** Дорожка этапа: строки попыток; имени и профиля в гуттере нет.
+ *
+ *  Слева остаётся только профиль — заголовок группы ролей (`laneGroupNode`), а
+ *  название этапа печатается у своей попытки внутри шкалы (Макс, 18.11: «убрать
+ *  подпись профиля у каждого этапа, название этапа перенести к попытке, слева
+ *  оставить только профиль»). Так колонка подписей сузилась до имени роли, а шкала
+ *  получила освободившиеся пиксели. */
+function laneNode(lane, bars, scale) {
+  const view = laneView(lane, bars, scale)
   return h(
     'div',
     // Роль дорожки — адрес провода вопроса: по ней поверхность находит, куда
     // вести линию от момента вопроса (`drawAskWires`).
     { class: 'tl-lane', 'data-key': `lane:${lane.key}`, 'data-lane-role': lane.role || '' },
-    head,
     view.empty
       ? h('div', { class: 'tl-row-empty' }, h('span', { class: 'tl-row-empty-t' }, 'попыток не было'))
-      : h('div', { class: 'tl-rows' }, ...view.rows.map((row) => attemptRowNode(row.view, `attempt:${row.key}`))),
+      : h('div', { class: 'tl-rows' }, ...view.rows.map((row) => attemptRowNode(row.view, `attempt:${row.key}`, view.hint))),
   )
 }
 
@@ -2733,7 +2784,10 @@ function scalePanel(scale) {
       // справа — та же область, где рисуются чипы.
       h(
         'div',
-        { class: 'scale-wrap' },
+        // `is-live` включает переезд геометрии по времени, `--tl-tick` держит его
+        // равным периоду опроса: данные приходят раз в 5 с, а ось едет к новой
+        // кромке всё это время (Макс, 18.11).
+        { class: 'scale-wrap is-live', style: `--tl-tick:${Math.max(1, Number(dealPlan().delaySec) || 5)}s` },
         // Подложка левого столбца: живёт ВНЕ скроллера, поэтому не едет с
         // содержимым и накрывает его целиком — чипы не видны ни в зазорах
         // между строками, ни между шапкой дорожки и строками. Только в режиме
@@ -2808,10 +2862,14 @@ function scalePanel(scale) {
         // Заходы лида — над этапами: «кто ведёт дело» отвечает первым, а не
         // выясняется подписью в шапке.
         leadLaneNode(scale.leadLane, scale),
-        ...scale.lanes.map((lane, index) =>
-          laneNode(
-            lane,
-            scale.bars.filter((bar) => bar.lane === index),
+        // Дорожки идут группами по роли исполнителя, и группа — это блок: подложка
+        // во всю ширину, волосяная линия слева по всей высоте и счётчики в шапке.
+        // Плоский список остаётся источником индексов (`bar.lane`), блоки — только
+        // порядок и обвязка (Макс, 18.11: «более явно группировать профили»).
+        ...(scale.laneGroups || []).map((group) =>
+          laneGroupBlock(
+            group,
+            group.lanes.map((index) => [scale.lanes[index], scale.bars.filter((bar) => bar.lane === index)]),
             scale,
           ),
         ),
@@ -2860,6 +2918,7 @@ function scalePanel(scale) {
   const dealKey = String(route.id || '')
   queueMicrotask(() => {
     fitScaleGutter(panel, dealKey)
+    fitAttemptLabels(panel)
     drawAskWires(panel, scale)
     if (scale.axis.zoom > 1) pinScaleScroll(panel)
   })
@@ -2871,6 +2930,7 @@ function scalePanel(scale) {
     requestAnimationFrame(() =>
       requestAnimationFrame(() => {
         fitScaleGutter(panel, dealKey)
+        fitAttemptLabels(panel)
         drawAskWires(panel, scale)
         if (scale.axis.zoom > 1) pinScaleScroll(panel)
       }),
@@ -3469,19 +3529,39 @@ function fitScaleGutter(root, dealKey) {
     scaleGutterSeen.deal = dealKey
     scaleGutterSeen.namePx = 0
   }
-  // В гуттере осталась одна колонка — имя этапа и профиль под ним (Макс, 14.11:
-  // подписи попыток ушли к своим полосам). Ширина — по более широкому из двоих,
-  // ровно по контенту: `scrollWidth` у обрезанного элемента равен его ширине,
-  // поэтому меряем детей, а не ячейку.
+  // В гуттере осталась одна колонка — имя профиля (заголовок группы ролей). Имена
+  // и значки этапов уехали к своим попыткам, подписи попыток стоят у полос
+  // (Макс, 18.11). Ширина — по самому широкому имени роли: `scrollWidth` у
+  // обрезанного элемента равен его ширине, поэтому меряем детей, а не ячейку.
   let namePx = 0
-  for (const head of root.querySelectorAll('.tl-lane-head')) {
-    for (const child of head.children) namePx = Math.max(namePx, child.scrollWidth || child.getBoundingClientRect().width || 0)
+  for (const name of root.querySelectorAll('.tl-group-name, .tl-group-meta')) {
+    namePx = Math.max(namePx, name.scrollWidth || name.getBoundingClientRect().width || 0)
   }
   if (!namePx) return
   scaleGutterSeen.namePx = Math.max(scaleGutterSeen.namePx || 0, namePx)
-  const named = Math.min(300, Math.max(96, Math.ceil(scaleGutterSeen.namePx) + 8))
+  const named = Math.min(300, Math.max(88, Math.ceil(scaleGutterSeen.namePx) + 18))
   wrap.style.setProperty('--tl-name', `${named}px`)
 }
+/**
+ * Поле под подпись попытки: подпись стоит СЛЕВА от своей полосы и никогда не
+ * наезжает на неё.
+ *
+ * Мерить надо: имя этапа плюс номер и исход занимают до двухсот пикселей, а у
+ * попытки, начавшейся от кромки окна, слева от полосы нет ничего. Раньше подпись
+ * в таком случае переносилась внутрь полосы — и наезжала на «сосиску» (Макс,
+ * 18.11). Теперь место отдаётся подписи: поле шкалы растягивается по самой
+ * широкой подписи, полосы начинаются правее, окно оси при этом не меняется.
+ */
+function fitAttemptLabels(root) {
+  const wrap = root && root.querySelector ? root.querySelector('.scale-wrap') : null
+  if (!wrap) return
+  let pad = 0
+  for (const att of wrap.querySelectorAll('.tl-att')) {
+    pad = Math.max(pad, att.scrollWidth || att.getBoundingClientRect().width || 0)
+  }
+  if (pad) wrap.style.setProperty('--tl-plot-pad', `${Math.min(320, Math.max(64, Math.ceil(pad) + 12))}px`)
+}
+
 /**
  * Провода обмена с ролью: путь от палки вопроса до дорожки адресата и обратно.
  *
@@ -3593,10 +3673,24 @@ function wireCross(left, y, width) {
   return cross
 }
 
+/**
+ * Место шкалы при обновлении данных: своё остаётся своим, правый край — правым.
+ *
+ * Ось пересчитывается от новых границ дела: справа приезжают свежие секунды, и
+ * ширина полотна меняется. Пиксели место не держат — полотно уезжает под руками.
+ * Поэтому у уехавшего от кромки человека сохраняется доля прокрутки (тот же кусок
+ * времени остаётся в кадре), а у стоящего на правой кромке — новая кромка: дело
+ * растёт, кадр идёт за ним (Макс, 18.11).
+ */
 function pinScaleScroll(root) {
   const scroller = root && root.querySelector ? root.querySelector('.scale-main.is-wide') : null
   if (!scroller) return
-  if (scroller.__tlPinned !== false) scroller.scrollLeft = scroller.scrollWidth
+  // Уехал от кромки — не трогаем вовсе. Масштаб оси заморожен на «вьюпорт = час»,
+  // поэтому новая секунда справа удлиняет полотно, а не сжимает нарисованное: в
+  // кадре у такого человека ничего не двигается. Править здесь `scrollLeft`
+  // значило бы увозить кадр на каждом тике (Макс, 18.11).
+  if (scroller.__tlPinned === false) return
+  scroller.scrollLeft = scroller.scrollWidth
 }
 document.addEventListener(
   'scroll',

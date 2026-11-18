@@ -3231,7 +3231,13 @@ def parse_plan(
             issues.append(exc.issue())
             continue
         beyond = sorted(set(declared) - set(STAGE_EDIT_KEYS))
-        if moving and beyond:
+        # `replay` — ревизию уже принял движок, и набор правок он мерил своим
+        # валидатором того дня. Перечитывая журнал более новым (или более старым)
+        # разбором, экран не должен отменять чужое решение: отказ здесь рубит
+        # цепочку ревизий (`transit.graph`) и прячет всё принятое после неё —
+        # кейс d_e7fb271b: ревизия 2 правила `verdict`, и docs с intake не
+        # доезжали до блока этапов (Макс, 18.11).
+        if moving and beyond and not replay:
             issues.append(
                 Issue(
                     where,

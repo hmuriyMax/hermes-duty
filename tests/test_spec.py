@@ -2341,6 +2341,34 @@ def test_replay_does_not_reject_a_historically_accepted_shell_wrapper():
     assert [stage.id for stage in replayed] == ["docs"]
 
 
+def test_replay_accepts_a_field_edit_the_engine_took_back_then(monkeypatch):
+    """Перечитывание журнала не спорит с движком о наборе правок.
+
+    Набор правок неначатого этапа расширялся со временем (`must`, `verdict`,
+    `artifacts`, `ask`, `allow`). Сервер на старом коде отвечал `plan.id` на
+    ревизию, которую в тот же момент принял свежий `bin/duty`, и цепочка ревизий
+    обрывалась — этапы следующих ревизий не доезжали до экрана (d_e7fb271b: docs
+    и intake). На чтении этот отказ не выдаётся: решил движок, а не валидатор
+    сегодняшнего дня.
+    """
+    old_keys = ("cmd", "budget", "evidence")
+    monkeypatch.setattr(spec_module, "EDIT_KEYS", old_keys)
+    monkeypatch.setattr(spec_module, "STAGE_EDIT_KEYS", spec_module.REORDER_KEYS + old_keys)
+    raw = [{"id": "feed", "role": "implementer", "needs": ["plan"],
+            "verdict": {"approve": "next", "changes": "plan", "max_rounds": 2}}]
+
+    _, live = spec_module.parse_plan(
+        raw, charter=spec_module.Charter(), base_stages=BASE_STAGES, **plan_base()
+    )
+    assert "plan.id" in {issue.rule for issue in live}, [issue.message for issue in live]
+
+    replayed, found = spec_module.parse_plan(
+        raw, charter=spec_module.Charter(), base_stages=BASE_STAGES, replay=True
+    )
+    assert found == [], [issue.message for issue in found]
+    assert [stage.id for stage in replayed] == ["feed"]
+
+
 def test_parse_plan_evidence_command_cannot_publish():
     _, found = plan([{"id": "impl", "role": "implementer",
                       "evidence": [{"cmd": "git push", "must": 0}]}])

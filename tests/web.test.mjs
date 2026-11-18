@@ -30,39 +30,131 @@ globalThis.requestAnimationFrame = (cb) => setImmediate(() => cb(0))
 const api = read('dashboard/plugin_api.py')
 const pluginSource = read('desktop/plugin.js')
 
-test('левый столбец: шапка дорожки липнет вместе с подписями, ширина — по контенту', () => {
-  // Макс, 09.11: «очень криво обошелся с левым столбцом. попытки закреплены,
-  // а названия этапов и профиль - нет. плюс ширина столбца уже, чем ширина
-  // самого широкого контента».
+test('левый столбец: в гуттере только профиль, имя этапа стоит у попытки', () => {
+  // Макс, 09.11: «попытки закреплены, а названия этапов и профиль - нет. плюс
+  // ширина столбца уже, чем ширина самого широкого контента».
+  // Макс, 18.11: «ярче выделять профиль слева, убрать подпись профиля у каждого
+  // этапа, название этапа перенести к попытке, слева оставить только профиль».
   const css = read('dashboard/web/styles.css')
-  // Дорожка — две колонки: имя этапа слева, попытки справа (Макс, 14.11).
-  // Попытки стоят по центру блока «этап + профиль»: подпись попытки не выше столбца.
+  // Дорожка — две колонки: гуттер (профиль) слева, попытки справа; колонка
+  // остаётся, чтобы шкала не съезжала и подпись профиля липла к кромке.
   assert.match(css, /\.tl-lane \{ display: grid; align-items: center; grid-template-columns: var\(--tl-name, 150px\) minmax\(0, 1fr\)/, 'веб: дорожка не двумя колонками')
-  // Ячейка имени занимает всю ширину дорожки (иначе sticky некуда ехать), а
-  // коробка внутри — только колонку имени.
-  assert.match(css, /\.tl-lane > \.tl-lane-h \{ grid-column: 1 \/ -1;[^}]*width: var\(--tl-name, 150px\); justify-self: start; position: sticky; left: 0/, 'веб: имя этапа не липнет к левой кромке')
   assert.match(css, /\.tl-lane \.tl-rows, \.tl-lane \.tl-row-empty \{ grid-column: 2 \/ -1; grid-row: 1;/, 'веб: попытки не во второй колонке')
-  // имя и профиль — одна липнущая ячейка
-  assert.match(app, /class: 'tl-lane-id'/, 'веб: имя и профиль не в одной ячейке')
-  assert.match(css, /\.scale-main\.is-wide \.tl-lane-id \{ position: sticky/, 'веб: шапка дорожки не липнет')
-  // ширина столбца подстраивается под самый широкий контент
+  // Профиль — рельс в левой колонке: значок, имя, счёт этапов и попыток; зона
+  // держится подложкой и волосяной линией, а линия нарисована внутренней тенью,
+  // чтобы не сдвинуть полосы относительно засечек оси (Макс, 18.11).
+  // Линия и подложка — цветом профиля из палитры ролей главной страницы.
+  assert.match(css, /\.tl-group-block \{[^}]*box-shadow: inset 1px 0 0 color-mix\(in srgb, var\(--zone-base\) 85%/, 'веб: у блока группы нет линии слева')
+  for (const role of ['implementer', 'documenter', 'tester', 'reviewer']) {
+    assert.match(css, new RegExp(`\\.tl-group-block\\[data-role="${role}"\\] \\{ --zone-base: var\\(--role-${role}\\)`), `веб: у роли ${role} нет своего цвета`)
+  }
+  assert.match(css, /\.tl-group-block \{[^}]*background: color-mix\(in srgb, var\(--zone-base\) 8%/, 'веб: у блока группы нет подложки')
+  assert.match(css, /\.tl-group-rail \{[^}]*position: sticky/, 'веб: рельс профиля не липнет к кромке')
+  assert.match(app, /class: 'tl-group-rail'/, 'веб: нет рельса профиля')
+  // Счёт — в левой колонке, под именем роли, а не в полотне.
+  assert.match(app, /tl-group-meta' \}, group\.summary/, 'веб: счёт этапов и попыток не в рельсе')
+  // Лид — управляющий: свой значок, и он стоит в рельсе, как у профилей.
+  assert.match(app, /class: 'tl-group-ico'[\s\S]{0,200}KIND_ICON\.lead/, 'веб: у лида нет значка')
+  assert.match(css, /\.tl-group-name \{[^}]*font-weight: 700[^}]*color: var\(--text\)/, 'веб: имя профиля читается как подпись, а не как заголовок')
+  // Имени этапа и значка профиля в гуттере дорожки больше нет.
+  assert.doesNotMatch(app, /laneNode[\s\S]{0,600}class: 'tl-lane-h'/, 'веб: шапка дорожки с именем этапа вернулась в гуттер')
+  assert.doesNotMatch(app, /laneNode[\s\S]{0,900}tl-kind-\$\{view\.kind\}/, 'веб: значок профиля вернулся в дорожку')
+  // Имя этапа печатается в подписи каждой попытки, подсказка — описание этапа.
+  assert.match(app, /view\.tag \? h\('span', \{ class: 'tl-lane-tag mono', title: hint \}, view\.tag\)/, 'веб: имя этапа не приехало к попытке')
+  assert.match(css, /\.tl-lane-tag \{[^}]*font-family: var\(--mono\)/, 'веб: имя этапа у попытки без моно-стиля')
+  // Ширина гуттера — по имени профиля, а поле шкалы — по самой широкой подписи.
   assert.match(app, /function fitScaleGutter/, 'веб: нет подгона ширины столбца')
-  // Замер — по имени и подписям, а не по ячейке: у обрезанной ячейки scrollWidth
-  // равен её ширине, и колонка не росла под длинное имя (Макс, 14.11).
-  // Замер — по коду этапа и подписям попыток. Описание не меряется: оно
-  // переносится по строкам, и его ширина — не заявка на колонку.
-  // Меряется только колонка имени: подписи попыток стоят у своих полос.
-  assert.match(app, /querySelectorAll\('\.tl-lane-head'\)/, 'веб: имя этапа не меряется')
-  assert.match(app, /setProperty\('--tl-name'/, 'веб: ширина колонки имени не ставится')
+  // Меряются и имя роли, и счёт под ним: рельс должен вмещать обе строки.
+  assert.match(app, /querySelectorAll\('\.tl-group-name, \.tl-group-meta'\)/, 'веб: рельс не меряется')
+  assert.match(app, /Math\.min\(300, Math\.max\(88,/, 'веб: нет потолка колонки профиля (88…300)')
+  // Место под подписью не растягивает поле шкалы: подпись, которой слева мало
+  // места, шейпер кладёт внутрь полосы (`label.inside`).
+  assert.doesNotMatch(app, /is-inside/, 'веб: подпись всё ещё заезжает внутрь полосы')
+  assert.match(app, /setProperty\('--tl-plot-pad'/, 'веб: подписи попытки не отдано поле шкалы')
+  assert.doesNotMatch(pluginSource, /duty-tl-att\$\{view\.label\.inside/, 'десктоп: подпись всё ещё заезжает внутрь полосы')
+  assert.match(pluginSource, /setProperty\('--duty-tl-plot-pad'/, 'десктоп: подписи попытки не отдано поле шкалы')
   assert.doesNotMatch(app, /querySelectorAll\('\.tl-lbl/, 'веб: подписи попыток всё ещё в гуттере')
-  assert.match(app, /Math\.min\(300, Math\.max\(96,/, 'веб: нет потолка колонки имени (96…300)')
   // Описания и счётчиков в гуттере нет вовсе: колонка не меняется при развороте.
   assert.doesNotMatch(css, /\.tl-lane-desc/, 'веб: описание вернулось в дорожку')
   assert.doesNotMatch(css, /\.tl-lane-meta/, 'веб: счётчик вернулся в дорожку')
-  assert.match(pluginSource, /duty-tl-lane-id/, 'десктоп: нет ячейки имени')
+  // Десктоп — то же самое: гуттер под профиль, имя этапа у попытки.
+  assert.match(pluginSource, /querySelectorAll\('\.duty-tl-group-name, \.duty-tl-group-meta'\)/, 'десктоп: рельс не меряется')
   assert.match(pluginSource, /duty-tl-lane\{display:grid;align-items:center;grid-template-columns:var\(--duty-tl-name,150px\) minmax\(0,1fr\)/, 'десктоп: дорожка не двумя колонками')
-  assert.match(pluginSource, /setProperty\('--duty-tl-name'/, 'десктоп: ширина колонки имени не ставится')
-  assert.match(pluginSource, /--duty-tl-gutter/, 'десктоп: нет подгона ширины')
+
+  assert.doesNotMatch(pluginSource, /function DutyLane[\s\S]{0,400}duty-tl-lane-h/, 'десктоп: шапка дорожки с именем этапа вернулась')
+})
+
+test('веб: этапы свёрнуты по умолчанию, раскрытие едет высотой', () => {
+  const css = read('dashboard/web/styles.css')
+  // Все этапы закрыты изначально — включая текущий и упавший (Макс, 18.11).
+  assert.match(app, /rowOpen\(stageOpen, stageShown, stageKey, false\)/, 'веб: этап раскрывается по умолчанию')
+  assert.match(app, /stageDefaults\.set\(stageKey, false\)/, 'веб: клик спорит с умолчанием шейпера')
+  // Тело рендерится всегда и лежит в DOM: раскрытие — класс, а не пересборка.
+  assert.match(app, /class: open \? 'stage-block is-open' : 'stage-block'/, 'веб: блок не помечает раскрытие')
+  assert.match(app, /class: 'stage-body', 'aria-hidden'/, 'веб: у тела этапа нет своей строки')
+  assert.match(css, /\.stage-body \{[^}]*grid-template-rows: 0fr/, 'веб: тело не свёрнуто')
+  assert.match(css, /\.stage-block\.is-open \.stage-body \{ grid-template-rows: 1fr; \}/, 'веб: раскрытие без цели высоты')
+  assert.match(css, /\.stage-body-inner \{ min-height: 0; overflow: hidden; \}/, 'веб: тело не режет содержимое')
+  // Новый этап въезжает: ключи блоков попадают в анимацию входа.
+  assert.match(app, /const ENTERING_RE = \/\^\(lane:\|attempt:\|track:\|stage:\|att:\|block:\)\//, 'веб: блок этапа не анимируется при появлении')
+})
+
+test('веб: пунктир сетки нарисован фоном, а не рамкой', () => {
+  const css = read('dashboard/web/styles.css')
+  // Ось в движении стоит на дробных координатах, а пунктирная рамка на такой
+  // позиции схлопывается в ноль — отсечки справа «иногда не прорисовывались»
+  // (Макс, 18.11).
+  const rule = (/\.scale-grid-line \{([^}]*)\}/.exec(css) || [])[1] || ''
+  assert.equal(/border-left/.test(rule), false, 'веб: пунктир всё ещё рамкой')
+  assert.match(rule, /background-image: repeating-linear-gradient\(to bottom/, 'веб: штрих не фоном')
+  // И сетка едет той же скоростью, что засечки: иначе линии расходятся с осью.
+  assert.match(
+    css,
+    /\.scale-wrap\.is-live \.scale-grid-line[\s\S]{0,200}transition: left var\(--tl-tick\)/,
+    'веб: сетка живёт своим темпом',
+  )
+})
+
+test('веб: ось едет к новой кромке весь период опроса, а не ступенькой', () => {
+  const css = read('dashboard/web/styles.css')
+  // Данные приходят раз в 5 с; если геометрия прыгает в момент ответа, таймлайн
+  // дёргается раз в 5 с. Поэтому позиции едут линейно ровно период опроса
+  // (Макс, 18.11: «плавно расширять таймлайн, а не раз в 5 сек»).
+  assert.match(app, /class: 'scale-wrap is-live', style: `--tl-tick:\$\{/, 'веб: панель не знает периода опроса')
+  assert.match(css, /\.scale-wrap \{ --tl-tick: 5s; \}/, 'веб: нет периода по умолчанию')
+  assert.match(
+    css,
+    /\.scale-wrap\.is-live \.tl-band,[\s\S]{0,240}transition: left var\(--tl-tick\) linear, width var\(--tl-tick\) linear/,
+    'веб: оси нечем ехать плавно',
+  )
+  // У указателя свой темп: раскрытие строки не должно тянуться пять секунд.
+  assert.match(css, /transition: left var\(--tl-tick, 5s\) linear, width var\(--tl-tick, 5s\) linear, top \.32s ease/, 'веб: чип потерял быстрый отклик')
+  assert.match(css, /prefers-reduced-motion[\s\S]{0,300}\.scale-wrap\.is-live \.tl-band/, 'веб: ход времени идёт и при «меньше движения»')
+})
+
+test('обновление данных не двигает шкалу, пока человек не на кромке', () => {
+  // При тике справа приезжают свежие секунды и полотно становится шире. Уехавший
+  // от кромки человек не должен видеть движения вовсе, стоящий на кромке — ехать
+  // за новой кромкой (Макс, 18.11).
+  const src = (/function pinScaleScroll\(root\) \{[\s\S]*?\n\}/.exec(app) || [])[0]
+  assert.ok(src, 'веб: функции пина нет')
+  const run = (state) => {
+    const scroller = {
+      scrollLeft: state.left,
+      scrollWidth: state.wide,
+      clientWidth: 100,
+      __tlPinned: state.pinned,
+      __tlWide: state.prevWide,
+    }
+    new Function('root', `${src};\npinScaleScroll(root)`)({ querySelector: () => scroller })
+    return scroller
+  }
+  // Масштаб заморожен на «вьюпорт = час»: справа полотно удлиняется, а рисунок в
+  // кадре стоит. Поэтому уехавшему от кромки прокрутку не трогаем совсем.
+  const left = run({ left: 400, wide: 2000, prevWide: 1000, pinned: false })
+  assert.equal(left.scrollLeft, 400, 'кадр уехал сам — ось не должна никуда ехать')
+  const right = run({ left: 0, wide: 2000, prevWide: 1000, pinned: true })
+  assert.equal(right.scrollLeft, 2000, 'кадр не ушёл на новую правую кромку')
 })
 
 test('шкала длиннее часа листается, мы висим на правой кромке', () => {
@@ -102,7 +194,7 @@ test('шкала длиннее часа листается, мы висим н�
   // обновления»). Повторный замер — после кадров: шрифт догружается позже.
   assert.match(app, /scaleGutterSeen\.namePx = Math\.max\(scaleGutterSeen\.namePx \|\| 0, namePx\)/, 'веб: ширина не монотонна')
   assert.match(app, /fitScaleGutter\(panel, dealKey\)/, 'веб: замер не привязан к делу')
-  assert.match(app, /fitScaleGutter\(panel, dealKey\)\n?[\s\S]{0,80}pinScaleScroll\(panel\)/, 'веб: нет повторного замера после кадров')
+  assert.match(app, /fitScaleGutter\(panel, dealKey\)\n?[\s\S]{0,200}pinScaleScroll\(panel\)/, 'веб: нет повторного замера после кадров')
   assert.match(pluginSource, /seen\.namePx = Math\.max\(seen\.namePx \|\| 0, namePx\)/, 'десктоп: ширина не монотонна')
   // Дорожки без собственного z-index, иначе подписи не поднимаются над подложкой.
   assert.ok(!/\.tl-lanes \{[^}]*z-index/.test(css), 'веб: у дорожек есть свой z-index — подписи под подложкой')
@@ -835,11 +927,15 @@ test('веб: строка этапа зовёт этап именем, а `id` 
   assert.equal(desc.textContent, 'Собрать требования', `описание этапа: ${desc.textContent}`)
   assert.match(doc.querySelector('.stage-row-meta').textContent, /попытка/, 'статистика этапа потерялась')
 
-  // Дорожка шкалы: код этапа крупно, описание — строкой ниже.
-  const codes = [...doc.querySelectorAll('.tl-lane-code')]
-  const lane = codes.find((item) => item.textContent === 'research')
-  assert.ok(lane, `дорожка шкалы не зовёт этап кодом: ${codes.map((item) => item.textContent).join(' | ')}`)
-  assert.equal(lane.getAttribute('title'), 'этап: research', 'подсказка дорожки не несёт `id`')
+  // Дорожка шкалы: имени этапа в гуттере нет — оно стоит у своей попытки
+  // (Макс, 18.11: «название этапа перенести к попытке»).
+  const tags = [...doc.querySelectorAll('.tl-lane-tag')].map((item) => item.textContent)
+  assert.deepEqual(tags, ['research'], `имя этапа у попытки: ${tags.join(' | ')}`)
+  assert.deepEqual(
+    [...doc.querySelectorAll('.tl-lane:not(.is-lead) .tl-lane-code')].map((item) => item.textContent),
+    [],
+    'имя этапа вернулось в гуттер',
+  )
   // Описание из спеки в дорожку не выводится никогда (Макс, 14.11): шкала зовёт
   // этап кодом, описание читают в блоке этапов.
   assert.equal(doc.querySelectorAll('.tl-lane-desc').length, 0, 'описание вернулось в дорожку')
@@ -1583,8 +1679,13 @@ test('веб: заходы лида стоят на шкале отдельно�
   // Дорожка первая: «кто ведёт дело» отвечает до этапов.
   const lanes = [...doc.querySelectorAll('.tl-lanes .tl-lane')]
   assert.equal(lanes[0], lane, 'дорожка лида стоит не первой')
-  assert.match(lane.textContent, /лид/, 'дорожка не подписана')
-  assert.match(lane.textContent, /lead/, 'у дорожки нет профиля')
+  // Подпись лида живёт в рельсе его зоны: так же, как имя профиля у этапов.
+  const leadZone = doc.querySelector("[data-key='block:lead']")
+  assert.ok(leadZone, 'лид стоит не зоной, как профили')
+  assert.equal(leadZone.querySelector('.tl-group-name').textContent, 'лид', 'дорожка не подписана')
+  // Значок профиля из гуттера убран: слева живёт только профиль, и у лида он и
+  // есть слово «лид» (Макс, 18.11).
+  assert.equal(lane.querySelectorAll('.tl-kind').length, 0, 'у лида остался значок профиля')
   // Заходы лида стоят подписью своей строки в колонке попыток — счётчика в шапке
   // дорожки больше нет (Макс, 14.11).
   // Подписи «заходы» больше нет: она наслаивалась на полосы (Макс, 14.11).
@@ -1928,3 +2029,133 @@ test('обе поверхности просят границы этапов п�
   // И потолок пачки не должен разъезжаться с потолком ручки.
   assert.match(api, /SPAN_MAX_DEALS = 40/, 'бэкенд: потолок /spans не 40')
 })
+
+test('веб: shell-этап помечен, но нарисован как все', () => {
+  const app = read('dashboard/web/app.js')
+  const css = read('dashboard/web/styles.css')
+  // Класс строки приходит из шейпера — по нему поверхность знает, что разворота
+  // нет (высота строки одна). Форму полосы shell не меняет: тонкая рейка читалась
+  // хуже, чем обычная «сосиска» (Макс, 18.11).
+  assert.match(app, /view\.shell \? ' is-shell' : ''/, 'веб: строка не знает, что попытка — команда')
+  assert.equal(/\.tl-row\.is-shell \.tl-band \{/.test(css), false, 'веб: у shell-этапа своя форма полосы')
+})
+
+test('веб: номер попытки — тем же стилем, что имя этапа', () => {
+  const css = read('dashboard/web/styles.css')
+  // «reviewer #1» читается одним названием: у номера тот же размер и вес, что у
+  // имени этапа (Макс, 18.11).
+  const num = (/^\.tl-n \{([^}]*)\}/m.exec(css) || [])[1] || ''
+  const tag = (/^\.tl-lane-tag \{([^}]*)\}/m.exec(css) || [])[1] || ''
+  assert.match(num, /font-size: 12px/, 'веб: номер попытки мельче имени этапа')
+  assert.match(num, /font-weight: 700/, 'веб: номер попытки не той же насыщенности')
+  assert.match(tag, /font-size: 12px/, 'веб: имя этапа другого размера')
+})
+
+test('веб: дорожки идут группами по роли — заголовок перед своими этапами', async (t) => {
+  if (!jsdomRoot()) return t.skip('нет jsdom в ~/.hermes/hermes-agent/node_modules')
+
+  // Макс, 16.11: группировка — по роли исполнителя, а не по этапу. Проверяется
+  // ровно то, что видит человек: заголовок роли стоит один раз, его этапы идут
+  // подряд, и shell-этап с названной ролью попадает в группу этой роли.
+  const at = DEAL_T0 + 600
+  const detail = {
+    id: DEAL_ID,
+    title: 'дело с четырьмя ролями',
+    repo: '/x/hermes-duty',
+    status: 'running',
+    terminal: false,
+    now: at,
+    created_at: DEAL_T0,
+    timeline: [{ kind: 'created', at: DEAL_T0, summary: '' }],
+    stages: [
+      { id: 'guard_base', kind: 'shell', role: '', needs: [] },
+      { id: 'impl_a', kind: 'agent', role: 'implementer', needs: ['guard_base'] },
+      { id: 'impl_b', kind: 'agent', role: 'implementer', needs: ['impl_a'] },
+      { id: 'check_tests', kind: 'shell', role: '', needs: ['impl_b'] },
+      { id: 'check_contract', kind: 'shell', role: 'tester', needs: ['check_tests'] },
+      { id: 'review', kind: 'agent', role: 'reviewer', needs: ['check_contract'] },
+    ],
+  }
+  const attempts = {
+    now: at,
+    attempts: [
+      { stage: 'guard_base', attempt: 1, start: DEAL_T0, end: DEAL_T0 + 20, status: 'done', outcome: 'done' },
+      { stage: 'impl_a', attempt: 1, start: DEAL_T0 + 20, end: DEAL_T0 + 200, status: 'done', outcome: 'done' },
+      { stage: 'impl_b', attempt: 1, start: DEAL_T0 + 200, end: DEAL_T0 + 400, status: 'done', outcome: 'done' },
+      { stage: 'check_tests', attempt: 1, start: DEAL_T0 + 400, end: DEAL_T0 + 440, status: 'done', outcome: 'done' },
+      { stage: 'check_contract', attempt: 1, start: DEAL_T0 + 440, end: DEAL_T0 + 470, status: 'done', outcome: 'done' },
+      { stage: 'review', attempt: 1, start: DEAL_T0 + 470, end: null, status: 'running', outcome: null },
+    ],
+  }
+
+  const doc = await renderDealPanel(detail, attempts)
+  const blocks = [...doc.querySelectorAll('.tl-lanes > *')]
+  // Группа — блок: подложка, волосяная линия и шапка держат роль как зону, а не
+  // как подпись (Макс, 18.11). Внутри блока — шапка и дорожки группы.
+  const groupBlocks = [...doc.querySelectorAll('.tl-lanes > .tl-group-block')]
+  assert.ok(groupBlocks.length >= 3, `блоков групп ${groupBlocks.length}`)
+  // Лид — тоже зона (его подпись стоит в рельсе, как у профилей), поэтому он
+  // первый блок полотна.
+  assert.deepEqual(
+    groupBlocks.map((block) => block.querySelector('.tl-group-name').textContent.trim()),
+    ['лид', 'движок', 'implementer', 'tester', 'reviewer'],
+    'профили в блоках',
+  )
+  // Счёт роли — в левой колонке (рельсе), а не над полосами.
+  const implRail = groupBlocks[2].querySelector('.tl-group-rail')
+  assert.ok(implRail, 'у implementer нет рельса')
+  assert.equal(
+    implRail.querySelector('.tl-group-meta').textContent,
+    '2 этапа · 2 попытки',
+    'счёт этапов и попыток не в рельсе',
+  )
+  // Порядок чтения сверху вниз: дорожка лида, затем блоки групп — имя профиля и
+  // имена этапов из подписей их попыток (в гуттере имени этапа больше нет).
+  const shape = blocks.flatMap((node) => {
+    if (!node.classList.contains('tl-group-block')) return []
+    return [
+      `[${node.querySelector('.tl-group-name').textContent.trim()}]`,
+      ...[...node.querySelectorAll('.tl-lane')].map(
+        (lane) => (lane.querySelector('.tl-lane-tag') || {}).textContent || '',
+      ),
+    ]
+  })
+
+  // Зона лида подписана словом «лид» в своём рельсе (у его заходов нет имени
+  // этапа), остальные дорожки приносят имя этапа к каждой своей попытке.
+  assert.deepEqual(shape, [
+    '[лид]',
+    '',
+    '[движок]',
+    'guard_base',
+    'check_tests',
+    '[implementer]',
+    'impl_a',
+    'impl_b',
+    '[tester]',
+    'check_contract',
+    '[reviewer]',
+    'review',
+  ], `группы ролей не собраны: ${shape.join(' | ')}`)
+
+  // Счётчики группы — в рельсе, двумя строками: этапы и попытки. «Сколько работы
+  // у implementer» читается в левой колонке, а не над полосами (Макс, 18.11).
+  // У лида счёта нет: он не этап, и «0 этапов» ничего не сказало бы.
+  const rails = [...doc.querySelectorAll('.tl-group-rail')].map((node) => [
+    node.querySelector('.tl-group-name').textContent.trim(),
+    (node.querySelector('.tl-group-meta') || {}).textContent || '',
+  ])
+  assert.deepEqual(rails[0], ['лид', ''], `рельс лида: ${rails[0]}`)
+  assert.deepEqual(rails[2], ['implementer', '2 этапа · 2 попытки'], `рельс implementer: ${rails[2]}`)
+  assert.deepEqual(rails[1], ['движок', '2 этапа · 2 попытки'], `рельс движка: ${rails[1]}`)
+  // «Движок» — не роль: он помечен классом, и стиль отличает его от ролей.
+  assert.ok(doc.querySelector('.tl-group-block.is-engine'), 'зона движка не помечена')
+  // Значок роли в рельсе: у роли — агент, у движка — команды.
+  for (const rail of doc.querySelectorAll('.tl-group-rail')) {
+    assert.ok(rail.querySelector('svg.tl-group-ico'), 'в рельсе нет значка роли')
+  }
+  const css = read('dashboard/web/styles.css')
+  assert.match(css, /\.tl-group-name \{[^}]*text-transform: uppercase/, 'имя роли не подписано как заголовок')
+  assert.match(css, /\.tl-group-rail \{[^}]*position: sticky/, 'рельс не липнет к левой кромке')
+})
+

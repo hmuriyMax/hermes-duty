@@ -901,6 +901,20 @@ pre.body {
   cursor: pointer;
 }
 .stage-block + .stage-block .stage-row { border-top: 1px solid var(--border); }
+
+/* Тело этапа: свёрнуто по умолчанию, раскрывается высотой.
+ *
+ * `grid-template-rows: 0fr → 1fr` — единственный способ анимировать «по
+ * содержимому» без замера высоты в JS: строка сетки сама едет к своему размеру,
+ * а `overflow: hidden` у внутреннего слоя режет то, что не влезло (Макс, 18.11:
+ * «этапы по дефолту свёрнуты и разворачиваются с анимацией»). */
+.stage-body {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows .28s ease;
+}
+.stage-block.is-open .stage-body { grid-template-rows: 1fr; }
+.stage-body-inner { min-height: 0; overflow: hidden; }
 .stage-row:hover { background: var(--bg-soft); }
 .stage-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .stage-row .sp { display: none; }
@@ -1067,7 +1081,16 @@ pre.body {
 .scale-plot { position: relative; }
 /* Сетка под дорожками: линии по меткам оси, чтобы время читалось поперёк дорожек. */
 .scale-grid { position: absolute; top: -2px; bottom: 0; left: calc(var(--tl-name, 150px) + var(--tl-gap, 8px) + var(--tl-plot-pad, 64px)); right: 0; pointer-events: none; z-index: 0; }
-.scale-grid-line { position: absolute; top: 0; bottom: 0; border-left: 1px dashed color-mix(in srgb, var(--text-3) 34%, transparent); }
+/* Пунктир — фоном, а не `border-left`.
+ *
+ * Ось едет всю дорогу между ответами, и координаты линии дробные. Пунктирная
+ * рамка на дробной позиции схлопывается в ноль: справа линии «иногда не
+ * прорисовываются» (Макс, 18.11). Штрих фоном рисуется при любой позиции, вид тот
+ * же. */
+.scale-grid-line {
+  position: absolute; top: 0; bottom: 0; width: 1px;
+  background-image: repeating-linear-gradient(to bottom, color-mix(in srgb, var(--text-3) 40%, transparent) 0 4px, transparent 4px 9px);
+}
 /* Сжатый промежуток оси: два пунктира по краям и подпись посередине — иначе
  * смена масштаба читается как ошибка данных. */
 /* Сжатый простой: полоса со штрихованием и знаками разрыва по краям. Пунктир
@@ -1105,6 +1128,63 @@ pre.body {
  * подписи (z3) не поднимаются над подложкой столбца (z2). Порядок над сеткой
  * (z0) и сжатым просто держится порядком в дереве. */
 .tl-lanes { padding-bottom: 12px; position: relative; display: flex; flex-direction: column; gap: 10px; }
+/* Блок группы: рельс профиля слева, попытки справа. Три якоря зоны, чтобы роль
+   читалась сразу и не спорила со шкалой (Макс, 18.11: «более явно группировать
+   профили — линиями, фоном», «количество этапов/попыток — в левую колонку»):
+     1) рельс — значок, имя роли и счёт этапов и попыток, по всей высоте зоны;
+     2) подложка во всю ширину — зона видна боковым зрением;
+     3) волосяная линия на границе зоны (внутренняя тень — без сдвига вёрстки:
+        полосы обязаны совпадать с засечками оси до пикселя).
+   Слева в гуттере живёт только профиль: имена этапов уехали к своим попыткам. */
+.tl-group-block {
+  --zone-base: var(--role-other);
+  display: grid; grid-template-columns: var(--tl-name, 150px) minmax(0, 1fr);
+  column-gap: var(--tl-gap, 8px);
+  padding: 6px 0 7px; margin-top: 10px;
+  box-shadow: inset 1px 0 0 color-mix(in srgb, var(--zone-base) 85%, transparent);
+  background: color-mix(in srgb, var(--zone-base) 8%, transparent);
+  border-radius: 0 8px 8px 0;
+}
+/* Цвет профиля — палитра ролей главной страницы дел: implementer, tester и
+   reviewer узнаются по цвету так же, как их полосы в мини-таймлайне (Макс, 18.11:
+   «сделай профили разными цветами, как на главной странице дел»). */
+.tl-group-block[data-role="planner"] { --zone-base: var(--role-planner); }
+.tl-group-block[data-role="implementer"] { --zone-base: var(--role-implementer); }
+.tl-group-block[data-role="documenter"] { --zone-base: var(--role-documenter); }
+.tl-group-block[data-role="tester"] { --zone-base: var(--role-tester); }
+.tl-group-block[data-role="reviewer"] { --zone-base: var(--role-reviewer); }
+.tl-group-block[data-role="publisher"] { --zone-base: var(--role-publisher); }
+.tl-group-block[data-role="other"] { --zone-base: var(--role-other); }
+/* Граница между зонами — волосяная: зона кончается там, где кончается подложка. */
+.tl-group-block + .tl-group-block { border-top: 1px solid color-mix(in srgb, var(--border) 55%, transparent); }
+.tl-group-block:first-child { margin-top: 0; }
+/* «Движок» — не роль: нейтральный тон палитры, без цвета исполнителя. */
+.tl-group-block.is-engine {
+  --zone-base: var(--role-other);
+  background: color-mix(in srgb, var(--text-3) 7%, transparent);
+}
+/* Рельс — центрированная табличка роли: значок, имя, счёт. По центру зоны, потому
+   что по вертикали его держит вся высота группы, а не строка-заголовок (Макс, 18.11:
+   «название профиля как-то интереснее — в центр поместить»). */
+.tl-group-rail { position: sticky; left: 0; z-index: 4; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: 0; padding: 0 6px; text-align: center; }
+.tl-group-name { min-width: 0; max-width: 100%; font-size: 11.5px; font-weight: 700; letter-spacing: .12em; line-height: 1.15; text-transform: uppercase; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+svg.tl-group-ico { flex: none; width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; color: var(--zone-base); }
+/* «Движок» — не роль, но и не инородное тело: та же типографика, тише тон,
+   свой значок (команды). Раньше он был строчным и выпадал из столбца (Макс, 18.11). */
+.tl-group-block.is-engine .tl-group-name { color: var(--text-2); }
+.tl-group-block.is-engine svg.tl-group-ico { color: var(--text-2); }
+.tl-group-meta { max-width: 100%; font-size: 9.5px; line-height: 1.2; color: var(--text-2); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Содержимое зоны стоит по центру её высоты: у этапа с одной попыткой полоса
+   прижималась к верхней кромке, и «сосиска» висела над серединой рельса
+   (Макс, 18.11: «выравнивать группы сосисок вертикально по центру»). */
+.tl-group-body { min-width: 0; display: flex; flex-direction: column; justify-content: center; gap: 2px; }
+/* Внутри зоны дорожки стоят плотно: зону держит подложка, а не разделители. */
+.tl-group-block .tl-lane { display: block; }
+/* Этапы отделены друг от друга на всей ширине шкалы — от рельса до правого края:
+   без линии строки сливались в одно полотно, и было не понять, где кончается
+   этап (Макс, 18.11: «отдели этапы друг от друга на всём таймлайне»). */
+.tl-group-block .tl-lane + .tl-lane { border-top: 1px solid color-mix(in srgb, var(--border) 42%, transparent); padding-top: 2px; margin-top: 0; }
+.tl-group-block .tl-lane { padding-bottom: 2px; }
 /* Дорожка этапа — две колонки в гуттере: слева имя этапа и профиль, справа
    попытки (каждая своей подписью, сколько их — столько строк рядом). Имя стоит
    один раз и не двигается (Макс, 14.11). */
@@ -1115,7 +1195,7 @@ pre.body {
    внутри — только колонку имени. Иначе sticky некуда ехать: он не выходит за
    родителя, и колонка уезжала вместе со шкалой (Макс, 14.11). */
 .tl-lane > .tl-lane-h { grid-column: 1 / -1; grid-row: 1; width: var(--tl-name, 150px); justify-self: start; position: sticky; left: 0; z-index: 3; background: var(--card); }
-.tl-lane + .tl-lane { border-top: 1px solid var(--border); padding-top: 10px; margin-top: 4px; }
+.tl-lane + .tl-lane { border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent); padding-top: 8px; margin-top: 2px; }
 .tl-lane-h { display: flex; align-items: center; min-height: 20px; padding-bottom: 2px; min-width: 0; }
 .tl-lane .tl-rows, .tl-lane .tl-row-empty { grid-column: 2 / -1; grid-row: 1; min-width: 0; }
 /* Левая колонка: имя этапа, значок вида и счёт попыток. Имя — единственное, что
@@ -1128,29 +1208,44 @@ pre.body {
 /* Имя и профиль — друг под другом: в одну строку они отбирали ширину у имени, и
    на обновлении оно сжималось до «impl…» (Макс, 14.11). */
 .tl-lane-head { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; min-width: 0; }
+/* Гуттер занят профилем: у лида значок управляющего стоит в строку со словом. */
+.tl-lane.is-lead .tl-lane-head { flex-direction: row; align-items: center; gap: 5px; }
+/* Лид подписан так же, как профили в зонах: управляющий — тоже роль. */
+.tl-lane.is-lead .tl-lane-code { font-family: inherit; font-size: 11.5px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--text-2); }
+.tl-lane.is-lead svg.tl-lane-ico { width: 13px; height: 13px; color: var(--accent); }
+svg.tl-lane-ico { flex: none; width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; color: var(--text-2); }
 .tl-lane-head > .tl-lane-code { flex: none; max-width: 100%; }
 .tl-lane-name { font-size: 12.5px; font-weight: 600; color: var(--text); letter-spacing: .01em; min-width: 0; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
 /* Крупно — id этапа, ниже — описание из спеки в две строки. Описание длинное по
    природе (это фраза, а не код), и в одну строку оно вытесняло счёт попыток. */
 .tl-lane-code { font-size: 12.5px; font-weight: 650; color: var(--text); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tl-lane-id > .tl-kind { flex: none; }
 .tl-lane-h .sp { flex: 1; }
 
-.tl-kind {
-  display: inline-flex; align-items: center; gap: 5px;
-  height: 19px; padding: 0 7px; border-radius: 5px;
-  border: 1px solid var(--border-strong); background: var(--bg-soft);
-  font-size: 10.5px; font-weight: 600; color: var(--text-2);
-}
-/* Класс стоит на самом `svg`, поэтому правила — про него, а не про потомка:
- * селектор `.tl-kind-ico svg` не совпадал бы ни с чем и значок терял размер. */
-svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
-.tl-kind-agent { color: var(--text); border-color: var(--accent); background: var(--accent-soft); }
-.tl-kind-agent svg.tl-kind-ico { stroke: var(--accent); }
-.tl-kind-shell { color: var(--text-2); }
-.tl-kind-gate { color: var(--warn); border-color: var(--warn); background: var(--warn-soft); }
-
 .tl-rows { display: flex; flex-direction: column; gap: 4px; }
+
+/* Плавное расширение шкалы.
+ *
+ * Ось живого дела тянется вперёд: с каждым ответом сервера правый край уезжает, а
+ * всё нарисованное сжимается к левому. Данные приходят раз в 5 с, и без перехода
+ * картинка дёргалась раз в 5 с. Поэтому позиции в процентах едут ровно период
+ * опроса (`--tl-tick`), линейно: движение непрерывное, а не ступенькой. Высоты и
+ * раскрытие строк остаются быстрыми — это реакция на указатель, а не ход времени
+ * (Макс, 18.11).
+ *
+ * `is-live` включает переход только со второго кадра: первый рисунок не должен
+ * приезжать из нуля. */
+.scale-wrap { --tl-tick: 5s; }
+/* Все слои, поставленные по времени, едут с одной скоростью. Пунктиры сетки и
+ * полосы простоя держали короткий переход (.32 s) и уезжали вперёд засечек —
+ * справа сетка и отсечки расходились, а на стыках линии пропадали (Макс, 18.11). */
+.scale-wrap.is-live .tl-band,
+.scale-wrap.is-live .scale-tick,
+.scale-wrap.is-live .scale-grid-line,
+.scale-wrap.is-live .tl-mark,
+.scale-wrap.is-live .tl-lead-run,
+.scale-wrap.is-live .tl-idle-gap,
+.scale-wrap.is-live .tl-silence,
+.scale-wrap.is-live .tl-wait { transition: left var(--tl-tick) linear, width var(--tl-tick) linear; }
 
 /* Строка попытки: свёрнутая показывает первый уровень вызовов и маркеры, полная
  * раскрывается под указателем. Высоты приходят переменными от шейпера
@@ -1191,7 +1286,7 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
   border-radius: 3px;
-  background: color-mix(in srgb, var(--card) 86%, transparent);
+  background: none;
   pointer-events: none;
   /* Лестница наложения в шкале: 0 — сетка и тишина, 1 — содержимое дорожек
      (подпись попытки поверх своих чипов), 2 — подложка гуттера, 3 — липкий
@@ -1200,8 +1295,21 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
   z-index: 1;
 }
 .tl-att.is-inside { transform: translate(0, -50%); padding: 0 2px 0 4px; }
+/* Название этапа у своей попытки: имя уехало из гуттера к полосе (Макс, 18.11).
+   Моно и приглушённо — рядом с номером и исходом это подпись, а не заголовок. */
+/* Имя этапа у попытки — главная подпись строки: крупнее номера и исхода, цветом
+   текста, а не приглушённо. Плашка под подписью снята: полупрозрачный
+   прямоугольник поверх сетки читался как случайное пятно (Макс, 18.11:
+   «выдели побольше и убери фон под текстом»). */
+.tl-lane-tag { font-family: var(--mono); font-size: 12px; font-weight: 700; color: var(--text); max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
+.tl-att:has(.tl-lane-tag) .tl-n { color: var(--text-3); }
+/* Единственный фон, который остаётся, — у подписи внутри полосы (заходы лида):
+   там текст лежит на цвете и без подложки не читается. */
+.tl-att.is-inside { background: color-mix(in srgb, var(--card) 86%, transparent); }
 
-.tl-n { font-family: var(--mono); font-size: 10px; color: var(--text-3); text-align: right; }
+/* Номер попытки — тем же стилем, что имя этапа: `reviewer #1` читается одним
+   названием, а не именем с мелким хвостом (Макс, 18.11). */
+.tl-n { font-family: var(--mono); font-size: 12px; font-weight: 700; color: var(--text-2); text-align: right; }
 .tl-st { font-size: 10.5px; font-weight: 700; color: var(--text-2); }
 .tl-st.t-green { color: var(--ok); }
 .tl-st.t-red { color: var(--danger); }
@@ -1244,6 +1352,11 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 .tl-band.t-red { background: color-mix(in srgb, var(--danger) 15%, transparent); border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
 .tl-band.t-yellow { background: color-mix(in srgb, var(--warn) 13%, transparent); border-color: color-mix(in srgb, var(--warn) 38%, transparent); }
 .tl-band.t-blue { background: color-mix(in srgb, var(--accent) 12%, transparent); border-color: color-mix(in srgb, var(--accent) 34%, transparent); }
+
+/* Shell-этап — команда, а не работа агента: вложенных вызовов у неё нет, поэтому
+   строка не разворачивается под указателем (высоту держит шейпер, см. model.js).
+   Сама полоса остаётся такой же, как у агентских попыток: тонкая рейка читалась
+   хуже — «а где команда шла?» (Макс, 18.11). */
 
 /* Тишина внутри попытки: ни вызова, ни слова. Рисуется редкой штриховкой поверх
  * полосы — «шло время, но ничего не происходило» видно, не читая подсказку. */
@@ -1369,7 +1482,9 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
  * на каждом тике квадратики не перерисовываются заново. */
 .tl-call {
   position: absolute; height: 10px; border-radius: 2px; cursor: pointer;
-  transition: left .32s ease, width .32s ease, top .32s ease, background-color .32s ease, opacity .32s ease;
+  /* По времени чип едет вместе с осью (период опроса), по уровню и цвету — быстро:
+     разворот строки должен отзываться на указатель, а не тянуться пять секунд. */
+  transition: left var(--tl-tick, 5s) linear, width var(--tl-tick, 5s) linear, top .32s ease, background-color .32s ease, opacity .32s ease;
 }
 
 /* Свёрнутая строка: все вызовы на одной линии, внахлёст и вполсилы — плотность
@@ -1440,7 +1555,7 @@ svg.tl-kind-ico { display: inline-block; width: 12px; height: 12px; fill: none; 
 @media (prefers-reduced-motion: reduce) {
   .tl-row, .tl-mini, .tl-stack, .tl-call, .tl-tick { transition: none; }
   .tl-call, .scale-tick, .scale-grid-line, .tl-idle-gap, .tl-silence, .tl-wait,
-  .tl-lane, .tl-row, .stage-row, .att-row { transition: none !important; }
+  .tl-lane, .tl-row, .stage-row, .att-row, .stage-body { transition: none !important; }
   .is-new { animation: none; }
   .is-gone { transition: none; }
 }
@@ -1932,6 +2047,16 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
 }
 
 @media (prefers-reduced-motion: reduce) {
+  /* Ход времени тоже движение: у «меньше движения» шкала прыгает к новой кромке. */
+  .scale-wrap.is-live .tl-band,
+  .scale-wrap.is-live .scale-tick,
+  .scale-wrap.is-live .scale-grid-line,
+  .scale-wrap.is-live .tl-mark,
+  .scale-wrap.is-live .tl-lead-run,
+  .scale-wrap.is-live .tl-idle-gap,
+  .scale-wrap.is-live .tl-silence,
+  .scale-wrap.is-live .tl-wait,
+  .scale-wrap.is-live .tl-call { transition: none; }
   .tl-sausage.is-live,
   .tl-legend-dot.t-blue,
   .finished-body,
@@ -2192,7 +2317,9 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
      зазора под подпись попытки): на шкалу оставалось 106 px. На телефоне имя
      этапа уходит строкой над дорожкой, шкала занимает всю ширину, а зазор
      остаётся только под подпись самой попытки (`#1 идёт`). */
-  .scale-wrap { grid-template-columns: minmax(0, 1fr); gap: 12px; --tl-name: 0px !important; --tl-plot-pad: 78px; }
+  /* Рельс профиля остаётся: он и есть левая колонка. Прежний ноль оставлял от
+     него пустоту — имя роли занимало нулевую ширину (Макс, 18.11). */
+  .scale-wrap { grid-template-columns: minmax(0, 1fr); gap: 12px; --tl-name: 78px !important; --tl-plot-pad: 64px; }
   .scale-main { width: 100%; }
   .scale-head { grid-template-columns: minmax(0, 1fr); }
   .scale-head-gap { display: none; }
@@ -2213,11 +2340,23 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
   .tl-lane > .tl-lane-h { grid-column: 1 / -1; grid-row: 1; width: auto; position: static; }
   .tl-lane .tl-rows, .tl-lane .tl-row-empty { grid-column: 1 / -1; grid-row: 2; }
   .tl-lane + .tl-lane { padding-top: 8px; margin-top: 2px; }
+  /* Рельс на узком экране: имя роли в две строки, счётчики под ним, всё по левой
+     кромке — по центру в узкой колонке читалось бы хуже. */
+  .tl-group-rail { align-items: flex-start; text-align: left; padding: 0 4px 0 0; }
+  .tl-group-name { font-size: 9.5px; letter-spacing: .02em; white-space: normal; overflow-wrap: anywhere; }
+  .tl-group-meta { font-size: 9px; }
+  svg.tl-group-ico { width: 11px; height: 11px; }
   .tl-lane-h { min-height: 24px; }
   .tl-lane-head { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px; }
   .tl-lane-code { font-size: 15px; white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
-  .tl-kind { height: auto; min-height: 22px; font-size: 13px; padding: 2px 8px; }
+  /* Узкий экран: в подписи попытки остаётся только имя этапа. Номер и слово
+     исхода там не помещаются (подпись съедала бы пол-шкалы), а исход и так
+     нарисован цветом полосы и лежит в подсказке. */
   .tl-n, .tl-st { font-size: 13px; }
+  .tl-att .tl-n, .tl-att .tl-st { display: none; }
+  /* Узкий экран: имя этапа остаётся крупным, но короче — длинное имя режется
+     многоточием, полная строка лежит в подсказке полосы. */
+  .tl-lane-tag { max-width: 138px; font-size: 11.5px; }
   .tl-lead-label, .tl-lead-run .tl-lead-label { font-size: 13px; }
   .tl-row-empty { position: static; width: auto; height: 24px; font-size: 13px; }
   .tl-row-empty > .tl-row-empty-t { position: static; transform: none; white-space: normal; }

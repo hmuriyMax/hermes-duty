@@ -79,6 +79,7 @@ VERDICT_KEYS = ("approve", "changes", "max_rounds")
 # старые спеки валидны без правки файла (раздел 12 контракта), а `stages` из
 # обязательного поля стало seed-подсказкой лиду.
 CHARTER_KEYS = (
+    "size",
     "max_stages",
     "max_rounds_replan",
     "allowed_roles",
@@ -90,6 +91,17 @@ CHARTER_KEYS = (
     "close",
     "publish",
 )
+
+# Размер дела (0.2.2) задаёт потолок графа: S/M/L — пресеты числа живых этапов,
+# явный `max_stages` главнее пресета, а чартер без `size` живёт на
+# `DEFAULT_MAX_STAGES`. Причина — живой журнал: старый шаблон чартера держал 6
+# этапов, а дела недели росли до 7–12 (`d_c13d53da` — 12 этапов, 10 попыток), и
+# тупик «правку начатого не принимаю и граф расти не может» выходил вопросом
+# человеку (`d_76b269ce`, вопрос #664). Одна цифра на все дела этого не решает:
+# размер дела оценивает тот, кто его заводит (решение Макса: «6 маловато, часто
+# бывают дела с большим количеством этапов, думаю это зависит от S/M/L оценки»).
+SIZE_CHOICES = ("S", "M", "L")
+SIZE_MAX_STAGES = {"S": 8, "M": 16, "L": 24}
 PLAN_GATE_KEYS = ("min_stages", "budget_share")
 PUBLISH_KEYS = ("human_gate", "reviewer_role", "plan")
 # Что предложение плана вправе сказать про этап, который **уже есть** в графе.
@@ -529,6 +541,9 @@ class Charter:
     спека 0.0.8: граф задан файлом и не растёт.
 
     - `max_stages` — потолок числа этапов дела (seed плюс добавленные планом);
+    - `size` — размер дела (S/M/L): пресет потолка этапов (8/16/24). Явный
+      `max_stages` главнее пресета, а чартер без `size` живёт на
+      `DEFAULT_MAX_STAGES` — так старые спеки читаются без правки файла;
     - `max_rounds_replan` — сколько отказов плана этап `plan` переживает до
       `failed(contract)`;
     - `allowed_roles` — роли, которыми плану разрешено добавлять этапы; пусто —
@@ -555,6 +570,7 @@ class Charter:
     """
 
     max_stages: int = DEFAULT_MAX_STAGES
+    size: str = ""
     max_rounds_replan: int = DEFAULT_MAX_ROUNDS_REPLAN
     allowed_roles: tuple[str, ...] = ()
     allowed_kinds: tuple[str, ...] = STAGE_KINDS
@@ -1084,7 +1100,31 @@ def _parse_charter(
         )
         return Charter()
     _unknown_keys(mapping, CHARTER_KEYS, path, lines, prefix + ("charter",), issues)
-    max_stages = mapping.get("max_stages", DEFAULT_MAX_STAGES)
+    size = mapping.get("size")
+    if size is not None:
+        # Размер дела приходит от того, кто дело заводит, и угадывать его нельзя:
+        # `"средний"` — это не пресет, а мусор в хартии, и потолок от него
+        # молча стал бы умолчанием.
+        declared_size = str(size).strip().upper()
+        if declared_size not in SIZE_CHOICES:
+            issues.append(
+                Issue(
+                    path,
+                    lines.get(prefix + ("charter", "size"), line),
+                    "charter.size",
+                    f"size={size!r}: размер дела — {'/'.join(SIZE_CHOICES)} "
+                    f"(потолок этапов: S={SIZE_MAX_STAGES['S']}, M={SIZE_MAX_STAGES['M']}, "
+                    f"L={SIZE_MAX_STAGES['L']})",
+                )
+            )
+            size = ""
+        else:
+            size = declared_size
+    else:
+        size = ""
+    # Потолок: явный `max_stages` главнее пресета размера, пресет — умолчанию
+    # движка. Так спека без `size` читается ровно как раньше.
+    max_stages = mapping.get("max_stages", SIZE_MAX_STAGES.get(str(size), DEFAULT_MAX_STAGES))
     if _int_or_none(max_stages) is None:
         issues.append(
             Issue(
@@ -1180,6 +1220,7 @@ def _parse_charter(
             budget = None
     return Charter(
         max_stages=int(max_stages),
+        size=str(size),
         max_rounds_replan=int(rounds),
         allowed_roles=roles,
         allowed_kinds=kinds,
@@ -1758,6 +1799,26 @@ def _check_evidence(spec: Spec) -> list[Issue]:
                         "спека принимает только то, что можно проверить повторным запуском",
                     )
                 )
+            wrapper = _shell_wrapper_hit(cmd)
+            if wrapper is not None and stage.kind != SHELL_KIND:
+                # Предупреждение, а не отказ: спека 1.x с такой записью уже живёт
+                # и работать по ней можно. Но объявлена она не так, как её
+                # запускают, — и гейт пакета вынужден снимать обёртку, чтобы не
+                # назвать честный прогон подменой (`evidence._normalise_cmd`).
+                # План такую же запись отклоняет (`plan.evidence.shell`).
+                # У этапа-команды обёртка законна: `kind: shell` исполняет движок,
+                # и гард терминала роли к нему не относится (то же условие, что в
+                # правиле плана, `_plan_base_issues` → `plan.evidence.shell`).
+                issues.append(
+                    Issue(
+                        spec.path,
+                        line,
+                        "evidence.shell",
+                        f"cmd {cmd!r} в обёртке {wrapper!r}: объявляй команду так, как её запускают — "
+                        "роль запускает инструмент, а обёртку режет гард терминала",
+                        WARNING,
+                    )
+                )
             timeout_line = stage.lines.get(f"evidence.{index}.timeout_sec", evidence.line)
             if evidence.timeout_sec <= 0 or evidence.timeout_sec > MAX_TIMEOUT_SEC:
                 issues.append(
@@ -1917,6 +1978,22 @@ def _check_charter(spec: Spec, profiles: frozenset[str]) -> list[Issue]:
                 line_of("charter.max_stages"),
                 "charter.max_stages",
                 f"max_stages={charter.max_stages}: потолок графа — не меньше одного этапа",
+            )
+        )
+    preset = SIZE_MAX_STAGES.get(str(getattr(charter, "size", "") or ""), 0)
+    if preset and charter.max_stages < preset:
+        # Предупреждение, а не отказ: дело с таким потолком запускается, но при
+        # падении этапа лид остаётся между «правку начатого не принимаю» и
+        # «граф расти не может» — ровно тупик `d_76b269ce` (вопрос #664).
+        issues.append(
+            Issue(
+                spec.path,
+                line_of("charter.max_stages"),
+                "charter.max_stages",
+                f"max_stages={charter.max_stages} мал для дела размера {charter.size} "
+                f"(пресет {preset}): при падении этапа лид не сможет ни поправить его, "
+                "ни добавить замену",
+                WARNING,
             )
         )
     if charter.max_rounds_replan < 0:
@@ -2961,6 +3038,64 @@ def _plan_publish_refusal(charter: Charter, stage: Stage, gates: Iterable[Stage]
     )
 
 
+def _plan_base_issues(
+    stages: Iterable[Stage],
+    *,
+    repo: Optional[str],
+    base: Optional[str],
+    where: Path,
+    exists: Optional[Callable[[Path, str], Optional[bool]]] = None,
+) -> list[Issue]:
+    """Гвард базы плана: worktree-этап отводится от `base`, и пустая база его убивает.
+
+    Живое дело `d_95f55146` (17.11 18:14): seed-спека кнопки «Продолжить» несла
+    `repo`, но не `base`; лид запланировал worktree-этап, дерево отводилось «от ''
+    », и `git worktree add` падал `fatal: invalid reference:` — десять
+    инфра-падений подряд (impl ×5, impl2 ×5), потому что падение мгновенное и лид
+    успевал добавить второй такой же этап. Дело поехало только после того, как
+    человек вписал `base` руками.
+
+    Правило живёт здесь, а не в валидаторе seed: у уже созданных дел с пустой
+    базой новый отказ не должен топить граф (`references/engine-map.md`), а план —
+    единственное место, где появляется НОВЫЙ worktree-этап.
+
+    Отказ только когда git сказал «такого rev нет»: репозитория может не быть на
+    этой машине или git может не ответить — тогда доказательства нет, и отказ был
+    бы догадкой (та же граница, что у `check_base`).
+    """
+    listed = [stage for stage in stages if str(getattr(stage, "workspace", "")) == "worktree"]
+    if not listed:
+        return []
+    line = listed[0].line
+    ids = ", ".join(stage.id for stage in listed)
+    if not repo or not base:
+        return [
+            Issue(
+                where,
+                line,
+                "plan.base",
+                f"этап {ids} работает в дереве, а дело создано спекой без base "
+                f"(repo={repo or '— не назван'}, base={base or '— не назван'}): впиши base в спеку "
+                "или планируй этап с `workspace: none` — без базы дерево не от чего отвести",
+            )
+        ]
+    path_repo = Path(str(repo)).expanduser()
+    if not path_repo.is_dir():
+        return []
+    probe = exists if exists is not None else rev_exists
+    if probe(path_repo, str(base)) is not False:
+        return []
+    return [
+        Issue(
+            where,
+            line,
+            "plan.base",
+            f"этап {ids} работает в дереве, а base {str(base)!r} не резолвится в {path_repo} как "
+            "коммит: дерево не от чего отвести — впиши существующий rev в спеку",
+        )
+    ]
+
+
 def parse_plan(
     raw_stages: Any,
     *,
@@ -2968,9 +3103,11 @@ def parse_plan(
     base_stages: Optional[Mapping[str, Any]] = None,
     started_ids: Iterable[str] = (),
     repo: Optional[str] = None,
+    base: Optional[str] = None,
     path: Optional[Path] = None,
     removed_out: Optional[set[str]] = None,
     replay: bool = False,
+    exists: Optional[Callable[[Path, str], Optional[bool]]] = None,
 ) -> tuple[tuple[Stage, ...], list[Issue]]:
     """Предложение плана → этапы и отказы; непустые отказы — план не принимается.
 
@@ -2991,6 +3128,9 @@ def parse_plan(
       вправе добавить этап, который закроется без доказательств;
     - `needs` ведёт только на известный этап, граф плана ацикличен — и цикл,
       замкнутый перестановкой через уже существующие этапы, тоже отказ;
+    - worktree-этап требует базы: при пустых `repo`/`base` в спеке (или `base`,
+      не резолвящемся в `repo`) план отказывает `plan.base` — без неё дерево
+      отводить не от чего, и падение мгновенное (`_plan_base_issues`);
     - `len(seed ∪ план) <= charter.max_stages`.
 
     **Перестановка и правка.** Запись с `id`, который уже есть в графе, граф не
@@ -3056,7 +3196,9 @@ def parse_plan(
     # Строк в предложении нет: `lines` пуст, и `_parse_stage` берёт номер 1 —
     # отказ называет этап по `id`, а не по строке отчёта.
     lines: dict[tuple[Any, ...], int] = {}
-    base: dict[str, Stage] = {str(stage_id): stage for stage_id, stage in (base_stages or {}).items()}
+    graph_stages: dict[str, Stage] = {
+        str(stage_id): stage for stage_id, stage in (base_stages or {}).items()
+    }
     started = {str(stage_id) for stage_id in started_ids}
     stages: list[Stage] = []
     removed: set[str] = set()
@@ -3073,13 +3215,13 @@ def parse_plan(
                 declared,
                 index=index,
                 where=where,
-                base=base,
+                base=graph_stages,
                 started=started,
                 removed=removed,
                 issues=issues,
             )
             continue
-        existing = base.get(declared_id) if isinstance(declared_id, str) else None
+        existing = graph_stages.get(declared_id) if isinstance(declared_id, str) else None
         moving = existing is not None
         try:
             stage = _parse_stage(raw, index, where, lines, issues)
@@ -3160,12 +3302,12 @@ def parse_plan(
     new_fields = {
         stage.id: (
             set(EDIT_KEYS)
-            if stage.id not in base
-            else {name for name in EDIT_KEYS if getattr(stage, name) != getattr(base[stage.id], name)}
+            if stage.id not in graph_stages
+            else {name for name in EDIT_KEYS if getattr(stage, name) != getattr(graph_stages[stage.id], name)}
         )
         for stage in stages
     }
-    known = (set(base) | {stage.id for stage in stages}) - removed
+    known = (set(graph_stages) | {stage.id for stage in stages}) - removed
     if removed:
         # Удаление снимает этап с графа, значит и рёбра на него больше некуда
         # вести: этап, которому удалённый нужен, остался бы ждать навсегда
@@ -3215,15 +3357,15 @@ def parse_plan(
     # `plan.publish` смотрит в те же рёбра.
     merged: dict[str, tuple[str, ...]] = {
         stage_id: tuple(str(need) for need in getattr(stage, "needs", ()) or ())
-        for stage_id, stage in base.items()
+        for stage_id, stage in graph_stages.items()
         if stage_id not in removed
     }
     merged.update({stage.id: stage.needs for stage in stages})
-    by_any_id: dict[str, Stage] = {stage_id: stage for stage_id, stage in base.items() if stage_id not in removed}
+    by_any_id: dict[str, Stage] = {stage_id: stage for stage_id, stage in graph_stages.items() if stage_id not in removed}
     by_any_id.update({stage.id: stage for stage in stages})
     kinds = {stage_id: str(getattr(stage, "kind", "") or "") for stage_id, stage in by_any_id.items()}
     for stage in stages:
-        moving = stage.id in base
+        moving = stage.id in graph_stages
         if stage.id in seen:
             issues.append(Issue(where, stage.line, "plan.id", f"id {stage.id!r} повторяется в предложении"))
             continue
@@ -3432,6 +3574,11 @@ def parse_plan(
             )
         )
         break
+    if not replay:
+        # База читается у того, что предлагают СЕЙЧАС: `replay` перечитывает
+        # журнал, где ревизии уже приняты, и отказ на перечитывании откатил бы
+        # граф к seed — та же причина, что у `plan.evidence.shell`.
+        issues.extend(_plan_base_issues(stages, repo=repo, base=base, where=where, exists=exists))
     if len(known) > charter.max_stages:
         # Отказ называет не только «не растёт», но и ЧЕМ занято место: лид иначе
         # добавляет ещё один этап поверх мёртвых и жжёт ревизию (d_76b269ce:
@@ -3531,6 +3678,11 @@ def check_seed(spec: Spec) -> list[Issue]:
         list(spec.raw_stages),
         charter=spec.charter,
         repo=spec.repo,
+        # База передаётся, чтобы seed судился тем же входом, что план; сам отказ
+        # `plan.base` в `SEED_RULES` не входит: у уже созданных дел с пустой базой
+        # он затопил бы граф, а seed-этап с деревом и без базы и так отказывает
+        # `_check_workspace`.
+        base=spec.base,
         path=spec.path,
     )
     return [issue for issue in issues if issue.rule in SEED_RULES]

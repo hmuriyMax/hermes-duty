@@ -824,6 +824,18 @@ def _stage_event(
             word = f"работы не было: {node.nothing}" if node.nothing else f"{outcome or 'ok'}"
             node.reason = f"попытка {node.attempt}: {word}"
             return
+        if fail_kind == failures.DRAINED:
+            # Попытку прервал рестарт рантайма: это не отказ работы и не вина
+            # этапа. Счётчик отказов не растёт (политика повторов не списывается),
+            # парковки нет — этап возвращается в готовность, и диспетчер поднимает
+            # его заново. Живое: `d_95f55146` — `Error: runtime_draining` в stderr
+            # попытки, `infra`-провал, и при `max=1` дело сразу запарковано.
+            node.state = PENDING
+            node.question_id = None
+            node.fail_kind = ""
+            node.failed_at = 0
+            node.reason = f"попытка {node.attempt}: попытку прервал рестарт рантайма"
+            return
         fail_kind = fail_kind or UNCLASSIFIED
         stage_spec = _stage_spec(spec, node.id)
         text = f"попытка {node.attempt}: отказ {fail_kind}"

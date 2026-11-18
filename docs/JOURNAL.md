@@ -55,7 +55,7 @@ CREATE INDEX IF NOT EXISTS events_deal ON events(deal_id, id);
 | `attempt_started` | открылся ран в `task_runs` (движок: попытка заспавнена) | `run_id`, `pid`, `stage`, `attempt`, `cmd`, `stage_kind` (только у `kind: shell` — `shell`; отсутствие ключа читается как `agent`), `shell_cmd` (у `shell` — строка `cmd` из спеки), `cwd`, `workdir`, `tree`, `base` (фактическая база дерева — коммит, от которого этап отведён), `lease_expires`, `retried_from` (только у попытки, которую движок поднял сам после отказа — номер повторяемой попытки: по нему считается «2 автоматических повтора, оба `contract`», `failures.auto_retries`), `contract` — фактическая команда и вход целиком |
 | `attempt_progress` | шаг попытки движка: вызов инструмента, его результат или сказанное агентом (телеметрия, состояние дела не меняет) | `stage`, `attempt`, `seq`, `phase` (`tool_use`/`tool_result`/`say`), `name`, `duration_ms` (у результата и у `say`), `preview` (только у `say`, ≤ 120 символов), `ts` |
 | `tree_reused` | повтор попытки продолжается в дереве прошлой попытки, а не с базы: движок уберёг его как `tree_kept`, и начинать заново значило бы выбросить работу | `stage`, `attempt`, `from` (путь сохранённого дерева) |
-| `attempt_ended` | ран закрыт (движок: попытка отчиталась, не отчиталась или упала; `done` — только при принятом evidence-пакете; `reaped: true` — попытку закрыл `reaper.sweep`, отчёта от неё не было; `refused: true` в `details` — попытку не поднимали вовсе: потолок дела исчерпан (`details.budget`: `{kind, used, limit}`) или нет «ок» человека на это дерево (`details.publish`); `cancelled: true` — попытку **погасили** сигналом: лид отказался от этапа или дела (`duty_cancel`/`duty_cancel_deal`) либо дело закрывают (`close_deal`/`close_stages_done`/`complete_deal` — гасят живые попытки до своего `completed`, тот же механизм, `docs/ENGINE-2.0.md`, раздел 5); у `shell`-попытки в `details` — `exit_code`, `duration_sec`, `must`, `timed_out`, хвосты `stdout_tail`/`stderr_tail`; у гейта — `stage_kind: gate`, `question_id`, `answer`, `allow`) | `run_id`, `stage`, `attempt`, `outcome` (`done`/`failed`/`cancelled`), `kind` (`infra`/`contract`/`capability`/`null`), `reason`, `cancelled` (только у погашенных), `pid` (у погашенных — тот, кому дали сигнал), `base` (база дерева попытки), `commit` (что произвела принятая попытка — коммит движка в её дереве или коммит исполнителя; от него отводится дерево следующего этапа; `null` — произвести было нечего), `details` (в том числе `witness` — принятый свидетель пакета: `commit\|artifacts` / `verdict` / `published` / `nothing`; `verdict`: вердикт гейта с `details`; `branch` — ветка дела `duty/<deal_id>`, на которую движок поставил коммит попытки, `branch_error` — причина, если поставить не удалось; `tree_kept` — путь сохранённого дерева упавшей попытки с незакоммиченной работой), `nothing` (`{reason}` — этап-производитель предъявил пустоту: работы для этапа не было, дерево не тронуто; исход при этом `done`, класса отказа нет, `plan_rethink` не вызывается — `docs/ENGINE-2.0.md`, раздел 5), `result` (если отчёт разобран), `reaped` (только у убранных), `pid` (у убранных — из `attempt_started`) |
+| `attempt_ended` | ран закрыт (движок: попытка отчиталась, не отчиталась или упала; `done` — только при принятом evidence-пакете; `reaped: true` — попытку закрыл `reaper.sweep`, отчёта от неё не было; `refused: true` в `details` — попытку не поднимали вовсе: потолок дела исчерпан (`details.budget`: `{kind, used, limit}`) или нет «ок» человека на это дерево (`details.publish`); `cancelled: true` — попытку **погасили** сигналом: лид отказался от этапа или дела (`duty_cancel`/`duty_cancel_deal`) либо дело закрывают (`close_deal`/`close_stages_done`/`complete_deal` — гасят живые попытки до своего `completed`, тот же механизм, `docs/ENGINE-2.0.md`, раздел 5); у `shell`-попытки в `details` — `exit_code`, `duration_sec`, `must`, `timed_out`, хвосты `stdout_tail`/`stderr_tail`; у гейта — `stage_kind: gate`, `question_id`, `answer`, `allow`) | `run_id`, `stage`, `attempt`, `outcome` (`done`/`failed`/`cancelled`), `kind` (`infra`/`contract`/`capability`/`drained`/`null`; `drained` — не класс политики, а признак «попытку прервал рестарт рантайма»), `reason`, `cancelled` (только у погашенных), `pid` (у погашенных — тот, кому дали сигнал), `base` (база дерева попытки), `commit` (что произвела принятая попытка — коммит движка в её дереве или коммит исполнителя; от него отводится дерево следующего этапа; `null` — произвести было нечего), `details` (в том числе `witness` — принятый свидетель пакета: `commit\|artifacts` / `verdict` / `published` / `plan` / `report` / `nothing`; `verdict`: вердикт гейта с `details`; `branch` — ветка дела `duty/<deal_id>`, на которую движок поставил коммит попытки, `branch_error` — причина, если поставить не удалось; `tree_kept` — путь сохранённого дерева упавшей попытки с незакоммиченной работой), `nothing` (`{reason}` — этап-производитель предъявил пустоту: работы для этапа не было, дерево не тронуто; исход при этом `done`, класса отказа нет, `plan_rethink` не вызывается — `docs/ENGINE-2.0.md`, раздел 5), `result` (если отчёт разобран), `reaped` (только у убранных), `pid` (у убранных — из `attempt_started`) |
 | `released` | движок отпустил дело, оставившееся `running`: попытка закончилась, а продолжения не было (таймаут, `--once`, предел шагов, Ctrl-C, прогон, убитый между шагом и решением). Пишет `dashboard/release.py` — проход, материализующий ответ `transit`: `run`/`wait(retry)` → этот факт и строка `ready`/`todo`; `done`/`failed`/`park` пишутся своими фактами (`completed`, `blocked`), а не `released` | `run_id`, `stage`, `attempt`, `decision` (`run`/`wait`), `wait` (`retry` или `null`), `idle_sec` (сколько журнал молчал), `from`/`to` (строка до и после), `reason` |
 | `blocked` | `status=blocked` | `block_kind`, `reason` |
 | `unblocked` | был `blocked`, стал иной статус | `previous_kind` |
@@ -546,11 +546,11 @@ approved_commit}`.
 
 | шаг | что сверяется | правило отказа | класс |
 |---|---|---|---|
-| 1 | `status` ∈ {`done`, `blocked`, `refused`}; для `done` есть свидетель этапа (`commit`\|`artifacts`, `verdict` или `published` — по `evidence.witness`), `evidence`, `summary`; лишнее поле — предупреждение | `status`, `required`, `extra` | `contract` |
-| 2 | артефакт: относительный путь внутри дерева попытки, файл есть, `sha256` полный и совпадает; отказ называет мерку («искали относительно дерево/каталог попытки») и подсказывает `workspace: worktree`, если файл нашёлся в дереве попытки | `artifact.path`, `artifact.missing`, `artifact.sha256` | `contract` |
+| 1 | `status` ∈ {`done`, `blocked`, `refused`}; для `done` есть свидетель этапа (`commit`\|`artifacts`, `verdict`, `published`, `plan` или `report` — по `evidence.witness`), `evidence`, `summary`; лишнее поле — предупреждение | `status`, `required`, `extra` | `contract` |
+| 2 | артефакт: относительный путь внутри дерева попытки, файл есть, `sha256` полный и совпадает; файл, найденный во втором корне (каталог попытки ↔ дерево попытки), принимается с предупреждением `artifact.elsewhere` о месте находки (0.2.2), а отказ «файла нет нигде» называет мерку и оба корня | `artifact.path`, `artifact.missing`, `artifact.elsewhere` (**warning**), `artifact.sha256` | `contract` |
 | 3 | `git rev-parse --verify <commit>^{commit}` в дереве; коммит не предок базы (предок = «принёс чужое готовое») — **только у этапа, чей свидетель работа** (`commit`/`artifacts`). У вердиктного этапа (`verdict`) названный коммит — ссылка «вот что я смотрел»: проверяется резолв, нерезолв — предупреждение `commit.resolve`, отказа нет | `commit.resolve`, `commit.foreign` (работа); `commit.resolve` (ссылка) | `contract` |
 | 4 | по каждой `{cmd, must}` из `stage.evidence` есть запись с тем же `cmd`, `exit == must` и `started_at` ≥ начала попытки (и не позже «сейчас») | `evidence.missing`, `evidence.exit`, `evidence.stale`, `evidence.future` | `contract` |
-| 5 | `cmd` совпадает со спекой посимвольно после нормализации пробелов: «почти та же команда» | `evidence.substituted` | `contract` |
+| 5 | `cmd` совпадает со спекой посимвольно после нормализации пробелов и снятия внешней обёртки оболочки (`sh -c '<cmd>'` ≡ `<cmd>`, 0.2.2): «почти та же команда» | `evidence.substituted` | `contract` |
 | 6 | `usage.total_tokens` больше `stage.budget.tokens` — работа сделана, но за рамками | `budget.tokens` | `capability` |
 
 Классы: `contract` для шагов 1–5, `capability` для 6. `infra` гейт не выдаёт
@@ -562,13 +562,14 @@ approved_commit}`.
 `attempt_started.contract`): гейт, о правилах которого узнают только из отказа, —
 не контракт, а ловушка. Требуемый свидетель (`required_for_done`) берётся из той же
 функции, что и проверка, — `evidence.witness(stage)`: `commit|artifacts` у обычного
-этапа, `verdict` у этапа с приговором, `published` у публикующего
-(`docs/SPEC.md`, «Свидетель этапа»).
+этапа, `verdict` у этапа с приговором, `published` у публикующего, `plan` у этапа
+плана и `report` у роли-отчёта (`tester`, роли без терминала) — `docs/SPEC.md`,
+«Свидетель этапа»).
 
 Принятый свидетель называется в самом факте: `attempt_ended.details.witness`
-(`commit|artifacts` / `verdict` / `published`, `null` — пакет не принимался) и рядом
-`details.verdict.witness`. По журналу видно не только «принято», но и чем этап
-назвал работу — без этого разбор отказа идёт по коду плагина.
+(`commit|artifacts` / `verdict` / `published` / `plan` / `report`, `null` — пакет не
+принимался) и рядом `details.verdict.witness`. По журналу видно не только «принято»,
+но и чем этап назвал работу — без этого разбор отказа идёт по коду плагина.
 
 Что гейт **не** делает: не запускает объявленные команды повторно, не считает
 дело закрытым (`fold` читает факт), не ставит ретраи — это `transit`/`failures`
@@ -584,9 +585,14 @@ approved_commit}`.
 регулярками нет и не будет — подпись сравнивается с именованным списком целиком,
 а если для класса не хватает источника, это `contract` с цитатой в `reason`.
 
+Отдельный признак `drained` (`failures.DRAINED`) классом не является: в `CLASSES`
+его нет, `retry.on` им не объявить, потому что повторять нечего — попытку погасил
+рестарт рантайма, а не работа (0.2.2).
+
 | источник | класс | повторяется по умолчанию | что видно человеку |
 |---|---|---|---|
-| таймаут попытки | `infra` | да, `max: 4` | `attempt_ended.kind=infra`, `reason` с пределом времени |
+| таймаут попытки или шага-команды | `infra` | да, `max: 4` | `attempt_ended.kind=infra`, `reason` вида «упал по бюджету N мин: … не уложился в бюджет времени» с подсказкой расчёта — падение по часам называется бюджетом, а не смертью процесса |
+| попытку погасил рестарт рантайма (маркер `runtime_draining` в stderr, `SIGINT` рестарта) | `drained` — не класс политики | нет, попытку не проиграли | `kind=drained`, `reason` «попытку прервал рестарт рантайма: …»; счётчики класса и предохранитель дела не растут, этап возвращается `pending`, повтор поднимает диспетчер |
 | код выхода ≠ 0 без `result.json` | `infra` | да, `max: 4` | `kind=infra`, `reason` с кодом выхода |
 | спавн вернул ошибку (нет процесса) | `infra` | да, `max: 4` | `kind=infra`, текст ошибки спавна |
 | шаг-команда умер от сигнала (`shell`, код `128 + N` или отрицательный) | `infra` | да, `max: 4` | `kind=infra`, `reason` вида «команда не дожила: код 143 (сигнал 15)» и `details.signal: 15` |

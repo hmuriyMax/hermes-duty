@@ -471,6 +471,7 @@ def plan(
         base_stages={stage.id: stage for stage in graph},
         started_ids=transit.started_stages(events),
         repo=getattr(spec, "repo", None),
+        base=getattr(spec, "base", None),
     )
     proposal = _lead_event(
         deal,

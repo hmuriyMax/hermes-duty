@@ -294,6 +294,79 @@ def test_documenter_witness_is_the_report(tmp_path: Path) -> None:
     assert silent.ok is False
 
 
+def test_tester_witness_is_the_report_and_the_live_refusal_is_gone(tmp_path: Path) -> None:
+    """`tester` проверяет чужую работу, а не делает свою: свидетель — отчёт.
+
+    Живой случай `d_95f55146` (этап `check2`, 17.11): `make lint` 0,
+    `go test -count=1` 0, sha256 файлов сошлись с отчётом `impl2` — и гейт назвал
+    отчёт контрактом только потому, что в `commit` был назван ПРОВЕРЕННЫЙ коммит
+    `fc4a88e`, уже бывший предком базы (`commit.foreign`). Дело закрылось
+    вопросом человеку.
+    """
+    tree = tmp_path / "tree"
+    base = git_repo(tree)
+    stage = make_stage(role="tester", workspace="worktree")
+
+    assert evidence.witness(stage) == evidence.WITNESS_REPORT
+
+    built = report(tree, commit=base, artifacts=[], summary="lint 0, go test 0, sha256 сходятся с impl2")
+    verdict = verify(built, stage, tree, base=base)
+
+    assert (verdict.ok, verdict.kind, rules(verdict)) == (True, None, []), [str(issue) for issue in verdict.details]
+    assert verdict.witness == evidence.WITNESS_REPORT
+
+
+def test_implementer_with_the_same_report_is_still_a_foreign_commit(tmp_path: Path) -> None:
+    """Та же лазейка для исполнителя не открыта: его свидетель — работа.
+
+    Отчёт один и тот же (коммит-предок базы, нет артефактов), но исполнитель
+    обязан назвать СВОЮ работу, и `commit.foreign` остаётся отказом — иначе
+    проверяющий свидетель стал бы способом закрыть этап чужим готовым.
+    """
+    tree = tmp_path / "tree"
+    base = git_repo(tree)
+    stage = make_stage(role="implementer", workspace="worktree")
+    built = report(tree, commit=base, artifacts=[], summary="lint 0, go test 0, sha256 сходятся с impl2")
+
+    verdict = verify(built, stage, tree, base=base)
+
+    assert evidence.witness(stage) == evidence.WITNESS_WORK
+    assert (verdict.ok, verdict.kind) == (False, "contract")
+    assert rules(verdict) == [evidence.RULE_COMMIT_FOREIGN]
+
+
+def test_tester_closes_on_a_summary_without_commit_or_artifacts(tmp_path: Path) -> None:
+    """Тестер без коммита и без артефактов закрывается непустым `summary`."""
+    stage = make_stage(role="tester")
+    built = {"status": "done", "summary": "прогнал go test -count=1 ./...: зелёное", "evidence": []}
+
+    verdict = verify(built, stage, tmp_path)
+
+    assert (verdict.ok, verdict.kind) == (True, None), [str(issue) for issue in verdict.errors]
+    silent = verify({"status": "done", "summary": " ", "evidence": []}, stage, tmp_path)
+    assert silent.ok is False
+    assert silent.errors[0].where == "result.json:report"
+
+
+def test_tester_with_a_declared_command_still_needs_its_record(tmp_path: Path) -> None:
+    """Объявленные тестеру команды проверяются по-прежнему: `evidence.missing` — отказ."""
+    stage = make_stage(role="tester", evidence_items=(("go test ./...", 0),))
+    built = {"status": "done", "summary": "прогнал, всё зелёное", "evidence": []}
+
+    verdict = verify(built, stage, tmp_path)
+
+    assert (verdict.ok, verdict.kind) == (False, "contract")
+    assert rules(verdict) == [evidence.RULE_EVIDENCE_MISSING]
+    assert "go test ./..." in str(verdict.errors[0])
+    # Контракт попытки просит у тестера и записи по командам: свидетель-отчёт
+    # не снимает с роли проверку, которую она объявила.
+    assert evidence.report_schema(stage)["required_for_done"] == [
+        evidence.WITNESS_REPORT,
+        "evidence",
+        "summary",
+    ]
+
+
 def test_done_needs_no_evidence_when_the_stage_declared_none(tmp_path: Path) -> None:
     """Этап без объявленных команд не требует `evidence`: контракт и гейт — одно.
 
@@ -425,20 +498,52 @@ def test_missing_artifact_in_a_tree_stage_names_the_tree(tmp_path: Path) -> None
     assert "искали относительно дерево попытки" in message
 
 
-def test_artifact_in_the_attempt_tree_hints_workspace_worktree(tmp_path: Path) -> None:
-    """Регрессия на E2E `d_221d021a`: файл есть в дереве, а мерка — каталог попытки.
+def test_artifact_in_the_attempt_tree_is_accepted_with_the_place_named(tmp_path: Path) -> None:
+    """Файл есть в дереве, а мерка — каталог попытки: работа принимается.
 
-    Тестер скопировал дерево `impl` в свою рабочую область, прогнал тесты и
-    отчитался артефактом — гейт честно отказывал, потому что по мерке каталога
-    попытки файла нет. Отказ обязан назвать подсказку, а не только «нету».
+    Регрессия на E2E `d_221d021a`, добитая в 0.2.2: тестер скопировал дерево
+    `impl` в свою рабочую область, прогнал тесты и отчитался артефактом — гейт
+    отказывал, потому что по мерке каталога попытки файла нет. Работа есть, а
+    где именно лежит файл — форма записи, а не содержание. Поэтому находка во
+    втором корне принимается, а её место называется в `details`.
     """
     path, digest = write(tmp_path / "tree", "dashboard/failures.py", "классы отказа\n")
     built = report(tmp_path, artifacts=[{"path": path, "sha256": digest}])
     verdict = verify(built, make_stage(), tmp_path)
+    assert (verdict.ok, rules(verdict)) == (True, []), [str(issue) for issue in verdict.errors]
+    assert warnings(verdict) == [evidence.RULE_ARTIFACT_ELSEWHERE]
+    assert f"{(tmp_path / 'tree' / path).resolve()}" in str(verdict.warnings[0])
+
+
+def test_artifact_in_the_attempt_dir_is_accepted_from_a_worktree_stage(tmp_path: Path) -> None:
+    """Обратное направление: этап с деревом отчитался файлом из каталога попытки.
+
+    Живые дела `d_b9c480c8`, `d_76b269ce`, `d_95f55146`: артефакт
+    `.duty/duty_test.log` объявлен от дерева, а лежит в каталоге попытки — гейт
+    отказывал три этапа подряд за то, что файл лежит рядом.
+    """
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    report(tree)
+    path, digest = write(tmp_path, ".duty/duty_test.log", "ok\n")
+    built = report(tree, artifacts=[{"path": path, "sha256": digest}])
+    verdict = verify(built, make_stage(workspace="worktree"), tmp_path, root=tree)
+    assert (verdict.ok, rules(verdict)) == (True, []), [str(issue) for issue in verdict.errors]
+    assert warnings(verdict) == [evidence.RULE_ARTIFACT_ELSEWHERE]
+    assert f"{(tmp_path / path).resolve()}" in str(verdict.warnings[0])
+
+
+def test_artifact_found_nowhere_names_both_roots(tmp_path: Path) -> None:
+    """«Файла нет нигде» — отказ, и текст называет оба корня, где искали."""
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    report(tree)
+    built = report(tree, artifacts=[{"path": "нет-такого.go", "sha256": "1" * 64}])
+    verdict = verify(built, make_stage(workspace="worktree"), tmp_path, root=tree)
     message = str(verdict.errors[0])
     assert rules(verdict) == [evidence.RULE_ARTIFACT_MISSING]
-    assert f"файл есть в дереве попытки ({(tmp_path / 'tree' / path).resolve()})" in message
-    assert "укажи workspace: worktree, чтобы работать в дереве" in message
+    assert f"файла нет: {tree.resolve() / 'нет-такого.go'}" in message
+    assert str(tmp_path.resolve()) in message
 
 
 def test_artifact_hint_is_not_invented_when_the_tree_has_no_file(tmp_path: Path) -> None:
@@ -607,6 +712,40 @@ def test_command_with_different_spacing_is_the_same_command(tmp_path: Path) -> N
     built = report(tmp_path, evidence=[{"cmd": " go test ./...  ", "exit": 0, "started_at": STARTED}])
     verdict = verify(built, stage, tmp_path)
     assert (verdict.ok, verdict.kind) == (True, None)
+
+
+@pytest.mark.parametrize(
+    "declared",
+    ["sh -c 'make lint'", 'bash -c "make lint"', "sh -lc 'make  lint'"],
+)
+def test_shell_wrapper_in_the_spec_is_the_same_command(tmp_path: Path, declared: str) -> None:
+    """`sh -c '<cmd>'` в старой спеке ≡ `<cmd>`: обёртка — форма запуска, не команда.
+
+    Старые спеки (1.x seed, планы до 0.2.1, живые дела) несут `sh -c '…'`, а роль
+    запускает инструмент напрямую — гард терминала режет обёртку. Прогон честный,
+    и отказ `evidence.substituted` за форму записи стоил дел `d_fb987c74` и
+    `d_fe6c91d0`.
+    """
+    stage = make_stage(evidence_items=((declared, 0),))
+    built = report(tmp_path, evidence=[{"cmd": "make lint", "exit": 0, "started_at": STARTED}])
+
+    verdict = verify(built, stage, tmp_path)
+
+    assert (verdict.ok, verdict.kind) == (True, None), [str(issue) for issue in verdict.errors]
+    # И обратное направление: честный прогон в обёртке против спеки без неё — та же команда.
+    stage_plain = make_stage(evidence_items=(("make lint", 0),))
+    wrapped = report(tmp_path, evidence=[{"cmd": declared, "exit": 0, "started_at": STARTED}])
+    assert verify(wrapped, stage_plain, tmp_path).ok is True
+
+
+def test_wrapper_does_not_excuse_a_substituted_command(tmp_path: Path) -> None:
+    """Обёртка снимается, а подмена под ней остаётся подменой: другая команда — отказ."""
+    stage = make_stage(evidence_items=(("sh -c 'go test -count=1 ./...'", 0),))
+    built = report(tmp_path, evidence=[{"cmd": "go test -count 1 ./...", "exit": 0, "started_at": STARTED}])
+    verdict = verify(built, stage, tmp_path)
+    assert verdict.ok is False
+    assert rules(verdict) == [evidence.RULE_EVIDENCE_SUBSTITUTED]
+    assert "-count=1" in str(verdict.errors[0])
 
 
 # ---------------------------------------------------------------- 6. бюджет

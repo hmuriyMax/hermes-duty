@@ -1611,6 +1611,48 @@ def test_shell_evidence_is_warning_not_refusal(tmp_path: Path):
     assert [(issue.rule, issue.severity) for issue in found] == [("kind.evidence", "warning")]
 
 
+def test_evidence_wrapped_in_a_shell_is_a_warning(tmp_path: Path):
+    """`sh -c '<cmd>'` в `evidence` — предупреждение, а не отказ (0.2.2).
+
+    Спека 1.x с такой записью уже живёт и работать по ней можно, но объявлена она
+    не так, как её запускают: гейт пакета снимает обёртку, чтобы не назвать честный
+    прогон подменой. План такую же запись у этапа-работы отклоняет
+    (`plan.evidence.shell`), а seed-спеки план не проходят — поэтому здесь
+    предупреждение.
+    """
+    found = issues(
+        tmp_path,
+        shell_spec(
+            stage="    role: implementer\n    evidence: [{cmd: \"sh -c 'make lint'\", must: 0}]\n"
+        ),
+    )
+
+    assert [issue.rule for issue in found if issue.severity == "warning"] == ["evidence.shell"]
+    assert "объявляй команду так, как её запускают" in next(
+        issue.message for issue in found if issue.rule == "evidence.shell"
+    )
+    assert [issue.rule for issue in found if issue.severity != "warning"] == []
+
+
+def test_evidence_wrapper_on_a_shell_stage_is_legal(tmp_path: Path):
+    """У этапа-команды обёртка законна: `kind: shell` исполняет движок, а не роль.
+
+    Гарда терминала роли здесь нет — предупреждение «объявляй так, как запускают»
+    адресовано роли, а у команды запускает движок (то же условие, что в
+    `plan.evidence.shell`). Иначе спека шумит на записи, которая ничего не теряет.
+    """
+    found = issues(
+        tmp_path,
+        shell_spec(
+            stage="    kind: shell\n    cmd: \"true\"\n"
+            "    evidence: [{cmd: \"bash -c 'go test ./...'\", must: 0}]\n"
+        ),
+    )
+
+    assert "evidence.shell" not in rules(found)
+    assert [issue.rule for issue in found if issue.severity == "warning"] == ["kind.evidence"]
+
+
 def test_unknown_kind_is_refused(tmp_path: Path):
     """Неизвестный вид этапа — отказ со списком допустимых: опечатка не «agent»."""
     found = issues(tmp_path, shell_spec(stage="    kind: wizard\n    cmd: \"true\"\n"))
@@ -1975,9 +2017,26 @@ BASE_STAGES = {
 }
 
 
+def plan_base() -> dict[str, Any]:
+    """Контекст базы для тестов, которые судят не базу: она объявлена и годна.
+
+    Правило `plan.base` (0.2.2) требует, чтобы worktree-этап отводился от
+    существующего rev, а `BASE_STAGES` держит worktree-этап `feed`. Здесь
+    проверяются другие правила плана, поэтому база дана, а `exists` отвечает
+    «есть» — сам гвард базы проверяет `tests/test_plan_base.py`.
+    """
+    return {"repo": str(ROOT), "base": "HEAD", "exists": lambda *_args: True}
+
+
 def plan(raw: list, charter: Any = None) -> tuple:
     """`spec.parse_plan` с хартией по умолчанию и seed-графом `BASE_STAGES`."""
-    return spec_module.parse_plan(raw, charter=charter or spec_module.Charter(), base_stages=BASE_STAGES)
+    context = plan_base()
+    return spec_module.parse_plan(
+        raw,
+        charter=charter or spec_module.Charter(),
+        base_stages=BASE_STAGES,
+        **context,
+    )
 
 
 def plan_rules(raw: list, charter: Any = None) -> set[str]:
@@ -2271,7 +2330,7 @@ def test_replay_does_not_reject_a_historically_accepted_shell_wrapper():
             "evidence": [{"cmd": "sh -c 'go test ./...'", "must": 0}]}]
 
     live, found = spec_module.parse_plan(
-        raw, charter=spec_module.Charter(), base_stages=BASE_STAGES
+        raw, charter=spec_module.Charter(), base_stages=BASE_STAGES, **plan_base()
     )
     assert [issue.rule for issue in found] == ["plan.evidence.shell"]
 
@@ -2382,6 +2441,7 @@ def test_parse_plan_edit_of_a_not_started_stage_changes_its_fields():
           "evidence": [{"cmd": "go build ./...", "must": 0}], "needs": ["plan"]}],
         charter=spec_module.Charter(),
         base_stages=BASE_STAGES,
+        **plan_base(),
     )
     assert found == []
     assert [stage.id for stage in stages] == ["feed"]
@@ -2398,6 +2458,7 @@ def test_parse_plan_edit_of_a_started_stage_names_the_stage():
         charter=spec_module.Charter(),
         base_stages=BASE_STAGES,
         started_ids=("feed",),
+        **plan_base(),
     )
     assert stages == ()
     assert [issue.rule for issue in found] == ["plan.edit"]
@@ -2466,7 +2527,9 @@ def test_parse_plan_edit_of_a_titled_stage_keeps_the_title(record: dict[str, Any
             id="feed", role="implementer", title="Правка движка", needs=("plan",), workspace="worktree"
         ),
     }
-    stages, found = spec_module.parse_plan([record], charter=spec_module.Charter(), base_stages=base)
+    stages, found = spec_module.parse_plan(
+        [record], charter=spec_module.Charter(), base_stages=base, **plan_base()
+    )
     assert found == []
     assert (stages[0].cmd, stages[0].title) == ("go vet ./...", want_title)
 

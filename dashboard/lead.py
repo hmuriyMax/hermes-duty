@@ -720,6 +720,19 @@ def _attempts_lines(events: list[dict[str, Any]], now: int) -> list[str]:
     return out
 
 
+def _ceiling_source(charter: Any) -> str:
+    """Откуда потолок графа: пресет размера дела или объявление хартии.
+
+    Без источника число читается как выдумка движка: лид либо боится растить граф,
+    либо растёт до отказа `charter.max_stages` и узнаёт правило из отказа. Размер
+    дела (0.2.2, `charter.size`) — пресет, и он называется именно пресетом.
+    """
+    size = str(getattr(charter, "size", "") or "")
+    if size:
+        return f"пресет размера {size}"
+    return "max_stages хартии или умолчание движка"
+
+
 def _budget_line(spec: Any, events: list[dict[str, Any]]) -> str:
     """Остаток бюджета дела словами — тем же расчётом, что у поверхностей.
 
@@ -874,7 +887,8 @@ def brief(
         lines += ["", "## Хартия и seed-план"]
         if charter is not None:
             lines.append(
-                f"- потолок плана: {getattr(charter, 'max_stages', spec_module.DEFAULT_MAX_STAGES)} этапов; "
+                f"- потолок плана: {getattr(charter, 'max_stages', spec_module.DEFAULT_MAX_STAGES)} этапов "
+                f"({_ceiling_source(charter)}); "
                 f"роли: {', '.join(getattr(charter, 'allowed_roles', ()) or ()) or 'не ограничены'}; "
                 f"виды: {', '.join(getattr(charter, 'allowed_kinds', ()) or ()) or '—'}"
             )

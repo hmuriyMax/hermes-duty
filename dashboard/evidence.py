@@ -129,6 +129,11 @@ RULE_REQUIRED = "required"
 RULE_EXTRA = "extra"
 RULE_ARTIFACT_PATH = "artifact.path"
 RULE_ARTIFACT_MISSING = "artifact.missing"
+# Файл есть, но не в том корне, от которого объявлен (0.2.2). Отдельное имя, а не
+# `artifact.missing` с предупреждением: разбор отказов считает их по правилу
+# (`docs/SPEC.md`, `contract_refusals.by_rule`), и найденный файл в той же куче,
+# что и пропавшие, читался бы как «артефактов не было вовсе».
+RULE_ARTIFACT_ELSEWHERE = "artifact.elsewhere"
 RULE_ARTIFACT_SHA = "artifact.sha256"
 RULE_COMMIT_RESOLVE = "commit.resolve"
 RULE_COMMIT_FOREIGN = "commit.foreign"
@@ -180,6 +185,21 @@ WITNESS_REPORT = "report"
 # было нечего (`nothing.reason`, `nothing.dirty`).
 WITNESS_NOTHING = "nothing"
 
+# Роли, чей отчёт и есть свидетель (0.2.2): они проверяют чужую работу, а не
+# делают свою. `EVIDENCE_FREE_ROLES` сюда входит целиком, а `tester` стоит рядом
+# отдельным именем, и это не дубль: набор `EVIDENCE_FREE_ROLES` читает ещё и
+# `spec.parse_plan` (`produces` — этапу плана надо объявить `evidence`), и
+# добавление туда тестера сняло бы с него обязанность объявлять проверяющие
+# команды, хотя терминал у него есть и команды он гоняет.
+#
+# Цена прежнего поведения видна в живом журнале: 18 отказов `commit.foreign` за
+# неделю, из них 9 — на этапах `tester`, и последний честный (дело `d_95f55146`,
+# этап `check2`: `make lint` 0, `go test -count=1` 0, sha256 файлов сошлись с
+# отчётом `impl2`) лёг контрактом только за то, что в `commit` был назван
+# ПРОВЕРЕННЫЙ коммит `fc4a88e`, который к моменту проверки уже был предком базы.
+# Работу эта проверка не находит — она её запрещает называть.
+REPORT_WITNESS_ROLES = (*spec_module.EVIDENCE_FREE_ROLES, "tester")
+
 # Имя отчёта в тексте отказа: `result.json:evidence[0].exit` читается как
 # `file:line` спеки, только «строка» здесь — путь внутри отчёта.
 REPORT_NAME = "result.json"
@@ -198,6 +218,11 @@ SHA_LEN = 64
 # С какого сходства команда считается «почти той же»: ниже — уже не подмена, а
 # другая команда (и тогда отказ называется «нет записи», а не «подменил»).
 SIMILAR = 0.8
+
+# Обёртки оболочки — тот же закрытый список, что у спеки (`spec.SHELL_WRAPPERS`):
+# спека отказывает такой записи на входе плана, а гейт пакета считает
+# `sh -c '<cmd>'` и `<cmd>` одной командой (`_strip_shell_wrapper`).
+SHELL_WRAPPERS = tuple(spec_module.SHELL_WRAPPERS)
 
 # Дерево попытки лежит внутри её каталога (`dashboard/runner.py`,
 # `prepare_tree`). Путь нужен отказу `artifact.missing`: «файла нет вовсе» и
@@ -310,13 +335,37 @@ def _stamp(value: Any) -> Optional[int]:
     return int(moment.timestamp())
 
 
-def _normalise_cmd(value: Any) -> str:
-    """Команда без различий в пробелах: `" ".join(text.split())`.
+def _strip_shell_wrapper(text: str) -> str:
+    """`sh -c '<cmd>'` → `<cmd>`: обёртка задаёт форму запуска, а не команду.
 
-    Нормализация — только про пробелы: текст команды, меняющий смысл от
-    порядка слов или от неразрывного пробела, обязан совпадать посимвольно.
+    Старые спеки (1.x seed, планы до 0.2.1, живые дела) несут `evidence.cmd`
+    завёрнутым в `sh -c '…'`, а роль запускает инструмент напрямую — гард
+    терминала режет обёртку. Прогон честный, команда та же, и судить её как
+    подмену (`evidence.substituted`) значило наказывать за форму записи (живые
+    дела `d_fb987c74`, `d_fe6c91d0`). Поэтому сравнение снимает внешнюю обёртку
+    вместе с её кавычками: `sh -c 'make lint'` ≡ `make lint`. Что под обёрткой —
+    сравнивается как есть, так что настоящая подмена (другая команда) остаётся
+    подменой.
     """
-    return " ".join(str(value or "").split())
+    for wrapper in SHELL_WRAPPERS:
+        if not text.startswith(wrapper + " ") and text != wrapper:
+            continue
+        rest = text[len(wrapper):].strip()
+        if len(rest) >= 2 and rest[0] == rest[-1] and rest[0] in "\"'":
+            rest = rest[1:-1].strip()
+        return rest
+    return text
+
+
+def _normalise_cmd(value: Any) -> str:
+    """Команда без различий в пробелах и без обёртки оболочки.
+
+    Нормализация — только про форму записи: пробелы схлопываются, внешний
+    `sh -c '<cmd>'` снимается (`_strip_shell_wrapper`). Текст команды, меняющий
+    смысл от порядка слов или от неразрывного пробела, обязан совпадать
+    посимвольно.
+    """
+    return " ".join(_strip_shell_wrapper(" ".join(str(value or "").split())).split())
 
 
 def _sha256(path: Path) -> Optional[str]:
@@ -376,6 +425,8 @@ def witness(stage: Any) -> str:
     - `role` из `spec.PUBLISHING_ROLES` — этап действует вовне, и его свидетель
       `published: {sha, branch}`, который сверяется с origin строже дерева
       (`runner.published_claim`, `git ls-remote`);
+    - роль из `REPORT_WITNESS_ROLES` — этап проверяет, а не делает: его работа —
+      отчёт, и коммит в нём называет, ЧТО смотрели;
     - всё остальное называет работу: `commit` или `artifacts`.
     """
     if getattr(stage, "verdict", None) is not None:
@@ -387,8 +438,8 @@ def witness(stage: Any) -> str:
         and str(getattr(stage, "kind", spec_module.DEFAULT_STAGE_KIND)) == spec_module.DEFAULT_STAGE_KIND
     ):
         return WITNESS_PLAN
-    if str(getattr(stage, "role", "") or "") in spec_module.EVIDENCE_FREE_ROLES:
-        # Роль без терминала или пишущая документ, а не код: дерево она не меняет,
+    if str(getattr(stage, "role", "") or "") in REPORT_WITNESS_ROLES:
+        # Роль без терминала или проверяющая чужими руками: дерево она не меняет,
         # её работа — отчёт, и свидетель у неё один и тот же (`WITNESS_REPORT`).
         return WITNESS_REPORT
     return WITNESS_WORK
@@ -463,7 +514,7 @@ def _witness_problem(kind: str, result: dict[str, Any]) -> Optional[Issue]:
         return Issue(
             _where(WITNESS_REPORT),
             RULE_REQUIRED,
-            "этап без терминала: нужен summary с находками; commit/artifacts "
+            "этап со свидетелем-отчётом: нужен summary с находками; commit/artifacts "
             "не требуются — работа такого этапа это отчёт",
         )
     if WITNESS_NOTHING in result:
@@ -555,15 +606,29 @@ def _check_schema(result: dict[str, Any], stage: Any, issues: list[Issue]) -> Op
 
 
 def _check_artifacts(
-    entries: list[Any], root: Path, issues: list[Issue], *, measure: str, tree: Path
+    entries: list[Any],
+    root: Path,
+    issues: list[Issue],
+    *,
+    measure: str,
+    tree: Path,
+    attempt: Optional[Path] = None,
 ) -> None:
     """Артефакты в дереве попытки: путь внутри, файл есть, sha256 совпадает.
 
     `measure` — как называется мерка в отказе (`дерево попытки` / `каталог
-    попытки` / `каталог дела`), `tree` — где лежало бы дерево этой попытки.
-    Отсутствующий файл называется вместе с меркой: без неё «файла нет» не
-    говорит, чего не хватило — файла или дерева, которое никто не создавал.
+    попытки` / `каталог дела`), `tree` — где лежало бы дерево этой попытки,
+    `attempt` — каталог попытки: второй корень для той же работы. Файл,
+    найденный во втором корне, **принимается**: где именно он лежит — форма
+    записи, а не содержание работы (живые дела `d_b9c480c8`, `d_76b269ce`,
+    `d_95f55146`: артефакт `.duty/duty_test.log` объявлен от дерева, а лёг в
+    каталог попытки). Место находки называется предупреждением `artifact.elsewhere`
+    в `details`, а `artifact.missing` остаётся для «файла нет нигде» — с обоими
+    корнями в тексте, чтобы человек не догадывался, где искали. Имена разные
+    намеренно: найденный файл и пропавший не должны складываться в одно правило
+    при разборе отказов (`contract_refusals.by_rule`).
     """
+    others = [path for path in (tree, attempt) if path is not None and path != root]
     for index, entry in enumerate(entries):
         where = _where("artifacts", index)
         if not isinstance(entry, dict):
@@ -603,20 +668,35 @@ def _check_artifacts(
             )
             continue
         if not target.is_file():
-            # Мерка в отказе — часть контракта: «файла нет» без неё заставляет
-            # человека гадать, чего не хватило — файла или дерева.
-            message = f"файла нет: {target}; искали относительно {measure}"
-            if tree != root:
-                in_tree = (tree / relative).resolve()
-                if in_tree.is_file():
-                    # Файл в дереве попытки есть, а этап работал в каталоге —
-                    # ровно случай E2E `d_221d021a`: отчёт верный, мерка чужая.
-                    message += (
-                        f"; файл есть в дереве попытки ({in_tree}) — этап работает в каталоге "
-                        "попытки, укажи workspace: worktree, чтобы работать в дереве"
+            # Второй корень: та же работа, другая мерка. Принимается, но
+            # называется — иначе «где лежит файл» выяснялось бы руками.
+            found = next(
+                (
+                    candidate
+                    for candidate in ((other / relative).resolve() for other in others)
+                    if candidate.is_file()
+                ),
+                None,
+            )
+            if found is not None:
+                issues.append(
+                    Issue(
+                        f"{where}.path",
+                        RULE_ARTIFACT_ELSEWHERE,
+                        f"артефакт найден не там, где искали: {found}; работа принята — "
+                        f"объявляй путь от того корня, где этап работает ({measure})",
+                        severity=WARNING,
                     )
-            issues.append(Issue(f"{where}.path", RULE_ARTIFACT_MISSING, message))
-            continue
+                )
+                target = found
+            else:
+                # Мерка в отказе — часть контракта: «файла нет» без неё заставляет
+                # человека гадать, чего не хватило — файла или дерева.
+                message = f"файла нет: {target}; искали относительно {measure}"
+                if others:
+                    message += f" и {', '.join(str(other) for other in others)}"
+                issues.append(Issue(f"{where}.path", RULE_ARTIFACT_MISSING, message))
+                continue
         claimed = entry.get("sha256")
         claimed_text = claimed.strip().lower() if isinstance(claimed, str) else ""
         if len(claimed_text) != SHA_LEN:
@@ -1066,7 +1146,14 @@ def verify(
             _check_nothing_work(commit_text, artifacts, root_path, base, issues)
             _check_nothing(root_path, base, issues)
         else:
-            _check_artifacts(list(artifacts or []), root_path, issues, measure=measure, tree=tree_path)
+            _check_artifacts(
+                list(artifacts or []),
+                root_path,
+                issues,
+                measure=measure,
+                tree=tree_path,
+                attempt=Path(workdir).resolve(),
+            )
             if commit_text:
                 # Коммит — свидетель РАБОТЫ (`witness` = `commit|artifacts`). У
                 # вердиктного этапа, у публикующего, у этапа плана и у роли с
@@ -1132,9 +1219,12 @@ def report_schema(stage: Any) -> dict[str, Any]:
     wanted = witness(stage)
     required = [wanted, "evidence", "summary"]
     if wanted == WITNESS_REPORT:
-        # Отчёт и есть свидетель: `evidence` у роли без терминала пуст, а
-        # `commit|artifacts` взять неоткуда — требование повторяло бы witness.
-        required = [WITNESS_REPORT, "summary"]
+        # Отчёт и есть свидетель: `commit|artifacts` взять неоткуда — требование
+        # повторяло бы witness. Объявленные команды — другое дело: их гейт
+        # проверяет отдельно от свидетеля (`_check_evidence`), поэтому роль,
+        # которая их объявила (tester гоняет `go test` и `make lint`), обязана
+        # принести и записи по ним.
+        required = [WITNESS_REPORT, "summary"] if not evidence else [WITNESS_REPORT, "evidence", "summary"]
     verdict: dict[str, str] = {}
     if wanted == WITNESS_VERDICT:
         verdict = {

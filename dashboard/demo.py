@@ -25,16 +25,28 @@
 3. гейт ребёнка открывается завершением родителя, а не вручную;
 4. `/now`, `/deal` и журнал говорят одно и то же про одно дело;
 5. `kanban.db` после прогона не изменился ни на байт (инвариант наблюдателя);
-6. повторный `ingest` не плодит событий.
+6. повторный `ingest` не плодит событий;
+7. две параллельные полосы живут каждая в своей ветке и своём дереве, этап-слияние
+   собирает их в ОДИН коммит с двумя родителями, а конфликт двух полос в одном
+   файле не «закрывается» стратегией: движок называет файлы, сохраняет деревья
+   полос и поднимает резолвера с обоими диффами (0.2.2).
+
+Граница слияния в прогоне. Полосы и резолвера здесь играет скрипт: демо гоняется
+в гейте и модель не поднимает. Настоящее — всё, что делает движок: `git worktree`
+на полосу, коммит и ветка полосы, слияние из двух полос, конфликт в индексе,
+контракт резолвера на диске и решение гейта пакета по его отчёту.
 """
 
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -222,6 +234,360 @@ def _seed_observed(board: Path, now: int) -> dict[str, Any]:
     return {"task_id": task_id, "path": board}
 
 
+# ------------------------------------------------------- слияние полос (0.2.2)
+#
+# Сценарий демо для fan-in: две полосы от одной базы, чистый merge и конфликт двух
+# полос в ОДНОМ файле. Требование, ради которого версия делалась (Макс, 18.11):
+# «каждое изменение — в своём ворктри/ветке, этап слияния вливает их в единую
+# ветку дела, при этом решая конфликты и не теряя логику».
+#
+# Модель здесь не поднимается: демо гоняется в гейте. Роль играет `Scripted`, а
+# всё, что доказывает слияние, делает движок по-настоящему — дерево `git worktree`
+# на полосу, коммит и ветку полосы, слияние с двумя родителями, конфликт в индексе
+# и решение гейта пакета по отчёту резолвера.
+
+
+def _module(name: str, filename: str) -> Any:
+    """Модуль плагина под общим именем: второй копии схемы в процессе не будет."""
+    loaded = sys.modules.get(name)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parent / filename
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - файл выпал из сборки
+        raise DemoError(f"модуль не найден: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def git(cwd: Path, *args: str) -> str:
+    """`git` в песочнице демо: подпись задаётся здесь, чужие настройки не читаются."""
+    done = subprocess.run(
+        ["git", "-C", str(cwd), "-c", "user.name=duty-demo", "-c", "user.email=demo@local", *args],
+        capture_output=True,
+        text=True,
+    )
+    if done.returncode != 0:
+        raise DemoError(f"git {' '.join(args)}: {(done.stderr or done.stdout).strip() or done.returncode}")
+    return done.stdout.strip()
+
+
+def git_optional(cwd: Path, *args: str) -> str:
+    """`git` без отказа: пустая строка — «не нашлось» (ветки, которой ещё нет)."""
+    try:
+        return git(cwd, *args)
+    except DemoError:
+        return ""
+
+
+def build_merge_repo(root: Path) -> tuple[Path, str]:
+    """Репозиторий полос: одна база и два файла — от неё отводятся деревья полос."""
+    repo = root / "repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    git(repo, "init", "-q", "-b", "main")
+    (repo / "a.txt").write_text("общая база\n", encoding="utf-8")
+    (repo / "shared.txt").write_text("общая строка\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "init")
+    return repo, git(repo, "rev-parse", "HEAD")
+
+
+def merge_spec_text(repo: Path, base: str) -> str:
+    """Спека сценария: две полосы в своих деревьях, слияние, проверка за слиянием.
+
+    `needs` слияния названы в порядке, отличном от порядка объявления полос: так
+    видно, что вливание идёт по объявлению, а не по времени готовности полос.
+    """
+    return (
+        "duty: demo-lanes\n"
+        f"repo: {repo}\n"
+        f"base: {base}\n"
+        "stages:\n"
+        "  - {id: impl_a, role: implementer, workspace: worktree, parallel_with: [impl_b]}\n"
+        "  - {id: impl_b, role: implementer, workspace: worktree, parallel_with: [impl_a]}\n"
+        "  - {id: join, kind: merge, needs: [impl_b, impl_a], workspace: worktree}\n"
+        "  - {id: gates, role: tester, workspace: worktree, needs: [join]}\n"
+    )
+
+
+def lane_act(name: str, text: str) -> Callable[[Path, dict[str, Any]], dict[str, Any]]:
+    """Полоса: правит свой файл и называет его артефактом (коммит делает движок)."""
+
+    def act(tree: Path, contract: dict[str, Any]) -> dict[str, Any]:
+        path = tree / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return {
+            "status": "done",
+            "summary": f"полоса {contract.get('stage')}: правка {name}",
+            "artifacts": [{"path": name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}],
+            "evidence": [],
+        }
+
+    return act
+
+
+def resolver_act(text: str) -> Callable[[Path, dict[str, Any]], dict[str, Any]]:
+    """Резолвер: первая попытка отказывается, вторая разводит обе стороны и коммитит.
+
+    Отказ первой попытки — исход «не смог»: движок обязан назвать конфликт файлами
+    (`merge.conflict`) и сохранить деревья полос, а не закрыть дело тишиной.
+    Вторая попытка идёт в сохранённом дереве (состояние merge не отменялось) и
+    получает merge-коммит с двумя родителями.
+    """
+
+    def act(tree: Path, contract: dict[str, Any]) -> dict[str, Any]:
+        merge = contract.get("merge") or {}
+        if int(contract.get("attempt") or 0) == 1:
+            return {
+                "status": "refused",
+                "summary": "конфликт не разведён: стороны расходятся по существу",
+                "evidence": [],
+            }
+        name = str((merge.get("conflict_files") or ["shared.txt"])[0])
+        (tree / name).write_text(text, encoding="utf-8")
+        git(tree, "add", name)
+        git(tree, "commit", "-q", "--no-edit")
+        return {
+            "status": "done",
+            "summary": f"конфликт {name} разведён: обе стороны на месте",
+            "commit": git(tree, "rev-parse", "HEAD"),
+            "evidence": [],
+            "merge": {
+                "files": list(merge.get("conflict_files") or []),
+                "sides": [
+                    {
+                        "lane": str(lane.get("lane") or ""),
+                        "sha": str(lane.get("sha") or ""),
+                        "intent": f"полоса {lane.get('lane')} правила {name} по-своему",
+                        "joined": "строка стороны сохранена в объединённом файле",
+                    }
+                    for lane in merge.get("lanes") or ()
+                ],
+            },
+        }
+
+    return act
+
+
+class Scripted:
+    """Скрипт за роль: `acts` — что «агент» делает на каждом этапе.
+
+    Отчёт пишется туда, куда велит контракт (`report_to`), поэтому его судит тот
+    же гейт пакета, что и настоящую попытку. Этап, которого скрипт не ждал,
+    роняет прогон: молча поднятый процесс означал бы, что движок делает не то.
+    """
+
+    def __init__(self, acts: dict[str, Callable[[Path, dict[str, Any]], dict[str, Any]]]) -> None:
+        self.acts = acts
+        self.calls: list[dict[str, Any]] = []
+        self.contracts: list[dict[str, Any]] = []
+        self.pid = 5150
+        self.exit_code = 0
+        self.exit = 0
+        self.stderr_text = ""
+        self.stderr_head = ""
+
+    def __call__(self, cmd: list[str], cwd: Path, env: Any = None) -> "Scripted":
+        query = Path(cmd[list(cmd).index("--query-file") + 1])
+        contract = json.loads(query.read_text(encoding="utf-8"))
+        stage = str(contract.get("stage") or "")
+        self.calls.append({"stage": stage, "cwd": str(cwd)})
+        self.contracts.append(contract)
+        act = self.acts.get(stage)
+        if act is None:
+            raise DemoError(f"прогон поднял процесс на этапе {stage!r}, которого не ждал")
+        report = act(Path(cwd), contract)
+        target = Path(str(contract.get("report_to") or ""))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+        return self
+
+    def next_line(self, timeout: float = 0.0) -> Optional[str]:
+        return None
+
+    def finished(self) -> bool:
+        return True
+
+    def wait(self, timeout: Optional[float] = None) -> Optional[int]:
+        return self.exit
+
+    def stop(self, grace: float = 10) -> Optional[int]:
+        return self.exit
+
+
+def merge_scenario(
+    api: Any, conn: sqlite3.Connection, home: Path, step: Callable[..., None]
+) -> dict[str, Any]:
+    """Две полосы, чистый merge и конфликт двух полос в одном файле.
+
+    Полосы идут шагом за шагом, а не пачкой: пачку поднимает `transit`, а прогон
+    проходит этапы по одному — правило «полоса в своём дереве и своей ветке» от
+    этого не меняется, и проверяется именно оно.
+    """
+    runner = _module("hermes_duty_runner", "runner.py")
+    spec_module = runner.spec_module
+    deals = api.deals
+    journal = api.journal
+    root = home / "lanes"
+    repo, base = build_merge_repo(root)
+
+    def lane_run(stage_spec: Any, deal: Any, acts: dict[str, Any], stage: str) -> dict[str, Any]:
+        report = runner.run_stage(conn, stage_spec, deal, stage, 1, home=home, spawn=Scripted(acts))
+        if report.get("outcome") != "done":
+            raise DemoError(f"этап {stage} не закрылся: {report.get('reason')}")
+        return report
+
+    # 1. Чистый fan-in: две полосы правят разные файлы.
+    clean_path = root / "clean.yaml"
+    clean_path.write_text(merge_spec_text(repo, base), encoding="utf-8")
+    clean_spec = spec_module.load_spec(clean_path)
+    created = deals.create_deal(conn, repo=str(repo), title="две полосы и слияние", body="")
+    clean_deal = deals.deal_row(conn, str(created["deal"]["id"]))
+    own = {"impl_a": ("a.txt", "работа полосы a\n"), "impl_b": ("b.txt", "работа полосы b\n")}
+    for stage, (name, text) in own.items():
+        lane_run(clean_spec, clean_deal, {stage: lane_act(name, text)}, stage)
+    lane_shas = {stage: git(repo, "rev-parse", runner.lane_branch(clean_deal, stage)) for stage in own}
+    deal_branch_before = git_optional(repo, "rev-parse", "--verify", runner.deal_branch(clean_deal))
+    step(
+        14,
+        "lanes   (две полосы)",
+        f"{clean_deal['id']} · "
+        + ", ".join(f"{stage} {sha[:8]}" for stage, sha in lane_shas.items())
+        + f" · ветка дела: {deal_branch_before or 'не сдвинута'}",
+    )
+
+    # Чистое слияние процессов не поднимает: `spawn` без актов упадёт, если движок
+    # всё-таки решит позвать агента.
+    merged = runner.run_stage(conn, clean_spec, clean_deal, "join", 1, home=home, spawn=Scripted({}))
+    if merged.get("outcome") != "done":
+        raise DemoError(f"чистое слияние не собралось: {merged.get('reason')}")
+    merge_sha = str(merged.get("commit") or "")
+    parents = git(repo, "rev-list", "--parents", "-n", "1", merge_sha).split()
+    after = next(item for item in clean_spec.stages if item.id == "gates")
+    dependent_base = runner.base_of_stage(clean_spec, after, journal.read_events(conn, clean_deal["id"]))
+    merged_tree = runner.attempt_dir(home, clean_deal, "join", 1) / "tree"
+    step(
+        15,
+        "merge   (чистый fan-in)",
+        f"{clean_deal['id']} · коммит {merge_sha[:8]} · родителей {len(parents) - 1} · "
+        f"a.txt+b.txt в дереве · база gates {dependent_base[:8]}",
+        by="engine",
+    )
+
+    # 2. Конфликт: обе полосы правят один файл по-своему.
+    conflict_path = root / "conflict.yaml"
+    conflict_path.write_text(merge_spec_text(repo, base), encoding="utf-8")
+    conflict_spec = spec_module.load_spec(conflict_path)
+    created = deals.create_deal(conn, repo=str(repo), title="две полосы в один файл", body="")
+    conflict_deal = deals.deal_row(conn, str(created["deal"]["id"]))
+    clash = {"impl_a": ("shared.txt", "строка от a\n"), "impl_b": ("shared.txt", "строка от b\n")}
+    for stage, (name, text) in clash.items():
+        lane_run(conflict_spec, conflict_deal, {stage: lane_act(name, text)}, stage)
+    step(
+        16,
+        "conflict (общий файл)",
+        f"{conflict_deal['id']} · обе полосы правили shared.txt",
+    )
+
+    resolver = Scripted({"join": resolver_act("строка от a\nстрока от b\n")})
+    refused = runner.run_stage(conn, conflict_spec, conflict_deal, "join", 1, home=home, spawn=resolver)
+    contract = resolver.contracts[0] if resolver.contracts else {}
+    brief = contract.get("merge") or {}
+    diffs = {str(lane.get("lane") or ""): str(lane.get("diff") or "") for lane in brief.get("lanes") or ()}
+    kept_trees = {stage: runner.attempt_dir(home, conflict_deal, stage, 1) / "tree" for stage in clash}
+    step(
+        17,
+        "resolver(поднят на конфликт)",
+        f"конфликтные файлы: {', '.join(brief.get('conflict_files') or []) or '—'} · "
+        f"диффов в контракте: {len(diffs)} · процессов: {len(resolver.calls)}",
+        by="engine",
+    )
+    if refused.get("outcome") != "failed":
+        raise DemoError(f"отказ резолвера принят как {refused.get('outcome')}: {refused}")
+    # Деревья полос при отказе остаются: в них единственная копия работы сторон.
+    # Снимок берётся здесь — успешное слияние ниже их уберёт, и проверка после
+    # факта мерила бы уже убранное.
+    alive = {stage: tree.is_dir() for stage, tree in kept_trees.items()}
+    step(
+        18,
+        "refused (не развёл)",
+        f"{str(refused.get('kind'))} · деревья полос целы: "
+        f"{sum(1 for alive_ in alive.values() if alive_)}/2 · причина: "
+        f"{str(refused.get('reason'))[:64]}…",
+        by="engine",
+    )
+
+    resolved = runner.run_stage(conn, conflict_spec, conflict_deal, "join", 2, home=home, spawn=resolver)
+    if resolved.get("outcome") != "done":
+        raise DemoError(f"конфликт не разведён на повторе: {resolved.get('reason')}")
+    resolved_sha = str(resolved.get("commit") or "")
+    resolved_parents = git(repo, "rev-list", "--parents", "-n", "1", resolved_sha).split()
+    # Повтор идёт в сохранённом дереве (`tree_reused`), поэтому путь берётся из
+    # отчёта попытки, а не собирается из каталога: это дерево прошлой попытки.
+    merged_text = (Path(str(resolved.get("tree") or "")) / "shared.txt").read_text(encoding="utf-8")
+    branches_after = git(repo, "branch", "--list", "--format=%(refname:short)").splitlines()
+    step(
+        19,
+        "resolved(обе стороны)",
+        f"коммит {resolved_sha[:8]} · родителей {len(resolved_parents) - 1} · "
+        f"shared.txt: {merged_text.replace(chr(10), ' | ').strip()} · "
+        f"ветка дела {git(repo, 'rev-parse', runner.deal_branch(conflict_deal))[:8]}",
+        by="engine",
+    )
+
+    return {
+        "repo": str(repo),
+        "base": base,
+        "clean": {
+            "deal": str(clean_deal["id"]),
+            "lanes": lane_shas,
+            "deal_branch_before": deal_branch_before,
+            "merge": merge_sha,
+            "parents": parents,
+            "base_of_dependent": dependent_base,
+            "deal_branch": git(repo, "rev-parse", runner.deal_branch(clean_deal)),
+            "files": {
+                name: (merged_tree / name).read_text(encoding="utf-8")
+                for name in ("a.txt", "b.txt")
+            },
+            "order": list((_ended(conn, clean_deal["id"], "join") or {}).get("merge", {}).get("order") or ()),
+        },
+        "conflict": {
+            "deal": str(conflict_deal["id"]),
+            "files": list(brief.get("conflict_files") or ()),
+            "diffs": diffs,
+            "refused": str(refused.get("reason") or ""),
+            "trees_kept": {stage: str(tree) for stage, tree in kept_trees.items()},
+            "kept_at_refusal": alive,
+            "merge": resolved_sha,
+            "parents": resolved_parents,
+            "merged_text": merged_text,
+            "lanes_cleaned": [
+                branch
+                for branch in (runner.lane_branch(conflict_deal, stage) for stage in clash)
+                if branch not in branches_after
+            ],
+            "contract": str(contract.get("stage") or ""),
+        },
+    }
+
+
+def _ended(conn: sqlite3.Connection, deal_id: str, stage: str) -> Optional[dict[str, Any]]:
+    """`details` принятого закрытия этапа из журнала: то, что движок записал сам."""
+    journal = _module("hermes_duty_journal", "journal.py")
+    found = [
+        dict((event.get("payload") or {}).get("details") or {})
+        for event in journal.read_events(conn, deal_id)
+        if str(event.get("kind")) == "attempt_ended"
+        and str((event.get("payload") or {}).get("stage")) == stage
+        and str((event.get("payload") or {}).get("outcome")) == "done"
+    ]
+    return found[-1] if found else None
+
+
 def run_demo(
     api: Any,
     *,
@@ -356,6 +722,12 @@ def run_demo(
             for e in journal.read_events(conn, deal_id)
         ]
 
+        # 12. Слияние параллельных полос (0.2.2): своё дерево и своя ветка у каждой
+        #     полосы, fan-in в один коммит, конфликт — через резолвера, а не
+        #     стратегией. Дела сценария свои: слияние живёт в графе дела, а не в
+        #     закрытом основном.
+        merge_facts = merge_scenario(api, conn, sandbox, step)
+
         # ---------------------------------------------------------------- проверки
         def check(name: str, ok: bool, detail: str) -> None:
             checks.append({"name": name, "ok": bool(ok), "detail": detail})
@@ -378,6 +750,36 @@ def run_demo(
         check("kanban.db не изменён", _sha(sand["board"]) == board_before,
               "sha256 чужой БД совпадает с исходным")
 
+        clean, conflict = merge_facts["clean"], merge_facts["conflict"]
+        check("полоса ведёт свою ветку",
+              clean["deal_branch_before"] == ""
+              and bool(clean["lanes"]["impl_a"]) and bool(clean["lanes"]["impl_b"])
+              and clean["lanes"]["impl_a"] != clean["lanes"]["impl_b"],
+              f"ветки полос {clean['lanes']['impl_a'][:8]} и {clean['lanes']['impl_b'][:8]}, "
+              "ветка дела их коммитами не сдвинута")
+        check("чистое слияние — один merge-коммит",
+              len(clean["parents"]) == 3 and set(clean["parents"][1:]) == set(clean["lanes"].values()),
+              f"коммит {clean['merge'][:8]} с двумя родителями, оба файла полос в дереве")
+        check("зависимый этап стоит на merge-коммите",
+              clean["base_of_dependent"] == clean["merge"] and clean["deal_branch"] == clean["merge"],
+              "base_of_stage(gates) = merge-коммит, ветка дела на нём же")
+        check("порядок вливания — объявление", clean["order"] == ["impl_b", "impl_a"],
+              f"needs слияния: {', '.join(clean['order']) or '—'} (не по времени готовности)")
+        check("конфликт назван файлами, полосы целы",
+              "merge.conflict" in conflict["refused"] and "shared.txt" in conflict["refused"]
+              and len(conflict["kept_at_refusal"]) == 2
+              and all(conflict["kept_at_refusal"].values()),
+              "отказ merge.conflict с файлом и обоими sha; деревья полос сохранены")
+        check("резолвер получил оба диффа",
+              set(conflict["diffs"]) == {"impl_a", "impl_b"}
+              and "строка от a" in conflict["diffs"]["impl_a"]
+              and "строка от b" in conflict["diffs"]["impl_b"],
+              "контракт резолвера: конфликтный файл и дифф каждой полосы")
+        check("резолвер сохранил обе стороны",
+              "строка от a" in conflict["merged_text"] and "строка от b" in conflict["merged_text"]
+              and len(conflict["parents"]) == 3 and len(conflict["lanes_cleaned"]) == 2,
+              "в shared.txt обе строки, merge-коммит с двумя родителями, ветки полос убраны")
+
         failed = [c["name"] for c in checks if not c["ok"]]
         if failed:
             raise DemoError("прогон не сошёлся: " + ", ".join(failed))
@@ -394,6 +796,7 @@ def run_demo(
             "steps": steps,
             "checks": checks,
             "ledger": ledger,
+            "merge": merge_facts,
             "now": {"deals": len(now_after), "ids": now_after},
             "pool": {"questions": _questions(sand["pool"])},
             "engine_todo": list(ENGINE_TODO),
@@ -491,6 +894,26 @@ def render_demo(report: dict[str, Any]) -> str:
     out.append("ПРОВЕРКИ")
     for check in report["checks"]:
         out.append(f"  [{'OK' if check['ok'] else 'FAIL'}] {check['name']}: {check['detail']}")
+    merge = report.get("merge") or {}
+    if merge:
+        clean, conflict = merge["clean"], merge["conflict"]
+        out.append("")
+        out.append(f"СЛИЯНИЕ ПОЛОС (настоящий git в песочнице: {merge['repo']})")
+        out.append(f"  база полос {merge['base'][:12]}")
+        out.append(
+            f"  чистое: {clean['deal']} · полосы "
+            + ", ".join(f"{stage} {sha[:8]}" for stage, sha in clean["lanes"].items())
+        )
+        out.append(
+            f"          merge {clean['merge'][:12]} · родителей {len(clean['parents']) - 1} · "
+            f"порядок {', '.join(clean['order'])} · база gates {clean['base_of_dependent'][:12]}"
+        )
+        out.append(f"  конфликт: {conflict['deal']} · файлы {', '.join(conflict['files'])}")
+        out.append(f"          отказ: {conflict['refused'][:96]}")
+        out.append(
+            f"          merge {conflict['merge'][:12]} · родителей {len(conflict['parents']) - 1} · "
+            f"shared.txt: {conflict['merged_text'].strip().replace(chr(10), ' | ')}"
+        )
     out.append("")
     out.append(f"ЧЕГО ЕЩЁ НЕТ (вне {_demo_version()}):")
     for item in report["engine_todo"]:
@@ -508,9 +931,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--keep", action="store_true", help="не удалять песочницу")
     args = parser.parse_args(argv)
-    import importlib.util
-    import sys
-
     here = Path(__file__).resolve().parent
     spec_ = importlib.util.spec_from_file_location("hermes_duty_plugin_api", here / "plugin_api.py")
     assert spec_ is not None and spec_.loader is not None

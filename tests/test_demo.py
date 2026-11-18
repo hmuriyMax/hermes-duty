@@ -124,3 +124,48 @@ def test_demo_refuses_live_root_as_sandbox(demo: Any, tmp_path: Path) -> None:
     live.mkdir()
     with pytest.raises(demo.DemoError):
         demo.build_sandbox(live, live)
+
+
+# ------------------------------------------------- слияние полос (0.2.2)
+
+
+def test_demo_merges_two_lanes_into_one_commit(report: dict) -> None:
+    """Две полосы живут своими ветками, а слияние даёт ОДИН коммит с двумя родителями.
+
+    Ради этого версия и делалась: полоса, объявленная параллельной, не двигает
+    ветку дела, а fan-in собирает обе в один коммит, на котором стоят зависимые
+    этапы (`d_c13d53da`: две полосы, зависимый этап не построился).
+    """
+    clean = report["merge"]["clean"]
+    assert clean["deal_branch_before"] == "", "полоса коммит дела не двигает"
+    assert clean["lanes"]["impl_a"] != clean["lanes"]["impl_b"]
+    assert len(clean["parents"]) == 3, clean["parents"]
+    assert set(clean["parents"][1:]) == set(clean["lanes"].values())
+    assert clean["base_of_dependent"] == clean["merge"], "зависимый этап — на merge-коммите"
+    assert clean["deal_branch"] == clean["merge"], "ветка дела на merge-коммите"
+    assert clean["order"] == ["impl_b", "impl_a"], "порядок вливания — объявление в needs"
+    assert clean["files"] == {"a.txt": "работа полосы a\n", "b.txt": "работа полосы b\n"}
+
+
+def test_demo_raises_a_resolver_on_a_lane_conflict(report: dict) -> None:
+    """Конфликт двух полос поднимает резолвера с обоими диффами, а не стратегию.
+
+    Отказ первой попытки — исход «не смог»: движок называет файлы и сохраняет
+    деревья полос; повтор разводит обе стороны и даёт merge-коммит с двумя
+    родителями, после чего ветки полос убираются.
+    """
+    conflict = report["merge"]["conflict"]
+    assert conflict["files"] == ["shared.txt"]
+    assert "merge.conflict" in conflict["refused"] and "shared.txt" in conflict["refused"]
+    assert conflict["kept_at_refusal"] == {"impl_a": True, "impl_b": True}, "деревья полос целы при отказе"
+    assert set(conflict["diffs"]) == {"impl_a", "impl_b"}, "в контракте дифф каждой полосы"
+    assert "строка от a" in conflict["diffs"]["impl_a"]
+    assert "строка от b" in conflict["diffs"]["impl_b"]
+    assert "строка от a" in conflict["merged_text"] and "строка от b" in conflict["merged_text"]
+    assert len(conflict["parents"]) == 3, "слияние собрано merge-коммитом"
+    assert len(conflict["lanes_cleaned"]) == 2, "ветки полос убраны после успешного слияния"
+
+
+def test_demo_keeps_the_lane_repo_inside_the_sandbox(report: dict) -> None:
+    """Репозиторий полос живёт в песочнице: прогон не трогает живые каталоги."""
+    assert report["merge"]["repo"].startswith(report["home"]), report["merge"]["repo"]

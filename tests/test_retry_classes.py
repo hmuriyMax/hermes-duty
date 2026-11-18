@@ -168,6 +168,7 @@ class Fake:
         self.calls: list[dict[str, Any]] = []
         self.stopped = 0
         self.stderr_text = ""
+        self.stderr_head = ""
 
     # --- то, что делает спавн попытки
     def __call__(self, cmd: list[str], cwd: Path, env: Any = None) -> "Fake":

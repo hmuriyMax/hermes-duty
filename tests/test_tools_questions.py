@@ -223,6 +223,7 @@ class RoleAnswer:
         self.calls: list[dict[str, Any]] = []
         self.contracts: list[dict[str, Any]] = []
         self.stderr_text = ""
+        self.stderr_head = ""
 
     def __call__(self, cmd: list[str], cwd: Path, env: Any = None) -> "RoleAnswer":
         self.calls.append({"cmd": list(cmd), "cwd": Path(cwd)})

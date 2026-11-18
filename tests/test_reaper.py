@@ -661,6 +661,7 @@ class FakeProc:
         self.pid = pid
         self.exit_code = exit_code
         self.stderr_text = ""
+        self.stderr_head = ""
 
     def next_line(self, timeout: float = 0.0) -> Optional[str]:
         return None

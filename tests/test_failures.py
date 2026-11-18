@@ -4,7 +4,8 @@
 
 - класс выводится только из пяти источников (`result.json`, код выхода, наличие
   файла, `Verdict.kind` гейта и подпись сломанного инструмента из закрытого
-  `TOOLCHAIN_SIGNATURES`) и не путается с соседним классом;
+  `TOOLCHAIN_SIGNATURES`); шестой вход — признак дренажа (`drained`), и он не
+  класс, а снятие попытки с политики — и не путается с соседним классом;
 - лимит, пауза и предохранитель на дело — политика (`dashboard/failures.py`), а
   не комментарий: `max: 0` паркует сразу, `on: [contract]` не повторяет `infra`,
   счётчик считается по классу, пауза растёт и упирается в потолок;
@@ -202,6 +203,7 @@ class Fake:
         self.calls: list[dict[str, Any]] = []
         self.stopped = 0
         self.stderr_text = "fake stderr tail"
+        self.stderr_head = "fake stderr head\n"
 
     def __call__(self, cmd: list[str], cwd: Path, env: Any = None) -> "Fake":
         self.calls.append({"cmd": list(cmd), "cwd": Path(cwd)})
@@ -769,6 +771,30 @@ def test_engine_parks_after_retries_are_exhausted(tmp_path: Path) -> None:
     assert len(pool_rows(home)) == 1
     assert deals.deal_row(conn, deal["id"])["status"] == "blocked"
     assert transit.next_stage(spec, events(conn, deal), NOW).what == transit.WAIT_PARKED
+
+
+def test_drain_marker_in_the_head_of_stderr_is_named_drained(tmp_path: Path) -> None:
+    """Маркер дренажа ищется в голове stderr, а не только в хвосте.
+
+    Рантайм печатает его при остановке, но двадцать строк собственного вывода
+    попытки (`runner.STDERR_TAIL`) засыпают голову: у этапа-команды голова и хвост
+    ищутся вместе (`stderr_seen`), теперь так же у попытки-агента. Иначе
+    рестарт гейтвея читался бы обычным инфра-отказом и списывал политику.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = retry_spec(tmp_path, "{max: 0, on: [infra]}")
+    fake = Fake(exit_code=1)
+    fake.stderr_head = "Error: runtime_draining\n"
+    fake.stderr_text = "\n".join(f"строка вывода {number}" for number in range(runner.STDERR_TAIL + 5))
+
+    ended = runner.run_stage(conn, spec, deal, "impl", 1, home=home, spawn=fake, clock=lambda: NOW)
+
+    assert (ended["outcome"], ended["kind"]) == ("failed", failures.DRAINED)
+    # Попытку не проиграли: политика `max: 0` её не паркует.
+    assert ended["park"] is None
+    assert pool_rows(home) == []
 
 
 def test_why_shows_counter_and_retry_at(tmp_path: Path) -> None:

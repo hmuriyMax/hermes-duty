@@ -901,6 +901,20 @@ pre.body {
   cursor: pointer;
 }
 .stage-block + .stage-block .stage-row { border-top: 1px solid var(--border); }
+
+/* Тело этапа: свёрнуто по умолчанию, раскрывается высотой.
+ *
+ * `grid-template-rows: 0fr → 1fr` — единственный способ анимировать «по
+ * содержимому» без замера высоты в JS: строка сетки сама едет к своему размеру,
+ * а `overflow: hidden` у внутреннего слоя режет то, что не влезло (Макс, 18.11:
+ * «этапы по дефолту свёрнуты и разворачиваются с анимацией»). */
+.stage-body {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows .28s ease;
+}
+.stage-block.is-open .stage-body { grid-template-rows: 1fr; }
+.stage-body-inner { min-height: 0; overflow: hidden; }
 .stage-row:hover { background: var(--bg-soft); }
 .stage-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .stage-row .sp { display: none; }
@@ -1541,7 +1555,7 @@ svg.tl-lane-ico { flex: none; width: 12px; height: 12px; fill: none; stroke: cur
 @media (prefers-reduced-motion: reduce) {
   .tl-row, .tl-mini, .tl-stack, .tl-call, .tl-tick { transition: none; }
   .tl-call, .scale-tick, .scale-grid-line, .tl-idle-gap, .tl-silence, .tl-wait,
-  .tl-lane, .tl-row, .stage-row, .att-row { transition: none !important; }
+  .tl-lane, .tl-row, .stage-row, .att-row, .stage-body { transition: none !important; }
   .is-new { animation: none; }
   .is-gone { transition: none; }
 }

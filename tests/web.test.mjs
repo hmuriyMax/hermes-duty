@@ -84,6 +84,21 @@ test('левый столбец: в гуттере только профиль, 
   assert.doesNotMatch(pluginSource, /function DutyLane[\s\S]{0,400}duty-tl-lane-h/, 'десктоп: шапка дорожки с именем этапа вернулась')
 })
 
+test('веб: этапы свёрнуты по умолчанию, раскрытие едет высотой', () => {
+  const css = read('dashboard/web/styles.css')
+  // Все этапы закрыты изначально — включая текущий и упавший (Макс, 18.11).
+  assert.match(app, /rowOpen\(stageOpen, stageShown, stageKey, false\)/, 'веб: этап раскрывается по умолчанию')
+  assert.match(app, /stageDefaults\.set\(stageKey, false\)/, 'веб: клик спорит с умолчанием шейпера')
+  // Тело рендерится всегда и лежит в DOM: раскрытие — класс, а не пересборка.
+  assert.match(app, /class: open \? 'stage-block is-open' : 'stage-block'/, 'веб: блок не помечает раскрытие')
+  assert.match(app, /class: 'stage-body', 'aria-hidden'/, 'веб: у тела этапа нет своей строки')
+  assert.match(css, /\.stage-body \{[^}]*grid-template-rows: 0fr/, 'веб: тело не свёрнуто')
+  assert.match(css, /\.stage-block\.is-open \.stage-body \{ grid-template-rows: 1fr; \}/, 'веб: раскрытие без цели высоты')
+  assert.match(css, /\.stage-body-inner \{ min-height: 0; overflow: hidden; \}/, 'веб: тело не режет содержимое')
+  // Новый этап въезжает: ключи блоков попадают в анимацию входа.
+  assert.match(app, /const ENTERING_RE = \/\^\(lane:\|attempt:\|track:\|stage:\|att:\|block:\)\//, 'веб: блок этапа не анимируется при появлении')
+})
+
 test('веб: пунктир сетки нарисован фоном, а не рамкой', () => {
   const css = read('dashboard/web/styles.css')
   // Ось в движении стоит на дробных координатах, а пунктирная рамка на такой

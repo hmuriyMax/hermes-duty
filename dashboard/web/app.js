@@ -240,7 +240,7 @@ function morphChildren(oldParent, newParent) {
 }
 
 /** Семейства узлов, чьё появление и уход стоят анимации: этапы и попытки. */
-const ENTERING_RE = /^(lane:|attempt:|track:|stage:|att:)/
+const ENTERING_RE = /^(lane:|attempt:|track:|stage:|att:|block:)/
 
 function tagEntering(el) {
   const key = el.getAttribute('data-key') || ''
@@ -1911,11 +1911,14 @@ function attRowNodes(stage, bar, key, open, rebuild) {
 function stageBlockNode(dealId, stage, timeline, rebuild) {
   const view = compactStageView(stage)
   const stageKey = `${dealId}:${view.id}`
-  const open = rowOpen(stageOpen, stageShown, stageKey, view.openByDefault)
+  // По умолчанию свёрнуты все этапы, включая текущий и упавший (Макс, 18.11):
+  // раскрытие — это чтение попыток, а не состояние дела, и оно не должно
+  // разворачиваться само на каждом обновлении. Состояние этапа видно в бейдже.
+  const open = rowOpen(stageOpen, stageShown, stageKey, false)
   if (open) stageShown.add(stageKey)
   // Умолчание раскрытия на текущем кадре: клик читает его отсюда, чтобы после
   // тихого обновления не спорить с устаревшим замыканием.
-  stageDefaults.set(stageKey, view.openByDefault)
+  stageDefaults.set(stageKey, false)
   const bars = stageColumnBars(stage, timeline)
   const nodes = [
     h(
@@ -1929,7 +1932,19 @@ function stageBlockNode(dealId, stage, timeline, rebuild) {
           stageOpen.set(stageKey, !current)
           if (current) stageShown.delete(stageKey)
           else stageShown.add(stageKey)
-          rebuild()
+          // Кадр не пересобираем: пересборка заменила бы узел, и переход высоты
+          // не сыграл бы — этап раскрывался бы рывком. Класс и атрибуты правим
+          // здесь же, а следующий тик обновления нарисует то же состояние (Макс,
+          // 18.11: «разворачивались с анимацией»).
+          const block = document.querySelector(`.stage-block[data-key="block:${stageKey}"]`)
+          if (!block) return
+          block.classList.toggle('is-open', !current)
+          block.querySelector('.stage-row')?.classList.toggle('open', !current)
+          block.querySelector('.stage-body')?.setAttribute('aria-hidden', current ? 'true' : 'false')
+          const row = block.querySelector('.stage-row')
+          if (row) row.setAttribute('aria-expanded', current ? 'false' : 'true')
+          const tog = block.querySelector('.stage-row-tog')
+          if (tog) tog.textContent = current ? '▸' : '▾'
         },
       },
       // Крупно — код этапа: по нему ищут в журнале и графе. Описание из спеки
@@ -1978,8 +1993,11 @@ function stageBlockNode(dealId, stage, timeline, rebuild) {
   // этапом тем же шрифтом, что «ждёт», но не жёлтым (`stage-note`), потому что
   // ждать нечего и чинить нечего.
   if (view.nothingText) nodes.push(h('div', { class: 'stage-note' }, view.nothingText))
-  if (!open) return h('div', { class: 'stage-block', 'data-key': `block:${stageKey}` }, ...nodes)
-  if (!bars.length) nodes.push(h('div', { class: 'att-none muted' }, 'попыток нет'))
+  // Тело рендерится всегда и лежит в DOM свёрнутым (`grid-template-rows: 0fr`):
+  // раскрытие — это смена класса, поэтому браузер анимирует высоту, а пересборка
+  // кадра ничего не рвёт (морф сохраняет узлы по `data-key`).
+  const body = nodes.splice(1)
+  if (!bars.length) body.push(h('div', { class: 'att-none muted' }, 'попыток нет'))
   bars.forEach((bar, index) => {
     // Ключ попытки — её номер, а не место в списке: новая попытка сдвинула бы
     // индексы, и раскрытие переехало бы на чужую строку.
@@ -1988,9 +2006,18 @@ function stageBlockNode(dealId, stage, timeline, rebuild) {
     attDefaults.set(attKey, barView.openByDefault)
     const attOpenNow = rowOpen(attOpen, attShown, attKey, barView.openByDefault)
     if (attOpenNow) attShown.add(attKey)
-    nodes.push(...attRowNodes(stage, bar, attKey, attOpenNow, rebuild))
+    body.push(...attRowNodes(stage, bar, attKey, attOpenNow, rebuild))
   })
-  return h('div', { class: 'stage-block', 'data-key': `block:${stageKey}` }, ...nodes)
+  return h(
+    'div',
+    { class: open ? 'stage-block is-open' : 'stage-block', 'data-key': `block:${stageKey}` },
+    ...nodes,
+    h(
+      'div',
+      { class: 'stage-body', 'aria-hidden': open ? 'false' : 'true' },
+      h('div', { class: 'stage-body-inner' }, ...body),
+    ),
+  )
 }
 
 /**

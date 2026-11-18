@@ -4921,6 +4921,10 @@ const CSS = `
    решение прошлого круга; остальные свёрнуты, иначе столбец снова простыня. */
 .duty-deal-stages{display:flex;flex-direction:column;gap:2px}
 .duty-stage-block{display:flex;flex-direction:column;min-width:0}
+/* Тело этапа: свёрнуто по умолчанию, раскрывается высотой (веб: .stage-body). */
+.duty-stage-body{display:grid;grid-template-rows:0fr;transition:grid-template-rows .28s ease}
+.duty-stage-block.is-open .duty-stage-body{grid-template-rows:1fr}
+.duty-stage-body-inner{min-height:0;overflow:hidden}
 .duty-stage-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto;grid-template-areas:'code badge tog' 'desc desc desc' 'meta meta meta';align-items:center;gap:2px 6px;padding:7px 2px;font-size:12px;cursor:pointer}
 .duty-stage-row-code{grid-area:code;color:var(--ui-text-primary);font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .duty-stage-row>.duty-badge,.duty-stage-row>span[class*=badge]{grid-area:badge}
@@ -5982,7 +5986,10 @@ function CompactStages({ feed, timeline }) {
   }
   const stageBlock = (stage, isLeaving) => {
     const view = compactStageView(stage)
-    const open = isLeaving ? true : openStages[view.id] === undefined ? view.openByDefault : openStages[view.id]
+    // Все этапы свёрнуты по умолчанию, включая текущий и упавший: раскрытие — это
+    // чтение попыток, а не состояние дела (Макс, 18.11). Уходящий блок оставляем
+    // раскрытым — он доигрывает схлопывание уже в своём виде.
+    const open = isLeaving ? true : openStages[view.id] === true
     const bars = stageColumnBars(stage, timeline)
     const children = [
       h(
@@ -6045,23 +6052,34 @@ function CompactStages({ feed, timeline }) {
     if (view.nothingText) {
       children.push(h('div', { key: 'nothing', className: 'duty-stage-note' }, view.nothingText))
     }
-    if (!bars.length && open) children.push(h('div', { key: 'none', className: 'duty-muted duty-att-none' }, 'попыток нет'))
-    if (open) {
-      bars.forEach((attempt, index) => {
-        const key = `${stage.id}#${index}`
-        const attOpen = openAtts[key] === undefined ? compactAttemptView(stage, attempt).openByDefault : openAtts[key]
-        children.push(
-          h(CompactAttemptRow, {
-            key: `att-${key}`,
-            stage,
-            attempt,
-            open: attOpen,
-            onToggle: () => setOpenAtts((prev) => ({ ...prev, [key]: !attOpen })),
-          }),
-        )
-      })
-    }
-    return h('div', { className: `duty-stage-block${isLeaving ? ' is-leaving' : ''}`, key: `st-${stage.id}` }, ...children)
+    // Тело этапа лежит в DOM всегда и свёрнуто высотой (`grid-template-rows: 0fr`):
+    // раскрытие — смена класса на блоке, поэтому высота едет переходом, а не
+    // рывком (Макс, 18.11).
+    const body = children.splice(1)
+    if (!bars.length) body.push(h('div', { key: 'none', className: 'duty-muted duty-att-none' }, 'попыток нет'))
+    bars.forEach((attempt, index) => {
+      const key = `${stage.id}#${index}`
+      const attOpen = openAtts[key] === undefined ? compactAttemptView(stage, attempt).openByDefault : openAtts[key]
+      body.push(
+        h(CompactAttemptRow, {
+          key: `att-${key}`,
+          stage,
+          attempt,
+          open: attOpen,
+          onToggle: () => setOpenAtts((prev) => ({ ...prev, [key]: !attOpen })),
+        }),
+      )
+    })
+    return h(
+      'div',
+      {
+        className: `duty-stage-block${open ? ' is-open' : ''}${isLeaving ? ' is-leaving' : ''}`,
+        key: `st-${stage.id}`,
+      },
+      ...children,
+      h('div', { key: 'body', className: 'duty-stage-body', 'aria-hidden': open ? 'false' : 'true' },
+        h('div', { key: 'inner', className: 'duty-stage-body-inner' }, ...body)),
+    )
   }
   const blocks = feed.stages.map((stage) => stageBlock(stage, false))
   for (const item of leaving) {

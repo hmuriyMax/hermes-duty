@@ -541,10 +541,15 @@ test('десктоп: строки этапов раскрываются кли�
     assert.equal(failures.length, 0, `экран дела упал: ${failures[0] || ''}`.slice(0, 600))
     const blocks = [...container.querySelectorAll('.duty-stage-block')]
     assert.equal(blocks.length, 2, `строк этапов ${blocks.length}, а не 2: столбец не нарисован`)
-    // Провал раскрыт без клика: в этапе `verify` видно и попытку, и доказательство.
-    assert.equal(blocks[0].querySelectorAll('.duty-att-row').length, 0, 'обычная попытка раскрыта без клика')
-    assert.equal(blocks[1].querySelectorAll('.duty-att-row').length, 1, 'провал свёрнут: его не видно без клика')
-    assert.equal(blocks[1].querySelectorAll('.duty-att-ev').length, 1, 'доказательство провала не показано')
+    // Все этапы свёрнуты по умолчанию (Макс, 18.11). Тело при этом в DOM есть —
+    // оно спрятано высотой (`grid-template-rows: 0fr`), поэтому раскрытие идёт
+    // переходом, а не пересборкой кадра.
+    const bodies = blocks.map((block) => block.querySelector('.duty-stage-body'))
+    assert.ok(bodies.every(Boolean), 'у этапа нет тела .duty-stage-body')
+    assert.equal(blocks[0].classList.contains('is-open'), false, 'обычный этап раскрыт без клика')
+    assert.equal(blocks[1].classList.contains('is-open'), false, 'упавший этап раскрыт без клика')
+    assert.deepEqual(bodies.map((body) => body.getAttribute('aria-hidden')), ['true', 'true'], 'тело не спрятано от чтения с экрана')
+    assert.equal(blocks[1].querySelectorAll('.duty-att-row').length, 1, 'попытка не отрисована вовсе')
 
     // Клик по строке этапа раскрывает его попытки, повторный — сворачивает.
     const stageRow = blocks[0].querySelector('.duty-stage-row')
@@ -559,7 +564,8 @@ test('десктоп: строки этапов раскрываются кли�
     assert.equal(blocks[0].querySelector('.duty-stage-row-code').textContent, 'check', 'безымянный этап потерял `id`')
     stageRow.click()
     await settle(60)
-    assert.equal(blocks[0].querySelectorAll('.duty-att-row').length, 1, 'клик по этапу не раскрыл попытки')
+    assert.equal(blocks[0].classList.contains('is-open'), true, 'клик по этапу не раскрыл его')
+    assert.equal(blocks[0].querySelector('.duty-stage-body').getAttribute('aria-hidden'), 'false', 'тело осталось спрятанным')
     assert.equal(blocks[0].querySelector('.duty-stage-row').getAttribute('aria-expanded'), 'true', 'строка этапа не пометила раскрытие')
 
     // Клик по строке попытки раскрывает доказательства; команда обрезана, полная — в title.
@@ -583,7 +589,7 @@ test('десктоп: строки этапов раскрываются кли�
 
     stageRow.click()
     await settle(60)
-    assert.equal(blocks[0].querySelectorAll('.duty-att-row').length, 0, 'повторный клик не свернул этап')
+    assert.equal(blocks[0].classList.contains('is-open'), false, 'повторный клик не свернул этап')
   } finally {
     console.error = origError
     try {

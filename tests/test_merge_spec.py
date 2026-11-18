@@ -178,6 +178,35 @@ def test_the_declared_resolver_role_is_kept() -> None:
     assert next(stage for stage in stages if stage.id == "join").role == "implementer"
 
 
+def test_a_merge_stage_cannot_be_a_lane() -> None:
+    """`parallel_with` у слияния — отказ `merge.parallel`, а не полоса слияния.
+
+    Merge-коммит — работа всего дела, и закрепляется он веткой дела
+    (`runner.anchor_commit` без `lane`). Объявленное `parallel_with` сделало бы
+    его полосой: коммит лёг бы в `duty/<дело>-<этап>`, и зависимые этапы ждали бы
+    работу, которой никто не публикует.
+    """
+    stages, found = plan(lanes() + [merge_stage(workspace="worktree", parallel_with=["impl_a"])])
+    assert "merge.parallel" in rules(found), [issue.message for issue in found]
+    assert next(stage for stage in stages if stage.id == "join").needs == ("impl_a", "impl_b")
+
+
+def test_the_merge_stage_is_never_asked_for_a_lane() -> None:
+    """`runner.lane_of` у этапа слияния пуст: ветка слияния — ветка дела.
+
+    Второй рубеж к `merge.parallel`: полоса спрашивается у каждого этапа перед
+    закреплением коммита, и ответ «join — полоса» увёл бы merge-коммит с ветки
+    дела даже там, где вход плана объявление пропустил.
+    """
+    merge = Stage(id="join", role="implementer", kind="merge", needs=("impl_a", "impl_b"),
+                  workspace="worktree", parallel_with=("impl_a",))
+    lane = Stage(id="impl_a", role="implementer", workspace="worktree", parallel_with=("impl_b",))
+    partner = Stage(id="impl_b", role="implementer", workspace="worktree", parallel_with=("impl_a",))
+    spec = SimpleNamespace(stages=(merge, lane, partner))
+    assert runner.lane_of(spec, merge) == ""
+    assert runner.lane_of(spec, lane) == "impl_a"
+
+
 @pytest.mark.parametrize(
     ("case", "extra", "rule"),
     [
@@ -294,6 +323,18 @@ def test_a_producer_in_a_shared_directory_refuses_the_lane() -> None:
         ("reviewer", {"id": "check", "role": "reviewer", "workspace": "dir"}),
         ("tester", {"id": "check", "role": "tester", "workspace": "dir"}),
         ("researcher", {"id": "check", "role": "researcher", "workspace": "dir"}),
+        # Команда с доказательством — проверка, а не работа (`spec._checks_work`),
+        # и `plan.merge.gates` прямо называет такой этап гейтом за слиянием.
+        (
+            "shell",
+            {
+                "id": "check",
+                "kind": "shell",
+                "cmd": "go test ./...",
+                "workspace": "dir",
+                "evidence": [{"cmd": "go test ./...", "must": 0}],
+            },
+        ),
     ],
 )
 def test_a_checking_stage_in_a_lane_keeps_its_shared_directory(case: str, producer: dict[str, Any]) -> None:
@@ -301,6 +342,8 @@ def test_a_checking_stage_in_a_lane_keeps_its_shared_directory(case: str, produc
 
     Его свидетель — отчёт, а не `commit|artifacts`: он ничего не правит, и общий
     каталог ему не мешает. Правило полос говорит о тех, кто производит работу.
+    Тот же признак читает `plan.merge.gates` (`spec._checks_work`), поэтому shell-
+    гейт, который правило слияния советует поставить, правилом полос не ловится.
     """
     proposal = [
         {"id": "impl_a", "role": "implementer", "workspace": "worktree"},
@@ -308,6 +351,31 @@ def test_a_checking_stage_in_a_lane_keeps_its_shared_directory(case: str, produc
     ]
     _, found = plan(proposal)
     assert "plan.parallel.workspace" not in rules(found), (case, [issue.message for issue in found])
+
+
+def test_a_shell_stage_with_artifacts_still_needs_its_own_branch() -> None:
+    """Объявленные `artifacts` — уже работа: полоса остаётся обязанной веткой.
+
+    Граница проходит по работе, а не по виду этапа: команда, которая называет
+    файлы артефактами, делит их с соседом в общем каталоге, и правило полос
+    возвращается к ней целиком.
+    """
+    proposal = [
+        {"id": "impl_a", "role": "implementer", "workspace": "worktree"},
+        {
+            "id": "pack",
+            "kind": "shell",
+            "cmd": "make dist",
+            "workspace": "dir",
+            "parallel_with": ["impl_a"],
+            "evidence": [{"cmd": "make dist", "must": 0}],
+            "artifacts": ["dist/app.tar.gz"],
+        },
+    ]
+    _, found = plan(proposal)
+    hits = [issue for issue in found if issue.rule == "plan.parallel.workspace"]
+    assert hits, [issue.message for issue in found]
+    assert "'pack'" in hits[0].message
 
 
 def test_a_producer_without_a_tree_is_not_a_shared_directory() -> None:

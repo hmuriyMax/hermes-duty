@@ -1172,7 +1172,14 @@ def lane_of(spec: Any, stage: Any) -> str:
 
     Спрашивается у графа, а не у этапа: `parallel_with` бывает объявлен только с
     одной стороны, и полосой этап от этого быть не перестаёт (`spec.parallel_partners`).
+
+    Этап слияния полосой не бывает даже при объявленном `parallel_with`: его
+    коммит — работа всего дела, и закрепляется он веткой ДЕЛА, иначе merge-коммит
+    остался бы в ветке полосы, которую никто не читает. Такое объявление вход
+    плана отказывает (`merge.parallel`), а здесь — второй рубеж.
     """
+    if str(getattr(stage, "kind", "") or "") == STAGE_KIND_MERGE:
+        return ""
     partners = spec_module.parallel_partners(getattr(spec, "stages", ()), str(getattr(stage, "id", "") or ""))
     return str(getattr(stage, "id", "") or "") if partners else ""
 
@@ -2138,6 +2145,10 @@ def plan_payload(spec: Any, events: Iterable[Any]) -> dict[str, Any]:
     events = list(events or ())
     graph = transit.graph(spec, events)
     started = transit.started_stages(events)
+    # Нерождённые этапы — те, что план ещё может снять: лид не должен
+    # реконструировать граф по памяти (`d_e7fb271b`: четыре мёртвых `impl_*`
+    # остались в графе — снимать их было некому, ход никто не назвал).
+    removable = list(transit.unborn_stages(spec, events))
     out = {
         "graph": [
             {
@@ -2151,6 +2162,7 @@ def plan_payload(spec: Any, events: Iterable[Any]) -> dict[str, Any]:
             for stage in graph
         ],
         "base_ids": [stage.id for stage in graph],
+        "removable": removable,
         "remaining": budget.describe(spec, events),
         "report": (
             "plan: {stages: [{id, role, kind, needs, parallel_with, evidence, budget}], "
@@ -2185,10 +2197,19 @@ def plan_payload(spec: Any, events: Iterable[Any]) -> dict[str, Any]:
                 "stage": str(rethink.get("failed_stage") or rethink.get("stage") or ""),
                 "kind": str(rethink.get("kind") or ""),
                 "total": int(rethink.get("total") or 0),
+                # Что можно снять прямо сейчас: нерождённые этапы графа. Живой
+                # список, а не снимок из payload — граф мог двинуться принятой
+                # ревизией после самого факта (d_e7fb271b: лид переставил
+                # `gates`, а четыре мёртвых `impl_*` остались в графе, потому что
+                # хода снятия в брифе не было вовсе).
+                "removable": removable,
                 "how": (
                     "сначала установи причину отказов по диагнозу; ревизия плана — "
                     "лишь один из исходов; если решение за человеком — подними "
-                    "гейт плана"
+                    "гейт плана; этап, который падением признан ненужным (работы "
+                    "для него не будет), снимается записью {id, remove: true} — "
+                    "не перестановкой и не пустым needs, иначе он останется в "
+                    "графе мёртвым и попадёт в итог дела как сделанный"
                 ),
             }
             break
@@ -2397,6 +2418,15 @@ def build_contract(
                 "поля role/kind/evidence/budget переписывают этап, план отклонят",
                 "этап, у которого уже есть попытки (начат), в плане не называется вовсе: "
                 "он выполняется, перестановке не подлежит — попытка plan#7 d_2fc749fb",
+                # Снятие мёртвого этапа — отдельный ход, а не побочный эффект
+                # перестановки: в живом журнале (`~/.hermes/duty/duty.db`, 18.11)
+                # ноль ревизий с `remove: true` при 153 предложениях, и мёртвые
+                # этапы копились молча (d_e7fb271b: четыре нерождённых `impl_*`
+                # в итоге дела наравне со сделанными).
+                "этап, который падением признан ненужным (работы для него не будет), "
+                "снимается записью {id, remove: true} — не перестановкой и не пустым "
+                "needs: снять можно только нерождённый не-каркасный этап, список — "
+                "plan.removable",
                 "новый этап — полный словарь {id, role, kind, needs, evidence, budget}: "
                 "evidence — список команд [{cmd: \"go test ./...\", must: 0}] "
                 "(must — код возврата), budget — словарь {tokens, minutes}; "
@@ -5543,9 +5573,12 @@ def finish_agent_stage(
         # Полосы убираются только после закрепления merge-коммита веткой дела:
         # до этого ветка полосы — единственная ссылка на её работу. При отказе
         # ветки и деревья полос остаются: там работа сторон, и пути названы в
-        # `details.merge.lanes` и в причине отказа.
-        cleaned, kept = cleanup_lanes(spec, deal, merge_lanes_found)
-        merge_details["cleaned"] = list(cleaned)
+        # `details.merge.lanes` и в причине отказа. Поле `cleaned` (дерево
+        # попытки убрано) здесь не трогается: уборка полос — свой факт
+        # (`details.merge.cleaned`), и разное наполнение одного поля в двух
+        # путях слияния читалось бы как одно и то же.
+        lanes_cleaned, kept = cleanup_lanes(spec, deal, merge_lanes_found)
+        merge_details["cleaned"] = list(lanes_cleaned)
         merge_details["kept"] = list(kept)
 
     payload: dict[str, Any] = {
@@ -5872,6 +5905,11 @@ def _rethink_park(
     if rethinks >= MAX_RETHINKS_PER_DEAL:
         return None
     now = _now_sec(int(clock()))
+    # Нерождённые этапы графа — в самом факте: лид читает диагноз из журнала, и
+    # «что тут можно снять» он не должен реконструировать по памяти (d_e7fb271b:
+    # четыре мёртвых `impl_*` дожили до закрытия, потому что хода снятия никто не
+    # назвал).
+    unborn = list(transit.unborn_stages(spec, events))
     journal.append(
         conn,
         [
@@ -5890,6 +5928,7 @@ def _rethink_park(
                     "why": str(reason or ""),
                     "total": int(total),
                     "round": rethinks + 1,
+                    "removable": unborn,
                     # Класс, число автоматических повторов и последняя причина —
                     # в одном факте: лид решает по серии, а не по одной попытке.
                     "retries": retries or {"count": 0, "kinds": {}},

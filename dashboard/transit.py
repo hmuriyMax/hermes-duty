@@ -1167,6 +1167,27 @@ def started_stages(events: Iterable[Any]) -> frozenset[str]:
     return frozenset(found)
 
 
+def unborn_stages(spec: Any, events: Iterable[Any]) -> tuple[str, ...]:
+    """id нерождённых этапов графа: ни одной попытки и не каркас дела.
+
+    Это ровно те этапы, которые план ещё может снять (`{id, remove: true}`,
+    `spec._plan_remove`), а закрытие обязано назвать вместо того, чтобы выдать их
+    за сделанную работу. Живой случай `d_e7fb271b` (18.11): лид схлопнул цепочку
+    ревизией 2, но записей снятия не сделал — четыре `impl_*` остались в графе и
+    `completed` перечислил их рядом со сделанными.
+
+    Каркас (`spec.is_frame_stage`) в этот список не входит: вход и закрытие
+    попыток не имеют по устройству, и «нерождённой работой» они не бывают.
+    """
+    started = started_stages(events)
+    view = graph_spec(spec, events)
+    return tuple(
+        stage.id
+        for stage in view.stages
+        if stage.id not in started and not spec_module.is_frame_stage(stage.id)
+    )
+
+
 def graph(spec: Any, events: Iterable[Any]) -> tuple[Any, ...]:
     """Граф дела: seed спеки плюс этапы последней принятой ревизии плана.
 

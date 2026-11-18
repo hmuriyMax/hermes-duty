@@ -29,7 +29,9 @@
 7. две параллельные полосы живут каждая в своей ветке и своём дереве, этап-слияние
    собирает их в ОДИН коммит с двумя родителями, а конфликт двух полос в одном
    файле не «закрывается» стратегией: движок называет файлы, сохраняет деревья
-   полос и поднимает резолвера с обоими диффами (0.2.2).
+   полос и поднимает резолвера с обоими диффами (0.2.2);
+8. нерождённый этап не переживает снятия: закрытие отказывает, пока он в графе,
+   ревизия `{id, remove: true}` убирает его из графа движка и с экрана (0.2.2).
 
 Граница слияния в прогоне. Полосы и резолвера здесь играет скрипт: демо гоняется
 в гейте и модель не поднимает. Настоящее — всё, что делает движок: `git worktree`
@@ -131,6 +133,25 @@ DEMO_SPEC: dict[str, Any] = {
         {"id": "review", "role": "reviewer", "needs": ["verify"], "verdict": {"approve": "done", "changes": "impl", "max_rounds": 2}},
     ],
 }
+
+# Спека дела, на котором прогон показывает снятие мёртвого этапа (`{id, remove:
+# true}`): работа `impl` и закрытие `close`. Этап `extra` план добавляет ревизией 1
+# и снимает ревизией 2. До 0.2.2 такой этап оставался в графе нерождённым и
+# попадал в итог дела как сделанный (`d_e7fb271b`, 18.11).
+REMOVAL_SPEC = """
+duty: снятие мёртвого этапа
+stages:
+  - id: impl
+    role: implementer
+    workspace: none
+    evidence:
+      - {cmd: "true", must: 0}
+  - id: close
+    role: coordinator
+    needs: [impl]
+    workspace: none
+    verdict: {approve: next, changes: impl, max_rounds: 2}
+"""
 
 # Чего у 0.1.0 нет — одной строкой, чтобы прогон сам называл границу версии.
 # Декомпозиции дела на этапы здесь быть не может: план лида этапы и добавляет,
@@ -299,14 +320,20 @@ def merge_spec_text(repo: Path, base: str) -> str:
 
     `needs` слияния названы в порядке, отличном от порядка объявления полос: так
     видно, что вливание идёт по объявлению, а не по времени готовности полос.
+
+    Вход один (`start`): спека с двумя входами — не то, что лид вправе написать
+    (`spec check` отказывает правилом `entry`, «вход должен быть один»), а прогон
+    обязан показывать форму, которую движок примет. Полосы ждут вход: без `needs`
+    у каждой полосы дело начиналось бы дважды.
     """
     return (
         "duty: demo-lanes\n"
         f"repo: {repo}\n"
         f"base: {base}\n"
         "stages:\n"
-        "  - {id: impl_a, role: implementer, workspace: worktree, parallel_with: [impl_b]}\n"
-        "  - {id: impl_b, role: implementer, workspace: worktree, parallel_with: [impl_a]}\n"
+        "  - {id: start, kind: shell, cmd: \"true\", workspace: none}\n"
+        "  - {id: impl_a, role: implementer, workspace: worktree, needs: [start], parallel_with: [impl_b]}\n"
+        "  - {id: impl_b, role: implementer, workspace: worktree, needs: [start], parallel_with: [impl_a]}\n"
         "  - {id: join, kind: merge, needs: [impl_b, impl_a], workspace: worktree}\n"
         "  - {id: gates, role: tester, workspace: worktree, needs: [join]}\n"
     )
@@ -440,13 +467,38 @@ def merge_scenario(
             raise DemoError(f"этап {stage} не закрылся: {report.get('reason')}")
         return report
 
+    def entry_run(stage_spec: Any, deal: Any) -> dict[str, Any]:
+        """Вход дела — настоящая попытка движка (`kind: shell`, команда `true`).
+
+        Вход в спеке один (`spec check`: два входа — отказ `entry`), и полосы ждут
+        его: без этого факта полоса стояла бы `pending`, а прогон проходил бы мимо
+        зависимости. Скрипт здесь не подставляется: команду исполняет движок тем
+        же путём, что в деле, — роль за `true` не нужна.
+        """
+        report = runner.run_stage(conn, stage_spec, deal, "start", 1, home=home)
+        if report.get("outcome") != "done":
+            raise DemoError(f"вход дела не закрылся: {report.get('reason')}")
+        return report
+
     # 1. Чистый fan-in: две полосы правят разные файлы.
     clean_path = root / "clean.yaml"
     clean_path.write_text(merge_spec_text(repo, base), encoding="utf-8")
     clean_spec = spec_module.load_spec(clean_path)
+    # Спека прогона судится тем же валидатором, что `spec check`: демо — часть
+    # приёмки версии, и форма, которую лид написать не может, доказывала бы не то.
+    # Профили названы явно (`tester`, `implementer`): песочница прогона — свой
+    # корень Hermes, и живого набора профилей машины в ней нет.
+    refusals = spec_module.errors(
+        spec_module.validate_spec(clean_spec, profiles=frozenset({"implementer", "tester"}))
+    )
+    if refusals:
+        raise DemoError(
+            "спека демо не проходит spec check: " + "; ".join(f"{issue.rule}: {issue.message}" for issue in refusals)
+        )
     created = deals.create_deal(conn, repo=str(repo), title="две полосы и слияние", body="")
     clean_deal = deals.deal_row(conn, str(created["deal"]["id"]))
     own = {"impl_a": ("a.txt", "работа полосы a\n"), "impl_b": ("b.txt", "работа полосы b\n")}
+    entry_run(clean_spec, clean_deal)
     for stage, (name, text) in own.items():
         lane_run(clean_spec, clean_deal, {stage: lane_act(name, text)}, stage)
     lane_shas = {stage: git(repo, "rev-parse", runner.lane_branch(clean_deal, stage)) for stage in own}
@@ -484,6 +536,7 @@ def merge_scenario(
     created = deals.create_deal(conn, repo=str(repo), title="две полосы в один файл", body="")
     conflict_deal = deals.deal_row(conn, str(created["deal"]["id"]))
     clash = {"impl_a": ("shared.txt", "строка от a\n"), "impl_b": ("shared.txt", "строка от b\n")}
+    entry_run(conflict_spec, conflict_deal)
     for stage, (name, text) in clash.items():
         lane_run(conflict_spec, conflict_deal, {stage: lane_act(name, text)}, stage)
     step(
@@ -572,6 +625,125 @@ def merge_scenario(
             ],
             "contract": str(contract.get("stage") or ""),
         },
+    }
+
+
+def removal_scenario(
+    api: Any, conn: sqlite3.Connection, home: Path, step: Callable[..., None]
+) -> dict[str, Any]:
+    """Нерождённый этап: план его добавил, rethink снял — и он исчез у читателей.
+
+    Живое дело `d_e7fb271b` (18.11): лид схлопнул цепочку перестановкой и не
+    записал ни одного снятия — четыре `impl_*` остались в графе нерождёнными и
+    попали в итог дела наравне со сделанной работой. Прогон проходит тот же путь
+    фактами журнала: ревизия 1 добавляет `extra`, закрытие отказывает (работа по
+    этапу не шла), ревизия 2 снимает его записью `{id, remove: true}`, и граф
+    экрана обязан сойтись с графом движка.
+    """
+    deals = api.deals
+    journal = api.journal
+    tools = _module("hermes_duty_tools", "tools.py")
+    transit = _module("hermes_duty_transit", "transit.py")
+    runner = _module("hermes_duty_runner", "runner.py")
+
+    plan_spec = home / "removal.yaml"
+    plan_spec.write_text(REMOVAL_SPEC, encoding="utf-8")
+    spec = runner.spec_module.load_spec(plan_spec)
+    created = deals.create_deal(
+        conn,
+        repo=DEMO_REPO,
+        title="снять мёртвый этап планом",
+        body="",
+        spec_path=str(plan_spec),
+        now=_now(),
+    )
+    planned_id = str(created["deal"]["id"])
+
+    def plan_fact(kind: str, payload: dict[str, Any]) -> None:
+        moment = _now()
+        journal.append(
+            conn,
+            [
+                {
+                    "ts": moment,
+                    "recorded_at": moment,
+                    "deal_id": planned_id,
+                    "kind": kind,
+                    "payload": payload,
+                    "source": "script",
+                    "idempotency_key": deals.event_key("script", planned_id, kind, payload),
+                }
+            ],
+        )
+
+    def screen() -> list[str]:
+        """Граф экрана: то, что рисует `GET /deal` по тому же журналу."""
+        rows = api.stagefeed.snapshot(
+            journal.read_events(conn, planned_id), _now(), spec_path=str(plan_spec)
+        )
+        return [str(row["id"]) for row in rows["stages"]]
+
+    plan_fact(
+        "plan_proposed",
+        {
+            "rev": 1,
+            "stages": [
+                {
+                    "id": "extra",
+                    "role": "implementer",
+                    "needs": ["impl"],
+                    "workspace": "none",
+                    "evidence": [{"cmd": "true", "must": 0}],
+                }
+            ],
+            "reason": "скоуп",
+            "source_stage": "impl",
+        },
+    )
+    plan_fact("plan_accepted", {"rev": 1, "by": "script"})
+    with_extra = screen()
+    # Закрытие нерождённый этап не принимает: этап без единой попытки — не
+    # сделанная работа, и итог, перечисливший его, врал бы.
+    refused = ""
+    try:
+        tools.close(planned_id, "сделано", "approve", "demo-close-unborn", home=home, now=_now())
+    except tools.ToolsError as exc:
+        refused = str(exc)
+    step(
+        20,
+        "plan    (этап добавлен)",
+        f"{planned_id} · граф экрана: {', '.join(with_extra)} · "
+        f"close: {'отказ на extra' if refused else 'принят'}",
+    )
+
+    plan_fact(
+        "plan_proposed",
+        {
+            "rev": 2,
+            "stages": [{"id": "extra", "remove": True}],
+            "reason": "работы для этапа не будет",
+            "source_stage": "impl",
+        },
+    )
+    plan_fact("plan_accepted", {"rev": 2, "by": "script"})
+    without_extra = screen()
+    events = journal.read_events(conn, planned_id)
+    unborn = list(transit.unborn_stages(spec, events))
+    step(
+        21,
+        "rethink (снятие этапа)",
+        f"{planned_id} · граф экрана: {', '.join(without_extra)} · "
+        f"нерождённые: {', '.join(unborn) or '—'} (extra снят)",
+        by="engine",
+    )
+    return {
+        "deal": planned_id,
+        "spec": str(plan_spec),
+        "with_extra": with_extra,
+        "without_extra": without_extra,
+        "close_refused": refused,
+        "unborn": unborn,
+        "graph": [stage.id for stage in transit.graph(spec, events)],
     }
 
 
@@ -728,6 +900,11 @@ def run_demo(
         #     закрытом основном.
         merge_facts = merge_scenario(api, conn, sandbox, step)
 
+        # 13. Снятие мёртвого этапа (0.2.2): ревизия плана `{id, remove: true}` —
+        #     ход лида, а не побочный эффект перестановки; до него нерождённые
+        #     этапы копились в графе и попадали в итог дела как сделанные.
+        removal_facts = removal_scenario(api, conn, sandbox, step)
+
         # ---------------------------------------------------------------- проверки
         def check(name: str, ok: bool, detail: str) -> None:
             checks.append({"name": name, "ok": bool(ok), "detail": detail})
@@ -780,6 +957,17 @@ def run_demo(
               and len(conflict["parents"]) == 3 and len(conflict["lanes_cleaned"]) == 2,
               "в shared.txt обе строки, merge-коммит с двумя родителями, ветки полос убраны")
 
+        check("rethink снял мёртвый этап",
+              "extra" in removal_facts["with_extra"]
+              and "extra" not in removal_facts["without_extra"]
+              and "extra" not in removal_facts["graph"]
+              and "extra" not in removal_facts["unborn"],
+              f"граф экрана: {removal_facts['with_extra']} → {removal_facts['without_extra']}")
+        check("закрытие не приняло нерождённый этап",
+              "extra" in removal_facts["close_refused"]
+              and "{id, remove: true}" in removal_facts["close_refused"],
+              "отказ закрытия называет id этапа и сам ход снятия")
+
         failed = [c["name"] for c in checks if not c["ok"]]
         if failed:
             raise DemoError("прогон не сошёлся: " + ", ".join(failed))
@@ -797,6 +985,7 @@ def run_demo(
             "checks": checks,
             "ledger": ledger,
             "merge": merge_facts,
+            "removal": removal_facts,
             "now": {"deals": len(now_after), "ids": now_after},
             "pool": {"questions": _questions(sand["pool"])},
             "engine_todo": list(ENGINE_TODO),
@@ -913,6 +1102,16 @@ def render_demo(report: dict[str, Any]) -> str:
         out.append(
             f"          merge {conflict['merge'][:12]} · родителей {len(conflict['parents']) - 1} · "
             f"shared.txt: {conflict['merged_text'].strip().replace(chr(10), ' | ')}"
+        )
+    removal = report.get("removal") or {}
+    if removal:
+        out.append("")
+        out.append(f"СНЯТИЕ МЁРТВОГО ЭТАПА (план: {removal['deal']})")
+        out.append(f"  ревизия 1: граф экрана {', '.join(removal['with_extra'])}")
+        out.append(f"             close: {removal['close_refused'][:110]}")
+        out.append(
+            f"  ревизия 2: граф экрана {', '.join(removal['without_extra'])} · "
+            f"нерождённые: {', '.join(removal['unborn']) or '—'} (extra снят)"
         )
     out.append("")
     out.append(f"ЧЕГО ЕЩЁ НЕТ (вне {_demo_version()}):")

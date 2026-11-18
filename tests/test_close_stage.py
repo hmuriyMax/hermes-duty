@@ -31,6 +31,8 @@ import textwrap
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 
 NOW = 1_791_000_000
@@ -54,6 +56,7 @@ spec_module = load_module("hermes_duty_spec", "spec.py")
 journal = load_module("hermes_duty_journal", "journal.py")
 deals = load_module("hermes_duty_deals", "deals.py")
 transit = load_module("hermes_duty_transit", "transit.py")
+stagefeed = load_module("hermes_duty_stagefeed", "stagefeed.py")
 runner = load_module("hermes_duty_runner", "runner.py")
 driver = load_module("hermes_duty_driver", "driver.py")
 release = load_module("hermes_duty_release", "release.py")
@@ -648,6 +651,10 @@ def move_deal(tmp_path: Path, branch: str = "work") -> tuple[Path, Path, sqlite3
     )
     deal = deals.deal_row(conn, str(created["deal"]["id"]))
     assert deal is not None
+    # Работа `impl` была: закрытие не принимает нерождённый этап
+    # (`tools.close` → `transit.unborn_stages`), и дело без единой попытки —
+    # не закрытое дело, а пустой граф.
+    append(conn, deal, [{"kind": "attempt_ended", "payload": ended("impl", summary="сделано")}])
     return repo, home, conn, deal
 
 
@@ -728,4 +735,98 @@ def test_close_does_not_repeat_a_transfer_that_already_happened(tmp_path: Path) 
     assert "integrate_failed" not in [event["kind"] for event in events]
     assert journal.closed_fact(events) is not None
     assert git(repo, "rev-parse", "work") == probe
+
+
+# ---------------------- 8. закрытие не принимает нерождённые этапы молча
+
+# Этап, который план добавил и который ни разу не начинался: работа `impl` есть,
+# `close` — каркас (попыток не имеет), а `docs` — нерождённый.
+DOCS = {"id": "docs", "role": "implementer", "needs": ["impl"], "workspace": "none",
+        "evidence": [{"cmd": "true", "must": 0}]}
+
+
+def planned(conn: sqlite3.Connection, deal: dict[str, Any], stage: dict[str, Any], rev: int = 1) -> None:
+    """Принятая ревизия плана, добавившая этап: без неё графа с этапом нет."""
+    append(
+        conn,
+        deal,
+        [
+            {
+                "kind": "plan_proposed",
+                "payload": {"rev": rev, "stages": [stage], "reason": "", "source_stage": "impl"},
+            },
+            {"kind": "plan_accepted", "payload": {"rev": rev, "by": "engine"}},
+        ],
+    )
+
+
+def test_close_refuses_a_stage_that_never_started(tmp_path: Path) -> None:
+    """Нерождённый этап в графе — отказ закрытия с его id и с самим ходом снятия.
+
+    Живое дело `d_e7fb271b` (18.11): лид схлопнул цепочку перестановкой, четыре
+    `impl_*` остались в графе без единой попытки, и `completed` перечислил их
+    наравне со сделанными — итог врал. Снять их может только ревизия плана, и
+    отказ называет id и запись `{id, remove: true}`.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, GOOD)
+    deal = make_deal(conn, spec)
+    append(conn, deal, [{"kind": "attempt_ended", "payload": ended("impl", summary="сделано")}])
+    planned(conn, deal, DOCS)
+
+    with pytest.raises(tools.ToolsError) as caught:
+        tools.close(str(deal["id"]), "сделано", "approve", "close-unborn", home=home, now=NOW)
+
+    assert "docs" in str(caught.value), str(caught.value)
+    assert "{id, remove: true}" in str(caught.value), str(caught.value)
+    assert journal.closed_fact(journal.read_events(conn, str(deal["id"]))) is None
+    assert deals.deal_row(conn, str(deal["id"]))["status"] != "done"
+
+
+def test_removed_stage_is_absent_from_every_reader(tmp_path: Path) -> None:
+    """Снятый этап исчезает у всех читателей: граф, решение, лента, итог дела.
+
+    Та же пара фактов, что у отказа выше, плюс ревизия 2 со снятием: граф снова
+    `impl` + `close`, нерождённых этапов нет, и `completed` перечисляет только
+    сделанное. Проверяются все читатели графа, а не один: снятие, доехавшее до
+    графа, но не до экрана или итога, — ровно дефект `d_e7fb271b` (18.11).
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, GOOD)
+    deal = make_deal(conn, spec)
+    append(conn, deal, [{"kind": "attempt_ended", "payload": ended("impl", summary="сделано")}])
+    planned(conn, deal, DOCS)
+    append(
+        conn,
+        deal,
+        [
+            {
+                "kind": "plan_proposed",
+                "payload": {
+                    "rev": 2,
+                    "stages": [{"id": "docs", "remove": True}],
+                    "reason": "",
+                    "source_stage": "impl",
+                },
+            },
+            {"kind": "plan_accepted", "payload": {"rev": 2, "by": "engine"}},
+        ],
+    )
+    events_before = journal.read_events(conn, str(deal["id"]))
+    decision = transit.next_stage(spec, events_before, NOW)
+    feed = stagefeed.stages(spec, events_before, NOW)
+
+    answer = tools.close(str(deal["id"]), "сделано и проверено", "approve", "close-removed", home=home, now=NOW)
+
+    assert answer["closed"] is True
+    assert transit.unborn_stages(spec, events_before) == ()
+    assert [stage.id for stage in transit.graph(spec, events_before)] == ["impl", "close"]
+    assert "docs" not in decision.reason
+    assert "docs" not in [row["id"] for row in feed]
+    closed = journal.closed_fact(journal.read_events(conn, str(deal["id"])))
+    assert closed is not None
+    assert closed["payload"]["stages"] == ["impl", "close"]
+    assert deals.deal_row(conn, str(deal["id"]))["status"] == "done"
 

@@ -169,3 +169,22 @@ def test_demo_raises_a_resolver_on_a_lane_conflict(report: dict) -> None:
 def test_demo_keeps_the_lane_repo_inside_the_sandbox(report: dict) -> None:
     """Репозиторий полос живёт в песочнице: прогон не трогает живые каталоги."""
     assert report["merge"]["repo"].startswith(report["home"]), report["merge"]["repo"]
+
+
+# ------------------------------------- снятие мёртвого этапа (0.2.2, 18.11)
+
+
+def test_demo_removes_a_dead_stage_by_a_plan_revision(report: dict) -> None:
+    """Нерождённый этап уходит из графа снятием `{id, remove: true}`, а не сам.
+
+    Прогон проходит тот же путь, что живое дело `d_e7fb271b`: ревизия добавляет
+    `extra`, закрытие отказывает (работа по этапу не шла), ревизия снятия убирает
+    его — и граф экрана (`stagefeed.snapshot`) сходится с графом движка.
+    """
+    removal = report["removal"]
+    assert "extra" in removal["with_extra"]
+    assert "extra" not in removal["without_extra"]
+    assert "extra" not in removal["graph"]
+    assert "extra" not in removal["unborn"]
+    assert "extra" in removal["close_refused"], removal["close_refused"]
+    assert "{id, remove: true}" in removal["close_refused"]

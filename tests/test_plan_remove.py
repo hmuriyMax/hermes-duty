@@ -1,13 +1,19 @@
-"""План удаляет неначатый этап, чтобы освободить потолок `charter.max_stages`.
+"""План удаляет неначатый этап: потолок хартии освобождается, а этап исчезает.
 
 Свидетельство — живое дело `d_76b269ce` (14.11, хартия `max_stages: 6`): лид не мог
 поправить начатый этап («правку начатого возвращает приговор ревью») и не мог
 вырасти («граф расти не может — потолок хартии»), а мёртвый этап от прошлой
 ревизии занимал место. Третий ход — снять неначатый этап — отсутствовал.
 
-Проверяется: удаление принимается и убирает этап из графа; удалять нельзя начатый,
-каркасный и несуществующий этап; наследник удалённого обязан назвать новое ребро;
-потолок после удаления снова свободен.
+Второе свидетельство — `d_e7fb271b` (18.11): ход появился, но лид им не пользуется
+(в живом журнале ноль ревизий с `remove: true` при 153 предложениях), и мёртвые
+этапы копятся молча. Поэтому снятие проверяется сквозным путём — не только
+валидатором: граф, решение, лента этапов, снимок экрана и итог дела обязаны его
+не видеть, а лид — получать сам ход и список снимаемых этапов в контракте.
+
+Проверяется: удаление принимается и убирает этап из всех читателей графа; удалять
+нельзя начатый, каркасный и несуществующий этап; наследник удалённого обязан
+назвать новое ребро; потолок после удаления снова свободен.
 """
 
 from __future__ import annotations
@@ -37,6 +43,8 @@ def load_module(name: str, filename: str) -> Any:
 
 spec_module = load_module("hermes_duty_spec", "spec.py")
 transit = load_module("hermes_duty_transit", "transit.py")
+stagefeed = load_module("hermes_duty_stagefeed", "stagefeed.py")
+runner = load_module("hermes_duty_runner", "runner.py")
 
 # Seed: вход, работа и потолок 3 — ровно столько, чтобы лишний этап не влезал.
 SEED = """
@@ -114,27 +122,42 @@ def test_removing_a_not_started_stage_is_accepted_and_frees_the_ceiling() -> Non
     assert "check2" in next(issue.message for issue in issues if issue.rule == "charter.max_stages")
 
 
-def test_removed_stage_leaves_the_graph(tmp_path: Path) -> None:
-    """Граф читается по журналу: этап, снятый ревизией, из него уходит.
+def test_removed_stage_leaves_the_graph_and_the_screens(tmp_path: Path) -> None:
+    """Граф читается по журналу: этап, снятый ревизией, уходит у всех читателей.
 
     `transit.graph` пересобирает граф разбором принятых ревизий; удаление
     переживает перечитывание, иначе дело продолжало бы показывать мёртвый этап, а
-    потолок остался бы занятым.
+    потолок остался бы занятым. Снятие — не только про валидатор: решение
+    (`next_stage`), лента этапов и снимок экрана (`stagefeed`) читают тот же граф,
+    и мёртвый этап не должен всплывать в них по отдельности.
     """
     spec = write_spec(tmp_path, SEED)
-    facts = events(
+    planned = [
         ("attempt_started", {"stage": "plan", "attempt": 1, "run_id": "plan#1"}),
         ("attempt_ended", {"stage": "plan", "attempt": 1, "outcome": "done", "kind": None, "reason": ""}),
         ("plan_proposed", {"rev": 1, "stages": [work("check2", needs=("impl",))], "reason": "", "source_stage": "plan"}),
         ("plan_accepted", {"rev": 1, "by": "engine"}),
+    ]
+    removed = [
         ("plan_proposed", {"rev": 2, "stages": [{"id": "check2", "remove": True}], "reason": "", "source_stage": "plan"}),
         ("plan_accepted", {"rev": 2, "by": "engine"}),
-    )
+    ]
+    # До снятия этап жив: иначе тест зеленел бы на графе, который ревизию не принял.
+    assert "check2" in {stage.id for stage in transit.graph(spec, events(*planned))}
 
+    facts = events(*planned, *removed)
     graph = {stage.id for stage in transit.graph(spec, facts)}
+    rows = [row["id"] for row in stagefeed.stages(spec, facts, NOW)]
+    snapshot = stagefeed.snapshot(facts, NOW, spec_path=str(spec.path))
+    decision = transit.next_stage(spec, facts, NOW)
 
     assert "check2" not in graph, "ревизия 2 сняла этап"
     assert {"plan", "impl"} <= graph
+    assert "check2" not in rows
+    assert "check2" not in [row["id"] for row in snapshot["stages"]]
+    assert "check2" not in transit.unborn_stages(spec, facts)
+    assert "check2" not in decision.reason
+    assert [stage_id for stage_id, _ in decision.pair] == ["impl"]
 
 
 def test_removing_a_started_stage_is_refused() -> None:
@@ -169,3 +192,48 @@ def test_a_heir_of_a_removed_stage_must_name_a_new_edge() -> None:
     """
     _, found = plan([{"id": "check2", "remove": True}, work("docs", needs=("check2",))])
     assert [issue.rule for issue in found] == ["plan.remove.needs"], [issue.message for issue in found]
+
+
+def test_plan_contract_names_the_move_and_the_removable_stages(tmp_path: Path) -> None:
+    """Ход снятия и список снимаемых этапов приходят лиду в контракте, а не из отказа.
+
+    `d_e7fb271b` (18.11): лид схлопнул цепочку перестановкой, четыре `impl_*`
+    остались в графе мёртвыми и попали в итог дела как сделанные. Ход
+    `{id, remove: true}` к тому времени существовал, но в брифе лида его не было, а
+    «что тут нерождено» лид собирал по памяти — и не собрал (в живом журнале ноль
+    ревизий со снятием при 153 предложениях). Список `removable` — это ещё и
+    проверка границы: начатый `impl` в него не попадает, снимать его нельзя.
+    """
+    spec = write_spec(tmp_path, SEED)
+    facts = events(
+        ("attempt_started", {"stage": "plan", "attempt": 1, "run_id": "plan#1"}),
+        ("attempt_ended", {"stage": "plan", "attempt": 1, "outcome": "done", "kind": None, "reason": ""}),
+        ("plan_proposed", {"rev": 1, "stages": [work("check2", needs=("impl",))], "reason": "", "source_stage": "plan"}),
+        ("plan_accepted", {"rev": 1, "by": "engine"}),
+        ("attempt_started", {"stage": "impl", "attempt": 1, "run_id": "impl#1"}),
+        ("attempt_ended", {"stage": "impl", "attempt": 1, "outcome": "done", "kind": None, "reason": ""}),
+        (
+            "plan_rethink",
+            {"failed_stage": "check2", "kind": "contract", "attempt": 1, "why": "предмета нет", "total": 3, "round": 1},
+        ),
+    )
+
+    payload = runner.plan_payload(spec, facts)
+    contract = runner.build_contract(
+        spec,
+        {"id": DEAL, "title": "снятие", "body": ""},
+        spec.stage("plan"),
+        1,
+        workdir=tmp_path,
+        tree=None,
+        cwd=tmp_path,
+        previous=[],
+        deadline_sec=600,
+        events=facts,
+    )
+
+    assert payload["removable"] == ["check2"]
+    assert payload["rethink"]["removable"] == ["check2"]
+    assert "{id, remove: true}" in payload["rethink"]["how"]
+    assert contract["plan"]["removable"] == ["check2"]
+    assert any("{id, remove: true}" in line for line in contract["boundaries"])

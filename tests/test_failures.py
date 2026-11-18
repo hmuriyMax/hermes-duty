@@ -950,6 +950,48 @@ def test_park_returns_deal_to_lead_for_rethink(tmp_path: Path) -> None:
     assert states["plan"].state == transit.PENDING
 
 
+def test_rethink_names_the_stages_that_can_be_removed(tmp_path: Path) -> None:
+    """Факт `plan_rethink` называет нерождённые этапы графа — лид их не вспоминает.
+
+    `d_e7fb271b` (18.11): диагноз лиду приходил без «что тут ещё нерождено», и
+    четыре `impl_*`, оставшиеся без работы, дожили до закрытия. Список считается
+    по графу: начатый `impl` и каркас `plan` в него не попадают, а добавленный
+    планом и ни разу не запущенный `extra` — попадает.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    spec = plan_impl_spec(tmp_path)
+    seed(
+        conn,
+        deal,
+        "plan_proposed",
+        {
+            "rev": 1,
+            "stages": [
+                {
+                    "id": "extra",
+                    "role": "implementer",
+                    "needs": ["impl"],
+                    "workspace": "none",
+                    "evidence": [{"cmd": "true", "must": 0}],
+                }
+            ],
+            "reason": "скоуп",
+            "source_stage": "plan",
+        },
+        key="plan:proposed:1",
+    )
+    seed(conn, deal, "plan_accepted", {"rev": 1, "by": "engine"}, key="plan:accepted:1")
+    failed_attempt(conn, deal, 1, "infra")
+    failed_attempt(conn, deal, 2, "infra")
+
+    assert rethink(conn, spec, deal, home)["reason"] == "rethink"
+    fact = [item for item in events(conn, deal) if item["kind"] == "plan_rethink"][-1]
+
+    assert fact["payload"]["removable"] == ["extra"]
+
+
 def test_rethink_budget_ends_with_a_human_question(tmp_path: Path) -> None:
     """Два переосмысления — предел: третий отказ спрашивает человека."""
     home = make_home(tmp_path)

@@ -246,6 +246,7 @@ class Proc:
         self.hang = hang
         self.stopped = 0
         self.stderr_text = ""
+        self.stderr_head = ""
         self._hook = hook
 
     def next_line(self, timeout: float = 0.0) -> Optional[str]:

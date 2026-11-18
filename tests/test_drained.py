@@ -75,6 +75,25 @@ def test_classify_marks_a_restarted_attempt_as_drained() -> None:
     assert (plain.outcome, plain.kind) == (failures.OUTCOME_FAILED, failures.INFRA)
 
 
+def test_marker_in_stderr_of_an_attempt_that_finished_is_not_drained() -> None:
+    """Маркер в stderr попытки с кодом 0 — её вывод, а не смерть от рестарта.
+
+    `drained` не списывает политику и не поднимает предохранитель дела
+    (`decide_park`, `total_failures`), поэтому без этой оговорки контрактный отказ
+    «исполнитель не отчитался» превращался в бесконечный перезапуск по слову в
+    stderr. То же правило у этапа-команды (`runner.classify_shell`), а ненулевой
+    код с маркером остаётся дренажом.
+    """
+    finished = failures.classify(
+        result=None, exit_code=0, result_error="result.json нет", stderr="runtime_draining: 3\n"
+    )
+    died = failures.classify(result=None, exit_code=1, stderr="Error: runtime_draining\n")
+
+    assert (finished.outcome, finished.kind) == (failures.OUTCOME_FAILED, failures.CONTRACT)
+    assert "result.json" in finished.reason
+    assert (died.outcome, died.kind) == (failures.OUTCOME_FAILED, failures.DRAINED)
+
+
 def test_drained_is_not_a_policy_class() -> None:
     """`drained` не класс политики: `CLASSES` его не знает, `retry.on` не объявить."""
     assert failures.DRAINED not in failures.CLASSES

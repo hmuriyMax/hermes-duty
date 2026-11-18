@@ -203,6 +203,9 @@ class Fake:
         self.stopped = 0
         self.exit = None if hang else exit_code
         self.stderr_text = "fake stderr tail"
+        # Голова stderr: движок ищет в ней подпись сломанного инструмента и маркер
+        # дренажа (`runner.STDERR_HEAD`), поэтому у фейка есть оба края вывода.
+        self.stderr_head = "fake stderr head\n"
 
     # --- то, что нужно `runner.follow`
     def __call__(self, cmd: list[str], cwd: Path, env: Any = None) -> "Fake":

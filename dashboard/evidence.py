@@ -1110,6 +1110,7 @@ def verify(
     root: Optional[Path] = None,
     base: Optional[str] = None,
     repo: Optional[str] = None,
+    merge_brief: Optional[dict[str, Any]] = None,
 ) -> Verdict:
     """Приговор пакету попытки: сверка заявленного с деревом, без запуска команд.
 
@@ -1119,7 +1120,8 @@ def verify(
     проверяется, что заявленный коммит не был готов до попытки. `workdir` — не
     только место отчёта: дерево попытки лежит внутри него (`TREE_SUBDIR`), и
     отказ `artifact.missing` по этому пути отличает «файла нет» от «этап смотрел
-    в каталог, а файл — в дереве».
+    в каталог, а файл — в дереве». `merge_brief` — бриф, который движок передал
+    резолверу слияния: по нему отчёт слияния сверяется с фактом, а не сам с собой.
     """
     if not isinstance(result, dict):
         return Verdict(
@@ -1189,7 +1191,7 @@ def verify(
             # взято с каждой стороны. Проверка идёт после коммита: сначала «это
             # вообще коммит этого дерева», потом «это коммит слияния».
             if str(getattr(stage, "kind", "") or "") == spec_module.MERGE_KIND:
-                _check_merge(result, stage, root_path, commit_text, issues)
+                _check_merge(result, stage, root_path, commit_text, issues, brief=merge_brief)
         records = result.get("evidence")
         if isinstance(records, list):
             # Отсутствие поля целиком уже названо схемой: повторять его на каждой
@@ -1260,6 +1262,7 @@ def _check_merge(
     root: Path,
     commit: str,
     issues: list[Issue],
+    brief: Optional[dict[str, Any]] = None,
 ) -> None:
     """Пакет этапа-слияния: merge-коммит, обе стороны названы, конфликтов не осталось.
 
@@ -1270,6 +1273,12 @@ def _check_merge(
     (`merge.dropped`). «Взял одну сторону целиком» — не запрещённое решение, но
     оно называется (`taken` + `why`): тихое «выбрал первую попавшуюся» — это и
     есть та потеря логики, ради которой версия делалась.
+
+    `brief` — то, что движок передал резолверу (файл контракта попытки): в нём
+    конфликтные файлы и коммиты полос. С ним отчёт сверяется не по слову: файл,
+    разведённый молча, сторона не из этого слияния и сторона, названная чужим
+    коммитом, — тот же `merge.dropped`, только теперь проверяемый по факту, а не
+    по обещанию отчёта.
 
     Конфликт, оставшийся в дереве, судится первым и называется файлами
     (`merge.conflict`): пока он там, коммита слияния нет, и остальные проверки
@@ -1353,6 +1362,8 @@ def _check_merge(
                 "было нельзя (или сохрани его)",
             )
         )
+    if brief is not None:
+        _check_merge_against_brief(block, named, taken, brief, issues)
     if not commit:
         return
     count = _parents_count(root, commit)
@@ -1363,6 +1374,77 @@ def _check_merge(
                 RULE_MERGE_PARENTS,
                 f"commit={commit} — коммит с одним родителем, а свидетель слияния — merge-коммит "
                 "с двумя и более: полоса, которой нет среди родителей, в него не вошла",
+            )
+        )
+
+
+def _check_merge_against_brief(
+    block: dict[str, Any],
+    named: dict[str, Any],
+    taken: str,
+    brief: dict[str, Any],
+    issues: list[Issue],
+) -> None:
+    """Сверка отчёта слияния с брифом, который движок передал резолверу.
+
+    Бриф называет конфликтные файлы и коммит каждой полосы. Отчёт обязан говорить
+    о том же: иначе «обе стороны сохранены» проверялось бы по слову отчёта, а не
+    по факту. Класс у всех трёх находок один — `merge.dropped`: разведено молча
+    (файла нет в `merge.files`), сторона не из этого слияния, сторона названа
+    чужим коммитом. Во всех трёх случаях по отчёту не видно, чья работа вошла в
+    результат, — а это ровно та потеря логики, ради которой версия делалась.
+    """
+    lanes = {
+        str(lane.get("lane") or ""): str(lane.get("sha") or "")
+        for lane in brief.get("lanes") or ()
+        if isinstance(lane, dict) and str(lane.get("lane") or "")
+    }
+    files = block.get("files")
+    resolved = {str(name) for name in files} if isinstance(files, list) else set()
+    for name in brief.get("conflict_files") or ():
+        if str(name) in resolved:
+            continue
+        issues.append(
+            Issue(
+                _where("merge", None, "files"),
+                RULE_MERGE_DROPPED,
+                f"файл {str(name)!r} был в конфликте, а в merge.files его нет: конфликт разведён "
+                "молча — назови файлы, которые действительно правил",
+            )
+        )
+    for lane_name, side in named.items():
+        if lane_name not in lanes:
+            issues.append(
+                Issue(
+                    _where("merge", None, "sides"),
+                    RULE_MERGE_DROPPED,
+                    f"сторона {lane_name!r} не полоса этого слияния "
+                    f"(полосы: {', '.join(sorted(lanes)) or '—'}): отчёт называет источник, "
+                    "которого вливание не касалось",
+                )
+            )
+            continue
+        reported = str(side.get("sha") or "").strip().lower()
+        actual = lanes[lane_name].strip().lower()
+        if reported and actual and min(len(reported), len(actual)) >= 7 and (
+            actual.startswith(reported) or reported.startswith(actual)
+        ):
+            continue
+        issues.append(
+            Issue(
+                _where("merge", None, "sides"),
+                RULE_MERGE_DROPPED,
+                f"сторона {lane_name!r} названа коммитом {reported[:12] or '—'}, "
+                f"а полоса — {actual[:12] or '—'}: чья работа вошла, не проверить",
+            )
+        )
+    if taken and taken not in lanes:
+        issues.append(
+            Issue(
+                _where("merge", None, "taken"),
+                RULE_MERGE_DROPPED,
+                f"взята целиком сторона {taken!r}, которой нет среди полос слияния "
+                f"({', '.join(sorted(lanes)) or '—'}): обоснование говорит не о той стороне",
             )
         )
 

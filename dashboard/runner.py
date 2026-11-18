@@ -1471,6 +1471,24 @@ def resolve_brief(
     }
 
 
+def merge_handoff(workdir: Path, stage_id: str, attempt: int) -> Optional[dict[str, Any]]:
+    """Бриф слияния, который движок передал резолверу: с чем сверять его отчёт.
+
+    Закрытие попытки видит только отчёт и дерево: процесс резолвера жил отдельно,
+    и `merge_brief` в памяти у него нет. Поэтому сверка берёт ту же копию брифа,
+    что получил резолвер, — файл контракта попытки. Нет файла (старый каталог,
+    ручной прогон) — сверки нет: требовать её от отчёта, не зная, что передавали,
+    значило бы отказывать за неизвестное.
+    """
+    path = contract_path(Path(workdir), stage_id, attempt)
+    try:
+        contract = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    block = contract.get("merge") if isinstance(contract, dict) else None
+    return block if isinstance(block, dict) else None
+
+
 def run_merge_evidence(stage: Any, tree: Optional[Path], started_at: int) -> list[dict[str, Any]]:
     """Объявленные команды слияния прогоняются по СЛИТОМУ дереву.
 
@@ -5396,6 +5414,11 @@ def finish_agent_stage(
             base=actual_base or spec.base,
             # Вторая мерка коммита — каталог дела (см. вызов у shell-этапа).
             repo=spec.repo,
+            # Бриф слияния — для сверки отчёта резолвера с тем, что ему передали:
+            # без него «обе стороны сохранены» проверялось бы по слову отчёта.
+            merge_brief=merge_handoff(workdir, stage_id, attempt)
+            if str(getattr(stage, "kind", "") or "") == STAGE_KIND_MERGE
+            else None,
         )
         if not verdict.ok:
             # Класс отказа гейта — из вердикта (`Verdict.kind`, W4), а не из текста:
@@ -5433,7 +5456,11 @@ def finish_agent_stage(
             "cleaned": [],
             "kept": [],
         }
-        if outcome != OUTCOME_DONE and kind == FAIL_CONTRACT and "merge." not in reason:
+        if outcome != OUTCOME_DONE and kind == FAIL_CONTRACT and conflict_files and "merge." not in reason:
+            # Класс `merge.conflict` — про НЕразведённый конфликт в дереве, а не
+            # про любой отказ контракта: разведённое слияние, упавшее на гейтах или
+            # на форме отчёта, говорит своей причиной (иначе отказ врал бы
+            # «слияние не собрано — конфликтные файлы —» про уже собранное).
             reason = merge_conflict_text(conflict_files, merge_lanes_found)
 
     # Публикация (0.0.5): «опубликовано» — заявка исполнителя, факт даёт origin.

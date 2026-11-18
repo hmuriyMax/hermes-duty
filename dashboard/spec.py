@@ -2283,6 +2283,31 @@ def _parallel_lanes(by_id: Mapping[str, Any]) -> list[tuple[str, str]]:
     return pairs
 
 
+def parallel_partners(stages: Iterable[Any], stage_id: str) -> tuple[str, ...]:
+    """Этапы, объявленные параллельными этому (в любую сторону), в порядке графа.
+
+    Полоса — это отношение, а не флаг одного этапа: `transit._parallel` читает обе
+    стороны одинаково, и движку для ветки полосы нужен тот же ответ. Нужен он
+    затем, чтобы полоса вела свою ветку (`runner.lane_branch`), а не двигала ветку
+    дела: коммит одной полосы не содержит работы другой, и ветка дела на нём
+    публиковала бы половину дела (`d_c13d53da`).
+    """
+    ordered = tuple(stages or ())
+    target = next((stage for stage in ordered if str(stage.id) == str(stage_id)), None)
+    if target is None:
+        return ()
+    mine = {str(other) for other in (getattr(target, "parallel_with", ()) or ())}
+    return tuple(
+        str(stage.id)
+        for stage in ordered
+        if str(stage.id) != str(stage_id)
+        and (
+            str(stage.id) in mine
+            or str(stage_id) in {str(other) for other in (getattr(stage, "parallel_with", ()) or ())}
+        )
+    )
+
+
 def _check_parallel_workspaces(
     by_id: Mapping[str, Any], *, where: Path, touched: Optional[Iterable[str]] = None
 ) -> list[Issue]:
@@ -2393,8 +2418,55 @@ def _check_parallel_fanin(by_id: Mapping[str, Any], *, where: Path) -> list[Issu
     return issues
 
 
+def _check_merge_gates(by_id: Mapping[str, Any], *, where: Path) -> list[Issue]:
+    """`plan.merge.gates`: слитое дерево обязан кто-то проверить после слияния.
+
+    «Зелёная полоса + зелёная полоса ≠ зелёный merge»: каждая полоса проверяла
+    свой код, а собранный результат не проверял никто, и конфликт, разведённый по
+    существу, остался бы непроверенным. Поэтому за слиянием стоит проверяющий
+    этап (`needs: [<merge>]`): тестер, ревьюер с приговором или команда с
+    доказательствами (`kind: shell` + `evidence`).
+
+    Предупреждение, а не отказ: граф вправе быть незаконченным, и лид собирает его
+    по частям (`plan.parallel.fanin` — та же природа). Но молчать нельзя: пропуск
+    гейта виден только на закрытии дела, когда цена уже уплачена.
+    """
+    issues: list[Issue] = []
+    for stage in by_id.values():
+        if str(getattr(stage, "kind", "") or "") != MERGE_KIND:
+            continue
+        dependents = [
+            item
+            for item in by_id.values()
+            if str(stage.id) in tuple(getattr(item, "needs", ()) or ())
+        ]
+        if any(_checks_work(item) for item in dependents):
+            continue
+        issues.append(
+            Issue(
+                where,
+                int(getattr(stage, "line", 1) or 1),
+                "plan.merge.gates",
+                f"за слиянием {stage.id!r} нет проверяющего этапа: зелёные полосы не дают "
+                f"зелёного merge — поставь гейт с needs: [{stage.id!r}] (tester, ревьюер с "
+                "приговором или kind: shell с evidence) и пропусти зависимые этапы через него",
+                WARNING,
+            )
+        )
+    return issues
+
+
+def _checks_work(stage: Any) -> bool:
+    """Этап проверяет чужую работу: приговор, роль тестера или команда с доказательствами."""
+    if getattr(stage, "verdict", None) is not None:
+        return True
+    if str(getattr(stage, "role", "") or "") == "tester":
+        return True
+    return str(getattr(stage, "kind", "") or "") == SHELL_KIND and bool(getattr(stage, "evidence", ()))
+
+
 def gate_warnings(spec: Any) -> list[Issue]:
-    """Предупреждения топологии: ревью и вопрос человеку в предках, fan-in полос.
+    """Предупреждения топологии: ревью, вопрос человеку в предках, fan-in полос.
 
     Одна дверь для `spec check` и для `duty_plan` (`docs/ENGINE-2.0.md`, раздел 8):
     форме графа — предупреждение, фактам — отказ. Вторая копия этого набора
@@ -2402,7 +2474,8 @@ def gate_warnings(spec: Any) -> list[Issue]:
 
     `plan.parallel.fanin` (0.2.2) — третье правило той же природы: параллельные
     полосы без этапа слияния остаются мёртвыми, но отказывать за это на входе
-    значило бы запретить лиду собрать граф по частям.
+    значило бы запретить лиду собрать граф по частям. `plan.merge.gates` —
+    четвёртое: слияние без проверки собранного результата.
     """
     stages = tuple(getattr(spec, "stages", ()) or ())
     by_id = {str(stage.id): stage for stage in stages}
@@ -2411,6 +2484,7 @@ def gate_warnings(spec: Any) -> list[Issue]:
         _check_review_gate(spec)
         + _check_publish_gate(spec)
         + _check_parallel_fanin(by_id, where=where)
+        + _check_merge_gates(by_id, where=where)
     )
 
 

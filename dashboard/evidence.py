@@ -159,6 +159,16 @@ RULE_NOTHING_STAGE = "nothing.stage"
 # предъявить `nothing`, а исполнитель его уже предъявил.
 RULE_NOTHING_COMMIT = "nothing.commit"
 RULE_NOTHING_ARTIFACTS = "nothing.artifacts"
+# Слияние полос (0.2.2, `spec.MERGE_KIND`). Три правила, по одному на способ
+# соврать про fan-in: свидетелем назван не merge-коммит (`merge.parents`),
+# сторона полосы исчезла из отчёта или выброшена целиком без обоснования
+# (`merge.dropped`), конфликт остался в дереве (`merge.conflict`). Живой дефект,
+# ради которого версия делалась: `d_c13d53da` 16.11 — две полосы, зависимый этап
+# отказался строиться, потому что слияния не было вовсе.
+RULE_MERGE_PARENTS = "merge.parents"
+RULE_MERGE_DROPPED = "merge.dropped"
+RULE_MERGE_CONFLICT = "merge.conflict"
+
 
 # Свидетели этапа (0.0.5): «готово» доказывается тем, что этап по своей природе
 # может предъявить, а не одним списком на всех. Обычный этап называет работу
@@ -1175,6 +1185,11 @@ def verify(
                     _check_commit(commit_text, root_path, base, issues, repo=repo_path)
                 else:
                     _check_commit_reference(commit_text, root_path, issues)
+            # Слияние (0.2.2): свидетель — merge-коммит, и отчёт называет, что
+            # взято с каждой стороны. Проверка идёт после коммита: сначала «это
+            # вообще коммит этого дерева», потом «это коммит слияния».
+            if str(getattr(stage, "kind", "") or "") == spec_module.MERGE_KIND:
+                _check_merge(result, stage, root_path, commit_text, issues)
         records = result.get("evidence")
         if isinstance(records, list):
             # Отсутствие поля целиком уже названо схемой: повторять его на каждой
@@ -1202,6 +1217,154 @@ def verify(
         return Verdict(ok=True, kind=None, details=issues, witness=accepted)
     kind = KIND_CONTRACT if any(issue.kind == KIND_CONTRACT for issue in errors) else KIND_CAPABILITY
     return Verdict(ok=False, kind=kind, details=issues)
+
+
+def _git_lines(args: list[str], cwd: Path) -> list[str]:
+    """`git` в дереве — список строк stdout: списку файлов нужны переводы строк.
+
+    `_git` собирает ответ одной строкой (так читается причина отказа), а конфликт
+    называть одной строкой нельзя: имена файлов — список, по которому человек
+    ищет, что разводить.
+    """
+    try:
+        done = subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT_SEC,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if done.returncode != 0:
+        return []
+    return [line.strip() for line in (done.stdout or "").splitlines() if line.strip()]
+
+
+def _unmerged(root: Path) -> list[str]:
+    """Файлы, оставшиеся в конфликте слияния: `git diff --name-only --diff-filter=U`."""
+    return _git_lines(["diff", "--name-only", "--diff-filter=U"], root)
+
+
+def _parents_count(root: Path, commit: str) -> Optional[int]:
+    """Сколько родителей у коммита; `None` — git не ответил."""
+    code, out = _git(["rev-list", "--parents", "-n", "1", commit], root)
+    if code != 0 or not out:
+        return None
+    return max(0, len(out.split()) - 1)
+
+
+def _check_merge(
+    result: dict[str, Any],
+    stage: Any,
+    root: Path,
+    commit: str,
+    issues: list[Issue],
+) -> None:
+    """Пакет этапа-слияния: merge-коммит, обе стороны названы, конфликтов не осталось.
+
+    Свидетель слияния — коммит, и он обязан быть **merge-коммитом** (два и более
+    родителя): коммит с одним родителем означает, что одна полоса осталась за
+    бортом, даже если отчёт говорит «слито» (`merge.parents`). Вторая половина —
+    отчёт: полос две (и больше), и про каждую надо сказать, что из неё взято
+    (`merge.dropped`). «Взял одну сторону целиком» — не запрещённое решение, но
+    оно называется (`taken` + `why`): тихое «выбрал первую попавшуюся» — это и
+    есть та потеря логики, ради которой версия делалась.
+
+    Конфликт, оставшийся в дереве, судится первым и называется файлами
+    (`merge.conflict`): пока он там, коммита слияния нет, и остальные проверки
+    говорили бы о несуществующем пакете.
+    """
+    conflicts = _unmerged(root)
+    if conflicts:
+        issues.append(
+            Issue(
+                _where("merge", None, "files"),
+                RULE_MERGE_CONFLICT,
+                f"слияние не собрано: в дереве {root} остался конфликт — файлы "
+                f"{', '.join(conflicts)}; разведи их (обе стороны) и закоммить",
+            )
+        )
+        return
+    block = result.get("merge")
+    if not isinstance(block, dict):
+        issues.append(
+            Issue(
+                _where("merge"),
+                RULE_REPORT,
+                "этап-слияние отчитывается полем merge: {files, sides} — по каждой полосе "
+                "{lane, sha, intent, joined}, иначе не видно, что взято с каждой стороны",
+            )
+        )
+        return
+    if not isinstance(block.get("files"), list):
+        issues.append(
+            Issue(
+                _where("merge", None, "files"),
+                RULE_REPORT,
+                "merge.files — список конфликтных файлов (пустой список, если конфликтов не было)",
+            )
+        )
+    named: dict[str, Any] = {}
+    sides = block.get("sides")
+    for position, side in enumerate(sides if isinstance(sides, list) else []):
+        if not isinstance(side, dict):
+            issues.append(Issue(_where("merge", None, "sides"), RULE_REPORT, f"sides[{position}] — словарь"))
+            continue
+        lane = str(side.get("lane") or "").strip()
+        if lane:
+            named[lane] = side
+        if not str(side.get("intent") or "").strip():
+            issues.append(
+                Issue(
+                    _where("merge", None, "sides"),
+                    RULE_MERGE_DROPPED,
+                    f"сторона {lane or '—'} не назвала намерения (intent): что она хотела — "
+                    "неизвестно, и «сохранено» не проверить",
+                )
+            )
+        if not str(side.get("joined") or "").strip():
+            issues.append(
+                Issue(
+                    _where("merge", None, "sides"),
+                    RULE_MERGE_DROPPED,
+                    f"сторона {lane or '—'} не назвала, что из неё вошло в результат (joined)",
+                )
+            )
+    for need in tuple(getattr(stage, "needs", ()) or ()):
+        if str(need) in named:
+            continue
+        issues.append(
+            Issue(
+                _where("merge", None, "sides"),
+                RULE_MERGE_DROPPED,
+                f"полоса {str(need)!r} не названа в отчёте: её работа либо вошла молча, "
+                "либо потеряна — назови {lane, sha, intent, joined}",
+            )
+        )
+    taken = str(block.get("taken") or "").strip()
+    if taken and not str(block.get("why") or "").strip():
+        issues.append(
+            Issue(
+                _where("merge", None, "taken"),
+                RULE_MERGE_DROPPED,
+                f"сторона {taken!r} взята целиком, а «why» пуст: «взял одну сторону целиком» — "
+                "решение, а не тишина — назови, почему намерение другой стороны сохранить "
+                "было нельзя (или сохрани его)",
+            )
+        )
+    if not commit:
+        return
+    count = _parents_count(root, commit)
+    if count is not None and count < 2:
+        issues.append(
+            Issue(
+                _where("commit"),
+                RULE_MERGE_PARENTS,
+                f"commit={commit} — коммит с одним родителем, а свидетель слияния — merge-коммит "
+                "с двумя и более: полоса, которой нет среди родителей, в него не вошла",
+            )
+        )
 
 
 def report_schema(stage: Any) -> dict[str, Any]:
@@ -1252,6 +1415,17 @@ def report_schema(stage: Any) -> dict[str, Any]:
             "reason": "одна строка: почему граф именно такой",
         }
     nothing_offer: dict[str, str] = {}
+    merge: dict[str, Any] = {}
+    if str(getattr(stage, "kind", "") or "") == spec_module.MERGE_KIND:
+        # Отчёт слияния — «что взято с каждой стороны»: без этих полей отказ
+        # (merge.dropped) узнавался бы только после работы, а требование
+        # сохранности обеих сторон — часть контракта (спека 0.2.2, пункт 4).
+        merge = {
+            "files": "список разведённых конфликтных файлов (пустой — слияние прошло без конфликта)",
+            "sides": "по каждой полосе {lane, sha, intent, joined}: что сторона хотела и что из неё вошло",
+            "taken": "id полосы, чьё изменение выброшено целиком (тогда why обязателен)",
+            "why": "одна строка: почему сторону нельзя было сохранить",
+        }
     if wanted == WITNESS_WORK:
         # Пустота — законный исход этапа-производителя, и о ней исполнитель должен
         # узнать из контракта, а не из отказа `commit.foreign`: «править нечего»
@@ -1281,4 +1455,6 @@ def report_schema(stage: Any) -> dict[str, Any]:
         schema["plan"] = plan
     if nothing_offer:
         schema["nothing"] = nothing_offer
+    if merge:
+        schema["merge"] = merge
     return schema

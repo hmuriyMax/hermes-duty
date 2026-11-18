@@ -177,6 +177,13 @@ STDERR_HEAD = 300
 STAGE_KIND_AGENT = "agent"
 STAGE_KIND_SHELL = "shell"
 STAGE_KIND_GATE = "gate"
+# Этап-слияние параллельных полос (0.2.2): движок вливает полосы в дерево этапа
+# сам, а на конфликт поднимает резолвера ролью этапа (`spec.MERGE_KIND`).
+STAGE_KIND_MERGE = spec_module.MERGE_KIND
+
+# Источник фактов слияния в журнале: этап собрал движок, а не профиль роли.
+MERGE_SOURCE = "merge"
+
 
 # Источник событий shell-попытки в журнале: по нему видно, что этап исполнила
 # команда, а не процесс профиля. `engine` остаётся источником решений движка
@@ -995,7 +1002,14 @@ def base_of_stage(spec: Any, stage: Any, events: Iterable[Any]) -> str:
     База этапа `dir`/`none` базой не становится: у первого каталог дела общий (и
     коммит движка туда не пишется), у второго работы нет вовсе — делиться нечем,
     и база остаётся `spec.base`.
+
+    Этап `kind: merge` — исключение по построению: его работа и есть слияние
+    полос, поэтому отводить его дерево от чужой полосы значило бы терять другую.
+    Его база — **общий предок полос** (`merge_base_of_lanes`); отказ «разошлись»
+    для слияния не отказ, а условие задачи.
     """
+    if str(getattr(stage, "kind", "") or "") == STAGE_KIND_MERGE:
+        return merge_base_of_lanes(spec, stage, events)
     needs = tuple(str(need) for need in (getattr(stage, "needs", None) or ()))
     if not needs:
         return str(getattr(spec, "base", "") or "")
@@ -1106,12 +1120,33 @@ def deal_branch(deal: Any) -> str:
     Одна ветка на дело, а не на этап: этапы дела идут цепочкой (`needs`), поэтому
     их коммиты — одна линия. Имя не совпадает с ветками человека (`main`,
     `release/*`), так что двигать её движку можно без спроса.
+
+    Полоса параллельного этапа сюда не попадает (`lane_branch`): её коммит — не
+    вся работа дела, и ветка дела на нём публиковала бы половину.
     """
     return f"{DEAL_BRANCH_PREFIX}{deal['id']}"
 
 
-def anchor_commit(tree: Path, deal: Any, commit: str) -> tuple[str, str]:
-    """Поставить ветку дела на коммит: `(ветка, причина отказа)`.
+def lane_branch(deal: Any, stage_id: str) -> str:
+    """Ветка полосы: `duty/<дело>-<этап>` — своя у каждого параллельного этапа.
+
+    Требование, ради которого версия и делалась (0.2.2): параллельное изменение
+    ведётся в своём дереве и своей ветке, а этап-слияние вливает их в ветку дела.
+    Общая ветка на две полосы означала бы, что её вершина — работа одной стороны,
+    и вторая сторона видна только в чужом дереве (`d_c13d53da`: две полосы,
+    зависимый этап отказался строиться, работы одной из них не было ни в одной
+    ветке).
+
+    Имя — сосед ветки дела, а не вложенное в неё (`duty/<дело>/<этап>`): git не
+    даёт держать одновременно ref `duty/<дело>` и `duty/<дело>/<этап>` — каталог
+    и файл в одном имени. `d_c13d53da`-подобное дело упёрлось бы в отказ
+    закрепления ровно там, где слияние собирается.
+    """
+    return f"{deal_branch(deal)}-{stage_id}"
+
+
+def anchor_commit(tree: Path, deal: Any, commit: str, *, lane: str = "") -> tuple[str, str]:
+    """Поставить ветку на коммит: `(ветка, причина отказа)`.
 
     Дерево попытки остаётся в detached HEAD — ветку оно не занимает, и две
     попытки не спорят за неё. Но сам коммит получает ссылку: без неё работа дела
@@ -1119,14 +1154,27 @@ def anchor_commit(tree: Path, deal: Any, commit: str) -> tuple[str, str]:
     `impl_core`/`impl_wire` пришлось закреплять руками (`git branch duty/... `).
     Отказ закрепления не отменяет коммит: работа уже зафиксирована, поэтому
     причина уходит в событие, а не в вердикт попытки.
+
+    `lane` — id параллельного этапа: такая попытка закрепляется своей веткой
+    полосы (`lane_branch`), а не веткой дела.
     """
     if not commit:
         return "", ""
-    branch = deal_branch(deal)
+    branch = lane_branch(deal, lane) if lane else deal_branch(deal)
     code, reason = _git(["branch", "-f", branch, commit], Path(tree))
     if code != 0:
         return branch, f"git branch -f {branch} отказал: {reason or code}"
     return branch, ""
+
+
+def lane_of(spec: Any, stage: Any) -> str:
+    """id полосы, если этап объявлен параллельным, иначе пустая строка.
+
+    Спрашивается у графа, а не у этапа: `parallel_with` бывает объявлен только с
+    одной стороны, и полосой этап от этого быть не перестаёт (`spec.parallel_partners`).
+    """
+    partners = spec_module.parallel_partners(getattr(spec, "stages", ()), str(getattr(stage, "id", "") or ""))
+    return str(getattr(stage, "id", "") or "") if partners else ""
 
 
 def tree_dirty(tree: Path) -> tuple[bool, int]:
@@ -1161,6 +1209,495 @@ def remove_tree(spec: Any, stage: Any, workdir: Path) -> tuple[bool, str]:
     if code != 0:
         return False, f"git worktree remove отказал: {reason or code}"
     return True, ""
+
+
+# --------------------------------------------------------------------- слияние
+#
+# Этап `kind: merge` (0.2.2) — fan-in параллельных полос. Полосы несут работу
+# каждая в своём дереве и своей ветке (`lane_branch`), а слияние вливает их в
+# ОДИН коммит в дереве этапа: первая полоса — точка отсчёта (`--ff-only`, она уже
+# потомок общего предка), каждая следующая — `git merge --no-ff` по порядку
+# `needs`, то есть по объявлению в плане, а не по времени: повтор того же плана
+# обязан дать тот же результат. Чистое слияние закрывает попытку тут же —
+# процесса нет, платить за него нечем. Конфликт НЕ отменяется (`merge --abort`
+# молча — потеря состояния): он остаётся в дереве этапа, а этап поднимает
+# РЕЗОЛВЕРА — агентскую попытку ролью этапа, чей контракт несёт конфликтные файлы
+# и дифф каждой полосы, требует сохранить намерения обеих сторон и прогонять
+# гейты по слитому дереву.
+# Стратегии `-X ours`/`-X theirs`/`--strategy=ours|theirs` и
+# `git checkout --ours|--theirs` — не способ решить конфликт, а способ его
+# потерять: ровно этим `parallel_with` и был мёртв (`d_c13d53da` 16.11).
+
+# Сколько знаков диффа полосы попадает в контракт резолвера: дифф нужен целиком
+# («что сторона хотела»), но контракт — файл, а не место для мегабайтов.
+MERGE_DIFF_LIMIT = 400_000
+
+# Опции git на коммит движка: имя и подпись машины на факт не влияют. Нужны и
+# слиянию (`git merge` фиксирует merge-коммит сам), и коммиту попытки: без них
+# обе команды упирались бы в `user.email` чужого окружения.
+ENGINE_IDENTITY = (
+    "-c", f"user.name={ENGINE_COMMIT_NAME}",
+    "-c", f"user.email={ENGINE_COMMIT_EMAIL}",
+    "-c", "commit.gpgsign=false",
+)
+
+
+def merge_conflicts(tree: Path) -> list[str]:
+    """Файлы, которые остались в конфликте: `git diff --name-only --diff-filter=U`."""
+    code, out = _git_stdout(["diff", "--name-only", "--diff-filter=U"], Path(tree))
+    if code != 0:
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def merge_in_progress(tree: Path) -> bool:
+    """В дереве начат merge и не закончен (`MERGE_HEAD`): состояние сохранено.
+
+    Нужна повторам: дерево конфликта уберегается как рабочее (`tree_kept`), и
+    повтор продолжает развод файлов, а не начинает слияние заново — иначе первый
+    же `git merge` сказал бы «уже влито» и конфликт выглядел бы решённым.
+    """
+    code, _ = _git(["rev-parse", "--quiet", "--verify", "MERGE_HEAD"], Path(tree))
+    return code == 0
+
+
+def apply_lane_merges(
+    tree: Path, deal: Any, stage: Any, lanes: Iterable[dict[str, Any]]
+) -> tuple[tuple[str, ...], tuple[str, ...], str]:
+    """Влить полосы в дерево этапа по порядку `needs`: (влитые, конфликты, причина).
+
+    Порядок — объявление (`stage.needs`), а не время готовности полос: иначе один
+    и тот же план давал бы разные merge-коммиты. Слияние — **одно и то же для
+    любых полос**: первая полоса становится точкой отсчёта (`--ff-only`: она уже
+    потомок базы), каждая следующая вливается `--no-ff`, поэтому двух полос
+    хватает ровно на ОДИН merge-коммит с двумя родителями. Отказ без конфликта
+    (нет общего предка, битый объект) причиной уходит вызывающему: это
+    инфраструктура, а не спор двух полос.
+    """
+    ordered = list(lanes)
+    applied: list[str] = []
+    for position, lane in enumerate(ordered):
+        message = f"duty: {deal['id']} {stage.id} joins lane {lane['lane']}"
+        if position == 0:
+            # Точка отсчёта: дерево отведено от общего предка, поэтому первая
+            # полоса — это fast-forward. Отдельного коммита она не даёт, и
+            # слияние остаётся одним коммитом, а не цепочкой.
+            code, reason = _git(
+                [*ENGINE_IDENTITY, "merge", "--ff-only", str(lane["commit"])], Path(tree)
+            )
+            if code == 0:
+                applied.append(str(lane["lane"]))
+                continue
+        code, reason = _git(
+            [
+                *ENGINE_IDENTITY,
+                "merge", "--no-ff", "--no-edit",
+                "-m", message,
+                str(lane["commit"]),
+            ],
+            Path(tree),
+        )
+        if code == 0:
+            applied.append(str(lane["lane"]))
+            continue
+        conflicts = tuple(merge_conflicts(Path(tree)))
+        if conflicts:
+            return tuple(applied), conflicts, ""
+        return tuple(applied), (), reason or f"git merge отказал кодом {code}"
+    return tuple(applied), (), ""
+
+
+def merge_lanes(spec: Any, stage: Any, events: Iterable[Any]) -> tuple[dict[str, Any], ...]:
+    """Полосы этапа слияния в порядке объявления: id, коммит, дерево попытки.
+
+    Полоса без коммита — отказ контракта (`BaseError`): сливать нечего, и
+    «слито» без работы одной стороны было бы ровно той потерей логики, от которой
+    правило `plan.parallel.workspace` уберегает на входе плана.
+    """
+    needs = tuple(str(need) for need in (getattr(stage, "needs", None) or ()))
+    found = _successful_of(needs, events)
+    lanes: list[dict[str, Any]] = []
+    for need in needs:
+        hit = found.get(need)
+        commit = attempt_commit(hit[1]) if hit is not None else ""
+        if hit is None or not commit:
+            raise BaseError(
+                f"этап {stage.id!r} сливает полосы, а {need!r} не произвёл коммита: "
+                "сливать нечего — полоса заканчивается работой (commit)"
+            )
+        payload = hit[1]
+        details = payload.get("details")
+        if not isinstance(details, dict):
+            details = {}
+        tree = details.get("tree")
+        lanes.append(
+            {
+                "lane": need,
+                "commit": commit,
+                "tree": str(tree) if isinstance(tree, str) and tree else "",
+                "attempt": int(payload.get("attempt") or 0),
+            }
+        )
+    return tuple(lanes)
+
+
+def merge_base_of_lanes(spec: Any, stage: Any, events: Iterable[Any]) -> str:
+    """Общий предок полос — база дерева слияния.
+
+    Полосы разошлись по построению, поэтому база берётся у git (`merge-base`), а
+    не у более поздней полосы: дерево, отведённое от одной из них, уже потеряло
+    бы работу другой — ровно то, чем `base_of_stage` отказывал до 0.2.2.
+    """
+    lanes = merge_lanes(spec, stage, events)
+    repo_text = str(getattr(spec, "repo", "") or "").strip()
+    repo = Path(repo_text).expanduser() if repo_text else None
+    if repo is None or not repo.is_dir():
+        raise BaseError(
+            f"этап {stage.id!r} сливает полосы, а репозитория {repo_text or '—'} нет: "
+            "от чего отводить дерево слияния"
+        )
+    shas: list[str] = []
+    for lane in lanes:
+        sha = _sha(repo, str(lane["commit"]))
+        if not sha:
+            raise BaseError(
+                f"этап {stage.id!r}: коммит полосы {lane['lane']!r} "
+                f"{str(lane['commit'])[:PUBLISH_SHORT]}… не резолвится в {repo}"
+            )
+        shas.append(sha)
+    code, out = _git(["merge-base", *shas], repo)
+    base = out.split()[0] if code == 0 and out.split() else ""
+    if not base:
+        named = ", ".join(repr(str(lane["lane"])) for lane in lanes)
+        raise BaseError(
+            f"этап {stage.id!r}: у полос {named} нет общего предка — общего дерева для "
+            "слияния нет, и слияние тут не поможет (это разные истории)"
+        )
+    return base
+
+
+def lane_diff(repo: Path, base: str, lane: dict[str, Any]) -> str:
+    """`git diff <база>..<полоса>` — то, что сторона хотела, словами git.
+
+    Резолвер получает дифф каждой полосы, а не только конфликтный кусок: без
+    него «сохранить намерение» невозможно — видно, что столкнулось, но не то,
+    чего добивались обе стороны.
+    """
+    code, out = _git_stdout(["diff", f"{base}..{lane['commit']}", "--"], Path(repo))
+    if code != 0:
+        return f"(дифф полосы {lane['lane']} не читается: {out})"
+    text = out if out.strip() else f"(полоса {lane['lane']} не изменила файлов)"
+    if len(text) > MERGE_DIFF_LIMIT:
+        return text[:MERGE_DIFF_LIMIT] + f"\n… дифф обрезан на {MERGE_DIFF_LIMIT} знаках"
+    return text
+
+
+def merge_report(
+    base: str, lanes: Iterable[dict[str, Any]], conflict_files: Iterable[str]
+) -> dict[str, Any]:
+    """Отчёт слияния в той форме, которую судит гейт пакета (`merge.files`/`sides`).
+
+    Чистое слияние пишет движок: сторона названа коммитом и веткой, намерение —
+    тем, что она принесла, `joined` — тем, что конфликтов не было. Конфликтное
+    слияние тот же блок заполняет резолвер, а `files` называет разведённые файлы.
+    """
+    sides = [
+        {
+            "lane": str(lane["lane"]),
+            "sha": str(lane["commit"]),
+            "intent": str(lane.get("intent") or f"работа полосы {lane['lane']}"),
+            "joined": str(lane.get("joined") or "влита целиком, столкновений не было"),
+        }
+        for lane in lanes
+    ]
+    return {
+        "base": base,
+        "order": [str(lane["lane"]) for lane in lanes],
+        "files": list(conflict_files),
+        "sides": sides,
+    }
+
+
+def merge_conflict_text(files: Iterable[str], lanes: Iterable[dict[str, Any]]) -> str:
+    """Причина отказа `merge.conflict`: конфликтные файлы и обе стороны с sha.
+
+    Текст называет всё, что нужно человеку и лиду, чтобы продолжить без разбора
+    журнала: файлы, стороны с коммитами и где лежат деревья полос.
+    """
+    named = ", ".join(str(item) for item in files) or "—"
+    sides = "; ".join(
+        f"{lane['lane']} {str(lane['commit'])[:PUBLISH_SHORT]}…"
+        + (f" (дерево {lane['tree']})" if lane.get("tree") else "")
+        for lane in lanes
+    )
+    return (
+        f"merge.conflict: слияние не собрано — конфликтные файлы {named}; стороны: {sides or '—'}. "
+        "Деревья полос сохранены, состояние конфликта лежит в дереве этапа: разведи обе "
+        "стороны по существу и закоммить (стратегия ours/theirs запрещена)"
+    )
+
+
+def resolve_brief(
+    spec: Any,
+    deal: Any,
+    stage: Any,
+    base: str,
+    lanes: Iterable[dict[str, Any]],
+    applied: Iterable[str],
+    conflicts: Iterable[str],
+) -> dict[str, Any]:
+    """Что резолвер получает о конфликте: файлы, диффы полос, порядок, база.
+
+    Лид планирует ОДИН этап, а не «merge + отдельный резолвер»: режим резолва —
+    часть этапа слияния, и попытка-резолвер поднимается движком из того же факта.
+    """
+    repo_text = str(getattr(spec, "repo", "") or "").strip()
+    repo = Path(repo_text).expanduser() if repo_text else Path(".")
+    return {
+        "base": base,
+        "order": [str(lane["lane"]) for lane in lanes],
+        "conflict_files": list(conflicts),
+        "applied": list(applied),
+        "lanes": [
+            {
+                "lane": str(lane["lane"]),
+                "sha": str(lane["commit"]),
+                "branch": lane_branch(deal, str(lane["lane"])),
+                "tree": str(lane.get("tree") or "") or None,
+                "diff": lane_diff(repo, base, lane),
+            }
+            for lane in lanes
+        ],
+    }
+
+
+def run_merge_evidence(stage: Any, tree: Optional[Path], started_at: int) -> list[dict[str, Any]]:
+    """Объявленные команды слияния прогоняются по СЛИТОМУ дереву.
+
+    «Зелёная полоса + зелёная полоса ≠ зелёный merge»: если лид объявил гейты у
+    самого слияния, они и есть проверка собранного результата, а не полос.
+    Записи той же формы, что у попытки агента, — сверяет их тот же гейт.
+    """
+    records: list[dict[str, Any]] = []
+    for item in getattr(stage, "evidence", ()) or ():
+        cmd = str(getattr(item, "cmd", "") or "")
+        if not cmd.strip():
+            continue
+        timeout = getattr(item, "timeout_sec", None) or spec_module.DEFAULT_TIMEOUT_SEC
+        code = 1
+        if tree is not None:
+            try:
+                done = subprocess.run(
+                    shell_command(cmd),
+                    cwd=str(tree),
+                    capture_output=True,
+                    text=True,
+                    timeout=float(timeout),
+                    env=shell_env(),
+                )
+                code = int(done.returncode)
+            except (OSError, subprocess.SubprocessError):
+                code = 1
+        records.append({"cmd": cmd, "exit": code, "started_at": int(started_at)})
+    return records
+
+
+def cleanup_lanes(
+    spec: Any, deal: Any, lanes: Iterable[dict[str, Any]]
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Убрать ветки и деревья полос после успешного слияния: (убрано, оставлено).
+
+    Уборка — не гарантия, а попытка: занятое дерево, чужой lock и грязный каталог
+    дают причину, а не тишину. Непустое дерево НЕ удаляется: в нём может лежать
+    единственная копия работы (правило 0.0.9), и цена ошибки здесь — чужая работа.
+    Зовётся только после того, как merge-коммит закреплён веткой дела: до этого
+    ветка полосы — единственная ссылка на её работу.
+    """
+    repo_text = str(getattr(spec, "repo", "") or "").strip()
+    repo = Path(repo_text).expanduser() if repo_text else None
+    cleaned: list[str] = []
+    kept: list[str] = []
+    for lane in lanes:
+        name = str(lane["lane"])
+        branch = lane_branch(deal, name)
+        tree_text = str(lane.get("tree") or "")
+        tree = Path(tree_text) if tree_text else None
+        if tree is not None and tree.is_dir():
+            dirty, _files = tree_dirty(tree)
+            if dirty:
+                kept.append(f"{name}: дерево {tree} с незакоммиченной работой — сохранено")
+                continue
+            if repo is None or not repo.is_dir():
+                kept.append(f"{name}: дерево {tree} — репозитория нет, убрать нечем")
+                continue
+            code, reason = _git(["worktree", "remove", "--force", str(tree)], repo)
+            if code != 0:
+                kept.append(f"{name}: дерево {tree} — git worktree remove отказал: {reason or code}")
+                continue
+        cleaned.append(f"{name}: дерево {tree} убрано" if tree is not None else f"{name}: дерева не было")
+        if repo is None or not repo.is_dir():
+            continue
+        code, reason = _git(["branch", "-D", branch], repo)
+        if code != 0:
+            cleaned[-1] += f"; ветка {branch} осталась: {reason or code}"
+    return tuple(cleaned), tuple(kept)
+
+
+def finish_merge_stage(
+    conn: sqlite3.Connection,
+    spec: Any,
+    deal: Any,
+    stage: Any,
+    attempt: int,
+    *,
+    workdir: Path,
+    tree: Optional[Path],
+    base: str,
+    lanes: tuple[dict[str, Any], ...],
+    conflict_files: Iterable[str] = (),
+    failure: str = "",
+    clock: Callable[[], float],
+    home: Path,
+) -> dict[str, Any]:
+    """Закрыть слияние, которое движок собрал сам: гейт, ветка, факт, уборка полос.
+
+    Процесса на этом пути нет вовсе: полосы слил движок, и платить за попытку
+    нечем. Поэтому факт — `attempt_ended` без `attempt_started` (ровно так же, как
+    отказ гейта и исчерпанный потолок): «попытка идёт» означало бы процесс,
+    которого нет, и уборка осиротевших попыток закрыла бы живую работу как мёртвую.
+    """
+    stage_id = stage.id
+    run_id = f"{stage_id}#{attempt}"
+    now = _now_sec(int(clock()))
+    result: Optional[dict[str, Any]] = None
+    verdict = None
+    outcome, kind, reason = OUTCOME_DONE, "", ""
+    conflicts = tuple(str(item) for item in conflict_files)
+    if conflicts:
+        outcome, kind, reason = OUTCOME_FAILED, FAIL_CONTRACT, merge_conflict_text(conflicts, lanes)
+    elif failure:
+        outcome, kind, reason = OUTCOME_FAILED, FAIL_INFRA, failure
+    else:
+        merge_sha = _sha(Path(tree), "HEAD") if tree is not None else ""
+        result = {
+            "status": OUTCOME_DONE,
+            "commit": merge_sha,
+            "summary": (
+                f"слияние: полосы {', '.join(str(lane['lane']) for lane in lanes)} влиты в один "
+                f"коммит {merge_sha[:PUBLISH_SHORT]}…"
+            ),
+            "evidence": run_merge_evidence(stage, Path(tree) if tree is not None else None, now),
+            "merge": merge_report(base, lanes, ()),
+        }
+        verdict = evidence_module.verify(
+            result,
+            stage,
+            workdir,
+            attempt_started_at=now,
+            now=now,
+            root=tree,
+            base=base,
+            repo=spec.repo,
+        )
+        if not verdict.ok:
+            outcome, kind, reason = OUTCOME_FAILED, failures.verdict_kind(verdict), verdict.reason()
+
+    committed = ""
+    branch = ""
+    branch_error = ""
+    cleaned: tuple[str, ...] = ()
+    kept: tuple[str, ...] = ()
+    if outcome == OUTCOME_DONE and tree is not None:
+        committed, commit_error = commit_tree(tree, deal, stage_id, attempt)
+        if not committed:
+            outcome = OUTCOME_FAILED
+            kind = FAIL_INFRA
+            reason = f"работа попытки не зафиксирована коммитом: {commit_error}"
+        else:
+            # Слияние закрепляется веткой ДЕЛА: merge-коммит — работа всего дела,
+            # и именно на нём стоят зависимые этапы и публикация.
+            branch, branch_error = anchor_commit(tree, deal, committed)
+            # Полосы убираются только после закрепления merge-коммита веткой дела:
+            # до этого ветка полосы — единственная ссылка на её работу.
+            cleaned, kept = cleanup_lanes(spec, deal, lanes)
+
+    payload: dict[str, Any] = {
+        "run_id": run_id,
+        "stage": stage_id,
+        "attempt": int(attempt),
+        "outcome": outcome,
+        "kind": kind or None,
+        "reason": reason,
+        "base": base,
+        "commit": committed or None,
+        "details": {
+            "stage_kind": STAGE_KIND_MERGE,
+            "workdir": str(workdir),
+            "tree": str(tree) if tree is not None else None,
+            "cleaned": False,
+            "cleanup": None,
+            "tree_kept": str(tree) if outcome != OUTCOME_DONE and tree is not None else None,
+            "branch": branch or None,
+            "branch_error": branch_error or None,
+            "verdict": verdict.as_payload() if verdict is not None else None,
+            "witness": verdict.witness if verdict is not None else None,
+            # Полосы слияния: порядок, коммиты, ветки и деревья — по ним видно, что
+            # вошло в merge-коммит и что осталось на диске после уборки.
+            "merge": {
+                "base": base,
+                "order": [str(lane["lane"]) for lane in lanes],
+                "lanes": [
+                    {
+                        "lane": str(lane["lane"]),
+                        "commit": str(lane["commit"]),
+                        "branch": lane_branch(deal, str(lane["lane"])),
+                        "tree": str(lane.get("tree") or "") or None,
+                    }
+                    for lane in lanes
+                ],
+                "conflict_files": list(conflicts),
+                "cleaned": list(cleaned),
+                "kept": list(kept),
+            },
+        },
+    }
+    if result is not None:
+        payload["result"] = result
+    ended = _event(
+        deal,
+        "attempt_ended",
+        payload,
+        {"stage": stage_id, "attempt": int(attempt), "outcome": outcome},
+        now,
+        MERGE_SOURCE,
+    )
+    with conn:
+        journal.append_in_tx(conn, [ended])
+        conn.execute(
+            "DELETE FROM leases WHERE deal_id = ? AND stage = ? AND pid = ?",
+            (str(deal["id"]), stage_id, os.getpid()),
+        )
+
+    park = None
+    if outcome == OUTCOME_FAILED:
+        park = park_exhausted(conn, spec, deal, stage, attempt, kind, reason, home=home, clock=clock)
+
+    return {
+        "started": True,
+        "stage": stage_id,
+        "attempt": int(attempt),
+        "outcome": outcome,
+        "kind": kind or None,
+        "reason": reason,
+        "run_id": run_id,
+        "workdir": str(workdir),
+        "tree": str(tree) if tree is not None else None,
+        "base": base,
+        "commit": committed or None,
+        "verdict": verdict.as_payload() if verdict is not None else None,
+        "park": park,
+        "retry": park is None and outcome == OUTCOME_FAILED,
+    }
 
 
 # ------------------------------------------------------- контракт и предыстория
@@ -1692,6 +2229,7 @@ def build_contract(
     session_id: str = "",
     approved: Optional[dict[str, Any]] = None,
     events: Optional[Iterable[Any]] = None,
+    merge: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Входной контракт попытки: файл, а не проза в командной строке.
 
@@ -1778,6 +2316,25 @@ def build_contract(
             "(файл result.json): summary это вывод, а не весь отчёт — "
             "читай файл, прежде чем править код"
         )
+    if merge is not None:
+        # Резолвер конфликта: у него нет ни времени на догадки, ни права выбрать
+        # сторону. Всё, что нужно для решения, — в контракте (`merge`), а форма
+        # отчёта — в `report_schema.merge`.
+        boundaries += [
+            "этап-слияние: в дереве уже начат merge, конфликтные файлы — "
+            "merge.conflict_files; по каждой полосе в merge.lanes лежит git diff от общей базы",
+            "сохрани намерения ОБЕИХ сторон: конфликт решается по существу, стратегией — никогда "
+            "(-X ours/-X theirs/--strategy=ours|theirs/git checkout --ours|--theirs запрещены)",
+            "разведённые файлы закоммить в дереве (git add -A && git commit): коммит в состоянии "
+            "merge получает двух родителей — это и есть свидетель слияния",
+            "прогони гейты затронутых пакетов в СЛИТОМ дереве: зелёная полоса + зелёная полоса "
+            "не даёт зелёного merge",
+            "отчёт несёт merge: {files, sides: [{lane, sha, intent, joined}]} — по каждой стороне, "
+            "что она хотела и что из неё вошло; сторону, выброшенную целиком, назови taken + why, "
+            "иначе отказ merge.dropped",
+            "не смог развести — status: refused со списком конфликтных файлов: класс merge.conflict "
+            "назовёт их, а деревья полос останутся на месте",
+        ]
     contract: dict[str, Any] = {
         "deal": str(deal["id"]),
         "stage": stage.id,
@@ -1802,6 +2359,8 @@ def build_contract(
         contract["approved"] = approved
     if session_id:
         contract["session_id"] = session_id
+    if merge is not None:
+        contract["merge"] = merge
     # Этап плана получает в контракте то, без чего план не нарисовать: хартию
     # (границы роста графа), уже существующий граф и остаток бюджета дела.
     # «Не влез в хартию» и «не знал потолка» — разные отказы, и второй из них
@@ -3175,7 +3734,7 @@ def finish_shell_stage(
             kind = FAIL_INFRA
             reason = f"работа попытки не зафиксирована коммитом: {commit_error}"
         else:
-            branch, branch_error = anchor_commit(tree, deal, committed)
+            branch, branch_error = anchor_commit(tree, deal, committed, lane=lane_of(spec, stage))
 
     # Дерево упавшей попытки убирается только пустым. Правило было перевёрнуто:
     # дерево удалялось ровно тогда, когда работы в коммите ещё не было, и падение
@@ -4405,6 +4964,10 @@ def start_stage(
         }
 
     stage_base = str(spec.base or "")
+    merge_lanes_found: tuple[dict[str, Any], ...] = ()
+    merged_applied: tuple[str, ...] = ()
+    merge_conflict_files: tuple[str, ...] = ()
+    merge_error = ""
     try:
         workdir.mkdir(parents=True, exist_ok=True)
         # Журнал читается один раз на шаг: из него же берётся база этапа и отчёты
@@ -4418,6 +4981,25 @@ def start_stage(
         tree, cwd = open_tree(
             conn, deal, spec, stage, stage_id, attempt, workdir, stage_base, clock=clock
         )
+        if str(getattr(stage, "kind", "") or "") == STAGE_KIND_MERGE:
+            # Слияние начинает сам движок: полосы уже лежат своими коммитами, и
+            # работа этапа — собрать из них один. Дерево отведено от общего
+            # предка полос (`base_of_stage` → `merge_base_of_lanes`).
+            merge_lanes_found = merge_lanes(spec, stage, events)
+            if tree is None:
+                raise RunnerError(
+                    f"этап {stage_id!r} с kind: merge без дерева: merge-коммит некуда писать"
+                )
+            if merge_in_progress(Path(tree)):
+                # Конфликт прошлой попытки сохранён в дереве (`tree_reused`):
+                # слияние продолжается с развода файлов, а не начинается заново —
+                # иначе `git merge` сказал бы «уже влито», и конфликт выглядел бы
+                # решённым.
+                merge_conflict_files = tuple(merge_conflicts(Path(tree)))
+            else:
+                merged_applied, merge_conflict_files, merge_error = apply_lane_merges(
+                    Path(tree), deal, stage, merge_lanes_found
+                )
     except (RunnerError, OSError) as exc:
         kind = FAIL_CONTRACT if isinstance(exc, BaseError) else FAIL_INFRA
         release(conn, deal=deal, stage=stage_id, pid=engine_pid)
@@ -4481,6 +5063,64 @@ def start_stage(
         if pinned:
             actual_base = pinned
 
+    # Слияние: чистое — закрывается тут же движком (процесс не нужен), а
+    # конфликтное поднимает резолвера обычной агентской попыткой с его брифом.
+    merge_brief: Optional[dict[str, Any]] = None
+    if str(getattr(stage, "kind", "") or "") == STAGE_KIND_MERGE:
+        # База слияния — общий предок полос (`stage_base`), а не HEAD дерева:
+        # после вливания HEAD и есть merge-коммит, и сверка «коммит новее базы»
+        # объявила бы его чужим готовым (`commit.foreign`). Диффы полос в брифе
+        # резолвера тоже считаются от этой базы, иначе они показали бы уже
+        # влитую сторону как «ничего не меняла».
+        merge_base = stage_base or actual_base
+        if merge_error:
+            # Слияние не состоялось и конфликта нет (битый объект, нет общей
+            # истории): резолверу здесь нечего разводить — это отказ инфраструктуры.
+            return {
+                "live": None,
+                "result": finish_merge_stage(
+                    conn,
+                    spec,
+                    deal,
+                    stage,
+                    attempt,
+                    workdir=workdir,
+                    tree=tree,
+                    base=merge_base,
+                    lanes=merge_lanes_found,
+                    failure=merge_error,
+                    clock=clock,
+                    home=home,
+                ),
+            }
+        if merge_conflict_files:
+            merge_brief = resolve_brief(
+                spec,
+                deal,
+                stage,
+                merge_base,
+                merge_lanes_found,
+                merged_applied,
+                merge_conflict_files,
+            )
+        else:
+            return {
+                "live": None,
+                "result": finish_merge_stage(
+                    conn,
+                    spec,
+                    deal,
+                    stage,
+                    attempt,
+                    workdir=workdir,
+                    tree=tree,
+                    base=merge_base,
+                    lanes=merge_lanes_found,
+                    clock=clock,
+                    home=home,
+                ),
+            }
+
     previous = previous_reports(conn, deal, spec, stage_id, events=events)
 
     if answer is None:
@@ -4517,6 +5157,7 @@ def start_stage(
             "answer": approval.answer,
         },
         events=events,
+        merge=merge_brief,
     )
     contract_file = write_contract(contract_path(workdir, stage_id, attempt), contract)
     query_file = contract_file
@@ -4764,6 +5405,37 @@ def finish_agent_stage(
             nothing = evidence_module.nothing_reason(result)
             reason = f"работы не было: {nothing}"
 
+    # Слияние (0.2.2): резолвер не справился — отказ называется классом и
+    # файлами (`merge.conflict`), а деревья полос НЕ убираются: в них лежит
+    # единственная копия работы сторон. Классы, которые уже сказали своё
+    # (`merge.dropped`, `merge.parents`), не переписываются: там причина точнее.
+    merge_details: Optional[dict[str, Any]] = None
+    merge_lanes_found: tuple[dict[str, Any], ...] = ()
+    if str(getattr(stage, "kind", "") or "") == STAGE_KIND_MERGE:
+        try:
+            merge_lanes_found = merge_lanes(spec, stage, events)
+        except BaseError:
+            merge_lanes_found = ()
+        conflict_files = tuple(merge_conflicts(Path(tree))) if tree is not None else ()
+        merge_details = {
+            "base": actual_base,
+            "order": [str(lane["lane"]) for lane in merge_lanes_found],
+            "lanes": [
+                {
+                    "lane": str(lane["lane"]),
+                    "commit": str(lane["commit"]),
+                    "branch": lane_branch(deal, str(lane["lane"])),
+                    "tree": str(lane.get("tree") or "") or None,
+                }
+                for lane in merge_lanes_found
+            ],
+            "conflict_files": list(conflict_files),
+            "cleaned": [],
+            "kept": [],
+        }
+        if outcome != OUTCOME_DONE and kind == FAIL_CONTRACT and "merge." not in reason:
+            reason = merge_conflict_text(conflict_files, merge_lanes_found)
+
     # Публикация (0.0.5): «опубликовано» — заявка исполнителя, факт даёт origin.
     # Сверка идёт до коммита в дереве и до `attempt_ended`: подтверждённый sha
     # ложится отдельным событием `published`, а несошедшаяся заявка — отказом
@@ -4821,7 +5493,7 @@ def finish_agent_stage(
             kind = FAIL_INFRA
             reason = f"работа попытки не зафиксирована коммитом: {commit_error}"
         else:
-            branch, branch_error = anchor_commit(tree, deal, committed)
+            branch, branch_error = anchor_commit(tree, deal, committed, lane=lane_of(spec, stage))
 
     # Дерево упавшей попытки убирается только пустым. Правило было перевёрнуто:
     # дерево удалялось ровно тогда, когда работы в коммите ещё не было, и падение
@@ -4839,6 +5511,15 @@ def finish_agent_stage(
             kept_tree = str(tree_path)
         else:
             cleaned, cleanup = remove_tree(spec, stage, workdir)
+
+    if merge_details is not None and outcome == OUTCOME_DONE and committed:
+        # Полосы убираются только после закрепления merge-коммита веткой дела:
+        # до этого ветка полосы — единственная ссылка на её работу. При отказе
+        # ветки и деревья полос остаются: там работа сторон, и пути названы в
+        # `details.merge.lanes` и в причине отказа.
+        cleaned, kept = cleanup_lanes(spec, deal, merge_lanes_found)
+        merge_details["cleaned"] = list(cleaned)
+        merge_details["kept"] = list(kept)
 
     payload: dict[str, Any] = {
         "run_id": run_id,
@@ -4882,6 +5563,10 @@ def finish_agent_stage(
             "witness": verdict.witness if verdict is not None else None,
         },
     }
+    if merge_details is not None:
+        # Полосы, конфликтные файлы и уборка: по факту видно, что вошло в
+        # merge-коммит и что осталось на диске после отказа.
+        payload["details"]["merge"] = merge_details
     if result is not None:
         payload["result"] = result
     if nothing is not None:

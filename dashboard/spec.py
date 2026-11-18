@@ -146,12 +146,28 @@ TO_HUMAN = ("decisions_only", "never")
 
 # Виды этапа (спека P2, `docs/SPEC.md`): `agent` — процесс профиля роли,
 # `shell` — команда с кодом возврата вместо отчёта, `gate` — остановка на
-# человеке: этап ничего не исполняет, а задаёт вопрос и читает ответ. Умолчание —
-# `agent`: спеки 0.0.4 объявляют этапы без `kind` и обязаны читаться без правок.
-STAGE_KINDS = ("agent", "shell", "gate")
+# человеке: этап ничего не исполняет, а задаёт вопрос и читает ответ, `merge` —
+# этап-слияние параллельных полос (0.2.2). Умолчание — `agent`: спеки 0.0.4
+# объявляют этапы без `kind` и обязаны читаться без правок.
+STAGE_KINDS = ("agent", "shell", "gate", "merge")
 DEFAULT_STAGE_KIND = "agent"
 SHELL_KIND = "shell"
 GATE_KIND = "gate"
+# Этап-слияние параллельных полос (0.2.2). Полосы объявляют друг друга
+# `parallel_with`, каждая производит работу в своём дереве и своей ветке, а
+# `merge` собирает их в ОДИН коммит в ветке этапа (`git merge --no-ff` по
+# порядку `needs`). Конфликт решается по существу — движок поднимает агентскую
+# попытку-резолвер ролью `role` (умолчание `MERGE_RESOLVER_ROLE`), а не выбирает
+# сторону стратегией `ours`/`theirs`. Причина появления: `base_of_stage` отказывал
+# `BaseError` («предшественники разошлись») на двух коммитах без общего потомка,
+# то есть `parallel_with` был разрешён, но при fan-in мёртв (`d_c13d53da` 16.11
+# 18:11, `d_1c53fbd0` — три отказа того же вида).
+MERGE_KIND = "merge"
+# Роль резолвера конфликтов: у неё есть терминал и дерево — она читает оба диффа,
+# правит файлы и коммитит результат.
+MERGE_RESOLVER_ROLE = "implementer"
+# Меньше двух полос — это не слияние, а перестановка: полосе не с кем сходиться.
+MERGE_MIN_LANES = 2
 
 # Этап, чей отчёт — предложение плана (1.0, `docs/ENGINE-1.0.md`, раздел 3): в
 # seed-графе он называется `coordinator` — координатор дела, он же ведёт его по
@@ -329,6 +345,15 @@ def reviewer_role(spec: Any) -> str:
 # Команду-доказательство спека ему всё равно может объявить (`test -s`, `grep -q`
 # по заметке) — это проверяется отдельно от свидетеля.
 EVIDENCE_FREE_ROLES = (REVIEWING_ROLE, "researcher", "documenter")
+
+# Кто не считается производителем в параллельной полосе (0.2.2): свидетель такого
+# этапа — отчёт, а не `commit|artifacts` (`dashboard/evidence.py`,
+# `REPORT_WITNESS_ROLES` собирается из этого набора). Тестер стоит рядом с ролями
+# без дерева по той же причине, что и там: команды он гоняет, но чужую работу не
+# присваивает, и своя ветка ему не нужна. Набор читает правило
+# `plan.parallel.workspace` — производитель в полосе не работает в общем каталоге
+# дела, а проверяющему общий каталог не мешает: он ничего не правит.
+PARALLEL_FREE_ROLES = (*EVIDENCE_FREE_ROLES, "tester")
 
 # Роли, чьи профили не запускают команд (`terminal` в disabled_toolsets): лид,
 # ресерчер. Объявлять такому этапу `evidence` бессмысленно: роль не может
@@ -590,7 +615,9 @@ class Stage:
     `kind` решает, кто исполняет этап: `agent` — процесс профиля `role`,
     `shell` — команда `cmd` с обязательным кодом возврата `must` и, если
     объявлены, артефактами `artifacts`, `gate` — никто: этап задаёт вопрос
-    человеку (`ask.q`/`ask.options`) и читает ответ (допустимые — `allow`).
+    человеку (`ask.q`/`ask.options`) и читает ответ (допустимые — `allow`),
+    `merge` — движок: он вливает параллельные полосы в свою ветку и поднимает
+    резолвера ролью `role` на конфликт (`MERGE_KIND`).
     Поля чужого вида у этапа ничего не значат и потому отказывают
     (`_check_kind`), а не игнорируются.
     """
@@ -1336,9 +1363,15 @@ def _parse_stage(
         )
         workspace = ""
         workspace_default = False
+    role_text = role if isinstance(role, str) else ""
+    if kind == MERGE_KIND and not role_text.strip():
+        # У слияния роль — это роль резолвера конфликтов, а не исполнителя полосы:
+        # лид, объявивший `kind: merge`, не обязан помнить умолчание, а без роли
+        # движку некого поднимать на конфликт.
+        role_text = MERGE_RESOLVER_ROLE
     return Stage(
         id=stage_id,
-        role=role if isinstance(role, str) else "",
+        role=role_text,
         title=title,
         kind=kind,
         workspace=workspace,
@@ -1559,9 +1592,12 @@ def known_profiles(root: Optional[Path] = None) -> frozenset[str]:
 def _check_roles(spec: Spec, profiles: frozenset[str]) -> list[Issue]:
     issues: list[Issue] = []
     for stage in spec.stages:
-        if stage.kind != DEFAULT_STAGE_KIND:
+        if stage.kind in (SHELL_KIND, GATE_KIND):
             # У этапа-команды роли нет: кто её исполняет — это `cmd`, и роль
             # здесь отказывает (`_check_kind`), а не ищется среди профилей.
+            # Гейт тоже ничего не исполняет и роли не имеет. Слияние — не
+            # исключение из правила «роль должна существовать»: его `role`
+            # называет профиль резолвера, которого движок поднимет на конфликт.
             continue
         if spawn_profile(stage.role) not in profiles:
             issues.append(
@@ -2183,14 +2219,199 @@ def _check_publish_gate(spec: Any) -> list[Issue]:
     return issues
 
 
+def produces_work(stage: Any) -> bool:
+    """Этап присваивает работу (свидетель `commit|artifacts`), а не отчёт о чужой.
+
+    Тот же признак, по которому свидетель выбирается в `dashboard/evidence.py`
+    (`witness`): не гейт, нет приговора, не публикующий этап, роль не из набора
+    «работа — это отчёт» (`PARALLEL_FREE_ROLES`: ревьюер, ресерчер, документер,
+    тестер). Признак живёт здесь, а не в `evidence`, потому что первым его
+    спрашивает вход плана: правило `plan.parallel.workspace` отказывает ДО
+    запуска, а `evidence` судит уже сделанное.
+
+    Копией это не становится: `evidence.REPORT_WITNESS_ROLES` собирается из
+    `EVIDENCE_FREE_ROLES` этого модуля, и оба читателя говорят об одном наборе.
+    """
+    kind = str(getattr(stage, "kind", DEFAULT_STAGE_KIND) or DEFAULT_STAGE_KIND)
+    if kind == GATE_KIND or getattr(stage, "verdict", None) is not None:
+        return False
+    role = str(getattr(stage, "role", "") or "")
+    # Роль без терминала (координатор, ресерчер) файлов не правит: у профиля нет
+    # ни записи, ни команд, и полосы у неё нет.
+    if role in NO_SHELL_ROLES:
+        return False
+    return role not in PARALLEL_FREE_ROLES and role not in PUBLISHING_ROLES
+
+
+def _need_closure(by_id: Mapping[str, Any], stage_id: str) -> set[str]:
+    """Транзитивные предки этапа по `needs` — без догадок и без бесконечности на цикле."""
+    seen: set[str] = set()
+    stack = [stage_id]
+    while stack:
+        node = by_id.get(stack.pop())
+        if node is None:
+            continue
+        for need in getattr(node, "needs", ()) or ():
+            name = str(need)
+            if name in seen:
+                continue
+            seen.add(name)
+            stack.append(name)
+    return seen
+
+
+def _parallel_lanes(by_id: Mapping[str, Any]) -> list[tuple[str, str]]:
+    """Пары полос, объявленных друг другу `parallel_with` (в любую сторону), без дублей.
+
+    Направление объявления ничего не значит: `transit._parallel` читает обе
+    стороны одинаково, и вход плана обязан мерить граф тем же отношением, иначе
+    правило срабатывало бы только на той половине полос, которая объявила соседа.
+    Порядок пар — порядок объявления: повтор того же плана даёт тот же список.
+    """
+    pairs: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for stage_id, stage in by_id.items():
+        for other in getattr(stage, "parallel_with", ()) or ():
+            name = str(other)
+            if name == stage_id or name not in by_id:
+                continue
+            key = (stage_id, name) if stage_id <= name else (name, stage_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append(key)
+    return pairs
+
+
+def _check_parallel_workspaces(
+    by_id: Mapping[str, Any], *, where: Path, touched: Optional[Iterable[str]] = None
+) -> list[Issue]:
+    """`plan.parallel.workspace`: параллельная полоса-производитель живёт в своей ветке.
+
+    Общий каталог дела (`workspace: dir`) у двух полос значит, что они правят один
+    файл без ветки и без слияния: работа одной стороны молча затирает другую, а
+    этап-слияние собирать нечего. Поэтому производитель в полосе не вправе
+    работать в общем каталоге — ему нужна своя ветка (`workspace: worktree`).
+
+    `workspace: none` отказом не считается: у такого этапа нет ни дерева, ни
+    коммита, и общего файла он с соседом не делит (его работа — каталог попытки).
+    Производящим он при этом быть не перестаёт, и отказ «производит, а коммита
+    нет» ему выносит гейт пакета (`evidence.verify`), а не вход плана.
+
+    Проверяющие этапы (ревьюер, тестер) правилом не ограничены: их свидетель —
+    отчёт, а не `commit`, и общий каталог им не мешает (`PARALLEL_FREE_ROLES`).
+
+    Отказ, а не предупреждение: план — единственное место, где полоса появляется,
+    и цена «предупредили, а лид не прочитал» здесь измерена в живых делах
+    (`d_c13d53da`: две полосы, зависимый этап отказался строиться).
+
+    `touched` — id, которые называет **это** предложение. Судится только пара,
+    в которой есть названная сторона: уже принятый граф этим правилом не
+    пересуживается (журнал не переписываем), а новая полоса получает отказ на
+    своей строке.
+    """
+    named_ids = None if touched is None else {str(name) for name in touched}
+    issues: list[Issue] = []
+    for left_id, right_id in _parallel_lanes(by_id):
+        if named_ids is not None and left_id not in named_ids and right_id not in named_ids:
+            continue
+        left, right = by_id[left_id], by_id[right_id]
+        offenders = [
+            stage
+            for stage in (left, right)
+            if produces_work(stage) and str(getattr(stage, "workspace", "") or "") == "dir"
+        ]
+        if not offenders:
+            continue
+        # Строка — та, где объявлена полоса: у названной стороны, если она есть,
+        # иначе у нарушителя (правило зовут и без `touched`, из `spec check`).
+        anchor = next(
+            (stage for stage in (left, right) if named_ids is None or str(stage.id) in named_ids),
+            offenders[0],
+        )
+        named = ", ".join(f"{stage.id!r} (workspace: {getattr(stage, 'workspace', '') or '—'})" for stage in offenders)
+        issues.append(
+            Issue(
+                where,
+                int(getattr(anchor, "line", 1) or 1),
+                "plan.parallel.workspace",
+                f"полосы {left_id!r} и {right_id!r} идут параллельно, а производитель {named} "
+                "работает в общем дереве: у параллельной полосы своя ветка "
+                "(workspace: worktree) — иначе две полосы правят один файл без ветки и без "
+                "слияния, и этап-слияние собирать нечего",
+            )
+        )
+    return issues
+
+
+def _check_parallel_fanin(by_id: Mapping[str, Any], *, where: Path) -> list[Issue]:
+    """`plan.parallel.fanin`: полосы, разошедшиеся без слияния, — предупреждение.
+
+    Параллельные производители без этапа `kind: merge`, который сходится на обе
+    полосы, остаются мёртвыми: зависимый этап получит два расходящихся коммита, и
+    `runner.base_of_stage` откажет `BaseError` («предшественники разошлись») —
+    ровно сегодняшний дефект. Вход плана такого не запрещает (граф вправе быть
+    незаконченным, и форма графа — подсказка), но и молчать не должен: лид видит
+    предупреждение сразу, а не отказ через два этапа.
+
+    «Сходится» — значит полоса в транзитивных `needs` этапа слияния: merge
+    собирает то, что объявлено его предшественниками, а не то, что рядом в файле.
+    """
+    issues: list[Issue] = []
+    # Полоса — только та, что производит КОММИТ: у дерева и ветки есть что
+    # сходиться. Две полосы в общем каталоге коммитов не дают вовсе, и итог
+    # такой пары — не расходящиеся коммиты, а отказ `plan.parallel.workspace`.
+    lanes = [
+        (left_id, right_id)
+        for left_id, right_id in _parallel_lanes(by_id)
+        if all(
+            produces_work(by_id[name]) and str(getattr(by_id[name], "workspace", "") or "") == "worktree"
+            for name in (left_id, right_id)
+        )
+    ]
+    if not lanes:
+        return issues
+    merges = [stage for stage in by_id.values() if str(getattr(stage, "kind", "") or "") == MERGE_KIND]
+    reached = {str(stage.id): _need_closure(by_id, str(stage.id)) for stage in merges}
+    for left_id, right_id in lanes:
+        if any(left_id in reached[str(merge.id)] and right_id in reached[str(merge.id)] for merge in merges):
+            continue
+        first = by_id[left_id]
+        issues.append(
+            Issue(
+                where,
+                int(getattr(first, "line", 1) or 1),
+                "plan.parallel.fanin",
+                f"полосы {left_id!r} и {right_id!r} разошлись: fan-in не объявлен — ни один этап "
+                f"kind: {MERGE_KIND} не сходится на обе, поэтому зависимый этап не построится "
+                "(предшественники разошлись, общего потомка нет). Добавь слияние: "
+                f"{{id: merge, kind: {MERGE_KIND}, needs: [{left_id!r}, {right_id!r}], "
+                "workspace: worktree}} и поставь зависимые этапы за него",
+                WARNING,
+            )
+        )
+    return issues
+
+
 def gate_warnings(spec: Any) -> list[Issue]:
-    """Предупреждения топологии публикации: ревью и вопрос человеку в предках.
+    """Предупреждения топологии: ревью и вопрос человеку в предках, fan-in полос.
 
     Одна дверь для `spec check` и для `duty_plan` (`docs/ENGINE-2.0.md`, раздел 8):
     форме графа — предупреждение, фактам — отказ. Вторая копия этого набора
     разошлась бы с первой на первом же новом правиле.
+
+    `plan.parallel.fanin` (0.2.2) — третье правило той же природы: параллельные
+    полосы без этапа слияния остаются мёртвыми, но отказывать за это на входе
+    значило бы запретить лиду собрать граф по частям.
     """
-    return _check_review_gate(spec) + _check_publish_gate(spec)
+    stages = tuple(getattr(spec, "stages", ()) or ())
+    by_id = {str(stage.id): stage for stage in stages}
+    where = Path(getattr(spec, "path", PLAN_PATH))
+    return (
+        _check_review_gate(spec)
+        + _check_publish_gate(spec)
+        + _check_parallel_fanin(by_id, where=where)
+    )
 
 
 def _check_workspace(spec: Spec) -> list[Issue]:
@@ -2470,7 +2691,8 @@ def _check_retry(spec: Spec) -> list[Issue]:
 
 
 def _check_kind(spec: Spec) -> list[Issue]:
-    """Вид этапа: `agent` исполняет профиль, `shell` — команда, `gate` — человек.
+    """Вид этапа: `agent` исполняет профиль, `shell` — команда, `gate` — человек,
+    `merge` — движок (`_check_merge_kind`).
 
     Отказ, а не тихий игнор. `role` у команды означал бы процесс профиля, которого
     никто не поднимает; `ask` — что этап задаст вопрос человеку, а он не умеет
@@ -2498,6 +2720,9 @@ def _check_kind(spec: Spec) -> list[Issue]:
             )
         if stage.kind == SHELL_KIND:
             issues += _check_shell_kind(spec, stage)
+            continue
+        if stage.kind == MERGE_KIND:
+            issues += _check_merge_kind(spec.path, stage)
             continue
         for key in ("cmd", "must", "artifacts"):
             if key not in stage.lines:
@@ -2584,6 +2809,104 @@ def _check_shell_kind(spec: Spec, stage: Stage) -> list[Issue]:
                 f"у этапа {stage.id!r} с kind: shell evidence не проверяется: договор команды — "
                 "код возврата must и список artifacts",
                 WARNING,
+            )
+        )
+    return issues
+
+
+def _check_merge_kind(where: Path, stage: Stage) -> list[Issue]:
+    """Правила одного `kind: merge`: не меньше двух полос, своё дерево, резолвер с терминалом.
+
+    Слияние — не вид агента с другим названием, поэтому проверки у него свои:
+
+    - `needs` называет **полосы**, и их не меньше двух: слияние одной полосы с
+      собой — это перестановка, а не fan-in, и лид, объявивший его, ждал бы
+      слияния, которого не будет;
+    - работа полос вливается в дерево этапа, поэтому `workspace: worktree`:
+      merge-коммит с двумя родителями пишется в ветку этапа, а не в общий
+      каталог дела (там его некуда писать — полосы живут в своих ветках);
+    - `role` — роль резолвера конфликтов, и у неё обязан быть терминал: резолвер
+      читает оба диффа, правит файлы и коммитит. Роль-отчёт (`reviewer`,
+      `researcher`, `documenter`, `tester`) и роль без записи (`coordinator`,
+      `lead`) конфликт разрешить не могут, а публикующая (`publisher`) — не этим
+      занята;
+    - поля других видов отказывают, а не игнорируются: `cmd`/`must`/`artifacts`
+      — поля команды, `ask` — поле гейта, `verdict` — поле ревьюера. Объявленное
+      и не прочитанное было бы ложью спеки.
+
+    Порядок слияния здесь не проверяется и не хранится: он и есть порядок
+    `needs` этапа (порядок объявления в плане, а не по времени), поэтому повтор
+    того же плана даёт тот же результат.
+    """
+    issues: list[Issue] = []
+    if len(stage.needs) < MERGE_MIN_LANES:
+        issues.append(
+            Issue(
+                where,
+                stage.line_of("needs"),
+                "merge.needs",
+                f"этап {stage.id!r} с kind: {MERGE_KIND} собирает полосы, а needs называет "
+                f"{len(stage.needs)}: у слияния не меньше {MERGE_MIN_LANES} предшественников — "
+                "с одной полосой сливать нечего",
+            )
+        )
+    if stage.workspace != "worktree":
+        issues.append(
+            Issue(
+                where,
+                stage.line_of("workspace"),
+                "merge.workspace",
+                f"этап {stage.id!r} с kind: {MERGE_KIND} вливает полосы в свою ветку, а у него "
+                f"workspace: {stage.workspace or '—'}: merge-коммит пишется в дерево этапа "
+                "(workspace: worktree)",
+            )
+        )
+    if stage.role in NO_SHELL_ROLES or stage.role in PARALLEL_FREE_ROLES or stage.role in PUBLISHING_ROLES:
+        issues.append(
+            Issue(
+                where,
+                stage.line_of("role"),
+                "merge.role",
+                f"этап {stage.id!r} с kind: {MERGE_KIND} поднимает резолвера конфликтов ролью "
+                f"{stage.role!r}: резолву нужны терминал и дерево — он читает оба диффа, правит "
+                "файлы и коммитит; объяви роль-исполнителя (умолчание "
+                f"{MERGE_RESOLVER_ROLE})",
+            )
+        )
+    if stage.ask is not None:
+        issues.append(
+            Issue(
+                where,
+                stage.line_of("ask"),
+                "kind.ask",
+                f"этап {stage.id!r} с kind: {MERGE_KIND} не задаёт вопросов человеку: конфликт "
+                "решает резолвер, а вопрос — поле агента или гейта",
+            )
+        )
+    if stage.verdict is not None:
+        issues.append(
+            Issue(
+                where,
+                stage.line_of("verdict"),
+                "kind.verdict",
+                f"этап {stage.id!r} с kind: {MERGE_KIND} не выносит приговора: свидетель слияния — "
+                "merge-коммит, verdict — поле агента-ревьюера",
+            )
+        )
+    for key, declared in (
+        ("cmd", bool(stage.cmd.strip())),
+        ("must", stage.must != DEFAULT_SHELL_MUST),
+        ("artifacts", bool(stage.artifacts)),
+    ):
+        if not declared:
+            continue
+        issues.append(
+            Issue(
+                where,
+                stage.line_of(key),
+                f"kind.{key}",
+                f"{key} у этапа {stage.id!r} с kind: {MERGE_KIND}: команду исполняет этап "
+                f"kind: {SHELL_KIND}, а полосы вливает движок",
             )
         )
     return issues
@@ -2768,6 +3091,13 @@ def validate_spec(spec: Spec, *, profiles: Optional[frozenset[str]] = None) -> l
     issues += _check_budget(spec)
     issues += _check_retry(spec)
     issues += _check_kind(spec)
+    # Полосы (0.2.2): отказ `plan.parallel.workspace` — для seed-файла тоже отказ
+    # (этап объявляет человек, и общий каталог у двух полос — та же ошибка), а
+    # `plan.parallel.fanin` — предупреждение той же природы, что `review-gate`:
+    # граф вправе быть собранным по частям, но молча мёртвые полосы — нет.
+    graph = {stage.id: stage for stage in spec.stages}
+    issues += _check_parallel_workspaces(graph, where=spec.path)
+    issues += _check_parallel_fanin(graph, where=spec.path)
     return issues
 
 
@@ -3131,6 +3461,14 @@ def parse_plan(
     - worktree-этап требует базы: при пустых `repo`/`base` в спеке (или `base`,
       не резолвящемся в `repo`) план отказывает `plan.base` — без неё дерево
       отводить не от чего, и падение мгновенное (`_plan_base_issues`);
+    - параллельная полоса-производитель живёт в своей ветке: производитель с
+      `parallel_with` в общем каталоге дела (`workspace: dir`) — отказ
+      `plan.parallel.workspace` с именами полос (`_check_parallel_workspaces`);
+      предупреждение о полосах без fan-in — не здесь, а в `gate_warnings`
+      (`plan.parallel.fanin`), потому что форма графа — подсказка, а не отказ;
+    - этап `kind: merge` судится своим набором (`_check_merge_kind`): не меньше
+      двух полос, `workspace: worktree`, роль резолвера с терминалом; хартия вид
+      `merge` не спрашивает — слияние не добавляет работы, а собирает полосы;
     - `len(seed ∪ план) <= charter.max_stages`.
 
     **Перестановка и правка.** Запись с `id`, который уже есть в графе, граф не
@@ -3314,6 +3652,13 @@ def parse_plan(
         for stage in stages
     }
     known = (set(graph_stages) | {stage.id for stage in stages}) - removed
+    # Слияние судится тем же набором, что `_check_kind` в `validate_spec`: план —
+    # второй вход, где появляется этап, и этап плана иначе был бы проверен слабее
+    # этапа файла. Судятся ЭТАПИ ГРАФА после сведения с записью (правка `kind` у
+    # неначатого этапа тоже делает этап слиянием).
+    for stage in {item.id: item for item in stages}.values():
+        if stage.kind == MERGE_KIND:
+            issues.extend(_check_merge_kind(where, stage))
     if removed:
         # Удаление снимает этап с графа, значит и рёбра на него больше некуда
         # вести: этап, которому удалённый нужен, остался бы ждать навсегда
@@ -3381,7 +3726,12 @@ def parse_plan(
             continue  # чистая перестановка: роль, вид и evidence — не её дело
         # «План добавляет» судится по новым значениям: у правки это только поля,
         # которые она изменила, — restate того же значения отказом не считается.
-        if "kind" in fresh and stage.kind not in charter.allowed_kinds:
+        if "kind" in fresh and stage.kind != MERGE_KIND and stage.kind not in charter.allowed_kinds:
+            # `merge` правило не спрашивает: слияние не добавляет работы, а
+            # собирает уже объявленные полосы в один коммит. Хартии живых дел
+            # перечисляют виды явно (`allowed_kinds: [agent, shell, gate]`), и
+            # требовать от них правки значило бы запретить fan-in ровно там, где
+            # параллель уже работает (`d_c13d53da`).
             issues.append(
                 Issue(
                     where,
@@ -3585,6 +3935,14 @@ def parse_plan(
         # журнал, где ревизии уже приняты, и отказ на перечитывании откатил бы
         # граф к seed — та же причина, что у `plan.evidence.shell`.
         issues.extend(_plan_base_issues(stages, repo=repo, base=base, where=where, exists=exists))
+        # Параллельная полоса-производитель живёт в своей ветке (0.2.2): общий
+        # каталог дела у двух полос значит «правят один файл без ветки и без
+        # слияния». Судится пара, в которой есть сторона ИЗ ЭТОГО предложения —
+        # принятый граф задним числом не пересуживается (`replay` выше уже
+        # отсекает перечитывание, здесь — предложение без своих полос).
+        issues.extend(
+            _check_parallel_workspaces(by_any_id, where=where, touched=[stage.id for stage in stages])
+        )
     if len(known) > charter.max_stages:
         # Отказ называет не только «не растёт», но и ЧЕМ занято место: лид иначе
         # добавляет ещё один этап поверх мёртвых и жжёт ревизию (d_76b269ce:

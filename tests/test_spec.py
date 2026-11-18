@@ -1915,7 +1915,7 @@ def test_charter_defaults_when_block_absent(tmp_path: Path):
     assert charter.max_stages == 24
     assert charter.max_rounds_replan == 3
     assert charter.allowed_roles == ()
-    assert charter.allowed_kinds == ("agent", "shell", "gate")
+    assert charter.allowed_kinds == ("agent", "shell", "gate", "merge")
     assert (charter.plan_gate.min_stages, charter.plan_gate.budget_share) == (0, 0.0)
     assert spec_module.validate_spec(loaded, profiles=PROFILES) == []
 
@@ -2432,9 +2432,13 @@ def test_parse_plan_parallel_with_is_declared_by_the_plan():
     Проверяется то, что видно до графа: запись принята и поле доехало до этапа.
     Исполнение пары одновременно — дело `transit._batch`, и оно проверяется
     `tests/test_plan_reorder.py`.
+
+    Дерево у полосы названо явно: производитель рядом с другой полосой в общем
+    каталоге дела отказывает `plan.parallel.workspace` (0.2.2) — две полосы правили
+    бы один файл без ветки и без слияния. Само правило — `tests/test_merge_spec.py`.
     """
-    stages, found = plan([{"id": "impl", "role": "implementer", "parallel_with": ["close"],
-                           "evidence": [{"cmd": "ls", "must": 0}]}])
+    stages, found = plan([{"id": "impl", "role": "implementer", "workspace": "worktree",
+                           "parallel_with": ["close"], "evidence": [{"cmd": "ls", "must": 0}]}])
     assert found == []
     assert stages[0].parallel_with == ("close",)
 

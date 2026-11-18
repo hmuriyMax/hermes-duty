@@ -1067,7 +1067,16 @@ pre.body {
 .scale-plot { position: relative; }
 /* Сетка под дорожками: линии по меткам оси, чтобы время читалось поперёк дорожек. */
 .scale-grid { position: absolute; top: -2px; bottom: 0; left: calc(var(--tl-name, 150px) + var(--tl-gap, 8px) + var(--tl-plot-pad, 64px)); right: 0; pointer-events: none; z-index: 0; }
-.scale-grid-line { position: absolute; top: 0; bottom: 0; border-left: 1px dashed color-mix(in srgb, var(--text-3) 34%, transparent); }
+/* Пунктир — фоном, а не `border-left`.
+ *
+ * Ось едет всю дорогу между ответами, и координаты линии дробные. Пунктирная
+ * рамка на дробной позиции схлопывается в ноль: справа линии «иногда не
+ * прорисовываются» (Макс, 18.11). Штрих фоном рисуется при любой позиции, вид тот
+ * же. */
+.scale-grid-line {
+  position: absolute; top: 0; bottom: 0; width: 1px;
+  background-image: repeating-linear-gradient(to bottom, color-mix(in srgb, var(--text-3) 40%, transparent) 0 4px, transparent 4px 9px);
+}
 /* Сжатый промежуток оси: два пунктира по краям и подпись посередине — иначе
  * смена масштаба читается как ошибка данных. */
 /* Сжатый простой: полоса со штрихованием и знаками разрыва по краям. Пунктир
@@ -1212,10 +1221,17 @@ svg.tl-lane-ico { flex: none; width: 12px; height: 12px; fill: none; stroke: cur
  * `is-live` включает переход только со второго кадра: первый рисунок не должен
  * приезжать из нуля. */
 .scale-wrap { --tl-tick: 5s; }
+/* Все слои, поставленные по времени, едут с одной скоростью. Пунктиры сетки и
+ * полосы простоя держали короткий переход (.32 s) и уезжали вперёд засечек —
+ * справа сетка и отсечки расходились, а на стыках линии пропадали (Макс, 18.11). */
 .scale-wrap.is-live .tl-band,
 .scale-wrap.is-live .scale-tick,
+.scale-wrap.is-live .scale-grid-line,
 .scale-wrap.is-live .tl-mark,
-.scale-wrap.is-live .tl-lead-run { transition: left var(--tl-tick) linear, width var(--tl-tick) linear; }
+.scale-wrap.is-live .tl-lead-run,
+.scale-wrap.is-live .tl-idle-gap,
+.scale-wrap.is-live .tl-silence,
+.scale-wrap.is-live .tl-wait { transition: left var(--tl-tick) linear, width var(--tl-tick) linear; }
 
 /* Строка попытки: свёрнутая показывает первый уровень вызовов и маркеры, полная
  * раскрывается под указателем. Высоты приходят переменными от шейпера
@@ -2020,8 +2036,12 @@ svg.spec-graph { display: block; width: auto; height: auto; max-width: 100%; ove
   /* Ход времени тоже движение: у «меньше движения» шкала прыгает к новой кромке. */
   .scale-wrap.is-live .tl-band,
   .scale-wrap.is-live .scale-tick,
+  .scale-wrap.is-live .scale-grid-line,
   .scale-wrap.is-live .tl-mark,
   .scale-wrap.is-live .tl-lead-run,
+  .scale-wrap.is-live .tl-idle-gap,
+  .scale-wrap.is-live .tl-silence,
+  .scale-wrap.is-live .tl-wait,
   .scale-wrap.is-live .tl-call { transition: none; }
   .tl-sausage.is-live,
   .tl-legend-dot.t-blue,

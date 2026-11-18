@@ -1058,7 +1058,8 @@ def test_timeout_is_infra_and_process_is_stopped(tmp_path: Path) -> None:
     assert fake.stopped == 1
     ended = only(conn, deal, "attempt_ended")
     assert ended["payload"]["details"]["timed_out"] is True
-    assert "таймаут" in ended["payload"]["reason"]
+    assert "упал по бюджету 1 мин" in ended["payload"]["reason"]
+    assert "прошлым прогонам" in ended["payload"]["reason"]
     assert runner.lease_of(conn, deal, "impl") is None
 
 
@@ -2862,7 +2863,13 @@ SHELL_CLASSES = [
     (
         "timeout",
         {"exit_code": None, "timed_out": True, "must": 0, "timeout_sec": 30},
-        (runner.OUTCOME_FAILED, runner.FAIL_INFRA, "команда не дожила: таймаут этапа 30 с"),
+        (
+            runner.OUTCOME_FAILED,
+            runner.FAIL_INFRA,
+            "упал по бюджету 30 с: команда не уложилась в бюджет времени — оценивай бюджет по "
+            "измеренной длительности работы: сборка и тесты по прошлым прогонам этого репо, "
+            "браузерные и скриншотные этапы с запасом не меньше 2×",
+        ),
     ),
     (
         "code unknown",

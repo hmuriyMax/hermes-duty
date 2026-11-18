@@ -1465,6 +1465,7 @@ def report_plan(
         base_stages={item.id: item for item in graph},
         started_ids=transit.started_stages(events),
         repo=getattr(spec, "repo", None),
+        base=getattr(spec, "base", None),
     )
     cost, cost_issues = spec_module.parse_plan_cost(raw.get("cost"))
     issues += cost_issues
@@ -1548,8 +1549,14 @@ def charter_payload(spec: Any) -> dict[str, Any]:
     """
     charter = getattr(spec, "charter", None) or spec_module.Charter()
     gate = getattr(charter, "plan_gate", None) or spec_module.PlanGate()
+    size = str(getattr(charter, "size", "") or "")
     return {
         "max_stages": int(getattr(charter, "max_stages", 0) or 0),
+        # Откуда потолок: пресет размера дела или объявление хартии. Лид,
+        # который не знает источника, читает «24» как выдумку движка и растит
+        # граф вслепую.
+        "max_stages_source": f"size {size}" if size else "explicit max_stages or default",
+        "size": size or None,
         "max_rounds_replan": int(getattr(charter, "max_rounds_replan", 0) or 0),
         "allowed_roles": [str(role) for role in getattr(charter, "allowed_roles", ()) or ()],
         "allowed_kinds": [str(kind) for kind in getattr(charter, "allowed_kinds", ()) or ()],
@@ -1827,6 +1834,12 @@ def build_contract(
                 "implementer, проверка tester, приговор reviewer",
                 "адрес вопросов добавленного этапа объявлен за тебя (allowed: "
                 "[researcher], max_hops: 2): свой ask называй только если нужен другой",
+                # Живое занижение бюджета: 1200 с у `shots` (d_fe6c91d0), 1500 с у
+                # `check` (d_76b269ce), 1800 с у `impl` (d_b9c480c8) — этапы
+                # умирали по часам, а не по ошибке, и лид читал это как отказ работы.
+                "бюджет этапа оценивай по измеренной длительности его работы: сборка/тесты — "
+                "по прошлым прогонам этого репо, браузерные и скриншотные этапы — с запасом "
+                "не меньше 2×; иначе этап умрёт по часам, а не по ошибке",
             ]
         )
     contract["report_to"] = str(report_to)
@@ -2560,6 +2573,7 @@ def classify(
     exit_code: Optional[int],
     followed: Followed,
     timeout_sec: int,
+    stderr: str = "",
 ) -> tuple[str, str, str]:
     """Чем кончилась попытка: `(outcome, kind, reason)` — по трём источникам.
 
@@ -2567,6 +2581,8 @@ def classify(
     лежит в `dashboard/failures.py`. Движок только собирает факты (отчёт, его
     отсутствие, код выхода, наши собственные таймаут и бюджет) и отдаёт их
     политике — иначе «почему класс именно такой» отвечалось бы в двух местах.
+    `stderr` нужен признаку дренажа: рестарт рантайма оставляет в нём маркер, а
+    сам процесс умирает кодом 1.
     """
     ended = failures.classify(
         result=result,
@@ -2575,6 +2591,7 @@ def classify(
         timed_out=followed.timed_out,
         over_budget=followed.over_budget,
         timeout_sec=timeout_sec,
+        stderr=stderr,
     )
     return ended.outcome, ended.kind, ended.reason
 
@@ -2695,9 +2712,29 @@ def classify_shell(
     config: Go version (go1.26) is lower than the targeted (1.27)», и дело встало
     на человека). Ненулевой код без подписи — отказ **контракта** («код N, ждали
     M»): команда дошла до конца и сказала «нет».
+
+    Падение по часам называется бюджетом, а не смертью: «упал по бюджету N мин» и
+    подсказка расчёта — та же причина, что у попытки-агента
+    (`failures.budget_reason`). Это единственный путь, где сборка и тесты
+    (этап-команда с `timeout_sec`) умирают по часам.
     """
     if timed_out:
-        return OUTCOME_FAILED, FAIL_INFRA, f"команда не дожила: таймаут этапа {int(timeout_sec)} с"
+        # Та же причина, что у попытки-агента: падение по часам — это наша оценка
+        # бюджета, а не ошибка работы (`failures.budget_reason`). Сборка и тесты
+        # живут именно здесь — у этапа-команды (`kind: shell` с `timeout_sec`).
+        return (
+            OUTCOME_FAILED,
+            FAIL_INFRA,
+            failures.budget_reason(timeout_sec, subject="команда не уложилась"),
+        )
+    # Рестарт рантайма гасит и команду этапа: это не её отказ, и попытка
+    # политики не списывается (`failures.DRAINED`). Только у неуспешной команды:
+    # маркер в stderr успешной — её вывод (shell-этап, который этот маркер ищет),
+    # а не смерть от рестарта.
+    refused = exit_code is None or int(exit_code) != int(must)
+    restarted = failures.drained(exit_code, stderr) if refused else ""
+    if restarted:
+        return OUTCOME_FAILED, failures.DRAINED, restarted
     if exit_code is None:
         return OUTCOME_FAILED, FAIL_INFRA, "команда не дожила: код выхода неизвестен"
     signal = failures.signal_of(exit_code)
@@ -4103,6 +4140,7 @@ def _parsed_plan(spec: Any, raw_stages: list[Any], events: Iterable[Any]) -> tup
         base_stages={stage.id: stage for stage in graph},
         started_ids=transit.started_stages(events),
         repo=getattr(spec, "repo", None),
+        base=getattr(spec, "base", None),
     )
     return tuple(stages)
 
@@ -4680,6 +4718,7 @@ def finish_agent_stage(
         exit_code=exit_code,
         followed=followed,
         timeout_sec=deadline_sec,
+        stderr=live.process.stderr_text or "",
     )
     status = str((result or {}).get("status") or "").strip().lower()
     parked = outcome == OUTCOME_DONE and status in BLOCKED_STATUSES
@@ -4921,7 +4960,11 @@ def finish_agent_stage(
         # значит «класс повторяется и лимит не исчерпан», и следующую попытку
         # поднимает `run_attempts` сам, дописав в её бриф причину этого отказа.
         # Парковка и переосмысление (`park` — словарь) отдают решение лиду.
-        "retry": park is None and outcome == OUTCOME_FAILED,
+        # Прерванную рестартом рантайма попытку (`drained`) движок не повторяет
+        # из этого же процесса: рантайм как раз перезапускается, и немедленный
+        # повтор умер бы так же. Этап возвращается `ready`, поднимает его
+        # диспетчер.
+        "retry": park is None and outcome == OUTCOME_FAILED and kind != failures.DRAINED,
     }
 
 

@@ -242,11 +242,18 @@ def stage_of(spec: Any, stage_id: str = "impl") -> Any:
 
 
 def test_timeout_is_infra() -> None:
-    """Таймаут — наш собственный факт: `infra`, а не «процесс не отчитался»."""
-    ended = failures.classify(result=None, exit_code=None, timed_out=True, timeout_sec=60)
+    """Таймаут — наш собственный факт: `infra`, а не «процесс не отчитался».
+
+    Причина называет бюджет и подсказывает расчёт: живое занижение (1200 с у
+    `shots`, 1500 с у `check`, 1800 с у `impl`) читалось как отказ работы, хотя
+    этап умер по часам.
+    """
+    ended = failures.classify(result=None, exit_code=None, timed_out=True, timeout_sec=1500)
 
     assert (ended.outcome, ended.kind) == (failures.OUTCOME_FAILED, "infra")
-    assert "таймаут" in ended.reason
+    assert "упал по бюджету 25 мин" in ended.reason
+    assert "прошлым прогонам" in ended.reason
+    assert "2×" in ended.reason
     assert failures.INFRA in failures.CLASSES
 
 

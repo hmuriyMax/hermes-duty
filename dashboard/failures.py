@@ -74,6 +74,27 @@ INFRA = "infra"
 CONTRACT = "contract"
 CAPABILITY = "capability"
 
+# Признак «попытку прервал рестарт рантайма» (0.2.2). Это **не** класс политики:
+# в `CLASSES` его нет и `retry.on` им не объявить — повторять тут нечего, попытку
+# не проиграли. 35 из 91 провала за неделю пришлись ровно на это, и кластеры
+# совпадают с рестартами гейтвея до секунды (13.11 18:39:20 — 5 падений в трёх
+# делах; 17.11 четыре рестарта, а в
+# `boards/duty/workspaces/d_95f55146-check3-1/.duty/stderr.log` прямо
+# `Error: runtime_draining`). Движок писал это `infra`-провалом этапа, и при
+# `max=1` дело сразу парковалось вопросом человеку.
+DRAINED = "drained"
+# Маркер дренажа в stderr самой попытки: рантайм говорит им, что гасит процесс.
+DRAIN_MARKERS = ("runtime_draining",)
+# Сигнал, которым рестарт рантайма убивает попытку: `SIGINT` (номер 2 — из POSIX,
+# чтобы модуль не тащил `signal` ради одного числа). `SIGTERM` здесь **не** назван
+# намеренно: им же гасят попытку наш собственный таймаут и рука человека, и
+# записывать такую смерть «рестартом» значило бы ослабить судейство `infra`
+# (RP-14338: `check2#1` умер кодом 143, и это был честный инфра-отказ). Дренаж по
+# `SIGTERM` узнаётся по маркеру в stderr — он и есть факт «гасит рантайм».
+DRAIN_SIGNALS = (2,)
+# Причина, которую видит лид и человек: рестарт называется рестартом.
+DRAIN_TEXT = "попытку прервал рестарт рантайма"
+
 # Вид этапа-гейта (`spec.GATE_KIND`): этап ничего не исполняет, он задаёт вопрос
 # человеку и читает ответ. Имя вида нужно здесь, потому что политика повторов
 # зависит от него (`policy`): отказ гейта — слово человека, а не форма отчёта.
@@ -97,6 +118,12 @@ CLASS_TEXT = {
     CAPABILITY: "доступ",
 }
 
+# Не класс политики, а факт журнала: попытку прервал рестарт рантайма. Имя нужно,
+# потому что `kind` этого факта читают поверхности, и «неизвестный класс» на
+# честной попытке читался бы как отказ работы. В `CLASS_TEXT` его нет: там имена
+# ровно тех классов, которыми политика распоряжается (`test_class_names_are_one_per_class`).
+DRAINED_TEXT = "перезапуск рантайма"
+
 # Значение вне закрытого набора. Догадка («наверное, инфраструктура») врала бы про
 # причину, поэтому неизвестный класс называется неизвестным.
 UNKNOWN_CLASS_TEXT = "неизвестный класс"
@@ -105,14 +132,20 @@ UNKNOWN_CLASS_TEXT = "неизвестный класс"
 def describe_class(kind: object) -> str:
     """Человеческое имя класса отказа по его слагу.
 
-    Известный слаг получает имя из `CLASS_TEXT`; любое другое значение — включая
-    пустую строку, другой регистр и не-строку — `UNKNOWN_CLASS_TEXT`. Исключения
-    не бросаются: класс приходит из данных (журнал, чужая доска), и падать на
-    неожиданном значении значит валить срез из-за одного дела. Регистр и пробелы
-    намеренно не прощаются: прощающий разбор сделал бы закрытый набор открытым
-    сбоку.
+    Известный слаг получает имя из `CLASS_TEXT`, а `drained` — своё имя рядом с
+    набором классов (`DRAINED_TEXT`): это факт журнала, а не класс политики, и
+    держать его внутри `CLASS_TEXT` значило бы сломать правило «ключи `CLASS_TEXT`
+    — ровно `CLASSES`». Любое другое значение — включая пустую строку, другой
+    регистр и не-строку — `UNKNOWN_CLASS_TEXT`. Исключения не бросаются: класс
+    приходит из данных (журнал, чужая доска), и падать на неожиданном значении
+    значит валить срез из-за одного дела. Регистр и пробелы намеренно не
+    прощаются: прощающий разбор сделал бы закрытый набор открытым сбоку.
     """
-    return CLASS_TEXT.get(kind, UNKNOWN_CLASS_TEXT) if isinstance(kind, str) else UNKNOWN_CLASS_TEXT
+    if not isinstance(kind, str):
+        return UNKNOWN_CLASS_TEXT
+    if kind == DRAINED:
+        return DRAINED_TEXT
+    return CLASS_TEXT.get(kind, UNKNOWN_CLASS_TEXT)
 
 
 # Подписи сломанного инструмента проверки в stderr: сломан не код, а тот, кто его
@@ -259,6 +292,47 @@ class Ended:
         return self.outcome == OUTCOME_FAILED
 
 
+def drained(exit_code: Optional[int], stderr: str = "") -> str:
+    """Попытку прервал рестарт рантайма: причина или пусто.
+
+    Два признака одного события и оба — факты, а не догадка по тексту: маркер
+    дренажа в stderr попытки (`DRAIN_MARKERS`, закрытый список) и смерть от
+    сигнала рестарта (`DRAIN_SIGNALS`). Разбор «на что похоже» здесь не заводится
+    по той же причине, что у `toolchain_signature`.
+
+    Наша собственная остановка по сроку сюда не попадает: `classify` проверяет
+    `timed_out` раньше, а его класс — `infra`, как и был.
+    """
+    text = stderr if isinstance(stderr, str) else ""
+    for marker in DRAIN_MARKERS:
+        if marker in text:
+            return f"{DRAIN_TEXT}: в stderr «{marker}»"
+    number = signal_of(exit_code)
+    if number in DRAIN_SIGNALS:
+        return f"{DRAIN_TEXT}: процесс убит сигналом {number}"
+    return ""
+
+
+def budget_reason(timeout_sec: int, *, subject: str = "процесс не уложился") -> str:
+    """Причина падения по часам: бюджет в минутах и откуда его брать.
+
+    Одна формулировка на агента и на этап-команду: «упал по бюджету N мин» читается
+    лидом как оценка бюджета, а не как ошибка работы (`docs/ENGINE-2.0.md`, раздел 5).
+    Второй раз текст не пишется: разъехавшиеся копии научили бы лида двум разным
+    вещам про одно и то же падение. `subject` — кто не уложился: процесс попытки
+    или команда этапа.
+    """
+    minutes = int(timeout_sec) // 60 if int(timeout_sec) > 0 else 0
+    # Меньше минуты — говорим секундами: «упал по бюджету 0 мин» читается как
+    # отсутствие бюджета, а не как его нехватка.
+    budget = f"{minutes} мин" if minutes else f"{int(timeout_sec)} с"
+    return (
+        f"упал по бюджету {budget}: {subject} в бюджет времени — оценивай бюджет по "
+        "измеренной длительности работы: сборка и тесты по прошлым прогонам этого репо, "
+        "браузерные и скриншотные этапы с запасом не меньше 2×"
+    )
+
+
 def classify(
     *,
     result: Optional[dict[str, Any]],
@@ -267,6 +341,7 @@ def classify(
     timed_out: bool = False,
     over_budget: bool = False,
     timeout_sec: int = 0,
+    stderr: str = "",
 ) -> Ended:
     """Чем кончилась попытка — по трём источникам и нашим собственным фактам.
 
@@ -284,11 +359,11 @@ def classify(
     JSON, не объект): это тоже факт источника, а не текст ошибки процесса.
     """
     if timed_out and result is None:
-        return Ended(
-            OUTCOME_FAILED,
-            INFRA,
-            f"таймаут попытки: процесс не уложился в бюджет времени ({timeout_sec} с)",
-        )
+        # «Упал по часам» звучит как ошибка работы, а это наша оценка бюджета:
+        # живое занижение — 1200 с у `shots` (`d_fe6c91d0`), 1500 с у `check`
+        # (`d_76b269ce`), 1800 с у `impl` (`d_b9c480c8`). Поэтому причина
+        # называет бюджет и подсказывает, откуда его брать.
+        return Ended(OUTCOME_FAILED, INFRA, budget_reason(timeout_sec))
     if over_budget and result is None:
         return Ended(OUTCOME_FAILED, CAPABILITY, "бюджет токенов попытки исчерпан")
     if result is not None:
@@ -298,6 +373,11 @@ def classify(
         if status in REFUSED_STATUSES:
             return Ended(OUTCOME_FAILED, CONTRACT, f"исполнитель отказался: status={status}")
         return Ended(OUTCOME_DONE, "", "")
+    # Рестарт рантайма — не отказ работы: попытку не проиграли, её погасили.
+    # Класс `drained` поэтому не списывает политику этапа (`decide_park`).
+    restarted = drained(exit_code, stderr)
+    if restarted:
+        return Ended(OUTCOME_FAILED, DRAINED, restarted)
     if exit_code not in (0, None):
         return Ended(OUTCOME_FAILED, INFRA, f"процесс упал сам: код выхода {exit_code}")
     return Ended(OUTCOME_FAILED, CONTRACT, result_error or "исполнитель не отчитался: result.json нет")
@@ -437,6 +517,11 @@ def decide_park(*, kind: str, attempts: int, total: int, policy_: Policy) -> Opt
     даже если каждый отдельный класс ещё «можно повторить». Иначе исчерпание
     лимита класса — `retries_exhausted`.
     """
+    if str(kind or "") == DRAINED:
+        # Рестарт рантайма прервал попытку: ни класс этапа, ни предохранитель на
+        # дело тут не при чём — работу не проиграли, её погасили. Повтор поднимает
+        # диспетчер (дело возвращается `ready`), а попытка политики не списывает.
+        return None
     if _int(total) >= MAX_ROUNDS_PER_DEAL:
         return REASON_TOO_MANY
     if retriable(policy_, str(kind or UNCLASSIFIED), attempts):
@@ -482,8 +567,13 @@ def failures_of(events: Iterable[Any], stage: Optional[str] = None) -> dict[str,
 
 
 def total_failures(events: Iterable[Any]) -> int:
-    """Сколько попыток дела упало по любому классу — предохранитель на дело."""
-    return sum(failures_of(events).values())
+    """Сколько попыток дела упало по любому классу — предохранитель на дело.
+
+    Прерванные рестартом рантайма (`DRAINED`) не считаются: это не проигранные
+    попытки, и предохранитель, считающий их, парковал бы дело за рестарты
+    гейтвея — ровно то, чего 0.2.2 и не делает (`decide_park`).
+    """
+    return sum(count for kind, count in failures_of(events).items() if kind != DRAINED)
 
 
 def auto_retries(events: Iterable[Any], stage: Optional[str] = None) -> dict[str, Any]:

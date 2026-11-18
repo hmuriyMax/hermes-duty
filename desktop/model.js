@@ -2177,6 +2177,21 @@ function stageColumnBars(stage, timeline) {
 // честная — `<1с`, иначе две ширины в процентах читались бы как две секунды.
 const BAR_MIN_PCT = 2
 
+/**
+ * Полоса попытки/захода на оси: минимальная длина не должна выпихивать её за
+ * правую кромку.
+ *
+ * Короткая работа у самой свежей кромки (лид только что поднялся) получала
+ * минимум 2 % и вылезала за край шкалы — читалось как «лид ушёл в будущее».
+ * Теперь пол ужимается тем местом, что осталось до кромки, а если его меньше
+ * минимума — полоса сдвигается влево, оставаясь в кадре (Макс, 18.11).
+ */
+function fitBarWidth(leftPct, widthPct) {
+  const width = Math.max(0, Math.min(100, Number(widthPct) || 0))
+  const left = Math.max(0, Math.min(Number(leftPct) || 0, 100 - width))
+  return { leftPct: Math.round(left * 10) / 10, widthPct: Math.round(width * 10) / 10 }
+}
+
 // Пустое ожидание на шкале сжимается: дело, где между этапами был простой в час
 // сорок минут, иначе показывает работу двумя тонкими полосками по краям. Порог —
 // и по длительности, и по доле оси: короткая пауза в долгом деле и так не мешает,
@@ -3880,7 +3895,9 @@ function shapeDealTime(detail, attemptsPayload) {
     const stop = bar.endAt
     bar.leftPct = pctOf(bar.start)
     bar.endPct = pctOf(stop)
-    bar.widthPct = bar.start === null ? 0 : Math.max(BAR_MIN_PCT, Math.round((bar.endPct - bar.leftPct) * 10) / 10)
+    const barFit = fitBarWidth(bar.leftPct, bar.start === null ? 0 : Math.max(BAR_MIN_PCT, bar.endPct - bar.leftPct))
+    bar.leftPct = barFit.leftPct
+    bar.widthPct = barFit.widthPct
     bar.durationSec = bar.open
       ? (bar.start !== null && now !== null ? Math.max(0, now - bar.start) : null)
       : bar.duration !== null
@@ -4108,9 +4125,10 @@ function shapeDealTime(detail, attemptsPayload) {
     const stop = openNow ? (live && now !== null ? now : null) : run.end
     run.open = openNow && live
     run.stale = stale
-    run.startPct = pctOf(run.start)
-    run.endPct = stop === null ? run.startPct : pctOf(stop)
-    run.widthPct = Math.max(BAR_MIN_PCT, Math.round((run.endPct - run.startPct) * 10) / 10)
+    const runFit = fitBarWidth(pctOf(run.start), Math.max(BAR_MIN_PCT, stop === null ? 0 : pctOf(stop) - pctOf(run.start)))
+    run.startPct = runFit.leftPct
+    run.widthPct = runFit.widthPct
+    run.endPct = Math.round((runFit.leftPct + runFit.widthPct) * 10) / 10
     run.durationSec = stop === null ? null : Math.max(0, stop - run.start)
     run.clockStart = fmtClock(run.start)
     run.clockEnd = stop === null ? '—' : fmtClock(stop)

@@ -2230,6 +2230,21 @@ function stageColumnBars(stage, timeline) {
 // честная — `<1с`, иначе две ширины в процентах читались бы как две секунды.
 const BAR_MIN_PCT = 2
 
+/**
+ * Полоса попытки/захода на оси: минимальная длина не должна выпихивать её за
+ * правую кромку.
+ *
+ * Короткая работа у самой свежей кромки (лид только что поднялся) получала
+ * минимум 2 % и вылезала за край шкалы — читалось как «лид ушёл в будущее».
+ * Теперь пол ужимается тем местом, что осталось до кромки, а если его меньше
+ * минимума — полоса сдвигается влево, оставаясь в кадре (Макс, 18.11).
+ */
+function fitBarWidth(leftPct, widthPct) {
+  const width = Math.max(0, Math.min(100, Number(widthPct) || 0))
+  const left = Math.max(0, Math.min(Number(leftPct) || 0, 100 - width))
+  return { leftPct: Math.round(left * 10) / 10, widthPct: Math.round(width * 10) / 10 }
+}
+
 // Пустое ожидание на шкале сжимается: дело, где между этапами был простой в час
 // сорок минут, иначе показывает работу двумя тонкими полосками по краям. Порог —
 // и по длительности, и по доле оси: короткая пауза в долгом деле и так не мешает,
@@ -3933,7 +3948,9 @@ function shapeDealTime(detail, attemptsPayload) {
     const stop = bar.endAt
     bar.leftPct = pctOf(bar.start)
     bar.endPct = pctOf(stop)
-    bar.widthPct = bar.start === null ? 0 : Math.max(BAR_MIN_PCT, Math.round((bar.endPct - bar.leftPct) * 10) / 10)
+    const barFit = fitBarWidth(bar.leftPct, bar.start === null ? 0 : Math.max(BAR_MIN_PCT, bar.endPct - bar.leftPct))
+    bar.leftPct = barFit.leftPct
+    bar.widthPct = barFit.widthPct
     bar.durationSec = bar.open
       ? (bar.start !== null && now !== null ? Math.max(0, now - bar.start) : null)
       : bar.duration !== null
@@ -4161,9 +4178,10 @@ function shapeDealTime(detail, attemptsPayload) {
     const stop = openNow ? (live && now !== null ? now : null) : run.end
     run.open = openNow && live
     run.stale = stale
-    run.startPct = pctOf(run.start)
-    run.endPct = stop === null ? run.startPct : pctOf(stop)
-    run.widthPct = Math.max(BAR_MIN_PCT, Math.round((run.endPct - run.startPct) * 10) / 10)
+    const runFit = fitBarWidth(pctOf(run.start), Math.max(BAR_MIN_PCT, stop === null ? 0 : pctOf(stop) - pctOf(run.start)))
+    run.startPct = runFit.leftPct
+    run.widthPct = runFit.widthPct
+    run.endPct = Math.round((runFit.leftPct + runFit.widthPct) * 10) / 10
     run.durationSec = stop === null ? null : Math.max(0, stop - run.start)
     run.clockStart = fmtClock(run.start)
     run.clockEnd = stop === null ? '—' : fmtClock(stop)
@@ -5055,7 +5073,7 @@ const CSS = `
 /* Ось живого дела тянется вперёд, и геометрия едет к новой кромке весь период
    опроса (5 с), а не ступенькой в момент ответа: картинка расширяется плавно.
    Высоты и раскрытие строк остаются быстрыми — это отклик на указатель. */
-.duty-tl-band,.duty-scale-tick,.duty-tl-mark,.duty-tl-lead-run{transition:left var(--duty-tl-tick,5s) linear,width var(--duty-tl-tick,5s) linear}
+.duty-tl-band,.duty-tl-mark,.duty-tl-lead-run{transition:left var(--duty-tl-tick,5s) linear,width var(--duty-tl-tick,5s) linear}
 .duty-tl-gutter-bg{position:absolute;left:-1px;top:0;bottom:0;width:calc(var(--duty-tl-name,150px) + var(--duty-tl-gap,8px) + 1px);background:var(--ui-bg-primary,#1a1a1a);border-right:1px solid var(--ui-border-primary,rgba(127,127,127,.3));z-index:2;pointer-events:none}
 .duty-scale-main.is-wide::-webkit-scrollbar{height:8px}
 .duty-scale-main.is-wide::-webkit-scrollbar-thumb{background:var(--ui-border-primary,rgba(127,127,127,.3));border-radius:4px}
@@ -5068,7 +5086,7 @@ const CSS = `
  * колонки подписей. Без этого сдвига пунктир и подпись сжатия встают на 194 px
  * левее промежутка и меряют проценты по ширине плагина, а не дорожки. */
 .duty-scale-grid{position:absolute;top:-2px;bottom:0;left:calc(var(--duty-tl-name,150px) + var(--duty-tl-gap,8px) + var(--duty-tl-plot-pad,64px));right:0;pointer-events:none;z-index:0}
-.duty-scale-grid-line{position:absolute;top:0;bottom:0;border-left:1px dashed color-mix(in srgb, var(--ui-text-tertiary) 34%, transparent)}
+.duty-scale-grid-line{position:absolute;top:0;bottom:0;width:1px;background-image:repeating-linear-gradient(to bottom, color-mix(in srgb, var(--ui-text-tertiary) 40%, transparent) 0 4px, transparent 4px 9px)}
 /* Сжатый промежуток оси: два пунктира по краям и подпись посередине — иначе
  * смена масштаба читается как ошибка данных. */
 /* Сжатый простой: штрихованная полоса — «здесь шкала рвётся, время вырезано».
@@ -5109,7 +5127,7 @@ const CSS = `
 /* Плавность дела: чипы и метки доезжают до новых процентов, дорожки и этапы —
  * вход/уход. Значение одно на все движения, чтобы панель не дышала вразнобой.
  * Обновления прилетают раз в 5 с: без переходов шкала дёргалась бы на каждом тике. */
-.duty-scale-tick,.duty-scale-grid-line,.duty-tl-idle-gap,.duty-tl-wait,.duty-tl-say{transition:left .32s ease,width .32s ease,top .32s ease}
+.duty-scale-tick,.duty-scale-grid-line,.duty-tl-idle-gap,.duty-tl-wait,.duty-tl-say{transition:left var(--duty-tl-tick,5s) linear,width var(--duty-tl-tick,5s) linear,top .32s ease}
 .duty-tl-lane,.duty-tl-row,.duty-stage-block,.duty-att-row{transition:opacity .28s ease,height .28s ease}
 .duty-stage-block.is-leaving,.duty-tl-lane.is-leaving{height:0!important;opacity:0;overflow:hidden;pointer-events:none}
 @keyframes duty-fade-in{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}

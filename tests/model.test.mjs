@@ -3833,6 +3833,28 @@ test('дорожка лида: заход без факта выхода у за
   assert.match(run.title, /конец захода не записан/)
 })
 
+test('короткий заход у свежей кромки не вылезает за шкалу', () => {
+  // Лид только что поднялся, дело живое: заход длиной в секунды при минимуме 2 %
+  // уезжал за правый край — читалось как «лид ушёл в будущее» (Макс, 18.11).
+  const scale = shapeDealTime(
+    {
+      now: 1_000 + 40 * 60,
+      timeline: [
+        { kind: 'created', at: 1_000, summary: '' },
+        { kind: 'lead_started', at: 1_000 + 40 * 60 - 5, summary: 'поднят', mode: 'resume', pid: 42 },
+      ],
+    },
+    { attempts: [] },
+  )
+  const [run] = scale.leadLane.runs
+  assert.equal(run.open, true)
+  assert.ok(run.startPct + run.widthPct <= 100.0001, `заход вылез за кромку: ${run.startPct} + ${run.widthPct}`)
+  assert.equal(run.widthPct, 2, 'полоса всё ещё различима минимальной шириной')
+  // И та же мера у попытки этапа: минимум ширины не расширяет ось.
+  const bars = scale.bars
+  for (const bar of bars) assert.ok(bar.leftPct + bar.widthPct <= 100.0001, `полоса за кромкой: ${bar.leftPct} + ${bar.widthPct}`)
+})
+
 test('дорожка лида: без фактов лида дорожка молчит, а не рисует пустую полосу', () => {
   const scale = shapeDealTime({ now: 1_600, terminal: true, timeline: [{ kind: 'created', at: 1_000, summary: '' }] }, { attempts: [] })
   assert.deepEqual(scale.leadLane.runs, [])

@@ -84,6 +84,22 @@ test('левый столбец: в гуттере только профиль, 
   assert.doesNotMatch(pluginSource, /function DutyLane[\s\S]{0,400}duty-tl-lane-h/, 'десктоп: шапка дорожки с именем этапа вернулась')
 })
 
+test('веб: пунктир сетки нарисован фоном, а не рамкой', () => {
+  const css = read('dashboard/web/styles.css')
+  // Ось в движении стоит на дробных координатах, а пунктирная рамка на такой
+  // позиции схлопывается в ноль — отсечки справа «иногда не прорисовывались»
+  // (Макс, 18.11).
+  const rule = (/\.scale-grid-line \{([^}]*)\}/.exec(css) || [])[1] || ''
+  assert.equal(/border-left/.test(rule), false, 'веб: пунктир всё ещё рамкой')
+  assert.match(rule, /background-image: repeating-linear-gradient\(to bottom/, 'веб: штрих не фоном')
+  // И сетка едет той же скоростью, что засечки: иначе линии расходятся с осью.
+  assert.match(
+    css,
+    /\.scale-wrap\.is-live \.scale-grid-line[\s\S]{0,200}transition: left var\(--tl-tick\)/,
+    'веб: сетка живёт своим темпом',
+  )
+})
+
 test('веб: ось едет к новой кромке весь период опроса, а не ступенькой', () => {
   const css = read('dashboard/web/styles.css')
   // Данные приходят раз в 5 с; если геометрия прыгает в момент ответа, таймлайн

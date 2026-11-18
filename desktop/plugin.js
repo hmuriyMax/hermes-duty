@@ -2844,6 +2844,10 @@ const KIND_ICON = {
   agent: 'M8 2.4a2.6 2.6 0 1 0 0 5.2 2.6 2.6 0 0 0 0-5.2ZM3 13.2c0-2.5 2.2-4.1 5-4.1s5 1.6 5 4.1',
   shell: 'M4 5.2 7 8l-3 2.8M8.6 11.4h3.6',
   gate: 'M8 2.2 13.4 8 8 13.8 2.6 8Z',
+  // Лид — управляющий: корона. Роль не описывается видом этапа («агент» — это
+  // любой исполнитель), а лид в деле один, и его подпись должна читаться как
+  // «тот, кто ведёт», иначе слева стоит убогое слово без значка (Макс, 18.11).
+  lead: 'M3.2 11.6h9.6M3.2 11.6 4 5.4l2.9 2.2L8 4.3l1.1 3.3L12 5.4l.8 6.2',
 }
 
 // Значок дела: маршрут от входа к итогу — узлы старта и закрытия, соединённые
@@ -3060,11 +3064,17 @@ function attemptView(bar, scale) {
   // Наслоения шли не от свёрнутой высоты, а от того, что в свёрнутой ленте сотни
   // двухпиксельных чипов стояли в одних и тех же пикселях — их разводит склейка
   // всплесков выше, а не высота строки.
-  const full = Math.max(TL.collapsed, layout.height + TL.pad)
+  // У shell-этапа нет вложенных вызовов инструментов: разворачивать строку не во
+  // что, и высота у неё одна. Полосу shell поверхность рисует рейкой, а не
+  // «сосиской» (Макс, 18.11).
+  const shell = String(b.kind || '') === 'shell'
+  const full = shell ? TL.collapsed : Math.max(TL.collapsed, layout.height + TL.pad)
   const collapsed = Math.min(full, TL.collapsed)
   return {
     full,
     collapsed,
+    // Вид попытки знает поверхность: у shell другая полоса и нет разворота.
+    shell,
     // Попытка ещё идёт: поверхность пульсирует её полосу тем же ореолом, каким
     // дышит живая сосиска на таймлайне дел («идёт прямо сейчас», Макс, 14.11).
     open: Boolean(b.open),
@@ -3080,6 +3090,10 @@ function attemptView(bar, scale) {
       number: b.number || '—',
       status: status || '—',
       tone: b.tone || 'grey',
+      // Подпись стоит слева от полосы и на полосу не наезжает никогда: место под
+      // неё отдаёт поле шкалы (его мерит вёрстка), а не сама полоса. Флаг
+      // `inside` был попыткой уместить подпись в тесноте — с именем этапа он
+      // означал «подпись поверх сосиски» (Макс, 18.11).
     },
     ticks: chips.map((chip) => ({
       leftPct: chip.leftPct,
@@ -3154,6 +3168,25 @@ function docBlocks(data) {
 }
 
 /** Вид дорожки этапа: имя, вид, сводка попыток и строки. */
+/** Человеческое описание этапа одной строкой: имя, исполнитель, команда, `id`.
+ *
+ * В спеке у этапа есть имя для человека (`title`), вид (`agent`/`shell`/`gate`),
+ * профиль и доказательства, а свободного описания нет. Подсказка собирается из
+ * этих фактов: «База зелёная · команда движка · go build ./... · id: guard_base»
+ * (Макс, 18.11).
+ */
+function stageHint(lane) {
+  const info = (lane && lane.info) || {}
+  const id = String((lane && lane.id) || '')
+  const kind = String(info.kind || '')
+  const by = kind === 'shell' ? 'команда движка' : kind === 'gate' ? 'вопрос человеку' : info.profile ? `профиль ${info.profile}` : 'этап движка'
+  // `reason` этапа сюда не идёт: это состояние последней попытки, а не описание
+  // этапа, и подсказка с ним читалась как журнальная строка.
+  return [info.title || '', by, info.cmd || '', id ? `id: ${id}` : '']
+    .filter(Boolean)
+    .join(' · ')
+}
+
 function laneView(lane, bars, scale) {
   const list = Array.isArray(bars) ? bars : []
   const first = list[0]
@@ -3170,21 +3203,34 @@ function laneView(lane, bars, scale) {
   ]
     .filter(Boolean)
     .join(' · ')
+  // Название этапа печатается у КАЖДОЙ своей попытки, а не в левой колонке:
+  // слева остаётся только профиль, и дорожки читаются по исполнителю, а подпись
+  // едет вместе со своей полосой. У первой попытки имени мало: когда попыток три,
+  // вторая и третья висели без подписи, и связь «полоса → этап» терялась
+  // (Макс, 18.11: «название этапа пиши у каждой попытки по этапу»).
+  const tag = String((lane && lane.id) || (lane && lane.label) || '')
+  const rows = list.map((bar) => {
+    const view = attemptView(bar, scale)
+    if (tag) view.tag = tag
+    return { key: `${bar.laneKey || ''}-${bar.number || ''}`, view }
+  })
+
   return {
     name: String((lane && lane.label) || '—'),
     // `id` этапа — отдельным полем: слева он печатается крупно (`impl-v3`), а
     // описание из спеки идёт строкой ниже. Одно поле на оба случая заставляло
     // выбирать между «не найти в журнале» и «не понять, о чём этап».
     id: String((lane && lane.id) || ''),
-    // Подсказка дорожки несёт `id` этапа: печатается имя, а ищут в журнале по
-    // `id`. У безымянного этапа подсказки нет — имя ему и есть `id`.
-    hint: lane && lane.id && lane.id !== lane.label ? `этап: ${lane.id}` : '',
+    // Подсказка дорожки: человеческое описание этапа. Печатается имя, а ищут в
+    // журнале по `id`, поэтому в подсказке сходятся имя из спеки, кто исполняет
+    // этап и (у shell) сама команда — «что это за этап» без ухода в журнал.
+    hint: stageHint(lane),
     kind: first ? String(first.kind || 'agent') : '',
     kindText: first ? (first.kind === 'agent' ? executorText(first) : String(first.kind)) : '',
     icon: first ? KIND_ICON[first.kind] || KIND_ICON.shell : '',
     meta,
     empty: list.length === 0,
-    rows: list.map((bar) => ({ key: `${bar.laneKey || ''}-${bar.number || ''}`, view: attemptView(bar, scale) })),
+    rows,
   }
 }
 
@@ -3729,10 +3775,38 @@ function shapeDealTime(detail, attemptsPayload) {
       String((stage && stage.role) || ''),
     ]),
   )
+  // Всё, из чего складывается человеческое описание этапа для подсказки: имя из
+  // спеки (`title`), вид (агент/команда/гейт), профиль и — у shell — команда из
+  // доказательств. Свободного текста в спеке нет, поэтому описание собирается из
+  // фактов, а не выдумывается (Макс, 18.11: «при наведении на название этапа
+  // показывать описание человеческое»).
+  const stageInfo = new Map(
+    (Array.isArray(d.stages) ? d.stages : []).map((stage) => {
+      const id = String((stage && stage.id) || '')
+      const evidence = Array.isArray(stage && stage.evidence) ? stage.evidence : []
+      return [
+        id,
+        {
+          title: String((stage && stage.title) || '').trim(),
+          kind: String((stage && stage.kind) || ''),
+          profile: String((stage && stage.profile) || (stage && stage.role) || ''),
+          cmd: String((evidence[0] && evidence[0].cmd) || '').trim(),
+          reason: String((stage && stage.reason) || '').trim(),
+        },
+      ]
+    }),
+  )
   const addLane = (key) => {
     if (!key || laneIndex.has(key)) return
     laneIndex.set(key, lanes.length)
-    lanes.push({ key, label: stageTitles.get(key) || key, id: key, count: 0, role: stageRoles.get(key) || '' })
+    lanes.push({
+      key,
+      label: stageTitles.get(key) || key,
+      id: key,
+      count: 0,
+      role: stageRoles.get(key) || '',
+      info: stageInfo.get(key) || null,
+    })
   }
   const graphKeys = (Array.isArray(d.stages) ? d.stages : []).map((stage) => String((stage && stage.id) || ''))
   const firstStart = new Map()
@@ -3778,6 +3852,61 @@ function shapeDealTime(detail, attemptsPayload) {
     else laneOrder.splice(at, 0, extra)
   }
   for (const key of laneOrder) addLane(key)
+
+  // Группы дорожек по роли исполнителя (Макс, 16.11: «группировку не попыток по
+  // этапу, а этапов + попыток по роли исполнителя»). Дело типично держит 5–10
+  // этапов и 3–4 роли: половина дорожек — это один `implementer` с пятью `impl_*`.
+  // Роль берётся у этапа (`stages[].role`); shell-этап с названной ролью идёт в
+  // группу этой роли (исполнитель — движок, но проверяет он роль), а shell без
+  // роли — в «движок»: это команды, а не чья-то работа.
+  //
+  // Группировка переставляет дорожки ДО того, как полосы получат свой `lane`:
+  // иначе `bar.lane` указывал бы на прежнюю нумерацию. Заголовок роли стоял бы
+  // один раз, а её этапы возвращались бы ниже, между чужими (в `d_c13d53da`
+  // `impl_widget_data` идёт после shell-шага). Порядок групп — по первому этапу
+  // роли в порядке графа, внутри группы — тот же порядок графа: работа не
+  // переупорядочивается по смыслу, а только собирается под своим исполнителем.
+  const laneGroups = []
+  const groupOf = new Map()
+  for (const lane of lanes) {
+    const role = String(lane.role || '').trim()
+    const key = role ? `role:${role}` : 'engine'
+    if (!groupOf.has(key)) {
+      groupOf.set(key, laneGroups.length)
+      laneGroups.push({
+        key,
+        role,
+        label: role ? (role === COORDINATOR_ROLE ? LEAD_ROLE_LABEL : role) : 'движок',
+        hint: role ? `исполнитель: ${role}` : 'шаги движка: команды без профиля-исполнителя',
+        // Значок роли: исполнитель — агент, движок — команды. Слева в гуттере
+        // остался только профиль, и «движок» без значка читался убого (Макс, 18.11).
+        icon: (role ? KIND_ICON.agent : KIND_ICON.shell),
+        // Цвет профиля — та же палитра, что у полос на главной странице дел
+        // (`--role-*`): роль узнаётся по цвету на обеих поверхностях, а не
+        // только по подписи (Макс, 18.11).
+        roleKey: role ? String(role) : 'other',
+        members: [],
+      })
+    }
+    laneGroups[groupOf.get(key)].members.push(lane)
+  }
+  const groupedLanes = laneGroups.flatMap((group) => group.members)
+  lanes.length = 0
+  lanes.push(...groupedLanes)
+  laneIndex.clear()
+  for (const [index, lane] of lanes.entries()) {
+    laneIndex.set(lane.key, index)
+    // Дорожка знает свою группу: поверхность рисует заголовок один раз, перед
+    // первой дорожкой группы.
+    lane.groupKey = String(lane.role || '').trim() ? `role:${String(lane.role).trim()}` : 'engine'
+    lane.group = groupOf.get(lane.groupKey)
+  }
+  for (const group of laneGroups) {
+    group.lanes = group.members.map((lane) => laneIndex.get(lane.key))
+    group.first = group.lanes.length ? group.lanes[0] : -1
+    delete group.members
+  }
+
   for (const bar of bars) {
     bar.lane = laneIndex.get(bar.laneKey) ?? 0
     if (lanes[bar.lane]) lanes[bar.lane].count += 1
@@ -3788,6 +3917,16 @@ function shapeDealTime(detail, attemptsPayload) {
     if (lane && lane.label !== lane.id) bar.laneLabel = `${lane.label} (${lane.id})`
   }
   if (!lanes.length) bars.forEach((bar) => { bar.lane = 0 })
+
+  // Счётчики групп — по попыткам уже расставленных полос: их число считается в
+  // цикле выше, поэтому сводка группы складывается после него.
+  for (const group of laneGroups) {
+    group.attempts = group.lanes.reduce((sum, index) => sum + (lanes[index] ? lanes[index].count : 0), 0)
+    const stages = group.lanes.length
+    group.countText = `${stages} ${plural(stages, 'этап', 'этапа', 'этапов')}`
+    group.attemptsText = `${group.attempts} ${plural(group.attempts, 'попытка', 'попытки', 'попыток')}`
+    group.summary = `${group.countText} · ${group.attemptsText}`
+  }
 
   for (const bar of bars) {
     // Конец полосы посчитан выше — тем же расчётом, по которому сжимается ось.
@@ -4229,6 +4368,9 @@ function shapeDealTime(detail, attemptsPayload) {
       ticks: axisTicks,
     },
     lanes,
+    // Группы дорожек по роли исполнителя: заголовок рисует поверхность, порядок и
+    // счётчики — здесь (обе поверхности обязаны показать одну картину).
+    laneGroups,
     bars,
     // Заходы лида — отдельной дорожкой над этапами: полосы уже с координатами,
     // поверхность только рисует (`leadLane.runs`).
@@ -4470,7 +4612,7 @@ function dutyTipBind() {
   window.addEventListener('resize', follow)
 }
 
-function DutyAttemptRow({ view, toolFilter }) {
+function DutyAttemptRow({ view, toolFilter, hint = '' }) {
   // Подсветка семейства: чужие вызовы гаснут, но остаются на месте — картина
   // дела не рассыпается, просто читается другое.
   const active = Array.isArray(toolFilter) ? toolFilter : []
@@ -4545,6 +4687,10 @@ function DutyAttemptRow({ view, toolFilter }) {
         style: { left: `${bandLeft}%` },
         'data-tip': view.bandTip || view.title || '',
       },
+      // Название этапа — у своей попытки: в гуттере слева живёт только профиль
+      // (Макс, 18.11). Стоит на первой попытке: у следующих это повтор, а номер
+      // уже говорит, какая из них какая.
+      view.tag ? h('span', { className: 'duty-tl-lane-tag duty-mono', title: hint }, view.tag) : null,
       h('span', { className: 'duty-tl-n' }, view.label.number),
       h('span', { className: `duty-tl-st t-${view.label.tone}` }, view.label.status),
     ),
@@ -4581,7 +4727,7 @@ function DutyAttemptRow({ view, toolFilter }) {
     // Свёрнутая высота — первый уровень вызовов и маркеры, полная раскрывается
     // под указателем. Числа из шейпера, CSS только переключает.
     {
-      className: `duty-tl-row${view.failed ? ' is-failed' : ''}`,
+      className: `duty-tl-row${view.failed ? ' is-failed' : ''}${view.shell ? ' is-shell' : ''}`,
       style: { '--duty-tl-collapsed': `${view.collapsed}px`, '--duty-tl-full': `${view.full}px` },
     },
     h('div', { className: 'duty-tl-track' }, h('div', { className: 'duty-tl-plot' }, ...track)),
@@ -4593,29 +4739,28 @@ function DutyAttemptRow({ view, toolFilter }) {
  *  и полоса показывает ровно это (идёт/вышел/упал/конец не записан). */
 function DutyLeadLane({ leadLane }) {
   const runs = (leadLane && leadLane.runs) || []
+  // Лид — такая же зона, как профили этапов: рельс с именем по центру зоны.
+  // Шапка строкой сверху оставляла «лид» не по центру своей полосы (Макс, 18.11).
   return h(
     'div',
-    { className: 'duty-tl-lane duty-tl-lane-lead' },
+    { className: 'duty-tl-group-block is-lead', 'data-key': 'block:lead', 'data-group': 'lead', 'data-role': 'lead' },
     h(
       'div',
-      { className: 'duty-tl-lane-h' },
+      { className: 'duty-tl-group-rail', title: 'лид: процесс, который ведёт дело' },
+      h(
+        'svg',
+        { className: 'duty-tl-group-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' },
+        h('path', { d: KIND_ICON.lead }),
+      ),
+      h('span', { className: 'duty-tl-group-name' }, 'лид'),
+    ),
+    h(
+      'div',
+      { className: 'duty-tl-group-body' },
       h(
         'div',
-        { className: 'duty-tl-lane-id' },
-        h(
-          'span',
-          { className: 'duty-tl-lane-head' },
-          h('span', { className: 'duty-tl-lane-code duty-mono', title: 'лид: процесс, который ведёт дело' }, 'лид'),
-          h(
-            'span',
-            { className: 'duty-tl-kind duty-tl-kind-agent', title: 'профиль: lead' },
-            h('svg', { className: 'duty-tl-kind-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' }, h('path', { d: KIND_ICON.agent })),
-            'lead',
-          ),
-        ),
-      ),
-    ),
-    runs.length
+        { className: 'duty-tl-lane duty-tl-lane-lead' },
+        runs.length
       ? h(
           'div',
           { className: 'duty-tl-rows' },
@@ -4649,55 +4794,53 @@ function DutyLeadLane({ leadLane }) {
             ),
           ),
         )
-      : h('div', { className: 'duty-tl-empty' }, h('span', null, 'заходов не было')),
+          : h('div', { className: 'duty-tl-empty' }, h('span', null, 'заходов не было')),
+      ),
+    ),
   )
 }
 
-/** Дорожка этапа: имя, значок вида, сводка и строки попыток. */
+/**
+ * Заголовок группы дорожек — роль исполнителя.
+ *
+ * Дело держит 5–10 этапов и 3–4 роли, и без заголовка половина дорожек читается
+ * как «ещё один impl_*»: имя роли повторялось в каждой подписи, а «сколько работы
+ * у implementer» не отвечал никто. Заголовок называет роль, число её этапов и
+ * попыток, и липнет к левому краю вместе с подписями (Макс, 16.11).
+ */
+/** Рельс профиля: значок роли, её имя и счёт этапов и попыток. Липнет к кромке. */
+function DutyLaneGroup({ group }) {
+  return h(
+    'div',
+    { className: 'duty-tl-group-rail', title: group.hint, 'data-key': `group:${group.key}` },
+    h(
+      'svg',
+      { className: 'duty-tl-group-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' },
+      h('path', { d: group.icon || '' }),
+    ),
+    h('span', { className: 'duty-tl-group-name' }, group.label),
+    h('span', { className: 'duty-tl-group-meta' }, group.summary),
+  )
+}
+
+/** Дорожка этапа: строки попыток; имени и профиля в гуттере нет.
+ *
+ *  Слева остаётся только профиль — заголовок группы ролей (`DutyLaneGroup`), а
+ *  название этапа печатается у своей попытки внутри шкалы (Макс, 18.11: «убрать
+ *  подпись профиля у каждого этапа, название этапа перенести к попытке, слева
+ *  оставить только профиль»). */
 function DutyLane({ lane, bars, scale, toolFilter }) {
   const view = laneView(lane, bars, scale)
   return h(
     'div',
     { className: 'duty-tl-lane' },
-    h(
-      'div',
-      { className: 'duty-tl-lane-h' },
-      // Имя и профиль — в левой колонке, прилипают вместе с подписями попыток
-      // (Макс, 09.11: «попытки закреплены, а названия этапов и профиль — нет»).
-      h(
-        'div',
-        { className: 'duty-tl-lane-id' },
-        // Свёрнутая дорожка — одна строка: код этапа и вид. Описание и счёт
-        // выезжают при развороте (см. веб).
-        h(
-          'span',
-          { className: 'duty-tl-lane-head' },
-          h('span', { className: 'duty-tl-lane-code duty-mono', title: view.id ? `этап: ${view.id}` : view.name }, view.id || view.name),
-          view.kind
-            ? h(
-                'span',
-                {
-                  className: `duty-tl-kind duty-tl-kind-${view.kind}`,
-                  title: view.kind === 'agent' ? `профиль: ${view.kindText}` : view.kind,
-                },
-                h(
-                  'svg',
-                  { className: 'duty-tl-kind-ico', viewBox: '0 0 16 16', 'aria-hidden': 'true' },
-                  h('path', { d: view.icon }),
-                ),
-                view.kindText,
-              )
-            : null,
-        ),
-      ),
-    ),
     view.empty
       ? h('div', { className: 'duty-tl-empty' }, h('span', null, 'попыток не было'))
       : h(
           'div',
           { className: 'duty-tl-rows' },
           ...view.rows.map((row) =>
-            h(DutyAttemptRow, { key: row.key, view: row.view, toolFilter }),
+            h(DutyAttemptRow, { key: row.key, view: row.view, toolFilter, hint: view.hint }),
           ),
         ),
   )
@@ -4872,6 +5015,7 @@ const CSS = `
 .duty-deal-rail{display:flex;flex-direction:column;gap:14px;min-width:0}
 /* Узкое окно: колонки друг под другом, документы — первыми, этапы — следом. */
 @media (max-width:1040px){.duty-deal-cols{grid-template-columns:1fr}}
+@media (max-width:760px){.duty-tl-att .duty-tl-n,.duty-tl-att .duty-tl-st{display:none}.duty-tl-lane-tag{max-width:138px;font-size:11.5px}}
 .duty-deal-spec,.duty-deal-docs,.duty-deal-stages{min-width:0}
 .duty-deal-scale{grid-column:1/-1;min-width:0}
 .duty-spec{margin:0;white-space:pre-wrap;word-break:break-word;font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:11px;line-height:1.5;color:var(--ui-text-secondary);max-height:60vh;overflow:auto;border:1px solid var(--ui-stroke-tertiary);border-radius:6px;padding:8px}
@@ -4907,7 +5051,11 @@ const CSS = `
 
 /* Шкала шире часа: листается по горизонтали, подписи прилипают слева (Макс, 09.11). */
 .duty-scale-main.is-wide{overflow-x:auto;overscroll-behavior-x:contain;scrollbar-width:thin}
-.duty-scale-wrap{position:relative;--duty-tl-plot-pad:64px}
+.duty-scale-wrap{position:relative;--duty-tl-plot-pad:64px;--duty-tl-tick:5s}
+/* Ось живого дела тянется вперёд, и геометрия едет к новой кромке весь период
+   опроса (5 с), а не ступенькой в момент ответа: картинка расширяется плавно.
+   Высоты и раскрытие строк остаются быстрыми — это отклик на указатель. */
+.duty-tl-band,.duty-scale-tick,.duty-tl-mark,.duty-tl-lead-run{transition:left var(--duty-tl-tick,5s) linear,width var(--duty-tl-tick,5s) linear}
 .duty-tl-gutter-bg{position:absolute;left:-1px;top:0;bottom:0;width:calc(var(--duty-tl-name,150px) + var(--duty-tl-gap,8px) + 1px);background:var(--ui-bg-primary,#1a1a1a);border-right:1px solid var(--ui-border-primary,rgba(127,127,127,.3));z-index:2;pointer-events:none}
 .duty-scale-main.is-wide::-webkit-scrollbar{height:8px}
 .duty-scale-main.is-wide::-webkit-scrollbar-thumb{background:var(--ui-border-primary,rgba(127,127,127,.3));border-radius:4px}
@@ -4930,9 +5078,32 @@ const CSS = `
 .duty-tl-idle-band{position:absolute;inset:0;background:repeating-linear-gradient(135deg,color-mix(in srgb,var(--ui-text-tertiary) 38%,transparent) 0 2px,transparent 2px 7px);-webkit-mask-image:linear-gradient(to right,transparent,#000 6px,#000 calc(100% - 6px),transparent);mask-image:linear-gradient(to right,transparent,#000 6px,#000 calc(100% - 6px),transparent);opacity:.8}
 .duty-tl-idle-pill{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);white-space:nowrap;font-size:9px;line-height:1.3;letter-spacing:.02em;font-variant-numeric:tabular-nums;color:var(--ui-text-secondary);background:var(--ui-surface-background);border:1px solid var(--ui-stroke-secondary);border-radius:5px;padding:1px 4px}
 .duty-tl-lanes{padding-bottom:12px;position:relative;display:flex;flex-direction:column;gap:10px}
+/* Заголовок группы дорожек — роль исполнителя: имя липнет к левой кромке вместе
+   с подписями дорожек, счётчики стоят в колонке полотна. */
+.duty-tl-group-block{--zone-base:var(--role-other);display:grid;grid-template-columns:var(--duty-tl-name,150px) minmax(0,1fr);column-gap:var(--duty-tl-gap,8px);padding:6px 0 7px;margin-top:10px;box-shadow:inset 1px 0 0 color-mix(in srgb, var(--zone-base) 85%, transparent);background:color-mix(in srgb, var(--zone-base) 9%, transparent);border-radius:0 8px 8px 0}
+.duty-tl-group-block[data-role="planner"]{--zone-base:var(--role-planner)}
+.duty-tl-group-block[data-role="implementer"]{--zone-base:var(--role-implementer)}
+.duty-tl-group-block[data-role="documenter"]{--zone-base:var(--role-documenter)}
+.duty-tl-group-block[data-role="tester"]{--zone-base:var(--role-tester)}
+.duty-tl-group-block[data-role="reviewer"]{--zone-base:var(--role-reviewer)}
+.duty-tl-group-block[data-role="publisher"]{--zone-base:var(--role-publisher)}
+.duty-tl-group-block[data-role="other"]{--zone-base:var(--role-other)}
+.duty-tl-group-block + .duty-tl-group-block{border-top:1px solid color-mix(in srgb, var(--ui-border-primary, rgba(127,127,127,.4)) 55%, transparent)}
+.duty-tl-group-block:first-child{margin-top:0}
+.duty-tl-group-block.is-engine{--zone-base:var(--role-other);background:color-mix(in srgb, var(--ui-text-tertiary) 8%, transparent)}
+.duty-tl-group-rail{position:sticky;left:0;z-index:4;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;min-width:0;padding:0 6px;text-align:center}
+.duty-tl-group-name{min-width:0;max-width:100%;font-size:11.5px;font-weight:700;letter-spacing:.12em;line-height:1.15;text-transform:uppercase;color:var(--ui-text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.duty-tl-group-ico{flex:none;width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;color:var(--zone-base)}
+.duty-tl-group-block.is-engine .duty-tl-group-name{color:var(--ui-text-secondary)}
+.duty-tl-group-block.is-engine .duty-tl-group-ico{color:var(--ui-text-secondary)}
+.duty-tl-group-meta{max-width:100%;font-size:9.5px;line-height:1.2;color:var(--ui-text-secondary);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.duty-tl-group-body{min-width:0;display:flex;flex-direction:column;justify-content:center;gap:2px}
+.duty-tl-group-block .duty-tl-lane{display:block}
+.duty-tl-group-block .duty-tl-lane + .duty-tl-lane{border-top:1px solid color-mix(in srgb, var(--ui-border-primary, rgba(127,127,127,.4)) 42%, transparent);padding-top:2px;margin-top:0}
+.duty-tl-group-block .duty-tl-lane{padding-bottom:2px}
 .duty-tl-lane{display:grid;align-items:center;grid-template-columns:var(--duty-tl-name,150px) minmax(0,1fr);column-gap:var(--duty-tl-gap,8px)}
 .duty-tl-lane>.duty-tl-lane-h{grid-column:1/-1;grid-row:1;width:var(--duty-tl-name,150px);justify-self:start;position:sticky;left:0;z-index:3;background:var(--ui-bg-primary,#1a1a1a)}
-.duty-tl-lane + .duty-tl-lane{border-top:1px solid var(--ui-border-primary, rgba(127,127,127,.2));padding-top:10px;margin-top:4px}
+.duty-tl-lane + .duty-tl-lane{border-top:1px solid color-mix(in srgb, var(--ui-border-primary, rgba(127,127,127,.3)) 60%, transparent);padding-top:8px;margin-top:2px}
 .duty-tl-lane .duty-tl-lane-h{display:flex;align-items:center;min-height:20px;padding-bottom:2px;min-width:0}
 .duty-tl-lane .duty-tl-rows,.duty-tl-lane .duty-tl-row-empty{grid-column:2/-1;grid-row:1;min-width:0}
 /* Плавность дела: чипы и метки доезжают до новых процентов, дорожки и этапы —
@@ -4949,17 +5120,16 @@ const CSS = `
 .duty-tl-lane-id{display:flex;flex-direction:column;align-items:stretch;gap:0;min-width:0}
 .duty-tl-lane-head{display:flex;flex-direction:column;align-items:flex-start;gap:2px;min-width:0}
 .duty-tl-lane-head>.duty-tl-lane-code{flex:none;max-width:100%}
+.duty-tl-lane-lead .duty-tl-lane-head{flex-direction:row;align-items:center;gap:5px}
+.duty-tl-lane-lead .duty-tl-lane-code{font-family:inherit;font-size:11.5px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--ui-text-secondary)}
+.duty-tl-lane-lead .duty-tl-lane-ico{width:13px;height:13px;color:var(--ui-accent)}
+.duty-tl-lane-ico{flex:none;width:12px;height:12px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;color:var(--ui-text-secondary)}
 .duty-tl-lane-meta{font-size:10.5px;color:var(--ui-text-tertiary);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
 .duty-tl-lane-name{font-size:12.5px;font-weight:600;color:var(--ui-text-primary);letter-spacing:.01em;min-width:0;flex:0 1 auto;overflow:hidden;text-overflow:ellipsis}
 .duty-tl-lane-code{font-size:12.5px;font-weight:650;color:var(--ui-text-primary);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .duty-tl-lane-desc{font-size:11px;line-height:1.3;color:var(--ui-text-secondary);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
 
-.duty-tl-kind{display:inline-flex;align-items:center;gap:5px;height:19px;padding:0 7px;border-radius:5px;border:1px solid var(--ui-border-primary, rgba(127,127,127,.3));background:var(--ui-bg-quaternary);font-size:10.5px;font-weight:600;color:var(--ui-text-secondary)}
-.duty-tl-kind-ico{width:12px;height:12px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
-.duty-tl-kind-agent{color:var(--ui-text-primary);border-color:var(--ui-blue);background:color-mix(in srgb, var(--ui-blue) 12%, transparent)}
-.duty-tl-kind-agent .duty-tl-kind-ico{stroke:var(--ui-blue)}
-.duty-tl-kind-gate{color:var(--ui-yellow);border-color:var(--ui-yellow);background:color-mix(in srgb, var(--ui-yellow) 12%, transparent)}
 .duty-tl-rows{display:flex;flex-direction:column;gap:4px}
 .duty-tl-row{position:relative;display:grid;grid-template-columns:minmax(0,1fr);align-items:stretch;border-radius:6px;height:var(--duty-tl-collapsed, 20px);transition:height .12s ease}
 .duty-tl-row:has(.duty-tl-band:hover,.duty-tl-call:hover,.duty-tl-att:hover),.duty-tl-row:focus-visible{height:var(--duty-tl-full, 20px)}
@@ -4971,10 +5141,12 @@ const CSS = `
 /* Колонки подписи фиксированы: иначе статус разной ширины двигал время в каждой строке. */
 .duty-tl-empty{position:sticky;left:calc(var(--duty-tl-name,150px) + var(--duty-tl-gap,8px) + (100cqw - var(--duty-tl-name,150px) - var(--duty-tl-gap,8px)) / 2);width:0;height:20px;overflow:visible}
 .duty-tl-empty>span{position:absolute;left:0;top:50%;transform:translate(-50%,-50%);white-space:nowrap}
-.duty-tl-att{position:absolute;top:50%;transform:translate(-100%,-50%);display:inline-flex;align-items:center;gap:4px;padding:0 4px 0 2px;height:14px;line-height:14px;white-space:nowrap;font-variant-numeric:tabular-nums;border-radius:3px;background:color-mix(in srgb, var(--ui-bg-primary,#1a1a1a) 86%, transparent);pointer-events:none;z-index:1}
+.duty-tl-att{position:absolute;top:50%;transform:translate(-100%,-50%);display:inline-flex;align-items:center;gap:4px;padding:0 4px 0 2px;height:14px;line-height:14px;white-space:nowrap;font-variant-numeric:tabular-nums;border-radius:3px;background:none;pointer-events:none;z-index:1}
 .duty-tl-att.is-inside{transform:translate(0,-50%);padding:0 2px 0 4px}
+.duty-tl-att.is-inside{background:color-mix(in srgb, var(--ui-bg-primary,#1a1a1a) 86%, transparent)}
+.duty-tl-lane-tag{font-family:var(--ui-font-mono,ui-monospace,monospace);font-size:12px;font-weight:700;color:var(--ui-text-primary);max-width:200px;overflow:hidden;text-overflow:ellipsis}
 
-.duty-tl-n{font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:10px;color:var(--ui-text-tertiary);text-align:right}
+.duty-tl-n{font-family:var(--ui-font-mono, ui-monospace, monospace);font-size:12px;font-weight:700;color:var(--ui-text-secondary);text-align:right}
 .duty-tl-st{font-size:10.5px;font-weight:700;color:var(--ui-text-secondary)}
 .duty-tl-st.t-green{color:var(--ui-green)}
 .duty-tl-st.t-red{color:var(--ui-red)}
@@ -5058,7 +5230,7 @@ const CSS = `
 .duty-tl-mark i.t-gray{color:var(--ui-text-tertiary)}
 /* Чип без рамки: перекрытие читается плотностью цвета, а не контуром — и на
  * каждом тике квадратики не перерисовываются заново. */
-.duty-tl-call{position:absolute;height:10px;border-radius:2px;cursor:pointer;transition:left .32s ease,width .32s ease,top .32s ease,background-color .32s ease,opacity .32s ease}
+.duty-tl-call{position:absolute;height:10px;border-radius:2px;cursor:pointer;transition:left var(--duty-tl-tick,5s) linear,width var(--duty-tl-tick,5s) linear,top .32s ease,background-color .32s ease,opacity .32s ease}
 /* Свёрнутая строка: все вызовы на одной линии, внахлёст и вполсилы — плотность
  * работы, а не россыпь квадратиков; наведение раскрывает строку, и чипы
  * доезжают на свои уровни. */
@@ -5135,7 +5307,7 @@ const CSS = `
 .duty-spec-node.is-live rect{animation:duty-spec-breath 1.6s ease-in-out infinite}
 .duty-spec-node.is-live .duty-spec-state{fill:var(--ui-accent)}
 @keyframes duty-spec-breath{0%,100%{stroke-opacity:.45}50%{stroke-opacity:1}}
-@media (prefers-reduced-motion: reduce){.duty-tl-row,.duty-tl-mini,.duty-tl-stack,.duty-tl-call{transition:none}.duty-spec-node.is-live rect{animation:none}}
+@media (prefers-reduced-motion: reduce){.duty-tl-row,.duty-tl-mini,.duty-tl-stack,.duty-tl-call,.duty-tl-band,.duty-scale-tick,.duty-tl-mark,.duty-tl-lead-run{transition:none}.duty-spec-node.is-live rect{animation:none}}
 
 .duty-scale-lanes{display:flex;flex-direction:column;gap:5px}
 .duty-scale-lane{display:grid;grid-template-columns:92px 1fr;gap:8px;align-items:center}
@@ -6145,6 +6317,23 @@ function DutyPlanRefusal({ plan }) {
 
 /** Панель шкалы времени: подписанная ось, дорожка на этап, полосы и маркеры. */
 /**
+ * Поле под подпись попытки: подпись стоит СЛЕВА от своей полосы и никогда не
+ * наезжает на неё. Имя этапа плюс номер и исход занимают до двухсот пикселей, а у
+ * попытки от кромки окна слева нет ничего — поле шкалы растягивается по самой
+ * широкой подписи, окно оси при этом не меняется (Макс, 18.11: подпись наезжала на
+ * «сосиску» этапа).
+ */
+function fitAttemptLabels(root) {
+  const wrap = root && root.querySelector ? root.querySelector('.duty-scale-wrap') : null
+  if (!wrap) return
+  let pad = 0
+  for (const att of wrap.querySelectorAll('.duty-tl-att')) {
+    pad = Math.max(pad, att.scrollWidth || att.getBoundingClientRect().width || 0)
+  }
+  if (pad) wrap.style.setProperty('--duty-tl-plot-pad', `${Math.min(320, Math.max(64, Math.ceil(pad) + 12))}px`)
+}
+
+/**
  * Провода обмена с ролью: путь от палки вопроса до дорожки адресата и обратно.
  *
  * Адрес вопроса — линия до того, кого спросили, а не значок у палки (Макс,
@@ -6270,17 +6459,24 @@ function ScalePanel({ scale, dealId, toolFilter, onToggleTool }) {
           seen.px = 0
           seen.namePx = 0
         }
-        // В гуттере одна колонка — имя этапа и профиль под ним.
+        // В гуттере одна колонка — имя профиля (заголовок группы ролей): имена и
+        // значки этапов уехали к своим попыткам (Макс, 18.11).
         let namePx = 0
-        for (const head of root.querySelectorAll('.duty-tl-lane-head')) {
-          for (const child of head.children) namePx = Math.max(namePx, child.scrollWidth || child.getBoundingClientRect().width || 0)
+        for (const name of root.querySelectorAll('.duty-tl-group-name, .duty-tl-group-meta')) {
+          namePx = Math.max(namePx, name.scrollWidth || name.getBoundingClientRect().width || 0)
         }
         if (namePx) {
           seen.namePx = Math.max(seen.namePx || 0, namePx)
-          wrap.style.setProperty('--duty-tl-name', `${Math.min(300, Math.max(96, Math.ceil(seen.namePx) + 8))}px`)
+          wrap.style.setProperty('--duty-tl-name', `${Math.min(300, Math.max(88, Math.ceil(seen.namePx) + 18))}px`)
         }
+        // Поле под подпись попытки остаётся штатным: подпись, которой слева от
+        // полосы не хватает места, шейпер переводит внутрь полосы, поэтому поле
+        // под имя этапа не растягиваем (шкала иначе теряла ~140 px).
       }
     }
+    // Подпись попытки, которой слева от полосы не хватает места, уходит внутрь
+    // полосы — проценты не знают пикселей, решает вёрстка.
+    fitAttemptLabels(rootRef.current)
     // Провода обмена с ролью: геометрия нужна после отрисовки и замера гуттера.
     drawAskWires(lanesRef.current, scale)
     if (!el || el.__tlPinned === false) return
@@ -6391,14 +6587,29 @@ function ScalePanel({ scale, dealId, toolFilter, onToggleTool }) {
             'div',
             { className: 'duty-tl-lanes' },
             h(DutyLeadLane, { key: 'lane-lead', leadLane: scale.leadLane }),
-            ...scale.lanes.map((lane, index) =>
-              h(DutyLane, {
-                key: `lane-${lane.key}`,
-                lane,
-                bars: scale.bars.filter((bar) => bar.lane === index),
-                scale,
-                toolFilter: active,
-              }),
+            // Дорожки идут группами по роли исполнителя, и группа — это блок:
+            // подложка во всю ширину, волосяная линия слева по всей высоте и шапка
+            // с ролью и счётчиками. Плоский список остаётся источником индексов
+            // (`bar.lane`), блоки — только порядок и обвязка (Макс, 18.11).
+            ...(scale.laneGroups || []).map((group) =>
+              h(
+                'div',
+                { key: `block-${group.key}`, className: `duty-tl-group-block${group.role ? '' : ' is-engine'}`, 'data-key': `block:${group.key}`, 'data-group': group.key, 'data-role': group.roleKey || 'other' },
+                h(DutyLaneGroup, { key: `group-${group.key}`, group }),
+                h(
+                  'div',
+                  { key: `body-${group.key}`, className: 'duty-tl-group-body' },
+                  ...group.lanes.map((index) =>
+                    h(DutyLane, {
+                      key: `lane-${scale.lanes[index].key}`,
+                      lane: scale.lanes[index],
+                      bars: scale.bars.filter((bar) => bar.lane === index),
+                      scale,
+                      toolFilter: active,
+                    }),
+                  ),
+                ),
+              ),
             ),
           ),
         ),

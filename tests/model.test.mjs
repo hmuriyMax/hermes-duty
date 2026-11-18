@@ -1161,6 +1161,92 @@ test('шкала времени: смещение полосы — от нача
   assert.equal(scale.bars[0].ariaLabel, scale.bars[0].title)
 })
 
+test('шкала времени: дорожки собраны группами по роли исполнителя', () => {
+  // Макс, 16.11: «отображать группировку не попыток по этапу, а этапов + попыток
+  // по роли исполнителя». Дело держит 5–10 этапов и 3–4 роли: половина дорожек —
+  // один `implementer` с пятью `impl_*`, и роль повторяется подписью в каждой.
+  const detail = {
+    now: 1000,
+    status: 'running',
+    terminal: false,
+    timeline: [{ kind: 'created', at: 100, summary: '' }],
+    stages: [
+      { id: 'guard_base', kind: 'shell', role: '', needs: [] },
+      { id: 'impl_a', kind: 'agent', role: 'implementer', needs: ['guard_base'] },
+      { id: 'impl_b', kind: 'agent', role: 'implementer', needs: ['impl_a'] },
+      { id: 'check_tests', kind: 'shell', role: '', needs: ['impl_b'] },
+      { id: 'check_contract', kind: 'shell', role: 'tester', needs: ['check_tests'] },
+      { id: 'docs', kind: 'agent', role: 'documenter', needs: ['impl_b'] },
+      { id: 'review', kind: 'agent', role: 'reviewer', needs: ['docs'] },
+    ],
+  }
+  const attempts = {
+    attempts: [
+      { run_id: 'guard_base#1', stage: 'guard_base', start: 200, end: 220, outcome: 'done', calls: [] },
+      { run_id: 'impl_a#1', stage: 'impl_a', start: 220, end: 400, outcome: 'done', calls: [] },
+      { run_id: 'impl_b#1', stage: 'impl_b', start: 400, end: 500, outcome: 'failed', calls: [] },
+      { run_id: 'impl_b#2', stage: 'impl_b', start: 500, end: 600, outcome: 'done', calls: [] },
+      { run_id: 'check_tests#1', stage: 'check_tests', start: 600, end: 640, outcome: 'done', calls: [] },
+      { run_id: 'check_contract#1', stage: 'check_contract', start: 640, end: 660, outcome: 'done', calls: [] },
+      { run_id: 'docs#1', stage: 'docs', start: 660, end: 700, outcome: 'done', calls: [] },
+      { run_id: 'review#1', stage: 'review', start: 700, end: null, outcome: null, calls: [] },
+    ],
+  }
+  const scale = shapeDealTime(detail, attempts)
+
+  // Группы — по роли; shell без роли — «движок». Порядок групп — по первому этапу
+  // роли в порядке графа, порядок дорожек внутри — тот же. Сам порядок графа здесь
+  // не проверяется (это делает соседний тест): проверяется, что группы идут по
+  // своим первым дорожкам и каждая занимает непрерывный кусок списка.
+  assert.deepEqual(
+    [...scale.laneGroups.map((group) => group.label)].sort(),
+    ['documenter', 'implementer', 'reviewer', 'tester', 'движок'],
+    'набор групп ролей',
+  )
+  assert.deepEqual(
+    [...scale.laneGroups].sort((a, b) => a.first - b.first).map((group) => group.key),
+    scale.laneGroups.map((group) => group.key),
+    'порядок групп не совпадает с порядком их первых дорожек',
+  )
+  let cursor = 0
+  for (const group of scale.laneGroups) {
+    assert.equal(group.first, cursor, `группа ${group.label} не идёт сразу за предыдущей`)
+    cursor += group.lanes.length
+  }
+  assert.deepEqual(
+    scale.lanes.map((lane) => lane.key),
+    ['guard_base', 'check_tests', 'impl_a', 'impl_b', 'docs', 'check_contract', 'review'],
+    'дорожки не собраны под своими ролями подряд',
+  )
+  // Роль у дорожки не теряется: по ней стрелка обмена находит адресата.
+  assert.deepEqual(
+    scale.lanes.map((lane) => lane.role),
+    ['', '', 'implementer', 'implementer', 'documenter', 'tester', 'reviewer'],
+  )
+  // Каждая дорожка знает свою группу, и группа начинается со своей первой дорожки.
+  for (const [index, lane] of scale.lanes.entries()) {
+    const group = scale.laneGroups[lane.group]
+    assert.ok(group, `дорожка ${lane.key} без группы`)
+    assert.ok(group.first <= index, `заголовок группы ${group.label} стоит после своей дорожки`)
+  }
+  const byLabel = new Map(scale.laneGroups.map((group) => [group.label, group]))
+  assert.equal(byLabel.get('движок').summary, '2 этапа · 2 попытки')
+  assert.equal(byLabel.get('implementer').summary, '2 этапа · 3 попытки')
+  // Shell-этап с названной ролью идёт в группу этой роли, а не в «движок».
+  assert.equal(byLabel.get('tester').summary, '1 этап · 1 попытка')
+  assert.deepEqual(byLabel.get('tester').lanes, [5])
+  // Полосы попыток остались на своих дорожках: смена порядка не сдвинула факты.
+  // Каждая полоса обязана указывать на дорожку СВОЕГО этапа — перестановка
+  // дорожек после расстановки `bar.lane` даёт сдвиг на единицу, и полосы уезжают
+  // под чужую роль (нашлось живой проверкой, 16.11).
+  for (const bar of scale.bars) {
+    assert.equal(scale.lanes[bar.lane].key, bar.laneKey, `полоса ${bar.key} стоит под чужим этапом`)
+  }
+  const laneOf = (runId) => scale.bars.find((bar) => bar.key === runId).lane
+  assert.equal(laneOf('impl_b#1'), laneOf('impl_b#2'), 'попытки одного этапа на разных дорожках')
+  assert.equal(scale.lanes[laneOf('docs#1')].key, 'docs')
+})
+
 test('шкала времени: дорожки — в порядке графа, старт решает только для этапов вне графа', () => {
   // Макс, 11.11: «close опять не в самом низу, хотя по порядку графа он
   // последний». Порядок дорожек — порядок графа (глубина зависимостей, затем
@@ -2249,9 +2335,36 @@ test('дорожка шкалы зовёт этап именем, а `id` дер
   )
   const view = laneView(scale.lanes[0], scale.bars, scale)
   assert.equal(view.name, 'Собрать требования')
-  assert.equal(view.hint, 'этап: research')
+  // Подсказка — человеческое описание этапа: имя из спеки, кто исполняет и `id`
+  // для журнала. Прежнее «этап: research» ничего не говорило о самом этапе.
+  assert.equal(view.hint, 'Собрать требования · этап движка · id: research')
   // подсказка строки попытки несёт оба имени: имя для человека, `id` для журнала
   assert.match(scale.bars[0].title, /Собрать требования \(research\) · попытка #1/)
+})
+
+test('shell-этап не разворачивается: у команды нет вложенных вызовов', () => {
+  // У shell-попытки нет телеметрии инструментов, и разворачивать строку не во что:
+  // высота одна, поверхность рисует полосу рейкой (Макс, 18.11).
+  const scale = shapeDealTime(
+    { stages: [{ id: 'build', kind: 'shell' }, { id: 'impl', kind: 'agent', role: 'implementer' }] },
+    {
+      attempts: [
+        { run_id: 'build#1', stage: 'build', stage_kind: 'shell', attempt: 1, start: 1000, end: 1040, outcome: 'done' },
+        { run_id: 'impl#1', stage: 'impl', stage_kind: 'agent', attempt: 1, start: 1040, end: 1400, outcome: 'done', calls: [
+          { seq: 1, name: 'read_file', at: 1050, ms: 120 },
+          { seq: 2, name: 'write_file', at: 1100, ms: 300 },
+        ] },
+      ],
+    },
+  )
+  const shell = scale.bars.find((bar) => bar.stage === 'build')
+  const agent = scale.bars.find((bar) => bar.stage === 'impl')
+  const shellView = attemptView(shell, scale)
+  const agentView = attemptView(agent, scale)
+  assert.equal(shellView.shell, true, 'shell-попытка не помечена')
+  assert.equal(shellView.full, shellView.collapsed, 'shell-попытку всё ещё можно развернуть')
+  assert.equal(agentView.shell, false, 'агентская попытка помечена shell')
+  assert.ok(agentView.full > agentView.collapsed, 'у агентской попытки пропал разворот')
 })
 
 test('параллель и автор этапа — из графа, а не догадка экрана', () => {

@@ -2791,6 +2791,10 @@ const KIND_ICON = {
   agent: 'M8 2.4a2.6 2.6 0 1 0 0 5.2 2.6 2.6 0 0 0 0-5.2ZM3 13.2c0-2.5 2.2-4.1 5-4.1s5 1.6 5 4.1',
   shell: 'M4 5.2 7 8l-3 2.8M8.6 11.4h3.6',
   gate: 'M8 2.2 13.4 8 8 13.8 2.6 8Z',
+  // Лид — управляющий: корона. Роль не описывается видом этапа («агент» — это
+  // любой исполнитель), а лид в деле один, и его подпись должна читаться как
+  // «тот, кто ведёт», иначе слева стоит убогое слово без значка (Макс, 18.11).
+  lead: 'M3.2 11.6h9.6M3.2 11.6 4 5.4l2.9 2.2L8 4.3l1.1 3.3L12 5.4l.8 6.2',
 }
 
 // Значок дела: маршрут от входа к итогу — узлы старта и закрытия, соединённые
@@ -3007,11 +3011,17 @@ function attemptView(bar, scale) {
   // Наслоения шли не от свёрнутой высоты, а от того, что в свёрнутой ленте сотни
   // двухпиксельных чипов стояли в одних и тех же пикселях — их разводит склейка
   // всплесков выше, а не высота строки.
-  const full = Math.max(TL.collapsed, layout.height + TL.pad)
+  // У shell-этапа нет вложенных вызовов инструментов: разворачивать строку не во
+  // что, и высота у неё одна. Полосу shell поверхность рисует рейкой, а не
+  // «сосиской» (Макс, 18.11).
+  const shell = String(b.kind || '') === 'shell'
+  const full = shell ? TL.collapsed : Math.max(TL.collapsed, layout.height + TL.pad)
   const collapsed = Math.min(full, TL.collapsed)
   return {
     full,
     collapsed,
+    // Вид попытки знает поверхность: у shell другая полоса и нет разворота.
+    shell,
     // Попытка ещё идёт: поверхность пульсирует её полосу тем же ореолом, каким
     // дышит живая сосиска на таймлайне дел («идёт прямо сейчас», Макс, 14.11).
     open: Boolean(b.open),
@@ -3027,6 +3037,10 @@ function attemptView(bar, scale) {
       number: b.number || '—',
       status: status || '—',
       tone: b.tone || 'grey',
+      // Подпись стоит слева от полосы и на полосу не наезжает никогда: место под
+      // неё отдаёт поле шкалы (его мерит вёрстка), а не сама полоса. Флаг
+      // `inside` был попыткой уместить подпись в тесноте — с именем этапа он
+      // означал «подпись поверх сосиски» (Макс, 18.11).
     },
     ticks: chips.map((chip) => ({
       leftPct: chip.leftPct,
@@ -3101,6 +3115,25 @@ function docBlocks(data) {
 }
 
 /** Вид дорожки этапа: имя, вид, сводка попыток и строки. */
+/** Человеческое описание этапа одной строкой: имя, исполнитель, команда, `id`.
+ *
+ * В спеке у этапа есть имя для человека (`title`), вид (`agent`/`shell`/`gate`),
+ * профиль и доказательства, а свободного описания нет. Подсказка собирается из
+ * этих фактов: «База зелёная · команда движка · go build ./... · id: guard_base»
+ * (Макс, 18.11).
+ */
+function stageHint(lane) {
+  const info = (lane && lane.info) || {}
+  const id = String((lane && lane.id) || '')
+  const kind = String(info.kind || '')
+  const by = kind === 'shell' ? 'команда движка' : kind === 'gate' ? 'вопрос человеку' : info.profile ? `профиль ${info.profile}` : 'этап движка'
+  // `reason` этапа сюда не идёт: это состояние последней попытки, а не описание
+  // этапа, и подсказка с ним читалась как журнальная строка.
+  return [info.title || '', by, info.cmd || '', id ? `id: ${id}` : '']
+    .filter(Boolean)
+    .join(' · ')
+}
+
 function laneView(lane, bars, scale) {
   const list = Array.isArray(bars) ? bars : []
   const first = list[0]
@@ -3117,21 +3150,34 @@ function laneView(lane, bars, scale) {
   ]
     .filter(Boolean)
     .join(' · ')
+  // Название этапа печатается у КАЖДОЙ своей попытки, а не в левой колонке:
+  // слева остаётся только профиль, и дорожки читаются по исполнителю, а подпись
+  // едет вместе со своей полосой. У первой попытки имени мало: когда попыток три,
+  // вторая и третья висели без подписи, и связь «полоса → этап» терялась
+  // (Макс, 18.11: «название этапа пиши у каждой попытки по этапу»).
+  const tag = String((lane && lane.id) || (lane && lane.label) || '')
+  const rows = list.map((bar) => {
+    const view = attemptView(bar, scale)
+    if (tag) view.tag = tag
+    return { key: `${bar.laneKey || ''}-${bar.number || ''}`, view }
+  })
+
   return {
     name: String((lane && lane.label) || '—'),
     // `id` этапа — отдельным полем: слева он печатается крупно (`impl-v3`), а
     // описание из спеки идёт строкой ниже. Одно поле на оба случая заставляло
     // выбирать между «не найти в журнале» и «не понять, о чём этап».
     id: String((lane && lane.id) || ''),
-    // Подсказка дорожки несёт `id` этапа: печатается имя, а ищут в журнале по
-    // `id`. У безымянного этапа подсказки нет — имя ему и есть `id`.
-    hint: lane && lane.id && lane.id !== lane.label ? `этап: ${lane.id}` : '',
+    // Подсказка дорожки: человеческое описание этапа. Печатается имя, а ищут в
+    // журнале по `id`, поэтому в подсказке сходятся имя из спеки, кто исполняет
+    // этап и (у shell) сама команда — «что это за этап» без ухода в журнал.
+    hint: stageHint(lane),
     kind: first ? String(first.kind || 'agent') : '',
     kindText: first ? (first.kind === 'agent' ? executorText(first) : String(first.kind)) : '',
     icon: first ? KIND_ICON[first.kind] || KIND_ICON.shell : '',
     meta,
     empty: list.length === 0,
-    rows: list.map((bar) => ({ key: `${bar.laneKey || ''}-${bar.number || ''}`, view: attemptView(bar, scale) })),
+    rows,
   }
 }
 
@@ -3676,10 +3722,38 @@ function shapeDealTime(detail, attemptsPayload) {
       String((stage && stage.role) || ''),
     ]),
   )
+  // Всё, из чего складывается человеческое описание этапа для подсказки: имя из
+  // спеки (`title`), вид (агент/команда/гейт), профиль и — у shell — команда из
+  // доказательств. Свободного текста в спеке нет, поэтому описание собирается из
+  // фактов, а не выдумывается (Макс, 18.11: «при наведении на название этапа
+  // показывать описание человеческое»).
+  const stageInfo = new Map(
+    (Array.isArray(d.stages) ? d.stages : []).map((stage) => {
+      const id = String((stage && stage.id) || '')
+      const evidence = Array.isArray(stage && stage.evidence) ? stage.evidence : []
+      return [
+        id,
+        {
+          title: String((stage && stage.title) || '').trim(),
+          kind: String((stage && stage.kind) || ''),
+          profile: String((stage && stage.profile) || (stage && stage.role) || ''),
+          cmd: String((evidence[0] && evidence[0].cmd) || '').trim(),
+          reason: String((stage && stage.reason) || '').trim(),
+        },
+      ]
+    }),
+  )
   const addLane = (key) => {
     if (!key || laneIndex.has(key)) return
     laneIndex.set(key, lanes.length)
-    lanes.push({ key, label: stageTitles.get(key) || key, id: key, count: 0, role: stageRoles.get(key) || '' })
+    lanes.push({
+      key,
+      label: stageTitles.get(key) || key,
+      id: key,
+      count: 0,
+      role: stageRoles.get(key) || '',
+      info: stageInfo.get(key) || null,
+    })
   }
   const graphKeys = (Array.isArray(d.stages) ? d.stages : []).map((stage) => String((stage && stage.id) || ''))
   const firstStart = new Map()
@@ -3725,6 +3799,61 @@ function shapeDealTime(detail, attemptsPayload) {
     else laneOrder.splice(at, 0, extra)
   }
   for (const key of laneOrder) addLane(key)
+
+  // Группы дорожек по роли исполнителя (Макс, 16.11: «группировку не попыток по
+  // этапу, а этапов + попыток по роли исполнителя»). Дело типично держит 5–10
+  // этапов и 3–4 роли: половина дорожек — это один `implementer` с пятью `impl_*`.
+  // Роль берётся у этапа (`stages[].role`); shell-этап с названной ролью идёт в
+  // группу этой роли (исполнитель — движок, но проверяет он роль), а shell без
+  // роли — в «движок»: это команды, а не чья-то работа.
+  //
+  // Группировка переставляет дорожки ДО того, как полосы получат свой `lane`:
+  // иначе `bar.lane` указывал бы на прежнюю нумерацию. Заголовок роли стоял бы
+  // один раз, а её этапы возвращались бы ниже, между чужими (в `d_c13d53da`
+  // `impl_widget_data` идёт после shell-шага). Порядок групп — по первому этапу
+  // роли в порядке графа, внутри группы — тот же порядок графа: работа не
+  // переупорядочивается по смыслу, а только собирается под своим исполнителем.
+  const laneGroups = []
+  const groupOf = new Map()
+  for (const lane of lanes) {
+    const role = String(lane.role || '').trim()
+    const key = role ? `role:${role}` : 'engine'
+    if (!groupOf.has(key)) {
+      groupOf.set(key, laneGroups.length)
+      laneGroups.push({
+        key,
+        role,
+        label: role ? (role === COORDINATOR_ROLE ? LEAD_ROLE_LABEL : role) : 'движок',
+        hint: role ? `исполнитель: ${role}` : 'шаги движка: команды без профиля-исполнителя',
+        // Значок роли: исполнитель — агент, движок — команды. Слева в гуттере
+        // остался только профиль, и «движок» без значка читался убого (Макс, 18.11).
+        icon: (role ? KIND_ICON.agent : KIND_ICON.shell),
+        // Цвет профиля — та же палитра, что у полос на главной странице дел
+        // (`--role-*`): роль узнаётся по цвету на обеих поверхностях, а не
+        // только по подписи (Макс, 18.11).
+        roleKey: role ? String(role) : 'other',
+        members: [],
+      })
+    }
+    laneGroups[groupOf.get(key)].members.push(lane)
+  }
+  const groupedLanes = laneGroups.flatMap((group) => group.members)
+  lanes.length = 0
+  lanes.push(...groupedLanes)
+  laneIndex.clear()
+  for (const [index, lane] of lanes.entries()) {
+    laneIndex.set(lane.key, index)
+    // Дорожка знает свою группу: поверхность рисует заголовок один раз, перед
+    // первой дорожкой группы.
+    lane.groupKey = String(lane.role || '').trim() ? `role:${String(lane.role).trim()}` : 'engine'
+    lane.group = groupOf.get(lane.groupKey)
+  }
+  for (const group of laneGroups) {
+    group.lanes = group.members.map((lane) => laneIndex.get(lane.key))
+    group.first = group.lanes.length ? group.lanes[0] : -1
+    delete group.members
+  }
+
   for (const bar of bars) {
     bar.lane = laneIndex.get(bar.laneKey) ?? 0
     if (lanes[bar.lane]) lanes[bar.lane].count += 1
@@ -3735,6 +3864,16 @@ function shapeDealTime(detail, attemptsPayload) {
     if (lane && lane.label !== lane.id) bar.laneLabel = `${lane.label} (${lane.id})`
   }
   if (!lanes.length) bars.forEach((bar) => { bar.lane = 0 })
+
+  // Счётчики групп — по попыткам уже расставленных полос: их число считается в
+  // цикле выше, поэтому сводка группы складывается после него.
+  for (const group of laneGroups) {
+    group.attempts = group.lanes.reduce((sum, index) => sum + (lanes[index] ? lanes[index].count : 0), 0)
+    const stages = group.lanes.length
+    group.countText = `${stages} ${plural(stages, 'этап', 'этапа', 'этапов')}`
+    group.attemptsText = `${group.attempts} ${plural(group.attempts, 'попытка', 'попытки', 'попыток')}`
+    group.summary = `${group.countText} · ${group.attemptsText}`
+  }
 
   for (const bar of bars) {
     // Конец полосы посчитан выше — тем же расчётом, по которому сжимается ось.
@@ -4176,6 +4315,9 @@ function shapeDealTime(detail, attemptsPayload) {
       ticks: axisTicks,
     },
     lanes,
+    // Группы дорожек по роли исполнителя: заголовок рисует поверхность, порядок и
+    // счётчики — здесь (обе поверхности обязаны показать одну картину).
+    laneGroups,
     bars,
     // Заходы лида — отдельной дорожкой над этапами: полосы уже с координатами,
     // поверхность только рисует (`leadLane.runs`).

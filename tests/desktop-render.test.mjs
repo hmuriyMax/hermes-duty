@@ -114,7 +114,7 @@ const sampleBars = [
   },
 ]
 
-test('десктоп: DutyLane рисует svg-значок, который ловит правило CSS', async (t) => {
+test('десктоп: дорожка отдаёт имя этапа попытке, гуттер — только профилю', async (t) => {
   const root = reactRoot()
   if (!root) return t.skip('нет React в ~/.hermes/hermes-agent/node_modules')
 
@@ -132,16 +132,24 @@ test('десктоп: DutyLane рисует svg-значок, который л�
     }),
   )
 
-  // Класс стоит на самом svg — иначе правило `.duty-tl-kind-ico{width:12px…}`
-  // до него не достанет.
-  assert.match(html, /<svg[^>]*class="duty-tl-kind-ico"/, 'значок должен быть svg с классом')
+  // В гуттере дорожки нет ни имени этапа, ни значка профиля: имя едет к своей
+  // попытке, профиль называет заголовок группы (Макс, 18.11).
+  assert.doesNotMatch(html, /duty-tl-lane-h/, 'шапка дорожки вернулась в гуттер')
+  assert.doesNotMatch(html, /duty-tl-kind/, 'значок профиля вернулся в дорожку')
+  assert.match(html, /duty-tl-lane-tag[^>]*>pinned-review-service</, 'имя этапа не приехало к попытке')
 
+  // Стиль имени при попытке объявлен — иначе подпись сольётся с номером попытки.
+  // Правил у класса два: основное и узкий экран (`max-width` подписи). Берём то,
+  // где объявлен размер шрифта, — именно оно задаёт вид подписи.
   const css = read('desktop/plugin.js').replace(/\/\*[\s\S]*?\*\//g, '')
-  const at = css.indexOf('.duty-tl-kind-ico{')
-  assert.ok(at > 0, 'нет правила .duty-tl-kind-ico')
-  const rule = css.slice(at, css.indexOf('}', at))
-  for (const declaration of ['width:12px', 'height:12px', 'fill:none', 'stroke:currentColor']) {
-    assert.ok(rule.includes(declaration), `.duty-tl-kind-ico: нет ${declaration}`)
+  const rules = [...css.matchAll(/\.duty-tl-lane-tag\{([^}]*)\}/g)].map((match) => match[1])
+  assert.ok(rules.length > 0, 'нет правила .duty-tl-lane-tag')
+  // Основное правило узнаём по насыщенности: у медиа-варианта для узкого экрана
+  // размер шрифта меньше, и он не должен подменять базовый.
+  const rule = rules.find((body) => body.includes('font-weight:700')) || ''
+  assert.ok(rule, 'у .duty-tl-lane-tag нет правила с размером шрифта')
+  for (const declaration of ['font-size:12px', 'font-weight:700', 'text-overflow:ellipsis']) {
+    assert.ok(rule.includes(declaration), `.duty-tl-lane-tag: нет ${declaration}`)
   }
 
   // Числа вызовов на подписи попытки больше нет: гуттер узкий, длинная строка
@@ -1232,4 +1240,78 @@ test('десктоп: пройденный без работы этап назв
     }
     keepWindow = dom.window
   }
+})
+
+/* -------------------- группы дорожек по роли (0.2.1) --------------------- */
+
+test('десктоп: заголовок группы роли стоит перед своими этапами', async (t) => {
+  const root = reactRoot()
+  if (!root) return t.skip('нет React в ~/.hermes/hermes-agent/node_modules')
+
+  const mod = await import(pathToFileURL(moduleForRender(root)).href)
+  const React = (await import(pathToFileURL(join(root, 'react', 'index.js')).href)).default
+  const { renderToStaticMarkup } = await import(
+    pathToFileURL(join(root, 'react-dom', 'server.node.js')).href
+  )
+
+  // Та же картина, что на вебе: группировка — по роли исполнителя, shell без роли
+  // — «движок», shell с ролью — в группу этой роли (Макс, 16.11).
+  const scale = mod.shapeDealTime(
+    {
+      now: 1_700_000_600,
+      status: 'running',
+      terminal: false,
+      timeline: [{ kind: 'created', at: 1_700_000_000, summary: '' }],
+      stages: [
+        { id: 'guard_base', kind: 'shell', role: '', needs: [] },
+        { id: 'impl_a', kind: 'agent', role: 'implementer', needs: ['guard_base'] },
+        { id: 'impl_b', kind: 'agent', role: 'implementer', needs: ['impl_a'] },
+        { id: 'check_contract', kind: 'shell', role: 'tester', needs: ['impl_b'] },
+        { id: 'review', kind: 'agent', role: 'reviewer', needs: ['check_contract'] },
+      ],
+    },
+    {
+      attempts: [
+        { run_id: 'guard_base#1', stage: 'guard_base', start: 1_700_000_000, end: 1_700_000_020, outcome: 'done', calls: [] },
+        { run_id: 'impl_a#1', stage: 'impl_a', start: 1_700_000_020, end: 1_700_000_200, outcome: 'done', calls: [] },
+        { run_id: 'impl_b#1', stage: 'impl_b', start: 1_700_000_200, end: 1_700_000_400, outcome: 'done', calls: [] },
+        { run_id: 'check_contract#1', stage: 'check_contract', start: 1_700_000_400, end: 1_700_000_440, outcome: 'done', calls: [] },
+        { run_id: 'review#1', stage: 'review', start: 1_700_000_440, end: null, outcome: null, calls: [] },
+      ],
+    },
+  )
+
+  const html = renderToStaticMarkup(React.createElement(mod.ScalePanel, { scale }))
+
+  // Зон ровно столько, сколько групп у шейпера, и каждая — блок со своим ключом.
+  // Зоны: лид (у него своя зона, как у профилей) и группы ролей.
+  const zones = [...html.matchAll(/data-key="block:([^"]+)"/g)].map((match) => match[1])
+  assert.deepEqual(zones, ['lead', ...scale.laneGroups.map((group) => group.key)], `зоны групп: ${zones.join(', ')}`)
+
+  // Рельс каждой зоны идёт ДО дорожек своей группы: профиль относится к своим
+  // этапам, а не к соседним (Макс, 16.11 и 18.11).
+  const marks = [...html.matchAll(/data-key="(group:[^"]+|lane:[^"]+)"/g)].map((match) => match[1])
+  let current = null
+  for (const mark of marks) {
+    if (mark.startsWith('group:')) {
+      current = mark.slice(6)
+      continue
+    }
+    const key = mark.slice(5)
+    if (key === 'lead') continue
+    const lane = scale.lanes.find((item) => item.key === key)
+    assert.ok(lane, `дорожка ${key} не из шейпера`)
+    assert.equal(`group:${scale.laneGroups[lane.group].key}`, `group:${current}`, `дорожка ${key} стоит под чужой ролью`)
+  }
+
+  // Счёт этапов и попыток — в рельсе, двумя строками; «движок» отличён классом;
+  // у каждой роли есть значок.
+  // Рельс есть у каждой зоны, включая лида.
+  const rails = [...html.matchAll(/class="duty-tl-group-rail"[\s\S]*?<\/div>/g)].map((match) => match[0])
+  assert.equal(rails.length, scale.laneGroups.length + 1, `рельсов ${rails.length}`)
+  const implRail = rails[2]
+  assert.ok(implRail.includes(scale.laneGroups[1].summary), `нет счёта implementer: ${scale.laneGroups[1].summary}`)
+  assert.match(implRail, /class="duty-tl-group-ico"/, 'в рельсе нет значка роли')
+  assert.match(html, /class="duty-tl-group-block is-engine"/, 'зона движка не помечена классом')
+  assert.match(html, />implementer</, 'имя роли не напечатано')
 })

@@ -316,10 +316,12 @@ def build_merge_repo(root: Path) -> tuple[Path, str]:
 
 
 def merge_spec_text(repo: Path, base: str) -> str:
-    """Спека сценария: две полосы в своих деревьях, слияние, проверка за слиянием.
+    """Спека сценария: три полосы в своих деревьях, слияние, проверка за слиянием.
 
     `needs` слияния названы в порядке, отличном от порядка объявления полос: так
     видно, что вливание идёт по объявлению, а не по времени готовности полос.
+    Полос три (`impl_c` правит свой файл): слияние обязано собрать ВСЕ стороны, и
+    конфликт на средней не теряет хвост.
 
     Вход один (`start`): спека с двумя входами — не то, что лид вправе написать
     (`spec check` отказывает правилом `entry`, «вход должен быть один»), а прогон
@@ -332,9 +334,10 @@ def merge_spec_text(repo: Path, base: str) -> str:
         f"base: {base}\n"
         "stages:\n"
         "  - {id: start, kind: shell, cmd: \"true\", workspace: none}\n"
-        "  - {id: impl_a, role: implementer, workspace: worktree, needs: [start], parallel_with: [impl_b]}\n"
-        "  - {id: impl_b, role: implementer, workspace: worktree, needs: [start], parallel_with: [impl_a]}\n"
-        "  - {id: join, kind: merge, needs: [impl_b, impl_a], workspace: worktree}\n"
+        "  - {id: impl_a, role: implementer, workspace: worktree, needs: [start], parallel_with: [impl_b, impl_c]}\n"
+        "  - {id: impl_b, role: implementer, workspace: worktree, needs: [start], parallel_with: [impl_a, impl_c]}\n"
+        "  - {id: impl_c, role: implementer, workspace: worktree, needs: [start], parallel_with: [impl_a, impl_b]}\n"
+        "  - {id: join, kind: merge, needs: [impl_b, impl_a, impl_c], workspace: worktree}\n"
         "  - {id: gates, role: tester, workspace: worktree, needs: [join]}\n"
     )
 
@@ -495,9 +498,13 @@ def merge_scenario(
         raise DemoError(
             "спека демо не проходит spec check: " + "; ".join(f"{issue.rule}: {issue.message}" for issue in refusals)
         )
-    created = deals.create_deal(conn, repo=str(repo), title="две полосы и слияние", body="")
+    created = deals.create_deal(conn, repo=str(repo), title="три полосы и слияние", body="")
     clean_deal = deals.deal_row(conn, str(created["deal"]["id"]))
-    own = {"impl_a": ("a.txt", "работа полосы a\n"), "impl_b": ("b.txt", "работа полосы b\n")}
+    own = {
+        "impl_a": ("a.txt", "работа полосы a\n"),
+        "impl_b": ("b.txt", "работа полосы b\n"),
+        "impl_c": ("c.txt", "работа полосы c\n"),
+    }
     entry_run(clean_spec, clean_deal)
     for stage, (name, text) in own.items():
         lane_run(clean_spec, clean_deal, {stage: lane_act(name, text)}, stage)
@@ -505,7 +512,7 @@ def merge_scenario(
     deal_branch_before = git_optional(repo, "rev-parse", "--verify", runner.deal_branch(clean_deal))
     step(
         14,
-        "lanes   (две полосы)",
+        "lanes   (три полосы)",
         f"{clean_deal['id']} · "
         + ", ".join(f"{stage} {sha[:8]}" for stage, sha in lane_shas.items())
         + f" · ветка дела: {deal_branch_before or 'не сдвинута'}",
@@ -517,6 +524,14 @@ def merge_scenario(
     if merged.get("outcome") != "done":
         raise DemoError(f"чистое слияние не собралось: {merged.get('reason')}")
     merge_sha = str(merged.get("commit") or "")
+    # Полосы вливаются по объявлению: первая — fast-forward, каждая следующая —
+    # `--no-ff`, поэтому при трёх полосах свидетель — последний merge-коммит, а в
+    # нём предок КАЖДАЯ полоса (ancestry, а не число родителей).
+    lane_inside = [
+        stage
+        for stage, sha in lane_shas.items()
+        if git_optional(repo, "merge-base", "--is-ancestor", sha, merge_sha) == ""
+    ]
     parents = git(repo, "rev-list", "--parents", "-n", "1", merge_sha).split()
     after = next(item for item in clean_spec.stages if item.id == "gates")
     dependent_base = runner.base_of_stage(clean_spec, after, journal.read_events(conn, clean_deal["id"]))
@@ -525,24 +540,31 @@ def merge_scenario(
         15,
         "merge   (чистый fan-in)",
         f"{clean_deal['id']} · коммит {merge_sha[:8]} · родителей {len(parents) - 1} · "
-        f"a.txt+b.txt в дереве · база gates {dependent_base[:8]}",
+        f"полос в свидетеле {len(lane_inside)}/{len(lane_shas)} · "
+        f"a.txt+b.txt+c.txt в дереве · база gates {dependent_base[:8]}",
         by="engine",
     )
 
-    # 2. Конфликт: обе полосы правят один файл по-своему.
+    # 2. Конфликт: две полосы правят один файл по-своему, третья — свой.
     conflict_path = root / "conflict.yaml"
     conflict_path.write_text(merge_spec_text(repo, base), encoding="utf-8")
     conflict_spec = spec_module.load_spec(conflict_path)
-    created = deals.create_deal(conn, repo=str(repo), title="две полосы в один файл", body="")
+    created = deals.create_deal(conn, repo=str(repo), title="две полосы в один файл, третья рядом", body="")
     conflict_deal = deals.deal_row(conn, str(created["deal"]["id"]))
-    clash = {"impl_a": ("shared.txt", "строка от a\n"), "impl_b": ("shared.txt", "строка от b\n")}
+    clash = {
+        "impl_a": ("shared.txt", "строка от a\n"),
+        "impl_b": ("shared.txt", "строка от b\n"),
+        "impl_c": ("c.txt", "работа полосы c\n"),
+    }
     entry_run(conflict_spec, conflict_deal)
+    clash_shas: dict[str, str] = {}
     for stage, (name, text) in clash.items():
-        lane_run(conflict_spec, conflict_deal, {stage: lane_act(name, text)}, stage)
+        landed = lane_run(conflict_spec, conflict_deal, {stage: lane_act(name, text)}, stage)
+        clash_shas[stage] = str(landed.get("commit") or "")
     step(
         16,
         "conflict (общий файл)",
-        f"{conflict_deal['id']} · обе полосы правили shared.txt",
+        f"{conflict_deal['id']} · полосы три, a и b правили shared.txt",
     )
 
     resolver = Scripted({"join": resolver_act("строка от a\nстрока от b\n")})
@@ -568,7 +590,7 @@ def merge_scenario(
         18,
         "refused (не развёл)",
         f"{str(refused.get('kind'))} · деревья полос целы: "
-        f"{sum(1 for alive_ in alive.values() if alive_)}/2 · причина: "
+        f"{sum(1 for alive_ in alive.values() if alive_)}/{len(alive)} · причина: "
         f"{str(refused.get('reason'))[:64]}…",
         by="engine",
     )
@@ -580,13 +602,24 @@ def merge_scenario(
     resolved_parents = git(repo, "rev-list", "--parents", "-n", "1", resolved_sha).split()
     # Повтор идёт в сохранённом дереве (`tree_reused`), поэтому путь берётся из
     # отчёта попытки, а не собирается из каталога: это дерево прошлой попытки.
-    merged_text = (Path(str(resolved.get("tree") or "")) / "shared.txt").read_text(encoding="utf-8")
+    resolved_tree = Path(str(resolved.get("tree") or ""))
+    merged_text = (resolved_tree / "shared.txt").read_text(encoding="utf-8")
+    # Хвост полосы после конфликтной вливает движок: резолвер развёл пару, а
+    # третью сторону доводит то же слияние — иначе её работа терялась.
+    tail_text = (resolved_tree / "c.txt").read_text(encoding="utf-8") if (resolved_tree / "c.txt").exists() else ""
+    lane_ancestors = {}
+    for stage, lane_sha in clash_shas.items():
+        lane_ancestors[stage] = (
+            git_optional(repo, "merge-base", "--is-ancestor", lane_sha, resolved_sha) == ""
+        )
     branches_after = git(repo, "branch", "--list", "--format=%(refname:short)").splitlines()
     step(
         19,
         "resolved(обе стороны)",
         f"коммит {resolved_sha[:8]} · родителей {len(resolved_parents) - 1} · "
+        f"полос в свидетеле {sum(1 for ok in lane_ancestors.values() if ok)}/{len(lane_ancestors)} · "
         f"shared.txt: {merged_text.replace(chr(10), ' | ').strip()} · "
+        f"c.txt: {tail_text.strip() or '—'} · "
         f"ветка дела {git(repo, 'rev-parse', runner.deal_branch(conflict_deal))[:8]}",
         by="engine",
     )
@@ -597,6 +630,7 @@ def merge_scenario(
         "clean": {
             "deal": str(clean_deal["id"]),
             "lanes": lane_shas,
+            "lanes_inside": lane_inside,
             "deal_branch_before": deal_branch_before,
             "merge": merge_sha,
             "parents": parents,
@@ -604,7 +638,7 @@ def merge_scenario(
             "deal_branch": git(repo, "rev-parse", runner.deal_branch(clean_deal)),
             "files": {
                 name: (merged_tree / name).read_text(encoding="utf-8")
-                for name in ("a.txt", "b.txt")
+                for name in ("a.txt", "b.txt", "c.txt")
             },
             "order": list((_ended(conn, clean_deal["id"], "join") or {}).get("merge", {}).get("order") or ()),
         },
@@ -612,12 +646,15 @@ def merge_scenario(
             "deal": str(conflict_deal["id"]),
             "files": list(brief.get("conflict_files") or ()),
             "diffs": diffs,
+            "applied": list(brief.get("applied") or ()),
             "refused": str(refused.get("reason") or ""),
             "trees_kept": {stage: str(tree) for stage, tree in kept_trees.items()},
             "kept_at_refusal": alive,
             "merge": resolved_sha,
             "parents": resolved_parents,
             "merged_text": merged_text,
+            "tail_text": tail_text,
+            "lane_ancestors": lane_ancestors,
             "lanes_cleaned": [
                 branch
                 for branch in (runner.lane_branch(conflict_deal, stage) for stage in clash)
@@ -930,32 +967,42 @@ def run_demo(
         clean, conflict = merge_facts["clean"], merge_facts["conflict"]
         check("полоса ведёт свою ветку",
               clean["deal_branch_before"] == ""
-              and bool(clean["lanes"]["impl_a"]) and bool(clean["lanes"]["impl_b"])
-              and clean["lanes"]["impl_a"] != clean["lanes"]["impl_b"],
-              f"ветки полос {clean['lanes']['impl_a'][:8]} и {clean['lanes']['impl_b'][:8]}, "
+              and all(bool(sha) for sha in clean["lanes"].values())
+              and len(set(clean["lanes"].values())) == len(clean["lanes"]),
+              f"ветки полос {', '.join(sha[:8] for sha in clean['lanes'].values())}, "
               "ветка дела их коммитами не сдвинута")
-        check("чистое слияние — один merge-коммит",
-              len(clean["parents"]) == 3 and set(clean["parents"][1:]) == set(clean["lanes"].values()),
-              f"коммит {clean['merge'][:8]} с двумя родителями, оба файла полос в дереве")
+        check("чистое слияние — merge-коммит со всеми полосами",
+              len(clean["parents"]) >= 3
+              and set(clean["lanes_inside"]) == set(clean["lanes"])
+              and all(text for text in clean["files"].values()),
+              f"коммит {clean['merge'][:8]} с двумя и более родителями, полос в свидетеле "
+              f"{len(clean['lanes_inside'])}/{len(clean['lanes'])}, файлы "
+              f"{', '.join(sorted(clean['files']))} в дереве")
         check("зависимый этап стоит на merge-коммите",
               clean["base_of_dependent"] == clean["merge"] and clean["deal_branch"] == clean["merge"],
               "base_of_stage(gates) = merge-коммит, ветка дела на нём же")
-        check("порядок вливания — объявление", clean["order"] == ["impl_b", "impl_a"],
+        check("порядок вливания — объявление", clean["order"] == ["impl_b", "impl_a", "impl_c"],
               f"needs слияния: {', '.join(clean['order']) or '—'} (не по времени готовности)")
         check("конфликт назван файлами, полосы целы",
               "merge.conflict" in conflict["refused"] and "shared.txt" in conflict["refused"]
-              and len(conflict["kept_at_refusal"]) == 2
+              and len(conflict["kept_at_refusal"]) == 3
               and all(conflict["kept_at_refusal"].values()),
-              "отказ merge.conflict с файлом и обоими sha; деревья полос сохранены")
-        check("резолвер получил оба диффа",
-              set(conflict["diffs"]) == {"impl_a", "impl_b"}
+              "отказ merge.conflict с файлом и обоими sha; деревья всех полос сохранены")
+        check("резолвер получил дифф каждой полосы",
+              set(conflict["diffs"]) == {"impl_a", "impl_b", "impl_c"}
               and "строка от a" in conflict["diffs"]["impl_a"]
-              and "строка от b" in conflict["diffs"]["impl_b"],
-              "контракт резолвера: конфликтный файл и дифф каждой полосы")
+              and "строка от b" in conflict["diffs"]["impl_b"]
+              and conflict["applied"] == ["impl_b"],
+              "контракт резолвера: конфликтный файл, дифф каждой полосы и что уже влито")
         check("резолвер сохранил обе стороны",
               "строка от a" in conflict["merged_text"] and "строка от b" in conflict["merged_text"]
-              and len(conflict["parents"]) == 3 and len(conflict["lanes_cleaned"]) == 2,
-              "в shared.txt обе строки, merge-коммит с двумя родителями, ветки полос убраны")
+              and len(conflict["parents"]) >= 3,
+              "в shared.txt обе строки, свидетель — merge-коммит")
+        check("хвост полосы влит движком, ветки полос убраны",
+              "работа полосы c" in conflict["tail_text"]
+              and all(conflict["lane_ancestors"].values())
+              and len(conflict["lanes_cleaned"]) == 3,
+              "c.txt в слитом дереве, каждая полоса — предок свидетеля, три ветки убраны")
 
         check("rethink снял мёртвый этап",
               "extra" in removal_facts["with_extra"]

@@ -830,3 +830,33 @@ def test_removed_stage_is_absent_from_every_reader(tmp_path: Path) -> None:
     assert closed["payload"]["stages"] == ["impl", "close"]
     assert deals.deal_row(conn, str(deal["id"]))["status"] == "done"
 
+
+def test_a_cancelled_stage_does_not_block_the_close(tmp_path: Path) -> None:
+    """Отменённый лидом этап нерождённым не считается: отмена — тоже конец работы.
+
+    У отмены `pending`-этапа нет ни `attempt_started`, ни `attempt_ended`
+    (`tools.cancel`), поэтому закрытие, отказывающее на «нерождённом», требовало
+    бы невозможного: попытку по отменённому этапу не поднять. Отмена названа в
+    журнале концом работы — закрытие идёт.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    spec = write_spec(tmp_path, GOOD)
+    deal = make_deal(conn, spec)
+    append(conn, deal, [{"kind": "attempt_ended", "payload": ended("impl", summary="сделано")}])
+    planned(conn, deal, DOCS)
+
+    assert transit.unborn_stages(spec, journal.read_events(conn, str(deal["id"]))) == ("docs",)
+    tools.cancel(
+        str(deal["id"]), "docs", "работа не нужна", "cancel-docs", home=home, clock=lambda: NOW
+    )
+
+    events = journal.read_events(conn, str(deal["id"]))
+    assert transit.unborn_stages(spec, events) == ()
+    answer = tools.close(str(deal["id"]), "сделано", "approve", "close-cancelled", home=home, now=NOW)
+
+    assert answer["closed"] is True
+    closed = journal.closed_fact(journal.read_events(conn, str(deal["id"])))
+    assert closed is not None
+    assert "docs" in closed["payload"]["stages"], "отменённый этап — часть графа дела"
+

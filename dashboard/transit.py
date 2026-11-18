@@ -1168,7 +1168,7 @@ def started_stages(events: Iterable[Any]) -> frozenset[str]:
 
 
 def unborn_stages(spec: Any, events: Iterable[Any]) -> tuple[str, ...]:
-    """id нерождённых этапов графа: ни одной попытки и не каркас дела.
+    """id нерождённых этапов графа: ни одной попытки, не каркас и не отмена.
 
     Это ровно те этапы, которые план ещё может снять (`{id, remove: true}`,
     `spec._plan_remove`), а закрытие обязано назвать вместо того, чтобы выдать их
@@ -1178,13 +1178,44 @@ def unborn_stages(spec: Any, events: Iterable[Any]) -> tuple[str, ...]:
 
     Каркас (`spec.is_frame_stage`) в этот список не входит: вход и закрытие
     попыток не имеют по устройству, и «нерождённой работой» они не бывают.
+    Отменённый лидом этап (`stage_cancelled`) — тоже нет: отмена названа в
+    журнале концом работы, а `duty_start` по такому этапу не поднимается, и
+    закрытие, отказывающее на нём, требовало бы невозможного.
     """
-    started = started_stages(events)
-    view = graph_spec(spec, events)
+    events = list(events or ())
+    return unborn_of(
+        graph_spec(spec, events).stages,
+        started_stages(events),
+        cancelled_stages(events),
+    )
+
+
+def cancelled_stages(events: Iterable[Any]) -> frozenset[str]:
+    """id этапов, отменённых лидом (`stage_cancelled`): отмена — тоже конец."""
+    found: set[str] = set()
+    for event in _ordered(events):
+        if str(event.get("kind") or "") != STAGE_CANCELLED:
+            continue
+        stage_id = _payload(event).get("stage")
+        if isinstance(stage_id, str) and stage_id:
+            found.add(stage_id)
+    return frozenset(found)
+
+
+def unborn_of(
+    stages: Iterable[Any], started: Iterable[str], cancelled: Iterable[str] = ()
+) -> tuple[str, ...]:
+    """id этапов, которые так и не родились: правило одно на всех читателей.
+
+    Отдельно от `unborn_stages` — чтобы этап плана, у которого граф и начатые
+    этапы уже посчитаны, не перечитывал журнал ради того же ответа
+    (`runner.plan_payload`).
+    """
+    born = {str(item) for item in started} | {str(item) for item in cancelled}
     return tuple(
         stage.id
-        for stage in view.stages
-        if stage.id not in started and not spec_module.is_frame_stage(stage.id)
+        for stage in stages
+        if stage.id not in born and not spec_module.is_frame_stage(stage.id)
     )
 
 

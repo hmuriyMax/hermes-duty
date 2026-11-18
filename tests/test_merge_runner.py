@@ -582,6 +582,9 @@ def test_the_conflict_state_is_reused_by_the_retry(tmp_path: Path) -> None:
     report = runner.run_stage(conn, spec, deal, "join", 2, home=home, spawn=retry, clock=lambda: NOW)
     assert report["outcome"] == "done", report
     assert retry.contracts[0]["merge"]["conflict_files"] == ["shared.txt"]
+    # Что уже влито до столкновения, резолвер видит по ancestry, а не по пустому
+    # списку: порядок `impl_b, impl_a`, конфликт на второй — влита первая.
+    assert retry.contracts[0]["merge"]["applied"] == ["impl_b"]
 
 
 # ------------------------------------- 5. порядок слияния детерминирован
@@ -724,3 +727,209 @@ def test_a_tester_after_the_merge_silences_the_warning(tmp_path: Path) -> None:
     merge = merge_stage_of()
     gates = spec_module.Stage(id="gates", role="tester", workspace="worktree", needs=("join",))
     assert "plan.merge.gates" not in warnings_of([merge, gates])
+
+
+# ------------------------- 8. три полосы: конфликт не на последней не теряет хвост
+
+
+def three_lanes_spec(tmp_path: Path, repo: Path) -> Any:
+    """Спека трёх полос: порядок объявления — `impl_a`, `impl_b`, `impl_c`.
+
+    Полосы правят один файл у первых двух и свой у третьей — так конфликт
+    случается на средней полосе, а хвост остаётся невлитым, если движок считает
+    слияние собранным по одному конфликту.
+    """
+    return write_spec(
+        tmp_path,
+        f"""
+        duty: lanes-three
+        repo: {repo}
+        base: HEAD
+        stages:
+          - id: impl_a
+            role: implementer
+            workspace: worktree
+            parallel_with: [impl_b, impl_c]
+          - id: impl_b
+            role: implementer
+            workspace: worktree
+            parallel_with: [impl_a, impl_c]
+          - id: impl_c
+            role: implementer
+            workspace: worktree
+            parallel_with: [impl_a, impl_b]
+          - id: join
+            kind: merge
+            needs: [impl_a, impl_b, impl_c]
+            workspace: worktree
+          - id: gates
+            role: tester
+            workspace: worktree
+            needs: [join]
+        """,
+    )
+
+
+def test_a_conflict_on_the_middle_lane_still_merges_the_tail(tmp_path: Path) -> None:
+    """Конфликт на средней полосе не теряет хвост: все три коммита в свидетеле.
+
+    Вливание идёт по порядку `needs`, и резолвер собирал только конфликтную пару.
+    Полоса, стоящая после конфликтной, оставалась невлитой, а её ветка удалялась
+    как «влитая» — работа третьей стороны пропадала (находка ревью на трёх
+    полосах). Хвост доводит движок: свидетель — коммит, где предок КАЖДАЯ полоса.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    repo = git_repo(tmp_path)
+    spec = three_lanes_spec(tmp_path, repo)
+    sha_a = lane_run(conn, spec, deal, home, "impl_a", "shared.txt", "from a\n")
+    sha_b = lane_run(conn, spec, deal, home, "impl_b", "shared.txt", "from b\n")
+    sha_c = lane_run(conn, spec, deal, home, "impl_c", "c.txt", "from c\n")
+
+    resolver = Resolver()
+    report = runner.run_stage(conn, spec, deal, "join", 1, home=home, spawn=resolver, clock=lambda: NOW)
+    assert report["outcome"] == "done", json.dumps(report, ensure_ascii=False)
+    merge = resolver.contracts[0]["merge"]
+    assert merge["order"] == ["impl_a", "impl_b", "impl_c"], "порядок объявления"
+    assert merge["conflict_files"] == ["shared.txt"]
+    assert merge["applied"] == ["impl_a"], "резолвер видит, что уже влито до столкновения"
+
+    witness = str(report["commit"])
+    for sha, lane in ((sha_a, "impl_a"), (sha_b, "impl_b"), (sha_c, "impl_c")):
+        assert git(repo, "merge-base", "--is-ancestor", sha, witness) == "", (
+            f"работа полосы {lane} не в свидетеле"
+        )
+    parents = git(repo, "rev-list", "--parents", "-n", "1", witness).split()
+    assert len(parents) >= 3, f"свидетель — merge-коммит: {parents}"
+
+    merged_tree = tree_of(home, deal, "join")
+    assert (merged_tree / "shared.txt").read_text(encoding="utf-8") == "from a and from b\n"
+    assert (merged_tree / "c.txt").read_text(encoding="utf-8") == "from c\n", "хвост влит"
+
+    details = ended_of(conn, deal, "join")["details"]["merge"]
+    assert details["order"] == ["impl_a", "impl_b", "impl_c"]
+    assert len(details["cleaned"]) == 3 and not details["kept"], details
+    branches = git(repo, "branch", "--list", "--format=%(refname:short)").splitlines()
+    for lane in ("impl_a", "impl_b", "impl_c"):
+        assert runner.lane_branch(deal, lane) not in branches, f"ветка {lane} убрана после слияния"
+
+
+def test_a_report_that_forgets_the_tail_lane_is_refused(tmp_path: Path) -> None:
+    """Отчёт, забывший полосу за конфликтной, — `merge.dropped`, а не зелёный пакет.
+
+    Хвост влит движком, но отчёт обязан назвать КАЖДУЮ полосу: иначе «вошла
+    молча» и «потеряна» неотличимы, и обещанию отчёта нельзя верить на слово.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    repo = git_repo(tmp_path)
+    spec = three_lanes_spec(tmp_path, repo)
+    sha_a = lane_run(conn, spec, deal, home, "impl_a", "shared.txt", "from a\n")
+    sha_b = lane_run(conn, spec, deal, home, "impl_b", "shared.txt", "from b\n")
+    sha_c = lane_run(conn, spec, deal, home, "impl_c", "c.txt", "from c\n")
+
+    resolver = Resolver(
+        sides=[
+            {"lane": "impl_a", "sha": sha_a, "intent": "свой файл", "joined": "влит"},
+            {"lane": "impl_b", "sha": sha_b, "intent": "свой файл", "joined": "влит"},
+        ]
+    )
+    report = runner.run_stage(conn, spec, deal, "join", 1, home=home, spawn=resolver, clock=lambda: NOW)
+    assert report["outcome"] == "failed", report
+    assert report["kind"] == "contract"
+    assert evidence_module.RULE_MERGE_DROPPED in str(report["reason"]), report["reason"]
+    assert "impl_c" in str(report["reason"])
+    assert sha_c  # полоса не выдумана тестом: её коммит назван выше
+
+    branches = git(repo, "branch", "--list", "--format=%(refname:short)").splitlines()
+    assert runner.lane_branch(deal, "impl_c") in branches, "ветка невлитой полосы сохранена"
+    assert tree_of(home, deal, "impl_c").is_dir(), "дерево невлитой полосы сохранено"
+
+
+def test_the_tail_lane_that_conflicts_too_keeps_every_tree(tmp_path: Path) -> None:
+    """Хвост, который тоже конфликтует, — отказ с файлами, все деревья полос целы.
+
+    Резолвер развёл пару, но следующая полоса правит тот же файл: движок называет
+    новый конфликт и НЕ убирает ни одной полосы — в каждой лежит работа стороны.
+    """
+    home = make_home(tmp_path)
+    conn = open_store(home)
+    deal = make_deal(conn)
+    repo = git_repo(tmp_path)
+    spec = three_lanes_spec(tmp_path, repo)
+    lane_run(conn, spec, deal, home, "impl_a", "shared.txt", "from a\n")
+    lane_run(conn, spec, deal, home, "impl_b", "shared.txt", "from b\n")
+    lane_run(conn, spec, deal, home, "impl_c", "shared.txt", "from c\n")
+
+    report = runner.run_stage(conn, spec, deal, "join", 1, home=home, spawn=Resolver(), clock=lambda: NOW)
+    assert report["outcome"] == "failed", report
+    assert report["kind"] == "contract"
+    assert evidence_module.RULE_MERGE_CONFLICT in str(report["reason"]), report["reason"]
+    assert "shared.txt" in str(report["reason"])
+    details = ended_of(conn, deal, "join")["details"]["merge"]
+    assert not details["cleaned"] and details["kept"] == [], "уборки не было вовсе"
+    branches = git(repo, "branch", "--list", "--format=%(refname:short)").splitlines()
+    for lane in ("impl_a", "impl_b", "impl_c"):
+        assert runner.lane_branch(deal, lane) in branches, f"ветка {lane} сохранена"
+        assert tree_of(home, deal, lane).is_dir(), f"дерево {lane} сохранено"
+
+
+def test_a_lane_outside_the_witness_is_a_dropped_side(tmp_path: Path) -> None:
+    """Полоса, чей коммит не предок свидетеля, — `merge.dropped` при двух родителях.
+
+    Число родителей отвечает «это merge-коммит», а не «вошли все полосы»: отчёт
+    «все три влиты» + два родителя проходил зелёным, и потерянная сторона
+    считалась слитой. Ancestry — единственная проверка, отличающая «вошла» от
+    «названа».
+    """
+    repo = git_repo(tmp_path)
+    base = git(repo, "rev-parse", "HEAD")
+    lanes: list[str] = []
+    for name in ("a", "b", "c"):
+        git(repo, "checkout", "-q", "-b", f"lane_{name}", base)
+        (repo / f"{name}.txt").write_text(f"from {name}\n", encoding="utf-8")
+        git(repo, "add", ".")
+        git(repo, "commit", "-qm", f"lane {name}")
+        lanes.append(git(repo, "rev-parse", "HEAD"))
+    # Свидетель — слияние двух полос из трёх: третья осталась за бортом.
+    git(repo, "checkout", "-q", "lane_a")
+    git(repo, "merge", "--no-ff", "--no-edit", "-qm", "join two", lanes[1])
+    commit = git(repo, "rev-parse", "HEAD")
+    brief = {
+        "base": lanes[0],
+        "conflict_files": [],
+        "applied": [],
+        "lanes": [
+            {"lane": "impl_a", "sha": lanes[0], "branch": "b", "tree": None, "diff": ""},
+            {"lane": "impl_b", "sha": lanes[1], "branch": "b", "tree": None, "diff": ""},
+            {"lane": "impl_c", "sha": lanes[2], "branch": "b", "tree": None, "diff": ""},
+        ],
+    }
+    result = {
+        "status": "done",
+        "commit": commit,
+        "summary": "слито",
+        "evidence": [],
+        "merge": {
+            "files": [],
+            "sides": [
+                {"lane": f"impl_{name}", "sha": sha, "intent": "свой файл", "joined": "влит"}
+                for name, sha in zip("abc", lanes)
+            ],
+        },
+    }
+    verdict = evidence_module.verify(
+        result,
+        merge_stage_of(("impl_a", "impl_b", "impl_c")),
+        tmp_path,
+        attempt_started_at=NOW,
+        now=NOW,
+        root=repo,
+        base=lanes[0],
+        merge_brief=brief,
+    )
+    assert not verdict.ok, verdict.details
+    assert evidence_module.RULE_MERGE_DROPPED in verdict.reason(), verdict.reason()
+    assert "impl_c" in verdict.reason()

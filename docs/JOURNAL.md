@@ -563,7 +563,7 @@ approved_commit}`.
 не контракт, а ловушка. Требуемый свидетель (`required_for_done`) берётся из той же
 функции, что и проверка, — `evidence.witness(stage)`: `commit|artifacts` у обычного
 этапа, `verdict` у этапа с приговором, `published` у публикующего, `plan` у этапа
-плана и `report` у роли-отчёта (`tester`, роли без терминала) — `docs/SPEC.md`,
+плана и `report` у роли-отчёта (`spec.EVIDENCE_FREE_ROLES` + `tester`) — `docs/SPEC.md`,
 «Свидетель этапа»).
 
 Принятый свидетель называется в самом факте: `attempt_ended.details.witness`

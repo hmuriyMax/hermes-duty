@@ -207,7 +207,7 @@ bin/duty review d_<hex> --reviewer reviewer
 bin/duty changes d_<hex> "вернул: нет теста"
 bin/duty complete d_<hex> --summary "готово"
 bin/duty attach d_<hex> ./report.md   # копия ляжет в duty/attachments/<deal_id>/
-bin/duty archive d_<hex>              # PATCH {status: archived}
+bin/duty archive d_<hex> [--reason "…"]   # PATCH {status: archived}; причина — в факт закрытия
 ```
 
 Коды возврата: `0` — ответ получен и `errors[]` пуст; `1` — дела нет; `2` —
@@ -582,7 +582,7 @@ sqlite3 "file:$HOME/.hermes/duty/duty.db?mode=ro" \
 | человек **решил продолжать** | `bin/duty decide <дело> continue` | `unblocked` со `previous_kind='parked'`, этап → `pending`, счётчики класса сброшены |
 | человек **решил остановить** | `bin/duty decide <дело> stop` | `completed` с `cause='stopped_by_human'`, `reason` — текст ответа человека; дело закрыто |
 | человек **решил остановить бегущее дело**, у которого нет живого драйвера (нет лизинга или срок истёк) | `bin/duty decide <дело> stop` | `completed` с `cause='stopped_by_human'` и снятый протухший лизинг — одной транзакцией |
-| человек **отклонил предложение** (дело, запаркованное `--park-kind proposal`) | `bin/duty decide <дело> stop` или `bin/duty archive <дело>` | `completed` со `status="archived"` — тот же факт у обеих команд: у предложения работы не было, и `stopped_by_human` («работу оборвали») здесь был бы неверным фактом |
+| человек **отклонил предложение** (дело, запаркованное `--park-kind proposal`) | `bin/duty decide <дело> stop` или `bin/duty archive <дело> --reason "…"` | `completed` со `status="archived"` — тот же факт у обеих команд: у предложения работы не было, и `stopped_by_human` («работу оборвали») здесь был бы неверным фактом. Причина не выдумывается: `cause='rejected_by_human'`, `reason` — слова человека (мост кладёт туда `отклонено человеком из пула #<qid>: <ответ>`), и `duty deals` показывает их колонкой «РЕШЕНИЕ» |
 | дело закрывают **не решением**, а «так вышло» | `bin/duty close <дело> --reason "…"` | `completed` с `cause='closed_by_human'` |
 
 `stop` на `running` разрешён ровно тогда, когда работу **некому вести**: строки

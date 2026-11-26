@@ -397,7 +397,7 @@ HERMES_HOME=~/.hermes ~/.hermes/plugins/hermes-duty/bin/duty now
 | `duty review d_… [--reviewer …] [--summary …]` | сдать в ревью |
 | `duty changes d_… "причина" [--reviewer …]` | вернуть на доработку |
 | `duty attach d_… FILE` | приложить файл (копия в `duty/attachments/<deal_id>/`) |
-| `duty archive d_…` | `PATCH {status: archived}` — архив назван командой |
+| `duty archive d_… [--reason "…"]` | `PATCH {status: archived}` — архив назван командой; причина ложится в факт закрытия (`cause='rejected_by_human'`, `reason` — слова человека) |
 | `bin/duty-version check` / `bump X.Y.Z` / `finalize [--push]` | версия плагина по контракту `docs/VERSIONING.md`: `check` сверяет три файла и ветку с номером, `bump` ставит номер везде (плюс `CHANGELOG`), `finalize` без `--push` только печатает план (ff `main` → tip рабочей ветки, тег `vX.Y.Z`, push) |
 
 `duty demo` — не роут, а прогон модели труда: одна команда проходит дело от создания

@@ -2309,6 +2309,7 @@ const CLOSE_CAUSE_WORD = {
   lead_closed: 'закрыто лидом',
   closed_by_human: 'закрыто человеком',
   stopped_by_human: 'остановлено человеком',
+  rejected_by_human: 'отклонено человеком',
 }
 
 /**

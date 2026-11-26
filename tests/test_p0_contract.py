@@ -296,6 +296,10 @@ DEALS_KEYS = {
     "deals[].finished_at",
     "deals[].duration_sec",
     "deals[].cause",
+    # Слова решения человека из того же факта закрытия: у отказа причиной
+    # (`rejected_by_human`) «что решил человек» не восстанавливается — текст и
+    # номер вопроса живут только здесь.
+    "deals[].reason",
     "deals[].stages",
     "deals[].attempts",
     "deals[].questions",

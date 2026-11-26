@@ -1269,6 +1269,12 @@ def test_archive_records_the_reason_in_the_closed_fact(home, frozen_now, capsys)
     assert payload == {"status": "archived", "cause": "rejected_by_human", "reason": words}
     assert deal_status(home, deal_id) == "archived"
 
+    # Карточка дела называет слова человека рядом с причиной закрытия: без них
+    # «отклонено человеком» не отвечает на «почему отказались».
+    code, card, _ = run(["deal", deal_id], capsys)
+    assert code == cli.EXIT_OK
+    assert f"причина: {words}" in card
+
 
 def test_deals_row_shows_the_decision_words(home, frozen_now, capsys):
     """Строка «Завершённых» называет решение человека, а не только класс отказа."""

@@ -2388,8 +2388,14 @@ function markerBody(type, event) {
   }
   if (type === 'closed') {
     const cause = CLOSE_CAUSE_WORD[String(e.cause || '')] || String(e.cause || '')
+    // Слова человека — из того же факта: у отказа (`rejected_by_human`) класс
+    // отвечает «кто решил», а «что сказал человек» (в пуле — вместе с номером
+    // вопроса) без них не восстановить, и подпись объясняла отказ догадкой.
+    const said = String(e.reason || '')
     const stages = Array.isArray(e.stages) ? e.stages.filter(Boolean).map(String) : []
-    return [cause, stages.length ? `этапы: ${stages.join(' → ')}` : ''].filter(Boolean).join(' · ')
+    return [cause, said ? `«${said}»` : '', stages.length ? `этапы: ${stages.join(' → ')}` : '']
+      .filter(Boolean)
+      .join(' · ')
   }
   // `summary` приговора и отказа по бюджету — уже фраза движка, а не JSON;
   // JSON-выжимку в подсказку не пускаем: это телеметрия.

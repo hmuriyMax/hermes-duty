@@ -1166,6 +1166,10 @@ def _timeline(
         elif kind == "completed":
             row["cause"] = payload.get("cause")
             row["stages"] = payload.get("stages")
+            # Слова человека — часть того же факта: у отказа (`rejected_by_human`)
+            # класс причины отвечает «кто решил», а «что человек сказал» есть
+            # только здесь, и без него карточка дела объясняла отказ догадкой.
+            row["reason"] = payload.get("reason") or None
         if home is not None and kind in ("question_asked", "question_answered"):
             text = ask.exchange_of(home, payload.get("question_id"))
             if text.get("question"):

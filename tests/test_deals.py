@@ -495,6 +495,32 @@ def test_archive_records_the_refusal_class_and_the_human_words(
             assert kinds(home, deal["id"]) == ["created", "completed"]
 
 
+def test_reason_without_archiving_is_refused(
+    home: Path, client: TestClient, subtests: pytest.Subtests
+) -> None:
+    """Причина у правки без архивации — ошибка, а не молча потерянное поле.
+
+    `cause`/`reason` описывают отказ, а не поля спецификации: правка `title` с
+    причиной не записала бы её никуда, и ответ «получилось» читался бы как
+    «причина сохранена». Дело при этом не меняется вовсе.
+    """
+    cases = [
+        {"name": "words", "patch": {"title": "новое", "reason": "не надо"}},
+        {"name": "class", "patch": {"title": "новое", "cause": "rejected_by_human"}},
+    ]
+    for case in cases:
+        with subtests.test(case["name"]):
+            deal = create(client)
+
+            refused = client.patch(f"/deals/{deal['id']}", json=case["patch"])
+
+            assert refused.status_code == 400
+            assert "status=archived" in refused.json()["errors"][0]["reason"]
+            assert kinds(home, deal["id"]) == ["created"]
+            # Правка не применилась: у дела прежний заголовок.
+            assert deal_rows(home)[0]["title"] == deal["title"]
+
+
 def test_create_with_unknown_parent_is_error_not_500(home: Path, client: TestClient) -> None:
     """Несуществующий родитель — `errors[]` и 400, а не падение роута."""
     response = client.post("/deals", json={"repo": BOARD, "title": "ребёнок", "parents": ["d_deadbeef"]})

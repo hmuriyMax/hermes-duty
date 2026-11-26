@@ -1957,6 +1957,28 @@ test('маркеры называют вопрос, ответ и причину
   assert.match(scale.waitSpans[0].title, /ждал человека — «Код корректен/)
 })
 
+test('маркер отказа называет слова человека из того же факта закрытия', () => {
+  // Красная проба: подпись «отклонено человеком» без текста — причина отказа
+  // снова догадка. Слова (в пуле — вместе с номером вопроса) живут в `reason`
+  // того же `completed`, и маркер обязан их назвать.
+  const detail = {
+    terminal: true,
+    timeline: [
+      {
+        kind: 'completed',
+        at: 2000,
+        summary: '{"status": "archived", "cause": "rejected_by_human"}',
+        cause: 'rejected_by_human',
+        reason: 'отклонено человеком из пула #651: Отклонить',
+        stages: [],
+      },
+    ],
+  }
+  const scale = shapeDealTime(detail, { attempts: [] })
+  const [closed] = scale.markers
+  assert.match(closed.title, /закрыто — отклонено человеком · «отклонено человеком из пула #651: Отклонить»/)
+})
+
 test('шкала времени: событие без маркера — не маркер (телеметрия попытки не считается)', () => {
   const quiet = shapeDealTime(
     { now: 2000, terminal: true, timeline: [{ kind: 'attempt_progress', at: 1500, summary: 'tool_use' }] },

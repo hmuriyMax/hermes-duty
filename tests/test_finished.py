@@ -263,6 +263,10 @@ def test_finished_archived_deal_carries_the_refusal_words(client: TestClient, ho
     assert row["reason"] == words
     assert detail["closed"]["cause"] == deals.CLOSE_CAUSE_REJECTED
     assert detail["closed"]["reason"] == words
+    # Лента карточки несёт те же слова: маркер закрытия рисуется из неё, и без
+    # `reason` в событии подпись объясняла отказ одним классом.
+    closed_event = next(event for event in detail["timeline"] if event["kind"] == "completed")
+    assert closed_event["reason"] == words
 
 
 def test_finished_archived_deal_has_no_invented_cause(client: TestClient, home: Path) -> None:

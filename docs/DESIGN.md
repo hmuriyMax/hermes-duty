@@ -102,11 +102,11 @@ desktop-страница `/duty` (внутренний роут приложен
 | `GET /now?repo=<path>&state=<waiting.state>` | срез «сейчас» (форма ниже); у дела — `stage {id, role, attempt, state, live, since}` из журнала (`null`, если попыток не было) | 400 — состояние не из таксономии или `?board=`; неизвестный `repo` — 200 с пустым срезом |
 | `GET /duty/{deal_id}/attempts` | таймлайн попыток дела | 400 — id не `d_<hex>`; 404 — дела нет; 503 — store не читается |
 | `GET /deal/{deal_id}?spec=<путь>` | одно дело: спецификация + факты `/now`, `comments[]`, `attachments[]`, `timeline[]`, лента этапов `stages[]` + `stages_note` + `spec` | 400 — `t_<hex>` или битый id; 404 — дела нет; 503 — store не читается |
-| `GET /deals?status=done,archived&repo=<path>&limit=<N>` | завершённые дела: `{now, statuses, count, total, limit, truncated, note, errors, deals[]}`; строка — `id`, `repo`, `title`, `assignee`, `status`, `created_at`, `finished_at`, `duration_sec`, `cause`, `stages`, `attempts`, `questions {asked, answered, waiting}`, `published` (0.0.7) | 400 — `?status=` не из `done,archived`, `?board=`, `limit` вне 1…500; неизвестный `repo` — 200 с пустым списком и `note`; store не читается — 200 с `errors[]` и `note` |
+| `GET /deals?status=done,archived&repo=<path>&limit=<N>` | завершённые дела: `{now, statuses, count, total, limit, truncated, note, errors, deals[]}`; строка — `id`, `repo`, `title`, `assignee`, `status`, `created_at`, `finished_at`, `duration_sec`, `cause`, `reason`, `stages`, `attempts`, `questions {asked, answered, waiting}`, `published` (0.0.7) | 400 — `?status=` не из `done,archived`, `?board=`, `limit` вне 1…500; неизвестный `repo` — 200 с пустым списком и `note`; store не читается — 200 с `errors[]` и `note` |
 | `GET /stats?repo=<path>&since=<unix>` | здоровье дел: `first_try` (доля этапов с первой попытки), `stages` (знаменатель), `waiting_human_sec` и `waiting_sec` (p50/p90/p99, `count`, `max`), `contract_refusals` (число и по правилу), `tokens`, `attempts_by_outcome`/`attempts_by_class`, `deals_by_status`; окно по умолчанию сутки, `?repo=` — один репозиторий, `?since=` — граница окна. Карточек kanban в ответе нет ни одним полем: они живут только в `GET /cards` | 400 — `?board=`; неизвестный `repo` — 200 с пустым результатом; деградация — в `errors[]`/`warnings[]` |
 | `POST /ask/{deal_id}` | вопрос по делу в пул: `{question_id, created, deduped, adopted, errors[]}` | 400 — битый id, пустой `text`/кривые `options`; 404 — дела нет; 503 — пул или журнал недоступны |
 | `POST /deals` | завести своё дело (`status=todo`): `{repo?, title, body?, assignee?, parents?[], spec?, external_ref?, dedup_window?}` | 400 — вход не тот (в том числе `board`); 503 — store не открылся |
-| `PATCH /deals/{id}` | спецификация (`title`/`body`/`assignee`) либо `{status: archived}` | 404 — дела нет; 400 — смена статуса мимо команды или попытка поправить `repo` |
+| `PATCH /deals/{id}` | спецификация (`title`/`body`/`assignee`) либо `{status: archived, cause?, reason?}` — `cause`/`reason` кладутся в факт закрытия (`completed`) и только вместе с архивацией | 404 — дела нет; 400 — смена статуса мимо команды, попытка поправить `repo`, `cause`/`reason` без `status=archived`, переписать причину уже архивного дела |
 | `POST /deals/{id}/comment` | комментарий: `{author, body}` | 404 — дела нет; 400 — пустой `body` |
 | `POST /deals/{id}/block` | блокировка: `{kind, reason}` | 404 — дела нет; 400 — архивное дело |
 | `POST /deals/{id}/unblock` | снять блокировку | 404 — дела нет; 400 — архивное дело |
@@ -582,6 +582,7 @@ failures.classify → policy → decide_park
     "finished_at": 1793693900,              // факт `completed` из журнала; null — закрытия не записано
     "duration_sec": 900,                    // ось журнала, как у шкалы времени карточки дела
     "cause": "all_stages_done",             // причина закрытия; "" — не записана (архивация)
+    "reason": "",                           // слова человека из того же факта: у отказа — с номером вопроса
     "stages": ["impl", "review"],           // пройденный граф из `completed`; [] — не записан
     "attempts": 2,                          // `stagefeed.attempts` — те же строки, что у таймлайна
     "questions": { "asked": 2, "answered": 1, "waiting": 1 },

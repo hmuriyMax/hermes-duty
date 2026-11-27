@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 # Пакета у `dashboard/` нет (плагин грузит модули по пути), поэтому обработчики
 # берём тем же способом и под стабильным именем: второй загрузки в процессе не

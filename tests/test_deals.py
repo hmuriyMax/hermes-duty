@@ -386,18 +386,36 @@ def test_decide_stop_archives_a_proposal_and_completes_an_ordinary_deal(
     У предложения работы не было: человек сказал «идеи не будет», и это архив
     (`completed` со `status="archived"` — тот же факт, что пишет `duty archive`).
     Обычное запаркованное дело на `stop` по-прежнему закрывается `completed` с
-    `cause='stopped_by_human'`: там останавливают начатую работу.
+    `cause='stopped_by_human'`: там останавливают начатую работу. Отказ несёт и
+    слова человека, и класс `rejected_by_human`: архив без них не отличался от
+    уборки, и «почему предложение отклонено» не восстанавливалось (живой случай:
+    56 архивных дел без `cause`).
     """
     cases = [
         {
             "name": "proposal",
             "park": {"park_kind": "proposal", "park_reason": "предложение"},
+            "decision": {"decision": "stop", "reason": "не надо"},
             "want_status": "archived",
-            "want_completed": {"status": "archived"},
+            "want_completed": {
+                "status": "archived",
+                "cause": "rejected_by_human",
+                "reason": "не надо",
+            },
+        },
+        {
+            "name": "proposal without words",
+            "park": {"park_kind": "proposal", "park_reason": "предложение"},
+            "decision": {"decision": "stop"},
+            "want_status": "archived",
+            # Причина не названа — и поля причины в факте нет: пустая строка
+            # вместо «человек сказал пустоту».
+            "want_completed": {"status": "archived", "cause": "rejected_by_human"},
         },
         {
             "name": "ordinary",
             "park": {"kind": "needs_input", "reason": "нужен человек"},
+            "decision": {"decision": "stop"},
             "want_status": "done",
             "want_completed": {"cause": "stopped_by_human", "reason": ""},
         },
@@ -410,13 +428,132 @@ def test_decide_stop_archives_a_proposal_and_completes_an_ordinary_deal(
             assert deal["status"] == "blocked"
 
             stopped = mutate(client, "POST", f"/deals/{deal['id']}/decide",
-                             json={"decision": "stop"})
+                             json=case["decision"])
 
             assert stopped["status"] == case["want_status"]
             assert kinds(home, deal["id"]) == ["created", "blocked", "completed"]
             payload = events(home, deal["id"])[-1]["payload"]
-            assert {key: payload.get(key) for key in case["want_completed"]} == case["want_completed"]
+            assert case["want_completed"].items() <= payload.items()
             assert deal["id"] not in now_deals(client)
+
+
+def test_archive_records_the_refusal_class_and_the_human_words(
+    home: Path, client: TestClient, subtests: pytest.Subtests
+) -> None:
+    """`archive` без причины и с причиной — два разных факта; отказ не переписывается.
+
+    Причина ложится в тот же `completed`, что у `decide stop`: класс
+    (`cause='rejected_by_human'`, когда причина названа) отвечает «кто решил»,
+    текст (`reason`) — «что человек сказал». Оба поля необязательны: уборка без
+    слов по-прежнему даёт `{"status": "archived"}` — история старых 56 дел не
+    переписывается. Повтор тех же слов — идемпотентность, другие слова —
+    отказ: закрытие уже записано, и молча переписать его нельзя.
+    """
+    cases = [
+        {
+            "name": "with words",
+            "patch": {"status": "archived", "reason": "отклонено человеком из пула #651: Отклонить"},
+            "want_payload": {
+                "status": "archived",
+                "cause": "rejected_by_human",
+                "reason": "отклонено человеком из пула #651: Отклонить",
+            },
+            "want_events": 1,
+        },
+        {
+            "name": "explicit class",
+            "patch": {"status": "archived", "cause": "tidy_up", "reason": "уборка"},
+            "want_payload": {"status": "archived", "cause": "tidy_up", "reason": "уборка"},
+            "want_events": 1,
+        },
+        {
+            "name": "without words",
+            "patch": {"status": "archived"},
+            "want_payload": {"status": "archived"},
+            "want_events": 1,
+        },
+    ]
+    for case in cases:
+        with subtests.test(case["name"]):
+            deal = create(client)
+            archived = mutate(client, "PATCH", f"/deals/{deal['id']}", json=case["patch"])
+
+            assert archived["status"] == "archived"
+            assert archived["mutation"] == {"events": case["want_events"], "idempotent": False}
+            assert kinds(home, deal["id"]) == ["created", "completed"]
+            assert events(home, deal["id"])[-1]["payload"] == case["want_payload"]
+
+            # Повтор тех же слов — не второй факт; другие слова — отказ, а не
+            # переписанная история.
+            assert mutate(
+                client, "PATCH", f"/deals/{deal['id']}", json=case["patch"]
+            )["mutation"] == {"events": 0, "idempotent": True}
+            other = dict(case["patch"], reason="другие слова")
+            refused = client.patch(f"/deals/{deal['id']}", json=other)
+            assert refused.status_code == 400
+            assert "причину отказа не переписываем" in refused.json()["errors"][0]["reason"]
+            # Повтор архивации с полем спецификации — тоже отказ: он пишет 0
+            # событий, и заголовок из той же правки потерялся бы молча.
+            mixed = client.patch(
+                f"/deals/{deal['id']}", json=dict(case["patch"], title="новое")
+            )
+            assert mixed.status_code == 400
+            assert "не применяет поля (title)" in mixed.json()["errors"][0]["reason"]
+            listed = next(
+                item for item in client.get("/deals").json()["deals"] if item["id"] == deal["id"]
+            )
+            assert listed["title"] == "своё дело"
+            assert kinds(home, deal["id"]) == ["created", "completed"]
+
+
+def test_archive_with_spec_fields_applies_them_on_a_live_deal(
+    home: Path, client: TestClient
+) -> None:
+    """Отказ у повтора архивации не режет первый архив с полями спецификации.
+
+    `{status: archived, title: …}` на неархивном деле — один `completed`, и
+    `title` из той же правки применяется: иначе 400 у повтора (дело уже
+    archived) молча отрезал бы законную правку.
+    """
+    deal = create(client)
+    archived = mutate(
+        client, "PATCH", f"/deals/{deal['id']}", json={"status": "archived", "title": "новое"}
+    )
+
+    assert archived["status"] == "archived"
+    assert archived["mutation"] == {"events": 1, "idempotent": False}
+    assert kinds(home, deal["id"]) == ["created", "completed"]
+    assert events(home, deal["id"])[-1]["payload"] == {"status": "archived"}
+    listed = next(
+        item for item in client.get("/deals").json()["deals"] if item["id"] == deal["id"]
+    )
+    assert listed["title"] == "новое"
+
+
+def test_reason_without_archiving_is_refused(
+    home: Path, client: TestClient, subtests: pytest.Subtests
+) -> None:
+    """Причина у правки без архивации — ошибка, а не молча потерянное поле.
+
+    `cause`/`reason` описывают отказ, а не поля спецификации: правка `title` с
+    причиной не записала бы её никуда, и ответ «получилось» читался бы как
+    «причина сохранена». Дело при этом не меняется вовсе.
+    """
+    cases = [
+        {"name": "words", "patch": {"title": "новое", "reason": "не надо"}},
+        {"name": "class", "patch": {"title": "новое", "cause": "rejected_by_human"}},
+    ]
+    for case in cases:
+        with subtests.test(case["name"]):
+            deal = create(client)
+
+            refused = client.patch(f"/deals/{deal['id']}", json=case["patch"])
+
+            assert refused.status_code == 400
+            assert "status=archived" in refused.json()["errors"][0]["reason"]
+            assert kinds(home, deal["id"]) == ["created"]
+            # Правка не применилась: у дела прежний заголовок.
+            assert deal_rows(home)[0]["title"] == deal["title"]
 
 
 def test_create_with_unknown_parent_is_error_not_500(home: Path, client: TestClient) -> None:

@@ -237,6 +237,38 @@ def test_finished_lists_closed_deals_newest_first(client: TestClient, home: Path
     assert body["deals"][0]["repo"] == "other-repo"
 
 
+def test_finished_archived_deal_carries_the_refusal_words(client: TestClient, home: Path) -> None:
+    """Архив с причиной: класс отказа и слова человека — в строке и в карточке.
+
+    Отказ по предложению пишется архивацией, и без этих двух полей «почему
+    отклонено» не восстанавливается: `rejected_by_human` отвечает «кто решил»,
+    `reason` — «что человек сказал» (номер вопроса в тексте).
+    """
+    words = "отклонено человеком из пула #651: Отклонить"
+    deal_id = make_deal(home, created_at=NOW - 400)
+    conn = store(home)
+    try:
+        deals.patch_deal(
+            conn, deal_id, status="archived", cause=deals.CLOSE_CAUSE_REJECTED,
+            reason=words, source="cli", now=NOW - 100,
+        )
+    finally:
+        conn.close()
+
+    row = rows_of(client)[0]
+    detail = plugin_api.deal(deal_id)
+
+    assert row["status"] == "archived"
+    assert row["cause"] == deals.CLOSE_CAUSE_REJECTED
+    assert row["reason"] == words
+    assert detail["closed"]["cause"] == deals.CLOSE_CAUSE_REJECTED
+    assert detail["closed"]["reason"] == words
+    # Лента карточки несёт те же слова: маркер закрытия рисуется из неё, и без
+    # `reason` в событии подпись объясняла отказ одним классом.
+    closed_event = next(event for event in detail["timeline"] if event["kind"] == "completed")
+    assert closed_event["reason"] == words
+
+
 def test_finished_archived_deal_has_no_invented_cause(client: TestClient, home: Path) -> None:
     """У архивного дела причины нет: пустая строка честнее придуманной."""
     deal_id = make_deal(home)
@@ -247,6 +279,7 @@ def test_finished_archived_deal_has_no_invented_cause(client: TestClient, home: 
     assert row["status"] == "archived"
     assert row["finished_at"] == NOW - 100
     assert row["cause"] == ""
+    assert row["reason"] == ""
     assert row["stages"] == []
     # Архивация пишется тем же `completed`: время закрытия — факт журнала.
     assert row["attempts"] == 0

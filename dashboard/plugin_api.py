@@ -1166,6 +1166,10 @@ def _timeline(
         elif kind == "completed":
             row["cause"] = payload.get("cause")
             row["stages"] = payload.get("stages")
+            # Слова человека — часть того же факта: у отказа (`rejected_by_human`)
+            # класс причины отвечает «кто решил», а «что человек сказал» есть
+            # только здесь, и без него карточка дела объясняла отказ догадкой.
+            row["reason"] = payload.get("reason") or None
         if home is not None and kind in ("question_asked", "question_answered"):
             text = ask.exchange_of(home, payload.get("question_id"))
             if text.get("question"):
@@ -1488,6 +1492,9 @@ def _closed_block(fact: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
     return {
         "at": int(fact.get("at") or 0),
         "cause": str(payload.get("cause") or ""),
+        # Слова человека — часть факта закрытия: у отказа («Отклонить» из пула,
+        # `archive --reason`) причина без текста не отвечает на «что решили».
+        "reason": str(payload.get("reason") or ""),
         "stages": [str(stage) for stage in payload.get("stages") or ()],
         "status": str(payload.get("status") or "done"),
     }
@@ -1812,6 +1819,9 @@ def _finished_row(
         "finished_at": None if closed is None else int(closed.get("at") or 0),
         "duration_sec": _finished_span(events, attempts),
         "cause": str(payload.get("cause") or ""),
+        # Слова решения — из того же факта: у отказа по предложению причина без
+        # них («rejected_by_human») не отличает отказ от уборки по существу.
+        "reason": str(payload.get("reason") or ""),
         "stages": [str(stage) for stage in payload.get("stages") or ()],
         "attempts": len(attempts),
         "questions": _finished_questions(events),
@@ -2752,11 +2762,17 @@ def _repo_of(spec: Optional[str], repo: Optional[str]) -> Optional[str]:
 def deals_patch(
     home: Path, deal_id: str, payload: dict[str, Any], *, source: str = "api"
 ) -> dict[str, Any]:
-    """`PATCH /deals/{id}`: title/body/assignee и `status='archived'`.
+    """`PATCH /deals/{id}`: title/body/assignee и `status='archived'` с причиной.
 
     `repo` правкой не принимается (0.0.6): он задаётся при создании из спеки дела
     или явного значения, и отказ назван словами — молча проигнорированное поле
     читалось бы как «репозиторий сменён».
+
+    `cause`/`reason` — причина архива (`completed.payload`), как у `decide stop`:
+    класс решения и слова человека. Без них архив неотличим от уборки, и «почему
+    предложение отклонено» не восстанавливается (живой случай: 56 архивных дел
+    без `cause`). У остальных правок этих полей нет: причина у `patched` значила
+    бы «спецификация поправлена почему-то», а это не факт журнала.
     """
     if payload.get("repo") is not None:
         raise deals.DealError(
@@ -2774,6 +2790,8 @@ def deals_patch(
                 body=payload.get("body"),
                 assignee=payload.get("assignee"),
                 status=payload.get("status"),
+                cause=str(payload.get("cause") or ""),
+                reason=str(payload.get("reason") or ""),
                 source=source,
             ),
         )
@@ -3045,7 +3063,11 @@ def create_deal_route(payload: dict[str, Any] = Body(...)) -> Any:
 
 @router.patch("/deals/{deal_id}")
 def patch_deal_route(deal_id: str, payload: dict[str, Any] = Body(...)) -> Any:
-    """`PATCH /deals/{id} {title?, body?, assignee?, status?}` → дело."""
+    """`PATCH /deals/{id} {title?, body?, assignee?, status?, cause?, reason?}` → дело.
+
+    `cause`/`reason` читаются только у архивации: это причина отказа в том же
+    факте `completed`, что пишет `bin/duty archive --reason`.
+    """
     try:
         return deals_patch(_hermes_home(), deal_id, payload)
     except deals.DealError as exc:

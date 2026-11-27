@@ -863,6 +863,53 @@ def test_answered_own_question_closes_one_fact(client: TestClient, home: Path) -
     assert waiting_now(client)["human_kind"] == "status"
 
 
+# ------------------------------- снятие вопроса: строка остаётся, статус меняется
+
+
+def test_closing_a_question_keeps_its_row(home: Path, subtests: pytest.Subtests) -> None:
+    """Снятие вопроса — видимое состояние, а не удаление строки (`pool.db`).
+
+    История решений — часть контракта пула: по строке видно, что вопрос был и чем
+    закрыт, и только по ней панель и дедупликация понимают, что человек уже
+    ответил. Живой случай: восемь вопросов дел-предложений исчезли из живого
+    `pool.db` целиком (id 651-653, 692-693, 763-765), и «что решил человек» не
+    восстановить ни по делу, ни по пулу. Поэтому инвариант проверяется по id:
+    после каждого закрывающего прохода строки те же самые и в том же порядке.
+    """
+    cases = [
+        {
+            "name": "answered by human",
+            "close": lambda qid: (
+                pool_close(home, qid, "answered", answer="ок"),
+                sync_now(home),
+            ),
+            "want": ("answered", "manual"),
+        },
+        {
+            "name": "expired by timeout",
+            "close": lambda qid: (pool_close(home, qid, "expired"), sync_now(home)),
+            "want": ("expired", None),
+        },
+        {
+            "name": "closed by lead",
+            "close": lambda qid: ask.resolve(home, qid, "continue", via="lead", deal_id=DEAL),
+            "want": ("answered", "lead"),
+        },
+    ]
+    for case in cases:
+        with subtests.test(case["name"]):
+            question_id = ask_once(home).question_id
+            before = [(row["id"], row["status"]) for row in pool_rows(home)]
+
+            case["close"](question_id)
+
+            rows = pool_rows(home)
+            # Ни одна строка не исчезла: те же id, тот же порядок.
+            assert [row["id"] for row in rows] == [item[0] for item in before]
+            closed = next(row for row in rows if row["id"] == question_id)
+            assert (closed["status"], closed["answered_via"]) == case["want"]
+
+
 # --------------------------------------------- запись в пул — только ask.py
 
 REPO_ROOT = MODULE_PATH.parent.parent

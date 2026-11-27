@@ -288,14 +288,17 @@ duty comment d_… "текст"
 duty block d_… --kind needs_input "причина"
 duty unblock d_… | duty complete d_… --summary "…" | duty claim d_…
 duty review d_… [--reviewer ROLE] | duty changes d_… "причина"
-duty attach d_… FILE | duty archive d_…
+duty attach d_… FILE | duty archive d_… [--reason "…"]
 duty decide d_… continue|stop | duty close d_… [--reason "…"]
 ```
 
 `--board` у CLI нет ни у одной команды: дело адресуется своим id, а `--repo` задаёт
 группировку (пустая строка — дела без репозитория). `archive` — это тот же
 `PATCH {status: archived}`, названный командой: закрытое дело не должно требовать
-ручного `PATCH`.
+ручного `PATCH`. `--reason` у `archive` — слова человека, сказанные при отказе: они
+ложатся в факт закрытия (`completed.payload.reason`), а класс отказа —
+`cause='rejected_by_human'` (без слов причины нет, и факт остаётся прежним
+`{"status": "archived"}` — старую историю не переписываем).
 `--json` печатает ответ роута дословно (включая `mutation`), человеческий вывод
 называет дело, статус, ожидание и число записанных событий.
 

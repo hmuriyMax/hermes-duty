@@ -655,6 +655,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     archive = command("archive", "пометить своё дело archived (PATCH {status: archived})")
     archive.add_argument("deal_id")
+    archive.add_argument(
+        "--reason",
+        default="",
+        help="слова решения: почему отклонено (в факт закрытия, cause=rejected_by_human)",
+    )
 
     # Прогон задачи по спеке на песочном корне: не роут, а демонстрация модели
     # (`dashboard/demo.py`). Живые БД только читаются — и это проверяется самим
@@ -980,6 +985,7 @@ DEALS_COLUMNS = (
     ("ВОПРОСОВ", 12),
     ("ДЛИТЕЛЬНОСТЬ", 13),
     ("ПРИЧИНА", 22),
+    ("РЕШЕНИЕ", 34),
     ("ЭТАПЫ", 20),
     ("ПУБЛИКАЦИЯ", 24),
 )
@@ -1005,7 +1011,8 @@ def _finished_cells(deal: dict[str, Any]) -> list[Any]:
     Ни одного нового правила: причина, этапы, попытки, вопросы, длительность и
     публикация — ровно те факты журнала, что называет `bin/duty deal <id>`
     (`closed`, `published`, таймлайн попыток). Пустая причина у архивного дела
-    печатается словами «не записана»: это честнее пустой клетки.
+    печатается словами «не записана»: это честнее пустой клетки, а «решение» —
+    слова человека из того же факта закрытия (у отказа — с номером вопроса).
     """
     return [
         _fmt_stamp(deal.get("finished_at")),
@@ -1016,6 +1023,7 @@ def _finished_cells(deal: dict[str, Any]) -> list[Any]:
         _questions_cell(deal.get("questions")),
         _fmt_age(deal.get("duration_sec")),
         deal.get("cause") or "не записана",
+        deal.get("reason") or "—",
         ", ".join(deal.get("stages") or []) or "—",
         _published_cell(deal.get("published")),
     ]
@@ -1402,9 +1410,11 @@ def _closure_text(closed: dict[str, Any]) -> str:
     поверхности».
     """
     cause = str(closed.get("cause") or "") or "причина не записана"
+    said = str(closed.get("reason") or "")
     stages = [str(stage) for stage in closed.get("stages") or ()]
+    words = f", причина: {said}" if said else ""
     tail = f", этапы: {', '.join(stages)}" if stages else ""
-    return f"completed cause={cause}{tail} в {_fmt_stamp(closed.get('at'))}"
+    return f"completed cause={cause}{words}{tail} в {_fmt_stamp(closed.get('at'))}"
 
 
 def _lead_line(block: Any) -> str:
@@ -2813,9 +2823,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                 filename=Path(args.file).name, content=content, source="cli", as_json=args.json,
             )
         if args.command == "archive":
+            # Причина — словами человека, как у `decide stop`: архив без неё
+            # неотличим от уборки, и «почему отклонено» не восстановить.
             return _mutate(
                 api().deals_patch, "АРХИВИРОВАНО", api().hermes_home(), args.deal_id,
-                {"status": "archived"}, source="cli", as_json=args.json,
+                {"status": "archived", "reason": args.reason}, source="cli", as_json=args.json,
             )
     except NotFound as exc:
         print(f"! {exc}", file=sys.stderr)

@@ -1304,6 +1304,8 @@ def patch_deal(
     body: Optional[str] = None,
     assignee: Optional[str] = None,
     status: Optional[str] = None,
+    cause: str = "",
+    reason: str = "",
     source: str = "cli",
     now: Optional[int] = None,
 ) -> dict[str, Any]:
@@ -1314,6 +1316,17 @@ def patch_deal(
     перестал бы объяснять, почему дело сдвинулось. Архивация пишется тем же
     `completed` со `status="archived"` — отдельного `kind` для неё нет
     (`docs/JOURNAL.md`), а правка спецификации — фактом `patched`.
+
+    Причина отказа (`cause`/`reason`) — та же пара, что у `close_deal`: класс
+    отвечает «кто решил», текст — «что человек сказал». Без неё архив неотличим
+    от уборки, и «почему предложение отклонено» не восстанавливается ни по делу,
+    ни по журналу (живой случай: 56 архивных дел без `cause`). Пустой класс при
+    названной причине не выдумывается отдельной командой: причина у архива одна —
+    человек сказал «не надо», и это `rejected_by_human`. У правки без архивации
+    этих полей нет вовсе: молча проигнорированная причина читалась бы как
+    записанная, поэтому она называется ошибкой. По той же причине повтор
+    архивации вместе с полями спецификации — отказ: повтор пишет ноль событий, и
+    половина правки потерялась бы молча.
     """
     now = _now_sec() if now is None else int(now)
     deal = _require_row(conn, deal_id)
@@ -1342,13 +1355,49 @@ def patch_deal(
         raise DealError("patch: нечего менять — передайте title, body, assignee или status=archived")
 
     archived = "status" in changes
+    said = " ".join(str(reason or "").split())
+    why = " ".join(str(cause or "").split()) or (CLOSE_CAUSE_REJECTED if said else "")
+    if not archived and (said or why):
+        # Молча проигнорированная причина читалась бы как «записали»: у остальных
+        # правок её нет (`patched` описывает поля спецификации), поэтому поле
+        # называется ошибкой, а не теряется.
+        raise DealError(
+            "patch: cause/reason — причина архивации, а status не меняется "
+            "(нужно status=archived)"
+        )
+    if archived and str(deal["status"]) == "archived":
+        # Повтор архивации пишет 0 событий, поэтому поля спецификации из той же
+        # правки в нём потерялись бы молча — тот же класс, что причина без
+        # архивации. Правка полей и повтор архивации — два разных факта журнала:
+        # их зовут раздельно, а не одним вызовом с тихо выброшенной половиной.
+        extra = sorted(set(changes) - {"status"})
+        if extra:
+            raise DealError(
+                f"patch: дело {deal['id']} уже archived — повтор архивации не применяет поля "
+                f"({', '.join(extra)}); правьте их отдельным PATCH без status"
+            )
+        # Отказ уже записан: тот же вызов (те же слова, тот же класс) — повтор с
+        # нулём событий, как у любой мутации; другие слова — не повтор, а попытка
+        # переписать историю, и она отвергается, а не ложится вторым `completed`.
+        last = _last_completion(journal.read_events(conn, str(deal["id"]))) or {}
+        if str(last.get("cause") or "") == why and str(last.get("reason") or "") == said:
+            return {"deal": deal_row(conn, str(deal["id"])), "events": 0, "idempotent": True}
+        raise DealError(
+            f"patch: дело {deal['id']} уже archived — причину отказа не переписываем"
+        )
     if archived:
         kind = "completed"
         payload: dict[str, Any] = {"status": changes["status"]}
+        if why:
+            payload["cause"] = why
+        if said:
+            payload["reason"] = said
+        args: dict[str, Any] = {"changes": dict(changes), "cause": why, "reason": said}
     else:
         kind = "patched"
         payload = {"fields": sorted(changes)}
-    event = _event(deal, kind, payload, source, {"changes": dict(changes)}, now)
+        args = {"changes": dict(changes)}
+    event = _event(deal, kind, payload, source, args, now)
     target = str(changes.pop("status", deal["status"]))
     return _apply(conn, deal, [event], target, now, changes)
 
@@ -1633,6 +1682,13 @@ def complete_deal(
 # текста причины.
 CLOSE_CAUSE_HUMAN = "closed_by_human"
 CLOSE_CAUSE_STOP = "stopped_by_human"
+# Причина архива: человек **отклонил** дело (`duty archive --reason`, «Отклонить»
+# из пула решений). У предложения работы не было, и `stopped_by_human` («работу
+# оборвали») был бы неверным фактом; при этом `archived` без класса не отличим от
+# уборки, из-за чего правило дедупликации improver читало любой архив как отказ
+# человека (живой случай: 56 архивных дел без `cause`). Текст человека остаётся в
+# `reason` — пара та же, что у `stop` и `close`.
+CLOSE_CAUSE_REJECTED = "rejected_by_human"
 # Причина гашения попыток у `complete`: своего `cause` его `completed` не несёт
 # (человек не закрывает дело, а завершает его), и называть отмену попытки
 # `closed_by_human` значило бы выдать `complete` за `close` в журнале.
@@ -2155,8 +2211,18 @@ def decide_deal(
         # «работу оборвали», а работы у предложения не было вовсе — человек
         # сказал «не надо». Пишется тем же фактом, что `bin/duty archive`
         # (`completed` со `status="archived"`), иначе у двух путей отказа
-        # («Отклонить» из пула и `duty archive`) была бы разная история.
-        return patch_deal(conn, deal_id, status="archived", source=source, now=now)
+        # («Отклонить» из пула и `duty archive`) была бы разная история. Слова
+        # решения (`reason`) идут в тот же факт: без них «что решил человек» не
+        # восстанавливается ни по делу, ни по журналу.
+        return patch_deal(
+            conn,
+            deal_id,
+            status="archived",
+            cause=CLOSE_CAUSE_REJECTED,
+            reason=reason,
+            source=source,
+            now=now,
+        )
     return close_deal(
         conn, str(deal["id"]), reason=reason, cause=CLOSE_CAUSE_STOP, source=source, now=now
     )

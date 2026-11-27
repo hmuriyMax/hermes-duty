@@ -379,7 +379,7 @@ failures.classify → policy → decide_park
 | # | состояние | какой факт журнала его даёт |
 |---|---|---|
 | 1 | `wait_human` | `question_asked` без `question_answered` (живой вопрос: пула — пара по `question_id`, роли — пара по порядку журнала); `blocked` без `unblocked` с `block_kind≠capability` (в том числе `parked` — попытки исчерпаны); `review_requested` без `collected`/`changes_requested` |
-| 2 | `capability` | `blocked` без `unblocked`, где `block_kind='capability'` или причина блока содержит слово из `CAPABILITY_WORDS` (доступ, права, разрешение, `permission`, `access`, `credential`, `token`, `forbidden`, `403`) |
+| 2 | `capability` | `blocked` без `unblocked`, где `block_kind='capability'`; либо `block_kind` не записан вовсе, а причина блока содержит слово из `CAPABILITY_WORDS` (доступ, права, разрешение, `permission`, `access`, `credential`, `token`, `forbidden`, `403`) — записанный класс старше слов причины |
 | 3 | `dead_lease` | `claimed` со сроком `claim_expires`, который прошёл, и без `attempt_started` за ним |
 | 4 | `crashed` | `attempt_started` без `attempt_ended`, а записанный `pid` мёртв |
 | 5 | `working` | `attempt_started` без `attempt_ended`, а `pid` жив; heartbeat в журнал не пишется, и это сказано в evidence, а не подразумевается |

@@ -772,6 +772,11 @@ def fold(
 
     # 3. Блок без последующего `unblocked`. Доступ/права — отдельное состояние
     #    `capability`, как в 0.0.2: это не «человек решает», а «человек даёт доступ».
+    #    Класс, записанный полем, старше слов причины: `block_kind` решает, а
+    #    `CAPABILITY_WORDS` — эвристика только для фактов, где класса нет вовсе.
+    #    Иначе «role-access» в причине вопроса превращал `needs_input` в
+    #    `capability`, и запаркованное с вопросом дело молчало: диспетчер поднимает
+    #    только `wait_human` (живое дело d_b04637b7, 27.11).
     #    Парковка (`block_kind='parked'`) — `wait_human` без разбора текста причины:
     #    класс и число попыток пришли полями, и словесное совпадение («token» в
     #    причине) не должно превращать её в `capability`.
@@ -812,7 +817,9 @@ def fold(
                     + (f", вопрос #{parked_fact['question_id']}" if parked_fact["question_id"] else "")
                     + needs
                 )
-        elif block_kind == "capability" or any(word in reason.lower() for word in CAPABILITY_WORDS):
+        elif block_kind == "capability" or (
+            not block_kind and any(word in reason.lower() for word in CAPABILITY_WORDS)
+        ):
             facts.setdefault("capability", []).append(text)
         else:
             facts.setdefault("wait_human", []).append(text)

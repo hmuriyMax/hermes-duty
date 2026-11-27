@@ -325,8 +325,11 @@ approved_commit}`.
    месте кода, а не разбросан по `if` в вызывающих.
 3. `blocked` без последующего `unblocked` → `wait_human` с `evidence` из payload.
    Исключение — доступ и права: `block_kind='capability'` (или причина блока со словом
-   из `CAPABILITY_WORDS`) даёт состояние `capability`, а не `wait_human`: человек тут
-   не решает, а даёт доступ. Таксономия — `docs/DESIGN.md`.
+   из `CAPABILITY_WORDS`, когда класса нет вовсе) даёт состояние `capability`, а не
+   `wait_human`: человек тут не решает, а даёт доступ. Записанный класс старше слов:
+   у `block_kind='needs_input'` слово «role-access» в причине состояния не меняет —
+   иначе запаркованное с вопросом дело читалось бы как стена доступа и молчало
+   (живое дело `d_b04637b7`, 27.11). Таксономия — `docs/DESIGN.md`.
 4. `claimed`, за которым нет `attempt_started`, и у которого в журнале записан срок
    (`claim_expires`) и этот срок уже прошёл, → `dead_lease`. «Протух» — свойство
    срока: `claimed` без срока (своё дело — `duty claim` пишет `claim_expires: null`)

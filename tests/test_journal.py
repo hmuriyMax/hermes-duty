@@ -689,6 +689,29 @@ def test_fold_capability_words_without_typed_kind() -> None:
     assert folded["state"] == "capability"
 
 
+@pytest.mark.parametrize(
+    "block_kind, reason, want",
+    [
+        ("needs_input", "вопрос лида #941: пути живого checkout закрыты role-access", "wait_human"),
+        ("needs_input", "ответ 403 от staging, токен не выдавали", "wait_human"),
+        ("capability", "нужен человек с правами", "capability"),
+        ("", "доступ к репозиторию закрыт", "capability"),
+    ],
+    ids=["needs_input role-access", "needs_input 403", "capability no words", "no kind access"],
+)
+def test_fold_written_block_kind_outranks_capability_words(
+    block_kind: str, reason: str, want: str
+) -> None:
+    """Записанный класс старше слов причины; эвристика работает только без класса."""
+    payload: dict[str, Any] = {"reason": reason}
+    if block_kind:
+        payload["block_kind"] = block_kind
+
+    folded = journal.fold(events(("blocked", payload)), now=NOW)
+
+    assert folded["state"] == want
+
+
 def test_fold_question_without_answer_is_wait_human_question() -> None:
     """Правило 6: `question_asked` без ответа — «ждёт ответа», `human_kind=question`."""
     folded = journal.fold(

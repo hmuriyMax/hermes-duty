@@ -225,6 +225,29 @@ def test_now_json_honours_repo_and_state_filters(home, deal, client, frozen_now,
     assert json.loads(out) == client.get("/now", params={"repo": REPO, "state": "wait_human"}).json()
 
 
+def test_now_json_reads_the_written_block_kind_over_the_reason_words(home, deal, frozen_now, capsys):
+    """Живая форма 27.11: `needs_input` с `role-access` в причине — ждёт человека, не доступа.
+
+    Диспетчер поднимает только `wait_human`, поэтому `capability` на этом факте
+    оставлял дело с ответом в пуле молча (живое дело `d_b04637b7`).
+    """
+    block_deal(
+        home,
+        deal,
+        kind="needs_input",
+        reason="вопрос лида #941: shell у роли запрещён, пути живого checkout закрыты role-access",
+    )
+
+    code, out, _ = run(["now", "--json"], capsys)
+
+    assert code == 0
+    waiting = json.loads(out)["deals"][0]["waiting"]
+    assert waiting["state"] == "wait_human"
+    assert waiting["human_kind"] == "status"
+    assert "block_kind=needs_input" in waiting["evidence"]
+    assert "role-access" in waiting["evidence"]
+
+
 def test_stats_json_is_exactly_the_route_payload(home, deal, client, frozen_now, capsys):
     code, out, _ = run(["stats", "--json"], capsys)
     assert code == 0

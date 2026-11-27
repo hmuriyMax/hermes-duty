@@ -492,6 +492,14 @@ def test_archive_records_the_refusal_class_and_the_human_words(
             refused = client.patch(f"/deals/{deal['id']}", json=other)
             assert refused.status_code == 400
             assert "причину отказа не переписываем" in refused.json()["errors"][0]["reason"]
+            # Повтор архивации с полем спецификации — тоже отказ: он пишет 0
+            # событий, и заголовок из той же правки потерялся бы молча.
+            mixed = client.patch(
+                f"/deals/{deal['id']}", json=dict(case["patch"], title="новое")
+            )
+            assert mixed.status_code == 400
+            assert "не применяет поля (title)" in mixed.json()["errors"][0]["reason"]
+            assert client.get("/deals").json()["deals"][0]["title"] == "своё дело"
             assert kinds(home, deal["id"]) == ["created", "completed"]
 
 

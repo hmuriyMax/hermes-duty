@@ -873,8 +873,8 @@ def test_closing_a_question_keeps_its_row(home: Path, subtests: pytest.Subtests)
     закрыт, и только по ней панель и дедупликация понимают, что человек уже
     ответил. Живой случай: восемь вопросов дел-предложений исчезли из живого
     `pool.db` целиком (id 651-653, 692-693, 763-765), и «что решил человек» не
-    восстановить ни по делу, ни по пулу. Поэтому инвариант проверяется числом и
-    id: после каждого закрывающего прохода строк столько же и те же самые.
+    восстановить ни по делу, ни по пулу. Поэтому инвариант проверяется по id:
+    после каждого закрывающего прохода строки те же самые и в том же порядке.
     """
     cases = [
         {
@@ -904,9 +904,8 @@ def test_closing_a_question_keeps_its_row(home: Path, subtests: pytest.Subtests)
             case["close"](question_id)
 
             rows = pool_rows(home)
-            # Ни одна строка не исчезла: те же id, тот же порядок, счётчик не убыл.
+            # Ни одна строка не исчезла: те же id, тот же порядок.
             assert [row["id"] for row in rows] == [item[0] for item in before]
-            assert len(rows) >= len(before)
             closed = next(row for row in rows if row["id"] == question_id)
             assert (closed["status"], closed["answered_via"]) == case["want"]
 

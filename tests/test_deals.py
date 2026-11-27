@@ -499,8 +499,35 @@ def test_archive_records_the_refusal_class_and_the_human_words(
             )
             assert mixed.status_code == 400
             assert "не применяет поля (title)" in mixed.json()["errors"][0]["reason"]
-            assert client.get("/deals").json()["deals"][0]["title"] == "своё дело"
+            listed = next(
+                item for item in client.get("/deals").json()["deals"] if item["id"] == deal["id"]
+            )
+            assert listed["title"] == "своё дело"
             assert kinds(home, deal["id"]) == ["created", "completed"]
+
+
+def test_archive_with_spec_fields_applies_them_on_a_live_deal(
+    home: Path, client: TestClient
+) -> None:
+    """Отказ у повтора архивации не режет первый архив с полями спецификации.
+
+    `{status: archived, title: …}` на неархивном деле — один `completed`, и
+    `title` из той же правки применяется: иначе 400 у повтора (дело уже
+    archived) молча отрезал бы законную правку.
+    """
+    deal = create(client)
+    archived = mutate(
+        client, "PATCH", f"/deals/{deal['id']}", json={"status": "archived", "title": "новое"}
+    )
+
+    assert archived["status"] == "archived"
+    assert archived["mutation"] == {"events": 1, "idempotent": False}
+    assert kinds(home, deal["id"]) == ["created", "completed"]
+    assert events(home, deal["id"])[-1]["payload"] == {"status": "archived"}
+    listed = next(
+        item for item in client.get("/deals").json()["deals"] if item["id"] == deal["id"]
+    )
+    assert listed["title"] == "новое"
 
 
 def test_reason_without_archiving_is_refused(

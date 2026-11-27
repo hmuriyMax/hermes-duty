@@ -4,7 +4,7 @@
 журнале и в командной строке захода, а не обещания docstring:
 
 1. нет сессии → заход собирает команду **первого** запуска с брифом
-   (`-p lead -s project-delivery --query-file <бриф> --format stream-json`);
+   (`-p lead -s duty-spec --query-file <бриф> --format stream-json`);
    бюджет захода держит сам супервизор: `hermes chat` через живой гейтвей
    отказывает `--run-budget`;
 2. `kill` процесса лида посреди дела → следующий тик поднимает **резюм**
@@ -263,7 +263,7 @@ def test_first_start_builds_brief_command_and_records_facts(tmp_path: Path) -> N
     """Нет сессии → команда первого запуска с брифом, `lead_started`/`lead_exited`.
 
     `docs/ENGINE-2.0.md`, раздел 2: первый заход поднимается скиллом
-    `project-delivery` и брифом; бюджет захода (1800 с) держит супервизор по
+    `duty-spec` и брифом; бюджет захода (1800 с) держит супервизор по
     часам — флага в команде нет, потому что живой гейтвей его отвергает. Факт
     начала несёт pid процесса и курсор — то, на чём потом стоит резюм.
     """
@@ -288,7 +288,7 @@ def test_first_start_builds_brief_command_and_records_facts(tmp_path: Path) -> N
     assert report["mode"] == lead.MODE_FIRST
     cmd = seen["cmd"]
     assert cmd[0].endswith("hermes")
-    assert cmd[1:6] == ["chat", "-p", "lead", "-s", "project-delivery"]
+    assert cmd[1:6] == ["chat", "-p", "lead", "-s", "duty-spec"]
     assert "--resume" not in cmd
     assert cmd[cmd.index("--format") + 1] == "stream-json"
     brief_path = Path(cmd[cmd.index("--query-file") + 1])
@@ -1267,7 +1267,7 @@ def test_unusable_session_is_replaced_by_a_fresh_brief(tmp_path: Path) -> None:
     assert third["mode"] == lead.MODE_FIRST
     cmd = seen["cmd"]
     assert "--resume" not in cmd
-    assert cmd[1:6] == ["chat", "-p", "lead", "-s", "project-delivery"]
+    assert cmd[1:6] == ["chat", "-p", "lead", "-s", "duty-spec"]
     brief = Path(cmd[cmd.index("--query-file") + 1]).read_text(encoding="utf-8")
     # История с нуля: бриф, а не дайджест от курсора сессии.
     assert "## История дела" in brief

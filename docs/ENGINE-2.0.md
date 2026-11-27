@@ -50,7 +50,7 @@ cron «Duty dispatcher» (каждую минуту)
   └─ на каждое незакрытое дело: жив ли лид?
        ├─ жив → ничего
        └─ нет → `bin/duty lead <id>` (супервизор, отсоединённый процесс)
-                 ├─ нет сессии  → `hermes chat -p lead -s project-delivery --query-file бриф`
+                 ├─ нет сессии  → `hermes chat -p lead -s duty-spec --query-file бриф`
                  └─ есть сессия → `hermes chat -p lead --resume <id> --query-file дайджест`
                        └─ лид в одном турне: duty_plan → duty_start → duty_wait → …
                              └─ `duty_start` = попытка: отдельный процесс роли,
